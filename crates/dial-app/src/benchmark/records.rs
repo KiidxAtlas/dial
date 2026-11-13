@@ -159,13 +159,35 @@ fn executable_digest() -> Result<String> {
     let digest = digest_file(&std::env::current_exe()?)?;
     Ok(DIGEST.get_or_init(|| digest).clone())
 }
+
+/// The run's exclusive record lock. A record another run holds is refused, but only after a short
+/// grace: a lock released a moment ago can still look held while a process forked elsewhere in
+/// this program has not yet exec'd and briefly holds a copy of the lock descriptor.
+fn acquire_record(path: &Path) -> Result<std::fs::File> {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + GRACE;
+    loop {
+        match crate::config::settings_store::try_locked(path) {
+            Err(error)
+                if std::time::Instant::now() < deadline
+                    && error
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
 impl Recorder {
     pub fn open(path: &Path, contract: Contract, resume: bool) -> Result<Self> {
         ensure!(
             contract.schema_version == 1,
             "unsupported run contract version"
         );
-        let lock = crate::config::settings_store::try_locked(path)?;
+        let lock = acquire_record(path)?;
         let data = if resume && let Some(bytes) = crate::platform::atomic::read_private(path)? {
             let data: Checkpoints =
                 serde_json::from_slice(&bytes).context("invalid benchmark checkpoint")?;

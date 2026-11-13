@@ -103,9 +103,10 @@ function Invoke-Installer {
     })
     $argText = ($Arguments | ForEach-Object { if ($_ -match '^-[A-Za-z]+$') { $_ } else { ConvertTo-PsLiteral $_ } }) -join ' '
     $lines += "`$ErrorActionPreference = 'Stop'"
-    # The message is written whole: PowerShell 7's error view wraps a thrown message at the console
-    # width ('Nothing' / '| was installed'), which would split the phrases the tests look for.
-    $lines += "try { & $(ConvertTo-PsLiteral $ScriptPath) $argText } catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }"
+    # The message is written whole to stdout: PowerShell 7's error view wraps a thrown message at
+    # the console width ('Nothing' / '| was installed'), and raw text on the error stream breaks the
+    # CLIXML that an -EncodedCommand child uses for it.
+    $lines += "try { & $(ConvertTo-PsLiteral $ScriptPath) $argText } catch { Write-Output `$_.Exception.Message; exit 1 }"
     $lines += 'exit 0'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($lines -join "`n")))
     $ErrorActionPreference = 'Continue'

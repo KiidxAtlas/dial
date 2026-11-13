@@ -19,8 +19,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- The `eval` tool description again says the portable helpers are `dial.*` methods, that `tool.<name>` and `tool.batch` take objects, and that a generated file is written and checked inside the cell. The 0.3.7 trim to fit 25 KiB dropped that wording, and in one 0.3.7 benchmark trial the model called `tool.readBytes(path)` (an error and a recovery round). A three-repetition A/B on two tasks showed no time or token difference either way. The description grows 28 bytes; the hosted and local core offers still fit their budgets ([tools](docs/tools.md)).
 - Background jobs in the embedded shell behave as in Bash: `$!` names the job's process (the last external member of a pipeline; a virtual PID for a job that runs only builtins), `kill $!`/`kill %N` stop the job, including a busy loop of builtins, `wait PID`/`wait %N`/`wait -n`/`wait -p VAR` return the job's status, and `kill` defaults to `TERM` (brush's `kill` sent `KILL`). Bash's `/dev/tcp` and `/dev/udp` redirections are supported. On Windows `kill` terminates the process tree.
 - In-process shell runs no longer report `external-command cleanup could not be established` when Dial leads many process groups: the run's marker check covers every candidate in one `ps` call instead of one call per group.
+- A turn no longer ends without reporting a command that was moved to the background and finished in the last moments of the turn: the turn now lists running jobs before it collects completions, and waits briefly for a just-exited job's output capture to close so its completion is queued.
 
 ### Changed
 

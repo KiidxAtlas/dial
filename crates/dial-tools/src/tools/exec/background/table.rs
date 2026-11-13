@@ -1027,6 +1027,19 @@ impl Table {
             .collect()
     }
 
+    /// `bash`-adopted jobs that have exited but whose output capture has not closed, so their
+    /// completion is not queued yet. Callers settle them (outside the table lock) before deciding
+    /// that nothing is left to wait for.
+    pub(super) fn settling(&self) -> Vec<String> {
+        self.procs
+            .iter()
+            .filter(|p| {
+                p.adopted && !p.is_running() && !p.completion_notified && !lock(&p.ring).closed
+            })
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
     /// Running jobs started explicitly with `bg` (not adopted from `bash`), as `name (command)`.
     pub(super) fn session_owned(&self) -> Vec<String> {
         self.procs

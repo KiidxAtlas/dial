@@ -368,7 +368,7 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript (default) or Python 3.8+; separate namespaces, persistent top-level bindings (prefer var in JS). Embedded JS has no Node modules; OS containment required; subprocesses/native addons denied. Portable dial helpers (JS await, Python sync): read/readText/readJson/readBytes, readLines/lines, writeText/writeJson/writeBytes (create only), run, batch (raises unless collect:true), check (local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB per whole-file call. Call tool.<name>(args) or tool.batch([{name,args},...]) under normal approval; denied calls raise ToolError. For generated data: read inputs in code, prove a tiny known-answer case, write, then assert the saved result; never transcribe printed values. Print short summaries; stdout alone is not check evidence. Failed cells can leave effects.",
+                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS has no Node modules; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson/writeBytes (create only), run, batch (raises unless collect:true), check (local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: in one cell read inputs, compute, write, assert; prove tricky logic on a tiny known-answer case; never print then transcribe. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js. Windows Python requires explicit unsandboxed opt-in."},
@@ -383,10 +383,10 @@ impl Tool for EvalTool {
         if !self.js.config.portable_helpers
             && let Some(description) = schema["function"]["description"].as_str()
             && let Some((start, remaining)) = description.split_once("Portable dial helpers")
-            && let Some((_, rest)) = remaining.split_once("Call tool.<name>")
+            && let Some((_, rest)) = remaining.split_once("tool.<name>")
         {
             schema["function"]["description"] = json!(format!(
-                "{start}Portable helpers are disabled. Call tool.<name>{rest}"
+                "{start}Portable helpers are disabled. tool.<name>{rest}"
             ));
         }
         schema

@@ -267,8 +267,9 @@ def main():
             assert "dial" in run("completions", shell)
 
         # Exercises the actual re-executed shell host and bundled utility registrations.
+        # Shell scripts use LF on every OS, as Dial writes them; Windows text mode would add CR.
         script = root / "dial-shell-artifact.sh"
-        script.write_text("printf 'alpha\\nbeta\\n' | head -n 1\n", encoding="utf-8")
+        script.write_text("printf 'alpha\\nbeta\\n' | head -n 1\n", encoding="utf-8", newline="\n")
         assert run("__embedded-shell", script).strip() == "alpha"
         assert not script.exists()
 
@@ -277,12 +278,12 @@ def main():
         seed = {"schema_version": 1, "completed": False, "cwd": str(workspace), "exported": {}}
         state.write_text(json.dumps(seed), encoding="utf-8")
         state.chmod(0o600)
-        script.write_text("mkdir nested; cd nested; export HARNESS_FIXTURE_VALUE=retained\n", encoding="utf-8")
+        script.write_text("mkdir nested; cd nested; export HARNESS_FIXTURE_VALUE=retained\n", encoding="utf-8", newline="\n")
         run("__embedded-shell", script, state)
         saved = json.loads(state.read_text())
         assert saved["completed"] and Path(saved["cwd"]).resolve() == (workspace / "nested").resolve()
         assert saved["exported"]["HARNESS_FIXTURE_VALUE"] == "retained"
-        script.write_text('printf "%s\\n" "$HARNESS_FIXTURE_VALUE"; pwd\n', encoding="utf-8")
+        script.write_text('printf "%s\\n" "$HARNESS_FIXTURE_VALUE"; pwd\n', encoding="utf-8", newline="\n")
         assert run("__embedded-shell", script, state, cwd=Path(saved["cwd"])).splitlines() == ["retained", saved["cwd"]]
         assert not script.exists()
 

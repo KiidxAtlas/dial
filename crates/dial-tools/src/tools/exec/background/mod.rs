@@ -1380,6 +1380,19 @@ impl Tool for Background {
     }
 
     fn awaited_work(&self) -> Vec<String> {
+        // A job that exited a moment ago queues its completion only once its reader closes. Let
+        // it settle first, so a caller that sees no awaited work also finds the completion queued.
+        let settling = {
+            let mut table = self.table();
+            table.refresh();
+            table.settling()
+        };
+        for name in settling {
+            let snap = self.table().snapshot(&name);
+            if let Ok(snap) = snap {
+                snap.settle();
+            }
+        }
         let mut table = self.table();
         table.refresh();
         table.awaited()
