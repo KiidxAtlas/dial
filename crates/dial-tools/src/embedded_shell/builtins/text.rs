@@ -10,6 +10,7 @@ use std::str::Chars;
 use regex::{Regex, RegexBuilder};
 
 use super::Io;
+use super::files::err_text;
 
 /// Parsed command-line options: switch letters, value options in order, and operands.
 #[derive(Default)]
@@ -90,25 +91,16 @@ fn inputs(operands: &[String]) -> Vec<&str> {
     }
 }
 
-/// Strips Rust's `(os error N)` suffix so messages read as GNU coreutils prints them.
-fn os_message(error: &std::io::Error) -> String {
-    let text = error.to_string();
-    match text.find(" (os error") {
-        Some(at) => text[..at].to_owned(),
-        None => text,
-    }
-}
-
 /// Reads a whole input: `-` is standard input, anything else a file relative to the shell cwd.
 fn read_input(io: &mut Io<'_>, name: &str) -> Result<Vec<u8>, String> {
     if name == "-" {
         let mut buf = Vec::new();
         io.stdin
             .read_to_end(&mut buf)
-            .map_err(|e| format!("standard input: {}", os_message(&e)))?;
+            .map_err(|e| format!("standard input: {}", err_text(&e)))?;
         return Ok(buf);
     }
-    std::fs::read(io.path(name)).map_err(|e| format!("{name}: {}", os_message(&e)))
+    std::fs::read(io.path(name)).map_err(|e| format!("{name}: {}", err_text(&e)))
 }
 
 fn read_text(io: &mut Io<'_>, name: &str) -> Result<String, String> {
@@ -319,7 +311,7 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
                 Err(error) => {
                     had_error = true;
                     if !silent {
-                        let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, os_message(&error));
+                        let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, err_text(&error));
                     }
                     continue;
                 }
@@ -336,7 +328,7 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
                 Ok(_) => {}
                 Err(error) => {
                     had_error = true;
-                    let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, os_message(&error));
+                    let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, err_text(&error));
                     break;
                 }
             }
@@ -494,7 +486,7 @@ fn expand(
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(error) => {
-            errors.push(format!("{label}: {}", os_message(&error)));
+            errors.push(format!("{label}: {}", err_text(&error)));
             return;
         }
     };
@@ -509,7 +501,7 @@ fn expand(
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) => {
-            errors.push(format!("{label}: {}", os_message(&error)));
+            errors.push(format!("{label}: {}", err_text(&error)));
             return;
         }
     };
@@ -1033,7 +1025,7 @@ pub(super) fn tr(io: &mut Io<'_>, args: &[String]) -> i32 {
 
     let mut input = Vec::new();
     if let Err(error) = io.stdin.read_to_end(&mut input) {
-        return io.fail(format!("standard input: {}", os_message(&error)));
+        return io.fail(format!("standard input: {}", err_text(&error)));
     }
     let text = String::from_utf8_lossy(&input);
     let out: String = if delete {

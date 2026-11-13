@@ -207,9 +207,18 @@ fn realpath_resolves_existing_and_missing_paths_by_mode() {
     let base = canonical(dir.path());
     fs::create_dir_all(dir.path().join("a/b")).unwrap();
     fs::write(dir.path().join("a/b/f"), "").unwrap();
-    let file = base.join("a/b/f").display().to_string() + "\n";
-    let missing_leaf = base.join("a/b/missing").display().to_string() + "\n";
-    let nothing = base.join("x/z").display().to_string() + "\n";
+    // Joined one component at a time so the separators are the platform's (`\` on Windows).
+    let under = |parts: &[&str]| {
+        parts
+            .iter()
+            .fold(base.clone(), |path, part| path.join(part))
+            .display()
+            .to_string()
+            + "\n"
+    };
+    let file = under(&["a", "b", "f"]);
+    let missing_leaf = under(&["a", "b", "missing"]);
+    let nothing = under(&["x", "z"]);
     let cases: &[(&[&str], i32, String)] = &[
         (&["a/b/f"], 0, file.clone()),
         (&["-e", "a/b/f"], 0, file),

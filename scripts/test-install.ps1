@@ -103,7 +103,9 @@ function Invoke-Installer {
     })
     $argText = ($Arguments | ForEach-Object { if ($_ -match '^-[A-Za-z]+$') { $_ } else { ConvertTo-PsLiteral $_ } }) -join ' '
     $lines += "`$ErrorActionPreference = 'Stop'"
-    $lines += "& $(ConvertTo-PsLiteral $ScriptPath) $argText"
+    # The message is written whole: PowerShell 7's error view wraps a thrown message at the console
+    # width ('Nothing' / '| was installed'), which would split the phrases the tests look for.
+    $lines += "try { & $(ConvertTo-PsLiteral $ScriptPath) $argText } catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }"
     $lines += 'exit 0'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($lines -join "`n")))
     $ErrorActionPreference = 'Continue'

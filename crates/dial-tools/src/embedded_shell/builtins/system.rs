@@ -106,7 +106,7 @@ fn find_all(name: &str, path: &OsStr, cwd: &Path, all: bool) -> Vec<PathBuf> {
             dir.clone()
         };
         if let Some(candidate) = executable_candidate(&resolved.join(name))
-            && let Some(file) = candidate.file_name()
+            && let Some(file) = stored_name(&candidate)
         {
             found.push(dir.join(file));
             if !all {
@@ -115,6 +115,28 @@ fn find_all(name: &str, path: &OsStr, cwd: &Path, all: bool) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// The file name of `path` as its directory stores it. On Windows a `PATHEXT` suffix is appended in
+/// `PATHEXT`'s spelling (`tool.EXE`) and the lookup is case-insensitive, so the directory entry is
+/// read to print the real name (`tool.exe`), as `where` does. Unix names are exact already.
+fn stored_name(path: &Path) -> Option<OsString> {
+    let name = path.file_name()?;
+    if cfg!(windows)
+        && let (Some(parent), Some(wanted)) = (path.parent(), name.to_str())
+        && let Ok(entries) = fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let stored = entry.file_name();
+            if stored
+                .to_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(wanted))
+            {
+                return Some(stored);
+            }
+        }
+    }
+    Some(name.to_owned())
 }
 
 /// `which [-a] NAME...`: prints the file each name resolves to on `PATH`. Exit 1 when any name is

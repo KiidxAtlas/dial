@@ -6,7 +6,9 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for the Node version probe. The x86_64 macOS artifact is checked on Apple silicon, where
+/// Rosetta translates the bundled Node on its first launch; that alone exceeded 10 s in CI.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
     let arguments: Vec<_> = arguments.collect();

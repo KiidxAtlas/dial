@@ -270,7 +270,9 @@ pub fn check_file(file: &File) -> Result<()> {
 
 pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     validate_private_path(path.parent().context("storage path has no parent")?)?;
-    let file = match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path) {
+    // `check_file` may restrict the file to its owner through this handle.
+    let options = platform_fs::read_and_restrict_options();
+    let file = match platform_fs::open_nofollow_nonblocking(&options, path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),

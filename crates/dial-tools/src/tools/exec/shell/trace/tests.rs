@@ -97,7 +97,9 @@ fn live_trace_summarizes_a_real_command_when_strace_is_installed() {
         eprintln!("strace not installed; live trace test skipped");
         return;
     }
+    // Tracing runs under system Bash only; `auto` now selects the embedded shell.
     let (_dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_shell_backend(crate::config::types::ShellBackend::System);
     let out = crate::tools::testkit::run(
         &ws,
         "bash",

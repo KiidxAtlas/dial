@@ -266,13 +266,19 @@ fn open_pid(pid: u32, access: u32) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(raw.cast()) })
 }
 pub(in crate::platform) fn process_exists(pid: u32) -> io::Result<bool> {
-    let process = match open_pid(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+    // The wait below needs SYNCHRONIZE: without it WaitForSingleObject fails (WAIT_FAILED) and a
+    // running process would read as exited.
+    let process = match open_pid(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE) {
         Ok(process) => process,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     // SAFETY: process keeps the handle live for this zero-time wait; a signalled process exited.
-    Ok(unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 0) } == WAIT_TIMEOUT)
+    match unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 0) } {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 pub(in crate::platform) fn terminate_pid(pid: u32, exit_code: u32) -> io::Result<()> {
     let process = open_pid(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)?;

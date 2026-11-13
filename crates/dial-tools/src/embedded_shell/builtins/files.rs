@@ -10,13 +10,39 @@ use std::time::SystemTime;
 
 use super::Io;
 
-/// Text of an I/O error without Rust's ` (os error N)` suffix, matching coreutils messages.
+/// Text of an I/O error as coreutils prints it. OS errors of the common kinds use the POSIX
+/// `strerror` wording on every platform (Windows' own text, such as "The system cannot find the
+/// file specified.", would make the same script print different diagnostics per OS); other errors
+/// keep their text without Rust's ` (os error N)` suffix.
 pub(super) fn err_text(e: &io::Error) -> String {
+    if e.raw_os_error().is_some()
+        && let Some(posix) = posix_text(e.kind())
+    {
+        return posix.to_owned();
+    }
     let text = e.to_string();
     match text.find(" (os error") {
         Some(i) => text[..i].to_string(),
         None => text,
     }
+}
+
+/// The `strerror` text glibc and macOS print for an error kind, where it is unambiguous.
+fn posix_text(kind: io::ErrorKind) -> Option<&'static str> {
+    use io::ErrorKind as K;
+    Some(match kind {
+        K::NotFound => "No such file or directory",
+        K::PermissionDenied => "Permission denied",
+        K::AlreadyExists => "File exists",
+        K::NotADirectory => "Not a directory",
+        K::IsADirectory => "Is a directory",
+        K::DirectoryNotEmpty => "Directory not empty",
+        K::ReadOnlyFilesystem => "Read-only file system",
+        K::StorageFull => "No space left on device",
+        K::CrossesDevices => "Invalid cross-device link",
+        K::BrokenPipe => "Broken pipe",
+        _ => return None,
+    })
 }
 
 /// Writes `name: message` for an I/O error and returns exit code 1.

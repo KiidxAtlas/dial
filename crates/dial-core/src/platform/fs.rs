@@ -60,6 +60,21 @@ pub fn open_nofollow_nonblocking(options: &OpenOptions, path: &Path) -> io::Resu
     super::imp::fs::open_nofollow(options, path, true)
 }
 
+/// Options for reading a file whose permissions the reader may then restrict to its owner
+/// (`atomic::check_file`). Windows changes a DACL through the handle, which needs `WRITE_DAC`
+/// besides read access; Unix `fchmod` needs no extra access.
+pub fn read_and_restrict_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, WRITE_DAC};
+        options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    }
+    options
+}
+
 /// Open the directory `path` read-only without following a final symlink
 /// (Unix: `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`).
 pub fn open_dir_nofollow(path: &Path) -> io::Result<File> {
