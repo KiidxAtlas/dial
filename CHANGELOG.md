@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Fixed
+
+- The release container image is published again: container staging refused the release archive's `LICENSE.node` (the bundled Node.js runtime's license, new in 0.3.7), so the v0.3.7 image was not published. The license is now staged and installed under `/usr/share/doc/dial/` ([docker](docs/docker.md)).
+
 ## [0.3.7] - 2026-11-13
 
 ### Added

@@ -9,6 +9,7 @@ COPY LICENSE /usr/share/doc/dial/LICENSE
 COPY THIRD_PARTY_NOTICES /usr/share/doc/dial/THIRD_PARTY_NOTICES
 COPY Silver.LICENSE /usr/share/doc/dial/Silver.LICENSE
 COPY Unscii.LICENSE /usr/share/doc/dial/Unscii.LICENSE
+COPY LICENSE.node /usr/share/doc/dial/LICENSE.node
 USER dial
 # Dial's private state (settings, sessions, credentials). Mount a volume here to keep it.
 ENV DIAL_HOME=/home/dial/.dial
