@@ -11,7 +11,7 @@ import sys
 import tarfile
 import tempfile
 
-FILES = {"dial", "LICENSE", "README.md", "THIRD_PARTY_NOTICES", "Silver.LICENSE", "Unscii.LICENSE"}
+FILES = {"dial", "LICENSE", "LICENSE.node", "README.md", "THIRD_PARTY_NOTICES", "Silver.LICENSE", "Unscii.LICENSE"}
 
 
 def signature_verifies(public_key, signature, manifest):

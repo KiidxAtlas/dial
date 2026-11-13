@@ -577,6 +577,13 @@ class ContainerStagingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.stage.stage(self.root, destination, self.tag, self.public)
 
+    def test_bundled_node_license_is_staged_and_installed(self):
+        # Release archives carry the bundled Node.js runtime's license; staging refused it in 0.3.7.
+        self.assertIn("LICENSE.node", self.stage.FILES)
+        dockerfile = (SCRIPT.parent.parent / "Dockerfile.release").read_text()
+        for name in self.stage.FILES - {"dial", "README.md"}:
+            self.assertIn(f"COPY {name} /usr/share/doc/dial/{name}", dockerfile)
+
     def test_signature_digest_and_duplicate_manifest_entries_fail_closed(self):
         self.archive_and_sign()
         manifest = (self.root / "SHA256SUMS").read_bytes()
@@ -611,8 +618,10 @@ class ContainerStagingTests(unittest.TestCase):
         root = SCRIPT.parent.parent
         source = (root / "Dockerfile").read_text().split("FROM debian:", 1)[1]
         release = (root / "Dockerfile.release").read_text().split("FROM debian:", 1)[1]
+        # The release archive's binary embeds the Node.js runtime, so its image also carries that license.
         expected = source.replace("COPY --from=build /out/dial", "COPY dial").replace(
-            "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "")
+            "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "").replace(
+            "USER dial\n", "COPY LICENSE.node /usr/share/doc/dial/LICENSE.node\nUSER dial\n", 1)
         self.assertEqual(release, expected)
         self.assertNotIn("cargo", release)
 
