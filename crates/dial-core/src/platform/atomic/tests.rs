@@ -13,6 +13,21 @@ fn policies_replace_without_leaving_temporary_files() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
+/// Verifying an existing private file through a read-only handle must still be able to restrict
+/// it: on Windows that handle has no WRITE_DAC (the bundled Node runtime check failed with
+/// "Access is denied").
+#[test]
+fn check_file_restricts_a_file_opened_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime");
+    write_checkpoint(&path, b"bytes", 0o644).unwrap();
+    let file =
+        platform_fs::open_nofollow_nonblocking(fs::OpenOptions::new().read(true), &path).unwrap();
+    check_file(&file).unwrap();
+    drop(file);
+    assert!(platform_fs::is_owner_only(&File::open(&path).unwrap()).unwrap());
+}
+
 #[test]
 fn deferred_checkpoint_writes_are_published_before_their_flush() {
     let dir = tempfile::tempdir().unwrap();

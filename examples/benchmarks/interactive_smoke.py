@@ -1150,7 +1150,8 @@ def main():
             terminal.command("/queue remove 1")
             terminal.wait("Removed only the selected queued message")
             terminal.command("/queue")
-            terminal.wait("[queue]")
+            # The active tab is styled, not bracketed; this summary is shown only by the queue tab.
+            terminal.wait("Enter edits one message")
             terminal.wait("No choices to pick from.")
             terminal.capture("streaming-queue-empty")
             terminal.key("Escape")
