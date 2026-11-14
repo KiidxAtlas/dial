@@ -156,7 +156,9 @@ class Benchmarks:
                 raise InvalidRequest(f"Provide a valid {key}")
         if request.get("thinking", "off") not in ("off", "low", "medium", "high"):
             raise InvalidRequest("Thinking must be off, low, medium or high")
-        suites = [tomllib.loads((self.tools / f"{name}.toml").read_text()) for name in request["suites"]]
+        # Read only files the catalog listed; request names select among them, never form a path.
+        listed = {path.stem: path for path in self.tools.glob("*.toml")}
+        suites = [tomllib.loads(listed[name].read_text()) for name in request["suites"]]
         cases = [case for suite in suites for case in suite["cases"]]
         ids = [case["id"] for case in cases]
         if len(set(ids)) != len(ids):
