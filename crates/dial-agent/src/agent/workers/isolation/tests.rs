@@ -10,6 +10,37 @@ fn project() -> (tempfile::TempDir, Workspace) {
 }
 
 #[test]
+fn isolated_copy_inherits_only_its_sources_scoped_capture_budget() {
+    use crate::agent::verify::inputs::{capture, scope_workspace_budget};
+    use crate::config::types::VerificationInputs;
+    let (_dir, workspace) = project();
+    let inputs = VerificationInputs {
+        paths: vec!["a.txt".into()],
+        environment: vec![],
+    };
+    let budget = scope_workspace_budget(workspace.root(), std::time::Duration::ZERO);
+    assert!(capture(&workspace, &inputs).is_none());
+    let isolated = Isolated::create(&workspace).unwrap();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                assert!(
+                    capture(isolated.workspace(), &inputs).is_none(),
+                    "an isolated worker must inherit the fixture's capture allowance"
+                );
+            })
+            .join()
+            .unwrap();
+    });
+    drop(budget);
+    assert!(capture(&workspace, &inputs).is_some());
+    assert!(
+        capture(isolated.workspace(), &inputs).is_none(),
+        "the copy keeps its own guard until it is dropped"
+    );
+}
+
+#[test]
 fn development_copy_has_private_git_and_dependencies_and_obeys_source_limits() {
     let (dir, ws) = project();
     crate::tools::vcs::git::initialize_private_snapshot(dir.path()).unwrap();

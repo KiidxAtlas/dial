@@ -174,6 +174,25 @@ fn satisfied_preparation_rechecks_bytes_and_cancellation_before_reporting_succes
 }
 
 #[test]
+fn denied_authorization_leaves_the_edited_file_and_observers_untouched() {
+    let (_dir, ws, path, observed) = workspace("desired\n");
+    ws.store().record_all(&path, "desired\n");
+    let prepared = prepare(
+        &ws,
+        &json!({"path":"a.txt", "old_string":"desired", "new_string":"changed"}),
+    )
+    .unwrap();
+    let deny = |_: &[PathBuf]| Err("denied".to_owned());
+    let execution = Execution {
+        authorize: Some(&deny),
+        ..Default::default()
+    };
+    assert!(finish_prepared(&ws, prepared, true, &execution).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "desired\n");
+    assert!(observed.0.lock().unwrap().is_empty());
+}
+
+#[test]
 fn missing_target_has_a_machine_readable_failure_without_crediting_new_text() {
     let (_dir, ws, path, _) = workspace("desired\n");
     ws.store().record_all(&path, "desired\n");

@@ -89,7 +89,6 @@ The approval mode sets how much Dial does without asking: `ask`, `write`, `auto`
 - [Configuration](docs/configuration.md) and [choosing a model](docs/provider-catalog.md)
 - [Tools](docs/tools.md), [subagents](docs/subagents.md), and [MCP, hooks and skills](docs/extensibility.md)
 - [Editor integration (RPC/ACP)](docs/rpc-and-acp.md)
-- [How Dial compares](docs/comparison.md)
 - [All documentation](docs/README.md)
 
 Small local models (under about 7B parameters) often produce broken tool calls. If results are

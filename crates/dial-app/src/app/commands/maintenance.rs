@@ -416,6 +416,22 @@ fn update(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
 }
 
 fn benchmark(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
+    let args = args.trim();
+    if matches!(args, "" | "open" | "status" | "stop") {
+        let result = crate::benchmark::dashboard::handle(
+            &app.layout.project_root,
+            if args.is_empty() { "open" } else { args },
+        )?;
+        if let Some(url) = result["url"].as_str() {
+            if args != "status" {
+                crate::llm::oauth::util::open_browser(url);
+            }
+            shell.note("Benchmark", format!("Select agents and task suites, review quota use, then start. Live results and the final comparison image appear here: {url}"));
+        } else {
+            shell.note("Benchmark", result["status"].as_str().unwrap_or("closed"));
+        }
+        return Ok(());
+    }
     let mut argv = vec!["benchmark".to_owned()];
     argv.extend(split_args(args)?);
     spawn_dial(shell, app, "Benchmark", argv, None)

@@ -7,8 +7,10 @@ design and [`AGENTS.md`](AGENTS.md) lists the rules the build enforces.
 
 - Rust: the toolchain is pinned in `rust-toolchain.toml` (rustup picks it up automatically).
 - Python 3.12 matches CI for Python contracts and benchmark graders (`make test-python`,
-  `make test-bench-offline`). Supported package versions are declared in `python/pyproject.toml`;
-  MLX checks are optional and Apple-Silicon only.
+  `make test-bench-offline`). Use the pinned portable test environment without changing system Python:
+  `uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make test-python`.
+  Worker package versions are declared in `python/pyproject.toml`; MLX checks remain optional
+  and require a prepared Apple-Silicon runtime. A portable suite pass does not establish MLX behavior.
 - Optional: [`cargo-nextest`](https://nexte.st) for `make test-nextest`, and `cargo-deny` for
   `cargo deny check` (CI runs it).
 - [`cargo-machete`](https://github.com/bnjbvr/cargo-machete) for `make lint-deps`

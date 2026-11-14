@@ -92,6 +92,8 @@ pub struct Isolated {
     /// Gitignored, untracked paths of the project, left out of the copy and its change set.
     ignored: IgnoredPaths,
     workspace: Workspace,
+    #[cfg(test)]
+    _capture_budget: Option<crate::agent::verify::inputs::WorkspaceBudget>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
@@ -640,6 +642,11 @@ impl Isolated {
             before,
             limits: config.clone(),
             ignored,
+            #[cfg(test)]
+            _capture_budget: crate::agent::verify::inputs::inherit_workspace_budget(
+                project.root(),
+                workspace.root(),
+            ),
             workspace,
         })
     }

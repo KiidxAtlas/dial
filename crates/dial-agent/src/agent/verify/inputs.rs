@@ -25,12 +25,71 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn budget(limit: Duration) -> Duration {
+fn budget(limit: Duration, root: &Path) -> Duration {
+    #[cfg(not(test))]
+    let _ = root;
     #[cfg(test)]
-    if let Some(forced) = TIME_OVERRIDE.with(|forced| forced.get()) {
-        return forced;
+    {
+        if let Some(forced) = TIME_OVERRIDE.with(|forced| forced.get()) {
+            return forced;
+        }
+        if let Some(scoped) = scoped_budget(root) {
+            return scoped;
+        }
     }
     limit
+}
+
+// Test-only allowance raised for one workspace root. Keyed by root, so other workspaces keep the
+// production allowance; the thread-local override above still takes precedence.
+#[cfg(test)]
+static SCOPED_BUDGETS: std::sync::Mutex<Vec<(u64, std::path::PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Restores the root's previous allowance when dropped; each guard removes only its own entry.
+#[cfg(test)]
+pub(in crate::agent) struct WorkspaceBudget(u64);
+
+#[cfg(test)]
+pub(in crate::agent) fn scope_workspace_budget(root: &Path, limit: Duration) -> WorkspaceBudget {
+    let id = NEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SCOPED_BUDGETS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push((id, root.to_path_buf(), limit));
+    WorkspaceBudget(id)
+}
+
+/// Keep a fixture's allowance scoped to the lifetime of its isolated worker copy.
+#[cfg(test)]
+pub(in crate::agent) fn inherit_workspace_budget(
+    source: &Path,
+    copy: &Path,
+) -> Option<WorkspaceBudget> {
+    scoped_budget(source).map(|limit| scope_workspace_budget(copy, limit))
+}
+
+#[cfg(test)]
+impl Drop for WorkspaceBudget {
+    fn drop(&mut self) {
+        SCOPED_BUDGETS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _, _)| *id != self.0);
+    }
+}
+
+#[cfg(test)]
+fn scoped_budget(root: &Path) -> Option<Duration> {
+    SCOPED_BUDGETS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .rev()
+        .find(|(_, scoped, _)| scoped == root)
+        .map(|(_, _, limit)| *limit)
 }
 
 #[derive(Clone, Copy)]
@@ -48,10 +107,10 @@ impl IdentityKind {
     }
 
     fn time(self) -> Duration {
-        budget(match self {
+        match self {
             Self::Content => MAX_TIME,
             Self::InstalledRuntime => Duration::from_secs(1),
-        })
+        }
     }
 }
 
@@ -119,10 +178,15 @@ fn capture_excluding(
             None => capture.field(b"absent"),
         }
     }
-    (capture.started.elapsed() <= kind.time()).then(|| Snapshot(capture.digest.finalize().into()))
+    (capture.started.elapsed() <= capture.limit())
+        .then(|| Snapshot(capture.digest.finalize().into()))
 }
 
 impl Capture<'_> {
+    /// The wall-clock allowance for this capture. Test-scoped budgets apply per workspace root.
+    fn limit(&self) -> Duration {
+        budget(self.kind.time(), self.workspace.root())
+    }
     fn field(&mut self, value: &[u8]) {
         self.digest.update((value.len() as u64).to_le_bytes());
         self.digest.update(value);
@@ -159,7 +223,7 @@ impl Capture<'_> {
 
     /// `None` makes the capture unknown; `Some(false)` skips an excluded path.
     fn admit(&self, relative: &Path) -> Option<bool> {
-        if self.started.elapsed() > self.kind.time() {
+        if self.started.elapsed() > self.limit() {
             return None;
         }
         let name = relative.to_str()?;
@@ -197,7 +261,7 @@ impl Capture<'_> {
             let mut children = Vec::new();
             for entry in fs::read_dir(path).ok()? {
                 if children.len() + self.seen.len() >= self.kind.entries()
-                    || self.started.elapsed() > self.kind.time()
+                    || self.started.elapsed() > self.limit()
                 {
                     return None;
                 }
@@ -241,7 +305,7 @@ impl Capture<'_> {
                 }
                 size += count as u64;
                 self.bytes += count as u64;
-                if self.bytes > MAX_BYTES || self.started.elapsed() > self.kind.time() {
+                if self.bytes > MAX_BYTES || self.started.elapsed() > self.limit() {
                     return None;
                 }
                 hash.update(&buffer[..count]);

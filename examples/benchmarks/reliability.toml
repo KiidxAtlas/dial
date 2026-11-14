@@ -7,7 +7,7 @@ name = "coding-reliability-v1"
 [[cases]]
 id = "amount-exact-decimal"
 project = "examples/benchmarks/reliability-fixture"
-prompt = "Ledger amounts come in as decimal strings: 19.99 is currently stored as 1998 cents. Make parse_amount exact for non-negative amounts with at most two fractional digits, and raise ValueError for anything else. Keep the integer-cents representation, preserve total_cents, and verify the behavior."
+prompt = "Ledger amounts come in as decimal strings: 19.99 is currently stored as 1998 cents. Make parse_amount exact for non-negative amounts written as digits with an optional dot followed by one or two digits (for example 0, 0.5, 19.99), and raise ValueError for anything else, including signs, exponents, surrounding whitespace, a leading or trailing dot, and special values. Keep the integer-cents representation, preserve total_cents, and verify the behavior."
 categories = ["reliability", "partial_implementation", "false_success", "verification"]
 checks = [{kind="command",command='''python3 -c '
 from ledger import parse_amount

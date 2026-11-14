@@ -478,6 +478,26 @@ impl Workspace {
         self
     }
 
+    /// Whether sandboxed shell commands are refused `path` because it lies under a `deny_read`
+    /// or protected-storage entry. The path itself is matched as well as its resolved form: running
+    /// a symlinked interpreter reads the link even when its target is visible.
+    pub fn sandbox_hides(&self, path: &Path) -> bool {
+        if self.unsandboxed {
+            return false;
+        }
+        let denied = match self.sandbox_policy() {
+            exec::sandbox::Policy::Dev { deny_read, .. }
+            | exec::sandbox::Policy::Strict { deny_read, .. } => deny_read,
+        };
+        let canonical = Self::canonical_prefix(path);
+        denied.iter().any(|denied| {
+            let resolved = Self::canonical_prefix(denied);
+            path.starts_with(denied)
+                || path.starts_with(&resolved)
+                || canonical.starts_with(&resolved)
+        })
+    }
+
     /// Select the shell that runs `bash` commands (`shell.backend`).
     pub fn with_shell_backend(mut self, backend: crate::config::types::ShellBackend) -> Self {
         self.shell_backend = backend;
@@ -1309,7 +1329,7 @@ that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the n
 const HASHLINE_WRITE_DESC: &str = "write: create files or near-total replacements; use edit for local changes. Read existing files in full first. Supply path plus content OR source (artifact://SHA256 and matching sha256), or files. Max 1 MiB/file, 8 MiB/batch; creates parents. Notebooks need literal JSON. Inline read prefixes stripped; incomplete projections refused. Artifact bytes stay exact. Returns fresh [PATH#TAG] headers and receipts. SSH accepts only path/content.";
 
 const HASHLINE_EDIT_DESC: &str = r#"edit: change existing files with a line-anchored patch in `input`; whole files use write.
-`input` holds sections: a header `[PATH#TAG]` (TAG from that file's latest read, edit or write), then operations. Line numbers refer to THAT snapshot, never to earlier operations in the call; touch only lines a read has shown.
+`input` holds `[PATH#TAG]` sections then operations. Copy the header from numbered source output (read/search/edit/write); N and M are 1-based lines in that snapshot, not earlier operations. Only complete source rows count; outlines and clipped rows do not.
 PUT N.=M:  replace lines N..M with the `+` rows that follow (N.=N for one line)
 PUT <N:    insert before line N (PUT <1: = top of file)
 PUT >N:    insert after line N (PUT >$: = end of file)
@@ -1317,10 +1337,10 @@ CUT N.=M   delete lines N..M
 PUT N*:    replace the block starting at line N (function, class, { } or [ ] body, indented body, markdown section)
 PUT >N*:   insert after that block;  CUT N* deletes it
 REM        delete the file;  MV new/path  move/rename it (after any edits)
-Rows: `+` then the exact text with indentation; a lone `+` is a blank line; text starting with + or - is `++x`/`+-x`. Rows are final text; never write `-` rows.
+Rows: `+` then exact final text with indentation; a lone `+` is a blank line; text starting with + or - is `++x`/`+-x`. Never write `-` rows. Delete with CUT, not an empty PUT.
 Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp` replaces; without @name one anonymous register).
 Example: `[src/main.rs#3FA9]` then `PUT 4.=4:` and `+    let total = a + b;` on separate lines.
-One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines: after a stale-anchor failure, re-read the target range (or use those lines and their new TAG) before retrying."#;
+One section per file. Success returns a fresh header and changed lines. Unchanged witnessed lines survive version changes; conflicting anchors return current context. Read only missing target ranges, then retry with their header; complete numbered rows in the diagnostic already count."#;
 
 const REPLACE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
 documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
@@ -1407,14 +1427,15 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "bash: run a shell command with Dial's embedded Bash-compatible shell (default); bundled utilities precede PATH. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. On Windows `sandbox.mode = \"dev\"` runs commands at Low integrity (writes confined to the project); `strict` or `allow_network = false` runs them in an AppContainer (reads also confined; no network) and `off` runs them with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
+                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. On Windows sandbox.mode=dev uses Low integrity (project-confined writes); strict or allow_network=false uses an AppContainer (confined reads; no network); off uses your privileges. Save reusable scripts instead of resending them."
             } else {
-                "bash: run a shell command with Dial's embedded Bash-compatible shell (default); bundled utilities precede PATH. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
+                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. Sandbox may confine writes and network; use $TMPDIR for temporary files. Save reusable scripts instead of resending them."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
                 "check": {"type":"boolean", "description":"This foreground command is an acceptance check: record its actual exit status as verification. Preserve failures (no || echo or trailing successful command); use assertions or cmp -s for generated artifacts. Omit for ordinary commands."},
                 "check_paths": {"type":"array","items":{"type":"string"},"maxItems":32,"description":"Files this check exercises. A passing foreground check releases rewrite pressure only for these paths."},
+                "expected_exit_codes": {"type":"array", "items":{"type":"integer", "minimum":0, "maximum":255}, "minItems":1, "maxItems":8, "description":"Foreground inspection only: accepted exit codes (default [0]); e.g. [0,1] for grep match/no-match. Raw exit stays visible. Not with check, background, pty or trace; stays foreground."},
                 "cwd": {"type": "string", "description": "Working directory: relative to the workspace root, or absolute in an added root. Defaults to the root; do not prefix `cd <root> &&`."},
                 "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported variables across commands with the same session name."},
                 "pty": {"type": "boolean", "description": "Start as a terminal `bg` job (default false). Incompatible with session and timeout."},

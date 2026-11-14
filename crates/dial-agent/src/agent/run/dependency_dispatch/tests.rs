@@ -410,13 +410,18 @@ fn grouped_verification_runs_once_after_all_source_epochs_and_bookkeeping_settle
     agent.verify_batch.begin(&calls);
     assert_eq!(agent.dependency_wave(&calls).calls.len(), 3);
     let mut results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
+    let verification = crate::agent::verify::verify_tool::post_mutation_verify(&results[2].0)
+        .unwrap_or_else(|| panic!("missing grouped verification result: {results:?}"));
+    assert_eq!(verification["is_error"], false, "{verification}");
     for (call, (out, _)) in calls.iter().zip(&mut results) {
         assert!(!out.is_error, "{}: {}", call.name, out.text);
         agent.settle_tool_mutation(call, out); // ordinary settlement must not stale the checks
     }
     assert_eq!(agent.step_checks.mutations, 2);
     assert_eq!(
-        std::fs::read_to_string(root.path().join("checks")).unwrap(),
+        std::fs::read_to_string(root.path().join("checks")).unwrap_or_else(|error| {
+            panic!("grouped verification produced no check output: {error}; results: {results:?}")
+        }),
         "checked\n"
     );
     assert_eq!(

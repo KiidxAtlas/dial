@@ -868,6 +868,23 @@ fn new_versions_keep_witnesses_only_for_unchanged_lines() {
 }
 
 #[test]
+fn returning_to_a_retained_version_keeps_intervening_unchanged_witnesses() {
+    let mut store = EditStore::default();
+    let path = Path::new("/w/a.txt");
+    let original = "one\ntwo\nthree\nfour\n";
+    let changed = "one\ntwo\nthree\nFOUR\n";
+    store.record(path, original, &[(1, 1)]);
+    store.record(path, changed, &[(2, 2), (4, 4)]);
+    // Another writer restores the original version; only line 3 is reread.
+    store.record(path, original, &[(3, 3)]);
+    assert_eq!(
+        store.witness_flags(path, original),
+        vec![true, true, true, false],
+        "unchanged line 2 was displayed; changed line 4 was not"
+    );
+}
+
+#[test]
 fn edit_after_another_writer_keeps_lines_seen_before_the_change() {
     let dir = tempfile::tempdir().unwrap();
     let ws = Workspace::new(dir.path()).unwrap();

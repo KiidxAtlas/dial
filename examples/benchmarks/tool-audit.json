@@ -1,0 +1,4029 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "read",
+      "tools": [
+        "read"
+      ],
+      "owner": "crates/dial-tools/src/tools/fs/files.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/fs/files/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "read-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "read-effects-no-mutation"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "read-permissions-protected-outside"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "read-recovery-retry-after-failure"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "read-cancel-before-start"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "read-concurrency-identical-text"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "read-presentation-numbered"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "write",
+      "tools": [
+        "write"
+      ],
+      "owner": "crates/dial-tools/src/tools/fs/write.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/fs/write/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "write-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "write-effects-atomic"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "write-permissions-authorizer-denial"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "write-recovery-resume"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "write-cancel-no-commit"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "write-concurrency-racing-revision"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "write-presentation-ordered-receipts"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "edit",
+      "tools": [
+        "edit",
+        "revert_edit"
+      ],
+      "owner": "crates/dial-tools/src/tools/edit/hashline.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline.rs",
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "edit-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "edit-effects-atomic-refusal"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "edit-permissions-authorizer-denial"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "edit-recovery-resume",
+            "edit-recovery-retained-witness",
+            "edit-recovery-other-writer"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "edit-cancel-racing-source"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "edit-cancel-racing-source"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "edit-presentation-projection"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "search",
+      "tools": [
+        "grep",
+        "glob"
+      ],
+      "owner": "crates/dial-tools/src/tools/fs/search.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search.rs",
+        "crates/dial-tools/src/tools/fs/search/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "search-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "search-effects-permissions-protected"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "search-effects-permissions-protected",
+            "search-permissions-symlink-boundary"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "search-recovery-cursor-resume"
+          ]
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "checks": [
+            "search-concurrency-parallel-serial"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "search-presentation-context"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "shell",
+      "tools": [
+        "bash"
+      ],
+      "owner": "crates/dial-tools/src/tools/exec/shell.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell.rs",
+        "crates/dial-tools/src/tools/exec/shell/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "shell-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "shell-steer-effects"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "shell-permissions-no-sandbox",
+            "shell-permissions-cwd-confined",
+            "shell-permissions-git-guard"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "shell-recovery-launch-nonzero",
+            "shell-recovery-launch-refused",
+            "shell-recovery-dir-delta",
+            "shell-recovery-cleanup-eof"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "shell-cancel-sigint",
+            "shell-cancel-hard-outranks"
+          ]
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "checks": [
+            "shell-presentation-cut-lines",
+            "shell-presentation-utf8-cut",
+            "shell-presentation-streaming"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "background",
+      "tools": [
+        "bg",
+        "monitor"
+      ],
+      "owner": "crates/dial-tools/src/tools/exec/background/mod.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs",
+        "crates/dial-tools/src/tools/exec/background/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "background-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "checks": [
+            "background-permissions-no-sandbox",
+            "background-permissions-cwd",
+            "background-permissions-approval"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "background-recovery-finished-leader",
+            "background-recovery-kill-drain"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "background-cancel-fd-wait"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "background-concurrency-process-cap",
+            "background-concurrency-tool-capacity"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "background-presentation-pty-identity",
+            "background-presentation-terminal-screen",
+            "background-presentation-artifact-middle"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "eval",
+      "tools": [
+        "eval"
+      ],
+      "owner": "crates/dial-tools/src/tools/exec/eval.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval.rs",
+        "crates/dial-tools/src/tools/exec/eval/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "eval-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "recovery": {
+          "checks": [
+            "eval-recovery-never-starts",
+            "eval-recovery-moved-receipt"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "eval-cancel-namespace"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "eval-concurrency-busy",
+            "eval-concurrency-kill-frees",
+            "eval-concurrency-full-table"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "eval-presentation-slow-cell"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "browser",
+      "tools": [
+        "browser"
+      ],
+      "owner": "crates/dial-tools/src/tools/net/browser.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser.rs",
+        "crates/dial-tools/src/tools/net/browser/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "browser-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "checks": [
+            "browser-permissions-approval-strict-sandbox",
+            "browser-permissions-bridge-private-addresses"
+          ]
+        },
+        "recovery": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "cancellation": {
+          "checks": [
+            "browser-cancellation-guarded-http"
+          ]
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "git",
+      "tools": [
+        "git"
+      ],
+      "owner": "crates/dial-tools/src/tools/vcs/git.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git.rs",
+        "crates/dial-tools/src/tools/vcs/git/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "git-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "git-effects-hooks",
+            "git-effects-worktree-remove-dirty",
+            "git-effects-clean-checkout"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "git-permissions-external-diff"
+          ]
+        },
+        "recovery": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "lsp",
+      "tools": [
+        "lsp"
+      ],
+      "owner": "crates/dial-tools/src/tools/code/lsp/mod.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs",
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "lsp-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "lsp-recovery-execute-command-settlement"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "lsp-permissions-server-start",
+            "lsp-permissions-format-apply"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "lsp-recovery-execute-command-settlement",
+            "lsp-recovery-resource-transaction"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "lsp-cancellation-silent-init"
+          ]
+        },
+        "concurrency": {
+          "checks": [
+            "lsp-concurrency-correlation"
+          ]
+        },
+        "presentation": {
+          "checks": [
+            "lsp-presentation-server-results"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "dap",
+      "tools": [
+        "dap"
+      ],
+      "owner": "crates/dial-tools/src/tools/code/dap.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/code/dap.rs",
+        "crates/dial-tools/src/tools/code/dap/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "dap-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "recovery": {
+          "checks": [
+            "dap-recovery-protocol-failures"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "dap-cancellation-restart"
+          ]
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "ast",
+      "tools": [
+        "ast_search",
+        "ast_edit"
+      ],
+      "owner": "crates/dial-tools/src/tools/edit/ast/mod.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/edit/ast/mod.rs",
+        "crates/dial-tools/src/tools/edit/ast/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "ast-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "ast-effects-observer-refusal"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "ast-permissions-readonly-roots",
+            "ast-permissions-outside-workspace"
+          ]
+        },
+        "recovery": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "notebook",
+      "tools": [
+        "notebook"
+      ],
+      "owner": "crates/dial-tools/src/tools/fs/notebook.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/fs/notebook.rs",
+        "crates/dial-tools/src/tools/fs/notebook/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "notebook-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "recovery": {
+          "checks": [
+            "notebook-recovery-replaced-before-publish",
+            "notebook-recovery-destination-race"
+          ]
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "archive",
+      "tools": [
+        "archive"
+      ],
+      "owner": "crates/dial-tools/src/tools/fs/archive.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/fs/archive.rs",
+        "crates/dial-tools/src/tools/fs/archive/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "archive-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "checks": [
+            "archive-permissions-project-scope"
+          ]
+        },
+        "recovery": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "checks": [
+            "archive-presentation-recovery-text"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "ida",
+      "tools": [
+        "ida"
+      ],
+      "owner": "crates/dial-tools/src/tools/code/ida/mod.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs",
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "ida-contracts"
+          ]
+        },
+        "effects": {
+          "checks": [
+            "ida-effects-list-no-approval"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "ida-permissions-open-authorization",
+            "ida-effects-list-no-approval"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "ida-recovery-unresponsive-killed",
+            "ida-recovery-worker-crash"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "ida-cancellation-exec-timeout"
+          ]
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "report",
+      "tools": [
+        "report_tool_issue"
+      ],
+      "owner": "crates/dial-tools/src/tools/integrations/report_tool_issue.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue.rs",
+        "crates/dial-tools/src/tools/integrations/report_tool_issue/tests.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "report-contracts"
+          ]
+        },
+        "effects": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "permissions": {
+          "checks": [
+            "report-permissions-no-approval"
+          ]
+        },
+        "recovery": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "cancellation": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "concurrency": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        },
+        "presentation": {
+          "checks": [
+            "report-presentation-redaction",
+            "report-effects-draft-no-send"
+          ]
+        },
+        "behavior": {
+          "gap": "No reviewed dimension-specific evidence mapping yet; owner suite execution alone does not establish this boundary."
+        }
+      }
+    },
+    {
+      "id": "controllers",
+      "tools": [
+        "ask",
+        "checkpoint",
+        "context_notes",
+        "exit_plan",
+        "escalate",
+        "finish",
+        "goal",
+        "memory",
+        "message",
+        "new_context",
+        "peers",
+        "rewind",
+        "session_search",
+        "side_request",
+        "skill",
+        "skill_manage",
+        "solve",
+        "task",
+        "todo",
+        "tool_load",
+        "tool_search",
+        "tts",
+        "verify"
+      ],
+      "owner": "crates/dial-agent/src/agent/run/tool_exposure.rs",
+      "sources": [
+        "crates/dial-agent/src/agent/run/tool_exposure.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "checks": [
+            "controllers-contract-overlap-refused"
+          ]
+        },
+        "effects": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "permissions": {
+          "checks": [
+            "controllers-permissions-restrictions"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "controllers-recovery-persistence-failure"
+          ]
+        },
+        "cancellation": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "concurrency": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "presentation": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "behavior": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        }
+      }
+    },
+    {
+      "id": "integrations",
+      "tools": [
+        "audio",
+        "autoresearch",
+        "computer",
+        "data",
+        "database",
+        "db_query",
+        "dep_source",
+        "document",
+        "evidence",
+        "find",
+        "gitea_pr",
+        "github",
+        "glab_mr",
+        "image_gen",
+        "image_search",
+        "image_weights",
+        "model_weights",
+        "network_inspect",
+        "research",
+        "runtime_inspect",
+        "security_scan",
+        "ssh",
+        "video",
+        "visual",
+        "web_fetch",
+        "web_search"
+      ],
+      "owner": "crates/dial-tools/src/tools/integrations/ext.rs",
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/ext.rs"
+      ],
+      "coverage": {
+        "contract": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "effects": {
+          "checks": [
+            "integrations-recovery-binary-publication"
+          ]
+        },
+        "permissions": {
+          "checks": [
+            "integrations-permissions-visual-ocr",
+            "integrations-permissions-audio-media"
+          ]
+        },
+        "recovery": {
+          "checks": [
+            "integrations-recovery-binary-publication"
+          ]
+        },
+        "cancellation": {
+          "checks": [
+            "integrations-recovery-binary-publication",
+            "integrations-permissions-visual-ocr"
+          ]
+        },
+        "concurrency": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "presentation": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        },
+        "behavior": {
+          "gap": "Needs individual operation-specific test mapping and execution; not inferred from registration."
+        }
+      }
+    }
+  ],
+  "checks": {
+    "read-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs"
+      ]
+    },
+    "write-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs"
+      ]
+    },
+    "edit-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ]
+    },
+    "search-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ]
+    },
+    "shell-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ]
+    },
+    "background-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ]
+    },
+    "eval-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ]
+    },
+    "browser-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::net::browser::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/net/browser.rs"
+      ]
+    },
+    "git-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::vcs::git::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/vcs/git.rs"
+      ]
+    },
+    "lsp-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "dap-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::dap::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/dap/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/dap.rs"
+      ]
+    },
+    "ast-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::ast::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/ast/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/ast/mod.rs"
+      ]
+    },
+    "notebook-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::notebook::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/notebook/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/notebook.rs"
+      ]
+    },
+    "archive-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::archive::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/archive/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/archive.rs"
+      ]
+    },
+    "ida-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "report-contracts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::integrations::report_tool_issue::",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue.rs"
+      ]
+    },
+    "audit-contracts": {
+      "tier": "offline",
+      "adapter": "unittest",
+      "minimum_tests": 1,
+      "timeout": 120,
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "examples/benchmarks",
+        "-p",
+        "test_tool_audit.py"
+      ],
+      "sources": [
+        "examples/benchmarks/test_tool_audit.py"
+      ],
+      "inputs": [
+        "examples/benchmarks/tool_audit.py",
+        "examples/benchmarks/tool_effectiveness.py"
+      ]
+    },
+    "workspace-contracts": {
+      "tier": "platform",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 7200,
+      "argv": [
+        "make",
+        "test-rust"
+      ],
+      "sources": [
+        "Makefile",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "Makefile"
+      ]
+    },
+    "embedded-drivers": {
+      "tier": "offline",
+      "adapter": "node",
+      "minimum_tests": 1,
+      "timeout": 120,
+      "argv": [
+        "node",
+        "--test",
+        "crates/dial-tools/src/tools/net/browser/driver.test.cjs",
+        "crates/dial-tools/src/tools/exec/eval/driver.test.cjs",
+        "assets/collab-web/viewer.test.cjs"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser/driver.test.cjs",
+        "crates/dial-tools/src/tools/exec/eval/driver.test.cjs",
+        "assets/collab-web/viewer.test.cjs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/net/browser/driver.cjs",
+        "crates/dial-tools/src/tools/exec/eval/driver.cjs"
+      ]
+    },
+    "shell-cancel-sigint": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::sigint_cancellation_kills_shell_and_process_group_promptly",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs",
+        "crates/dial-tools/src/tools/exec/signals.rs",
+        "crates/dial-core/src/platform/wake.rs"
+      ]
+    },
+    "shell-cancel-hard-outranks": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::hard_cancel_outranks_every_adoption_trigger",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ]
+    },
+    "shell-steer-effects": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::steering_hands_off_running_work_without_killing_its_effects",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs",
+        "crates/dial-tools/src/tools/exec/signals.rs"
+      ]
+    },
+    "edit-recovery-resume": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::hashline::tests::resume_rehydrates_witnesses_from_a_multi_path_read",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ]
+    },
+    "edit-recovery-retained-witness": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::hashline::tests::returning_to_a_retained_version_keeps_intervening_unchanged_witnesses",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ]
+    },
+    "edit-recovery-other-writer": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::hashline::tests::edit_after_another_writer_keeps_lines_seen_before_the_change",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ]
+    },
+    "write-cancel-no-commit": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::cancellation_authority_and_racing_revisions_fail_before_any_commit",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/edit/editing.rs"
+      ]
+    },
+    "write-effects-atomic": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::malformed_batch_and_failed_preconditions_leave_every_destination_untouched",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/edit/editing.rs"
+      ]
+    },
+    "write-recovery-resume": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::compact_receipts_restore_batch_witnesses_after_resume",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/edit/editing.rs",
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ]
+    },
+    "background-cancel-fd-wait": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::notify_cancel_interrupts_a_blocked_fd_wait",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs",
+        "crates/dial-tools/src/tools/exec/background/wake.rs"
+      ]
+    },
+    "eval-cancel-namespace": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::cancel_reports_and_preserves_idle_namespace_but_discards_active_namespace",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs",
+        "crates/dial-tools/src/tools/exec/eval/driver.cjs"
+      ]
+    },
+    "read-effects-no-mutation": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::reads_change_no_file_bytes_or_modification_time_and_report_no_effects",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/mod.rs"
+      ],
+      "note": "Successful read: effects Known, no changed paths, bytes and mtime unchanged."
+    },
+    "read-permissions-protected-outside": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::reads_refuse_protected_and_outside_paths_without_leaking_their_bytes",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/mod.rs"
+      ],
+      "note": "Protected and outside-workspace reads refused without leaking bytes."
+    },
+    "read-recovery-retry-after-failure": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::failed_read_does_not_poison_a_later_read_of_the_same_path",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/mod.rs"
+      ],
+      "note": "A failed read does not poison a later read after the file appears."
+    },
+    "read-cancel-before-start": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::read_cancelled_before_it_starts_opens_nothing",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/mod.rs",
+        "crates/dial-tools/src/tools/exec/execution.rs"
+      ],
+      "note": "Pre-cancelled read returns Aborted/Effects none-like refusal without content."
+    },
+    "read-concurrency-identical-text": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::concurrent_reads_of_one_file_return_identical_text",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs",
+        "crates/dial-tools/src/tools/mod.rs"
+      ],
+      "note": "Four concurrent reads of one file return identical text."
+    },
+    "read-presentation-numbered": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::files::tests::read_numbers_lines_and_pages",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/files/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/files.rs"
+      ],
+      "note": "Numbered line presentation and paging (existing test)."
+    },
+    "write-permissions-authorizer-denial": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::controller_batch_authorizes_all_paths_and_reports_only_actual_mutations",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/edit/editing.rs"
+      ],
+      "note": "Per-path controller authorizer denial commits nothing; only actual mutations reported."
+    },
+    "write-concurrency-racing-revision": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::cancellation_authority_and_racing_revisions_fail_before_any_commit",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs",
+        "crates/dial-tools/src/tools/edit/editing.rs"
+      ],
+      "note": "Racing revision after planning fails before any commit."
+    },
+    "write-presentation-ordered-receipts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::write::tests::batch_creates_files_with_ordered_structured_receipts",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/write/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/write.rs"
+      ],
+      "note": "Ordered structured per-file receipts."
+    },
+    "edit-effects-atomic-refusal": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::editing::tests::hashline_exact_noop_is_stable_but_stale_and_mixed_batches_remain_atomic_refusals",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/editing/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/editing.rs",
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ],
+      "note": "Mixed batch is an atomic refusal; stale tag refused without writing (existing test)."
+    },
+    "edit-permissions-authorizer-denial": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::editing::tests::denied_authorization_leaves_the_edited_file_and_observers_untouched",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/editing/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/editing.rs",
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ],
+      "note": "Denied authorization leaves file and observers untouched."
+    },
+    "edit-cancel-racing-source": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::editing::tests::satisfied_preparation_rechecks_bytes_and_cancellation_before_reporting_success",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/editing/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/editing.rs",
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ],
+      "note": "Cancellation and changed-source recheck before commit (existing test). Same test covers the racing-writer concurrency cell."
+    },
+    "edit-presentation-projection": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::hashline::tests::successful_edit_model_projection_keeps_fresh_anchors_and_raw_diff",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/hashline/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/hashline.rs"
+      ],
+      "note": "Successful edit projection keeps fresh anchors and raw diff (existing test)."
+    },
+    "search-effects-permissions-protected": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::tests::grep_and_glob_change_nothing_and_skip_protected_paths",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ],
+      "note": "One test covers both: grep/glob change nothing (Known, no changed paths) and skip protected paths."
+    },
+    "search-permissions-symlink-boundary": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::tests::glob_and_grep_do_not_follow_symlinks",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ],
+      "note": "Symlink escape boundary (existing test)."
+    },
+    "search-recovery-cursor-resume": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::tests::parallel_grep_cursors_resume_exactly_like_serial_ones",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ],
+      "note": "Cursor resume after a page matches serial results (existing test)."
+    },
+    "search-concurrency-parallel-serial": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::tests::parallel_and_serial_grep_pages_are_byte_identical",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ],
+      "note": "Parallel and serial pages are byte identical (existing test)."
+    },
+    "search-presentation-context": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::search::tests::grep_context_lines_merge_and_separate_groups",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/search/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/search.rs"
+      ],
+      "note": "Context line merge and group separation (existing test)."
+    },
+    "browser-permissions-approval-strict-sandbox": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::net::browser::tests::every_browser_action_requires_approval_and_policy_applies_before_startup",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/net/browser.rs"
+      ]
+    },
+    "browser-permissions-bridge-private-addresses": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::net::browser::tests::bridge_refuses_private_addresses_and_non_http_schemes",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/net/browser.rs"
+      ]
+    },
+    "browser-cancellation-guarded-http": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::net::browser::tests::guarded_http_cancellation_interrupts_stalled_headers_and_body_and_closes_socket",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/net/browser/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/net/browser.rs"
+      ]
+    },
+    "git-effects-hooks": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::vcs::git::tests::hooks_run_by_default_and_bypass_is_reported",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/vcs/git.rs"
+      ]
+    },
+    "git-effects-worktree-remove-dirty": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::vcs::git::tests::worktree_remove_refuses_dirty_without_force",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/vcs/git.rs"
+      ]
+    },
+    "git-effects-clean-checkout": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::vcs::git::tests::clean_source_checkout_reverts_tracked_edits_and_removes_untracked_files",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/vcs/git.rs"
+      ]
+    },
+    "git-permissions-external-diff": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::vcs::git::tests::host_diff_disables_repository_external_driver_without_running_it",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/vcs/git/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/vcs/git.rs"
+      ]
+    },
+    "lsp-recovery-execute-command-settlement": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::reliability_tests::execute_command_preserves_typed_settlement_and_never_retries",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/reliability_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "lsp-permissions-server-start": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::tests::approval_is_needed_only_to_start_a_server",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "lsp-permissions-format-apply": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::tests::format_needs_approval_unless_it_only_previews",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "lsp-recovery-resource-transaction": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::tests::ordered_file_resources_share_transaction_and_refuse_overwriting_external_recovery",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs",
+        "crates/dial-tools/src/tools/code/lsp/workspace_edit.rs"
+      ]
+    },
+    "lsp-cancellation-silent-init": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::reliability_tests::cancelling_silent_initialization_terminates_and_reaps_pending_server",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/reliability_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "lsp-concurrency-correlation": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::tests::concurrent_requests_receive_their_own_responses",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "lsp-presentation-server-results": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::lsp::tests::symbol_and_diagnostic_actions_format_server_results",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/lsp/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/lsp/mod.rs"
+      ]
+    },
+    "dap-recovery-protocol-failures": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::dap::tests::fake_adapter_protocol_failures_stop_the_session",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/dap/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/dap.rs"
+      ]
+    },
+    "dap-cancellation-restart": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::dap::tests::unanswered_restart_times_out_and_cancellation_interrupts_it",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/dap/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/dap.rs"
+      ]
+    },
+    "ast-effects-observer-refusal": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::ast::tests::observer_refusal_blocks_the_whole_edit",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/ast/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/ast/mod.rs"
+      ]
+    },
+    "ast-permissions-readonly-roots": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::ast::tests::ast_search_read_only_roots_do_not_authorize_ast_edits_or_private_reads",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/ast/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/ast/mod.rs"
+      ]
+    },
+    "ast-permissions-outside-workspace": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::edit::ast::tests::paths_outside_the_workspace_are_refused",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/edit/ast/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/edit/ast/mod.rs"
+      ]
+    },
+    "notebook-recovery-replaced-before-publish": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::notebook::tests::a_notebook_replaced_by_another_writer_before_publication_is_preserved",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/notebook/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/notebook.rs"
+      ]
+    },
+    "notebook-recovery-destination-race": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::notebook::tests::a_file_appearing_at_the_destination_during_publication_is_never_overwritten",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/notebook/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/notebook.rs"
+      ]
+    },
+    "ida-effects-list-no-approval": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::tests::only_list_runs_without_approval_or_workspace_mutation",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "ida-permissions-open-authorization": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::tests::open_requires_mutation_authorization",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "ida-recovery-unresponsive-killed": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::tests::unresponsive_worker_is_killed_and_forgotten",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "ida-recovery-worker-crash": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::tests::worker_crash_is_reported_and_forgotten",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "ida-cancellation-exec-timeout": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::code::ida::tests::exec_timeout_interrupts_and_keeps_the_database",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/code/ida/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/code/ida/mod.rs"
+      ]
+    },
+    "report-permissions-no-approval": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::integrations::report_tool_issue::tests::needs_no_approval",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue.rs"
+      ]
+    },
+    "report-presentation-redaction": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::integrations::report_tool_issue::tests::redacts_credentials_pasted_into_the_report",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue.rs"
+      ]
+    },
+    "report-effects-draft-no-send": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::integrations::report_tool_issue::tests::drafts_report_with_sections_and_environment_without_sending_anything",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/integrations/report_tool_issue.rs"
+      ]
+    },
+    "controllers-permissions-restrictions": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-agent",
+        "--lib",
+        "agent::run::tool_exposure::default_offer_tests::restrictions_apply_to_discovery_loading_and_late_offers",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-agent/src/agent/run/tool_exposure/default_offer_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-agent/src/agent/run/tool_exposure.rs"
+      ]
+    },
+    "controllers-recovery-persistence-failure": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-agent",
+        "--lib",
+        "agent::run::tool_exposure::default_offer_tests::tool_load_persistence_failure_cannot_report_success_or_change_effective_offer",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-agent/src/agent/run/tool_exposure/default_offer_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-agent/src/agent/run/tool_exposure.rs"
+      ]
+    },
+    "controllers-contract-overlap-refused": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-agent",
+        "--lib",
+        "agent::run::tool_exposure::default_offer_tests::tool_load_refuses_overlap_before_changing_pins_discovery_or_routing",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-agent/src/agent/run/tool_exposure/default_offer_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-agent/src/agent/run/tool_exposure.rs"
+      ]
+    },
+    "integrations-recovery-binary-publication": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::data_io::tests::binary_publication_is_lossless_exclusive_and_cancelled_before_commit",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/data_io/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/data_io.rs"
+      ]
+    },
+    "integrations-permissions-visual-ocr": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::visual::tests::external_execution_requires_both_approval_boundaries_and_cancellation_is_early",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/visual/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/visual.rs"
+      ]
+    },
+    "integrations-permissions-audio-media": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::audio::tests::external_media_requires_both_confirmation_and_controller",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/audio/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/audio.rs"
+      ]
+    },
+    "archive-permissions-project-scope": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::archive::tests::current_project_reads_need_no_approval_but_other_projects_do",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/archive/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/archive.rs"
+      ]
+    },
+    "archive-presentation-recovery-text": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::fs::archive::tests::errors_name_the_recovery",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/fs/archive/tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/fs/archive.rs"
+      ]
+    },
+    "shell-permissions-no-sandbox": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::bash_refuses_without_sandbox",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-permissions-cwd-confined": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::cwd_argument_and_leading_cd_are_confined_to_workspace",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-permissions-git-guard": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::the_git_guard_refuses_before_anything_runs",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-recovery-launch-nonzero": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::launch_nonzero_exit_is_a_failure_that_still_reports_launch_facts",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-recovery-launch-refused": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::launch_refused_or_cancelled_before_start_reports_no_launch_facts",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-recovery-dir-delta": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::directory_delta_reports_disappearing_and_shrinking_sources",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-presentation-cut-lines": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::captured_output_is_cut_at_line_boundaries_and_names_the_omitted_lines",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-presentation-utf8-cut": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::captured_output_never_splits_a_character_at_the_head_cut",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-presentation-streaming": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::tests::streaming_output_precedes_result_and_has_bounded_chunks",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-permissions-no-sandbox": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::start_refuses_when_no_sandbox_is_available",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-permissions-cwd": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::cwd_must_stay_inside_the_workspace",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-permissions-approval": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::approval_is_needed_to_start_and_kill_only",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-recovery-finished-leader": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::a_finished_leader_takes_its_stragglers_with_it",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-recovery-kill-drain": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::kill_drains_final_output_before_one_completion_notification",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-concurrency-process-cap": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::process_cap_and_unique_names_are_enforced",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-concurrency-tool-capacity": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tool_tests::tool_jobs_share_capacity_and_finished_names_can_be_reused",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tool_tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-presentation-pty-identity": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::pty_notifications_use_job_identity_and_replace_semantics",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-presentation-terminal-screen": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::terminal_ring_renders_the_current_screen_not_the_byte_stream",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "background-presentation-artifact-middle": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::background::tests::background_complete_artifact_preserves_discarded_middle",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/background/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/background/mod.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-recovery-never-starts": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::an_interpreter_that_never_starts_is_a_known_failure_not_an_uncertain_effect",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-recovery-moved-receipt": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::moved_cell_is_a_launch_receipt_not_an_uncertain_effect",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-concurrency-busy": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::a_moved_cell_keeps_the_runtime_busy_until_its_job_finishes",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-concurrency-kill-frees": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::killing_a_moved_cell_frees_the_runtime_for_the_next_cell",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-concurrency-full-table": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::a_full_background_table_keeps_the_cell_in_the_foreground_with_a_notice",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "eval-presentation-slow-cell": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 1,
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "scripts/embedded-host.py",
+        "--",
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::eval::tests::slow_cell_moves_at_the_threshold_and_its_display_output_moves_with_it",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/eval/tests.rs",
+        "scripts/embedded-host.py"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/eval.rs"
+      ],
+      "skip_markers": []
+    },
+    "shell-recovery-cleanup-eof": {
+      "tier": "rust",
+      "adapter": "cargo",
+      "minimum_tests": 2,
+      "timeout": 900,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "dial-tools",
+        "--lib",
+        "tools::exec::shell::drain_tests",
+        "--",
+        "--nocapture"
+      ],
+      "sources": [
+        "crates/dial-tools/src/tools/exec/shell/drain_tests.rs"
+      ],
+      "inputs": [
+        "crates/dial-tools/src/tools/exec/shell.rs",
+        "crates/dial-tools/src/tools/exec/shell/inprocess.rs",
+        "crates/dial-tools/src/tools/exec/shell/drain_tests.rs"
+      ]
+    }
+  },
+  "findings": [
+    {
+      "id": "TOOL-001",
+      "group": "edit",
+      "owner": "crates/dial-tools/src/tools/edit/hashline.rs",
+      "status": "closed",
+      "check": "edit-contracts",
+      "evidence": "Native audit observed tools::edit::hashline::tests::returning_to_a_retained_version_keeps_intervening_unchanged_witnesses fail at hashline/tests.rs:880: unchanged line 2 was not retained as witnessed. Module summary: 161 passed, 1 failed, 1 ignored. See benchmarks/tool-audit-session-native/edit-contracts.log and its hashed run receipt.",
+      "cause": "Unchanged witness propagation happened only when creating a new snapshot, not when a retained version reappeared. The owner moved propagation before the snapshot-reuse branch. The failure was observed during active development, not established as a released regression.",
+      "next_action": "Retain the regression test and independently verify the linked failing-before and passing-after receipts on stable source.",
+      "before": "benchmarks/tool-audit-session-native/run.json",
+      "after": "benchmarks/tool-audit-completion-20261113/final-native/run.json",
+      "fix": "Carry unchanged witnesses from the latest observation before either reusing or creating a hashline snapshot; independently verify edit-contracts after the owner fix."
+    }
+  ]
+}

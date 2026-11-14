@@ -42,16 +42,17 @@ def linux_problems():
 
 
 def python_prerequisites(suite):
-    module = "pytest" if suite == "python" else "cryptography.hazmat.primitives.asymmetric.ed25519"
-    try:
-        importlib.import_module(module)
-    except (ImportError, OSError) as error:
-        print(f"{suite} tests cannot start: {sys.executable} cannot import {module}: {error}", file=sys.stderr)
-        print("Use the pinned CI environment (no system Python changes):", file=sys.stderr)
-        print(f"  uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make test-{suite}", file=sys.stderr)
-        print("Or select an existing prepared interpreter with make PYTHON=/path/to/python.", file=sys.stderr)
-        print("No tests ran; this is a prerequisite failure, not a passing or skipped suite.", file=sys.stderr)
-        return 1
+    modules = ("pytest", "fastapi") if suite == "python" else ("cryptography.hazmat.primitives.asymmetric.ed25519",)
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except (ImportError, OSError) as error:
+            print(f"{suite} tests cannot start: {sys.executable} cannot import {module}: {error}", file=sys.stderr)
+            print("Use the pinned CI environment (no system Python changes):", file=sys.stderr)
+            print(f"  uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make test-{suite}", file=sys.stderr)
+            print("Or select an existing prepared interpreter with make PYTHON=/path/to/python.", file=sys.stderr)
+            print("No tests ran; this is a prerequisite failure, not a passing or skipped suite.", file=sys.stderr)
+            return 1
     print(f"{suite} test prerequisites available in {sys.executable}.")
     return 0
 

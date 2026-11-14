@@ -9,7 +9,7 @@ fn data_io_and_scoped_checks_resume_old_builtin_contracts_without_replay() {
     for (name, added) in [
         ("read", &["format", "retain"][..]),
         ("write", &["encoding"][..]),
-        ("bash", &["check_paths"][..]),
+        ("bash", &["check_paths", "expected_exit_codes"][..]),
     ] {
         let current =
             crate::tools::schema(name, crate::config::types::EditMode::default()).unwrap();

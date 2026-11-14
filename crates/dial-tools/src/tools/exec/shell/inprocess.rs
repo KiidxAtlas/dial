@@ -48,6 +48,7 @@ pub(super) fn run(
     command: &str,
     cwd: &Path,
     timeout_secs: u64,
+    expected_codes: &[i32],
     on_output: &(dyn Fn(&[u8]) + Sync),
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, String> {
@@ -125,6 +126,7 @@ pub(super) fn run(
         &mut eof,
         &waiter,
         on_output,
+        Duration::from_millis(300),
     )?;
 
     let original = capture.total as u64;
@@ -133,13 +135,14 @@ pub(super) fn run(
     let mut text = captured_text(capture);
     let body_len = text.len();
     let code = shell.code();
-    let success = code == Some(0) && !timed_out && !cancelled;
+    let success =
+        code.is_some_and(|code| expected_codes.contains(&code)) && !timed_out && !cancelled;
     append_stop_notes(&mut text, cancelled, timed_out, timeout_secs, &termination);
     if !cancelled
         && !timed_out
         && let Some(code) = code
     {
-        text.push_str(&format!("[exit code: {code}]\n"));
+        append_exit_note(&mut text, command, code, expected_codes);
     }
     if !cancelled && let Some(note) = super::created_entries_note(entries_before.as_ref(), cwd) {
         text.push_str(&note);

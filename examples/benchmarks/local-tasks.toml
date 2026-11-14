@@ -14,19 +14,19 @@ checks = [
   {kind="response_equals", content="DONE"},
 ]
 
-# ast_search is in DEFERRED_BY_DEFAULT (crates/dial-tools/src/tools/mod.rs), a builtin structural search.
-# The prompt names it, so the agent must find it with tool_search, load it, then use it on ledger.py.
+# ast_edit is deferred from the initial offer, and benchmark isolation keeps it eligible
+# (src/cmd/benchmark/mod.rs isolated_config). The prompt names it, so the agent must find and load it
+# with tool_search (names:[...] or load:true; there is no separate tool_load), then use it on ledger.py.
 [[cases]]
 id = "deferred-tool-discovery"
 project = "examples/benchmarks/local-tasks-fixture"
-prompt = "ast_search is a deferred tool. Use tool_search to find it, tool_load it, then use it to find the function in ledger.py that returns min(sum(rows), 100). Write only that function name to answer.txt, and reply DONE."
+prompt = "ast_edit is a deferred tool. Use tool_search to find and load it, then use it to change the cap in bounded_total in ledger.py from 100 to 250, leaving the rest of the file unchanged, and reply DONE."
 categories = ["deferred_discovery"]
 checks = [
-  {kind="command", command='''python3 -c "assert open('answer.txt').read().strip() == 'bounded_total'"'''},
+  {kind="command", command='''python3 -c "import ledger; assert ledger.bounded_total([300]) == 250 and ledger.bounded_total([7, 3]) == 10 and ledger.total([200]) == 200; assert open('ledger.py').read().count('250') == 1"'''},
   {kind="response_equals", content="DONE"},
   {kind="tool_invoked", tool="tool_search"},
-  {kind="tool_invoked", tool="tool_load"},
-  {kind="tool_invoked", tool="ast_search"},
+  {kind="tool_invoked", tool="ast_edit"},
 ]
 
 # Empty-discovery recovery: zzqxjvkmnop matches no builtin name or description. Avoid ordinary words

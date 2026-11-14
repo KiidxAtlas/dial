@@ -928,9 +928,10 @@ impl<'a> Agent<'a> {
     }
 
     /// Interpreter for generated Python checks. Endpoint users may never have run `dial setup`;
-    /// a missing interpreter must not read as broken code.
+    /// a missing interpreter must not read as broken code. Dial's managed interpreter is used only
+    /// when sandboxed commands can launch it: `--sandbox dev` hides protected Dial storage.
     pub(in crate::agent) fn check_python(&self) -> PathBuf {
-        if self.config.python.is_file() {
+        if self.config.python.is_file() && !self.workspace.sandbox_hides(&self.config.python) {
             self.config.python.clone()
         } else {
             PathBuf::from("python3")

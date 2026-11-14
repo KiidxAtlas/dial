@@ -288,31 +288,28 @@ impl EditStore {
         self.observation_id = self.observation_id.wrapping_add(1);
         self.observations.remove(path);
         let snaps = self.files.entry(path.to_path_buf()).or_default();
+        // A retained version can reappear after another writer restores it. Carry the latest
+        // unchanged observations even when the target snapshot already exists.
+        let mut witnessed = Seen::from_ranges(seen);
+        if raw_revision.is_none()
+            && let Some(prior) = snaps.iter().rev().find(|s| s.raw_revision.is_none())
+            && prior.text.as_ref() != lf
+        {
+            witnessed
+                .0
+                .extend(carried_witnesses(&prior.text, &prior.seen, lf));
+            witnessed.normalize();
+        }
         if let Some(pos) = snaps
             .iter()
             .position(|s| s.tag == tag && *s.text == *lf && s.raw_revision == raw_revision)
         {
             let mut snap = snaps.remove(pos);
             snap.observation_id = self.observation_id;
-            for &(a, b) in seen {
-                snap.seen.0.push((a, b));
-            }
+            snap.seen.0.extend(witnessed.0);
             snap.seen.normalize();
             snaps.push(snap);
         } else {
-            // Lines the model saw that survive unchanged into this version stay witnessed, as in
-            // stale-edit re-anchoring: a new version (for example after another session's edit)
-            // must not force a reread of unrelated, already-observed lines. Changed and inserted
-            // lines need a fresh display. Notebook snapshots stay pinned to their raw revision.
-            let mut witnessed = Seen::from_ranges(seen);
-            if raw_revision.is_none()
-                && let Some(prior) = snaps.iter().rev().find(|s| s.raw_revision.is_none())
-            {
-                for (a, b) in carried_witnesses(&prior.text, &prior.seen, lf) {
-                    witnessed.0.push((a, b));
-                }
-                witnessed.normalize();
-            }
             snaps.push(Snapshot {
                 tag: tag.clone(),
                 text: Arc::from(lf),

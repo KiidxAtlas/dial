@@ -59,6 +59,46 @@ fn observer_write_failure_stops_before_next_agent_call() {
     assert!(error.to_string().contains("progress disk full"));
 }
 
+/// Gitignored local data (benchmark runs, virtualenvs) is not source: freezing the suite source
+/// leaves it out, so an escaping symlink inside it no longer aborts the run.
+#[cfg(unix)]
+#[test]
+fn frozen_source_skips_gitignored_local_data() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("repo");
+    fs::create_dir_all(root.join("local/env/bin")).unwrap();
+    fs::write(root.join(".gitignore"), "/local/\n").unwrap();
+    fs::write(outer.path().join("python3"), "outside").unwrap();
+    std::os::unix::fs::symlink(
+        outer.path().join("python3"),
+        root.join("local/env/bin/python3"),
+    )
+    .unwrap();
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(git.success());
+    let mut saw_local = None;
+    let report = suite()
+        .run(
+            &root,
+            |_, workspace| {
+                saw_local = Some(workspace.join("local").exists());
+                fs::write(workspace.join("answer"), "done")?;
+                Ok(RunMetrics {
+                    agent_succeeded: true,
+                    ..Default::default()
+                })
+            },
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+    assert!(report.cases.iter().all(|case| case.passed));
+    assert_eq!(saw_local, Some(false));
+}
+
 #[test]
 fn observers_also_receive_resumed_cases_without_new_inference() {
     let root = tempfile::tempdir().unwrap();

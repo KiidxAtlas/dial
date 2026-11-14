@@ -1837,10 +1837,9 @@ impl LiveTasks {
                 ui,
             );
             let pending = self.pool_pending(id)
-                || self
-                    .jobs
-                    .iter()
-                    .any(|(name, j)| id.is_none_or(|id| id == name) && j.running());
+                || self.jobs.iter().any(|(name, j)| {
+                    id.is_none_or(|id| id == name) && (j.running() || j.worker.is_some())
+                });
             if interrupt.load(Ordering::SeqCst) {
                 return Err("wait interrupted by the user".into());
             }

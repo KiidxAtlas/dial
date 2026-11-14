@@ -142,6 +142,13 @@ class ReliabilityFixtureTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=120)
         self.assertEqual(rejected.returncode, 0, rejected.stderr)
 
+    def test_prompt_states_every_rejected_form_the_acceptance_command_probes(self):
+        # A hidden check may only enforce what the prompt asks for.
+        prompt = CASES["amount-exact-decimal"]["prompt"]
+        for phrase in ["signs", "exponents", "surrounding whitespace", "leading or trailing dot",
+                       "special values", "one or two digits"]:
+            self.assertIn(phrase, prompt)
+
     def test_replacing_visible_tests_cannot_defeat_the_acceptance_command(self):
         workspace = self.workspace("stub-tests")
         apply(workspace, FIXES["amount-exact-decimal"])

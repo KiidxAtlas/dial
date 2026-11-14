@@ -6,7 +6,33 @@ By default, commands run with stdin at EOF and stdout/stderr captured, without a
 
 Commands are placed in a dedicated process group. The tool combines stdout and stderr, streams output while running, and bounds retained output while preserving diagnostic lines. The configured timeout defaults to 300 seconds; a positive `timeout` argument requests a shorter duration, capped by the configured limit. A timeout of zero in configuration disables the deadline. Long-lived services should be started with the managed background tool rather than detached from foreground Bash.
 
+After a command exits, output cleanup waits at most 300 ms for EOF and makes a final bounded
+nonblocking read even if scheduling consumed that allowance. Already-ready output and EOF are
+retained; a pipe still held open is reported as incomplete capture, not silently accepted as success.
+
 The sandbox may deny network access or writes outside the project. Use the command's `$TMPDIR` for temporary files. Do not retry a denied command unchanged; adapt it to the sandbox or explain the limitation.
+
+## Exit status and inspection results
+
+By default only exit 0 succeeds. For a foreground inspection with documented nonzero results,
+set `expected_exit_codes`, for example:
+
+```json
+{"command":"grep needle file.txt","expected_exit_codes":[0,1]}
+```
+
+This accepts grep's match/no-match results, but exit 2 remains an error. The raw exit code and
+output are preserved; accepted nonzero results are labeled and the requested codes are included
+in result data. No output-text heuristic can turn a command into success. Do not use this to
+ignore unexpected errors or missing prerequisites. Use native `grep`/`glob` for ordinary lookups.
+
+The list contains 1–8 integers in 0–255. It is refused with `check:true`, `background:true`,
+`pty:true` or `trace:true`; explicit-code commands stay foreground even during automatic adoption
+or steering. They retain their timeout and cancellation controls. Capture failures and uncertain
+cleanup remain failures.
+Acceptance checks still require the actual successful exit, not an accepted inspection result.
+For compound commands, the shell status belongs to the final executed step; split independent
+inspections and use `&&` for dependent work rather than masking errors with `|| true`.
 
 `trace: true` (Linux with `strace` installed) runs the command under `strace -f` and appends a
 summary: programs executed, abnormal exits and fatal signals, paths looked up but not found,

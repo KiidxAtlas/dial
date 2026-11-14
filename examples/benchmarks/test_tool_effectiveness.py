@@ -259,6 +259,15 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(regressed["matched_success_tasks"], [])
         self.assertIsNone(regressed["matched_success_ratios"]["tool_calls_median"])
 
+    def test_unknown_candidate_or_baseline_usage_keeps_ratio_unknown(self):
+        for baseline_observed, candidate_observed in ((True, False), (False, True), (False, False)):
+            with self.subTest(baseline=baseline_observed, candidate=candidate_observed):
+                payload = machine({"baseline": task_cases((True, True, True), observed=baseline_observed),
+                                   "candidate": task_cases((True, True, True), observed=candidate_observed)})
+                comparison = summarize_tools(payload)["comparisons"][1]
+                self.assertIsNone(comparison["matched_success_ratios"]["observed_tokens_median"])
+                self.assertEqual(comparison["matched_success_ratios"]["tool_calls_median"], 1.0)
+
     def test_invalid_run_and_mixed_contracts_are_refused(self):
         payload = machine({"baseline": task_cases((True, True, True))})
         payload["configurations"][0]["report"]["invalid_run"] = "missing credentials"

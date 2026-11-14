@@ -98,13 +98,27 @@ class PrerequisiteTests(unittest.TestCase):
         self.probe.assert_not_called()
 
     def test_python_tiers_probe_only_their_required_imports(self):
-        for suite, module in [("python", "pytest"), ("release-policy", "cryptography.hazmat.primitives.asymmetric.ed25519")]:
+        for suite, modules in [
+            ("python", ["pytest", "fastapi"]),
+            ("release-policy", ["cryptography.hazmat.primitives.asymmetric.ed25519"]),
+        ]:
             with self.subTest(suite=suite), \
                     mock.patch.object(prerequisites.importlib, "import_module") as imported, \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(prerequisites.main(suite), 0)
-                imported.assert_called_once_with(module)
+                self.assertEqual(imported.call_args_list, [mock.call(module) for module in modules])
         self.probe.assert_not_called()
+
+    def test_missing_fastapi_fails_before_collection_even_when_pytest_is_available(self):
+        def imported(module):
+            if module == "fastapi":
+                raise ImportError("missing fastapi")
+        with mock.patch.object(prerequisites.importlib, "import_module", side_effect=imported), \
+                contextlib.redirect_stderr(io.StringIO()) as error, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prerequisites.main("python"), 1)
+        self.assertIn("fastapi", error.getvalue())
+        self.assertIn("scripts/requirements-ci.lock", error.getvalue())
 
     def test_broken_python_import_is_a_prerequisite_failure(self):
         with mock.patch.object(prerequisites.importlib, "import_module", side_effect=OSError("shared library unavailable")), \
@@ -142,6 +156,10 @@ class MakePrerequisiteTests(unittest.TestCase):
                 "import os, sys\n"
                 "open('checked', 'a').write('gate\\n')\n"
                 "sys.exit(int(os.environ['GATE_EXIT']))\n")
+            # This fixture tests Make's prerequisite ordering, not host compilation.
+            (root / "scripts/embedded-host.py").write_text(
+                "import subprocess, sys\n"
+                "sys.exit(subprocess.call(sys.argv[sys.argv.index('--') + 1:]))\n")
             cargo = root / "fake-cargo"
             cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> cargo-ran\n")
             cargo.chmod(0o755)

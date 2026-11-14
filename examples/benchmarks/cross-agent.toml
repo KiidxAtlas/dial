@@ -37,3 +37,28 @@ follow_up = ["omp", "-p", "-c", "--mode", "json", "--auto-approve", "--model", "
              "--thinking", "{thinking}", "--max-time", "{timeout}", "{prompt}"]
 # `omp --help` (18.13.2) lists `task` as its sub-agent tool.
 delegation_tools = ["task"]
+
+# Local installed configurations: authentication and state are not shared with Dial.
+# Thinking-off follows the existing Harbor Claude Code settings contract; other levels are explicit.
+[[agents]]
+name = "claude-code"
+version = ["claude", "--version"]
+output = "claude-json"
+first = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+         "--model", "{model}", "--effort", "{effort}", "--settings", "{{\"alwaysThinkingEnabled\":{thinking_enabled}}}", "{prompt}"]
+follow_up = ["claude", "-p", "-c", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+             "--model", "{model}", "--effort", "{effort}", "--settings", "{{\"alwaysThinkingEnabled\":{thinking_enabled}}}", "{prompt}"]
+thinking_values = { off = { effort = "low", thinking_enabled = "false" }, low = { effort = "low", thinking_enabled = "true" }, medium = { effort = "medium", thinking_enabled = "true" }, high = { effort = "high", thinking_enabled = "true" } }
+delegated_usage = "included"
+delegation_tools = ["Task", "Agent"]
+
+[[agents]]
+name = "hermes"
+version = ["hermes", "--version"]
+output = "hermes"
+first = ["hermes", "--provider", "anthropic", "--model", "{model}", "--reasoning", "{thinking}",
+         "--usage-file", "{usage_file}", "-z", "{prompt}"]
+follow_up = ["hermes", "--resume", "latest", "--no-restore-cwd", "--provider", "anthropic", "--model", "{model}",
+             "--reasoning", "{thinking}", "--usage-file", "{usage_file}", "-z", "{prompt}"]
+thinking_values = { off = { thinking = "none" }, low = { thinking = "low" }, medium = { thinking = "medium" }, high = { thinking = "high" } }
+delegation_tools = ["delegate_task"]

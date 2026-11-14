@@ -972,3 +972,97 @@ fn rewrite_advice_flags_mostly_unchanged_overwrites_of_non_trivial_files() {
     // Small files are cheap to regenerate; no advice.
     assert_eq!(rewrite_advice("a\nb\n", "a\nc\n"), None);
 }
+
+#[test]
+fn read_cancelled_before_it_starts_opens_nothing() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let out = crate::tools::read_tool_streaming(&ws, &json!({"path":"a.txt"}), &cancel, 4096);
+    assert!(out.is_error, "{}", out.text);
+    assert!(!out.text.contains("alpha"), "{}", out.text);
+    assert_eq!(
+        out.execution.status,
+        Some(crate::runtime::execution::ToolStatus::Aborted)
+    );
+    assert_eq!(
+        out.execution.effects,
+        crate::runtime::execution::Effects::None
+    );
+}
+
+#[test]
+fn failed_read_does_not_poison_a_later_read_of_the_same_path() {
+    let (dir, ws) = workspace();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let args = json!({"path":"late.txt"});
+    assert!(crate::tools::read_tool_streaming(&ws, &args, &cancel, 4096).is_error);
+    fs::write(dir.path().join("late.txt"), "late\n").unwrap();
+    let out = crate::tools::read_tool_streaming(&ws, &args, &cancel, 4096);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("late"), "{}", out.text);
+}
+
+#[test]
+fn reads_change_no_file_bytes_or_modification_time_and_report_no_effects() {
+    let (dir, ws) = workspace();
+    let path = dir.path().join("a.txt");
+    fs::write(&path, "alpha\n").unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let out = crate::tools::read_tool_streaming(&ws, &json!({"path":"a.txt"}), &cancel, 4096);
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(
+        out.execution.effects,
+        crate::runtime::execution::Effects::Known
+    );
+    assert!(out.execution.changed_paths.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\n");
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+}
+
+#[test]
+fn reads_refuse_protected_and_outside_paths_without_leaking_their_bytes() {
+    let (dir, ws) = workspace();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(private.join("key.txt"), "PROTECTED_BYTES\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("o.txt");
+    fs::write(&outside_file, "OUTSIDE_BYTES\n").unwrap();
+    let ws = ws.with_protected_paths(std::slice::from_ref(&private));
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for path in [
+        "private/key.txt".to_owned(),
+        "../outside_missing/x".to_owned(),
+        outside_file.to_str().unwrap().to_owned(),
+    ] {
+        let out = crate::tools::read_tool_streaming(&ws, &json!({"path":path}), &cancel, 4096);
+        assert!(out.is_error, "{path}: {}", out.text);
+        assert!(
+            !out.text.contains("PROTECTED_BYTES"),
+            "{path}: {}",
+            out.text
+        );
+        assert!(!out.text.contains("OUTSIDE_BYTES"), "{path}: {}", out.text);
+    }
+}
+
+#[test]
+fn concurrent_reads_of_one_file_return_identical_text() {
+    let (dir, ws) = workspace();
+    numbered_file(&dir, "shared.txt", 50);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let args = json!({"path":"shared.txt"});
+    let serial = crate::tools::read_tool_streaming(&ws, &args, &cancel, 4096).text;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| crate::tools::read_tool_streaming(&ws, &args, &cancel, 4096).text)
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), serial);
+        }
+    });
+}

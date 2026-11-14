@@ -162,13 +162,16 @@ class MlxTests(unittest.TestCase):
                   _dial_thinking_supported=True, _dial_initial_state="reasoning")
         sampler = server._make_sampler(args, tokenizer)
         loop = tokenizer.encode("self.bullet.set_linear_velocity(Point(0, 0, 0))\n", add_special_tokens=False)
-        action = "<tool_call>read<arg_key>path</arg_key><arg_value>game.py</arg_value></tool_call>"
+        action = "<tool_call>\n<function=read>\n<parameter=path>\ngame.py\n</parameter>\n</function>\n</tool_call>"
         action_tokens = tokenizer.encode(action, add_special_tokens=False)
         base_tokens = loop * 4 + action_tokens
+        # HF vocab_size excludes added markers, but model logits must include them.
+        logit_width = max(tokenizer.get_vocab().values()) + 1
+        self.assertLess(max(base_tokens + list(tokenizer.think_end_tokens)), logit_width)
         output = []
         index = 0
         while index < len(base_tokens):
-            scores = mx.full((1, tokenizer.vocab_size), -100.0)
+            scores = mx.full((1, logit_width), -100.0)
             scores[:, base_tokens[index]] = 0.0
             forced = bool(sampler.closing) or sampler.redirected and sampler.thinking
             token = sampler(scores).item()

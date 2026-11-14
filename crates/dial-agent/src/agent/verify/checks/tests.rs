@@ -1527,3 +1527,41 @@ fn a_check_run_before_the_first_effect_becomes_its_lazy_baseline() {
         Some("the failure this request asked to diagnose; nothing was edited")
     );
 }
+
+/// Dial's managed interpreter lives in protected Dial storage. When the shell sandbox hides that
+/// storage, the automatic Python checks must use a launchable interpreter instead: otherwise every
+/// Python edit under `--sandbox dev` reports a failed check the agent can never clear.
+#[test]
+fn focused_python_checks_avoid_an_interpreter_hidden_by_the_shell_sandbox() {
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let python = private.path().join("python/.venv/bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(&python, "").unwrap();
+    let config = Config {
+        python: python.clone(),
+        ..Config::default()
+    };
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.workspace =
+        agent
+            .workspace
+            .clone()
+            .with_policy(crate::tools::exec::sandbox::Policy::Dev {
+                deny_read: Vec::new(),
+                extra_write: Vec::new(),
+                allow_network: false,
+            });
+    assert_eq!(agent.check_python(), python, "visible interpreter is kept");
+    agent.workspace = agent
+        .workspace
+        .clone()
+        .with_protected_paths(&[private.path().to_path_buf()]);
+    assert_eq!(agent.check_python(), PathBuf::from("python3"));
+    agent.workspace = agent.workspace.clone().without_sandbox();
+    assert_eq!(
+        agent.check_python(),
+        python,
+        "unsandboxed commands can run it"
+    );
+}

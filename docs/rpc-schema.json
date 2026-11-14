@@ -27,6 +27,21 @@
       "oneOf": [
         {
           "type": "object",
+          "description": "Open, query or stop the local comparison workspace without starting inference. Returns status and a capability-scoped loopback URL. Confirm and start selected runs through that workspace; Python 3.11+ and a Dial benchmark checkout are required. Native RPC only; busy open and invalid actions have coded refusals.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "benchmark" },
+            "params": {
+              "type": "object",
+              "properties": { "action": { "enum": ["open", "status", "stop"] } },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "properties": {
             "id": {
               "$ref": "#/$defs/id"
