@@ -250,7 +250,7 @@ class WindowsContractTests(unittest.TestCase):
                 self.assertEqual(contract.run_contract(tests, skips, "ci"), 0)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertEqual(calls[2], ["/t/dial_core-1", "platform::", "--skip", "platform::unix"])
-        self.assertEqual(run.call_args_list[2].kwargs["cwd"], "/repo/crates/dial-core")
+        self.assertEqual(run.call_args_list[2].kwargs["cwd"], str(Path("/repo/crates/dial-core")))
         self.assertEqual(calls[3], ["/t/dial-2", "cmd::", "--skip", "platform::unix"])
         # No built executable for this target: Cargo still runs it rather than skipping coverage.
         self.assertEqual(calls[4][:2], ["cargo", "test"])
