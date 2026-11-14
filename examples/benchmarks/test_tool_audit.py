@@ -178,6 +178,35 @@ class AuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit.closure(self.root, self.manifest)
 
+    def test_plan_validation_reports_absent_closure_receipts_as_unverified(self):
+        finding = dict(id="F1", group="owner", owner="maintainer", evidence="observed", cause="defect",
+                       next_action="none", check="regression", status="closed", fix="causal change",
+                       before="benchmarks/missing/before.json", after="benchmarks/missing/after.json")
+        self.manifest["findings"] = [finding]
+        audit.validate(self.root, self.manifest)
+        rows = audit.closure(self.root, self.manifest, require_receipts=False)
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [("F1", "closed-unverified")])
+        with self.assertRaises(OSError):
+            audit.closure(self.root, self.manifest)
+        # A receipt that is present is still verified in full.
+        after = self.recorded("after", started=3, finished=4)
+        finding["before"] = finding["after"] = str(after.relative_to(self.root))
+        with self.assertRaises(ValueError):
+            audit.closure(self.root, self.manifest, require_receipts=False)
+
+    def test_plan_validation_reports_a_stale_closure_as_unverified(self):
+        before = self.recorded("before", passed=False, source="old-source", started=1, finished=2)
+        after = self.recorded("after", source="older-source", started=3, finished=4)
+        data = audit.read_json(after)
+        data["checks"][0]["inputs_sha256"] = "newer-implementation"
+        after.write_text(json.dumps(data))
+        self.manifest["findings"] = [dict(id="F1", group="owner", check="regression", status="closed",
+            before=str(before.relative_to(self.root)), after=str(after.relative_to(self.root)))]
+        rows = audit.closure(self.root, self.manifest, require_receipts=False)
+        self.assertEqual([r["status"] for r in rows], ["closed-unverified"])
+        with self.assertRaisesRegex(ValueError, "stale evidence"):
+            audit.closure(self.root, self.manifest)
+
     def test_compile_failure_cannot_close_as_behavioral_reproduction(self):
         before = self.recorded("before", passed=False, source="old-source", started=1, finished=2)
         log = before.parent / "regression.log"

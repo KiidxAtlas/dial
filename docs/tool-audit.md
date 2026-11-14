@@ -68,7 +68,9 @@ operations and dimensions remain explicit gaps; a successful non-strict gate is 
 `validate` means **valid plan, not executed audit**. CI runs offline gate contracts and the
 coverage/finding ratchet. It does not claim the initial plan is complete or run paid providers.
 Use the strict gate below for a completeness requirement; the initial global strict gate fails
-as intended. A green CI plan check is not a green exhaustive tool audit.
+as intended. A green CI plan check is not a green exhaustive tool audit. Closure receipts are
+ignored local evidence, so `validate` reports a closed finding whose receipts are absent (as in CI)
+as `closed-unverified`, never `closed`; `gate` still requires and verifies them.
 
 ## Local follow-through checkpoint (2026-11-13)
 

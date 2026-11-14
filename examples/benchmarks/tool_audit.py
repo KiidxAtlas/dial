@@ -314,16 +314,26 @@ def coverage(root, manifest, receipts=()):
     return rows
 
 
-def closure(root, manifest):
+def closure(root, manifest, require_receipts=True):
+    """Verify closed findings against their before/after receipts.
+
+    Receipts are ignored local evidence. Without `require_receipts`, a closed finding whose
+    receipts are absent, or whose passing receipt predates the current source, is reported as
+    `closed-unverified`, never `closed`; receipts that are present are still verified in full."""
     fresh = snapshot(root)
     results = []
     for finding in manifest.get("findings", []):
         if finding["status"] != "closed":
             results.append({"id": finding["id"], "status": "open"})
             continue
+        paths = [local(root, finding["before"]), local(root, finding["after"])]
+        if not require_receipts and not all(path.is_file() for path in paths):
+            results.append({"id": finding["id"], "status": "closed-unverified",
+                            "reason": "closure receipts are local evidence absent from this checkout"})
+            continue
         key = finding["check"]
-        before = receipt(root, local(root, finding["before"]), manifest["checks"], None)[key]
-        after = receipt(root, local(root, finding["after"]), manifest["checks"], fresh)[key]
+        before = receipt(root, paths[0], manifest["checks"], None)[key]
+        after = receipt(root, paths[1], manifest["checks"], fresh if require_receipts else None)[key]
         require(before["status"] == "failed" and type(before["exit_code"]) is int
                 and before["exit_code"] > 0 and before["timed_out"] is False
                 and before.get("interrupted", False) is False
@@ -333,7 +343,11 @@ def closure(root, manifest):
                 f"no later passing regression: {finding['id']}")
         require(before["source_sha256"] != after["source_sha256"], "closure needs changed inputs")
         require(before["inputs_sha256"] != after["inputs_sha256"], "closure needs changed implementation/test inputs, not just plan metadata")
-        results.append({"id": finding["id"], "status": "closed"})
+        if after["source_sha256"] == fresh and after["inputs_changed"] is False:
+            results.append({"id": finding["id"], "status": "closed"})
+        else:
+            results.append({"id": finding["id"], "status": "closed-unverified",
+                            "reason": "the passing receipt predates the current source"})
     return results
 
 def evaluate(payload, candidate, limits=None):
@@ -481,7 +495,7 @@ def main(argv=None):
                 previous = git_baseline(root, args.base_ref, args.manifest)
                 if previous is not None:
                     ratchet(previous, manifest)
-            findings = closure(root, manifest)
+            findings = closure(root, manifest, require_receipts=False)
             result = {"families": len(roster(root)), "groups": len(manifest["groups"]),
                       "checks": len(manifest["checks"]), "findings": findings, "status": "valid-plan-not-executed"}
         elif args.action == "run":
