@@ -329,8 +329,11 @@ def serve(root, dial_executable=None, port=0, parent_pid=None):
                     return self.reply(200, engine.stop())
                 if route == "/api/shutdown":
                     engine.stop()
+                    # Reply before signalling: the serve loop exits on `stopping`, and daemon
+                    # handler threads die with the process, which could cut the reply short.
+                    self.reply(200, {"status": "stopping"})
                     stopping.set()
-                    return self.reply(200, {"status": "stopping"})
+                    return None
                 self.reply(404, {"error": "Not found"})
             except (ValueError, OSError) as error:
                 self.reply(409 if isinstance(error, Busy) else 400, {"error": str(error)})

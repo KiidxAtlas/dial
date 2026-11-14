@@ -21,11 +21,13 @@ fn isolated_copy_inherits_only_its_sources_scoped_capture_budget() {
     let budget = scope_workspace_budget(workspace.root(), std::time::Duration::ZERO);
     assert!(capture(&workspace, &inputs).is_none());
     let isolated = Isolated::create(&workspace).unwrap();
+    // Share only the copy's workspace: on Windows `Isolated` owns a ProjFS handle that is not Sync.
+    let worker = isolated.workspace();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 assert!(
-                    capture(isolated.workspace(), &inputs).is_none(),
+                    capture(worker, &inputs).is_none(),
                     "an isolated worker must inherit the fixture's capture allowance"
                 );
             })
