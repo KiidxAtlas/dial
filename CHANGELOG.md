@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-14
+
 ### Added
 
 - `/benchmark` opens a local agent/suite selection workspace with sequential live results, cancellation, private JSON evidence and an automatic SVG comparison image plus browser PNG export. The shared launch owner is available through native RPC. Dial trials use fresh settings homes and discard ambient Dial overrides; personal tuning is unchanged and model-quality effects are unmeasured. Python 3.11+ and a checkout are required; Harbor/SWE-bench remain separate runners ([benchmarks](docs/benchmarks.md#interactive-comparisons-benchmark)).
@@ -2894,7 +2896,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.8...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -2938,3 +2940,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.5]: https://github.com/KiidxAtlas/dial/tree/v0.3.5
 [0.3.6]: https://github.com/KiidxAtlas/dial/tree/v0.3.6
 [0.3.7]: https://github.com/KiidxAtlas/dial/tree/v0.3.7
+[0.3.8]: https://github.com/KiidxAtlas/dial/tree/v0.3.8
