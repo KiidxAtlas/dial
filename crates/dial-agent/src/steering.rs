@@ -26,15 +26,29 @@ pub fn pending_path(config: &AppConfig, name: &str) -> Result<PathBuf> {
         .join(format!("{name}.json")))
 }
 
+pub(crate) struct VectorLease {
+    file: fs::File,
+}
+
+impl Drop for VectorLease {
+    fn drop(&mut self) {
+        // A concurrent spawn can inherit this open-file description until exec.
+        // Closing only our descriptor would leave the finished job's lease held.
+        if let Err(error) = self.file.unlock() {
+            eprintln!("dial: could not release steering vector lease: {error}");
+        }
+    }
+}
+
 /// Hold the vector's mutation lease before reading admission or replacement state.
 /// Import, evaluation, automatic creation and promotion share this lock identity.
-pub(crate) fn lock_vector(path: &Path) -> Result<fs::File> {
+pub(crate) fn lock_vector(path: &Path) -> Result<VectorLease> {
     crate::platform::atomic::private_dir(path.parent().context("steering directory")?)?;
     let lock = crate::learn::auto::lock_file(&path.with_extension("job.lock"))?;
     std::fs::File::try_lock(&lock)
         .map_err(std::io::Error::from)
         .context("another steering job already owns this vector")?;
-    Ok(lock)
+    Ok(VectorLease { file: lock })
 }
 
 /// Make a pending vector active. Requires its own passing local evaluation; never runs unevaluated.

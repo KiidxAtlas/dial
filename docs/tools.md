@@ -1,5 +1,11 @@
 # Tools, safety and context
 
+Edit witnesses come from complete numbered source rows returned by native read/search/edit/write
+tools, not only `read`. Reuse those rows and their `[PATH#TAG]` header; outlines, clipped lines,
+summaries and arbitrary shell output do not prove exact source. Unchanged witnessed lines carry
+across versions, including when a previously retained version is restored. Read only missing
+target ranges; complete source rows returned in an edit refusal already count for the next edit.
+
 For programmatic reads, `read` accepts `format: "text"` or `"base64"`: one literal local file,
 at most 1 MiB, exact payload in `data.content`, and a compact SHA-256/byte-count receipt in text.
 `retain: true` additionally preserves the exact source in the artifact store. Omitting these

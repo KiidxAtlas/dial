@@ -17,9 +17,34 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-14
+
+### Added
+
+- `/benchmark` opens a local agent/suite selection workspace with sequential live results, cancellation, private JSON evidence and an automatic SVG comparison image plus browser PNG export. The shared launch owner is available through native RPC. Dial trials use fresh settings homes and discard ambient Dial overrides; personal tuning is unchanged and model-quality effects are unmeasured. Python 3.11+ and a checkout are required; Harbor/SWE-bench remain separate runners ([benchmarks](docs/benchmarks.md#interactive-comparisons-benchmark)).
+- Tool audit inventory, evidence receipts, behavior-report evaluation and coverage/closure gates, with offline contract tests and a CI ratchet against silently dropping coverage or findings. Missing native, operation-specific and live evidence remains explicit, not a passing audit ([tool audit](docs/tool-audit.md)).
+
 ### Fixed
 
+- Steering vector jobs explicitly release their mutation leases before closing file descriptors, so concurrent subprocess launches cannot prolong a finished job's lock. Portable Python test prerequisites now check FastAPI before collection and point to the pinned isolated CI environment.
+- Task waits drain worker completion events and join the finished worker before reporting settlement, so immediate contract re-verification no longer races pending completion bookkeeping.
+- Real MLX thinking tests include added tokenizer markers in their scripted logits and use the pinned parser's function-call syntax, preserving complete tool calls through reasoning redirection.
+- Shell output cleanup makes a final bounded nonblocking read before declaring capture incomplete, so a descheduled waiter can observe already-ready output and EOF without extending the cleanup deadline or hiding a pipe that remains open.
+- Benchmark comparisons now include wall-time, request, tool and input/output/cache metrics with explicit measurement coverage in live results, JSON and SVG/PNG exports; add installed Claude Code/Hermes choices, expose redacted per-agent setup errors, refuse the known Sonnet model-ID typo and skip repeated fatal setup failures without grading them as task failures ([benchmarks](docs/benchmarks.md#interactive-comparisons-benchmark)).
+- Benchmark comparisons recognize Claude Code's expired-OAuth result and Hermes' missing Anthropic credentials as setup failures, so those agents stop after one trial with the redacted cause instead of repeating unauthenticated trials as execution errors.
+- Benchmark source snapshots skip gitignored local data (such as a `benchmarks/` venv with absolute interpreter symlinks), so `dial benchmark` and `/benchmark` no longer fail copying it.
+- When the user asks for an exact reply, Dial now sends only that reply, plus any blocker or unverified check, instead of adding its routine report. The `eval` description says that relative paths resolve in the project directory and that generated files should read input files instead of copying their data into code. Measured on `claude-sonnet-4-6`, hosted headline profile, 3 repetitions: pass rate rose from 2/6 to 5/6. The local efficiency suite (8 cases × 3) still passes 24/24, with 8% fewer requests and input tokens and 11% less wall time ([benchmarks](docs/benchmarks.md#headline-score)).
+- Under `--sandbox dev` (and in `dial benchmark --share-auth`), editing a Python file no longer leaves the turn incomplete. The automatic `python AST` check used Dial's managed interpreter in protected Dial storage, which the sandbox hides. It now falls back to `python3` when sandboxed commands cannot launch that interpreter.
+- The headline suite's `deferred-tool-discovery` case required calls to `tool_load` and `ast_search`, which were folded into `tool_search` and `grep`, so the case could never pass. It now asks the agent to discover, load and use the deferred `ast_edit` tool on `ledger.py`, which benchmark isolation keeps eligible; offline suite tests guard the change.
+- The reliability suite's `amount-exact-decimal` prompt now states the accepted amount format. Its hidden check already rejected surrounding whitespace, `1.` and `.5`, which the old wording ("at most two fractional digits") allowed, so `claude-sonnet-4-6` failed it in 11 of 11 runs while its own tests passed. With the format stated it passed 5 of 5; the checks are unchanged, and an offline test keeps the prompt naming each rejected form.
+- Restoring a retained file version preserves unchanged edit witnesses learned in intervening versions. Tool guidance reuses numbered source evidence instead of requiring redundant reads while preserving read-before-edit, evidence-based decisions and existing prompt budgets across built-in profiles.
+- Foreground shell inspections can declare `expected_exit_codes` without hiding raw statuses or weakening acceptance checks. Child and in-process shell output share exit explanations ([shell](docs/shell.md#exit-status-and-inspection-results)).
+- Tool-effectiveness comparisons preserve unknown candidate token usage instead of crashing or treating it as zero; audit efficiency gates keep missing usage inconclusive ([tool audit](docs/tool-audit.md#behavior-evaluation)).
 - The release container image is published again: container staging refused the release archive's `LICENSE.node` (the bundled Node.js runtime's license, new in 0.3.7), so the v0.3.7 image was not published. The license is now staged and installed under `/usr/share/doc/dial/` ([docker](docs/docker.md)).
+
+### Removed
+
+- The "How Dial compares" documentation page (`docs/comparison.md`) and its links from the README, documentation index and quickstart.
 
 ## [0.3.7] - 2026-11-13
 
@@ -2871,7 +2896,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.8...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -2915,3 +2940,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.5]: https://github.com/KiidxAtlas/dial/tree/v0.3.5
 [0.3.6]: https://github.com/KiidxAtlas/dial/tree/v0.3.6
 [0.3.7]: https://github.com/KiidxAtlas/dial/tree/v0.3.7
+[0.3.8]: https://github.com/KiidxAtlas/dial/tree/v0.3.8

@@ -40,6 +40,20 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
       - name: No-build release and workflow contracts
         run: make release-check test-release-policy
+      - name: Tool audit ownership, coverage ratchet and closure contracts
+        env:
+          AUDIT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          make test-tool-audit
+          if [ -n "$AUDIT_BASE" ] && [ "$AUDIT_BASE" != 0000000000000000000000000000000000000000 ]; then
+            # A force-push can leave `before` outside history; ratchet against the first parent
+            # instead of failing or silently skipping the comparison.
+            if ! git cat-file -e "$AUDIT_BASE^{commit}" 2>/dev/null; then
+              echo "::notice::audit base $AUDIT_BASE is unavailable; comparing against HEAD^"
+              AUDIT_BASE=$(git rev-parse HEAD^)
+            fi
+            python3 examples/benchmarks/tool_audit.py validate --base-ref "$AUDIT_BASE"
+          fi
       - name: Format before any compilation
         run: cargo fmt --check
       - name: Unused Rust dependencies (cargo-machete 0.9.2)

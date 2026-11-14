@@ -967,5 +967,7 @@ without `--replace` it refuses to overwrite an existing active vector. Import, e
 automatic creation and promotion share per-vector mutation locks. Promotion locks both the
 pending and active vectors before checking admission or replacement state, so it cannot move
 a vector while another job is evaluating or replacing it. Busy vectors are refused, not queued.
+When a vector job ends, it explicitly unlocks its lease before closing the file; descriptors
+inherited during concurrent subprocess spawning cannot keep a finished job appearing busy.
 Packs carry weights and provenance only; exporter admission records are informational and are
 re-verified on import.

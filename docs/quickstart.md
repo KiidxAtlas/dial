@@ -58,4 +58,3 @@ them. When you are happy, commit as usual.
 - `dial -c` continues your last session; `dial -p "…"` runs one prompt for scripts.
 - [Everyday Dial](everyday.md): the full ask, steer, review and resume loop.
 - [Shell and sandbox](shell.md): what commands may do, network rules and the git guard.
-- [How Dial compares](comparison.md): what Dial does differently from other terminal agents.

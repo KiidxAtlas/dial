@@ -40,6 +40,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "message" => Method("task_message"),
         "cancel" => Method("task_cancel"),
         "processes" => Method("list_jobs"),
+        "benchmark" => Method("benchmark"),
         "review-file" => Method("checkpoint_diff"),
         "rollback" => Method("restore_checkpoint_files"),
         "undo" => Method("undo"),
@@ -82,7 +83,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "providers" => Terminal("provider setup wizard; use set_setting and login"),
         "commit" | "git" | "wt" | "changes" | "code-history" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
-        | "benchmark" | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
+        | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
         "collab" | "join" | "leave" | "relay" | "peers" => Terminal(COLLAB),
         "mode" | "vibe" | "skillful" | "drafter" | "advisor" | "external-thinking"
         | "plan-yolo" | "fast" | "slow" | "extended-context" | "prewalk" => Terminal(MODES),

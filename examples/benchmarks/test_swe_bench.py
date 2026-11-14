@@ -163,6 +163,7 @@ class WorkspacePatchTests(unittest.TestCase):
 
 class ComparisonAgentTests(unittest.TestCase):
     def test_real_config_gets_matching_isolation_flags_and_renders(self):
+        # The shared default catalog also lists dashboard-only agents; prepare selects the pair.
         agents = {a["name"]: a for a in swe_bench.comparison_agents(ROOT / "cross-agent.toml")}
         self.assertEqual(set(agents), {"dial", "omp"})
         for template in ("first", "follow_up"):
@@ -175,6 +176,19 @@ class ComparisonAgentTests(unittest.TestCase):
             self.assertIn("--no-extensions", omp)
             self.assertIn("--plan", omp)
             self.assertNotIn("--no-extensions", agents["dial"][template])
+
+    def test_explicit_pair_selection_still_requires_both_agents(self):
+        body = 'name = "{name}"\noutput = "dial-json"\nfirst = ["x", "{{prompt}}"]\nfollow_up = ["x", "{{prompt}}"]\n'
+        for names in (("dial", "omp", "other"), ("dial", "other")):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "agents.toml"
+                path.write_text("".join(f"[[agents]]\n{body.format(name=name)}" for name in names))
+                if "omp" not in names:
+                    with self.assertRaises(ValueError):
+                        swe_bench.comparison_agents(path, select_pair=True)
+                else:
+                    self.assertEqual([a["name"] for a in swe_bench.comparison_agents(path, select_pair=True)],
+                                     ["dial", "omp"])
 
     def test_wrong_agent_set_is_rejected(self):
         body = 'name = "{name}"\noutput = "dial-json"\nfirst = ["x", "{{prompt}}"]\nfollow_up = ["x", "{{prompt}}"]\n'
@@ -310,14 +324,14 @@ class DialSandboxFlagTests(unittest.TestCase):
     CONFIG = ROOT / "cross-agent.toml"
 
     def test_default_comparison_adds_no_sandbox_flag(self):
-        for agent in swe_bench.comparison_agents(self.CONFIG):
+        for agent in swe_bench.comparison_agents(self.CONFIG, select_pair=True):
             for template in ("first", "follow_up"):
                 with self.subTest(agent=agent["name"], template=template):
                     self.assertNotIn("--sandbox", agent[template])
 
     def test_explicit_opt_out_inserts_sandbox_off_into_dial_templates_only(self):
-        default = {a["name"]: a for a in swe_bench.comparison_agents(self.CONFIG)}
-        opted = {a["name"]: a for a in swe_bench.comparison_agents(self.CONFIG, dial_sandbox_off=True)}
+        default = {a["name"]: a for a in swe_bench.comparison_agents(self.CONFIG, select_pair=True)}
+        opted = {a["name"]: a for a in swe_bench.comparison_agents(self.CONFIG, dial_sandbox_off=True, select_pair=True)}
         for template in ("first", "follow_up"):
             flags = opted["dial"][template]
             index = flags.index("--sandbox")

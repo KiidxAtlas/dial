@@ -173,6 +173,9 @@ fn fake_adapter_protocol_failures_stop_the_session() {
             "{mode} adapter unexpectedly succeeded: {}",
             output.text
         );
+        let status: Value =
+            serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+        assert_eq!(status["active"], false, "{mode}: {status}");
     }
 }
 

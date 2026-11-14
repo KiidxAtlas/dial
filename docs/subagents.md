@@ -25,6 +25,10 @@ blockers, acceptance/audit details and isolation/merge warnings remain visible. 
 `task status` with an `id` recovers the full existing preview; `read` on its `artifact://` URI retrieves the complete
 canonical report. Polling never labels a running worker complete or counts a report as verification.
 
+A task wait keeps pumping completion bookkeeping until the finished worker is joined, unless
+the wait times out or is interrupted. A published result alone is not a settled worker;
+normal wait completion permits immediate retained-output verification without another poll.
+
 When the foreground agent has no independent work left, it can state what is pending and yield
 without tools. The harness suspends inference until owned workers or side questions settle, a
 worker message arrives, or user input/cancellation/turn limits require attention. Results retain

@@ -34,6 +34,7 @@ HOST_RUN = $(PYTHON) scripts/embedded-host.py --cargo "$(CARGO)"
 .PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline bench-headline test-smoke test-mlx preflight preflight-quick hooks
 .PHONY: test-install test-build test-windows-contract test-embedded-host test-packaging test-release-policy preflight-worktree
 .PHONY: release-check lint-deps clean test-clean
+.PHONY: test-tool-audit audit-tools
 
 help:
 	@printf '%s\n' \
@@ -53,6 +54,8 @@ help:
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
+		'make test-tool-audit  Validate all tool-family ownership and test audit evidence/closure gates (offline)' \
+		'make audit-tools AUDIT_TIER=rust AUDIT_OUT=benchmarks/audit-run  Execute reviewed tool checks and retain evidence' \
 		'make bench-headline DIAL=target/local/dial [BASELINE=old.json]  Run the headline local-tasks score (needs a loaded model in HEADLINE_PROFILES)' \
 		'make test-packaging  Check distribution metadata and packaging contracts' \
 		'make test-release-policy  Check publication authorization and version ordering' \
@@ -136,11 +139,22 @@ test-drivers:
 
 test-python:
 	$(PYTHON) scripts/test-prerequisites.py python
+	$(PYTHON) scripts/test-prerequisites-unit.py
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py
 	$(PYTHON) -m unittest discover -s sdk/python/tests
 
 test-bench-offline:
 	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'
+
+test-tool-audit:
+	$(PYTHON) examples/benchmarks/tool_audit.py validate
+	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_tool_audit.py'
+
+AUDIT_TIER ?= offline
+AUDIT_OUT ?=
+audit-tools:
+	@test -n "$(AUDIT_OUT)" || { printf '%s\n' 'Set a new AUDIT_OUT under benchmarks/; existing evidence is never overwritten.' >&2; exit 2; }
+	$(PYTHON) examples/benchmarks/tool_audit.py run --tier "$(AUDIT_TIER)" --out "$(AUDIT_OUT)"
 
 # Headline task score: the fixed local-tasks suite, run against an already-loaded model. Reports
 # go to a durable path under the target dir, never $TMPDIR, so an interrupted run keeps its

@@ -7,7 +7,7 @@ use crate::agent::{
 
 #[test]
 fn malformed_or_unchecked_contract_starts_launch_nothing() {
-    with_agent("", |agent| {
+    with_contract_agent("", |agent| {
         for args in [
             json!({"contract":{"id":"n1"},"action":"start","task":"inspect"}),
             json!({"contract":{"id":"n1"},"action":"start","task":"inspect","acceptance_checks":[]}),
@@ -23,7 +23,7 @@ fn malformed_or_unchecked_contract_starts_launch_nothing() {
 
 #[test]
 fn plan_mode_contract_start_is_refused_without_a_journal_entry() {
-    with_agent("", |agent| {
+    with_contract_agent("", |agent| {
         agent.set_plan_mode(true);
         let args = json!({"contract":{"id":"n1"},"action":"start","task":"inspect","acceptance_checks":["behavior"]});
         assert!(agent.contract_task(&args, &mut NullUi).is_err());
@@ -33,7 +33,7 @@ fn plan_mode_contract_start_is_refused_without_a_journal_entry() {
 
 #[test]
 fn restored_running_node_blocks_completion_while_ordinary_tasks_stay_unblocked() {
-    with_agent("", |agent| {
+    with_contract_agent("", |agent| {
         assert!(
             agent.workflow_contracts.blocker().is_none(),
             "ordinary sessions are unchanged"
@@ -79,7 +79,7 @@ fn unsettled_contracts_block_plain_final_and_explicit_finish() {
             response,
             crate::llm::fake::json(200, &json!({"total_slots":1})),
         ]);
-        with_agent(
+        with_contract_agent(
             "[compaction]\nenabled=false\n[harness]\nmax_steps=2",
             |agent| {
                 agent.backend = Some(Backend::new(
@@ -117,7 +117,7 @@ fn unsettled_contracts_block_plain_final_and_explicit_finish() {
 
 #[test]
 fn nested_and_batch_contracts_cannot_fall_back_to_ordinary_execution() {
-    with_agent("", |agent| {
+    with_contract_agent("", |agent| {
         for args in [
             json!({"contract":{"id":"nested"},"task":"t","solution_space":"s"}),
             json!({"tasks":[{"contract":{"id":"batch"},"task":"t","solution_space":"s"}]}),
@@ -152,7 +152,7 @@ paths = ["source.txt"]
 "#,
         server.url
     );
-    with_agent(&overlay, |agent| {
+    with_contract_agent(&overlay, |agent| {
         agent.approval = crate::config::types::Approval::Auto;
         std::fs::write(agent.workspace.root().join("source.txt"), "candidate").unwrap();
         let reply = agent.start_subagents(&json!({
@@ -195,7 +195,7 @@ paths = ["source.txt"]
 
 #[test]
 fn strict_read_only_contract_is_rejected_before_durable_intent() {
-    with_agent(
+    with_contract_agent(
         r#"
 [task]
 persist = true
@@ -259,7 +259,7 @@ timeout_secs = 5
 "#,
         server.url
     );
-    with_agent(&overlay, |agent| {
+    with_contract_agent(&overlay, |agent| {
         agent.approval = crate::config::types::Approval::Auto;
         let root = agent.workspace.root().to_path_buf();
         std::fs::write(root.join("source.txt"), "candidate").unwrap();
@@ -309,14 +309,25 @@ timeout_secs = 5
         }
         agent.backend = Some(backend);
         agent.sync_contracts().unwrap();
-        assert_eq!(
-            agent.workflow_contracts.node("unrelated").unwrap()["state"],
-            "accepted"
-        );
+        let unrelated_node = agent.workflow_contracts.node("unrelated").unwrap();
+        assert_eq!(unrelated_node["state"], "accepted", "{unrelated_node}");
         assert_eq!(
             agent.workflow_contracts.node("first").unwrap()["state"],
             "accepted"
         );
         assert!(agent.workflow_contracts.blocker().is_none());
     });
+}
+
+/// Contract fixtures run isolated workers whose declared-input captures can execute on background
+/// threads. Their workspace root gets a test-only allowance for this fixture alone; the production
+/// bound and every other workspace are unchanged.
+fn with_contract_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    with_agent(overlay, |agent| {
+        let _budget = crate::agent::verify::inputs::scope_workspace_budget(
+            agent.workspace.root(),
+            std::time::Duration::from_secs(600),
+        );
+        f(agent)
+    })
 }

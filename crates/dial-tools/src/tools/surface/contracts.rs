@@ -23,7 +23,17 @@ pub struct HistoricalCall {
 /// Optional built-in properties added after release whose absence keeps the old meaning, so
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
-    ("bash", &["session", "pty", "check", "check_paths", "trace"]),
+    (
+        "bash",
+        &[
+            "session",
+            "pty",
+            "check",
+            "check_paths",
+            "trace",
+            "expected_exit_codes",
+        ],
+    ),
     ("bg", &["persist", "lifetime", "call"]),
     (
         "monitor",

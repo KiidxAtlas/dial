@@ -31,6 +31,7 @@ from pathlib import Path
 PORTABLE_CHECKS = {"file_exists", "file_contains", "file_equals", "command", "response_equals"}
 CHECK_TIMEOUT_SECS = 120
 TOKEN_FIELDS = ("input_total", "uncached_input", "cache_read", "cache_write", "output")
+MEASUREMENT_FIELDS = (*TOKEN_FIELDS, "requests", "tool_calls", "tool_errors", "delegations")
 # Dial's per-turn `efficiency` object, as emitted by turn_loop.rs. `inference_latency` is the request timer
 # snapshot (additive counters plus an `attribution` string); `storage_io` holds inclusive SessionIoMetrics
 # counters; `projection_bytes` is the request-attribution Metrics. `requests_by_phase`, `prefix_invalidations`,
@@ -86,6 +87,11 @@ def load_agents(path):
             raise ValueError(f"{agent['name']}.delegation_tools must be a list of tool names")
         if agent.setdefault("delegated_usage", "unknown") not in ("included", "unknown"):
             raise ValueError(f"{agent['name']}.delegated_usage must be 'included' or 'unknown'")
+        thinking = agent.get("thinking_values", {})
+        if (not isinstance(thinking, dict) or any(not isinstance(v, dict) or
+                not all(isinstance(k, str) and isinstance(s, str) for k, s in v.items())
+                for v in thinking.values())):
+            raise ValueError(f"{agent['name']}.thinking_values must map levels to string substitutions")
     return agents
 
 
@@ -94,6 +100,9 @@ def agent_environment(agent, values):
     directory, so state written there (a `*_HOME`, sessions) cannot leak into another trial. Then `~`
     and `$VAR` expand."""
     environment = dict(os.environ)
+    if agent["env"].get("DIAL_HOME", "").startswith("{trial_root}"):
+        # A clean benchmark home must not inherit process-level experimental/config overrides.
+        environment = {name: value for name, value in environment.items() if not name.startswith("DIAL_")}
     for name, value in agent["env"].items():
         expanded = os.path.expandvars(os.path.expanduser(value.format(**values)))
         environment[name] = expanded
@@ -104,6 +113,15 @@ def agent_environment(agent, values):
 
 def render(template, values):
     return [argument.format(**values) for argument in template]
+
+
+def agent_values(agent, values):
+    """Translate the shared thinking level to the installed CLI's explicit spelling/settings."""
+    choices = agent.get("thinking_values", {})
+    level = values.get("thinking", "off")
+    if choices and level not in choices:
+        raise ValueError(f"{agent['name']} does not support thinking level {level!r}")
+    return {**values, **choices.get(level, {})}
 
 
 def first_prompt(case):
@@ -118,15 +136,16 @@ def portable(check):
     return check["kind"] in PORTABLE_CHECKS
 
 
-def run_check(check, workspace, final_text):
+def run_check(check, workspace, final_text, *, cancel=None):
     """Return True, False, or None when the check could not be evaluated."""
     kind = check["kind"]
     if kind == "response_equals":
         return None if final_text is None else final_text.strip() == check["content"].strip()
     if kind == "command":
         try:
-            result = subprocess.run(check["command"], cwd=workspace, shell=True, capture_output=True,
-                                    text=True, timeout=CHECK_TIMEOUT_SECS)
+            result = run_agent_process(["/bin/sh", "-c", check["command"]], cwd=workspace,
+                                       text=True, timeout=CHECK_TIMEOUT_SECS,
+                                       env=dict(os.environ), stdin=subprocess.DEVNULL, cancel=cancel)
         except subprocess.TimeoutExpired:
             return None
         if result.returncode != check.get("expect_exit", 0):
@@ -397,16 +416,20 @@ def parse_hermes_usage(usage_text, session_text=""):
     if not isinstance(report, dict) or not isinstance(report.get("api_calls"), int):
         usage["usage_complete"] = False
         return None, usage
+    usage["known_fields"] = ["requests"]
     fields = {"uncached_input": "input_tokens", "cache_read": "cache_read_tokens",
               "cache_write": "cache_write_tokens", "output": "output_tokens"}
     for key, source in fields.items():
         value = report.get(source)
         if isinstance(value, int):
             usage[key] = value
+            usage["known_fields"].append(key)
         else:
             usage["usage_complete"] = False
     usage["requests"] = report["api_calls"]
     usage["input_total"] = usage["uncached_input"] + usage["cache_read"] + usage["cache_write"]
+    if all(k in usage["known_fields"] for k in ("uncached_input", "cache_read", "cache_write")):
+        usage["known_fields"].append("input_total")
     usage["models"] = [f"{report.get('provider')}/{report.get('model')}"] if report.get("model") else []
     messages = []
     for line in (session_text or "").splitlines():
@@ -428,6 +451,7 @@ def parse_hermes_usage(usage_text, session_text=""):
     # The export has no structured tool-error flag: unknown, never a measured zero.
     usage["tool_errors"] = None
     if usage["requests"] == 0 or usage["delegations"]:
+        usage["known_fields"] = []
         # Delegated subagents run as separate sessions whose usage this report does not prove.
         usage["usage_complete"] = False
     return None, usage
@@ -439,12 +463,17 @@ def parse_text(stdout):
     return stdout, usage
 
 
-PARSERS = {"dial-json": parse_dial_json, "omp-json": parse_omp_json, "claude-json": parse_claude_json, "text": parse_text}
+PARSERS = {"dial-json": parse_dial_json, "omp-json": parse_omp_json, "claude-json": parse_claude_json,
+           "text": parse_text, "hermes": parse_text}
 
 
 def add_usage(total, part, agent):
+    before = set(total.get("known_fields", MEASUREMENT_FIELDS if total["usage_complete"] else []))
+    known = set(part.get("known_fields", MEASUREMENT_FIELDS if part["usage_complete"] else []))
+    total["known_fields"] = sorted(before & known)
     for field in (*TOKEN_FIELDS, "requests", "tool_calls", "tool_errors"):
-        total[field] += part[field]
+        total[field] = (total[field] + part[field]
+                        if total[field] is not None and part[field] is not None else None)
     for name, count in part["tools"].items():
         total["tools"][name] = total["tools"].get(name, 0) + count
     delegations = sum(part["tools"].get(name, 0) for name in agent["delegation_tools"])
@@ -453,16 +482,28 @@ def add_usage(total, part, agent):
     # Usage of delegated workers counts only when the agent is known to report it in this output.
     total["usage_complete"] = (total["usage_complete"] and part["usage_complete"]
                                and not (delegations and agent["delegated_usage"] != "included"))
+    if delegations and agent["delegated_usage"] != "included":
+        total["known_fields"] = []
 
 
-def run_agent_process(command, *, timeout, cwd, env, stdin, **_):
+def run_agent_process(command, *, timeout, cwd, env, stdin, cancel=None, **_):
     """Stop the entire agent process group before a caller snapshots its files."""
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=stdin,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
+    deadline = time.monotonic() + timeout
     try:
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (cancel is not None and cancel.is_set()):
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(remaining, .2) if cancel is not None else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel is None:
+                        raise
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -481,7 +522,8 @@ def run_agent_process(command, *, timeout, cwd, env, stdin, **_):
 
 
 def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, keep, logs=None,
-              prepare_workspace=None, *, hard_timeout=None, capture_traces=False):
+              prepare_workspace=None, *, hard_timeout=None, capture_traces=False, cancel=None):
+    values = agent_values(agent, values)
     trial_dir = Path(tempfile.mkdtemp(prefix=f"{agent['name']}-{case['id']}-r{repetition}-", dir=work_root))
     workspace = trial_dir / "project"
     source = suite_root / case["project"] if case.get("project") else None
@@ -509,19 +551,27 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
     started = time.monotonic()
     trace_capture_secs = 0
     for index, prompt in enumerate(prompts):
+        if cancel is not None and cancel.is_set():
+            agent_error = "cancelled"
+            usage["usage_complete"] = False
+            usage["known_fields"] = []
+            break
         template = agent["first"] if index == 0 else agent["follow_up"]
-        command = render(template, {**values, "prompt": prompt, "timeout": str(timeout)})
+        turn_values = {**values, "prompt": prompt, "timeout": str(timeout),
+                       "usage_file": str(trial_dir / f"usage-{index}.json")}
+        command = render(template, turn_values)
         stderr_path = str(log_dir / f"turn-{index}.stderr") if log_dir is not None else None
         turn_started = time.monotonic()
         try:
             process = run_agent_process(command, cwd=workspace, capture_output=True, text=True, env=environment,
-                                        stdin=subprocess.DEVNULL, timeout=process_timeout)
+                                        stdin=subprocess.DEVNULL, timeout=process_timeout, cancel=cancel)
         except subprocess.TimeoutExpired as error:
             stdout, stderr = as_text(error.stdout), as_text(error.stderr)
             if log_dir is not None:
                 (log_dir / f"turn-{index}.stdout").write_text(stdout)
                 (log_dir / f"turn-{index}.stderr").write_text(stderr)
             usage["usage_complete"] = False
+            usage["known_fields"] = []
             agent_error = f"turn {index} exceeded {process_timeout}s"
             turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
                           "efficiency": None, "stderr_log": stderr_path, "stderr_tail": stderr_excerpt(stderr)})
@@ -530,6 +580,7 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
             break
         except OSError as error:
             usage["usage_complete"] = False
+            usage["known_fields"] = []
             agent_error = f"turn {index} could not start: {error}"
             turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
                           "efficiency": None, "stderr_log": None, "stderr_tail": ""})
@@ -539,7 +590,14 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         if log_dir is not None:
             (log_dir / f"turn-{index}.stdout").write_text(process.stdout)
             (log_dir / f"turn-{index}.stderr").write_text(process.stderr)
-        text, part = PARSERS[agent["output"]](process.stdout)
+        if agent["output"] == "hermes":
+            usage_path = Path(turn_values["usage_file"])
+            _, part = parse_hermes_usage(usage_path.read_text() if usage_path.is_file() else "")
+            text = process.stdout
+            if log_dir is not None and usage_path.is_file():
+                shutil.copyfile(usage_path, log_dir / f"turn-{index}.usage.json")
+        else:
+            text, part = PARSERS[agent["output"]](process.stdout)
         add_usage(usage, part, agent)
         final_text = text
         final_session_id = None
@@ -556,8 +614,11 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         turns.append({"exit": process.returncode,
                       "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
                       "efficiency": part.get("efficiency"),
+                      "usage": {k: v for k, v in part.items() if k != "efficiency"},
                       "stderr_log": stderr_path,
-                      "stderr_tail": stderr_excerpt(process.stderr) if process.returncode else ""})
+                      "stderr_tail": stderr_excerpt(process.stderr) if process.returncode else "",
+                      # Some CLIs (Claude Code) report setup failures only in their final result text.
+                      "result_tail": stderr_excerpt(text or "") if process.returncode else ""})
         if capture_traces:
             capture_started = time.monotonic()
             turns[-1]["trace"] = capture_trial_trace(
@@ -574,7 +635,7 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         if not portable(check):
             checks.append({"index": index, "kind": check["kind"], "result": "not_portable"})
             continue
-        outcome = run_check(check, workspace, final_text)
+        outcome = run_check(check, workspace, final_text, cancel=cancel)
         checks.append({"index": index, "kind": check["kind"],
                        "result": {True: "passed", False: "failed", None: "unavailable"}[outcome]})
     trace_check = None
@@ -593,6 +654,9 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         "checks": checks, "usage": usage,
         "skipped_compactions": sum(1 for turn in case.get("turns", []) if turn.get("compact_before")),
     }
+    if agent_error:
+        record["error_kind"] = failure_kind("\n".join(t["stderr_tail"] + "\n" + t.get("result_tail", "")
+                                                      for t in turns), agent_error)
     if trace_check is not None:
         record["discovery_trace"] = trace_check
     if keep:
@@ -612,6 +676,29 @@ def percentile95(values):
     return ordered[(95 * len(ordered) + 99) // 100 - 1] if ordered else None
 
 
+def failure_kind(stderr, error):
+    """Classify only explicit setup failures; task/tool failures must not disable later cases."""
+    message = (stderr + "\n" + error).lower()
+    if any(s in message for s in ("no api key found", "missing api key", "invalid api key", "authentication_error",
+                                  "not authenticated", "not logged in", "http 401", "failed to authenticate",
+                                  "oauth session expired", "no anthropic credentials found")):
+        return "authentication"
+    if (("model" in message and any(s in message for s in ("was not found", "model_not_found", "unknown model")))
+            or "no model configured" in message):
+        return "model"
+    if any(s in message for s in ("unexpected argument", "unknown option", "unrecognized arguments", "could not start")):
+        return "startup"
+    return "execution"
+
+
+def measurement(trials, field):
+    values = [t["usage"][field] for t in trials if field in t["usage"].get(
+        "known_fields", MEASUREMENT_FIELDS if t["usage"]["usage_complete"] else [])
+        and t["usage"].get(field) is not None]
+    return {"total": sum(values) if values else None, "median": median(values),
+            "known_trials": len(values), "trials": len(trials)}
+
+
 def summarize(trials, agents):
     summary = {}
     for agent in agents:
@@ -623,6 +710,10 @@ def summarize(trials, agents):
             "passed_trials": len(passed),
             "pass_rate": len(passed) / len(own) if own else None,
             "agent_errors": sum(1 for t in own if t["agent_error"]),
+            "executed_trials": sum(t["agent_error"] is None for t in own),
+            "failed_check_trials": sum(t["agent_error"] is None and not t["passed"] for t in own),
+            "total_elapsed_ms_all": sum(t["elapsed_ms"] for t in own),
+            "measurements": {field: measurement(own, field) for field in MEASUREMENT_FIELDS},
             "median_elapsed_ms_all": median([t["elapsed_ms"] for t in own]),
             "median_elapsed_ms_passed": median([t["elapsed_ms"] for t in passed]),
             "p95_elapsed_ms_all": percentile95([t["elapsed_ms"] for t in own]),
@@ -636,7 +727,8 @@ def summarize(trials, agents):
             "median_output_tokens": median([t["usage"]["output"] for t in complete]),
             "median_requests": median([t["usage"]["requests"] for t in complete]),
             "total_tool_calls": sum(t["usage"]["tool_calls"] for t in own),
-            "total_tool_errors": sum(t["usage"]["tool_errors"] for t in own),
+            "total_tool_errors": (sum(t["usage"]["tool_errors"] for t in own)
+                                  if all(t["usage"]["tool_errors"] is not None for t in own) else None),
             "total_delegations": sum(t["usage"]["delegations"] for t in own),
             "tool_calls_by_name": dict(sorted(sum(
                 (collections.Counter(t["usage"]["tools"]) for t in own), collections.Counter()).items())),
@@ -681,11 +773,14 @@ def table(summary, by_case, agents):
     return "\n".join(lines)
 
 
-def version_of(agent):
+def version_of(agent, *, cancel=None):
     command = agent.get("version")
     if not command:
         return None
     try:
+        if cancel is not None:
+            return run_agent_process(command, cwd=None, env=dict(os.environ), stdin=subprocess.DEVNULL,
+                                     timeout=30, cancel=cancel).stdout.strip()
         return subprocess.run(command, capture_output=True, text=True, timeout=30).stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"unavailable: {error}"
@@ -706,9 +801,9 @@ def binary_identity(command):
     return {"binary_path": path, "binary_sha256": digest.hexdigest()}
 
 
-def agent_identity(agent):
+def agent_identity(agent, *, cancel=None):
     """Captured before any trial, so the report states which binary and version produced its trials."""
-    return {"version": version_of(agent), **binary_identity(agent["first"])}
+    return {"version": version_of(agent, cancel=cancel), **binary_identity(agent["first"])}
 
 
 def trial_plan(agents, cases, repetitions, seed):
