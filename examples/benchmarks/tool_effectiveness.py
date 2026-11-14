@@ -250,7 +250,7 @@ def summarize_tools(payload, expectations=None):
         for field in ("tool_calls_median", "tool_errors_median", "observed_tokens_median", "elapsed_ms_median"):
             before_total = total([baseline_tasks[name]["per_success"][field] for name in matched])
             after_total = total([by_id[name]["per_success"][field] for name in matched])
-            ratios[field] = after_total / before_total if before_total else None
+            ratios[field] = after_total / before_total if before_total and after_total is not None else None
         comparisons.append({
             "name": configuration["name"],
             "matched_success_tasks": matched,

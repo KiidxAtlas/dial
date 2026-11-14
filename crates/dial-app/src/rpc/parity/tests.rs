@@ -44,7 +44,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "anonymize",
     "archive",
     "autoresearch",
-    "benchmark",
     "branch",
     "btw",
     "changelog",

@@ -486,3 +486,25 @@ fn only_completed_attempts_start_the_cooldown() {
     .unwrap();
     assert!(!path.exists());
 }
+
+#[test]
+fn releasing_a_vector_lease_unlocks_inherited_file_descriptions() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("vector.json");
+    let lease = lock_vector(&path).unwrap();
+    // A subprocess fork can keep this open-file description alive until exec.
+    let inherited = lease.file.try_clone().unwrap();
+    assert!(
+        lock_vector(&path).is_err(),
+        "the live owner remains exclusive"
+    );
+    drop(lease);
+    let replacement = lock_vector(&path).expect("dropping the owner releases its lease");
+    drop(inherited);
+    assert!(
+        lock_vector(&path).is_err(),
+        "the new owner remains exclusive"
+    );
+    drop(replacement);
+    assert!(lock_vector(&path).is_ok());
+}

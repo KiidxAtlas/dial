@@ -1,6 +1,6 @@
 //! Behavioral regression for progress-aware automatic repair, driven through the real turn loop
 //! against the deterministic scripted backend. No live model, network or sleeps are involved.
-use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled as with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled;
 use crate::agent::*;
 
 const COMMAND: &str = "grep -q ok input || { echo \"AssertionError: input is not ok\"; exit 1; }";
@@ -9,6 +9,17 @@ fn check_config() -> String {
     format!(
         "[compaction]\nenabled=false\n[verification]\nautomatic_checks=true\n[[verification.commands]]\nname=\"ready\"\ncommand='{COMMAND}'\ntimeout_secs=5\n[verification.inputs.ready]\npaths=[\"input\"]\n[verification.requirements.delivery]\nchecks=[\"ready\"]\n"
     )
+}
+
+fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    with_review_disabled(overlay, |agent| {
+        // These tests exercise repair progress, not input-capture wall-clock exhaustion.
+        let _budget = crate::agent::verify::inputs::scope_workspace_budget(
+            agent.workspace.root(),
+            std::time::Duration::from_secs(600),
+        );
+        f(agent)
+    })
 }
 
 fn calls(calls: &[(&str, Value)]) -> llm::fake::Script {

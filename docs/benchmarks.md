@@ -2,6 +2,93 @@
 
 Benchmark suites, efficiency measurement, workflow regression checks, configuration comparisons and assistance ablation.
 
+## Interactive comparisons: `/benchmark`
+
+In a Dial session, run `/benchmark` (or `/benchmark open`) to open the **local browser workspace**.
+Select installed agents and compatible task suites, enter the shared model ID, repetitions and
+per-turn timeout, then confirm quota use and local command execution. Opening the workspace does
+not run a model. This is a browser-based picker and live scoreboard launched from the terminal,
+not a new terminal overlay. `/benchmark status` returns its URL; `/benchmark stop` requests
+cancellation and shuts down that workspace (a workspace that does not answer within three seconds
+is killed). Existing `/benchmark <suite.toml> [flags]` commands still use the native benchmark CLI.
+
+The workspace requires **Python 3.11+ and a Dial checkout** containing `examples/benchmarks/`,
+on macOS or Linux (trials use POSIX process groups and `/bin/sh` checks; Windows is unsupported).
+From another project, set `DIAL_BENCHMARK_ROOT` to that checkout before starting Dial. It reuses
+`cross_agent.py` for execution, scoring, usage parsing and balanced trial order. Agent definitions
+come from `examples/benchmarks/cross-agent.toml`: **Dial, OMP, Claude Code and Hermes**.
+Unavailable executables are disabled, not installed. Each CLI needs its own authentication;
+Dial's subscription login does not authenticate OMP. The shared model must be the provider's
+exact ID (for example, **`claude-sonnet-4-6`**, not `claude-sonnet-4.6`). The known rejected spelling
+is refused before running any trials. Availability is not proof of authentication or a live
+provider connection. Harbor and SWE-bench
+retain their separate provisioned runners and **are not selectable in this workspace yet**.
+Suites needing native observations/integrations or missing fixtures are disabled. Portable checks
+are scored equally; excluded checks remain explicit in the final report. Suites with overlapping
+case IDs must be run separately. The workspace limits selections to 1000 sequential trials.
+
+Live results update after each graded trial, with the current agent/case visible while it runs.
+The per-agent scoreboard and final image include total/median/p95 wall time, requests, tool calls,
+tool errors, delegations, input, uncached input, cache-read, cache-write and output tokens.
+The browser additionally shows all-attempt wall/tokens per success, usage medians, observed tool
+names/models and Dial efficiency coverage; individual trial details expose checks, exit codes,
+redacted error excerpts, private stderr-log paths and available efficiency counters.
+Cache read/write are **included in input**, not additional prompt tokens. Each usage measurement
+has its own known-trial coverage; totals cover only those known trials, not a zero-filled estimate
+of the whole run. Failed attempts with reported usage remain included. Request counts are those
+reported by each adapter, not an independent count of network retries. Claude Code requests count
+unique streamed assistant message IDs. Hermes sidecars report main-session tokens/requests;
+tool counts, tool errors and delegated usage are unknown without session evidence. Prices are not
+invented and no cost estimate is derived from an unverified pricing table.
+
+All failures count in all-attempt wall times; grading/diagnostic capture is outside that timer.
+Explicit authentication, model-not-found and unsupported-CLI startup errors disable only the
+affected agent's remaining trials, and only when the failing trial made no tool calls (an agent
+that already ran tools got past setup, and its stderr can echo tool output). They are retained as
+**skipped**, never task-check failures; other agents continue. Ordinary execution/check failures
+do not disable later trials. Model IDs are not validated by name; the agent CLI's own rejection is
+the evidence. If the runner itself crashes, its traceback is kept privately in the run's
+`logs/runner-error.txt`. The page
+distinguishes aggregate errors across all agents from each agent's own errors. Open a trial for
+its reason; fix credentials in that agent separately before starting another comparison.
+Runs with skips are incomplete; runs where every invocation fails are invalid, not a measured
+zero score. Cancellation stops the active agent/check process group and retains completed evidence.
+
+The CLIs execute with approval prompts bypassed. A disposable working directory is **not a
+sandbox**: only select trusted agents/suites. OMP, Claude Code and Hermes retain installed state.
+Claude Code maps thinking-off to `alwaysThinkingEnabled:false` with low effort; Hermes maps it
+to `--reasoning none`. Other thinking levels map explicitly to each CLI's options. The runner
+applies the existing turn timeout/grace to CLIs without a native wall-clock flag.
+
+Each run creates a unique private `benchmarks/runs/<timestamp>-<id>/` directory containing the
+selection, incremental `progress.json`, final `report.json`, private per-turn logs and automatically
+generated **`comparison.svg`**. The workspace shows the image and offers SVG, JSON and **PNG**
+downloads (PNG conversion runs in the browser). Partial/invalid images carry their actual status.
+No generative image service is used. Raw logs and reports may contain private material; inspect
+before sharing. Do not interpret offline fixture checks as live-model quality evidence.
+
+After updating the checkout, finish/cancel any active run, then `/benchmark stop` and `/benchmark`
+to restart the Python workspace with the new code. Merely refreshing an older running controller
+does not update its Python implementation. Existing saved runs are not rewritten.
+
+**Settings are separate.** Dial trials have a fresh `DIAL_HOME` and discard ambient `DIAL_*`
+overrides before applying the explicit agent environment. Only the declared subscription-auth
+home is shared; provider credential environment variables remain available for authentication.
+Personal settings are never rewritten. This measures the selected executable's shipped defaults,
+not a claim that those defaults are optimal. Other agents retain their declared installed state;
+the page and image disclose that asymmetry. Keep model, thinking, suite and executable identities
+matched when comparing results. Promote tuning to everyday settings only after a matched run
+demonstrates the desired quality/cost/latency tradeoff.
+
+Native RPC exposes the same launch owner with `{"method":"benchmark","params":{"action":"open"}}`
+(`status` and `stop` are also accepted). The returned capability-scoped loopback URL serves the
+selection page and a frontend-neutral API: `GET api/catalog`, `GET api/state`, `POST api/start`
+(`agents`, `suites`, `model`, `thinking`, `repetitions`, `timeout`, `confirm:true`), and
+`POST api/cancel`. POSTs require JSON and `X-Dial-Benchmark: 1`; cross-origin requests and
+unexpected Hosts are refused. The URL is private. ACP does not expose this capability.
+
+Offline contracts: `python3 -m unittest discover -s examples/benchmarks -p 'test_benchmark_dashboard.py'`.
+
 The `examples/benchmarks/lifecycle-efficiency.toml` slice covers a self-contained answer, a read-only
 workspace investigation and a completed calculator fix. Run it deliberately with a configured model:
 

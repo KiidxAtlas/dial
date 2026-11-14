@@ -280,6 +280,67 @@ fn completion_is_visible_before_pumping_and_an_early_ack_is_not_redelivered() {
 }
 
 #[test]
+fn wait_pumps_completion_bookkeeping_after_the_body_has_settled() {
+    for target in [Some("task-1"), None] {
+        let mut tasks = LiveTasks::default();
+        let body = tasks.tree.start("worker", "settled before Done", None);
+        let value = json!({"id":"task-1","status":"done","result":"finished"});
+        settle_result(&body, &value);
+        tasks.jobs.insert(
+            "task-1".into(),
+            JobState {
+                control: None,
+                body,
+                interrupt: Arc::new(AtomicBool::new(false)),
+                worker: Some(std::thread::spawn(|| {})),
+                active_tool: Arc::default(),
+                delivered: false,
+            },
+        );
+        // Release Done only once wait observes pending bookkeeping. No timing window
+        // or sleeping worker is needed to reproduce body publication before Done.
+        struct CompletingUi(Option<mpsc::Sender<Event>>);
+        impl Ui for CompletingUi {
+            fn pending_input(&mut self) -> bool {
+                if let Some(tx) = self.0.take() {
+                    tx.send(Event::Done(
+                        "task-1".into(),
+                        json!({"id":"task-1","status":"done","result":"finished"}),
+                    ))
+                    .unwrap();
+                    crate::platform::wake::signal();
+                }
+                false
+            }
+        }
+        let mut ui = CompletingUi(Some(tasks.tx.clone()));
+        let (_, stopped) = tasks
+            .wait(
+                target,
+                5,
+                ApprovalGate {
+                    approval: Approval::Ask,
+                    read_only: false,
+                    rules: &mut Vec::new(),
+                    root: std::path::Path::new("."),
+                    extra_roots: &[],
+                    layout: None,
+                    cost: &mut None,
+                },
+                &AtomicBool::new(false),
+                &mut ui,
+            )
+            .unwrap();
+        assert!(stopped.is_none());
+        assert!(
+            tasks.running_ids().is_empty(),
+            "wait must drain Done and join"
+        );
+        assert!(ui.0.is_none(), "wait observed the unfinished bookkeeping");
+    }
+}
+
+#[test]
 fn transcript_persistence_policy_applies_while_live_and_after_every_terminal_phase() {
     use crate::agent::workers::child_transcript::{messages, scan};
     let project = tempfile::tempdir().unwrap();

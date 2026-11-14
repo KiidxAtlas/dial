@@ -154,3 +154,43 @@ fn an_exhausted_time_budget_is_unknown_never_a_snapshot() {
     TIME_OVERRIDE.with(|forced| forced.set(None));
     assert!(exhausted.is_none());
 }
+
+#[test]
+fn a_scoped_workspace_budget_reaches_other_threads_and_isolates_roots() {
+    let scoped = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    for root in [&scoped, &other] {
+        fs::write(root.path().join("a"), "one").unwrap();
+    }
+    let scoped_ws = Workspace::new(scoped.path()).unwrap();
+    let other_ws = Workspace::new(other.path()).unwrap();
+    let _budget = scope_workspace_budget(scoped_ws.root(), Duration::ZERO);
+    // A zero allowance fails closed on the worker thread that actually captures the inputs.
+    let root = scoped_ws.root().to_path_buf();
+    let on_worker = std::thread::spawn(move || {
+        let workspace = Workspace::new(&root).unwrap();
+        capture(&workspace, &declared(&["a"]))
+    })
+    .join()
+    .unwrap();
+    assert_eq!(on_worker, None);
+    assert_eq!(capture(&scoped_ws, &declared(&["a"])), None);
+    // Other workspaces keep the production allowance.
+    assert!(capture(&other_ws, &declared(&["a"])).is_some());
+}
+
+#[test]
+fn a_scoped_workspace_budget_is_restored_on_drop_and_thread_override_wins() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a"), "one").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let budget = scope_workspace_budget(workspace.root(), Duration::ZERO);
+    assert_eq!(capture(&workspace, &declared(&["a"])), None);
+    // The thread-local override is consulted before any scoped allowance.
+    TIME_OVERRIDE.with(|forced| forced.set(Some(Duration::from_secs(3600))));
+    let overridden = capture(&workspace, &declared(&["a"]));
+    TIME_OVERRIDE.with(|forced| forced.set(None));
+    assert!(overridden.is_some());
+    drop(budget);
+    assert!(capture(&workspace, &declared(&["a"])).is_some());
+}

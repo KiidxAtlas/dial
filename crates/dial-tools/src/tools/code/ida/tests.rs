@@ -84,6 +84,17 @@ fn sample_binary(root: &Path) {
 
 #[test]
 fn only_list_runs_without_approval_or_workspace_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    sample_binary(dir.path());
+    let names = || {
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = (names(), fs::read(dir.path().join("a.bin")).unwrap());
     let ida = ida_with(String::new());
     assert!(!ida.needs_approval(&json!({"action": "list"})));
     assert!(!ida.may_modify_workspace(&json!({"action": "list"})));
@@ -91,6 +102,14 @@ fn only_list_runs_without_approval_or_workspace_mutation() {
         ida.concurrency(&json!({"action": "list"})),
         Concurrency::Shared
     ));
+    let listed = call(&ida, dir.path(), json!({"action": "list"}));
+    assert!(!listed.is_error, "{}", listed.text);
+    assert_eq!(listed.text, "No IDA databases open.");
+    assert_eq!(
+        (names(), fs::read(dir.path().join("a.bin")).unwrap()),
+        before,
+        "list must not write to the workspace"
+    );
     for action in ["open", "exec", "close", "save", "rename", "not-an-action"] {
         assert!(
             ida.needs_approval(&json!({"action": action})),

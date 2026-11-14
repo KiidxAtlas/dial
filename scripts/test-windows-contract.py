@@ -5,6 +5,7 @@ import os
 import sys
 import importlib.util
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -75,7 +76,8 @@ class WindowsContractTests(unittest.TestCase):
             with self.subTest(host=host), patch.dict(os.environ, {"DIAL_EMBEDDED_SHELL_HOST": "C:\\stale.exe"}):
                 result, run, _, _ = self.run_fixture(summary(1), tests=tests, host=host)
                 self.assertEqual(result, 0)
-                self.assertEqual(run.call_count, 2)
+                # One prebuild per distinct target selection, then one run per filter; all get the host.
+                self.assertEqual(run.call_count, 4)
                 for call in run.call_args_list:
                     self.assertEqual(call.kwargs["env"].get("DIAL_EMBEDDED_SHELL_HOST"), expected)
 
@@ -91,7 +93,7 @@ class WindowsContractTests(unittest.TestCase):
                     contextlib.redirect_stdout(stdout):
                 self.assertEqual(contract.main(), 0)
         prepare.assert_called_once_with("cargo", "ci", dry_run=False)
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_count, 2)  # the target prebuild, then the filter
         self.assertEqual(run.call_args.kwargs["env"]["DIAL_EMBEDDED_SHELL_HOST"], "/built/dial")
 
     def test_print_shows_host_preparation_without_building(self):
@@ -125,6 +127,7 @@ class WindowsContractTests(unittest.TestCase):
     def test_each_filter_must_execute_tests(self):
         tests = [(["--workspace", "--lib"], name) for name in ("platform::", "missing::")]
         with patch.object(contract.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, stdout=""),
                 subprocess.CompletedProcess([], 0, stdout=summary(1)),
                 subprocess.CompletedProcess([], 0, stdout=summary())]):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -134,7 +137,8 @@ class WindowsContractTests(unittest.TestCase):
         tests = [(["--workspace", "--lib"], name) for name in ("broken::", "platform::")]
         result, run, output, error = self.run_fixture("compile failed\n", code=101, tests=tests)
         self.assertEqual(result, 101)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("contract prebuild failed", error)
         self.assertIn("compile failed", output)
         self.assertIn("Windows contract failed in filter `broken::`", error)
         self.assertIn("Windows contract failures: `broken::`, `platform::`", error)
@@ -183,11 +187,81 @@ class WindowsContractTests(unittest.TestCase):
         for target, _ in tests:
             self.assertNotIn("--workspace", target)
         ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        job = ci.split("\n  test:\n", 1)[1].split("\n  lint:\n", 1)[0]
-        self.assertIn("--contract scripts/macos-contract.txt --label macOS", job)
-        for step in ("Build", "Install cargo-nextest (verified archive)", "Test"):
-            body = job.split(f"- name: {step}\n", 1)[1].split("\n      - ", 1)[0]
-            self.assertIn("if: runner.os == 'Linux'", body, step)
+        macos = ci.split("\n  test:\n", 1)[1].split("\n  linux-tests:\n", 1)[0]
+        self.assertIn("os: [macos-15]", macos)
+        self.assertIn("--contract scripts/macos-contract.txt --label macOS", macos)
+        for step in ("- name: Build\n", "cargo-nextest", "make test-nextest"):
+            self.assertNotIn(step, macos)
+
+    def test_linux_gate_keeps_the_required_check_and_needs_every_linux_job(self):
+        root = Path(contract.__file__).resolve().parent.parent
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        tests = ci.split("\n  linux-tests:\n", 1)[1].split("\n  linux-runtime:\n", 1)[0]
+        self.assertIn("partition: [1, 2]", tests)
+        self.assertIn("NEXTEST_PARTITION=hash:${{ matrix.partition }}/2", tests)
+        self.assertIn("NEXTEST_DOCTESTS=${{ matrix.partition == 2 && '1' || '0' }}", tests)
+        gate = ci.split("\n  linux-gate:\n", 1)[1].split("\n  lint:\n", 1)[0]
+        self.assertIn("name: fmt, build, test (ubuntu-22.04)\n", gate)
+        self.assertIn("needs: [linux-tests, linux-runtime]", gate)
+        self.assertIn("if: always()", gate)
+        self.assertIn('test "$TESTS" = success && test "$RUNTIME" = success', gate)
+
+    def test_prebuild_compiles_exactly_the_filter_targets_together(self):
+        tests, _ = self.parse("test-lib dial-core platform::\n"
+                              "test-lib dial-tools tools::\n"
+                              "test-lib dial-core more::\n"
+                              "test-bin dial dial cmd::\n"
+                              "test-integration dial integration isolation::\n")
+        build = ["cargo", "test", "--locked", "--profile", "ci", "--no-run",
+                 "--message-format=json-render-diagnostics"]
+        self.assertEqual(contract.prebuild_commands(tests, "ci"), [
+            [*build, "--package", "dial-core", "--package", "dial-tools", "--lib"],
+            [*build, "--package", "dial", "--bin", "dial"],
+            [*build, "--package", "dial", "--test", "integration"],
+        ])
+        result, run, _, _ = self.run_fixture(summary(2), tests=tests)
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_count, 3 + len(tests))
+        self.assertIn("--no-run", run.call_args_list[0].args[0])
+        self.assertIn("--message-format=json-render-diagnostics", run.call_args_list[0].args[0])
+        self.assertNotIn("--no-run", run.call_args_list[3].args[0])
+
+    def test_filters_run_prebuilt_binaries_so_cargo_never_rebuilds(self):
+        def artifact(kind, name, exe, manifest="/repo/crates/x/Cargo.toml", test=True):
+            return json.dumps({"reason": "compiler-artifact", "executable": exe,
+                               "manifest_path": manifest, "profile": {"test": test},
+                               "target": {"kind": [kind], "name": name}}) + "\n"
+        lib_build = (artifact("lib", "dial_core", "/t/dial_core-1", "/repo/crates/dial-core/Cargo.toml")
+                     + artifact("lib", "dial_core", "/t/not-a-test", test=False)
+                     + "not json\n")
+        bin_build = artifact("bin", "dial", "/t/dial-2", "/repo/Cargo.toml")
+        tests, skips = self.parse("test-lib dial-core platform::\n"
+                                  "test-bin dial dial cmd::\n"
+                                  "test-lib dial-llm missing::\n"
+                                  "skip platform::unix # POSIX only\n")
+        with patch.object(contract.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, stdout=lib_build, stderr=""),
+                subprocess.CompletedProcess([], 0, stdout=bin_build, stderr=""),
+                subprocess.CompletedProcess([], 0, stdout=summary(4)),
+                subprocess.CompletedProcess([], 0, stdout=summary(3)),
+                subprocess.CompletedProcess([], 0, stdout=summary(1))]) as run:
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(contract.run_contract(tests, skips, "ci"), 0)
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(calls[2], ["/t/dial_core-1", "platform::", "--skip", "platform::unix"])
+        self.assertEqual(run.call_args_list[2].kwargs["cwd"], str(Path("/repo/crates/dial-core")))
+        self.assertEqual(calls[3], ["/t/dial-2", "cmd::", "--skip", "platform::unix"])
+        # No built executable for this target: Cargo still runs it rather than skipping coverage.
+        self.assertEqual(calls[4][:2], ["cargo", "test"])
+        self.assertIn("VERIFIED platform::: 4 tests passed", out.getvalue())
+
+    def test_a_failed_prebuild_falls_back_to_cargo_for_every_filter(self):
+        tests, _ = self.parse("test-lib dial-core platform::\n")
+        result, run, _, error = self.run_fixture("error\n", code=101, tests=tests)
+        self.assertEqual(result, 101)
+        self.assertIn("prebuild failed", error)
+        self.assertEqual(run.call_args_list[1].args[0][:2], ["cargo", "test"])
 
 
 if __name__ == "__main__":

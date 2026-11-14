@@ -13,7 +13,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 license = "MIT"
 
@@ -237,11 +237,13 @@ debug = false
 [profile.dev.package.sha2]
 opt-level = 3
 
-# Shipped binaries: thin cross-crate LTO, no symbols. Fat LTO with one codegen unit took
-# 14-43 min per release target for no measurable gain in an I/O-bound agent; thin LTO keeps
-# cross-crate inlining and compiles in parallel.
+# Shipped binaries: no cross-crate LTO, no symbols. Fat LTO with one codegen unit took 14-43 min
+# per release target, and thin cross-crate LTO still spent about 30% of the warm workspace
+# rebuild that release candidate jobs pay on a dependency-cache hit (local Apple Silicon: 150 s
+# thin vs 105 s off), for no measured startup gain in an I/O-bound agent. `false` keeps Cargo's
+# crate-local thin LTO across each crate's codegen units.
 [profile.release]
-lto = "thin"
+lto = false
 codegen-units = 16
 strip = true
 

@@ -119,8 +119,17 @@ def require_harness():
     return version
 
 
-def comparison_agents(path, *, dial_sandbox_off=False):
+DEFAULT_AGENTS = Path(__file__).with_name("cross-agent.toml")
+
+
+def comparison_agents(path, *, dial_sandbox_off=False, select_pair=None):
     agents = cross_agent.load_agents(path)
+    if select_pair is None:
+        # Only the shared catalog (which also serves the dashboard) holds extra agents by design.
+        # A custom --agents file must contain exactly the pair, so a wrong file fails loudly.
+        select_pair = Path(path).resolve() == DEFAULT_AGENTS.resolve()
+    if select_pair:
+        agents = [agent for agent in agents if agent["name"] in {"dial", "omp"}]
     if len(agents) != 2 or {a["name"] for a in agents} != {"dial", "omp"}:
         raise ValueError("this comparison requires exactly dial and omp")
     # Keep installed authentication in place; never copy grants into trial roots.
@@ -400,7 +409,7 @@ def main():
     prep = commands.add_parser("prepare")
     prep.add_argument("--dataset", type=Path, required=True, help="frozen selected rows, including grader metadata")
     prep.add_argument("--manifest", type=Path, required=True)
-    prep.add_argument("--agents", type=Path, default=Path(__file__).with_name("cross-agent.toml"))
+    prep.add_argument("--agents", type=Path, default=DEFAULT_AGENTS)
     prep.add_argument("--model", default="claude-sonnet-4-6")
     prep.add_argument("--timeout", type=int, default=900)
     prep.add_argument("--seed", type=int, default=0)

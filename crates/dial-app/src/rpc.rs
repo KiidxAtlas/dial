@@ -72,6 +72,7 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "jobs"
                 | "session_control"
                 | "schema"
+                | "benchmarks"
         ))
 }
 
@@ -1707,6 +1708,33 @@ fn run_control(
                     let result = auth::ensure_v2(&out).and_then(|()| {
                         auth::mcp_logout(&auth_state, &auth_dir, &request["params"])
                     });
+                    out.result(&id, result);
+                }
+                "benchmark" if !acp => {
+                    let params = &request["params"];
+                    let action = params
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("open");
+                    let valid = params.is_null()
+                        || params.as_object().is_some_and(|p| {
+                            p.keys().all(|key| key == "action")
+                                && p.get("action").is_none_or(Value::is_string)
+                        });
+                    let result = if !valid || !matches!(action, "open" | "status" | "stop") {
+                        Err(coded(
+                            ErrorCode::InvalidParams,
+                            "benchmark requires action open, status or stop",
+                        ))
+                    } else if busy.load(Ordering::SeqCst) && action == "open" {
+                        Err(coded(
+                            ErrorCode::Busy,
+                            "wait for the current turn before opening benchmarks",
+                        ))
+                    } else {
+                        crate::benchmark::dashboard::handle(&question_root, action)
+                            .map_err(|error| coded(ErrorCode::Failed, error))
+                    };
                     out.result(&id, result);
                 }
                 "list_jobs" | "stop_job" | "list_sessions" | "delete_session" | "pin_session"

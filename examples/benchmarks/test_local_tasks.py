@@ -40,7 +40,8 @@ class SnakeTest(unittest):
 REFERENCE = {
     "research-cited-comparison": {"answer.md": "source_a.md: Alpha grew 3 percent in 2025.\n"
                                                "source_b.md: Beta shrank 2 percent in 2025.\n"},
-    "deferred-tool-discovery": {"answer.txt": "bounded_total\n"},
+    "deferred-tool-discovery": {"ledger.py": "def bounded_total(rows):\n    return min(sum(rows), 250)\n\n\n"
+                                             "def total(rows):\n    return sum(rows)\n"},
     "unavailable-tool-recovery": {"summary.txt": "alpha beta\n"},
     "read-edit-test-program": {"calc.py": "def add(a, b):\n    return a + b\n"},
     DENIAL: {},
@@ -146,9 +147,17 @@ class LocalTasksSuiteTests(unittest.TestCase):
         self.assertTrue(all(command_outcomes(DENIAL)))
         self.assertFalse(all(command_outcomes(DENIAL, outside="x")))
 
-    def test_deferred_discovery_needs_the_real_ast_search_path(self):
-        self.assertIn("ast_search", CASES["deferred-tool-discovery"]["prompt"])
-        self.assertIn("ast_search", {c.get("tool") for c in CASES["deferred-tool-discovery"]["checks"]})
+    def test_deferred_discovery_needs_a_real_deferred_tool_path(self):
+        case = CASES["deferred-tool-discovery"]
+        self.assertIn("ast_edit", case["prompt"])
+        tools = {c.get("tool") for c in case["checks"]} - {None}
+        self.assertEqual(tools, {"tool_search", "ast_edit"})
+        # tool_load and ast_search were folded into tool_search and grep; checks on them cannot pass.
+        self.assertFalse(tools & {"tool_load", "ast_search"})
+
+    def test_deferred_discovery_rejects_a_changed_neighbour(self):
+        broken = REFERENCE["deferred-tool-discovery"]["ledger.py"].replace("return sum(rows)", "return 250")
+        self.assertFalse(command_outcomes("deferred-tool-discovery", {"ledger.py": broken})[0])
 
     def test_integration_path_checks_are_declared_and_not_outcomes(self):
         kinds = {case_id: {c["kind"] for c in CASES[case_id]["checks"]} for case_id in CASES}

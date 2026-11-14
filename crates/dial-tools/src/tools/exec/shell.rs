@@ -575,10 +575,12 @@ fn drain_after_exit<R: Read + crate::platform::io::Pipe>(
     eof: &mut bool,
     waiter: &crate::platform::wake::Waiter,
     on_output: &(dyn Fn(&[u8]) + Sync),
+    grace_limit: Duration,
 ) -> Result<(), String> {
-    const GRACE: Duration = Duration::from_millis(300);
     let grace = Instant::now();
-    while !*eof && capture_error.is_none() && grace.elapsed() < GRACE {
+    // Probe once more after a wait, even if scheduling used up the grace. Readiness (including EOF)
+    // may already be available; the deadline bounds additional waiting, not this nonblocking probe.
+    while !*eof && capture_error.is_none() {
         match drain_pipe(reader, capture, spool, artifact_error, on_output) {
             Ok(closed) => *eof = closed,
             Err(error) => {
@@ -587,20 +589,23 @@ fn drain_after_exit<R: Read + crate::platform::io::Pipe>(
             }
         }
         if !*eof {
+            if grace.elapsed() >= grace_limit {
+                break;
+            }
             waiter
                 .wait(
                     Some(&*reader),
                     None::<&Child>,
-                    Some(GRACE.saturating_sub(grace.elapsed())),
+                    Some(grace_limit.saturating_sub(grace.elapsed())),
                 )
                 .map_err(|e| format!("waiting for command output: {e}"))?;
         }
     }
     if !*eof && capture_error.is_none() {
-        *capture_error = Some(
-            "pipe did not reach EOF within the 300ms cleanup grace; output may be incomplete"
-                .to_string(),
-        );
+        *capture_error = Some(format!(
+            "pipe did not reach EOF within the {}ms cleanup grace; output may be incomplete",
+            grace_limit.as_millis(),
+        ));
     }
     Ok(())
 }
@@ -814,6 +819,56 @@ fn effective_timeout(requested: Option<u64>, cap: u64) -> u64 {
     }
 }
 
+/// Explicit command-result semantics, never inferred from diagnostic text. Acceptance checks
+/// and managed jobs retain their own unmodified exit contracts.
+fn expected_exit_codes(args: &Value) -> Result<Vec<i32>, String> {
+    let Some(value) = args.get("expected_exit_codes") else {
+        return Ok(vec![0]);
+    };
+    let values = value
+        .as_array()
+        .filter(|values| !values.is_empty() && values.len() <= 8)
+        .ok_or("expected_exit_codes needs 1..8 integers in 0..255")?;
+    let codes = values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|code| *code <= 255)
+                .map(|code| code as i32)
+                .ok_or_else(|| "expected_exit_codes needs 1..8 integers in 0..255".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for field in ["check", "background", "pty", "trace"] {
+        if opt_bool(args, field)? {
+            return Err(format!(
+                "expected_exit_codes is for foreground inspection, not {field}=true"
+            ));
+        }
+    }
+    Ok(codes)
+}
+
+fn append_exit_note(text: &mut String, command: &str, code: i32, expected: &[i32]) {
+    let silent = text == "(no output)\n";
+    text.push_str(&format!("[exit code: {code}]\n"));
+    if code != 0 && expected.contains(&code) {
+        text.push_str("[accepted command result: exit code explicitly listed in expected_exit_codes; not verification evidence]\n");
+    }
+    if code == 0
+        && let Some(failure) = super::minimizer::masked_failure(command, text)
+    {
+        text.push_str(&format!(
+            "[exit 0 is the last step's status; earlier output reports a failure: {failure}. Confirm that step succeeded before relying on its result]\n"
+        ));
+    }
+    if silent && let Some(meaning) = super::minimizer::silent_exit_meaning(command, code) {
+        text.push_str(&format!(
+            "[exit {code} without output conventionally means {meaning}]\n"
+        ));
+    }
+}
+
 /// Executes the platform-native shell with bounded live chunks, artifact capture, and cooperative cancellation.
 /// The callback runs before the final result, on the calling thread, with at most 16 KiB.
 /// Cancellation is checked at least once per wait slice (100 ms) and after every pipe-drain pass (at most 256 KiB).
@@ -860,7 +915,7 @@ pub fn bash_tool_streaming_with_adopter(
     if opt_bool(args, "pty")? {
         return Err("bash pty=true requires the managed bg registry; use the native execution boundary or bg start with pty=true".into());
     }
-    with_bash_interceptor(ws, args, |command| {
+    with_bash_interceptor(ws, args, |command, expected_codes| {
         let trace = trace::prepare(ws, args, command)?;
         let mut output = run_bash(
             ws,
@@ -868,6 +923,7 @@ pub fn bash_tool_streaming_with_adopter(
             trace
                 .as_ref()
                 .map_or(command, |trace| trace.command.as_str()),
+            expected_codes,
             timeout_secs,
             auto_background_secs,
             on_output,
@@ -885,8 +941,9 @@ pub fn bash_tool_streaming_with_adopter(
 fn with_bash_interceptor(
     ws: &Workspace,
     args: &Value,
-    run: impl FnOnce(&str) -> Result<ToolOutput, String>,
+    run: impl FnOnce(&str, &[i32]) -> Result<ToolOutput, String>,
 ) -> Result<ToolOutput, String> {
+    let expected_codes = expected_exit_codes(args)?;
     let command = req_str(args, "command")?;
     if command.trim().is_empty() {
         return Err("command must not be empty".to_string());
@@ -919,7 +976,13 @@ fn with_bash_interceptor(
         }
         None => None,
     };
-    let mut output = run(command)?;
+    let mut output = run(command, &expected_codes)?;
+    if let Some(codes) = args.get("expected_exit_codes") {
+        let data = output.data.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(data) = data.as_object_mut() {
+            data.insert("expected_exit_codes".into(), codes.clone());
+        }
+    }
     if let Some(note) = bash_interceptor::exit_masking_hint(command) {
         output.text.push('\n');
         output.text.push_str(note);
@@ -953,7 +1016,7 @@ pub(super) fn bash_tool_pty(
     }
     // These flags cannot delay a PTY launch, but malformed values must not be silently ignored.
     opt_bool(args, "background")?;
-    with_bash_interceptor(ws, args, |command| {
+    with_bash_interceptor(ws, args, |command, _| {
         let (cwd, command) = working_directory(ws, args, command)?;
         let cwd = cwd.to_str().ok_or("working directory is not UTF-8")?;
         // Forward only supported launch fields. Explicit stdin keeps ConPTY input and resize
@@ -989,6 +1052,7 @@ fn run_bash(
     ws: &Workspace,
     args: &Value,
     command: &str,
+    expected_codes: &[i32],
     timeout_secs: u64,
     auto_background_secs: u64,
     on_output: &(dyn Fn(&[u8]) + Sync),
@@ -997,6 +1061,7 @@ fn run_bash(
 ) -> Result<ToolOutput, String> {
     let session = crate::tools::opt_str(args, "session")?;
     let asynchronous = opt_bool(args, "background")?;
+    let explicit_exit_codes = args.get("expected_exit_codes").is_some();
     if let Some(name) = session {
         if name.is_empty()
             || name.len() > 64
@@ -1065,7 +1130,15 @@ fn run_bash(
     }
     // Background requests need a child process, so they take the child-host path below.
     if !asynchronous && session.is_none() && runner_for(ws)? == Runner::InProcess {
-        return inprocess::run(ws, &command, &cwd, timeout_secs, on_output, cancel);
+        return inprocess::run(
+            ws,
+            &command,
+            &cwd,
+            timeout_secs,
+            expected_codes,
+            on_output,
+            cancel,
+        );
     }
     let entries_before = directory_entries(&cwd);
     let mut spool = ws
@@ -1118,7 +1191,11 @@ fn run_bash(
         .filter(|secs| *secs > 0)
         .map(|_| timeout)
         .filter(|timeout| !timeout.is_zero());
-    let mut adopt_after = adoption_deadline(auto_background, requested);
+    let mut adopt_after = if explicit_exit_codes {
+        None
+    } else {
+        adoption_deadline(auto_background, requested)
+    };
     // Set once no background owner could take the command (none registered, or every slot in use).
     // It then stays here under its own timeout: a refused hand-off would drop, and so stop, it.
     let mut adoption_refused = false;
@@ -1128,7 +1205,8 @@ fn run_bash(
         // Hard cancellation is read once per pass and outranks adoption: a cancelled command stays
         // with this owner, and the group kill below reaps it.
         let cancel_now = cancel.load(Ordering::Acquire);
-        let adoption_wanted = !adoption_refused
+        let adoption_wanted = !explicit_exit_codes
+            && !adoption_refused
             && adoption_due(
                 asynchronous,
                 crate::tools::exec::signals::steering_requested(),
@@ -1247,6 +1325,7 @@ fn run_bash(
         &mut eof,
         &waiter,
         on_output,
+        Duration::from_millis(300),
     )?;
 
     use crate::runtime::execution::Completeness;
@@ -1255,7 +1334,11 @@ fn run_bash(
     let elided = spool.as_ref().map(|spool| spool.elided_bytes());
     let mut text = captured_text(capture);
     let body_len = text.len();
-    let success = status.success() && !timed_out && !cancelled;
+    let success = status
+        .code()
+        .is_some_and(|code| expected_codes.contains(&code))
+        && !timed_out
+        && !cancelled;
     if cancelled {
         text.push_str("[cancelled; process group killed]\n");
     } else if timed_out {
@@ -1264,24 +1347,7 @@ fn run_bash(
         ));
         text.push_str("[foreground commands do not survive this timeout; for a dev server/watcher discover/load bg, reuse an existing process or start it with bg, then wait for readiness before browser navigation]\n");
     } else if let Some(code) = status.code() {
-        text.push_str(&format!("[exit code: {code}]\n"));
-        if code == 0
-            && let Some(failure) = super::minimizer::masked_failure(&command, &text)
-        {
-            // `step; ls` reports the last step's status; the model otherwise reads success.
-            text.push_str(&format!(
-                "[exit 0 is the last step's status; earlier output reports a failure: {failure}. Confirm that step succeeded before relying on its result]\n"
-            ));
-        }
-        if text.starts_with("(no output)\n")
-            && body_len == "(no output)\n".len()
-            && let Some(meaning) = super::minimizer::silent_exit_meaning(&command, code)
-        {
-            // The status is a result, not a failure; the model otherwise reruns or investigates.
-            text.push_str(&format!(
-                "[exit {code} without output conventionally means {meaning}]\n"
-            ));
-        }
+        append_exit_note(&mut text, &command, code, expected_codes);
     } else if let Some(signal) = crate::platform::process::exit_signal(&status) {
         text.push_str(&format!("[terminated by signal {signal}]\n"));
     }
@@ -1917,3 +1983,6 @@ mod tests;
 
 #[cfg(all(test, unix))]
 mod inprocess_tests;
+
+#[cfg(all(test, unix))]
+mod drain_tests;

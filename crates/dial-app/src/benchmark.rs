@@ -1,10 +1,11 @@
 //! Reproducible, local benchmark suite parsing, workspace isolation, and scoring.
+pub mod dashboard;
 #[cfg(test)]
 mod integration_tests;
 pub mod records;
 pub mod runtime;
 use crate::config::types::LeanLocal;
-pub use crate::workspace_copy::clone_project;
+pub use crate::workspace_copy::{clone_project, freeze_source};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1381,7 +1382,7 @@ impl BenchmarkSuite {
         O: FnMut(&CaseResult) -> Result<()>,
     {
         self.validate()?;
-        let frozen = clone_project(source_root)?;
+        let frozen = freeze_source(source_root)?;
         let source_root = frozen.path();
         let contract = if let Some(recorder) = recorder.as_ref() {
             ensure!(

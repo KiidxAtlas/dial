@@ -119,7 +119,7 @@
     ["anonymize", "[SESSION] [-o PATH]", "write an anonymized copy of a session (default: this one)"],
     ["images", "[status|doctor|probe|purge]", "image cache: status, doctor, probe, purge [--apply] [--all]"],
     ["update", "[VERSION]", "verify and install the latest signed release (then /restart)"],
-    ["benchmark", "[flags]", "run a coding benchmark suite in the background (same flags as `dial benchmark`)"],
+    ["benchmark", "[open|status|stop|flags]", "select agents and suites, watch live results, and export a comparison image"],
     ["relay", "start [ADDR]|stop|status", "local collaboration relay for /collab (start [ADDR], stop, status)"],
     ["hooks", "", "list configured lifecycle hooks"],
     ["weights", "[status|open|next|map|analyze|stats|activations|trace|experiment NAME [--budget N]|generate|direction NAME|edit NAME|combine NAME --edits a,b|evaluate EDIT --cases FILE|history|show ID|compare A B|prune|cases --session ID|improve [--with MODEL] GOAL|promote EDIT|revert]", "inspect local MLX model weights and run evaluation-gated weight edit experiments"]

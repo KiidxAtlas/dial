@@ -1619,3 +1619,32 @@ fn grep_preview_reports_budget_omissions_and_refuses_changed_locations() {
     );
     assert!(!stale.contains("1:def changed"), "{stale}");
 }
+
+#[test]
+fn grep_and_glob_change_nothing_and_skip_protected_paths() {
+    let (dir, ws) = workspace();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(private.join("hidden.rs"), "needle_private\n").unwrap();
+    fs::write(dir.path().join("open.rs"), "needle_open\n").unwrap();
+    let ws = ws.with_protected_paths(std::slice::from_ref(&private));
+    let open = dir.path().join("open.rs");
+    let modified = fs::metadata(&open).unwrap().modified().unwrap();
+    let found = run(&ws, "grep", json!({"pattern":"needle"}));
+    assert!(found.text.contains("needle_open"), "{}", found.text);
+    assert!(!found.text.contains("needle_private"), "{}", found.text);
+    assert_eq!(
+        found.execution.effects,
+        crate::runtime::execution::Effects::Known
+    );
+    assert!(found.execution.changed_paths.is_empty());
+    let globbed = run(&ws, "glob", json!({"pattern":"**/*.rs"}));
+    assert!(globbed.text.contains("open.rs"), "{}", globbed.text);
+    assert!(!globbed.text.contains("hidden.rs"), "{}", globbed.text);
+    assert_eq!(
+        globbed.execution.effects,
+        crate::runtime::execution::Effects::Known
+    );
+    assert_eq!(fs::read_to_string(&open).unwrap(), "needle_open\n");
+    assert_eq!(fs::metadata(&open).unwrap().modified().unwrap(), modified);
+}

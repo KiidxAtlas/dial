@@ -124,6 +124,71 @@ fn named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy() {
 
 #[cfg(unix)]
 #[test]
+fn embedded_inspection_exit_codes_preserve_nonmatches_and_errors() {
+    const CHILD: &str = "DIAL_TEST_INSPECTION_EXIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shell_sessions::embedded_inspection_exit_codes_preserve_nonmatches_and_errors",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                dial::embedded_shell::HOST_EXE_ENV,
+                env!("CARGO_BIN_EXE_dial"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    let ws = Workspace::new(dir.path())
+        .unwrap()
+        .without_sandbox()
+        .with_shell_backend(ShellBackend::Embedded);
+    for (command, error, code) in [
+        ("grep needle empty.txt", false, 1),
+        ("grep needle missing.txt", true, 2),
+        ("exit 3", true, 3),
+    ] {
+        let out = bash_tool_streaming_with_adopter(
+            &ws,
+            &json!({"command":command, "expected_exit_codes":[0,1]}),
+            10,
+            0,
+            &|_| {},
+            &AtomicBool::new(false),
+            &|_job| panic!("unexpected adoption"),
+        )
+        .unwrap();
+        assert_eq!(out.is_error, error, "{command}: {}", out.text);
+        assert_eq!(
+            out.execution.process.as_ref().unwrap().exit_code,
+            Some(code),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            out.data.as_ref().unwrap()["expected_exit_codes"],
+            json!([0, 1])
+        );
+        if code == 1 {
+            assert!(out.text.contains("no lines matched"), "{}", out.text);
+            assert!(out.text.contains("accepted command result"), "{}", out.text);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn named_state_saves_only_changed_exports_with_a_large_inherited_environment() {
     use dial::embedded_shell::state::{Exchange, State};
     use std::process::Command;

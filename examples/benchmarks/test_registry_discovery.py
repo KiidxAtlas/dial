@@ -137,7 +137,10 @@ class DiscoveryRunnerTests(unittest.TestCase):
                     agent = {"name": "dial", "output": "dial-json", "first": ["dial", "{prompt}"],
                              "follow_up": ["dial", "{prompt}"], "delegation_tools": ["task"],
                              "env": {"DIAL_HOME": "{trial_root}/dial-home"}, "delegated_usage": "included"}
+                    from cross_agent import run_agent_process as real_process
                     def execute(command, *, cwd, env, **kwargs):
+                        if command[0] != "dial":
+                            return real_process(command, cwd=cwd, env=env, **kwargs)
                         (cwd / "answer.json").write_text(json.dumps(ANSWER if valid_answer else {}))
                         messages = good_messages(mode) if valid_trace else good_messages(mode)[:-1]
                         write_session(Path(env["DIAL_HOME"]), messages)

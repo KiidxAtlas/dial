@@ -139,6 +139,13 @@ pub fn clone_project_except(source: &Path, ignored: &IgnoredPaths) -> Result<tem
     copy_project_with(source, crate::platform::fs::copy_on_write, ignored)
 }
 
+/// Freeze a checkout's source for a benchmark run: `clone_project` without its gitignored,
+/// untracked local data (benchmark runs, virtualenvs, downloads). That data is not source, can be
+/// far larger than the source itself, and may hold symlinks that escape the checkout.
+pub fn freeze_source(root: &Path) -> Result<tempfile::TempDir> {
+    clone_project_except(root, &IgnoredPaths::of(root))
+}
+
 /// Copy the project file by file with plain reads and writes, never reflinks. The `copy`
 /// isolation backend uses it so its behavior does not depend on the filesystem.
 pub fn copy_project_plain(source: &Path) -> Result<tempfile::TempDir> {

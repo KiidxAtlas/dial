@@ -1861,8 +1861,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         cli: Some("benchmark"),
         ..CommandSpec::new(
             "benchmark",
-            "[flags]",
-            "run a coding benchmark suite in the background (same flags as `dial benchmark`)",
+            "[open|status|stop|flags]",
+            "select agents and suites, watch live results, and export a comparison image",
             Category::Maintenance,
             Surface::Group,
         )

@@ -8,7 +8,7 @@ use dial::{
         AssistanceOverrides, BenchmarkProfile, BenchmarkReport, BenchmarkSuite, CommandCheck,
         EfficiencyOverrides, ExperimentalOverrides, MachineBenchmarkPolicy, MachineBenchmarkReport,
         MachineConfiguration, MachineConfigurationReport, MachineIdentity, PolicyOverrides,
-        RunMetrics, clone_project, compare_baseline, named_invalid_runs,
+        RunMetrics, compare_baseline, freeze_source, named_invalid_runs,
         rank_machine_configurations, score_report,
     },
     config::compaction::CompactionMethod,
@@ -131,7 +131,7 @@ pub fn run(layout: &Layout, config: &Config, options: RunOptions<'_>) -> Result<
             invalid.extend(report.invalid_runs.iter().cloned());
             json!({"machine_benchmark": report})
         } else {
-            let frozen = clone_project(&layout.project_root)?;
+            let frozen = freeze_source(&layout.project_root)?;
             let mut contracts = std::collections::BTreeMap::new();
             let mut comparison = suite.run_profiles(
                 frozen.path(),
@@ -222,7 +222,7 @@ pub fn run(layout: &Layout, config: &Config, options: RunOptions<'_>) -> Result<
             json!({"profile_comparison": comparison})
         }
     } else {
-        let frozen_source = clone_project(&layout.project_root)?;
+        let frozen_source = freeze_source(&layout.project_root)?;
         let contract = dial::benchmark::records::Contract::new(
             &suite,
             frozen_source.path(),
@@ -1195,7 +1195,7 @@ fn run_machine(
         .collect::<Result<Vec<_>>>()?;
     let baseline_configuration = configurations[0].name.clone();
     // All configurations and repetitions see exactly one snapshot of the source tree.
-    let snapshot = clone_project(&layout.project_root)?;
+    let snapshot = freeze_source(&layout.project_root)?;
     let mut progress = report_path
         .map(|path| {
             progress::Progress::open(

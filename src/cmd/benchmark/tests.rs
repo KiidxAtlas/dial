@@ -40,7 +40,7 @@ fn policy_overrides_are_isolated_recorded_and_hashed() {
     );
     assert_eq!(settings["policy_sha256"], policy_hash);
     assert_eq!(shipped_policy(&base).strict_requirements, Some(false));
-    let frozen = clone_project(root.path()).unwrap();
+    let frozen = freeze_source(root.path()).unwrap();
     let contract = |config: &Config| {
         dial::benchmark::records::Contract::new(
         &BenchmarkSuite::parse_toml("version=1\nname='policy'\n[[cases]]\nid='one'\nprompt='test'\nchecks=[{kind='file_exists',path='ok'}]\n").unwrap(),

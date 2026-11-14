@@ -25,6 +25,10 @@ This index explains ownership; existing paths remain stable for suites, CI and i
   provisioned integrations; ordinary offline checks do not install them.
 - **Graders and analysis** (`test_*.py`, `compare.py`, `reliability.py`, `tool_effectiveness.py`)
   check evaluation contracts or analyze existing reports. Analysis is not a fresh measurement.
+- **Tool audit** (`tool_audit.py`, `tool-audit.json`) inventories configured tool families,
+  maps owner checks to explicit coverage dimensions, records executable evidence and refuses
+  unsupported closure claims. `make test-tool-audit` is offline; native and live evidence stay
+  separate. See [tool audit coverage and closure](../../docs/tool-audit.md).
 - **Cross-agent evaluation** uses `cross_agent.py` and `cross-agent.toml` with installed agent CLIs.
   [Registry discovery](registry-discovery.md) additionally checks ordered trace behavior;
   answer-only `dial benchmark` runs do not establish that behavior.

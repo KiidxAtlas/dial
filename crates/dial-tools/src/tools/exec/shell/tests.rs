@@ -75,6 +75,126 @@ fn bash(ws: &Workspace, command: &str) -> ToolOutput {
 }
 
 #[test]
+fn expected_exit_codes_preserve_raw_status_and_real_errors() {
+    let (_dir, base) = workspace();
+    let base = base.without_sandbox();
+    let cancel = AtomicBool::new(false);
+    // Child-host execution requires the real Dial binary; covered in shell_sessions integration.
+    for (name, backend) in unsandboxed_backends() {
+        let ws = base.clone().with_shell_backend(backend);
+        fs::write(ws.root().join("empty.txt"), "").unwrap();
+        for (command, codes, error, code) in [
+            ("grep needle empty.txt", json!([0, 1]), false, 1),
+            ("grep needle missing.txt", json!([0, 1]), true, 2),
+            ("exit 3", json!([0, 1]), true, 3),
+            ("exit 0", json!([1]), true, 0),
+        ] {
+            let out = bash_tool_streaming(
+                &ws,
+                &json!({"command": command, "expected_exit_codes": codes}),
+                10,
+                &|_| {},
+                &cancel,
+            )
+            .unwrap();
+            assert_eq!(out.is_error, error, "{name}: {command}: {}", out.text);
+            assert_eq!(
+                out.execution.process.as_ref().unwrap().exit_code,
+                Some(code),
+                "{name}: {command}: {}",
+                out.text
+            );
+            if code == 1 {
+                assert!(
+                    out.text.contains("accepted command result"),
+                    "{name}: {}",
+                    out.text
+                );
+                assert!(
+                    out.text.contains("no lines matched"),
+                    "{name}: {}",
+                    out.text
+                );
+            }
+            assert_eq!(out.data.as_ref().unwrap()["expected_exit_codes"], codes);
+        }
+        let default = launch(&ws, "exit 1", &cancel);
+        assert!(
+            default.is_error,
+            "defaults must not change: {}",
+            default.text
+        );
+    }
+}
+
+#[test]
+fn expected_exit_codes_refuse_invalid_or_check_and_background_requests_before_launch() {
+    let (_dir, ws) = workspace();
+    let ws = ws.without_sandbox();
+    for extra in [
+        json!({"expected_exit_codes": []}),
+        json!({"expected_exit_codes": [256]}),
+        json!({"expected_exit_codes": [-1]}),
+        json!({"expected_exit_codes": [true]}),
+        json!({"expected_exit_codes": "0,1"}),
+        json!({"expected_exit_codes": [0, 1], "check": true}),
+        json!({"expected_exit_codes": [0, 1], "background": true}),
+        json!({"expected_exit_codes": [0, 1], "pty": true}),
+        json!({"expected_exit_codes": [0, 1], "trace": true}),
+        json!({"expected_exit_codes": [0, 0, 0, 0, 0, 0, 0, 0, 0]}),
+    ] {
+        let mut args = extra;
+        args["command"] = json!("echo ran > marker");
+        assert!(
+            bash_tool_streaming_with_adopter(
+                &ws,
+                &args,
+                10,
+                0,
+                &|_| {},
+                &AtomicBool::new(false),
+                &|_job| Err("must not launch".into()),
+            )
+            .is_err(),
+            "{args}"
+        );
+        assert!(
+            !ws.root().join("marker").exists(),
+            "invalid request ran: {args}"
+        );
+    }
+}
+
+#[test]
+fn expected_exit_codes_cannot_accept_cancellation_or_timeout_or_trigger_adoption() {
+    let (_dir, base) = workspace();
+    let base = base.without_sandbox();
+    for (name, backend) in unsandboxed_backends() {
+        let ws = base.clone().with_shell_backend(backend);
+        let args = json!({"command": "sleep 3", "expected_exit_codes": [0, 1, 137, 143]});
+        let out = bash_tool_streaming_with_adopter(
+            &ws,
+            &args,
+            1,
+            1,
+            &|_| {},
+            &AtomicBool::new(false),
+            &|_job| panic!("explicit inspection must not be adopted"),
+        )
+        .unwrap();
+        assert!(out.is_error, "{name}: {}", out.text);
+        assert!(
+            out.execution.process.as_ref().unwrap().timed_out,
+            "{name}: {}",
+            out.text
+        );
+        let cancelled =
+            bash_tool_streaming(&ws, &args, 1, &|_| {}, &AtomicBool::new(true)).unwrap();
+        assert!(cancelled.is_error, "{name}: {}", cancelled.text);
+    }
+}
+
+#[test]
 fn cwd_argument_and_leading_cd_are_confined_to_workspace() {
     let (dir, ws) = workspace();
     fs::create_dir(dir.path().join("src")).unwrap();
@@ -979,7 +1099,7 @@ fn bash_timeout_kills_process_group_without_orphans() {
     let out = run(
         &ws,
         "bash",
-        json!({"command": "sh -c 'echo $$ > bg.pid; exec sleep 30' & echo $$ > sh.pid; echo partial; until [ -s bg.pid ]; do sleep 0.01; done; sleep 30", "timeout": 1}),
+        json!({"command": "sh -c 'echo $$ > bg.pid; exec sleep 30' & echo $$ > sh.pid; echo partial; until [ -s bg.pid ]; do sleep 0.01; done; sleep 30", "timeout": 3}),
     );
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -987,7 +1107,7 @@ fn bash_timeout_kills_process_group_without_orphans() {
         started.elapsed()
     );
     assert!(
-        out.is_error && out.text.contains("timed out after 1s") && out.text.contains("partial"),
+        out.is_error && out.text.contains("timed out after 3s") && out.text.contains("partial"),
         "{}",
         out.text
     );

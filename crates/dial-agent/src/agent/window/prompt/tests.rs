@@ -343,10 +343,17 @@ fn response_format_guidance_applies_to_all_prompt_profiles() {
             guidance.contains("Follow the user's requested response format"),
             "missing final-response format guidance: lean={lean}, one_call={one_call}"
         );
-        assert!(
-            guidance.contains("disclosing blockers, unverified checks and safety-relevant gaps"),
-            "missing disclosure guidance: lean={lean}, one_call={one_call}"
-        );
+        // An exact requested reply is not followed by the routine report.
+        for phrase in [
+            "for an exact reply send only that",
+            "failed/unverified check or safety gap",
+            "Otherwise end with a brief report",
+        ] {
+            assert!(
+                guidance.contains(phrase),
+                "missing {phrase:?}: lean={lean}, one_call={one_call}"
+            );
+        }
     }
 }
 
