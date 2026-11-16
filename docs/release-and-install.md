@@ -198,7 +198,7 @@ brew tap kiidxatlas/dial https://github.com/KiidxAtlas/dial
 brew install dial
 ```
 
-After a release is published, the release workflow verifies the signed `SHA256SUMS`, regenerates `Formula/dial.rb` and the AUR `dial-bin` metadata from it with `scripts/update-formula.py`, and opens a `release-packaging/<tag>` pull request. A branch pushed with the workflow token starts no `pull_request` CI run, so the job dispatches `ci.yml` on that branch, waits for the checks `main` requires and then merges the pull request, so Homebrew users get the release without a manual step. If CI reports no required checks within 10 minutes or fails, the job fails and the pull request stays open for a manual merge; the published release is unaffected. Submission-ready definitions for the AUR (`dial-bin`) and homebrew-core are in [`packaging/`](../packaging/README.md). The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container runs interactively or one-shot; mount the project directory and persistent Dial state explicitly. [`docs/docker.md`](docker.md) has the `docker run` and Compose recipes, the sandbox options Bubblewrap needs, and Docker Model Runner setup.
+After a release is published, the release workflow verifies the signed `SHA256SUMS`, regenerates `Formula/dial.rb` and the AUR `dial-bin` metadata from it with `scripts/update-formula.py`, and opens a `release-packaging/<tag>` pull request. A pull request opened with the workflow token gets a `pull_request` CI run that waits for approval, and a dispatched run on the same commit does not count toward the pull request's required checks. The job therefore approves the pull request's own run, watches it to completion and then merges the pull request, so Homebrew users get the release without a manual step. If no run appears or CI fails, the job fails and the pull request stays open for a manual merge; the published release is unaffected. Submission-ready definitions for the AUR (`dial-bin`) and homebrew-core are in [`packaging/`](../packaging/README.md). The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container runs interactively or one-shot; mount the project directory and persistent Dial state explicitly. [`docs/docker.md`](docker.md) has the `docker run` and Compose recipes, the sandbox options Bubblewrap needs, and Docker Model Runner setup.
 
 To build the container locally, pass the source revision explicitly because `.dockerignore`
 excludes Git metadata:
@@ -530,8 +530,8 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 
 **Release train (default).** After each release, the publication workflow's metadata pull
 request dates the published notes, updates Homebrew/AUR metadata and moves `main` to the next
-patch version (`scripts/advance-release.py`). It dispatches CI on that branch, merges once the
-required checks pass, then dispatches CI on `main`. From then on, every `main` commit is
+patch version (`scripts/advance-release.py`). It approves and watches that pull request's CI,
+merges once the required checks pass, then dispatches CI on `main`. From then on, every `main` commit is
 untagged, so its CI builds and smoke-tests the unsigned candidates for all eight targets next to
 the tests. Write notes under `## [Unreleased]` as usual; for a minor or major release, change the
 workspace version in a pull request first.

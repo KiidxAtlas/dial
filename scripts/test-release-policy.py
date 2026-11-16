@@ -537,7 +537,7 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() && needs.sign.result == 'success' }}", publish)
         self.assertIn('uses: ./.github/workflows/release-publish.yml', publish)
 
-    def test_packaging_pull_request_dispatches_ci_before_merging(self):
+    def test_packaging_pull_request_approves_its_own_ci_before_merging(self):
         workflows = SCRIPT.parent.parent / '.github/workflows'
         packaging = (workflows / 'release-publish.yml').read_text().split('\n  packaging:\n', 1)[1].split('\n  container:\n', 1)[0]
         publish = (workflows / 'release.yml').read_text().split('\n  publish:\n', 1)[1]
@@ -545,12 +545,16 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn('workflow_dispatch:', ci)
         self.assertIn('actions: write', packaging)
         self.assertIn('actions: write', publish)
-        dispatch = packaging.index('gh workflow run ci.yml --ref "$branch"')
-        # It watches the dispatched run, which may queue for a long time, rather than a fixed wait.
+        # A dispatched run is not counted for the pull request's required checks (seen on v0.3.9).
+        self.assertNotIn('gh workflow run ci.yml --ref "$branch"', packaging)
+        find = packaging.index('--event pull_request --commit "$sha"')
+        approve = packaging.index('actions/runs/$run/approve')
+        # It watches the run, which may queue for a long time, rather than a fixed wait.
         watch = packaging.index('gh run watch "$run" --exit-status')
         self.assertNotIn('waited -ge 600', packaging)
         merge = packaging.index('gh pr merge "$branch" --merge --delete-branch')
-        self.assertLess(dispatch, watch)
+        self.assertLess(find, approve)
+        self.assertLess(approve, watch)
         self.assertLess(watch, merge)
         # The merge starts no push run either, so main CI is dispatched after it.
         self.assertLess(merge, packaging.index('gh workflow run ci.yml --ref main'))

@@ -21,7 +21,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 - Releases no longer wait on a release pull request. After publishing, the release workflow's metadata pull request also dates the published notes and moves `main` to the next patch version (`scripts/advance-release.py`), and CI on `main` then builds the release candidates for every commit. The new **Cut release** workflow (`release-cut.yml`) waits for `main` CI, tags the head and starts the release, which reuses those candidates and publishes in a few minutes. `scripts/release.sh <version> --tag --push` does the same locally. Pull requests now build candidates only when they change the version. CI dispatched on `main` counts as main CI, because a merge made by automation starts no push run.
 - Release candidate builds keep their Rust caches. Superseded Rust caches filled the 10 GB Actions cache quota and evicted the release caches, so every release compiled from scratch (about 20 minutes per platform). `cache-prune.yml` now deletes superseded entries after each `main` CI run.
-- The post-release metadata job waits for the CI run it dispatched instead of giving up after 10 minutes. For v0.3.9 that run sat queued behind other jobs, so the job failed and the Homebrew/AUR pull request had to be merged by hand.
+- The post-release metadata job now approves and watches its pull request's own CI run. It used to dispatch a separate run and give up after 10 minutes. For v0.3.9 that dispatched run sat queued, and even when it passed GitHub did not count it toward the pull request's required checks, so the Homebrew/AUR pull request had to be approved and merged by hand.
 
 ## [0.3.9] - 2026-11-16
 

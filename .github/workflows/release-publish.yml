@@ -130,22 +130,25 @@ jobs:
               --title "release: Dial $RELEASE_TAG package metadata and next version" \
               --body "Automated after publishing $RELEASE_TAG: Homebrew formula and AUR metadata from the signed SHA256SUMS of the published release, the released notes dated in CHANGELOG.md, and the workspace moved to the next patch version (scripts/advance-release.py)."
           fi
-          # main requires CI checks, and a GITHUB_TOKEN push starts no pull_request run (it shows
-          # as a failed run with no jobs), so dispatch CI on the branch head and merge once it passes.
+          # main requires CI checks from the pull request's own run: a dispatched CI run passes on
+          # the same commit but is not counted for the pull request. The pull_request run for a
+          # GITHUB_TOKEN-made pull request waits for approval (action_required), so approve it,
+          # then watch it. It can queue behind other jobs for a long time, so only finding it is
+          # time-limited (the step timeout bounds the rest).
           sha="$(git rev-parse HEAD)"
-          gh workflow run ci.yml --ref "$branch"
-          # Watch the dispatched run itself: it can sit queued behind other jobs for a long time,
-          # so only finding it is time-limited (the step timeout bounds the rest).
           run=""
           for _ in $(seq 1 30); do
-            run="$(gh run list --workflow ci.yml --branch "$branch" --event workflow_dispatch --commit "$sha" \
+            run="$(gh run list --workflow ci.yml --branch "$branch" --event pull_request --commit "$sha" \
               --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
             [ -n "$run" ] && break
             sleep 10
           done
           if [ -z "$run" ]; then
-            echo "The dispatched CI run for $branch did not appear; merge it manually once CI passes." >&2
+            echo "No pull request CI run appeared for $branch; push to it or merge it manually once CI passes." >&2
             exit 1
+          fi
+          if [ "$(gh run view "$run" --json conclusion --jq .conclusion)" = action_required ]; then
+            gh api -X POST "repos/$GH_REPO/actions/runs/$run/approve"
           fi
           gh run watch "$run" --exit-status --interval 60 > /dev/null
           gh pr checks "$branch" --required
