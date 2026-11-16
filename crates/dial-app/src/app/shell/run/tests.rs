@@ -25,3 +25,70 @@ fn peer_wake_yields_to_human_input_and_pending_reconfiguration() {
     shell.pending_resource_rebuild = false;
     assert!(shell.peer_turn_available());
 }
+
+#[test]
+fn animation_frames_repaint_without_ending_the_wait() {
+    let mut paints = 0;
+    let mut steps = Vec::new();
+    let ready = wait_frames(
+        &mut paints,
+        Duration::from_millis(60),
+        |_| Some(Duration::from_millis(10)),
+        |step| {
+            steps.push(step);
+            std::thread::sleep(step);
+            Ok(false)
+        },
+        |paints| {
+            *paints += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(!ready);
+    assert!(paints >= 2, "frames painted inside one wait: {paints}");
+    assert!(steps.iter().all(|s| *s <= Duration::from_millis(10)));
+    assert_eq!(
+        steps.len(),
+        paints + 1,
+        "the last poll ends the wait unpainted"
+    );
+}
+
+#[test]
+fn input_ends_the_wait_and_still_marks_use_one_poll() {
+    let mut paints = 0;
+    let mut polls = 0;
+    let ready = wait_frames(
+        &mut paints,
+        Duration::from_secs(5),
+        |_| Some(Duration::from_millis(10)),
+        |_| {
+            polls += 1;
+            Ok(polls == 3)
+        },
+        |paints| {
+            *paints += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(ready);
+    assert_eq!((polls, paints), (3, 2));
+
+    let mut steps = Vec::new();
+    let ready = wait_frames(
+        &mut paints,
+        Duration::from_millis(30),
+        |_| None,
+        |step| {
+            steps.push(step);
+            Ok(false)
+        },
+        |_| panic!("no frames without motion"),
+    )
+    .unwrap();
+    assert!(!ready);
+    assert_eq!(steps.len(), 1);
+    assert!(steps[0] <= Duration::from_millis(30));
+}
