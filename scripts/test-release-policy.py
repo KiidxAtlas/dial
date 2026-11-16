@@ -546,7 +546,9 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn('actions: write', packaging)
         self.assertIn('actions: write', publish)
         dispatch = packaging.index('gh workflow run ci.yml --ref "$branch"')
-        watch = packaging.index('gh pr checks "$branch" --required --watch')
+        # It watches the dispatched run, which may queue for a long time, rather than a fixed wait.
+        watch = packaging.index('gh run watch "$run" --exit-status')
+        self.assertNotIn('waited -ge 600', packaging)
         merge = packaging.index('gh pr merge "$branch" --merge --delete-branch')
         self.assertLess(dispatch, watch)
         self.assertLess(watch, merge)

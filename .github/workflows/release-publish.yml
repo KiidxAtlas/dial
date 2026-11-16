@@ -132,17 +132,23 @@ jobs:
           fi
           # main requires CI checks, and a GITHUB_TOKEN push starts no pull_request run (it shows
           # as a failed run with no jobs), so dispatch CI on the branch head and merge once it passes.
+          sha="$(git rev-parse HEAD)"
           gh workflow run ci.yml --ref "$branch"
-          waited=0
-          until gh pr checks "$branch" --required --json name --jq 'length > 0' 2>/dev/null | grep -qx true; do
-            if [ "$waited" -ge 600 ]; then
-              echo "CI did not report required checks for $branch within 10 minutes; merge it manually once CI passes." >&2
-              exit 1
-            fi
-            sleep 20
-            waited=$((waited + 20))
+          # Watch the dispatched run itself: it can sit queued behind other jobs for a long time,
+          # so only finding it is time-limited (the step timeout bounds the rest).
+          run=""
+          for _ in $(seq 1 30); do
+            run="$(gh run list --workflow ci.yml --branch "$branch" --event workflow_dispatch --commit "$sha" \
+              --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [ -n "$run" ] && break
+            sleep 10
           done
-          gh pr checks "$branch" --required --watch --interval 30
+          if [ -z "$run" ]; then
+            echo "The dispatched CI run for $branch did not appear; merge it manually once CI passes." >&2
+            exit 1
+          fi
+          gh run watch "$run" --exit-status --interval 60 > /dev/null
+          gh pr checks "$branch" --required
           # The release is already published (this job needs publish) and the checksums come from
           # its verified manifest, so merge now; an unmerged PR leaves Homebrew users on the old version.
           # Publishing to the AUR itself still needs the maintainer's AUR key (packaging/README.md).
