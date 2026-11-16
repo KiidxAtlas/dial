@@ -73,6 +73,7 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "session_control"
                 | "schema"
                 | "benchmarks"
+                | "usage"
         ))
 }
 
@@ -1497,6 +1498,16 @@ fn run_control(
                         Ok(auth::providers(&auth_dir))
                     })();
                     out.result(&id, result);
+                }
+                "usage" if !acp => {
+                    // Each signed-in provider is asked over the network; answer off the
+                    // controller so other requests keep flowing.
+                    let (out, dir) = (out.clone(), auth_dir.clone());
+                    thread::spawn(move || {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let outcomes = crate::llm::usage_report::fetch_all(&dir, &cancel);
+                        out.result(&id, Ok(crate::llm::usage_report::outcomes_json(&outcomes)));
+                    });
                 }
                 "login" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {

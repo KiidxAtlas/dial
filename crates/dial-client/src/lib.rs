@@ -1000,6 +1000,14 @@ impl Client {
         self.call("list_jobs", json!({}), timeout)
     }
 
+    /// Subscription usage and plan for every signed-in provider, as `/usage` shows.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn usage(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("usage", json!({}), timeout)
+    }
+
     /// Stop one background job by name.
     ///
     /// # Errors

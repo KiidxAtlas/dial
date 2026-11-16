@@ -120,6 +120,7 @@ pub const METHODS: &[Method] = &[
     write("stop_job", "jobs"),
     write("apply_settings", "settings"),
     write("benchmark", "benchmarks"),
+    read("usage", "usage"),
 ];
 
 /// The method named `name`, if the protocol defines it.

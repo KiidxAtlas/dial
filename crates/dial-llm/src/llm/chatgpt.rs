@@ -41,6 +41,8 @@ const MAX_JSON: u64 = 256 * 1024;
 // Account catalogs include model instructions and can be much larger than OAuth responses.
 const MAX_CATALOG_JSON: u64 = 8 * 1024 * 1024;
 const FILE: &str = "chatgpt-accounts.json";
+/// Model discovery renews an access token issued longer ago than this (seconds).
+const DISCOVERY_RENEW_AGE: u64 = 600;
 
 /// Credential file protected independently from other subscription-store data.
 pub fn credential_path(dir: &std::path::Path) -> std::path::PathBuf {
@@ -189,14 +191,20 @@ pub fn accounts(dir: &Path) -> Result<Vec<AccountInfo>> {
         .iter()
         .map(|(id, account)| AccountInfo {
             client_id: id.clone(),
-            label: format!(
-                "{} ({id})",
-                if account.email.is_empty() {
+            label: {
+                let name = if account.email.is_empty() {
                     "ChatGPT account"
                 } else {
                     &account.email
+                };
+                // The plan the stored access token was issued for; renewal keeps it current.
+                match account.tokens.as_ref().and_then(plan_of) {
+                    Some(plan) => {
+                        format!("{name} · {} ({id})", super::usage_report::plan_label(&plan))
+                    }
+                    None => format!("{name} ({id})"),
                 }
-            ),
+            },
             active: state.active.as_ref() == Some(id),
             signed_in: account.tokens.is_some() && account.client_id == CLIENT_ID,
         })
@@ -824,14 +832,96 @@ fn account_token_at(
     scoped_account_token_at(dir, None, cancel, url)
 }
 
+/// When a stored access token is exchanged for a new one.
+#[derive(Clone, Copy)]
+enum Renew {
+    /// Only within a minute of expiry (every dispatch).
+    Expiring,
+    /// Also when it was issued at least this many seconds ago (model discovery).
+    OlderThan(u64),
+    /// Whenever the provider permits (a plan-gated refusal).
+    Now,
+}
+
+/// A forced token renewal and the ChatGPT plan the old and new access tokens name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renewal {
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+impl Renewal {
+    /// The account's plan changed (an upgrade or downgrade) since the old token was issued.
+    pub fn plan_changed(&self) -> bool {
+        self.after.is_some() && self.before != self.after
+    }
+}
+
+/// The ChatGPT plan (`chatgpt_plan_type`) an access token, else its identity token, was issued for.
+fn plan_of(tokens: &Tokens) -> Option<String> {
+    [tokens.access_token.as_str(), tokens.id_token.as_str()]
+        .into_iter()
+        .filter_map(|token| codex_claims(token).ok())
+        .find_map(|claims| {
+            claims[JWT_AUTH_CLAIM]["chatgpt_plan_type"]
+                .as_str()
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+/// Exchange the account's refresh token now, so a plan bought since sign-in reaches the access
+/// token: the access token records the plan it was issued for, and an unexpired one is otherwise
+/// kept for days. `None` when the provider does not permit a renewal yet (`earliest_refresh_at`).
+pub fn renew_access(
+    dir: &Path,
+    account_id: Option<&str>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<Renewal>> {
+    renew_at(dir, account_id, cancel, TOKEN_URL, Renew::Now)
+}
+
+/// [`renew_access`] against a fake token endpoint.
+#[cfg(any(test, feature = "test-support"))]
+pub fn renew_access_at(
+    dir: &Path,
+    account_id: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    token_url: &str,
+) -> Result<Option<Renewal>> {
+    renew_at(dir, account_id, cancel, token_url, Renew::Now)
+}
+
 fn scoped_account_token_at(
     dir: &Path,
     selected: Option<&str>,
     cancel: Arc<AtomicBool>,
     url: &str,
 ) -> Result<(String, SecretToken)> {
-    cancelled(&cancel)?;
     let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
+    token_locked(dir, selected, cancel, url, Renew::Expiring).map(|(id, token, _)| (id, token))
+}
+
+fn renew_at(
+    dir: &Path,
+    selected: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    url: &str,
+    renew: Renew,
+) -> Result<Option<Renewal>> {
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
+    token_locked(dir, selected, cancel, url, renew).map(|(_, _, renewal)| renewal)
+}
+
+/// Caller holds the credential lock.
+fn token_locked(
+    dir: &Path,
+    selected: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    url: &str,
+    renew: Renew,
+) -> Result<(String, SecretToken, Option<Renewal>)> {
+    cancelled(&cancel)?;
     let mut state = load(dir)?;
     let id = selected
         .map(str::to_owned)
@@ -879,7 +969,17 @@ fn scoped_account_token_at(
         previous.expires_at > now() || previous.earliest_refresh_at <= now(),
         "ChatGPT token expired before renewal is available; sign in again from /providers"
     );
-    if previous.expires_at <= now() + 60 && previous.earliest_refresh_at <= now() {
+    let due = match renew {
+        Renew::Expiring => false,
+        Renew::Now => true,
+        // ChatGPT access tokens carry `iat`; one without it is left to expire normally.
+        Renew::OlderThan(age) => codex_claims(&previous.access_token)
+            .ok()
+            .and_then(|claims| claims["iat"].as_u64())
+            .is_some_and(|issued| now().saturating_sub(issued) >= age),
+    };
+    let mut renewal = None;
+    if (due || previous.expires_at <= now() + 60) && previous.earliest_refresh_at <= now() {
         let response = token_request(
             url,
             &[
@@ -896,6 +996,10 @@ fn scoped_account_token_at(
             refreshed_id == id && refreshed_subject == account.subject,
             "ChatGPT refresh returned a different workspace; sign in again from /providers"
         );
+        renewal = Some(Renewal {
+            before: plan_of(previous),
+            after: plan_of(&replacement),
+        });
         account.tokens = Some(replacement);
         save(dir, &state)?;
     }
@@ -906,7 +1010,11 @@ fn scoped_account_token_at(
         account_id == id,
         "ChatGPT refresh returned a different workspace; sign in again from /providers"
     );
-    Ok((account_id, SecretToken::new(tokens.access_token.clone())))
+    Ok((
+        account_id,
+        SecretToken::new(tokens.access_token.clone()),
+        renewal,
+    ))
 }
 pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String> {
     let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
@@ -986,6 +1094,16 @@ pub fn discover(
 ) {
     let label = "ChatGPT subscription";
     let outcome = (|| -> Result<(String, Vec<super::catalog::ModelEntry>)> {
+        // Discovery (startup, F5, /providers) renews a token older than ten minutes, so a plan
+        // bought since sign-in lists its models without signing in again. A failed renewal keeps
+        // the stored token; the normal access below reports any real sign-in problem.
+        let _ = renew_at(
+            dir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            TOKEN_URL,
+            Renew::OlderThan(DISCOVERY_RENEW_AGE),
+        );
         let (id, token) = account_token_at(dir, Arc::new(AtomicBool::new(false)), TOKEN_URL)?;
         let urls = [
             format!("{BASE_URL}/codex/models?client_version={CLIENT_VERSION}"),

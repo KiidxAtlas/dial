@@ -50,6 +50,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "set" | "roles" | "model-settings" => Method("set_setting"),
         "reload" => Method("apply_settings"),
         "new" => Method("new_session"),
+        "usage" => Method("usage"),
         "sessions" => Method("list_sessions"),
         "fork" => Method("fork_session"),
         "rename" => Method("rename"),
@@ -90,11 +91,12 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "compute" | "review" | "seance" | "archive" | "tree" | "profile" | "permissions"
         | "todo" | "skills" | "reliability" | "policy" | "understanding" | "search"
         | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
-        | "evidence" | "modelpreset" | "usage" | "ssh" | "checks" | "branch" | "label" | "move"
-        | "pack" | "stats" | "changelog" | "loop" | "fresh" | "handoff" | "shake" | "btw"
-        | "tan" | "debug" | "rule" | "plan-review" | "goal" | "guided-goal" | "contract"
-        | "cleanse" | "schedule" | "gc" | "anonymize" | "images" | "hooks" | "marketplace"
-        | "inbox" => Terminal(PANEL),
+        | "evidence" | "modelpreset" | "ssh" | "checks" | "branch" | "label" | "move" | "pack"
+        | "stats" | "changelog" | "loop" | "fresh" | "handoff" | "shake" | "btw" | "tan"
+        | "debug" | "rule" | "plan-review" | "goal" | "guided-goal" | "contract" | "cleanse"
+        | "schedule" | "gc" | "anonymize" | "images" | "hooks" | "marketplace" | "inbox" => {
+            Terminal(PANEL)
+        }
         _ => return None,
     })
 }

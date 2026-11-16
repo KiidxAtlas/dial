@@ -565,6 +565,10 @@ fn refusal(entry: &ModelEntry) -> String {
     let source = entry.source.to_lowercase();
     if entry.is_embedding() && is_local_mlx(entry) {
         "local embedding inference is not managed by Dial; serve it through an embeddings endpoint and assign the embedding role".to_owned()
+    } else if entry.metadata.kind == ModelKind::Image && is_local_mlx(entry) {
+        // Discovery lists downloaded diffusion checkpoints (FLUX and similar) but marks them
+        // unavailable: Dial's local worker serves chat models only.
+        "Dial cannot run a downloaded image checkpoint itself; serve it with MLX-Serve, then press F5 to rescan and select its endpoint".to_owned()
     } else if source.contains("cached, unverified") {
         "its provider is not reachable; only cached metadata is shown".to_owned()
     } else if source.contains("unverified") {

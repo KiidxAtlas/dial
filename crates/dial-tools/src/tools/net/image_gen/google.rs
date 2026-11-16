@@ -23,12 +23,12 @@ const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 /// Upper bound for a model ID after the optional `models/` prefix is removed.
 const MAX_MODEL_CHARS: usize = 128;
 
-/// Runs one Google image request for `target.wire` and returns the single image's bytes.
+/// Runs one Google image request for `target.wire` and returns every image it produced.
 pub(super) fn request(
     client: &Client<'_>,
     target: &Target,
     request: &Request<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     match target.wire {
         Wire::Gemini => gemini(client, target, request),
         Wire::Imagen => imagen(client, target, request),
@@ -36,21 +36,21 @@ pub(super) fn request(
     }
 }
 
-fn gemini(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<u8>> {
+fn gemini(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     let model = model_id(&target.model)?;
     let url = client.endpoint(&format!("models/{model}:generateContent"));
     let response = client.post(&url, &gemini_body(request))?;
-    gemini_image(&response)
+    gemini_images(&response)
         .map_err(|error| client.withhold(error, "Gemini returned no usable image"))
 }
 
-fn imagen(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<u8>> {
+fn imagen(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     ensure_no_edit(request)?;
     check_imagen_base(&target.base_url)?;
     let model = model_id(&target.model)?;
     let url = client.endpoint(&format!("models/{model}:predict"));
     let response = client.post(&url, &imagen_body(request)?)?;
-    imagen_image(&response)
+    imagen_images(&response)
         .map_err(|error| client.withhold(error, "Imagen returned no usable image"))
 }
 
@@ -106,8 +106,8 @@ fn gemini_body(request: &Request<'_>) -> Value {
     })
 }
 
-/// Extracts exactly one non-thought image from a `generateContent` response.
-fn gemini_image(response: &Value) -> Result<Vec<u8>> {
+/// Extracts every non-thought image from a `generateContent` response, in order.
+fn gemini_images(response: &Value) -> Result<Vec<Vec<u8>>> {
     if let Some(reason) = response["promptFeedback"]["blockReason"].as_str() {
         bail!("Gemini blocked the image prompt (blockReason {reason})");
     }
@@ -130,19 +130,22 @@ fn gemini_image(response: &Value) -> Result<Vec<u8>> {
         .filter(|part| !part["thought"].as_bool().unwrap_or(false))
         .filter(|part| part.get("inlineData").is_some())
         .collect();
-    match images.as_slice() {
-        [] => bail!("Gemini returned no image data"),
-        [image] => {
+    ensure!(!images.is_empty(), "Gemini returned no image data");
+    ensure!(
+        images.len() <= super::MAX_IMAGES,
+        "Gemini returned {} images; image_gen writes at most {}",
+        images.len(),
+        super::MAX_IMAGES
+    );
+    images
+        .iter()
+        .map(|image| {
             let data = image["inlineData"]["data"]
                 .as_str()
                 .ok_or_else(|| anyhow!("Gemini image part has no data"))?;
             decode_bounded(data)
-        }
-        many => bail!(
-            "Gemini returned {} images; image_gen requires exactly one",
-            many.len()
-        ),
-    }
+        })
+        .collect()
 }
 
 /// Imagen editing is not implemented; refuses a source image before any request is built.
@@ -192,25 +195,34 @@ fn imagen_body(request: &Request<'_>) -> Result<Value> {
     }))
 }
 
-/// Extracts exactly one image from a `:predict` response.
-fn imagen_image(response: &Value) -> Result<Vec<u8>> {
+/// Extracts every image from a `:predict` response, in order. A filtered prediction refuses the
+/// whole response rather than silently dropping an image.
+fn imagen_images(response: &Value) -> Result<Vec<Vec<u8>>> {
     let predictions = response["predictions"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
-    match predictions {
-        [] => bail!("Imagen returned no image predictions"),
-        [prediction] => match prediction["bytesBase64Encoded"].as_str() {
-            Some(data) => decode_bounded(data),
-            None => match prediction["raiFilteredReason"].as_str() {
-                Some(reason) => bail!("Imagen filtered the image (raiFilteredReason {reason})"),
-                None => bail!("Imagen prediction contained no image bytes"),
+    ensure!(
+        !predictions.is_empty(),
+        "Imagen returned no image predictions"
+    );
+    ensure!(
+        predictions.len() <= super::MAX_IMAGES,
+        "Imagen returned {} images; image_gen writes at most {}",
+        predictions.len(),
+        super::MAX_IMAGES
+    );
+    predictions
+        .iter()
+        .map(
+            |prediction| match prediction["bytesBase64Encoded"].as_str() {
+                Some(data) => decode_bounded(data),
+                None => match prediction["raiFilteredReason"].as_str() {
+                    Some(reason) => bail!("Imagen filtered the image (raiFilteredReason {reason})"),
+                    None => bail!("Imagen prediction contained no image bytes"),
+                },
             },
-        },
-        many => bail!(
-            "Imagen returned {} images; image_gen requires exactly one",
-            many.len()
-        ),
-    }
+        )
+        .collect()
 }
 
 /// Decodes base64 image data, refusing anything that would exceed the response budget.

@@ -22,19 +22,21 @@ const MAX_ERROR_CHARS: usize = 300;
 /// Input keys this adapter owns; configured values for them are never sent.
 const ADAPTER_OWNED_INPUT: &[&str] = &["prompt", "n", "size", "output_format"];
 
-/// Runs one queued image request for `target.wire` and returns the single image's bytes.
+/// Runs one queued image request for `target.wire` and returns every image it produced.
 pub(super) fn request(
     client: &Client<'_>,
     target: &Target,
     request: &Request<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     ensure!(
         request.source.is_none(),
         "image edits are not supported on {}'s queued image route; use an OpenAI Images, MLX-Serve or Responses image model",
         target.model
     );
     match target.wire {
-        Wire::BlackForestLabs => black_forest_labs(client, target, request),
+        Wire::BlackForestLabs => {
+            black_forest_labs(client, target, request).map(|image| vec![image])
+        }
         Wire::Fal => fal(client, target, request),
         Wire::Replicate => replicate(client, target, request),
         _ => bail!("image_gen queued transport received a non-queued route"),
@@ -85,7 +87,7 @@ fn black_forest_labs(
 }
 
 /// `POST {base}/{model}`, then poll `status_url` until `COMPLETED`, then fetch `response_url`.
-fn fal(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<u8>> {
+fn fal(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     let model = fal_model(&target.model)?;
     let body = fal_body(target, request)?;
     let submitted = client.post(&client.endpoint(model), &body)?;
@@ -107,8 +109,10 @@ fn fal(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Ve
                         client.provider_text(remote_detail(&status))
                     );
                     let result = client.get(response_url)?;
-                    let url = fal_image_url(&result)?;
-                    return client.download(url);
+                    return fal_image_urls(&result)?
+                        .into_iter()
+                        .map(|url| client.download(url))
+                        .collect();
                 }
                 "IN_QUEUE" | "IN_PROGRESS" => {}
                 other => bail!(
@@ -126,7 +130,7 @@ fn fal(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Ve
 
 /// `POST /models/{owner}/{name}/predictions` or `POST /predictions` (version form), then poll
 /// `urls.get` until `succeeded`.
-fn replicate(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<u8>> {
+fn replicate(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     let route = replicate_route(&target.model)?;
     let body = replicate_body(target, request, &route)?;
     let path = match route {
@@ -141,7 +145,12 @@ fn replicate(client: &Client<'_>, target: &Target, request: &Request<'_>) -> Res
             client.pause()?;
             let status = client.get(poll)?;
             match status["status"].as_str().unwrap_or_default() {
-                "succeeded" => return client.download(replicate_output(&status["output"])?),
+                "succeeded" => {
+                    return replicate_output(&status["output"])?
+                        .into_iter()
+                        .map(|url| client.download(url))
+                        .collect();
+                }
                 "starting" | "processing" => {}
                 state @ ("failed" | "canceled") => bail!(
                     "Replicate prediction {task} ended as {state}: {}",
@@ -360,36 +369,45 @@ fn output_format(wire: Wire, output: &str) -> Result<&'static str> {
     }
 }
 
-/// The single image URL in a fal result, which must contain exactly one image.
-fn fal_image_url(result: &Value) -> Result<&str> {
+/// The image URLs in a fal result, in order; every entry must carry a URL.
+fn fal_image_urls(result: &Value) -> Result<Vec<&str>> {
     let images = result["images"]
         .as_array()
-        .ok_or_else(|| anyhow!("fal result contained no images array"))?;
-    ensure!(
-        images.len() == 1,
-        "fal result contained {} images; image_gen requires exactly one",
-        images.len()
-    );
-    field(&images[0], "url").ok_or_else(|| anyhow!("fal image entry contained no url"))
+        .filter(|images| !images.is_empty())
+        .ok_or_else(|| anyhow!("fal result contained no images"))?;
+    within_limit(images.len(), "fal result")?;
+    images
+        .iter()
+        .map(|image| field(image, "url").ok_or_else(|| anyhow!("fal image entry contained no url")))
+        .collect()
 }
 
-/// The single image URL in a Replicate output (a string, or an array of exactly one string).
-fn replicate_output(output: &Value) -> Result<&str> {
+/// The image URLs in a Replicate output: a string, or an array of strings.
+fn replicate_output(output: &Value) -> Result<Vec<&str>> {
     match output {
-        Value::String(url) if !url.is_empty() => Ok(url.as_str()),
-        Value::Array(urls) => {
-            ensure!(
-                urls.len() == 1,
-                "Replicate prediction returned {} outputs; image_gen requires exactly one",
-                urls.len()
-            );
-            urls[0]
-                .as_str()
-                .filter(|url| !url.is_empty())
-                .ok_or_else(|| anyhow!("Replicate prediction returned an empty output"))
+        Value::String(url) if !url.is_empty() => Ok(vec![url.as_str()]),
+        Value::Array(urls) if !urls.is_empty() => {
+            within_limit(urls.len(), "Replicate prediction")?;
+            urls.iter()
+                .map(|url| {
+                    url.as_str()
+                        .filter(|url| !url.is_empty())
+                        .ok_or_else(|| anyhow!("Replicate prediction returned an empty output"))
+                })
+                .collect()
         }
         _ => bail!("Replicate prediction returned no output image"),
     }
+}
+
+/// Refuses an output list larger than one call may write, before anything is downloaded.
+fn within_limit(count: usize, what: &str) -> Result<()> {
+    ensure!(
+        count <= super::MAX_IMAGES,
+        "{what} contained {count} images; image_gen writes at most {}",
+        super::MAX_IMAGES
+    );
+    Ok(())
 }
 
 /// A non-empty string field.

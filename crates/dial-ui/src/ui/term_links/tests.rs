@@ -42,6 +42,22 @@ fn links_urls_and_existing_paths_with_line_fragments() {
 }
 
 #[test]
+fn an_image_preview_header_links_the_image_without_a_line_fragment() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("art")).unwrap();
+    std::fs::write(root.path().join("art/fox.png"), "").unwrap();
+    let fox = url::Url::from_file_path(root.path().join("art/fox.png")).unwrap();
+    for fragments in [true, false] {
+        let mut linker = linker_in(root.path(), fragments);
+        assert_eq!(
+            targets(&mut linker, "Image · art/fox.png · 1024x1024", false),
+            vec![("art/fox.png".to_owned(), fox.to_string())],
+            "fragments={fragments}"
+        );
+    }
+}
+
+#[test]
 fn without_fragments_file_links_carry_no_line() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.rs"), "").unwrap();

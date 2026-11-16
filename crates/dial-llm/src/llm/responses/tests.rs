@@ -886,12 +886,11 @@ fn image_stream_accepts_large_inline_images_but_never_partial_or_failed_turns() 
         5,
     )
     .unwrap();
-    assert_eq!(output, encoded);
+    assert_eq!(output, vec![encoded.clone()]);
     server.requests();
     for terminal in [
         json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[image.clone()]}}),
         json!({"type":"response.failed","response":{"status":"failed","error":{"message":"failed"}}}),
-        json!({"type":"response.completed","response":response(vec![image.clone(),image.clone()])}),
     ] {
         let server = fake::serve(vec![Script::Sse(sse(vec![terminal]))]);
         assert!(
@@ -910,6 +909,28 @@ fn image_stream_accepts_large_inline_images_but_never_partial_or_failed_turns() 
         );
         server.requests();
     }
+}
+
+#[test]
+fn image_stream_returns_every_completed_image_in_order() {
+    let first = json!({"type":"image_generation_call","status":"completed","result":"Zmlyc3Q="});
+    let second = json!({"type":"image_generation_call","status":"completed","result":"c2Vjb25k"});
+    let terminal =
+        json!({"type":"response.completed","response":response(vec![first, second.clone()])});
+    let server = fake::serve(vec![Script::Sse(sse(vec![terminal]))]);
+    let endpoint = Endpoint {
+        url: &server.url,
+        token: "fixture-token",
+        account_id: None,
+        model: "selected",
+        headers: &[],
+    };
+    let output = generate_image(endpoint, &json!({"model":"selected","stream":true}), 5).unwrap();
+    assert_eq!(output, vec!["Zmlyc3Q=".to_owned(), "c2Vjb25k".to_owned()]);
+    server.requests();
+    // One unfinished image still refuses the whole turn: no partial previews are released.
+    let unfinished = json!({"type":"image_generation_call","status":"in_progress","result":"YQ=="});
+    assert!(completed_image(&response(vec![second, unfinished])).is_err());
 }
 
 #[test]

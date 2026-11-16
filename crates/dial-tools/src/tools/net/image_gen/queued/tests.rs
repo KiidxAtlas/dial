@@ -166,25 +166,37 @@ fn replicate_version_form_carries_version_and_model_form_does_not() {
 }
 
 #[test]
-fn fal_result_requires_exactly_one_image() {
+fn fal_result_yields_every_image_url_in_order() {
     let one = json!({"images": [{"url": "https://v3.fal.media/a.png"}]});
-    assert_eq!(fal_image_url(&one).unwrap(), "https://v3.fal.media/a.png");
+    assert_eq!(
+        fal_image_urls(&one).unwrap(),
+        ["https://v3.fal.media/a.png"]
+    );
     let two = json!({"images": [{"url": "https://v3.fal.media/a.png"}, {"url": "https://v3.fal.media/b.png"}]});
-    assert!(fal_image_url(&two).is_err());
-    assert!(fal_image_url(&json!({})).is_err());
+    assert_eq!(
+        fal_image_urls(&two).unwrap(),
+        ["https://v3.fal.media/a.png", "https://v3.fal.media/b.png"]
+    );
+    assert!(fal_image_urls(&json!({"images": [{"url": "a"}, {}]})).is_err());
+    assert!(fal_image_urls(&json!({"images": []})).is_err());
+    assert!(fal_image_urls(&json!({})).is_err());
+    let many = json!({"images": vec![json!({"url": "a"}); super::super::MAX_IMAGES + 1]});
+    assert!(fal_image_urls(&many).is_err());
 }
 
 #[test]
-fn replicate_output_accepts_one_string_or_one_element_array() {
+fn replicate_output_accepts_a_string_or_an_array_of_strings() {
     assert_eq!(
         replicate_output(&json!("https://replicate.delivery/a.png")).unwrap(),
-        "https://replicate.delivery/a.png"
+        ["https://replicate.delivery/a.png"]
     );
     assert_eq!(
         replicate_output(&json!(["https://replicate.delivery/a.png"])).unwrap(),
-        "https://replicate.delivery/a.png"
+        ["https://replicate.delivery/a.png"]
     );
-    assert!(replicate_output(&json!(["a", "b"])).is_err());
+    assert_eq!(replicate_output(&json!(["a", "b"])).unwrap(), ["a", "b"]);
+    assert!(replicate_output(&json!(["a", ""])).is_err());
+    assert!(replicate_output(&json!([])).is_err());
     assert!(replicate_output(&json!("")).is_err());
     assert!(replicate_output(&Value::Null).is_err());
 }
@@ -386,10 +398,11 @@ fn loopback_target(base: &str, wire: Wire, model: &str) -> Target {
     }
 }
 
-/// Runs one queued request through a real `Client` against the loopback target.
+/// Runs one queued request through a real `Client` against the loopback target and returns its
+/// single image.
 fn submit_with(target: &Target, config: &Config, output: &str) -> Result<Vec<u8>> {
     let client = Client::new(target, config, Arc::new(AtomicBool::new(false)));
-    super::request(
+    let mut images = super::request(
         &client,
         target,
         &Request {
@@ -399,7 +412,9 @@ fn submit_with(target: &Target, config: &Config, output: &str) -> Result<Vec<u8>
             output,
             source: None,
         },
-    )
+    )?;
+    assert_eq!(images.len(), 1, "expected one image");
+    Ok(images.remove(0))
 }
 
 #[test]

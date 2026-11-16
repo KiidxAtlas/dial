@@ -17,6 +17,19 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Added
+
+- `/usage`, the status-line usage segment and the ChatGPT account label in `/providers` now show the account's plan or tier (for example `Plus`, `Pro`, `Max 20x`, a Copilot or Z.AI plan, or a Gemini tier). Claude's plan is read from its profile. RPC clients get the same data from the new `usage` method.
+
+### Fixed
+
+- `image_gen` on a ChatGPT account without the hosted image tool (for example a free plan) now reports that the account lacks it instead of a bare `HTTP 400: Tool choice 'image_generation' not found`, and stops offering `image_gen` for that account until Dial restarts.
+- The model picker now explains why a downloaded local image checkpoint (FLUX and similar) cannot be selected: Dial cannot run it itself, so serve it with MLX-Serve and press F5 to rescan. It used to say only "the provider reports it as unavailable".
+- Upgrading a ChatGPT plan no longer requires signing in to the ChatGPT subscription provider again. Dial kept the old access token, which records the plan it was issued for, until it expired, so the new plan's models and limits stayed unavailable. Model discovery now renews a token older than ten minutes, and a request refused for credentials or plan limits renews the sign-in once and retries on the new plan.
+- `/providers` no longer lags. Every frame re-read and locked the saved-credentials file once per listed provider to show "key saved". The panel now asks once per endpoint and asks again only after a key is saved or removed, the configuration changes, or providers are rescanned.
+- `image_gen` no longer fails with "must return exactly one image" when a model returns several images. Each image is saved: the first to the requested output, the rest as `name-2.ext`, `name-3.ext` and so on. Existing files are never overwritten, and one call writes at most eight images. This covers the Responses hosted tool (including ChatGPT sign-in), chat-completion images, OpenAI-compatible Images APIs, Gemini, Imagen, ComfyUI, fal and Replicate.
+- Generated images now always appear in the chat. `/image generate`, `/image edit` and `/image gif` showed only the text result, and a model call that returned several images previewed only the first. Every written image is now previewed, and each is attached for vision models. In iTerm2 the preview's clickable path opens the image in its viewer instead of sending it to the text editor with a line number.
+
 ## [0.3.9] - 2026-11-16
 
 ### Fixed

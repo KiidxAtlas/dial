@@ -1469,6 +1469,27 @@
         },
         {
           "type": "object",
+          "description": "Subscription usage and plan for every signed-in provider with a usage endpoint, as `/usage` shows. Result: {providers:[{provider, plan, report, error}]}: `plan` is the readable plan or tier (for example `Plus`, `Max 20x`) or null, `report` is the provider's UsageReport {provider, fetched_at_ms, limits, reset_credits, notes, metadata} or null, and `error` is the provider's failure message or null. Providers without stored credentials are omitted. Answered off the controller, also during a turn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "usage"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Stop one background job by name. Result: {name, stopped}.",
           "properties": {
             "id": {

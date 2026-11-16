@@ -4,7 +4,56 @@ use crate::config::{paths::Layout, types::Config};
 use crate::llm::{self, profiles::ImageGenerationApi};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, atomic::AtomicBool};
+
+/// ChatGPT sign-ins whose account refused the hosted image tool in this process, keyed by
+/// subscription sign-in directory and account id. Free plans can lack the tool while the model
+/// catalog says nothing, so the first refusal withdraws `image_gen` for that account until Dial
+/// restarts instead of failing every later call the same way.
+static REFUSED: LazyLock<Mutex<HashSet<(PathBuf, String)>>> = LazyLock::new(Default::default);
+
+/// ChatGPT refused its hosted image tool for the signed-in account. Context on the provider
+/// error when first seen; the resolution error afterwards. `auto_tools` stops offering on it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HostedImageRefused;
+
+impl std::fmt::Display for HostedImageRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this ChatGPT account does not offer the hosted image tool (free plans may not include \
+             it); image_gen is withdrawn for this account until Dial restarts. Assign an image role \
+             in /models or configure an image provider in /providers to generate images",
+        )
+    }
+}
+
+impl std::error::Error for HostedImageRefused {}
+
+fn refused(dir: &Path, account: &str) -> bool {
+    REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(dir.to_path_buf(), account.to_owned()))
+}
+
+pub(super) fn record_refusal(dir: &Path, account: &str) {
+    REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((dir.to_path_buf(), account.to_owned()));
+}
+
+/// The Responses API's 400 for a forced `tool_choice` whose hosted tool the account lacks:
+/// "Tool choice 'image_generation' not found in 'tools' parameter."
+pub(super) fn refuses_hosted_tool(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("http 400")
+        && text.contains("tool choice")
+        && text.contains("image_generation")
+        && text.contains("not found")
+}
 
 pub(super) fn resolve(config: &Config) -> Result<Option<Target>> {
     let role_config = config.for_role("image");
@@ -71,6 +120,9 @@ pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
                 .is_none_or(|ids| ids.contains(&account)),
             "ChatGPT account is restricted by private global policy"
         );
+        if refused(&user_dir, &account) {
+            return Err(HostedImageRefused.into());
+        }
         return Ok(Some(Target {
             base_url: endpoint.base_url.clone(),
             model: selection.model,
@@ -194,7 +246,11 @@ pub(super) fn body(target: &Target, request: &Request) -> Value {
     }
 }
 
-pub(super) fn responses(target: &Target, config: &Config, request: &Request) -> Result<Vec<u8>> {
+pub(super) fn responses(
+    target: &Target,
+    config: &Config,
+    request: &Request,
+) -> Result<Vec<Vec<u8>>> {
     use base64::Engine as _;
     let headers = llm::model_config::resolve_headers(&target.headers)?;
     let pairs: Vec<_> = headers.pairs().collect();
@@ -228,13 +284,26 @@ pub(super) fn responses(target: &Target, config: &Config, request: &Request) -> 
         &body(target, request),
         config.image.timeout_secs,
     )
-    .map_err(|error| headers.redact(error))?;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .context("Responses returned invalid base64 image data")
+    .map_err(|error| headers.redact(error));
+    let encoded = match (encoded, &target.account_id) {
+        (Err(error), Some(account)) if refuses_hosted_tool(&error) => {
+            let dir = crate::config::paths::subscription_auth_dir(&config.user_dir)?;
+            record_refusal(&dir, account);
+            return Err(error.context(HostedImageRefused));
+        }
+        (encoded, _) => encoded?,
+    };
+    encoded
+        .iter()
+        .map(|image| {
+            base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .context("Responses returned invalid base64 image data")
+        })
+        .collect()
 }
 
-pub(super) fn chat_image(value: &Value) -> Result<Vec<u8>> {
+pub(super) fn chat_image(value: &Value) -> Result<Vec<Vec<u8>>> {
     use base64::Engine as _;
     let choice = &value["choices"][0];
     ensure!(
@@ -243,25 +312,27 @@ pub(super) fn chat_image(value: &Value) -> Result<Vec<u8>> {
     );
     let images = choice["message"]["images"]
         .as_array()
+        .filter(|images| !images.is_empty())
         .context("chat completion returned no images")?;
-    ensure!(
-        images.len() == 1,
-        "image chat completion must return exactly one image"
-    );
-    let url = images[0]["image_url"]["url"]
-        .as_str()
-        .context("chat completion returned no inline image")?;
-    let (prefix, data) = url.split_once(',').context("invalid image data URL")?;
-    ensure!(
-        [
-            "data:image/png;base64",
-            "data:image/jpeg;base64",
-            "data:image/webp;base64"
-        ]
-        .contains(&prefix),
-        "chat image must be inline PNG, JPEG or WebP base64; remote image URLs are not fetched"
-    );
-    base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .context("chat completion returned invalid image base64")
+    images
+        .iter()
+        .map(|image| {
+            let url = image["image_url"]["url"]
+                .as_str()
+                .context("chat completion returned no inline image")?;
+            let (prefix, data) = url.split_once(',').context("invalid image data URL")?;
+            ensure!(
+                [
+                    "data:image/png;base64",
+                    "data:image/jpeg;base64",
+                    "data:image/webp;base64"
+                ]
+                .contains(&prefix),
+                "chat image must be inline PNG, JPEG or WebP base64; remote image URLs are not fetched"
+            );
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .context("chat completion returned invalid image base64")
+        })
+        .collect()
 }

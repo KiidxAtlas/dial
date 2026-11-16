@@ -82,7 +82,8 @@ swallowed. Lists in Settings and Providers stop at their first and last rows rat
 - **`/extensions`** browses MCP servers, skills, tool groups and hooks; `/extensions
   mcp|skills|tools|hooks` opens a tab and `/hooks` opens the Hooks tab.
 - **`/stats`** opens searchable Usage / cost, Tokens, Sessions and Tools tabs across sessions.
-  `/stats <range>` and `/stats --port <port>` behave as before; `/usage` (provider quotas) and
+  `/stats <range>` and `/stats --port <port>` behave as before; `/usage` (provider quotas, with
+  each account's plan or tier such as `Plus`, `Pro` or `Max 20x`) and
   `/cost` (this runtime's accounting) stay separate.
 - **`/inbox`** lists this session's notifications; `Enter` reads a notice and marks it read, and
   **Mark all read** (or `/inbox read-all`) clears the unread count. **`/doctor`** lists

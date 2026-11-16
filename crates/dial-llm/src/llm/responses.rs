@@ -698,7 +698,7 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
     reply.reasoning_tokens = usage["output_tokens_details"]["reasoning_tokens"].as_u64();
     Ok(reply)
 }
-/// An image turn accepts exactly one completed hosted image, never a partial preview.
+/// An image turn accepts one or more completed hosted images, never a partial preview.
 fn completed_image(response: &Value) -> Result<Reply> {
     let mut response = response.clone();
     let output = response["output"]
@@ -710,19 +710,21 @@ fn completed_image(response: &Value) -> Result<Reply> {
         .cloned()
         .collect();
     ensure!(
-        images.len() == 1,
-        "Responses image generation must return exactly one image"
+        !images.is_empty(),
+        "Responses image generation returned no image"
     );
-    let image = &images[0];
     ensure!(
-        image["status"] == "completed" && image["result"].as_str().is_some_and(|s| !s.is_empty()),
+        images.iter().all(|image| image["status"] == "completed"
+            && image["result"].as_str().is_some_and(|s| !s.is_empty())),
         "Responses image generation is unfinished or has no image data"
     );
     output.retain(|item| item["type"] != "image_generation_call");
     let mut reply = completed(&response)?;
-    reply
-        .provider_content
-        .push(json!({"type":"dial_response_item", "item":image}));
+    reply.provider_content.extend(
+        images
+            .into_iter()
+            .map(|image| json!({"type":"dial_response_item", "item":image})),
+    );
     Ok(reply)
 }
 
@@ -1161,12 +1163,13 @@ fn stream_body(
     )
 }
 
-/// Execute an approved image-only turn through the ordinary Responses transport.
+/// Execute an approved image-only turn through the ordinary Responses transport and return every
+/// completed image's base64 data, in output order.
 /// The caller owns account/origin validation and approval; this never retries or falls back.
 ///
 /// # Errors
-/// Fails on transport errors, unfinished responses, missing or multiple images.
-pub fn generate_image(endpoint: Endpoint<'_>, body: &Value, timeout: u64) -> Result<String> {
+/// Fails on transport errors, unfinished responses or a response without an image.
+pub fn generate_image(endpoint: Endpoint<'_>, body: &Value, timeout: u64) -> Result<Vec<String>> {
     let reply = stream_body_inner(
         endpoint,
         body,
@@ -1176,13 +1179,15 @@ pub fn generate_image(endpoint: Endpoint<'_>, body: &Value, timeout: u64) -> Res
         &mut |_| true,
         StreamPurpose::Image,
     )?;
-    reply
+    let images: Vec<String> = reply
         .provider_content
         .iter()
-        .find(|part| part["item"]["type"] == "image_generation_call")
-        .and_then(|part| part["item"]["result"].as_str())
+        .filter(|part| part["item"]["type"] == "image_generation_call")
+        .filter_map(|part| part["item"]["result"].as_str())
         .map(str::to_owned)
-        .context("Responses returned no completed image")
+        .collect();
+    ensure!(!images.is_empty(), "Responses returned no completed image");
+    Ok(images)
 }
 
 enum StreamPurpose<'a> {

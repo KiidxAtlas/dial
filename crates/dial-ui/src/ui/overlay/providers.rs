@@ -4,7 +4,9 @@
 //! API keys are typed into a masked field backed by [`Secret`]; the text is never drawn, never in
 //! `Debug` output, and is moved into the single `SaveCredential` event (or wiped) the moment the
 //! field is confirmed or abandoned. Whether a key is saved is asked of the controller through the
-//! `has_key` callback, so the display always reflects the real credential store.
+//! `has_key` callback. Each answer is kept until the credential store can have changed (a
+//! controller reply, a configuration change or a rescan), so drawing never reads the store per row
+//! and per frame.
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -255,6 +257,8 @@ pub struct ProviderOverlay {
     discovery: Option<Discovery>,
     configured: BTreeMap<String, ProviderSpec>,
     has_key: Box<dyn Fn(&str) -> bool>,
+    /// `has_key` answers by base URL; see [`Self::forget_saved_keys`].
+    saved_keys: std::cell::RefCell<BTreeMap<String, bool>>,
     scope: Scope,
     project_name: String,
     cursor: usize,
@@ -327,6 +331,7 @@ impl ProviderOverlay {
             discovery,
             configured,
             has_key,
+            saved_keys: Default::default(),
             scope,
             project_name: "this project".into(),
             cursor: 0,
@@ -361,6 +366,11 @@ impl ProviderOverlay {
     }
     pub fn set_configured(&mut self, configured: BTreeMap<String, ProviderSpec>) {
         self.configured = configured;
+        self.forget_saved_keys();
+    }
+    /// Drop remembered `has_key` answers so the next frame reads the credential store again.
+    fn forget_saved_keys(&mut self) {
+        self.saved_keys.get_mut().clear();
     }
     /// Where each provider's key comes from, keyed by base URL. The caller
     /// resolves the saved key and the environment variable; this overlay only describes them.
@@ -371,6 +381,7 @@ impl ProviderOverlay {
     pub fn set_discovery(&mut self, d: Discovery) {
         let anchor = self.entries().get(self.cursor).map(|e| e.id.clone());
         self.discovery = Some(d);
+        self.forget_saved_keys();
         let entries = self.entries();
         self.cursor = anchor
             .and_then(|id| entries.iter().position(|e| e.id == id))
@@ -472,10 +483,15 @@ impl ProviderOverlay {
     }
 
     fn key_saved(&self, entry: &Entry) -> bool {
-        entry
-            .base_url
-            .as_deref()
-            .is_some_and(|url| (self.has_key)(url))
+        let Some(url) = entry.base_url.as_deref() else {
+            return false;
+        };
+        if let Some(saved) = self.saved_keys.borrow().get(url) {
+            return *saved;
+        }
+        let saved = (self.has_key)(url);
+        self.saved_keys.borrow_mut().insert(url.to_owned(), saved);
+        saved
     }
 
     // ---- input ----------------------------------------------------------------------------
@@ -533,6 +549,8 @@ impl ProviderOverlay {
     pub fn set_status(&mut self, message: String, is_error: bool) {
         self.message = Some((message, !is_error));
         self.saving = false;
+        // The controller replies after applying a save or removal.
+        self.forget_saved_keys();
     }
 
     fn list_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {

@@ -2230,6 +2230,26 @@ fn images_group_lists_generators_and_enter_assigns_image_not_main() {
 }
 
 #[test]
+fn unserved_local_image_checkpoints_explain_how_to_serve_them() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    let mut image = image_entry();
+    image.selection.base_url = None;
+    image.available = false;
+    image.source = "LM Studio download (MLX) · image checkpoint, not served: import/serve in MLX-Serve, then F5 rescan".into();
+    d.models.push(image);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.group = Group::Images;
+    assert!(matches!(o.confirm(), OverlayEvent::None));
+    let shown = draw(&mut o, &rig, 220, 35);
+    assert!(shown.contains("serve it with MLX-Serve"), "{shown}");
+    assert!(
+        !shown.contains("provider reports it as unavailable"),
+        "{shown}"
+    );
+}
+
+#[test]
 fn image_role_picker_and_chooser_share_capability_policy_and_inheritance() {
     let rig = Rig::new();
     let image = image_entry();

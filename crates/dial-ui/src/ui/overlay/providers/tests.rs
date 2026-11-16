@@ -281,6 +281,42 @@ fn pending_chatgpt_login_can_be_cancelled_explicitly() {
     assert!(!draw(&mut o, &rig, 110, 24).contains("Cancel pending sign-in"));
 }
 #[test]
+fn key_status_is_read_once_per_endpoint_not_on_every_frame() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    let rig = Rig::new();
+    let calls = Rc::new(Cell::new(0usize));
+    let saved = Rc::new(RefCell::new(false));
+    let (seen, store) = (Rc::clone(&calls), Rc::clone(&saved));
+    let mut o = ProviderOverlay::new(
+        Some(discovery()),
+        BTreeMap::new(),
+        Box::new(move |_| {
+            seen.set(seen.get() + 1);
+            *store.borrow()
+        }),
+        Scope::Global,
+    );
+    draw(&mut o, &rig, 120, 30);
+    let first = calls.get();
+    assert!(first > 0, "the first frame reads the credential store");
+    for _ in 0..5 {
+        send(&mut o, &rig, key(KeyCode::Down));
+        draw(&mut o, &rig, 120, 30);
+    }
+    assert_eq!(
+        calls.get(),
+        first,
+        "redraws and cursor moves reuse the answer"
+    );
+
+    // A rescan (as after saving or removing a key) reads the store again.
+    *saved.borrow_mut() = true;
+    o.set_discovery(discovery());
+    assert!(draw(&mut o, &rig, 120, 30).contains("key saved"));
+    assert!(calls.get() > first);
+}
+#[test]
 fn chatgpt_actions_use_account_login_and_never_the_api_key_editor() {
     let rig = Rig::new();
     let mut d = discovery();

@@ -383,7 +383,10 @@ not an entitlement check, and your first completed inference request verifies ac
 permission and limits in [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
 
 The provider menu lets you choose a saved workspace, sign in again, or sign out. Dial refreshes
-rotating tokens under a cross-process lock. Sign-in continues if you close the provider panel; use
+rotating tokens under a cross-process lock. A plan change (for example an upgrade) needs no new
+sign-in: model discovery (startup, **F5**, `/providers`) renews an access token older than ten
+minutes, and a request the account refuses (HTTP 401 or a usage/plan limit) renews the sign-in
+once and retries when the renewed token names a different plan. Sign-in continues if you close the provider panel; use
 **Cancel pending sign-in** in its menu to stop it. OAuth credentials are stored in owner-private,
 atomic `chatgpt-accounts.json` storage under Dial's user directory (plaintext, not an OS keychain),
 separately from API keys and editable project files. Requests use the ChatGPT Codex Responses

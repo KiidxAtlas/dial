@@ -45,6 +45,7 @@ server supports them. Runtime offers and normal approvals remain authoritative.
 | Approval mode, retry, managed model | `/approval`, `/retry`, `/model restart` | `set_approval`, `retry`, `restart_model`; `state.approval` | Not exposed |
 | Workspace directories | `/add-dir`, `/remove-dir`, `/dirs`, directory-access prompts | `add_dir`, `remove_dir`, `list_dirs`; directory-access prompts after `hello {interactive: true}` | Not exposed |
 | Background jobs | `/processes` | `list_jobs`, `stop_job` (no terminal attach) | Not exposed |
+| Provider usage and plan | `/usage`, status line | `usage` (`plan`, limits and notes per signed-in provider; `/usage reset` stays terminal-only) | Not exposed |
 | Slash-command parity | Every command | `get_available_commands` rows carry `rpc`: the method, client presentation, or terminal-only with a reason | ACP `available_commands_update` |
 | Client code generation | Not applicable | `get_schema` (same document as `docs/rpc-schema.json`) | ACP's own schema |
 

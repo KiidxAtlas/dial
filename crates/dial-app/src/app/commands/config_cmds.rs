@@ -749,7 +749,10 @@ fn usage_text(outcomes: &[Outcome]) -> String {
 }
 
 fn report_text(report: &UsageReport) -> String {
-    let mut lines = vec![report.provider.clone()];
+    let mut lines = vec![match report.plan() {
+        Some(plan) => format!("{} · {plan}", report.provider),
+        None => report.provider.clone(),
+    }];
     for limit in &report.limits {
         let window = limit
             .window

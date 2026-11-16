@@ -113,8 +113,12 @@ pub fn status_summary(reports: &[UsageReport], now_ms: u64) -> Option<String> {
                 .filter_map(|limit| resolve_used_fraction(limit).map(|used| (used, limit)))
                 .max_by(|a, b| a.0.total_cmp(&b.0))?;
             let (used, limit) = limit;
+            let plan = report
+                .plan()
+                .map(|plan| format!(" ({plan})"))
+                .unwrap_or_default();
             let mut part = format!(
-                "{} {} {:.0}%",
+                "{}{plan} {} {:.0}%",
                 report.provider,
                 limit
                     .window
@@ -131,6 +135,29 @@ pub fn status_summary(reports: &[UsageReport], now_ms: u64) -> Option<String> {
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// The `usage` RPC result: every signed-in provider with its plan, its report or its error,
+/// in [`PROVIDERS`] order. `/usage` renders the same outcomes as text.
+pub fn outcomes_json(outcomes: &[Outcome]) -> serde_json::Value {
+    let providers: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|outcome| match &outcome.result {
+            Ok(report) => serde_json::json!({
+                "provider": outcome.provider,
+                "plan": report.plan(),
+                "report": report,
+                "error": null,
+            }),
+            Err(error) => serde_json::json!({
+                "provider": outcome.provider,
+                "plan": null,
+                "report": null,
+                "error": error,
+            }),
+        })
+        .collect();
+    serde_json::json!({ "providers": providers })
 }
 
 fn humanize_ms(ms: u64) -> String {

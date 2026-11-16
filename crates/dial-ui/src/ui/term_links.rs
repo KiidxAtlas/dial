@@ -75,11 +75,14 @@ impl Linker {
         }
         let (path, line) = split_line(token);
         let (absolute, is_dir) = self.resolve(path)?;
-        let fragment = (self.line_fragments && !is_dir).then(|| match line {
-            Some((line, Some(col))) => format!("{line}:{col}"),
-            Some((line, None)) => line.to_string(),
-            None => "1".to_owned(),
-        });
+        // An image opens in its viewer; a line fragment would route it to the text editor instead.
+        let fragment =
+            (self.line_fragments && !is_dir && !crate::llm::images::is_image(Path::new(path)))
+                .then(|| match line {
+                    Some((line, Some(col))) => format!("{line}:{col}"),
+                    Some((line, None)) => line.to_string(),
+                    None => "1".to_owned(),
+                });
         file_url(&absolute, "", fragment.as_deref())
     }
 

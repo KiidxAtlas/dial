@@ -2744,3 +2744,69 @@ fn reset_provider_stays_unconfigured_despite_saved_selections() {
         );
     }
 }
+
+/// A model served by MLX-Serve that declares `image` is listed as an available image-role
+/// candidate, and the saved listing is what `image_gen` later reads for the role's transport.
+#[test]
+fn served_mlx_serve_image_model_is_selectable_for_the_image_role() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let url = routed(vec![(
+        "/v1/models",
+        serde_json::json!({"data":[
+            {"id":"mlx-community/flux2-klein-9b-4bit","owned_by":"mlx-serve","capabilities":["image"]},
+            {"id":"mlx-community/chat-4bit","owned_by":"mlx-serve","capabilities":["chat"]}
+        ]})
+        .to_string(),
+    )]);
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let mut configured: BTreeMap<_, _> = LOCAL_SERVERS
+        .iter()
+        .map(|&(id, ..)| id)
+        .chain(KNOWN.iter().map(|row| row.0))
+        .chain(["chatgpt", "apple"])
+        .map(|id| {
+            (
+                id.to_owned(),
+                ProviderSpec {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    configured.insert(
+        "mlx-serve".into(),
+        ProviderSpec {
+            label: "MLX-Serve".into(),
+            base_url: url.clone(),
+            ..Default::default()
+        },
+    );
+    let found = discover(&layout, &configured, &[]);
+    let served: Vec<_> = found
+        .models
+        .iter()
+        .filter(|entry| entry.selection.provider == "mlx-serve")
+        .collect();
+    let image = served
+        .iter()
+        .find(|entry| entry.selection.model == "mlx-community/flux2-klein-9b-4bit")
+        .expect("served image model listed");
+    assert!(image.available, "a served image model can be selected");
+    assert!(image.accepts_image_role());
+    assert!(!image.supports_chat(), "never offered as a chat model");
+    assert_eq!(image.selection.base_url.as_deref(), Some(url.as_str()));
+    let chat = served
+        .iter()
+        .find(|entry| entry.selection.model == "mlx-community/chat-4bit")
+        .unwrap();
+    assert!(!chat.accepts_image_role(), "chat models stay out of Images");
+
+    // Assigning the entry to the image role stores its selection; image_gen reads the saved listing.
+    assert_eq!(
+        model_metadata(&layout, &image.selection).image_generation,
+        Some(ImageGenerationApi::MlxServe)
+    );
+}

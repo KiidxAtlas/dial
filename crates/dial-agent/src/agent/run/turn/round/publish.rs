@@ -179,19 +179,22 @@ impl Agent<'_> {
             std::mem::take(&mut self.callback_question_results),
             limit,
         );
-        // A read image, or the file `image_gen` just wrote, is attached so a vision model can
-        // inspect it (and regenerate when it misses the request).
-        let attach = match call.name.as_str() {
-            "read" => call.arguments["path"].as_str(),
-            crate::tools::net::image_gen::TOOL => call.arguments["output"].as_str(),
-            _ => None,
+        // A read image, or every file `image_gen` just wrote, is attached so a vision model can
+        // inspect it (and regenerate when it misses the request), and previewed in the transcript.
+        let attach: Vec<PathBuf> = match call.name.as_str() {
+            "read" => call.arguments["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .into_iter()
+                .collect(),
+            crate::tools::net::image_gen::TOOL => {
+                self.written_images(&output, call.arguments["output"].as_str())
+            }
+            _ => Vec::new(),
         };
-        if !output.is_error
-            && !self.hermetic
-            && let Some(path) = attach
-        {
-            let path = Path::new(path);
-            if llm::images::is_image(path) {
+        if !output.is_error && !self.hermetic {
+            let mut attached = Vec::new();
+            for path in attach.iter().filter(|path| llm::images::is_image(path)) {
                 let authorized = (call.name == "read")
                     .then(|| llm::images::authorized_user_reference(&self.session.messages(), path))
                     .flatten();
@@ -209,9 +212,12 @@ impl Agent<'_> {
                         })
                 };
                 match attachment {
-                    Ok(image) => message["dial_images"] = json!([image]),
+                    Ok(image) => attached.push(image),
                     Err(error) => ui.notice(&format!("Image attachment unavailable: {error:#}")),
                 }
+            }
+            if !attached.is_empty() {
+                message["dial_images"] = json!(attached);
             }
         }
         if !self.hermetic && message.get("dial_images").is_some() && backend.accepts_image_input() {

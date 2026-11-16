@@ -736,3 +736,140 @@ fn hosted_image_capability_survives_account_catalog_roundtrip() {
         None
     );
 }
+
+#[test]
+fn account_label_names_the_plan_its_token_was_issued_for() {
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    assert_eq!(
+        accounts(dir.path()).unwrap()[0].label,
+        "test@example.com (oaiapp_test)"
+    );
+    store_access(dir.path(), plan_access("pro", 0), 0);
+    assert_eq!(
+        accounts(dir.path()).unwrap()[0].label,
+        "test@example.com · Pro (oaiapp_test)"
+    );
+}
+
+/// An access token for the test account naming `plan`, issued `age` seconds ago.
+fn plan_access(plan: &str, age: u64) -> String {
+    format!(
+        "{}.{}.sig",
+        URL_SAFE_NO_PAD.encode("{}"),
+        URL_SAFE_NO_PAD.encode(
+            json!({
+                "iat": now() - age,
+                "https://api.openai.com/auth":{"chatgpt_account_id":"oaiapp_test","chatgpt_plan_type":plan}
+            })
+            .to_string()
+        )
+    )
+}
+
+fn store_access(dir: &Path, access: String, earliest_refresh_at: u64) {
+    let _lock = locked(&credential_path(dir)).unwrap();
+    let mut state = load(dir).unwrap();
+    let tokens = state
+        .accounts
+        .get_mut("oaiapp_test")
+        .unwrap()
+        .tokens
+        .as_mut()
+        .unwrap();
+    tokens.access_token = access;
+    tokens.earliest_refresh_at = earliest_refresh_at;
+    save(dir, &state).unwrap();
+}
+
+fn stored_access(dir: &Path) -> String {
+    load(dir).unwrap().accounts["oaiapp_test"]
+        .tokens
+        .as_ref()
+        .unwrap()
+        .access_token
+        .clone()
+}
+
+fn renewed(access: &str) -> Vec<super::super::fake::Script> {
+    vec![super::super::fake::json(
+        200,
+        &json!({"access_token":access,"refresh_token":"rotated","token_type":"Bearer","expires_in":3600}),
+    )]
+}
+
+#[test]
+fn forced_renewal_picks_up_an_upgraded_plan_from_an_unexpired_token() {
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    store_access(dir.path(), plan_access("free", 30), 0);
+    let upgraded = plan_access("plus", 0);
+    let server = super::super::fake::serve(renewed(&upgraded));
+    let renewal = renew_at(
+        dir.path(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        &server.url,
+        Renew::Now,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        (renewal.before.as_deref(), renewal.after.as_deref()),
+        (Some("free"), Some("plus"))
+    );
+    assert!(renewal.plan_changed());
+    assert_eq!(stored_access(dir.path()), upgraded);
+    assert_eq!(server.requests().len(), 1);
+
+    // The same plan again is a renewal without a plan change.
+    let server = super::super::fake::serve(renewed(&plan_access("plus", 0)));
+    let renewal = renew_at(
+        dir.path(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        &server.url,
+        Renew::Now,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!renewal.plan_changed());
+}
+
+#[test]
+fn discovery_renews_only_old_tokens_and_never_before_the_provider_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    let recent = plan_access("free", 60);
+    store_access(dir.path(), recent.clone(), 0);
+    let server = super::super::fake::serve(vec![]);
+    let cancel = || Arc::new(AtomicBool::new(false));
+    let age = Renew::OlderThan(DISCOVERY_RENEW_AGE);
+    assert_eq!(
+        renew_at(dir.path(), None, cancel(), &server.url, age).unwrap(),
+        None
+    );
+    assert!(server.requests().is_empty(), "a recent token is kept");
+    assert_eq!(stored_access(dir.path()), recent);
+
+    // The provider's earliest renewal time wins even over a forced renewal.
+    store_access(dir.path(), plan_access("free", 3600), now() + 600);
+    assert_eq!(
+        renew_at(dir.path(), None, cancel(), &server.url, Renew::Now).unwrap(),
+        None
+    );
+    assert!(server.requests().is_empty());
+
+    store_access(dir.path(), plan_access("free", 3600), 0);
+    let server = super::super::fake::serve(renewed(&plan_access("pro", 0)));
+    let renewal = renew_at(dir.path(), None, cancel(), &server.url, age)
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewal.after.as_deref(), Some("pro"));
+
+    // A failed renewal is an error for the caller and leaves the stored token in place.
+    let kept = stored_access(dir.path());
+    let server = super::super::fake::serve(vec![super::super::fake::json(500, &json!({}))]);
+    assert!(renew_at(dir.path(), None, cancel(), &server.url, Renew::Now).is_err());
+    assert_eq!(stored_access(dir.path()), kept);
+}

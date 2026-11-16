@@ -64,3 +64,47 @@ fn status_summary_picks_tightest_limit_and_countdown() {
     );
     assert_eq!(status_summary(&[], now), None);
 }
+
+#[test]
+fn plans_read_as_names_on_reports_and_the_status_line() {
+    for (raw, label) in [
+        ("plus", "Plus"),
+        ("pro", "Pro"),
+        ("claude_max", "Max"),
+        ("max_20x", "Max 20x"),
+        ("free_limited_copilot", "Free Limited Copilot"),
+        ("Gemini Code Assist Standard", "Gemini Code Assist Standard"),
+    ] {
+        assert_eq!(plan_label(raw), label);
+    }
+    let now = 1_000_000_000;
+    let mut report = UsageReport {
+        provider: "openai-codex".into(),
+        fetched_at_ms: now,
+        limits: vec![limit("5h", 40.0, None)],
+        reset_credits: None,
+        notes: vec![],
+        metadata: Default::default(),
+    };
+    assert_eq!(report.plan(), None);
+    report.metadata.insert("planType".into(), "plus".into());
+    assert_eq!(report.plan().as_deref(), Some("Plus"));
+    assert_eq!(
+        status_summary(std::slice::from_ref(&report), now).as_deref(),
+        Some("openai-codex (Plus) 5h 40%")
+    );
+    let json = outcomes_json(&[
+        Outcome {
+            provider: "openai-codex",
+            result: Ok(report),
+        },
+        Outcome {
+            provider: "anthropic",
+            result: Err("offline".into()),
+        },
+    ]);
+    assert_eq!(json["providers"][0]["plan"], "Plus");
+    assert_eq!(json["providers"][0]["report"]["provider"], "openai-codex");
+    assert_eq!(json["providers"][1]["plan"], serde_json::Value::Null);
+    assert_eq!(json["providers"][1]["error"], "offline");
+}

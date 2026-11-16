@@ -121,7 +121,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "tree",
     "understanding",
     "update",
-    "usage",
     "vibe",
     "weights",
     "wt",
