@@ -5,7 +5,7 @@
 //! The component is pure: [`Composer::handle_key`] maps a key to a [`ComposerEvent`], and
 //! [`Composer::view`] returns styled rows plus the cursor position. Every app-level shortcut comes
 //! from the [`Keymap`], every color and glyph from the [`Theme`], so hints and behavior always agree.
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::llm::model_config::{BusySend, UiConfig};
 
@@ -67,6 +67,11 @@ impl DoubleTap {
             .is_some_and(|last| now.saturating_duration_since(last) <= DOUBLE_TAP_WINDOW);
         self.last = if hit { None } else { Some(now) };
         hit
+    }
+
+    /// Forgets a pending first press, so an unrelated key in between breaks the pair.
+    pub fn reset(&mut self) {
+        self.last = None;
     }
 }
 
@@ -211,11 +216,15 @@ struct Choice {
 /// Returns newest-first history entries matching a case-insensitive substring, up to a limit.
 type HistoryProvider = std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>;
 
+/// A sent draft kept for recall: `(sent text, draft with chip markers, the chips' payloads)`.
+type ChipRecall = (String, String, Vec<(String, String)>);
+
 /// One in-flight lookup and one replaceable, debounced request: slow providers never block input
 /// or grow a thread per keystroke. Results are collected by the existing autocomplete poll loop.
 struct HistoryLookup {
-    tx: std::sync::mpsc::Sender<(u64, Vec<String>)>,
-    rx: std::sync::mpsc::Receiver<(u64, Vec<String>)>,
+    /// `None` reports a lookup that failed; the shown entries are kept.
+    tx: std::sync::mpsc::Sender<(u64, Option<Vec<String>>)>,
+    rx: std::sync::mpsc::Receiver<(u64, Option<Vec<String>>)>,
     epoch: u64,
     query: Option<String>,
     pending: Option<(u64, String, std::time::Instant)>,
@@ -287,6 +296,9 @@ pub struct Composer {
     mention_edit: bool,
     /// Payloads referenced by the draft, saved draft, undo/redo or bounded kill rings.
     pastes: Vec<(String, String)>,
+    /// Recently sent drafts that held chips, so recalling one shows its chips again instead of
+    /// the full expanded text.
+    recalls: Vec<ChipRecall>,
     paste_count: usize,
     /// Keep pasted-image files alive for the session because message expansion happens after submit.
     pasted_images: Vec<tempfile::TempPath>,
@@ -311,6 +323,8 @@ pub struct Composer {
     keyboard_enhanced: Option<bool>,
     /// A busy Ctrl+C just cleared the draft; the next one stops the turn (hint only).
     stop_armed: bool,
+    /// Cells per draft row at the last render, so Up and Down move by wrapped rows; 0 before any.
+    wrap_width: std::cell::Cell<usize>,
 }
 
 impl Composer {
@@ -336,6 +350,7 @@ impl Composer {
             eof_armed: false,
             mention_edit: false,
             pastes: Vec::new(),
+            recalls: Vec::new(),
             clipboard_read: None,
             paste_count: 0,
             pasted_images: Vec::new(),
@@ -368,6 +383,7 @@ impl Composer {
             word_notice: None,
             keyboard_enhanced: None,
             stop_armed: false,
+            wrap_width: std::cell::Cell::new(0),
         };
         for entry in history {
             composer.push_history(entry);
@@ -537,16 +553,29 @@ impl Composer {
         if self.busy && key.kind == KeyEventKind::Repeat && ctx.keys.matches(Action::Submit, &key) {
             return ComposerEvent::None;
         }
-        self.stop_armed = false;
-        // Stopping is global even while a completion, history search or chooser is open.
-        // A user-mapped dismiss chord still belongs to the local layer first.
+        // A press that only closed a search or cleared the draft arms the next one to stop.
+        let stop_armed = std::mem::take(&mut self.stop_armed);
+        // The double-Left gesture needs two Left presses in a row; any other key breaks it.
+        if !(key.code == KeyCode::Left && key.modifiers.is_empty()) {
+            self.double_left.reset();
+        }
+        // Stopping is global even while a completion or chooser is open. A user-mapped dismiss
+        // chord still belongs to the local layer first, and the shared Ctrl+C closes an open
+        // history search first, as it does when idle.
         if self.busy
             && ctx.keys.matches(Action::Interrupt, &key)
             && !self.dismisses_interrupt(&key, ctx.keys)
         {
             self.editor.cancel_jump();
+            if self.search.is_some() && ctx.keys.matches(Action::ClearDraft, &key) {
+                self.search = None;
+                self.stop_armed = true;
+                self.refresh();
+                return ComposerEvent::None;
+            }
             // With a draft, the shared Ctrl+C clears it first (like idle); the next press stops.
             if self.search.is_none()
+                && !stop_armed
                 && !self.editor.text.is_empty()
                 && ctx.keys.matches(Action::ClearDraft, &key)
             {
@@ -563,10 +592,7 @@ impl Composer {
             return ComposerEvent::Interrupt;
         }
         // A pending Ctrl-] jump takes the next typed letter; any other key cancels it before dispatch.
-        let plain = matches!(key.code, KeyCode::Char(_))
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let plain = super::keys::typed_char(&key).is_some();
         if self.search.is_none() && self.editor.jump_pending() && plain {
             self.editor.key_with(key, ctx.keys);
             self.refresh();
@@ -574,11 +600,15 @@ impl Composer {
         }
         self.editor.cancel_jump();
         let (length, cursor) = (self.editor.text.len(), self.editor.cursor);
+        let before = (!self.pastes.is_empty()).then(|| self.editor.text.clone());
         let event = if self.search.is_some() {
             self.search_key(key, ctx)
         } else {
             self.edit_key(key, ctx)
         };
+        if let Some(before) = before {
+            self.keep_chips_whole(&before, cursor);
+        }
         self.mention_edit =
             self.editor.text.len() != length || (self.mention_edit && self.editor.cursor == cursor);
         self.refresh();
@@ -713,7 +743,7 @@ impl Composer {
         if up || keys.matches(Action::SelectDown, &key) {
             if self.menu_open() {
                 self.step_menu(if up { -1 } else { 1 }, true, rows);
-            } else if !self.editor.vertical(up) {
+            } else if !self.move_vertically(up) {
                 self.browse_history(up);
             }
             return ComposerEvent::None;
@@ -733,6 +763,22 @@ impl Composer {
         }
         self.editor.key_with(key, keys);
         ComposerEvent::None
+    }
+
+    /// Up or Down within the draft: by wrapped screen rows once the composer has been drawn, by
+    /// logical lines before that. False at the top or bottom row, where history takes over.
+    fn move_vertically(&mut self, up: bool) -> bool {
+        let width = self.wrap_width.get();
+        if width == 0 {
+            return self.editor.vertical(up);
+        }
+        match render::wrapped_vertical(&self.editor.text, self.editor.cursor, width, up) {
+            Some(at) => {
+                self.editor.move_to(at);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Sends a finished speech draft without accepting autocomplete. During a turn it uses the
@@ -823,10 +869,11 @@ impl Composer {
         }
         let sent = expand_pastes(&self.editor.text, &self.pastes);
         self.learn_words(&sent);
+        // Before the draft is cleared, so a draft with chips can be recalled with them.
+        self.push_history(sent.clone());
         self.finish_draft();
         // Sending an edited queue item consumes it; the original is intentionally not restored.
         self.editing_queue = None;
-        self.push_history(sent.clone());
         ComposerEvent::Submit(sent)
     }
 

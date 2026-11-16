@@ -381,3 +381,35 @@ fn choice_navigation_and_hints_follow_the_keymap() {
     dialog.key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &keys);
     assert_eq!(dialog.cursor, start + 1);
 }
+
+#[test]
+fn a_timeout_that_picks_an_answer_says_what_it_chose() {
+    let request = request(2, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    let now = Instant::now();
+    dialog.deadline = Some(now);
+    assert!(dialog.expired_at(now).is_none(), "the first page moves on");
+    assert_eq!(dialog.page, 1);
+    assert_eq!(
+        dialog.feedback,
+        "No answer in time to \u{201c}Pick 0?\u{201d}; chose \u{201c}yes\u{201d}."
+    );
+    assert_eq!(dialog.timeout_notes(), [dialog.feedback.clone()]);
+    dialog.deadline = Some(now);
+    let Some(QuestionOutcome::Answered(answers)) = dialog.expired_at(now) else {
+        panic!("the last page answers");
+    };
+    assert!(answers.iter().all(|answer| answer.timed_out));
+    assert_eq!(dialog.timeout_notes().len(), 2);
+}
+
+#[test]
+fn a_timeout_after_the_user_chose_reports_nothing_extra() {
+    let request = request(1, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    dialog.answers[0].selected_options.push("yes".into());
+    let now = Instant::now();
+    dialog.deadline = Some(now);
+    assert!(dialog.expired_at(now).is_some());
+    assert!(dialog.timeout_notes().is_empty());
+}

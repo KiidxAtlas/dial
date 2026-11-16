@@ -179,7 +179,7 @@ impl Shell {
                     shell: self,
                     interrupt: app.interrupt.clone(),
                     started: Instant::now(),
-                    last_paint: Instant::now() - PAINT_EVERY,
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                     failed: false,
                     pending: Vec::new(),
                     next_id: 0,
@@ -210,7 +210,7 @@ impl Shell {
                     shell: self,
                     interrupt: app.interrupt.clone(),
                     started: Instant::now(),
-                    last_paint: Instant::now() - PAINT_EVERY,
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                     failed: false,
                     pending: Vec::new(),
                     next_id: 0,
@@ -370,14 +370,7 @@ impl Shell {
             };
             let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
             let ambient = self.home.as_ref().is_some_and(welcome::Home::ambient);
-            let timeout = if animating {
-                timeout.min(crate::ui::fx::FRAME)
-            } else if ambient {
-                timeout.min(crate::ui::fx::AMBIENT)
-            } else {
-                timeout
-            };
-            if self.held.is_empty() && !poll(timeout)? {
+            if self.held.is_empty() && !self.wait_input(timeout)? {
                 dirty = animating || ambient;
                 if self.pending_favorite.is_some() {
                     self.catalog.collect();
@@ -475,6 +468,24 @@ impl Shell {
         }
     }
 
+    /// Wait up to `timeout` for input. While the home mark moves, frames before the deadline only
+    /// repaint, so each costs one diffed draw instead of a pass through the loop's disk, status and
+    /// maintenance polling, which on slow file systems (Windows) made the start-up motion stutter.
+    fn wait_input(&mut self, timeout: Duration) -> Result<bool> {
+        wait_frames(
+            self,
+            timeout,
+            |shell| match shell.home.as_ref() {
+                _ if shell.busy_overlay.is_some() => None,
+                Some(home) if home.animating() => Some(crate::ui::fx::FRAME),
+                Some(home) if home.ambient() => Some(crate::ui::fx::AMBIENT),
+                _ => None,
+            },
+            poll,
+            |shell| shell.paint(None),
+        )
+    }
+
     fn peer_turn_available(&self) -> bool {
         self.startup.is_none()
             && self.busy_overlay.is_none()
@@ -487,6 +498,29 @@ impl Shell {
             && self.composer.draft().is_empty()
             && self.loop_mode.next_due().is_none()
             && !self.loop_mode.is_awaiting_condition()
+    }
+}
+
+/// Poll for input for up to `timeout`, painting `state` every `frame` interval in between while
+/// one is set. True when input is ready.
+fn wait_frames<S>(
+    state: &mut S,
+    timeout: Duration,
+    frame: impl Fn(&S) -> Option<Duration>,
+    mut poll: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut paint: impl FnMut(&mut S) -> Result<()>,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let step = frame(state).map_or(left, |frame| frame.min(left));
+        if poll(step)? {
+            return Ok(true);
+        }
+        if step >= left || Instant::now() >= deadline {
+            return Ok(false);
+        }
+        paint(state)?;
     }
 }
 

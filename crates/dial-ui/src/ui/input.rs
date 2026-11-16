@@ -1,5 +1,5 @@
 //! Keep pasted line breaks out of the prompt's submit-key path.
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use std::time::{Duration, Instant};
 
 mod pump;
@@ -85,11 +85,7 @@ impl PasteGuard {
             self.raw = false;
         }
         match key.code {
-            KeyCode::Char(_)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
-            {
+            KeyCode::Char(_) if super::keys::typed_char(&key).is_some() => {
                 if buffered || (protected && self.raw) {
                     self.until = Some(now + PASTE_SETTLE);
                 }

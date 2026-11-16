@@ -36,19 +36,9 @@ pub(in crate::ui::overlay) fn pressed(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release
 }
 
-/// The character a key types into a text field (no Ctrl/Alt/Super chords, no controls).
+/// The character a key types into a text field (see [`crate::ui::keys::typed_char`]).
 pub(in crate::ui::overlay) fn typed_char(key: &KeyEvent) -> Option<char> {
-    match key.code {
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                && !c.is_control() =>
-        {
-            Some(c)
-        }
-        _ => None,
-    }
+    crate::ui::keys::typed_char(key)
 }
 
 pub(in crate::ui::overlay) fn is_ctrl(key: &KeyEvent, c: char) -> bool {

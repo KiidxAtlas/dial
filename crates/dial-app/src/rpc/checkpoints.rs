@@ -186,7 +186,7 @@ pub(super) fn undo_result(
         }
     };
     let files = outcome.files.as_ref().map(|report| {
-        json!({"restored":report.restored,"removed":report.removed,"warnings":report.warnings})
+        json!({"restored":report.restored,"removed":report.removed,"warnings":report.warnings,"unrestorable":report.unrestorable})
     });
     Ok(json!({
         "turns": turns,

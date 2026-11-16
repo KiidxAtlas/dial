@@ -202,7 +202,7 @@ pub fn notebook_value_to_editable_text(
         let kind = cell["cell_type"].as_str().expect("validated cell type");
         write!(text, "# %% [{kind}] cell:{index}").expect("writing to String cannot fail");
         let source = source_to_text(cell.get("source"));
-        let source = super::text::normalize_to_lf(&source);
+        let source = crate::tools::edit::hashline::normalize_body(&source);
         if !source.is_empty() {
             text.push('\n');
             text.push_str(&escape_marker_like_source_lines(&source));
@@ -349,7 +349,8 @@ pub fn apply_notebook_editable_text(
                 Value::String(parsed.cell_type.as_str().into()),
             );
             let old_source = source_to_text(original.get("source"));
-            let changed = super::text::normalize_to_lf(&old_source).as_ref() != parsed.source
+            let changed = crate::tools::edit::hashline::normalize_body(&old_source).as_ref()
+                != parsed.source
                 || original["cell_type"].as_str() != Some(parsed.cell_type.as_str());
             if changed {
                 let persisted = super::text::restore_line_endings_like(&old_source, &parsed.source);

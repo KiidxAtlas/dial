@@ -144,9 +144,10 @@ fn oversized_file_is_listed_as_skipped_not_restored() {
     assert_eq!(cp.changed_files(turn), ["big.bin"]);
     let report = cp.rollback(1).unwrap();
     assert!(
-        report.warnings.iter().any(|w| w.contains("too large")),
+        report.unrestorable.iter().any(|w| w.contains("too large")),
         "{report:?}"
     );
+    assert!(report.warnings.is_empty(), "{report:?}");
 }
 
 #[cfg(unix)]

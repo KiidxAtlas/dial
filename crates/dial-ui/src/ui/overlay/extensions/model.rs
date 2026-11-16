@@ -346,7 +346,7 @@ impl Form {
     /// Deletes the last character of the focused field.
     pub fn backspace(&mut self) {
         if let Some(field) = self.fields.get_mut(self.focus) {
-            field.value.pop();
+            crate::ui::text::pop_grapheme(&mut field.value);
             self.error = None;
         }
     }
@@ -605,7 +605,7 @@ impl Browser {
     }
 
     pub fn pop_query(&mut self) {
-        self.query.pop();
+        crate::ui::text::pop_grapheme(&mut self.query);
         self.clamp_cursors();
     }
 

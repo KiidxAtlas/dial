@@ -170,6 +170,7 @@ impl Checkpoints {
                 mode: saved.stamp.mode,
                 writers: vec![SHELL_WRITER.to_owned()],
                 len: Some(before.len() as u64),
+                new_dirs: None,
             });
             recorded.push(rel.clone());
         }
@@ -184,6 +185,7 @@ impl Checkpoints {
                 mode: 0,
                 writers: vec![SHELL_WRITER.to_owned()],
                 len: None,
+                new_dirs: None,
             });
             recorded.push(rel);
         }

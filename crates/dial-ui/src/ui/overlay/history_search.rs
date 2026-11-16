@@ -139,8 +139,7 @@ impl HistorySearchOverlay {
                 return OverlayEvent::Action(format!("history-open:{}", hit.session_id));
             }
         } else if self.filtering {
-            if key.code == KeyCode::Backspace {
-                self.filter.pop();
+            if crate::ui::editor::delete_at_end(&mut self.filter, key, Some(keys)).is_some() {
                 self.refilter();
             } else if let Some(c) = typed_char(key) {
                 self.filter.push(c);

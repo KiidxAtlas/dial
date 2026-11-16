@@ -2028,6 +2028,58 @@ fn git_status_counts_staged_modified_and_untracked() {
     assert_eq!(parse_status(""), (0, 0, 0));
 }
 
+#[cfg(unix)]
+#[test]
+fn status_probe_never_runs_repository_filter_drivers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("a.txt"), "one\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    // A sandboxed command could plant this: a clean filter that runs on any worktree read.
+    let marker = root.join("filter-ran");
+    git(&[
+        "config",
+        "filter.audit.clean",
+        &format!("touch {}; cat", marker.display()),
+    ]);
+    std::fs::write(root.join(".gitattributes"), "* filter=audit\n").unwrap();
+    std::fs::write(root.join("a.txt"), "two\n").unwrap();
+    let status = crate::app::git::git_output(root, &["status", "--porcelain=v1"]);
+    assert!(status.is_some_and(|out| out.contains("a.txt")));
+    let diff = crate::app::git::git_output(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "-z",
+            "HEAD",
+        ],
+    );
+    assert!(diff.is_some_and(|out| out.contains("a.txt")));
+    assert!(crate::app::git::git_output(root, &["hash-object", "--", "a.txt"]).is_some());
+    assert!(!marker.exists(), "repo-configured filters must not run");
+}
+
 #[test]
 fn terminal_background_is_read_from_colorfgbg() {
     assert_eq!(terminal_dark(Some("15;0")), Some(true));

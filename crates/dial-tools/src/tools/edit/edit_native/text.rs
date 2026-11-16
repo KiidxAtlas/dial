@@ -47,26 +47,6 @@ pub fn dominant_line_ending(content: &str) -> LineEnding {
     }
 }
 
-/// Normalize every `\r\n` and lone `\r` to `\n`. Borrows when nothing changes.
-pub fn normalize_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains('\r') {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            out.push('\n');
-        } else {
-            out.push(ch);
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
 /// Re-encode LF-normalized `after` against `original`, the raw text it was derived from, so every
 /// line the edit left alone keeps its own terminator. Lines matched to `original` by a line diff
 /// keep that line's `\r\n`/`\n`; inserted or rewritten lines take `dominant_line_ending`. The

@@ -173,6 +173,7 @@ impl Checkpoints {
             mode: 0,
             writers: Vec::new(),
             len: None,
+            new_dirs: None,
         }
         .display();
         let mut inner = self.lock();

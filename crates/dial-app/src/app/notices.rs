@@ -354,6 +354,37 @@ impl RetryNotice {
         })
     }
 
+    /// The cause without the provider's `(after 1.0s)` attempt timing, which changes every
+    /// attempt; two attempts with the same key failed the same way.
+    pub(super) fn cause_key(&self) -> &str {
+        match self.cause.rsplit_once(" (after ") {
+            Some((head, tail)) if tail.ends_with("s)") => head,
+            _ => &self.cause,
+        }
+    }
+
+    /// The transcript note for this attempt, given the cause already explained this turn.
+    /// The first failure is explained in full; later attempts are noted only when the cause
+    /// changes (the status line shows each wait). `stop_key` is empty when interrupt is unbound.
+    pub(super) fn note_text(&self, explained: Option<&str>, stop_key: &str) -> Option<String> {
+        let stop = if stop_key.trim().is_empty() {
+            "interrupt"
+        } else {
+            stop_key
+        };
+        match explained {
+            None => Some(format!(
+                "The model request failed ({}). Dial retries up to {} times; /retry skips the wait, {stop} stops.",
+                self.cause, self.max
+            )),
+            Some(previous) if previous != self.cause_key() => Some(format!(
+                "Attempt {} of {} failed differently ({}).",
+                self.attempt, self.max, self.cause
+            )),
+            Some(_) => None,
+        }
+    }
+
     /// The one line that closes a retry explanation once the request finally succeeds.
     pub(super) fn recovered_text(attempt: u32) -> String {
         format!("The model request succeeded on attempt {attempt}; the turn continues.")

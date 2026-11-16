@@ -267,16 +267,11 @@ impl Picker {
                     KeyCode::Right => self.step_sibling(true),
                     KeyCode::Home => self.selected = 0,
                     KeyCode::End => self.selected = last,
-                    KeyCode::Backspace => {
-                        self.query.pop();
+                    _ if crate::ui::editor::delete_at_end(&mut self.query, key, None).is_some() => {
                         self.refilter();
                     }
-                    KeyCode::Char(c)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        self.query.push(c);
+                    _ if crate::ui::keys::typed_char(key).is_some() => {
+                        self.query.extend(crate::ui::keys::typed_char(key));
                         self.refilter();
                     }
                     _ => {}

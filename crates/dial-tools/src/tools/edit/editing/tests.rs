@@ -226,6 +226,29 @@ fn notebook_identity_requires_the_raw_metadata_revision() {
 }
 
 #[test]
+fn notebook_edits_keep_lone_carriage_returns_in_the_edited_cell() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(EditMode::Replace);
+    let path = ws.root().join("a.ipynb");
+    let notebook = json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"id":"cell","cell_type":"code","metadata":{},"source":["print('a\rb')\n","value = 1\n"],"outputs":[],"execution_count":null}]});
+    fs::write(&path, notebook.to_string()).unwrap();
+    let read = execute(&ws, "read", &json!({"path":"a.ipynb"}), 20);
+    assert!(!read.is_error, "{}", read.text);
+    let output = execute(
+        &ws,
+        "edit",
+        &json!({"path":"a.ipynb", "old_string":"value = 1", "new_string":"value = 2"}),
+        20,
+    );
+    assert!(!output.is_error, "{}", output.text);
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        saved["cells"][0]["source"],
+        json!(["print('a\rb')\n", "value = 2\n"])
+    );
+}
+
+#[test]
 fn replace_all_unchanged_fuzzy_matches_still_require_witnesses() {
     use super::super::edit_native::{
         error::EditError,
@@ -248,6 +271,20 @@ fn replace_all_unchanged_fuzzy_matches_still_require_witnesses() {
         assert!(calls.get() > 0);
         let result = replace_text(current, old, new, true, true, None, &|_, _| Ok(())).unwrap();
         assert!(matches!(result, ReplaceOutcome::NoChange), "{result:?}");
+    }
+}
+
+#[test]
+fn replacing_text_keeps_lone_and_doubled_carriage_returns_in_untouched_lines() {
+    for (before, expected) in [
+        ("progress\rdone\nold\n", "progress\rdone\nnew\n"),
+        ("x\r\r\nold\r\n", "x\r\r\nnew\r\n"),
+    ] {
+        let (_dir, ws, path, _observed) = workspace(before);
+        ws.store().record_all(&path, &hashline::normalize(before));
+        let output = replace(&ws, "old", "new");
+        assert!(!output.is_error, "{before:?}: {}", output.text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected, "{before:?}");
     }
 }
 

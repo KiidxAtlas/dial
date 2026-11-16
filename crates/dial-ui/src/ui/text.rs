@@ -62,6 +62,12 @@ impl Sanitizer {
                         State::Text
                     }
                 },
+                // A newline ends any unfinished sequence and is kept: a stray ESC cannot join two
+                // lines and an unterminated CSI, OSC or DCS cannot hide the rest of the output.
+                _ if c == '\n' => {
+                    out.push('\n');
+                    State::Text
+                }
                 State::Escape => match c {
                     '[' => State::Csi,
                     ']' | 'P' | 'X' | '^' | '_' => State::String,
@@ -113,6 +119,18 @@ pub fn clip(text: &str, max: usize) -> String {
             used <= max
         })
         .collect()
+}
+
+/// Remove the last grapheme cluster, the unit a user sees as one character (an accented letter,
+/// an emoji with modifiers, a flag). Returns whether anything was removed.
+pub fn pop_grapheme(text: &mut String) -> bool {
+    match text.grapheme_indices(true).next_back() {
+        Some((start, _)) => {
+            text.truncate(start);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Clip to `max` cells, ending in `…` (or `...` when `ascii`) if anything was cut.

@@ -146,9 +146,19 @@ mod live {
         .unwrap();
         assert_eq!((http.host.as_str(), http.port), ("Example.com", 8080));
         let forward = String::from_utf8(http.forward.unwrap()).unwrap();
+        // The client's Host header is replaced by the authority the policy checked.
         assert_eq!(
             forward,
-            "GET /a?b=1 HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+            "GET /a?b=1 HTTP/1.1\r\nHost: Example.com:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+        let spoofed = parse(
+            b"GET http://allowed.example/ HTTP/1.1\r\nhost: internal.corp\r\nHOST: other\r\n\r\n",
+        )
+        .unwrap();
+        let forward = String::from_utf8(spoofed.forward.unwrap()).unwrap();
+        assert_eq!(
+            forward,
+            "GET / HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n"
         );
         let bare = parse(b"GET http://example.com HTTP/1.0\r\n\r\n").unwrap();
         let forward = String::from_utf8(bare.forward.unwrap()).unwrap();
@@ -167,6 +177,17 @@ mod live {
         ] {
             assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
+    }
+
+    #[test]
+    fn malformed_unicode_targets_return_400_without_panicking() {
+        for target in ["aaaaaaé", "aaaaa€", "aaaa💣", "é", ""] {
+            let request = format!("GET {target} HTTP/1.1\r\n\r\n");
+            assert!(parse(request.as_bytes()).is_err());
+            let reply = exchange(&rules(&["*"], &[]), request.as_bytes());
+            assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
+        }
+        assert!(parse("GET hTtP://example.com/é HTTP/1.1\r\n\r\n".as_bytes()).is_ok());
     }
 
     /// Run one proxy exchange over a socket pair and return the client's view of it.

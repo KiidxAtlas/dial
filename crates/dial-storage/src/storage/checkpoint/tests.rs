@@ -106,6 +106,25 @@ fn modify(cp: &Checkpoints, fx: &Fixture, rel: &str, text: &str) {
     fx.write(rel, text);
 }
 
+/// Undo removes the directories a turn created for a new file, but an empty directory that was
+/// already there stays.
+#[test]
+fn undo_removes_only_directories_the_turn_created() {
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.path("kept")).unwrap();
+    let cp = fx.open();
+    cp.begin_turn("t").unwrap();
+    modify(&cp, &fx, "kept/new.txt", "x");
+    modify(&cp, &fx, "kept/made/deeper/new.txt", "y");
+    let report = cp.rollback(1).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(
+        fx.path("kept").is_dir(),
+        "a pre-existing empty directory stays"
+    );
+    assert!(!fx.path("kept/made").exists(), "the turn's directories go");
+}
+
 #[test]
 fn turn_versions_pair_saved_content_with_current_content() {
     let fx = Fixture::new();
@@ -414,7 +433,35 @@ fn oversized_files_are_skipped_with_a_warning() {
     modify(&cp, &fx, "a.txt", "A1");
     let report = cp.rollback(1).unwrap();
     assert_eq!(report.restored, ["a.txt"]);
-    assert!(report.warnings.iter().any(|w| w.contains("big.bin")));
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.unrestorable.iter().any(|w| w.contains("big.bin")));
+}
+
+/// A file too large to checkpoint can never be restored, so it is reported once and does not
+/// block the turn or the older turns behind it.
+#[test]
+fn an_oversized_file_does_not_block_undoing_older_turns() {
+    let fx = Fixture::new();
+    let big = fx.path("big.bin");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_FILE_BYTES + 1)
+        .unwrap();
+    fx.write("a.txt", "A0");
+    let cp = fx.open();
+    cp.begin_turn("older").unwrap();
+    modify(&cp, &fx, "a.txt", "A1");
+    cp.begin_turn("newer").unwrap();
+    cp.before_write(&big).unwrap();
+    modify(&cp, &fx, "a.txt", "A2");
+    let report = cp.rollback(1).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.unrestorable.len(), 1, "{:?}", report.unrestorable);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("A1"));
+    let report = cp.rollback(1).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.unrestorable.is_empty(), "{:?}", report.unrestorable);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("A0"));
 }
 
 #[test]
@@ -557,6 +604,105 @@ fn failed_newer_manifest_stops_older_rollbacks_across_retries() {
     assert_eq!(fx.read("a.txt").as_deref(), Some("A0"));
     assert_eq!(fs::read_to_string(extra_root.join("b.txt")).unwrap(), "B0");
     assert!(cp.list().is_empty());
+}
+
+#[test]
+fn rollback_refuses_unreadable_newer_checkpoints_before_restoring_any_file() {
+    for missing in [false, true] {
+        let fx = Fixture::new();
+        let cp = fx.open();
+        fx.write("a.txt", "A");
+        let first = cp.begin_turn("one").unwrap();
+        modify(&cp, &fx, "a.txt", "B");
+        let second = cp.begin_turn("two").unwrap();
+        modify(&cp, &fx, "a.txt", "C");
+        cp.begin_turn("flush").unwrap();
+        let path = turn_dir(&fx.dir, second).join("manifest.json");
+        let saved = fs::read(&path).unwrap();
+        if missing {
+            fs::remove_file(&path).unwrap();
+        } else {
+            fs::write(&path, "broken").unwrap();
+        }
+        for turns in [1, 2] {
+            assert!(
+                cp.rollback(turns).is_err(),
+                "missing={missing}, turns={turns}"
+            );
+            assert_eq!(fx.read("a.txt").as_deref(), Some("C"));
+            assert!(turn_dir(&fx.dir, first).exists());
+        }
+        fs::write(&path, saved).unwrap();
+        cp.rollback(1).unwrap();
+        assert_eq!(fx.read("a.txt").as_deref(), Some("B"));
+        cp.rollback(1).unwrap();
+        assert_eq!(fx.read("a.txt").as_deref(), Some("A"));
+    }
+}
+
+#[test]
+fn rollback_refuses_non_directory_checkpoint_entries() {
+    let fx = Fixture::new();
+    let cp = fx.open();
+    fx.write("a.txt", "A");
+    cp.begin_turn("one").unwrap();
+    modify(&cp, &fx, "a.txt", "B");
+    let second = cp.begin_turn("two").unwrap();
+    modify(&cp, &fx, "a.txt", "C");
+    cp.begin_turn("flush").unwrap();
+    let path = turn_dir(&fx.dir, second);
+    let saved = fx.dir.join("saved-second");
+    fs::rename(&path, &saved).unwrap();
+    fs::write(&path, "not a checkpoint directory").unwrap();
+    assert!(cp.rollback(1).is_err());
+    assert_eq!(fx.read("a.txt").as_deref(), Some("C"));
+    fs::remove_file(&path).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&saved, &path).unwrap();
+        assert!(cp.rollback(1).is_err());
+        assert_eq!(fx.read("a.txt").as_deref(), Some("C"));
+        fs::remove_file(&path).unwrap();
+    }
+    fs::rename(saved, path).unwrap();
+    cp.rollback(1).unwrap();
+    assert_eq!(fx.read("a.txt").as_deref(), Some("B"));
+}
+
+#[test]
+fn missing_checkpoint_storage_blocks_restore_and_review() {
+    let fx = Fixture::new();
+    let cp = fx.open();
+    fx.write("a.txt", "A");
+    let turn = cp.begin_turn("one").unwrap();
+    modify(&cp, &fx, "a.txt", "B");
+    cp.begin_turn("flush").unwrap();
+    let items = vec![("a.txt".to_owned(), cp.review_file(turn, "a.txt").unwrap().1)];
+    let saved = fx.dir.with_extension("saved");
+    fs::rename(&fx.dir, &saved).unwrap();
+    assert!(cp.rollback(1).is_err());
+    assert!(cp.rollback_conversation("test-session", &[turn]).is_err());
+    assert!(cp.review_turn(turn).is_err());
+    assert!(cp.restore_files(turn, &items, true).is_err());
+    assert_eq!(fx.read("a.txt").as_deref(), Some("B"));
+    fs::rename(saved, &fx.dir).unwrap();
+}
+
+#[test]
+fn unreadable_later_checkpoint_blocks_selective_restore() {
+    let fx = Fixture::new();
+    let cp = fx.open();
+    fx.write("a.txt", "A");
+    let turn = cp.begin_turn("one").unwrap();
+    modify(&cp, &fx, "a.txt", "B");
+    let second = cp.begin_turn("two").unwrap();
+    modify(&cp, &fx, "a.txt", "C");
+    cp.begin_turn("flush").unwrap();
+    let items = vec![("a.txt".to_owned(), cp.review_file(turn, "a.txt").unwrap().1)];
+    fs::write(turn_dir(&fx.dir, second).join("manifest.json"), "broken").unwrap();
+    assert!(cp.review_turn(turn).is_err());
+    assert!(cp.restore_files(turn, &items, true).is_err());
+    assert_eq!(fx.read("a.txt").as_deref(), Some("C"));
 }
 
 /// A checkpoint whose directory cannot be discarded after a full restore is reported and
@@ -813,7 +959,7 @@ fn conversation_rollback_rejects_legacy_foreign_missing_and_intervening_links() 
 }
 
 #[test]
-fn conversation_range_restores_newest_first_and_retains_incomplete_checkpoint() {
+fn conversation_range_restores_newest_first_and_names_oversized_files() {
     let fx = Fixture::new();
     fx.write("a", "original");
     let cp = fx.open();
@@ -835,13 +981,14 @@ fn conversation_range_restores_newest_first_and_retains_incomplete_checkpoint() 
     cp.before_write(&fx.path("large")).unwrap();
     let report = cp.rollback_conversation("session", &[partial]).unwrap();
     assert_eq!(report.restored, ["a"]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(
         report
-            .warnings
+            .unrestorable
             .iter()
-            .any(|warning| warning.contains("not restored"))
+            .any(|note| note.contains("large") && note.contains("too large to checkpoint"))
     );
-    assert!(cp.list().iter().any(|info| info.turn == partial));
+    assert_eq!(fx.read("a").as_deref(), Some("original"));
 }
 
 #[test]

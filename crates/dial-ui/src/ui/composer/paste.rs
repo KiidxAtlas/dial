@@ -138,6 +138,90 @@ impl Composer {
         true
     }
 
+    /// Paste and image chips behave as single characters. The cursor never rests inside one:
+    /// a move that lands inside skips to the edge in the direction of travel. An edit that
+    /// touches part of a chip (typing, a word or line kill, a yank) removes the whole chip
+    /// instead, so a broken marker can never be sent in place of its content. Undo returns to
+    /// the text before the edit.
+    pub(super) fn keep_chips_whole(&mut self, before: &str, cursor_before: usize) {
+        let chips = chip_ranges(before, &self.pastes);
+        if chips.is_empty() {
+            return;
+        }
+        let after = self.editor.text.as_str();
+        if after == before {
+            let cursor = self.editor.cursor;
+            if let Some(&(start, end)) = chips.iter().find(|(s, e)| *s < cursor && cursor < *e) {
+                let to = if cursor < cursor_before { start } else { end };
+                self.editor.amend(before.to_owned(), to);
+            }
+            return;
+        }
+        let (mut start, mut end, inserted) = changed_region(before, after);
+        let mut touched = false;
+        loop {
+            let partial = chips.iter().find(|&&(s, e)| {
+                let covers = start <= s && end >= e;
+                let overlaps = start < e && end > s;
+                let inside = start == end && s < start && start < e;
+                (overlaps && !covers) || inside
+            });
+            let Some(&(s, e)) = partial else { break };
+            start = start.min(s);
+            end = end.max(e);
+            touched = true;
+        }
+        if touched {
+            let text = format!("{}{inserted}{}", &before[..start], &before[end..]);
+            let cursor = start + inserted.len();
+            self.editor.amend(text, cursor);
+        }
+    }
+}
+
+/// Byte ranges of every intact chip marker in `text`, in order.
+pub(super) fn chip_ranges(text: &str, pastes: &[(String, String)]) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = pastes
+        .iter()
+        .flat_map(|(marker, _)| {
+            text.match_indices(marker.as_str())
+                .map(|(at, found)| (at, at + found.len()))
+        })
+        .collect();
+    ranges.sort_unstable();
+    ranges
+}
+
+/// The edit that turned `before` into `after`: the replaced byte range of `before` and the text
+/// inserted there. The common prefix is taken first, so a repeated character resolves rightward.
+fn changed_region(before: &str, after: &str) -> (usize, usize, String) {
+    let prefix = before
+        .char_indices()
+        .zip(after.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(before.len().min(after.len()), |((at, _), _)| at);
+    let room = before.len().min(after.len()) - prefix;
+    let suffix = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .scan(0, |sum, len| {
+            *sum += len;
+            Some(*sum)
+        })
+        .take_while(|sum| *sum <= room)
+        .last()
+        .unwrap_or(0);
+    (
+        prefix,
+        before.len() - suffix,
+        after[prefix..after.len() - suffix].to_owned(),
+    )
+}
+
+impl Composer {
     // -----------------------------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------------------------
@@ -145,6 +229,11 @@ impl Composer {
     /// Bracketed paste never submits. Long pastes collapse to `[Pasted text #n +X lines]` and are
     /// expanded when the draft is submitted.
     pub fn handle_paste(&mut self, pasted: &str) {
+        self.insert_long_text(pasted, "Pasted text");
+    }
+
+    /// Inserts pasted or spoken text; long text collapses to a `[{label} #n +X lines]` chip.
+    fn insert_long_text(&mut self, pasted: &str, label: &str) {
         let clean = text::sanitize(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
         self.exit_armed = false;
         self.eof_armed = false;
@@ -161,7 +250,7 @@ impl Composer {
         if lines > PASTE_COLLAPSE_LINES || clean.chars().count() > PASTE_COLLAPSE_CHARS {
             self.paste_count += 1;
             let noun = if lines == 1 { "line" } else { "lines" };
-            let placeholder = format!("[Pasted text #{} +{lines} {noun}]", self.paste_count);
+            let placeholder = format!("[{label} #{} +{lines} {noun}]", self.paste_count);
             self.editor.insert(&placeholder);
             self.pastes.push((placeholder, clean));
         } else {
@@ -170,10 +259,11 @@ impl Composer {
         self.refresh();
     }
 
-    /// Speech belongs to the draft, not an open history-search query.
+    /// Speech belongs to the draft, not an open history-search query. Long dictation collapses
+    /// to a `[Dictation #n …]` chip rather than one labelled as a paste.
     pub fn paste_voice(&mut self, transcript: &str) {
         self.search = None;
-        self.handle_paste(transcript);
+        self.insert_long_text(transcript, "Dictation");
     }
 
     pub(super) fn prune_pastes(&mut self) {

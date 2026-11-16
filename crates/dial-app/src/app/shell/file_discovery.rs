@@ -113,7 +113,7 @@ impl Files {
             shared,
             result,
             root: None,
-            requested: Instant::now() - CACHE_TTL,
+            requested: crate::runtime::clock::instant_ago(CACHE_TTL),
             running: false,
             delivered: None,
             warned: Vec::new(),

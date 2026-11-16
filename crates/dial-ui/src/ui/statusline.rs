@@ -604,7 +604,7 @@ impl Env<'_> {
                 }
                 let provider = text::one_line(&data.provider);
                 let provider = provider.trim();
-                let short = short_model(model);
+                let short = short_account(&short_model(model));
                 let label = if provider.is_empty() {
                     short
                 } else {
@@ -1014,6 +1014,24 @@ fn short_model(model: &str) -> String {
         return name.to_string_lossy().into_owned();
     }
     model.to_owned()
+}
+
+/// Account ids are long opaque identifiers; the status bar keeps only their first 8 characters,
+/// enough to tell accounts apart without spelling out the whole id.
+fn short_account(label: &str) -> String {
+    const MARK: &str = " [account ";
+    let Some((head, rest)) = label.split_once(MARK) else {
+        return label.to_owned();
+    };
+    let Some((id, tail)) = rest.split_once(']') else {
+        return label.to_owned();
+    };
+    let id: String = if id.chars().count() > 8 {
+        id.chars().take(8).chain(std::iter::once('…')).collect()
+    } else {
+        id.to_owned()
+    };
+    format!("{head}{MARK}{id}]{tail}")
 }
 
 /// Show `path` relative to `home` as `~/…`; a trailing `/` on `home` is ignored.

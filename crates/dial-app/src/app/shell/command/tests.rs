@@ -90,12 +90,7 @@ fn permission_agent(app: &App) -> Agent<'_> {
 
 #[test]
 fn undo_keeps_conversation_on_partial_restore_and_both_commands_show_warnings() {
-    for (command, failure) in [
-        ("/undo", "oversized"),
-        ("/rollback", "oversized"),
-        ("/undo", "restore"),
-        ("/rollback", "restore"),
-    ] {
+    for command in ["/undo", "/rollback"] {
         let (_home, _project, app, mut shell) = shell();
         let mut agent = permission_agent(&app);
         let cp = agent.checkpoints().unwrap().clone();
@@ -103,52 +98,75 @@ fn undo_keeps_conversation_on_partial_restore_and_both_commands_show_warnings() 
         let turn = cp.begin_conversation_turn("partial", &session).unwrap();
         let path = app.layout.project_root.join("file");
         std::fs::write(&path, "original").unwrap();
-        if failure == "oversized" {
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_len(crate::storage::checkpoint::MAX_FILE_BYTES + 1)
-                .unwrap();
-        }
         cp.before_write(&path).unwrap();
-        if failure == "restore" {
-            std::fs::remove_file(&path).unwrap();
-            std::fs::create_dir(&path).unwrap();
-        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         agent.session_mut().append(serde_json::json!({"role":"user","content":"change file", "dial_checkpoint":{"session":session,"turn":turn}})).unwrap();
         let before = agent.session().messages();
         shell.command(&app, &mut agent, command).unwrap();
         assert_eq!(agent.session().messages(), before, "{command}");
-        let ctx = TranscriptCtx {
-            theme: shell.themes.current(),
-            ui: &shell.ui,
-            tick: 0,
-            tools_expanded: false,
-            expand_key: "Ctrl+O",
-        };
-        let text = shell
-            .transcript
-            .document(400, &ctx)
-            .0
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("rollback stopped"),
-            "{command}, {failure}: {text}"
-        );
-        if failure == "oversized" {
-            assert!(
-                text.contains("too large to checkpoint") && text.contains("not restored"),
-                "{command}: {text}"
-            );
-        }
+        let text = transcript_text(&shell);
+        assert!(text.contains("rollback stopped"), "{command}: {text}");
         if command == "/undo" {
             assert!(text.contains("conversation kept"), "{text}");
         }
     }
+}
+
+/// A file too large to checkpoint cannot come back; both commands name it and finish instead
+/// of stopping at it forever.
+#[test]
+fn oversized_files_are_named_without_blocking_undo_or_rollback() {
+    for command in ["/undo", "/rollback"] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        let cp = agent.checkpoints().unwrap().clone();
+        let session = agent.session().id().to_owned();
+        let turn = cp.begin_conversation_turn("big", &session).unwrap();
+        let path = app.layout.project_root.join("file");
+        std::fs::write(&path, "original").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(crate::storage::checkpoint::MAX_FILE_BYTES + 1)
+            .unwrap();
+        cp.before_write(&path).unwrap();
+        agent.session_mut().append(serde_json::json!({"role":"user","content":"change file", "dial_checkpoint":{"session":session,"turn":turn}})).unwrap();
+        let before = agent.session().messages();
+        shell.command(&app, &mut agent, command).unwrap();
+        let text = transcript_text(&shell);
+        assert!(
+            text.contains("too large to checkpoint") && text.contains("keeps the turn's content"),
+            "{command}: {text}"
+        );
+        assert!(!text.contains("rollback stopped"), "{command}: {text}");
+        if command == "/undo" {
+            assert_ne!(
+                agent.session().messages(),
+                before,
+                "the conversation is rewound"
+            );
+        }
+    }
+}
+
+fn transcript_text(shell: &Shell) -> String {
+    let ctx = TranscriptCtx {
+        theme: shell.themes.current(),
+        ui: &shell.ui,
+        tick: 0,
+        tools_expanded: false,
+        expand_key: "Ctrl+O",
+    };
+    shell
+        .transcript
+        .document(400, &ctx)
+        .0
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(unix)]

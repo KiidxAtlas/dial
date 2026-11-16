@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 fn press(editor: &mut Editor, code: KeyCode, mods: KeyModifiers) -> bool {
     editor.key(KeyEvent::new(code, mods))
@@ -208,5 +209,101 @@ fn inserting_text_cancels_a_pending_jump() {
     assert_eq!(
         e.text, "zcabc",
         "the typed letter is text, not a jump target"
+    );
+}
+
+#[test]
+fn a_run_of_backspaces_is_one_undo_step() {
+    let mut e = Editor::default();
+    e.set("hello world");
+    for _ in 0..5 {
+        press(&mut e, KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    assert_eq!(e.text, "hello ");
+    assert!(e.undo());
+    assert_eq!(e.text, "hello world", "one undo restores the whole run");
+    press(&mut e, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut e, KeyCode::Left, KeyModifiers::NONE);
+    press(&mut e, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(e.text, "hello wol");
+    assert!(e.undo());
+    assert_eq!(e.text, "hello worl", "moving the cursor starts a new step");
+}
+
+#[test]
+fn undo_history_stays_within_its_byte_budget() {
+    let mut e = Editor::default();
+    let big = "x".repeat(MAX_UNDO_BYTES / 4);
+    for round in 0..10 {
+        e.set(&format!("{round}{big}"));
+    }
+    let kept: usize = e.undo.iter().map(|s| s.text.len()).sum();
+    assert!(kept <= MAX_UNDO_BYTES, "{kept} bytes kept");
+    assert!(e.undo(), "the newest step is always kept");
+}
+
+#[test]
+fn altgr_symbols_type_but_ctrl_alt_letters_stay_shortcuts() {
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    let mut e = Editor::default();
+    assert!(press(&mut e, KeyCode::Char('@'), altgr));
+    assert!(press(&mut e, KeyCode::Char('€'), altgr));
+    assert_eq!(e.text, "@€");
+    assert_eq!(
+        crate::ui::keys::typed_char(&KeyEvent::new(KeyCode::Char('f'), altgr)),
+        None
+    );
+    assert_eq!(
+        crate::ui::keys::typed_char(&KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SUPER)),
+        None
+    );
+}
+
+#[test]
+fn single_line_fields_delete_characters_words_and_lines_from_the_end() {
+    let key = |code, mods| KeyEvent::new(code, mods);
+    let mut text = "find the café".to_owned();
+    assert_eq!(
+        delete_at_end(
+            &mut text,
+            &key(KeyCode::Backspace, KeyModifiers::NONE),
+            None
+        ),
+        Some(true)
+    );
+    assert_eq!(text, "find the caf");
+    assert_eq!(
+        delete_at_end(
+            &mut text,
+            &key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            None
+        ),
+        Some(true)
+    );
+    assert_eq!(text, "find the ");
+    assert_eq!(
+        delete_at_end(
+            &mut text,
+            &key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None
+        ),
+        Some(true)
+    );
+    assert_eq!(text, "");
+    assert_eq!(
+        delete_at_end(
+            &mut text,
+            &key(KeyCode::Backspace, KeyModifiers::NONE),
+            None
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        delete_at_end(
+            &mut text,
+            &key(KeyCode::Char('a'), KeyModifiers::NONE),
+            None
+        ),
+        None
     );
 }

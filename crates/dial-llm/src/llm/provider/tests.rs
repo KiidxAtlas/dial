@@ -894,6 +894,28 @@ fn anthropic_auth_errors_do_not_expose_key_or_prompt() {
 }
 
 #[test]
+fn auth_failures_give_the_repair_advice_once() {
+    for anthropic in [false, true] {
+        let server = fake::serve(vec![fake::json(
+            401,
+            &json!({"error":{"message":"credential expired"}}),
+        )]);
+        let url = format!("{}/v1", server.url);
+        let mut remote = backend(if anthropic {
+            anthropic_endpoint(&url)
+        } else {
+            endpoint(&url)
+        });
+        let error = format!("{:#}", remote.chat(None, &request(), 5, None).unwrap_err());
+        assert!(
+            error.contains("provider authentication failed (HTTP 401)"),
+            "{error}"
+        );
+        assert_eq!(error.matches("/providers").count(), 1, "{error}");
+    }
+}
+
+#[test]
 fn anthropic_callback_receives_buffered_text_once() {
     let server = fake::serve(vec![fake::json(
         200,

@@ -883,6 +883,16 @@ fn paths_and_model_ids_are_shortened_to_what_the_user_recognizes() {
     );
     assert_eq!(short_model("/models/local/qwen.gguf"), "qwen.gguf");
     assert_eq!(short_model("qwen3:9b"), "qwen3:9b");
+    assert_eq!(
+        short_account("gpt-6 [account ea3b0a3e-5b68-4254-95f8-678cc0580c6b]"),
+        "gpt-6 [account ea3b0a3e…]"
+    );
+    assert_eq!(
+        short_account("gpt-6 [account ea3b0a3e-5b68] [plan]"),
+        "gpt-6 [account ea3b0a3e…] [plan]"
+    );
+    assert_eq!(short_account("gpt-6 [account abc]"), "gpt-6 [account abc]");
+    assert_eq!(short_account("gpt-6"), "gpt-6");
 }
 
 #[test]

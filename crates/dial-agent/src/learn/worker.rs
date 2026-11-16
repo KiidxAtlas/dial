@@ -289,7 +289,7 @@ fn run_command_handoff(
     let mut err_done = false;
     let mut status = None;
     let mut exited_at = None;
-    let mut tick = Instant::now() - Duration::from_secs(1);
+    let mut tick = crate::runtime::clock::instant_ago(Duration::from_secs(1));
     loop {
         if tick.elapsed() >= Duration::from_millis(80) {
             on_tick()?;

@@ -343,6 +343,7 @@ fn main() -> anyhow::Result<()> {
                     attempt: 4,
                     maximum: "10".into(),
                     ready_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    stop_key: "Ctrl+C".into(),
                 });
             }
             let view = composer.view(

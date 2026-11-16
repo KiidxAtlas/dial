@@ -170,9 +170,9 @@ A command that exits 127 because a program is missing (`bash: NAME: command not 
 - `always`: every `bash` and `bg` command is guarded.
 - `off`: never.
 
-Refused forms: `git stash` (push, save, drop, clear, pop, apply; `list`, `show`, `create`, `store` run), `git reset --hard`, `git checkout -f`, `git checkout .`/`:/`/`*`, `git checkout -- <path>` (and `git checkout <path>` when a file of that name exists), `git restore` of the working tree (`--staged` alone is fine), `git clean -f` (not with `-n`), and `git switch -f`/`--discard-changes`. Forms that keep work run normally: `git reset`, `--soft`, `--mixed`, `git reset <path>`, `git checkout -b`, `git checkout --ours|--theirs -- <path>`, `git restore --staged`, `git clean -n`.
+Refused forms: `git stash` (push, save, drop, clear, pop, apply; `list`, `show`, `create`, `store` run), `git reset --hard`, `git checkout -f`, `git checkout .`/`:/`/`*`, `git checkout -- <path>` (and `git checkout <path>` when a file of that name exists), `git restore` of the working tree (`--staged` alone is fine), `git checkout <rev> -- <path>` and `git checkout <rev> <path>` (they overwrite the file with the revision's copy), `git rm -f`, `git checkout-index -f`, `git clean -f` (not with `-n`; also `git -c clean.requireForce=false clean`), and `git switch -f`/`--discard-changes`. Forms that keep work run normally: `git reset`, `--soft`, `--mixed`, `git reset <path>`, `git checkout -b`, `git checkout --ours|--theirs -- <path>`, `git restore --staged`, `git clean -n`.
 
-The command is read before it runs, following `-C <dir>`, `-c k=v` and other global options, a preceding `cd`, `env`/`command`/`exec` wrappers, `sh -c '...'` scripts, subshells and `if`/`while` bodies. A git command whose directory resolves outside every workspace root is allowed (it is another repository). Only clear matches are refused: a script that cannot be lexed (unterminated quote), `git` reached through a variable, alias or script file, and arguments that need expansion are never refused on a guess. The refusal is a blocked tool error naming the form and the safe alternatives; to proceed, ask the user to run it or to set `shell.git_guard = "off"`, or run the worker isolated.
+The command is read before it runs, following `-C <dir>`, `-c k=v` and other global options, a preceding `cd`, `env`/`command`/`exec`/`nohup`/`builtin` and `timeout`/`sudo`/`doas`/`nice`/`ionice`/`stdbuf` wrappers, `sh -c '...'` scripts, subshells and `if`/`while` bodies. A git command whose directory resolves outside every workspace root is allowed (it is another repository). Only clear matches are refused: a script that cannot be lexed (unterminated quote), `git` reached through a variable, alias or script file, and arguments that need expansion are never refused on a guess. The refusal is a blocked tool error naming the form and the safe alternatives; to proceed, ask the user to run it or to set `shell.git_guard = "off"`, or run the worker isolated.
 
 ## Undo for shell changes
 
@@ -192,7 +192,7 @@ Tool edits are checkpointed before they happen; a shell command's effects are no
 Not covered: files matched by `.gitignore`, dependency and build directories (`target`,
 `node_modules`, `build`, `dist`, `vendor`, virtual environments), `.git`, `.dial`, credential-like
 files (`.env`, keys), symlinks, directories added with `/add-dir`, and anything outside the project.
-A file over 8 MiB is not copied; if a command changes it, the undo report names it as not restored.
+A file over 8 MiB is not copied; if a command changes it, the undo report names it as keeping the turn's content, and the rest of the undo goes on.
 The copy is taken only before the main agent's own `bash` commands. Changes that `eval`, extension
 tools or delegated workers make outside checkpoints are captured only when they follow such a
 command in the same turn. Because the comparison is against the whole project, a file you edit in

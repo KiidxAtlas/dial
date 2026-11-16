@@ -3,7 +3,7 @@
 //! Editing operations are [`Action`]s from the keymap (`tui.editor.*`), so they are rebindable and
 //! listed in `/hotkeys`. Typing coalesces into word-sized undo units, kills feed an Emacs-style kill
 //! ring with yank and yank-pop.
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
 use std::sync::LazyLock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -14,6 +14,9 @@ use super::{
 };
 
 const MAX_UNDO: usize = 100;
+/// Undo history keeps at most this many bytes of snapshots (always at least the newest), so a
+/// very large draft cannot hold a hundred full copies of itself.
+const MAX_UNDO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_KILLS: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +32,10 @@ enum Last {
     Other,
     TypeWord,
     Kill,
+    /// A Backspace (`forward: false`) or Delete run, coalesced into one undo step.
+    DeleteChar {
+        forward: bool,
+    },
     Yank {
         start: usize,
         end: usize,
@@ -102,6 +109,33 @@ static DEFAULT_KEYS: LazyLock<Keymap> = LazyLock::new(Keymap::defaults);
 
 fn default_keymap() -> &'static Keymap {
     &DEFAULT_KEYS
+}
+
+/// The deletion keys every single-line search or name field shares with the composer:
+/// Backspace removes one character, the word-delete keys (Ctrl+W, Alt+Backspace) one word and
+/// the line-delete key (Ctrl+U) everything, all from the end where these fields keep their cursor.
+/// `None` when `key` is not a deletion key; otherwise whether the text changed.
+/// `keys` defaults to the built-in bindings for fields with no keymap in reach.
+pub fn delete_at_end(text: &mut String, key: &KeyEvent, keys: Option<&Keymap>) -> Option<bool> {
+    let keys = keys.unwrap_or_else(|| default_keymap());
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let action = [
+        Action::EditorDeleteBackward,
+        Action::EditorDeleteWordBackward,
+        Action::EditorDeleteToLineStart,
+    ]
+    .into_iter()
+    .find(|action| keys.matches(*action, key))?;
+    let cut = match action {
+        Action::EditorDeleteBackward => prev_boundary(text, text.len()),
+        Action::EditorDeleteWordBackward => word_left(text, text.len()),
+        _ => 0,
+    };
+    let changed = cut < text.len();
+    text.truncate(cut);
+    Some(changed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -274,6 +308,10 @@ impl Editor {
             if self.undo.len() > MAX_UNDO {
                 self.undo.remove(0);
             }
+            let mut bytes: usize = self.undo.iter().map(|s| s.text.len()).sum();
+            while self.undo.len() > 1 && bytes > MAX_UNDO_BYTES {
+                bytes -= self.undo.remove(0).text.len();
+            }
         }
         self.redo.clear();
     }
@@ -384,6 +422,22 @@ impl Editor {
         self.last = Last::Other;
     }
 
+    /// Replace the text and cursor as part of the edit just made, without a new undo step, so
+    /// one undo returns to the text before that edit.
+    pub(crate) fn amend(&mut self, text: String, cursor: usize) {
+        self.text = text;
+        self.cursor = snap(&self.text, cursor.min(self.text.len()));
+        self.last = Last::Other;
+        self.jump = None;
+    }
+
+    /// Move the cursor to `at` (snapped to a grapheme boundary) without editing.
+    pub(crate) fn move_to(&mut self, at: usize) {
+        self.cursor = snap(&self.text, at.min(self.text.len()));
+        self.last = Last::Other;
+        self.jump = None;
+    }
+
     /// Whether a Ctrl-] jump is waiting for its target character.
     pub(crate) fn jump_pending(&self) -> bool {
         self.jump.is_some()
@@ -400,11 +454,7 @@ impl Editor {
             return false;
         }
         if let Some(forward) = self.jump.take() {
-            if let KeyCode::Char(c) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            {
+            if let Some(c) = super::keys::typed_char(&key) {
                 self.jump_to(c, forward);
             }
             // Any other key cancels the pending jump without acting.
@@ -417,16 +467,12 @@ impl Editor {
         {
             return self.apply(action);
         }
-        match key.code {
-            KeyCode::Char(c)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
-            {
+        match super::keys::typed_char(&key) {
+            Some(c) => {
                 self.type_char(c);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -462,11 +508,11 @@ impl Editor {
             Action::EditorJumpBackward => self.jump = Some(false),
             Action::EditorDeleteBackward => {
                 let start = self.previous();
-                self.delete(start, self.cursor);
+                self.delete_char(start, self.cursor, false, last);
             }
             Action::EditorDeleteForward => {
                 let end = self.next();
-                self.delete(self.cursor, end);
+                self.delete_char(self.cursor, end, true, last);
             }
             Action::EditorDeleteWordBackward => {
                 let start = word_left(&self.text, self.cursor);
@@ -514,6 +560,22 @@ impl Editor {
             self.text.replace_range(start..end, "");
             self.cursor = start;
         }
+    }
+
+    /// One Backspace or Delete. A run of them in one direction is a single undo step, as typing
+    /// is, so holding Backspace through a long draft keeps one snapshot instead of one per key.
+    fn delete_char(&mut self, start: usize, end: usize, forward: bool, last: Last) {
+        if start >= end {
+            return;
+        }
+        if last == (Last::DeleteChar { forward }) {
+            self.redo.clear();
+        } else {
+            self.record();
+        }
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.last = Last::DeleteChar { forward };
     }
 
     fn kill(&mut self, start: usize, end: usize, backward: bool, last: Last) {

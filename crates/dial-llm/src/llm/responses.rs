@@ -11,13 +11,109 @@ use std::{
 pub(super) struct TerminalFailure {
     kind: &'static str,
     code: &'static str,
+    /// For an unrecognized failure, `label: value` facts the provider sent: its own code (or
+    /// incomplete reason), error type and rejected parameter. Only plain identifiers are kept;
+    /// provider messages may echo prompt text and are never kept.
+    details: Vec<String>,
+}
+/// Maps a provider failure code (or, failing that, an incomplete reason) onto the fixed
+/// identifiers `TerminalFailure` classifies. Every Responses stream reader uses this one table
+/// so a code is classified the same way on each path.
+fn known_code(code: &str, reason: &str) -> &'static str {
+    match code {
+        "server_error" => "server_error",
+        "model_error" => "model_error",
+        "websocket_connection_limit_reached" => "websocket_connection_limit_reached",
+        "previous_response_not_found" => "previous_response_not_found",
+        "rate_limit_exceeded" => "rate_limit_exceeded",
+        "insufficient_quota" => "insufficient_quota",
+        "context_length_exceeded" => "context_length_exceeded",
+        "usage_not_included" => "usage_not_included",
+        "usage_limit_reached" => "usage_limit_reached",
+        "invalid_api_key" => "invalid_api_key",
+        "model_not_found" => "model_not_found",
+        "authentication_error" => "authentication_error",
+        "permission_denied" => "permission_denied",
+        "subscription_sharing_usage_limit_exceeded" => "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_usage_unavailable" => "subscription_sharing_usage_unavailable",
+        _ => match reason {
+            "max_output_tokens" => "max_output_tokens",
+            "content_filter" => "content_filter",
+            _ => "unclassified_failure",
+        },
+    }
+}
+/// A provider value safe to show and record: a short plain identifier such as `reasoning.effort`.
+fn identifier(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    .then_some(value)
 }
 impl TerminalFailure {
+    /// A failure from a stream event's `type`, its error fields and the incomplete `reason`
+    /// (empty when absent).
+    pub(super) fn from_event(kind: &str, event: &Value, reason: &str) -> Self {
+        let field = |name: &str| {
+            event
+                .pointer(&format!("/response/error/{name}"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .pointer(&format!("/error/{name}"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| event.get(name).and_then(Value::as_str))
+                .unwrap_or("")
+        };
+        let code = field("code");
+        let known = known_code(code, reason);
+        let kind = match kind {
+            "response.failed" => "response.failed",
+            "response.incomplete" => "response.incomplete",
+            _ => "error",
+        };
+        let mut details = Vec::new();
+        if known == "unclassified_failure" {
+            let label = if kind == "response.incomplete" {
+                "reason"
+            } else {
+                "code"
+            };
+            let raw = if code.is_empty() { reason } else { code };
+            details.push(match identifier(raw) {
+                Some(raw) => format!("provider {label}: {raw}"),
+                None => format!("no provider {label}"),
+            });
+            // The top-level event `type` is the stream event name, so only nested error types count.
+            let error_type = event
+                .pointer("/response/error/type")
+                .or_else(|| event.pointer("/error/type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if let Some(error_type) = identifier(error_type) {
+                details.push(format!("type: {error_type}"));
+            }
+            if let Some(param) = identifier(field("param")) {
+                details.push(format!("param: {param}"));
+            }
+        }
+        Self {
+            kind,
+            code: known,
+            details,
+        }
+    }
     /// Unrecognized `error`/`response.failed` codes are retried like server errors: they come from
     /// mid-stream provider faults far more often than from a request that can never succeed, and
     /// known permanent codes (auth, quota, missing model) are classified before reaching here.
+    /// An unrecognized failure that the provider marks as an invalid request, or that names the
+    /// parameter it rejected, is permanent: resending the same request cannot succeed.
     pub(super) fn retryable(&self) -> bool {
         self.kind != "response.incomplete"
+            && !self.rejects_request()
             && matches!(
                 self.code,
                 "server_error"
@@ -26,6 +122,17 @@ impl TerminalFailure {
                     | "previous_response_not_found"
                     | "unclassified_failure"
             )
+    }
+    fn rejects_request(&self) -> bool {
+        self.details
+            .iter()
+            .any(|detail| detail == "type: invalid_request_error" || detail.starts_with("param: "))
+    }
+    /// The provider refused a reasoning setting (`reasoning.effort`, `reasoning`, …).
+    fn rejects_reasoning(&self) -> bool {
+        self.details
+            .iter()
+            .any(|detail| detail.starts_with("param: reasoning"))
     }
     pub(super) fn class(&self) -> super::errors::ErrorClass {
         match self.code {
@@ -72,6 +179,21 @@ impl std::fmt::Display for TerminalFailure {
         } else {
             "code"
         };
+        if self.code == "unclassified_failure" {
+            write!(
+                f,
+                "Responses {} ({field}: {}, {}); no tool calls were executed",
+                self.kind,
+                self.code,
+                self.details.join(", ")
+            )?;
+            if self.rejects_reasoning() {
+                f.write_str(
+                    ". The model refused this reasoning level; choose a lower one with /effort",
+                )?;
+            }
+            return Ok(());
+        }
         write!(
             f,
             "Responses {} ({field}: {}); no tool calls were executed",
@@ -750,38 +872,7 @@ impl Accumulator {
                     self.result = Some(reply);
                     return Ok(true);
                 }
-                let code = match code {
-                    "server_error" => "server_error",
-                    "model_error" => "model_error",
-                    "websocket_connection_limit_reached" => "websocket_connection_limit_reached",
-                    "previous_response_not_found" => "previous_response_not_found",
-                    "rate_limit_exceeded" => "rate_limit_exceeded",
-                    "insufficient_quota" => "insufficient_quota",
-                    "context_length_exceeded" => "context_length_exceeded",
-                    "usage_not_included" => "usage_not_included",
-                    "usage_limit_reached" => "usage_limit_reached",
-                    "invalid_api_key" => "invalid_api_key",
-                    "model_not_found" => "model_not_found",
-                    "authentication_error" => "authentication_error",
-                    "permission_denied" => "permission_denied",
-                    "subscription_sharing_usage_limit_exceeded" => {
-                        "subscription_sharing_usage_limit_exceeded"
-                    }
-                    "subscription_sharing_usage_unavailable" => {
-                        "subscription_sharing_usage_unavailable"
-                    }
-                    _ => match reason {
-                        "max_output_tokens" => "max_output_tokens",
-                        "content_filter" => "content_filter",
-                        _ => "unclassified_failure",
-                    },
-                };
-                let kind = match kind {
-                    "response.failed" => "response.failed",
-                    "response.incomplete" => "response.incomplete",
-                    _ => "error",
-                };
-                return Err(TerminalFailure { kind, code }.into());
+                return Err(TerminalFailure::from_event(kind, &event, reason).into());
             }
             Some(_) => {}
             None => bail!("Responses stream event has no type"),
@@ -1178,6 +1269,7 @@ fn stream_body_inner(
             return Err(TerminalFailure {
                 kind: "error",
                 code,
+                details: Vec::new(),
             }
             .into());
         }
@@ -1508,32 +1600,7 @@ pub(super) fn compact(
                         return Ok(true);
                     }
                     Some(kind @ ("response.failed" | "response.incomplete" | "error")) => {
-                        let code = match event
-                            .pointer("/response/error/code")
-                            .and_then(Value::as_str)
-                            .or_else(|| event.pointer("/error/code").and_then(Value::as_str))
-                            .or_else(|| event.get("code").and_then(Value::as_str))
-                            .unwrap_or("")
-                        {
-                            "server_error" => "server_error",
-                            "model_error" => "model_error",
-                            "rate_limit_exceeded" => "rate_limit_exceeded",
-                            "insufficient_quota" => "insufficient_quota",
-                            "context_length_exceeded" => "context_length_exceeded",
-                            "usage_not_included" => "usage_not_included",
-                            "usage_limit_reached" => "usage_limit_reached",
-                            "invalid_api_key" => "invalid_api_key",
-                            "model_not_found" => "model_not_found",
-                            "authentication_error" => "authentication_error",
-                            "permission_denied" => "permission_denied",
-                            _ => "unclassified_failure",
-                        };
-                        let kind = match kind {
-                            "response.failed" => "response.failed",
-                            "response.incomplete" => "response.incomplete",
-                            _ => "error",
-                        };
-                        return Err(TerminalFailure { kind, code }.into());
+                        return Err(TerminalFailure::from_event(kind, &event, "").into());
                     }
                     _ => {}
                 }

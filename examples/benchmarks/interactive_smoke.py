@@ -994,7 +994,8 @@ def credential_recovery_case(server, binary, captures):
         try:
             terminal.wait("mock-main")
             terminal.command("PTY-EXPIRED-CREDENTIAL")
-            terminal.wait("PTY credential expired; repair before retry")
+            # The provider's own message, short enough not to depend on where the error box wraps.
+            terminal.wait("PTY credential expired")
             terminal.command("/help")
             terminal.wait_panel()
             terminal.wait("Actions", history=False)

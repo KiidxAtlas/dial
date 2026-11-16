@@ -307,3 +307,32 @@ fn recovery_identity_obeys_workspace_confinement_and_size_bound() {
     fs::write(&file, vec![b'x'; 16 * 1024 * 1024 + 1]).unwrap();
     assert!(ws.file_identity(&file).is_none());
 }
+
+#[test]
+fn dev_sandbox_denies_present_credential_files_and_token_directories() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    for file in [
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".config/gh/hosts.yml",
+    ] {
+        let path = home.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "token").unwrap();
+    }
+    let denied = dev_home_secrets(home);
+    for path in [
+        ".ssh",
+        ".aws",
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".config/gh",
+    ] {
+        assert!(denied.contains(&home.join(path)), "{path}: {denied:?}");
+    }
+    // Absent credential files are not listed (Linux cannot mask them inside a writable home).
+    assert!(!denied.contains(&home.join(".pypirc")), "{denied:?}");
+}

@@ -125,7 +125,7 @@ impl Shell {
         self.improve_watch = Some(ImproveWatch {
             state_dir: learning.state_dir.clone(),
             started: crate::learn::improve::now(),
-            checked: Instant::now() - Duration::from_secs(2),
+            checked: crate::runtime::clock::instant_ago(Duration::from_secs(2)),
         });
     }
 

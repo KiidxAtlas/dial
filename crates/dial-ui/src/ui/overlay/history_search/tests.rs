@@ -132,3 +132,17 @@ fn slash_filters_the_hits_titles_replace_ids_and_no_fixed_branch_note() {
         OverlayEvent::Close
     ));
 }
+
+/// Backspace in the filter removes a whole accented letter, not just its combining mark.
+#[test]
+fn filter_backspace_removes_a_whole_grapheme() {
+    let keys = Keymap::defaults();
+    let mut panel = HistorySearchOverlay::new("needle".into(), vec![hit("one", "entry")], false);
+    panel.handle(&ch('/'), &keys);
+    for c in ['n', 'e', '\u{301}'] {
+        panel.handle(&ch(c), &keys);
+    }
+    assert_eq!(panel.filter, "ne\u{301}");
+    panel.handle(&key(KeyCode::Backspace), &keys);
+    assert_eq!(panel.filter, "n");
+}

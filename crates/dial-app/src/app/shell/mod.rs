@@ -115,8 +115,9 @@ pub(super) struct Shell {
     pub(crate) extensions_job: Option<crate::app::commands::extensions_browser::InstallJob>,
     /// Set by `/restart`; `run_interactive` relaunches the binary once the terminal is restored.
     pub(super) restart_requested: bool,
-    /// A provider retry was already explained in this turn; later attempts update nothing new.
-    pub(super) retry_noted: bool,
+    /// The cause of the last provider retry explained in this turn (timing stripped); a later
+    /// attempt is noted again only when its cause differs.
+    pub(super) retry_cause: Option<String>,
     /// Attempt number of the last provider retry of the running request; the request's
     /// successful usage report takes it and notes the recovery once.
     pub(super) retry_attempt: Option<u32>,

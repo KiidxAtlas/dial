@@ -510,6 +510,20 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() && needs.sign.result == 'success' }}", publish)
         self.assertIn('uses: ./.github/workflows/release-publish.yml', publish)
 
+    def test_packaging_pull_request_dispatches_ci_before_merging(self):
+        workflows = SCRIPT.parent.parent / '.github/workflows'
+        packaging = (workflows / 'release-publish.yml').read_text().split('\n  packaging:\n', 1)[1].split('\n  container:\n', 1)[0]
+        publish = (workflows / 'release.yml').read_text().split('\n  publish:\n', 1)[1]
+        ci = (workflows / 'ci.yml').read_text().split('\njobs:\n', 1)[0]
+        self.assertIn('workflow_dispatch:', ci)
+        self.assertIn('actions: write', packaging)
+        self.assertIn('actions: write', publish)
+        dispatch = packaging.index('gh workflow run ci.yml --ref "$branch"')
+        watch = packaging.index('gh pr checks "$branch" --required --watch')
+        merge = packaging.index('gh pr merge "$branch" --merge --delete-branch')
+        self.assertLess(dispatch, watch)
+        self.assertLess(watch, merge)
+
     def test_candidates_keep_artifact_checks_without_repeating_portable_installer_suite(self):
         root = SCRIPT.parent.parent / '.github/workflows'
         candidates = (root / 'release-build.yml').read_text()

@@ -684,25 +684,23 @@ impl Ui for Bridge<'_> {
 
     fn notice(&mut self, message: &str) {
         // Provider retries arrive once per attempt. The first one is explained in plain words;
-        // later attempts stay off the transcript (the status line already shows the wait).
+        // later attempts stay off the transcript unless their cause changes (the status line
+        // already shows each wait).
         if let Some(retry) = RetryNotice::parse(message) {
+            let stop_key = self.shell.keys.label(crate::ui::keys::Action::Interrupt);
             self.shell.status.provider_retry =
                 Instant::now().checked_add(retry.delay).map(|ready_at| {
                     crate::ui::status::ProviderRetry {
                         attempt: retry.attempt,
                         maximum: retry.max.clone(),
                         ready_at,
+                        stop_key: stop_key.clone(),
                     }
                 });
             self.shell.retry_attempt = Some(retry.attempt);
-            if !std::mem::replace(&mut self.shell.retry_noted, true) {
-                self.shell.note(
-                    "Retrying",
-                    format!(
-                        "The model request failed ({}). Dial retries up to {} times; the status line shows each wait. /retry retries now; {} stops.",
-                        retry.cause, retry.max, self.shell.keys.label(crate::ui::keys::Action::Interrupt)
-                    ),
-                );
+            if let Some(text) = retry.note_text(self.shell.retry_cause.as_deref(), &stop_key) {
+                self.shell.retry_cause = Some(retry.cause_key().to_owned());
+                self.shell.note("Retrying", text);
             }
             self.repaint(true);
             return;
@@ -1160,6 +1158,12 @@ impl Ui for Bridge<'_> {
             }
         };
         self.shell.awaiting_user = was_waiting;
+        // A timeout that picked an answer is said in the transcript, not only to the model.
+        if matches!(outcome, QuestionOutcome::Answered(_)) {
+            for note in dialog.timeout_notes() {
+                self.shell.note("Question", note);
+            }
+        }
         self.settle_prompt(was_stopping);
         outcome
     }

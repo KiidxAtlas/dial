@@ -17,6 +17,50 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-16
+
+### Fixed
+
+- Windows terminal setup no longer requests Kitty keyboard reports that the native console input backend cannot decode, preventing key-release sequences such as `[99;1:3u` from appearing in the composer.
+- Checkpoint discovery now fails closed on directory-read errors and numeric symlink/non-directory entries. Rollback, conversation undo and selective restore no longer skip unavailable history.
+- Failed RPC client handshakes terminate the child immediately instead of adding the five-second graceful-drop wait to connection timeouts.
+- The Rust client's `mcp_login(server)` now returns a request id instead of blocking for completion, allowing callers to poll authorization URLs and prompts and answer them before login finishes.
+- `/rollback` now refuses unreadable checkpoint manifests before touching files, rather than skipping newer turns and undoing more work than requested.
+- The Rust RPC client queues writes through a bounded FIFO worker, so a non-reading engine cannot trap request submission, call timeouts or shutdown. Queue-full refusals send nothing; admitted requests retain unknown-outcome accounting on timeout or disconnect.
+- Malformed Unicode request targets in the sandbox network proxy now return HTTP 400 instead of panicking the connection handler.
+- Composer paste and image chips are now atomic: the cursor skips over them, and an edit touching part of one removes the whole chip (one undo restores it). Previously a chip broken by typing or a word kill was sent as its literal marker, silently dropping the pasted text or image.
+- On Windows, AltGr characters (reported as Ctrl+Alt: `@`, `{`, `€` on many European layouts) now type in the composer and every dialog text field instead of being dropped. A Ctrl+Alt letter or digit stays a shortcut.
+- Up and Down in the composer move by wrapped screen rows, so Up in a long one-paragraph draft no longer jumps straight into history.
+- History search (`Ctrl+R`) keeps the highlighted entry when slower provider results arrive, and a failed provider lookup no longer stops later searches for the rest of the session.
+- During a turn, the shared `Ctrl+C` closes an open history search first (as when idle); the next press stops the turn and keeps the draft. The hint says "close search".
+- The double-Left gesture for the worker hub now needs two Left presses in a row; another key in between resets it.
+- Long voice dictation collapses to a `[Dictation #n …]` chip instead of one labelled as a paste.
+- A question that times out and picks an answer for you now says which option it chose, on the next question and in the transcript.
+- In a terminal narrower than the composer box, an open history search or `/` menu now shows its line instead of taking keys invisibly.
+- Composer undo coalesces a run of Backspace or Delete presses into one step, and undo history is bounded by total size, so editing a very large draft no longer keeps up to a hundred full copies.
+- Recalling a prompt sent earlier in the session with paste or image chips shows the chips again instead of flooding the box with the expanded text.
+- Single-line search and name fields in dialogs (session and tree pickers, history, stats, settings, models, downloads, Git) now accept the editor's word delete (`Ctrl+W`, `Alt+Backspace`) and line delete (`Ctrl+U`) alongside Backspace.
+- Provider retry status no longer suggests `/retry now`, which was refused with a usage error; it says `/retry skips the wait` and names the bound stop key. The retry note no longer says "; stops" with no key when interrupt is unbound, and a later attempt that fails for a different reason is now noted instead of hidden.
+- The Responses compaction stream now recognizes ChatGPT plan-sharing limits (and the other codes the main stream knows) through one shared table, so an exhausted plan is reported as a quota error instead of being retried ten times as a transient failure.
+- An unrecognized Responses failure now names the provider's own code, error type and rejected parameter when they are plain identifiers (`code: unclassified_failure, provider code: …, type: …, param: …`), or says the provider sent no code; provider messages are still never shown. A failure the provider marks as `invalid_request_error`, or that names a rejected parameter, is no longer retried ten times. A rejected `reasoning…` parameter (for example `ultra` effort on a ChatGPT plan whose catalog lists it but whose server refuses it) says to choose a lower level with `/effort`.
+- The status bar shortens a long `[account …]` id to its first 8 characters.
+
+- Exact and fuzzy `old_string` edits no longer rewrite stray carriage returns elsewhere in the file: a lone `\r` (or the extra `\r` of a `\r\r\n` line) in an untouched line was turned into a line break. The replacement now works on the same CRLF-only normalized text the edit pipeline reads and witnesses.
+- Provider rate-limit window headers sent as a bare number (`x-ratelimit-reset-requests: 60`) are read as seconds from now, or as an epoch timestamp when that large, instead of being discarded as a 1970 date; quota-reset waits now see them.
+- A finished provider retry wait can no longer clear or consume a newer wait on the same retry control.
+- Rejected credentials (HTTP 401/403) now give the repair advice once. The error repeated "check the API key or sign in through /providers" from both the provider error and its wrapper (nearly three times for Anthropic); a provider-specific variable such as `OPENAI_API_KEY` is still named when the provider error does not.
+- Notebook edits keep a lone `\r` inside a cell's source. The editable notebook view split such a cell line in two and the saved cell turned the `\r` into a line break; notebooks now use the same CRLF-only normalization as other files.
+- The terminal's Git status probe and `@diff` attachments no longer run repository-configured `filter.<name>.clean`/`process` drivers. Like the `git` tool, they now disable filter drivers, so a repository cannot run its own program outside the sandbox every few seconds.
+- The Git guard now also refuses `git checkout <rev> [--] <path>`, `git rm -f`, `git checkout-index -f`, `git -c clean.requireForce=false clean`, and the destructive forms behind `timeout`, `sudo`, `doas`, `nice`, `ionice` and `stdbuf`.
+- The `dev` sandbox denies reads of credential files that exist under the home directory: GitHub CLI tokens, Git credential stores, `.netrc`, `.npmrc`, `.pypirc`, RubyGems and (outside Linux) Cargo registry credentials.
+- `/undo` and `/rollback` no longer stop forever at a file too large to checkpoint (over 8 MiB). The file is named as keeping the turn's content and the rest of the turn, and older turns, are restored. RPC `undo` reports these under `files.unrestorable`.
+- Undoing a turn that created a file no longer deletes an empty directory that existed before the turn; only directories the turn created are removed.
+- The sandbox network proxy replaces the client's `Host` header on plain `http://` requests with the host it checked, so an allowed address cannot be asked for a different virtual host.
+- Paint throttles and refresh timers no longer subtract from `Instant::now()`, which could panic when Dial started within seconds of boot.
+- Backspace in overlay inputs (session, tree, model, settings, extension, history, stats and Git message fields, and the watch pane) removes a whole character such as an accented letter or emoji, not one code point of it.
+- Output sanitizing ends an unfinished escape sequence at a newline: a stray ESC no longer joins two lines, and an unterminated OSC/DCS no longer hides the rest of the output.
+- The release workflow now finishes the Homebrew formula and AUR metadata update on its own. Its `release-packaging/<tag>` pull request received no CI run (pushes made with the workflow token start none), so main's required checks blocked the merge every release and Homebrew stayed on the previous version until someone merged it by hand. The packaging job now dispatches CI on that branch, waits for the required checks and then merges.
+
 ## [0.3.8] - 2026-11-14
 
 ### Added
@@ -2905,7 +2949,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.9...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -2950,3 +2994,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.6]: https://github.com/KiidxAtlas/dial/tree/v0.3.6
 [0.3.7]: https://github.com/KiidxAtlas/dial/tree/v0.3.7
 [0.3.8]: https://github.com/KiidxAtlas/dial/tree/v0.3.8
+[0.3.9]: https://github.com/KiidxAtlas/dial/tree/v0.3.9

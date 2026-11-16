@@ -119,6 +119,8 @@ pub struct ProviderRetry {
     pub attempt: u32,
     pub maximum: String,
     pub ready_at: std::time::Instant,
+    /// The bound interrupt chord (`"Ctrl+C"`); empty when unbound.
+    pub stop_key: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -224,8 +226,13 @@ impl StatusData {
             } else {
                 "retrying…".to_owned()
             };
+            let stop_key = crate::ui::text::one_line(&retry.stop_key);
+            let stop = match stop_key.trim() {
+                "" => "interrupt",
+                key => key,
+            };
             return format!(
-                "provider retry {}/{} · {next} · /retry now · interrupt to stop",
+                "provider retry {}/{} · {next} · /retry skips the wait · {stop} stops",
                 retry.attempt,
                 crate::ui::text::one_line(&retry.maximum),
             );

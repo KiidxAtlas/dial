@@ -3,6 +3,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Release packaging dispatches CI for its metadata pull request: a pull request pushed with
+  # GITHUB_TOKEN starts no pull_request run, and main requires these checks before merging.
+  workflow_dispatch:
 
 permissions:
   contents: read

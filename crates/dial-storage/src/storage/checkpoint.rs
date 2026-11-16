@@ -41,8 +41,11 @@ pub struct RollbackReport {
     pub restored: Vec<String>,
     /// Files that did not exist before the turn and were deleted.
     pub removed: Vec<String>,
-    /// Things that could not be undone (files too large to checkpoint, restore failures).
+    /// Restore failures and bookkeeping problems that need attention before a retry.
     pub warnings: Vec<String>,
+    /// Files the turn changed that were too large to checkpoint. They keep the turn's content;
+    /// no retry can bring them back, so they do not stop the rollback.
+    pub unrestorable: Vec<String>,
 }
 
 /// One file a turn changed: its content before the turn's first write and its content now.
@@ -76,6 +79,12 @@ struct Entry {
     /// checkpoints written before the length was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     len: Option<u64>,
+    /// For a created file: how many of its parent directories did not exist at the first write.
+    /// Undo removes at most these, so an empty directory that was already there stays. `None`
+    /// in older checkpoints and for files found after a shell command, whose new directories
+    /// were not observed; then empty parents are removed as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_dirs: Option<u32>,
 }
 
 impl Entry {
@@ -156,16 +165,28 @@ fn discard_turn(dir: &Path, turn: u64) -> std::io::Result<()> {
 }
 
 /// Turn numbers of the turn directories on disk, ascending.
-fn disk_turns(dir: &Path) -> Vec<u64> {
-    let mut turns: Vec<u64> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
-        .collect();
+fn disk_turns(dir: &Path) -> Result<Vec<u64>> {
+    let mut turns = Vec::new();
+    for entry in fs::read_dir(dir).context("listing checkpoint storage")? {
+        let entry = entry.context("reading checkpoint directory entry")?;
+        let Some(turn) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        ensure!(
+            entry
+                .file_type()
+                .context("reading checkpoint entry type")?
+                .is_dir(),
+            "turn {turn}: checkpoint is not a regular directory; rollback refused"
+        );
+        turns.push(turn);
+    }
     turns.sort_unstable();
-    turns
+    Ok(turns)
 }
 
 fn read_manifest(dir: &Path, turn: u64) -> Result<Manifest> {
@@ -225,7 +246,7 @@ impl Checkpoints {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("reading checkpoint turn counter"),
         };
-        let next_turn = disk_turns(&dir)
+        let next_turn = disk_turns(&dir)?
             .last()
             .map_or(1, |t| t + 1)
             .max(recorded_next.unwrap_or(1));
@@ -591,6 +612,7 @@ impl Checkpoints {
             mode: 0,
             writers: Vec::new(),
             len: None,
+            new_dirs: None,
         }
         .display();
         if inner.current.is_none() {
@@ -636,6 +658,7 @@ impl Checkpoints {
                     mode: platform_fs::mode(&meta) & 0o7777,
                     writers: Vec::new(),
                     len: Some(bytes.len() as u64),
+                    new_dirs: None,
                 });
             }
             Ok(_) => bail!("{shown} is not a regular file; refusing to checkpoint it"),
@@ -647,6 +670,7 @@ impl Checkpoints {
                     mode: 0,
                     writers: Vec::new(),
                     len: None,
+                    new_dirs: Some(missing_parents(resolved)),
                 });
             }
             Err(e) => return Err(e).with_context(|| format!("inspecting {shown}")),
@@ -679,6 +703,7 @@ impl Checkpoints {
     pub fn list(&self) -> Vec<CheckpointInfo> {
         let _inner = self.lock();
         let mut out: Vec<CheckpointInfo> = disk_turns(&self.dir)
+            .unwrap_or_default()
             .into_iter()
             .rev()
             .filter_map(|t| read_manifest(&self.dir, t).ok().filter(|m| !m.restored))
@@ -701,7 +726,7 @@ impl Checkpoints {
         let mut report = RollbackReport::default();
         self.drain_into(&mut report);
         let mut manifests: Vec<Manifest> = Vec::new();
-        for t in disk_turns(&self.dir).into_iter().rev() {
+        for t in disk_turns(&self.dir)?.into_iter().rev() {
             if manifests.len() == turns {
                 break;
             }
@@ -710,9 +735,11 @@ impl Checkpoints {
                     manifests.push(m)
                 }
                 Ok(_) => {}
-                Err(e) => report
-                    .warnings
-                    .push(format!("turn {t}: unreadable checkpoint skipped: {e:#}")),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("turn {t}: unreadable checkpoint blocks rollback; files kept")
+                    });
+                }
             }
         }
         ensure!(
@@ -744,7 +771,7 @@ impl Checkpoints {
             manifests.push(manifest);
         }
         if let Some(oldest) = turns.iter().min() {
-            for turn in disk_turns(&self.dir)
+            for turn in disk_turns(&self.dir)?
                 .into_iter()
                 .filter(|turn| turn >= oldest)
             {
@@ -790,10 +817,12 @@ impl Checkpoints {
             if manifest.restored {
                 continue;
             }
-            let mut failed = !manifest.skipped.is_empty();
+            let mut failed = false;
+            // An oversized file was never saved, so no retry can restore it: report it and let
+            // the rest of this turn and the older turns roll back.
             for skipped in &manifest.skipped {
-                report.warnings.push(format!(
-                    "turn {}: {skipped} was too large to checkpoint and was not restored",
+                report.unrestorable.push(format!(
+                    "turn {}: {skipped} was too large to checkpoint and keeps the turn's content",
                     manifest.turn
                 ));
             }
@@ -953,17 +982,34 @@ impl Checkpoints {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            // Drop directories the turn created and left empty, never the root itself.
+            // Drop directories the turn created and left empty, never the root itself nor one
+            // that existed before the turn's first write.
+            let mut budget = entry.new_dirs.unwrap_or(u32::MAX);
             let mut parent = target.parent();
             while let Some(dir) = parent.filter(|d| *d != base && d.starts_with(&base)) {
-                if fs::remove_dir(dir).is_err() {
+                if budget == 0 || fs::remove_dir(dir).is_err() {
                     break;
                 }
+                budget -= 1;
                 parent = dir.parent();
             }
             Ok(false)
         }
     }
+}
+
+/// The number of missing directories between `path` and its nearest existing ancestor.
+fn missing_parents(path: &Path) -> u32 {
+    let mut missing = 0;
+    let mut parent = path.parent();
+    while let Some(dir) = parent {
+        if fs::symlink_metadata(dir).is_ok() {
+            break;
+        }
+        missing += 1;
+        parent = dir.parent();
+    }
+    missing
 }
 
 fn one_line(label: &str) -> String {

@@ -26,7 +26,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,9 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Frames buffered between the reader thread and the owner before the reader waits.
 const QUEUED_FRAMES: usize = 1024;
+
+/// Bound queued writes as well as each frame; a full queue refuses admission without blocking.
+const QUEUED_REQUESTS: usize = 8;
 
 /// How long a dropped client waits for a graceful exit after closing stdin before killing.
 const DROP_GRACE: Duration = Duration::from_secs(5);
@@ -478,7 +481,9 @@ enum Line {
 #[derive(Debug)]
 pub struct Client {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Failed handshakes kill immediately; only established connections get graceful EOF time.
+    drop_grace: Duration,
+    stdin: Option<SyncSender<String>>,
     lines: Receiver<LineSlot>,
     next_id: u64,
     pending: BTreeMap<u64, String>,
@@ -522,9 +527,10 @@ impl Client {
                 return Err(ClientError::Handshake("child pipes unavailable".into()));
             }
         };
-        let lines = spawn_reader(stdout, MAX_FRAME_BYTES);
+        let (stdin, lines) = spawn_transport(stdin, stdout, MAX_FRAME_BYTES);
         let mut client = Self {
             child,
+            drop_grace: Duration::ZERO,
             stdin: Some(stdin),
             lines,
             next_id: 1,
@@ -586,6 +592,7 @@ impl Client {
                     ClientError::Handshake(format!("unexpected hello reply: {reply}"))
                 })?;
         }
+        client.drop_grace = DROP_GRACE;
         Ok(client)
     }
 
@@ -624,18 +631,20 @@ impl Client {
             .collect()
     }
 
-    /// Send a request without waiting. Its reply arrives as a [`Message::Response`].
+    /// Queue a request without waiting for pipe I/O. Its reply arrives as a [`Message::Response`].
     ///
     /// # Errors
     /// [`ClientError::Unsupported`] when the engine does not serve `method`;
-    /// [`ClientError::Disconnected`] when the connection is closed or writing fails. A failed
-    /// write leaves a mutating request's outcome unknown: it stays in [`Client::outstanding`].
+    /// [`ClientError::Io`] with `WouldBlock` when the bounded writer queue is full, or
+    /// `InvalidInput` when the frame exceeds [`MAX_FRAME_BYTES`]. These refusals send nothing.
+    /// [`ClientError::Disconnected`] when the connection is closed. An admitted request stays
+    /// outstanding until a response or disconnect; write failures are reported by [`Client::poll`]
+    /// and leave mutating outcomes unknown.
     pub fn request(&mut self, method: &str, params: Value) -> Result<RequestId, ClientError> {
         if !self.supports(method) {
             return Err(ClientError::Unsupported(method.to_owned()));
         }
-        let effect = effect(method);
-        let Some(stdin) = self.stdin.as_mut().filter(|_| !self.closed) else {
+        let Some(stdin) = self.stdin.as_ref().filter(|_| !self.closed) else {
             return Err(ClientError::Disconnected {
                 method: method.to_owned(),
                 effect: Effect::ReadOnly,
@@ -645,20 +654,32 @@ impl Client {
         self.next_id += 1;
         let mut line = json!({"id": id, "method": method, "params": params}).to_string();
         line.push('\n');
-        // Recorded before writing: a partial write can still reach the engine.
-        self.pending.insert(id, method.to_owned());
-        if stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-            .is_err()
-        {
-            self.stdin = None;
-            return Err(ClientError::Disconnected {
-                method: method.to_owned(),
-                effect,
-            });
+        if line.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request frame exceeds client limit",
+            )
+            .into());
         }
-        Ok(RequestId(id))
+        match stdin.try_send(line) {
+            Ok(()) => {
+                // The writer may already have sent a prefix. Only the owner settles replies.
+                self.pending.insert(id, method.to_owned());
+                Ok(RequestId(id))
+            }
+            Err(TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "RPC request queue is full; poll responses before retrying admission",
+            )
+            .into()),
+            Err(TrySendError::Disconnected(_)) => {
+                self.stdin = None;
+                Err(ClientError::Disconnected {
+                    method: method.to_owned(),
+                    effect: Effect::ReadOnly,
+                })
+            }
+        }
     }
 
     /// Next message, waiting at most `timeout`. Returns `None` on timeout, and after
@@ -713,8 +734,8 @@ impl Client {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, ClientError> {
-        let wanted = self.request(method, params)?;
         let deadline = Instant::now() + timeout;
+        let wanted = self.request(method, params)?;
         let mut deferred = Vec::new();
         let outcome = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -937,13 +958,16 @@ impl Client {
         )
     }
 
-    /// Sign in to the configured MCP server `server`, answering `auth_prompt` events (provider
-    /// `mcp:<server>`) with `auth_code`. Apply the grant with `apply_settings {reconnect: true}`.
+    /// Start signing in to the configured MCP server `server`.
+    ///
+    /// Drain [`Client::poll`] while the request is outstanding: display `auth_url` events and
+    /// answer `auth_prompt` events with an `auth_code` request. The response with the returned id
+    /// completes login. Apply the grant with `apply_settings {reconnect: true}`.
     ///
     /// # Errors
-    /// As [`Client::call`]; an unconfigured server fails with code `not_found`.
-    pub fn mcp_login(&mut self, server: &str, timeout: Duration) -> Result<Value, ClientError> {
-        self.call("mcp_login", json!({"server": server}), timeout)
+    /// As [`Client::request`]; the eventual reply uses `not_found` for an unconfigured server.
+    pub fn mcp_login(&mut self, server: &str) -> Result<RequestId, ClientError> {
+        self.request("mcp_login", json!({"server": server}))
     }
 
     /// The workspace roots: `{root, dirs}`.
@@ -1071,7 +1095,7 @@ impl Drop for Client {
     fn drop(&mut self) {
         // Closing stdin is the engine's graceful EOF path; kill only if it does not settle.
         self.stdin = None;
-        let _ = self.wait_or_kill(DROP_GRACE);
+        let _ = self.wait_or_kill(self.drop_grace);
     }
 }
 
@@ -1140,10 +1164,30 @@ fn classify_frame(frame: Value, pending: &mut BTreeMap<u64, String>) -> Message 
     }
 }
 
-fn spawn_reader(stdout: ChildStdout, limit: usize) -> Receiver<LineSlot> {
+fn spawn_transport(
+    mut stdin: ChildStdin,
+    stdout: ChildStdout,
+    limit: usize,
+) -> (SyncSender<String>, Receiver<LineSlot>) {
     let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
-    thread::spawn(move || read_frames(BufReader::new(stdout), limit, &tx));
-    rx
+    let (requests, writes) = mpsc::sync_channel::<String>(QUEUED_REQUESTS);
+    let reader = tx.clone();
+    thread::spawn(move || read_frames(BufReader::new(stdout), limit, &reader));
+    // Only this thread owns the pipe: complete frames stay FIFO and never interleave. Blocking
+    // writes cannot trap the caller's timeout or shutdown; killing the child releases the pipe.
+    thread::spawn(move || {
+        while let Ok(line) = writes.recv() {
+            if stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                let _ = tx.send(LineSlot(Line::End));
+                break;
+            }
+        }
+    });
+    (requests, rx)
 }
 
 /// Decode newline-delimited JSON until EOF, an oversized line or a closed receiver; always ends

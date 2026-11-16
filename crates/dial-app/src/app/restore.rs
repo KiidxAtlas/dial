@@ -134,7 +134,7 @@ fn restore_ids(
                 shell: &mut *shell,
                 interrupt: app.interrupt.clone(),
                 started: Instant::now(),
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,

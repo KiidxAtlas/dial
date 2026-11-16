@@ -1131,19 +1131,20 @@ fn run_git_diff(
     staged: bool,
     interrupt: &AtomicBool,
 ) -> Result<(String, bool), String> {
+    // Repo config is untrusted: switch off every hook `git diff` honours that runs a program,
+    // including clean/process filter drivers, which convert the worktree side of the diff.
+    let filters_off = crate::tools::vcs::git::filters_off_args(root, interrupt)
+        .map_err(|why| format!("not read: {why}"))?;
     let mut cmd = Command::new("git");
-    // Repo config is untrusted: switch off every hook `git diff` honours that runs a program.
-    cmd.args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.pager=cat",
-        "--no-pager",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-    ]);
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat"])
+        .args(&filters_off)
+        .args([
+            "--no-pager",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]);
     if staged {
         cmd.arg("--staged");
     }

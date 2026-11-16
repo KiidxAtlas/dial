@@ -1149,13 +1149,35 @@ fn a_transcript_replay_larger_than_one_frame_is_painted_in_slices() {
 
 #[test]
 fn input_setup_requests_shift_enter_without_a_successful_capability_probe() {
-    let setup = terminal_input_setup();
+    let setup = terminal_input_setup(true);
     assert!(
         setup.contains("\x1b[>7u"),
         "request disambiguated keys and releases"
     );
     assert!(setup.contains("\x1b[?2004h"), "enable bracketed paste");
     assert!(setup.contains("\x1b[?1004h"), "enable focus reports");
+}
+
+#[test]
+fn native_console_setup_does_not_enable_kitty_reporting() {
+    let setup = terminal_input_setup(false);
+    assert!(
+        !setup.contains("\x1b[>7u"),
+        "native console input cannot decode CSI-u key releases"
+    );
+    assert!(setup.contains("\x1b[?2004h"));
+    assert!(setup.contains("\x1b[?1004h"));
+}
+
+#[test]
+fn native_console_suspend_does_not_rearm_kitty_reporting() {
+    let mut rig = Rig::new(20, 8);
+    assert!(!rig.term.keyboard_flags);
+    rig.term.suspend(|| {}).unwrap();
+    rig.sync();
+    let all = String::from_utf8(rig.raw.clone()).unwrap();
+    assert!(!all.contains("\x1b[>7u"));
+    assert!(!all.contains("\x1b[<1u"));
 }
 
 #[test]

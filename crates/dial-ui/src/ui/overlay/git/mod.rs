@@ -531,8 +531,7 @@ impl GitOverlay {
         }
         match key.code {
             KeyCode::Enter => self.message.push('\n'),
-            KeyCode::Backspace => {
-                self.message.pop();
+            _ if crate::ui::editor::delete_at_end(&mut self.message, key, Some(keys)).is_some() => {
             }
             KeyCode::Tab => {
                 self.editing = false;
@@ -559,18 +558,12 @@ impl GitOverlay {
                     self.start_ai_stage(instruction);
                 }
             }
-            KeyCode::Backspace => {
+            _ if self.ai_prompt.as_mut().is_some_and(|prompt| {
+                crate::ui::editor::delete_at_end(prompt, key, Some(keys)).is_some()
+            }) => {}
+            _ if crate::ui::keys::typed_char(key).is_some() => {
                 if let Some(prompt) = self.ai_prompt.as_mut() {
-                    prompt.pop();
-                }
-            }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(prompt) = self.ai_prompt.as_mut() {
-                    prompt.push(c);
+                    prompt.extend(crate::ui::keys::typed_char(key));
                 }
             }
             _ => {}

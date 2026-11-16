@@ -1127,7 +1127,7 @@
         },
         {
           "type": "object",
-          "description": "Undoes the last user turns like /undo: restores their checkpointed files, then rewinds the conversation keeping the abandoned branch as a summary. Result: {turns,files,rollback_error,dropped,note,rewind_error,cleanup_error,conversation_kept}.",
+          "description": "Undoes the last user turns like /undo: restores their checkpointed files, then rewinds the conversation keeping the abandoned branch as a summary. Result: {turns,files,rollback_error,dropped,note,rewind_error,cleanup_error,conversation_kept}; files is {restored,removed,warnings,unrestorable}, where unrestorable names files too large to checkpoint that keep the turn's content without stopping the undo.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "undo"},
