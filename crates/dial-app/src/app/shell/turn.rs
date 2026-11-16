@@ -183,7 +183,7 @@ impl Shell {
             platform::interrupt::clear_interrupt();
             app.interrupt.store(false, Ordering::SeqCst);
         }
-        self.retry_noted = false;
+        self.retry_cause = None;
         self.retry_attempt = None;
         self.stop_speech();
         self.live_tasks = Some(agent.live_task_control());
@@ -263,7 +263,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started,
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,

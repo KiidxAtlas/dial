@@ -369,7 +369,7 @@ pub(crate) fn record_cell(
             ),
             _ => return Err("invalid cell source".into()),
         };
-        let normalized = super::edit_native::text::normalize_to_lf(&text);
+        let normalized = super::hashline::normalize_body(&text);
         marker_line += 1 + if normalized.is_empty() {
             0
         } else {

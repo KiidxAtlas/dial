@@ -1,17 +1,20 @@
 //! Git guard: refuses shell commands that discard uncommitted work in a shared checkout.
 //!
 //! Agents that share one checkout lose each other's edits when one of them runs `git reset --hard`,
-//! `git stash`, `git checkout -- <path>`, `git restore <path>`, `git clean -f` or
-//! `git switch --discard-changes`. `shell.git_guard` decides where the guard applies (see
-//! [`Workspace::git_guard_active`]); this module only judges a command.
+//! `git stash`, `git checkout -- <path>`, `git checkout <rev> <path>`, `git restore <path>`,
+//! `git clean -f`, `git rm -f`, `git checkout-index -f` or `git switch --discard-changes`.
+//! `shell.git_guard` decides where the guard applies (see [`Workspace::git_guard_active`]); this
+//! module only judges a command.
 //!
 //! The command is read before it runs, so only invocations that are visible in the script are
-//! judged: `git` reached through a variable, an alias, a script file or `xargs` is not. Scripts the
-//! lexer cannot read (an unterminated quote) are never refused on a guess, and an argument that
-//! needs shell expansion (`$VAR`, `$(...)`) is not treated as a match. `-C <dir>`, a preceding
-//! `cd`, `env`/`command`/`exec` wrappers, `sh -c '...'` scripts, subshells and `if`/`then` bodies
-//! are followed. A git command whose resolved directory lies outside every workspace root works on
-//! another repository and is allowed; an unknown directory counts as inside.
+//! judged: `git` reached through a variable, an alias, a script file or `xargs` is not, and neither
+//! is configuration stored in the repository (`clean.requireForce = false` set with `git config`;
+//! a `-c` on the command line is read). Scripts the lexer cannot read (an unterminated quote) are
+//! never refused on a guess, and an argument that needs shell expansion (`$VAR`, `$(...)`) is not
+//! treated as a match. `-C <dir>`, a preceding `cd`, `env`/`command`/`exec`/`nohup`/`timeout`/
+//! `sudo`/`doas`/`nice`/`ionice`/`stdbuf` wrappers, `sh -c '...'` scripts, subshells and
+//! `if`/`then` bodies are followed. A git command whose resolved directory lies outside every
+//! workspace root works on another repository and is allowed; an unknown directory counts as inside.
 
 use crate::tools::surface::outcome::Effects;
 use crate::tools::{ToolOutput, ToolStatus, Workspace};
@@ -382,6 +385,8 @@ fn command(
                 rest = &rest[skip.min(rest.len())..];
             }
             words = rest;
+        } else if let Some(rest) = unwrap_runner(name, &words[1..]) {
+            words = rest;
         } else {
             break;
         }
@@ -427,6 +432,69 @@ fn command(
     }
 }
 
+/// The command a runner wrapper (`timeout 60 git ...`, `sudo -u bob git ...`) executes, after its
+/// own options and leading operands; `None` when `name` is not such a wrapper.
+fn unwrap_runner<'a>(name: &str, rest: &'a [Word]) -> Option<&'a [Word]> {
+    // Short and long options that take a value, and the operands before the command.
+    let (short_valued, long_valued, operands): (&[char], &[&str], usize) =
+        match name.rsplit('/').next().unwrap_or(name) {
+            "timeout" => (&['s', 'k'], &["signal", "kill-after"], 1),
+            "sudo" => (
+                &['u', 'g', 'C', 'D', 'h', 'p', 'r', 't', 'U', 'T', 'R'],
+                &[
+                    "user",
+                    "group",
+                    "close-from",
+                    "chdir",
+                    "host",
+                    "prompt",
+                    "role",
+                    "type",
+                    "other-user",
+                    "command-timeout",
+                    "chroot",
+                ],
+                0,
+            ),
+            "doas" => (&['u', 'C'], &[], 0),
+            "nice" => (&['n'], &["adjustment"], 0),
+            "ionice" => (
+                &['c', 'n', 'p', 'P', 'u'],
+                &["class", "classdata", "pid", "pgid", "uid"],
+                0,
+            ),
+            "stdbuf" => (&['i', 'o', 'e'], &["input", "output", "error"], 0),
+            _ => return None,
+        };
+    let mut rest = rest;
+    while let Some(next) = rest.first() {
+        let text = next.text.as_str();
+        let skip = if text == "--" {
+            rest = &rest[1..];
+            break;
+        } else if let Some(long) = text.strip_prefix("--") {
+            if !long.contains('=') && long_valued.contains(&long) {
+                2
+            } else {
+                1
+            }
+        } else if let Some(bundle) = text.strip_prefix('-').filter(|bundle| !bundle.is_empty()) {
+            // A valued letter takes the rest of the bundle, else the next word.
+            match bundle
+                .char_indices()
+                .find(|(_, flag)| short_valued.contains(flag))
+            {
+                Some((at, flag)) if at + flag.len_utf8() == bundle.len() => 2,
+                _ => 1,
+            }
+        } else {
+            break;
+        };
+        rest = &rest[skip.min(rest.len())..];
+    }
+    Some(&rest[operands.min(rest.len())..])
+}
+
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
         !name.is_empty()
@@ -439,6 +507,7 @@ fn is_assignment(word: &str) -> bool {
 
 fn git(args: &[Word], dir: &Dir, roots: &[&Path]) -> Option<Danger> {
     let mut dir = dir.clone();
+    let mut config = Config::default();
     let mut at = 0;
     let sub = loop {
         let word = args.get(at)?;
@@ -446,8 +515,9 @@ fn git(args: &[Word], dir: &Dir, roots: &[&Path]) -> Option<Danger> {
         let text = word.text.as_str();
         match text {
             "-C" => dir = dir.join(args.get(at)?),
-            "-c" | "--config-env" | "--namespace" | "--super-prefix" | "--attr-source"
-            | "--exec-path" => {}
+            "-c" => config.read(args.get(at)?),
+            "--config-env" | "--namespace" | "--super-prefix" | "--attr-source" | "--exec-path" => {
+            }
             "--git-dir" | "--work-tree" => dir = Dir::Unknown,
             _ if text.starts_with("--git-dir=") || text.starts_with("--work-tree=") => {
                 dir = Dir::Unknown;
@@ -463,8 +533,33 @@ fn git(args: &[Word], dir: &Dir, roots: &[&Path]) -> Option<Danger> {
     }
     let sub = Sub::parse(&sub.text)?;
     let args = &args[at..];
-    let danger = classify(sub, args, &dir)?;
+    let danger = classify(sub, args, &dir, &config)?;
     dir.inside(roots).then_some(danger)
+}
+
+/// `-c name=value` settings on the command line that change what a subcommand discards.
+#[derive(Debug, Default)]
+struct Config {
+    /// `clean.requireForce` set false: `git clean` deletes without `-f`.
+    clean_unforced: bool,
+}
+
+impl Config {
+    fn read(&mut self, setting: &Word) {
+        if setting.dynamic {
+            return;
+        }
+        let (name, value) = setting
+            .text
+            .split_once('=')
+            .unwrap_or((&setting.text, "true"));
+        if name.eq_ignore_ascii_case("clean.requireForce") {
+            self.clean_unforced = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "no" | "off" | "0" | ""
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +570,8 @@ enum Sub {
     Switch,
     Restore,
     Clean,
+    Rm,
+    CheckoutIndex,
 }
 
 impl Sub {
@@ -486,6 +583,8 @@ impl Sub {
             "switch" => Self::Switch,
             "restore" => Self::Restore,
             "clean" => Self::Clean,
+            "rm" => Self::Rm,
+            "checkout-index" => Self::CheckoutIndex,
             _ => return None,
         })
     }
@@ -498,6 +597,8 @@ impl Sub {
             Self::Switch => "switch",
             Self::Restore => "restore",
             Self::Clean => "clean",
+            Self::Rm => "rm",
+            Self::CheckoutIndex => "checkout-index",
         }
     }
 
@@ -531,6 +632,8 @@ impl Sub {
                 ],
             ),
             Self::Clean => (&['e'], &["exclude"]),
+            Self::Rm => (&[], &["pathspec-from-file"]),
+            Self::CheckoutIndex => (&[], &["stage", "prefix"]),
         }
     }
 }
@@ -604,7 +707,7 @@ fn has_short(args: &[Arg], flag: char) -> bool {
         .any(|arg| matches!(arg, Arg::Short(f) if *f == flag))
 }
 
-fn classify(sub: Sub, args: &[Word], dir: &Dir) -> Option<Danger> {
+fn classify(sub: Sub, args: &[Word], dir: &Dir, config: &Config) -> Option<Danger> {
     let scanned = scan(sub, args);
     let form = |detail: &str| {
         if detail.is_empty() {
@@ -644,12 +747,36 @@ fn classify(sub: Sub, args: &[Word], dir: &Dir) -> Option<Danger> {
             })
         }
         Sub::Clean => {
-            let force = has_short(&scanned, 'f') || has_long(&scanned, "force");
+            let force =
+                has_short(&scanned, 'f') || has_long(&scanned, "force") || config.clean_unforced;
             let dry = has_short(&scanned, 'n') || has_long(&scanned, "dry-run");
             (force && !dry).then(|| Danger {
                 form: form("-f"),
                 effect: "deletes untracked files from disk",
                 instead: "`git clean -n` lists what it would delete; remove specific files you created with `rm <path>`",
+            })
+        }
+        Sub::Rm => {
+            let force = has_short(&scanned, 'f') || has_long(&scanned, "force");
+            let cached = has_long(&scanned, "cached");
+            let dry = has_short(&scanned, 'n') || has_long(&scanned, "dry-run");
+            (force && !cached && !dry).then(|| Danger {
+                form: form("-f"),
+                effect: "deletes the files from disk together with their uncommitted edits",
+                instead: "plain `git rm <path>` refuses when the file has uncommitted edits; `git rm --cached <path>` stops tracking it and keeps the file",
+            })
+        }
+        Sub::CheckoutIndex => {
+            let force = has_short(&scanned, 'f') || has_long(&scanned, "force");
+            // `--temp` and `--prefix=<dir>` write copies elsewhere instead of over the files.
+            let elsewhere = has_long(&scanned, "temp")
+                || args
+                    .iter()
+                    .any(|arg| arg.text.strip_prefix("--prefix=").is_some_and(|p| !p.is_empty()));
+            (force && !elsewhere).then(|| Danger {
+                form: form("-f"),
+                effect: DISCARD_TREE,
+                instead: "`git checkout-index` without `-f` keeps existing files; `--temp` or `--prefix=<dir>/` writes copies elsewhere; `git diff` shows what would be lost",
             })
         }
         Sub::Restore => {
@@ -676,7 +803,8 @@ fn classify(sub: Sub, args: &[Word], dir: &Dir) -> Option<Danger> {
                 .iter()
                 .any(|arg| matches!(arg, Arg::Pathspec(_)))
                 || has_long(&scanned, "pathspec-from-file");
-            // `git checkout <name>` without `--` is a path when a file of that name exists.
+            // `git checkout <name>` without `--` is a path when a file of that name exists, and
+            // `git checkout <rev> <path>...` restores the paths from that revision.
             let operands: Vec<&Word> = scanned
                 .iter()
                 .filter_map(|arg| match arg {
@@ -689,15 +817,19 @@ fn classify(sub: Sub, args: &[Word], dir: &Dir) -> Option<Danger> {
                     Dir::Known(base) => base.join(&word.text).exists(),
                     Dir::Unknown => false,
                 });
-            let destructive = forced || whole_tree || (pathspec && !resolving) || names_a_path;
+            let revision_paths = !creating && !resolving && operands.len() >= 2;
+            let destructive =
+                forced || whole_tree || (pathspec && !resolving) || names_a_path || revision_paths;
             destructive.then(|| Danger {
                 form: if forced {
                     form("-f")
+                } else if revision_paths && !pathspec {
+                    form("<rev> <path>")
                 } else {
                     form("-- <path>")
                 },
                 effect: DISCARD_TREE,
-                instead: "`git checkout -b <branch>` or `git switch <branch>` keep local changes; `git checkout --ours|--theirs -- <path>` resolves a conflict; `git diff <path>` shows what would be lost",
+                instead: "`git checkout -b <branch>` or `git switch <branch>` keep local changes; `git checkout --ours|--theirs -- <path>` resolves a conflict; `git show <rev>:<path>` reads an old version without touching the file; `git diff <path>` shows what would be lost",
             })
         }
     }

@@ -169,3 +169,171 @@ fn sequence_gaps_count_lost_events_and_replies_are_unnumbered() {
     assert_eq!(last, Some(5));
     assert_eq!(skipped_events(&mut None, &event(9)), 0);
 }
+
+#[cfg(unix)]
+fn engine_script(script: &str) -> (tempfile::TempDir, Client) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine");
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = Client::connect(&Launch::new(path), Duration::from_secs(5)).unwrap();
+    (dir, client)
+}
+
+#[cfg(unix)]
+#[test]
+fn handshake_failure_does_not_wait_for_drop_grace() {
+    use std::os::unix::fs::PermissionsExt;
+    for output in [
+        "",
+        "printf '%s\\n' 'not-json'",
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":99}'",
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":2,\"methods\":[\"hello\"]}'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine");
+        std::fs::write(&path, format!("#!/bin/sh\n{output}\nexec sleep 10\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let start = Instant::now();
+        assert!(Client::connect(&Launch::new(path), Duration::from_millis(20)).is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_login_delivers_interaction_before_completion() {
+    let (_dir, mut client) = engine_script(
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":2,\"methods\":[\"hello\",\"mcp_login\",\"auth_code\"]}'\nIFS= read -r hello\nprintf '%s\\n' '{\"id\":1,\"result\":{\"protocol_version\":2}}'\nIFS= read -r login\nprintf '%s\\n' '{\"event\":\"auth_prompt\",\"prompt_id\":\"p1\"}'\nIFS= read -r answer\nprintf '%s\\n' '{\"id\":3,\"result\":{\"received\":true}}' '{\"id\":2,\"result\":{\"server\":\"audit\"}}'",
+    );
+    let login = client.mcp_login("audit").unwrap();
+    let Some(Message::Event(event)) = client.poll(Duration::from_secs(2)) else {
+        panic!("login prompt must be available before completion");
+    };
+    assert_eq!(event.kind, "auth_prompt");
+    let result = client
+        .call(
+            "auth_code",
+            json!({"prompt_id":"p1","code":"test-code"}),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(result["received"], true);
+    assert!(
+        matches!(client.poll(Duration::from_secs(2)), Some(Message::Response { id, result: Ok(_), .. }) if id == login)
+    );
+}
+
+#[cfg(unix)]
+fn nonreading_engine() -> (tempfile::TempDir, Client) {
+    engine_script(
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"send\",\"shutdown\"]}'\nexec sleep 10",
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn call_timeout_includes_backpressured_request_write() {
+    let (_dir, mut client) = nonreading_engine();
+    let start = Instant::now();
+    let result = client.call(
+        "send",
+        json!({"text":"x".repeat(2 * 1024 * 1024)}),
+        Duration::from_millis(20),
+    );
+    let elapsed = start.elapsed();
+    client.kill().unwrap();
+    assert!(
+        matches!(result, Err(ClientError::Timeout { .. })),
+        "{result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(client.outstanding().len(), 1);
+    assert_eq!(client.outstanding()[0].effect, Effect::MayHaveApplied);
+    let mut disconnected = false;
+    while let Some(message) = client.poll(Duration::from_secs(2)) {
+        if let Message::Disconnected { outstanding } = message {
+            assert_eq!(outstanding.len(), 1);
+            assert_eq!(outstanding[0].effect, Effect::MayHaveApplied);
+            disconnected = true;
+            break;
+        }
+    }
+    assert!(disconnected);
+}
+
+#[cfg(unix)]
+#[test]
+fn request_backpressure_is_bounded_and_shutdown_can_kill_a_blocked_writer() {
+    let (_dir, mut client) = nonreading_engine();
+    let mut admitted = 0;
+    let mut refused = false;
+    for _ in 0..QUEUED_REQUESTS + 2 {
+        match client.request("send", json!({"text":"x".repeat(2 * 1024 * 1024)})) {
+            Ok(_) => admitted += 1,
+            Err(ClientError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                refused = true;
+                break;
+            }
+            other => panic!("unexpected admission: {other:?}"),
+        }
+    }
+    assert!(refused, "a non-reading engine must fill the bounded queue");
+    assert_eq!(client.outstanding().len(), admitted);
+    assert!(admitted <= QUEUED_REQUESTS + 1);
+    let start = Instant::now();
+    let status = client.shutdown(Duration::from_millis(20)).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(
+        !status.success(),
+        "shutdown must kill the non-reading engine"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_requests_keep_fifo_order_and_call_preserves_other_responses() {
+    let (_dir, mut client) = engine_script(
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"send\",\"state\"]}'\nIFS= read -r first\nIFS= read -r second\nprintf '{\"id\":1,\"result\":%s}\\n' \"$first\"\nprintf '{\"id\":2,\"result\":%s}\\n' \"$second\"",
+    );
+    let first = client.request("send", json!({"text":"first"})).unwrap();
+    let second = client
+        .call("state", json!({}), Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(second["method"], "state");
+    let Some(Message::Response {
+        id,
+        result: Ok(result),
+        ..
+    }) = client.poll(Duration::ZERO)
+    else {
+        panic!("first response was lost");
+    };
+    assert_eq!(id, first);
+    assert_eq!(result["params"]["text"], "first");
+    assert!(client.outstanding().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn write_failure_reports_disconnect_even_when_stdout_stays_open() {
+    let (_dir, mut client) = engine_script(
+        "exec 0<&-\nprintf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"send\"]}'\nexec sleep 10",
+    );
+    let id = client.request("send", json!({"text":"hello"})).unwrap();
+    let message = client.poll(Duration::from_secs(2));
+    client.kill().unwrap();
+    let Some(Message::Disconnected { outstanding }) = message else {
+        panic!("write failure did not signal disconnect: {message:?}");
+    };
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].id, id);
+    assert_eq!(outstanding[0].effect, Effect::MayHaveApplied);
+    assert!(client.outstanding().is_empty());
+    assert!(client.poll(Duration::ZERO).is_none());
+}

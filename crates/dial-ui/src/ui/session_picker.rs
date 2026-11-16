@@ -426,16 +426,12 @@ impl Picker {
                         self.query.clear();
                         self.refilter_keeping_selection();
                     }
-                    KeyCode::Backspace => {
-                        self.query.pop();
+                    // Backspace, word and line deletes edit the query from its end.
+                    _ if crate::ui::editor::delete_at_end(&mut self.query, key, None).is_some() => {
                         self.refilter_keeping_selection();
                     }
-                    KeyCode::Char(c)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        self.query.push(c);
+                    _ if crate::ui::keys::typed_char(key).is_some() => {
+                        self.query.extend(crate::ui::keys::typed_char(key));
                         self.refilter_keeping_selection();
                     }
                     _ => {}
@@ -477,13 +473,8 @@ impl Picker {
                 }
             }
             KeyCode::Char('u') if ctrl => draft.clear(),
-            KeyCode::Backspace => {
-                draft.pop();
-            }
-            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                draft.push(c)
-            }
-            _ => {}
+            _ if crate::ui::editor::delete_at_end(draft, key, None).is_some() => {}
+            _ => draft.extend(crate::ui::keys::typed_char(key)),
         }
         Action::None
     }

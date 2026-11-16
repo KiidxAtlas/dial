@@ -40,3 +40,46 @@ fn malformed_retry_timing_or_attempts_never_create_a_countdown() {
         );
     }
 }
+
+#[test]
+fn retry_notes_explain_the_first_failure_and_only_later_changes_of_cause() {
+    let first = RetryNotice::parse(
+        "transient provider failure: Responses error (code: server_error) (after 1.0s); retrying in 2.0s (attempt 1/10)",
+    )
+    .unwrap();
+    assert_eq!(first.cause_key(), "Responses error (code: server_error)");
+    let text = first.note_text(None, "Ctrl+C").unwrap();
+    assert!(
+        text.contains("/retry skips the wait, Ctrl+C stops."),
+        "{text}"
+    );
+    assert!(!text.contains("status line"), "{text}");
+    // An unbound interrupt key never leaves a dangling "; stops".
+    assert!(
+        first
+            .note_text(None, "")
+            .unwrap()
+            .contains("interrupt stops")
+    );
+
+    // Same cause, different timing: nothing new to say.
+    let same = RetryNotice::parse(
+        "transient provider failure: Responses error (code: server_error) (after 7.3s); retrying in 4.0s (attempt 2/10)",
+    )
+    .unwrap();
+    assert_eq!(same.note_text(Some(first.cause_key()), "Ctrl+C"), None);
+
+    // A new cause is noted with its attempt number.
+    let changed = RetryNotice::parse(
+        "rate limited: HTTP 429 Too Many Requests (after 0.2s); retrying in 15.0s (attempt 3/10)",
+    )
+    .unwrap();
+    let text = changed
+        .note_text(Some(first.cause_key()), "Ctrl+C")
+        .unwrap();
+    assert!(
+        text.starts_with("Attempt 3 of 10 failed differently"),
+        "{text}"
+    );
+    assert!(text.contains("HTTP 429"), "{text}");
+}

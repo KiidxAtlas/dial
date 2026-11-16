@@ -90,14 +90,9 @@ impl StatsOverlay {
         } else if self.searching {
             match key.code {
                 KeyCode::Enter => self.searching = false,
-                KeyCode::Backspace => {
-                    self.query.pop();
-                }
-                _ => {
-                    if let Some(c) = super::settings::typed_char(key) {
-                        self.query.push(c);
-                    }
-                }
+                _ if crate::ui::editor::delete_at_end(&mut self.query, key, Some(keys))
+                    .is_some() => {}
+                _ => self.query.extend(super::settings::typed_char(key)),
             }
             self.scroll = 0;
         } else if key.code == KeyCode::Char('/') {

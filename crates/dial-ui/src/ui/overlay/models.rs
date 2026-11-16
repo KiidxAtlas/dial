@@ -1841,8 +1841,10 @@ impl ModelOverlay {
             || (self.group == Group::Roles && typed_char(key) == Some('x'))
         {
             return self.clear_role();
-        } else if key.code == KeyCode::Backspace {
-            if self.search.pop().is_some() {
+        } else if let Some(changed) =
+            crate::ui::editor::delete_at_end(&mut self.search, key, Some(keys))
+        {
+            if changed {
                 self.cursor = 0;
                 self.scroll = 0;
             }

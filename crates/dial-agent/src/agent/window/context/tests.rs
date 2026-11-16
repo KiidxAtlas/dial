@@ -803,6 +803,35 @@ fn git_diff_is_bounded_and_ignores_repo_hooks() {
     assert!(!marker.exists(), "repo-configured programs must not run");
 }
 
+#[cfg(unix)]
+#[test]
+fn git_diff_never_runs_repository_filter_drivers() {
+    let (_t, base) = project();
+    let root = base.join("proj");
+    git(&root, &["init", "-q"]);
+    write(root.join("a.txt"), "one\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    // A sandboxed command could plant this: a clean filter that runs on any worktree read.
+    let marker = base.join("filter-ran");
+    for field in ["clean", "process"] {
+        git(
+            &root,
+            &[
+                "config",
+                &format!("filter.audit.{field}"),
+                &format!("touch {}; cat", marker.display()),
+            ],
+        );
+    }
+    write(root.join(".gitattributes"), "* filter=audit\n");
+    write(root.join("a.txt"), "two\n");
+    let (out, w) = expand_references(&root, "@diff", &AtomicBool::new(false));
+    assert!(w.is_empty(), "{w:?}");
+    assert!(out.contains("+two"), "{out}");
+    assert!(!marker.exists(), "repo-configured filters must not run");
+}
+
 // ---------------------------------------------------------- commands
 
 fn def(template: &str) -> CommandDef {

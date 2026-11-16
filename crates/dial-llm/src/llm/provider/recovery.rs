@@ -276,22 +276,42 @@ impl Backend {
                 }
             }
         }
-        if let Some(status @ (401 | 403)) = error
+        if let Some(http) = error
             .downcast_ref::<llm::HttpError>()
             .filter(|_| matches!(class, llm::errors::ErrorClass::Auth))
-            .map(|http| http.status)
+            .filter(|http| matches!(http.status, 401 | 403))
         {
-            let host = llm::host_of(url);
-            let key = match host.as_deref() {
-                Some("api.openai.com") => "OPENAI_API_KEY",
-                Some("api.anthropic.com") => "ANTHROPIC_API_KEY",
-                Some("openrouter.ai") => "OPENROUTER_API_KEY",
-                Some("api.groq.com") => "GROQ_API_KEY",
-                Some("api.mistral.ai") => "MISTRAL_API_KEY",
-                Some("api.deepseek.com") => "DEEPSEEK_API_KEY",
-                _ => "the endpoint's configured API key",
+            let status = http.status;
+            let key = match llm::host_of(url).as_deref() {
+                Some("api.openai.com") => Some("OPENAI_API_KEY"),
+                Some("api.anthropic.com") => Some("ANTHROPIC_API_KEY"),
+                Some("openrouter.ai") => Some("OPENROUTER_API_KEY"),
+                Some("api.groq.com") => Some("GROQ_API_KEY"),
+                Some("api.mistral.ai") => Some("MISTRAL_API_KEY"),
+                Some("api.deepseek.com") => Some("DEEPSEEK_API_KEY"),
+                _ => None,
             };
-            return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
+            // The provider error usually carries the repair advice already; say it once, and add
+            // only the specific variable it does not name.
+            let advised = http.excerpt.contains("/providers");
+            let mut repair = Vec::new();
+            if let Some(key) = key.filter(|key| !http.excerpt.contains(key)) {
+                repair.push(format!("check {key}"));
+            } else if !advised {
+                repair.push("check the endpoint's configured API key".to_owned());
+            }
+            if !advised {
+                repair.push("sign in through /providers".to_owned());
+            }
+            let context = if repair.is_empty() {
+                format!("provider authentication failed (HTTP {status})")
+            } else {
+                format!(
+                    "provider authentication failed (HTTP {status}); {}",
+                    repair.join(" or ")
+                )
+            };
+            return Err(error.context(context));
         }
         // `x-should-retry: false`: resending this request cannot succeed. Credential rotation above
         // has already had its chance; the unchanged class still lets the caller fall back.

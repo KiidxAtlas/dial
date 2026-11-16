@@ -69,7 +69,7 @@ impl Shell {
             extensions_pending: None,
             extensions_job: None,
             restart_requested: false,
-            retry_noted: false,
+            retry_cause: None,
             retry_attempt: None,
             retry_control: None,
             smithery_resume: None,
@@ -160,7 +160,7 @@ impl Shell {
             pending_resume: None,
             pending_favorite: None,
             resources: ResourceWatch {
-                at: Instant::now() - RESOURCE_TTL,
+                at: crate::runtime::clock::instant_ago(RESOURCE_TTL),
                 settings: None,
                 events: resource_events(&app.layout),
                 resources: None,
@@ -472,7 +472,7 @@ impl Shell {
         self.search.invalidate();
         self.pending_config = None;
         self.resources = ResourceWatch {
-            at: Instant::now() - RESOURCE_TTL,
+            at: crate::runtime::clock::instant_ago(RESOURCE_TTL),
             settings: None,
             resources: None,
             events: resource_events(&app.layout),

@@ -9,6 +9,41 @@ fn sanitize_removes_terminal_control_but_keeps_text_and_newlines() {
     assert_eq!(sanitize("\u{9d}title\u{9c}ok"), "ok");
 }
 
+/// A stray ESC, an unfinished CSI or an unterminated OSC/DCS ends at a newline, so it cannot
+/// merge two lines or hide everything after it; the streamed form agrees with the whole form.
+#[test]
+fn a_newline_ends_any_unfinished_escape_sequence() {
+    assert_eq!(sanitize("one\x1b\ntwo"), "one\ntwo");
+    assert_eq!(sanitize("one\x1b[12\ntwo"), "one\ntwo");
+    assert_eq!(sanitize("one\x1b]0;title\ntwo\nthree"), "one\ntwo\nthree");
+    assert_eq!(sanitize("one\x1bP data\x1b\ntwo"), "one\ntwo");
+    assert_eq!(
+        sanitize("a\x1b]8;;http://x\x1b\\link\x1b]8;;\x07b"),
+        "alinkb"
+    );
+    let input = "x\x1b]0;t\ny\x1b[3\nz";
+    let mut streamed = String::new();
+    let mut sanitizer = Sanitizer::default();
+    for piece in ["x\x1b]0", ";t", "\ny\x1b[", "3\nz"] {
+        sanitizer.feed(piece, &mut streamed);
+    }
+    assert_eq!(streamed, sanitize(input));
+}
+
+#[test]
+fn pop_grapheme_removes_one_whole_user_perceived_character() {
+    let mut text = "ae\u{301}👍🏽🇫🇷".to_owned();
+    assert!(pop_grapheme(&mut text));
+    assert_eq!(text, "ae\u{301}👍🏽");
+    assert!(pop_grapheme(&mut text));
+    assert_eq!(text, "ae\u{301}");
+    assert!(pop_grapheme(&mut text));
+    assert_eq!(text, "a");
+    assert!(pop_grapheme(&mut text));
+    assert!(!pop_grapheme(&mut text));
+    assert_eq!(text, "");
+}
+
 #[test]
 fn clip_and_wrap_never_split_wide_or_combining_graphemes() {
     assert_eq!(clip("日本語", 5), "日本");

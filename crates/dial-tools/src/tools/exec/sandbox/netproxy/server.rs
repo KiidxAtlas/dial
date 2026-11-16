@@ -313,11 +313,13 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
         query if query.starts_with('?') => format!("/{query}"),
         path => path.to_owned(),
     };
-    let mut forward = format!("{method} {path} {version}\r\n");
-    let mut has_host = false;
+    // A proxy replaces the client's Host with the authority it checked (RFC 9112 §3.2.2), so a
+    // request to an allowed address cannot name another virtual host there.
+    let mut forward = format!("{method} {path} {version}\r\nHost: {authority}\r\n");
     for header in lines.filter(|line| !line.is_empty()) {
         let name = header.split(':').next().unwrap_or_default().trim();
         if [
+            "host",
             "proxy-connection",
             "proxy-authorization",
             "connection",
@@ -328,12 +330,8 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
         {
             continue;
         }
-        has_host |= name.eq_ignore_ascii_case("host");
         forward.push_str(header);
         forward.push_str("\r\n");
-    }
-    if !has_host {
-        forward.push_str(&format!("Host: {authority}\r\n"));
     }
     // One request per connection, so every request passes the host check.
     forward.push_str("Connection: close\r\n\r\n");
@@ -345,8 +343,9 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
 }
 
 fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    (text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then(|| &text[prefix.len()..])
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 fn split_host_port(authority: &str, default: Option<u16>) -> Result<(String, u16), &'static str> {

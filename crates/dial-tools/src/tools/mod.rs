@@ -2044,23 +2044,7 @@ pub fn apply_sandbox_config(
                 deny_read.push(crate::config::paths::subscription_auth_dir(user)?);
             }
             if let Some(home) = &home {
-                for rel in [
-                    ".ssh",
-                    ".aws",
-                    ".gnupg",
-                    ".config/gcloud",
-                    ".azure",
-                    ".kube",
-                    ".docker",
-                    "Library/Keychains",
-                ] {
-                    deny_read.push(home.join(rel));
-                }
-                if cfg!(windows) {
-                    for rel in ["AppData/Roaming/gcloud", "AppData/Roaming/GitHub CLI"] {
-                        deny_read.push(home.join(rel));
-                    }
-                }
+                deny_read.extend(dev_home_secrets(home));
             }
             let extra_write = config
                 .extra_write
@@ -2077,6 +2061,55 @@ pub fn apply_sandbox_config(
             })
         }
     })
+}
+
+/// Home paths the Dev sandbox policy never lets a command read: credential directories, and the
+/// credential files that exist.
+fn dev_home_secrets(home: &Path) -> Vec<PathBuf> {
+    let mut denied: Vec<PathBuf> = [
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".config/gcloud",
+        ".azure",
+        ".kube",
+        ".docker",
+        "Library/Keychains",
+    ]
+    .iter()
+    .map(|rel| home.join(rel))
+    .collect();
+    // Credential files and the GitHub CLI's token directory. Only present ones are listed: Linux
+    // cannot mask an absent path inside a writable home, and it keeps the rest of the home
+    // unreadable anyway.
+    let mut credentials = vec![
+        ".config/gh",
+        ".git-credentials",
+        ".config/git/credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".gem/credentials",
+    ];
+    // Linux mounts `~/.cargo` read-only for toolchains and refuses a denied path inside a read
+    // mount, so cargo's registry token stays readable there.
+    if !cfg!(target_os = "linux") {
+        credentials.extend([".cargo/credentials.toml", ".cargo/credentials"]);
+    }
+    if cfg!(windows) {
+        credentials.extend([
+            "AppData/Roaming/gcloud",
+            "AppData/Roaming/GitHub CLI",
+            "_netrc",
+        ]);
+    }
+    denied.extend(
+        credentials
+            .into_iter()
+            .map(|rel| home.join(rel))
+            .filter(|path| path.symlink_metadata().is_ok()),
+    );
+    denied
 }
 
 #[cfg(test)]

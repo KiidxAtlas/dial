@@ -94,6 +94,31 @@ fn window_reset_headers_never_become_the_retry_delay() {
 }
 
 #[test]
+fn bare_number_window_resets_are_relative_seconds_or_epoch_timestamps() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let relative = at(&[("x-ratelimit-reset-requests", "60")], now);
+    assert_eq!(relative.delay, None);
+    assert_eq!(relative.reset_at, Some(now + Duration::from_secs(60)));
+    assert_eq!(
+        at(&[("x-ratelimit-reset-tokens", "1.5")], now).reset_at,
+        Some(now + Duration::from_millis(1500))
+    );
+    assert_eq!(
+        at(&[("anthropic-ratelimit-tokens-reset", "1800000090")], now).reset_at,
+        Some(now + Duration::from_secs(90))
+    );
+    assert_eq!(
+        at(&[("x-ratelimit-reset-requests", "1800000005000")], now).reset_at,
+        Some(now + Duration::from_secs(5))
+    );
+    assert_eq!(
+        at(&[("x-ratelimit-reset-requests", "1700000000")], now).reset_at,
+        None,
+        "a past epoch is not a future reset"
+    );
+}
+
+#[test]
 fn overloaded_with_short_retry_after_and_long_window_reset_retries() {
     let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let hints = at(
@@ -269,6 +294,22 @@ fn manual_retry_only_releases_the_current_wait_and_cancellation_wins() {
         !control.request_now(),
         "early exits also clear the pending wait"
     );
+}
+
+#[test]
+fn a_finished_wait_never_clears_a_newer_wait_on_the_same_control() {
+    let control = RetryControl::default();
+    let interrupt = AtomicBool::new(false);
+    let stale = control.begin_wait();
+    let current = control.begin_wait();
+    drop(stale);
+    assert!(
+        control.request_now(),
+        "the newer wait still accepts an immediate retry"
+    );
+    current.wait(Duration::from_secs(300), &interrupt).unwrap();
+    drop(current);
+    assert!(!control.request_now());
 }
 
 #[test]

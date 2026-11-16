@@ -368,7 +368,7 @@ impl Shell {
                     shell: self,
                     interrupt: app.interrupt.clone(),
                     started: Instant::now(),
-                    last_paint: Instant::now() - PAINT_EVERY,
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                     failed: false,
                     pending: Vec::new(),
                     next_id: 0,
@@ -420,7 +420,10 @@ impl Shell {
                             format!(
                                 "restored {:?}, removed {:?}{}",
                                 report.restored, report.removed,
-                                if report.warnings.is_empty() { String::new() } else { format!("\n{}", report.warnings.join("\n")) }
+                                {
+                                    let notes: Vec<&String> = report.unrestorable.iter().chain(&report.warnings).collect();
+                                    if notes.is_empty() { String::new() } else { format!("\n{}", notes.iter().map(|note| note.as_str()).collect::<Vec<_>>().join("\n")) }
+                                }
                             ),
                         ),
                         Err(error) => self.note("Rollback", format!("{error:#}")),
@@ -442,7 +445,7 @@ impl Shell {
                         shell: self,
                         interrupt: app.interrupt.clone(),
                         started: Instant::now(),
-                        last_paint: Instant::now() - PAINT_EVERY,
+                        last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                         failed: false,
                         pending: Vec::new(),
                         next_id: 0,
@@ -468,7 +471,7 @@ impl Shell {
                     shell: self,
                     interrupt: app.interrupt.clone(),
                     started: Instant::now(),
-                    last_paint: Instant::now() - PAINT_EVERY,
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                     failed: false,
                     pending: Vec::new(),
                     next_id: 0,
@@ -639,7 +642,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started,
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,
@@ -715,7 +718,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started,
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,
@@ -1049,7 +1052,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started: Instant::now(),
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,
@@ -1110,6 +1113,8 @@ impl Shell {
                 report.restored.len(),
                 report.removed.len()
             ));
+            // Oversized files could never be checkpointed; they are named, and the undo goes on.
+            lines.extend(report.unrestorable.iter().cloned());
             if !report.warnings.is_empty() {
                 lines.extend(report.warnings.iter().cloned());
                 lines.push(
@@ -1160,7 +1165,7 @@ impl Shell {
                     shell: self,
                     interrupt: app.interrupt.clone(),
                     started: Instant::now(),
-                    last_paint: Instant::now() - PAINT_EVERY,
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                     failed: false,
                     pending: Vec::new(),
                     next_id: 0,
@@ -1204,7 +1209,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started: Instant::now(),
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,
@@ -1245,7 +1250,7 @@ impl Shell {
                 shell: self,
                 interrupt: app.interrupt.clone(),
                 started: Instant::now(),
-                last_paint: Instant::now() - PAINT_EVERY,
+                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
                 failed: false,
                 pending: Vec::new(),
                 next_id: 0,

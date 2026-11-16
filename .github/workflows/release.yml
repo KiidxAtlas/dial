@@ -250,7 +250,8 @@ jobs:
     uses: ./.github/workflows/release-publish.yml
     permissions:
       contents: write
-      actions: read
+      # The packaging job dispatches CI for its metadata pull request.
+      actions: write
       pull-requests: write
       packages: write
       id-token: write

@@ -999,6 +999,7 @@ fn streamed_context_overflow_and_plan_limits_are_not_retried_as_transient() {
     let failure = |code| TerminalFailure {
         kind: "response.failed",
         code,
+        details: Vec::new(),
     };
     assert_eq!(
         failure("context_length_exceeded").class(),
@@ -1015,4 +1016,88 @@ fn streamed_context_overflow_and_plan_limits_are_not_retried_as_transient() {
         failure("unclassified_failure").class(),
         ErrorClass::Transient
     );
+}
+
+#[test]
+fn every_stream_reader_classifies_plan_limits_as_quota_not_transient() {
+    use super::super::errors::ErrorClass;
+    // The compaction stream passes no incomplete reason; it must still know the plan codes.
+    for code in [
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_usage_unavailable",
+        "usage_limit_reached",
+    ] {
+        for reason in ["", "other"] {
+            let event = json!({"type": "response.failed", "response": {"error": {"code": code}}});
+            let failure = TerminalFailure::from_event("response.failed", &event, reason);
+            assert!(
+                matches!(failure.class(), ErrorClass::QuotaExhausted { .. }),
+                "{code}"
+            );
+            assert!(!failure.retryable(), "{code}");
+        }
+    }
+}
+
+#[test]
+fn unrecognized_codes_name_the_provider_code_but_never_unsafe_text() {
+    use super::super::errors::ErrorClass;
+    let error = |error: Value| json!({"type": "error", "error": error});
+    let failure =
+        TerminalFailure::from_event("error", &error(json!({"code": "engine_overloaded_v2"})), "");
+    let text = failure.to_string();
+    assert!(
+        text.contains("code: unclassified_failure, provider code: engine_overloaded_v2"),
+        "{text}"
+    );
+    // An unknown fault without a rejected parameter still looks transient.
+    assert_eq!(failure.class(), ErrorClass::Transient);
+    // The stats label stays a fixed identifier.
+    assert_eq!(failure.kind_label(), "error:unclassified_failure");
+
+    let text = TerminalFailure::from_event("error", &error(json!({})), "").to_string();
+    assert!(text.contains("no provider code"), "{text}");
+
+    for unsafe_code in ["has space", "quote\"s", &"x".repeat(65)] {
+        let event = error(json!({"code": unsafe_code, "param": unsafe_code, "type": unsafe_code}));
+        let text = TerminalFailure::from_event("error", &event, "").to_string();
+        assert!(!text.contains(unsafe_code), "{text}");
+        assert!(text.contains("no provider code"), "{text}");
+    }
+
+    let event = json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "other"}}});
+    let text = TerminalFailure::from_event("response.incomplete", &event, "other").to_string();
+    assert!(
+        text.contains("reason: unclassified_failure, provider reason: other"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_rejected_reasoning_effort_is_named_and_not_retried() {
+    use super::super::errors::{ErrorClass, classify};
+    for event in [
+        json!({"type": "error", "error": {"type": "invalid_request_error", "code": "unsupported_value", "param": "reasoning.effort", "message": "private prompt"}}),
+        json!({"type": "error", "error": {"param": "reasoning.effort", "message": "private prompt"}}),
+        json!({"type": "response.failed", "response": {"error": {"code": "", "param": "reasoning", "message": "private prompt"}}}),
+    ] {
+        let err = Accumulator::default()
+            .feed(&event.to_string(), &mut |_| true, &mut |_| true)
+            .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(classify(&err), ErrorClass::Fatal, "{text}");
+        assert!(text.contains("param: reasoning"), "{text}");
+        assert!(text.contains("/effort"), "{text}");
+        assert!(!text.contains("private prompt"), "{text}");
+    }
+    // An invalid request without a named parameter is also permanent, without the effort hint.
+    let err = Accumulator::default()
+        .feed(
+            &json!({"type": "error", "error": {"type": "invalid_request_error"}}).to_string(),
+            &mut |_| true,
+            &mut |_| true,
+        )
+        .unwrap_err();
+    assert_eq!(classify(&err), ErrorClass::Fatal);
+    assert!(!err.to_string().contains("/effort"), "{err}");
 }

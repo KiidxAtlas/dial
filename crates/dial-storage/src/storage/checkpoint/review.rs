@@ -135,11 +135,11 @@ impl Checkpoints {
     }
 
     /// Manifests of checkpointed turns after `turn`, oldest first.
-    fn later_manifests(&self, inner: &Inner, turn: u64) -> Vec<Manifest> {
-        disk_turns(&self.dir)
+    fn later_manifests(&self, inner: &Inner, turn: u64) -> Result<Vec<Manifest>> {
+        disk_turns(&self.dir)?
             .into_iter()
             .filter(|t| *t > turn)
-            .filter_map(|t| self.manifest_in(inner, t).ok())
+            .map(|t| self.manifest_in(inner, t))
             .collect()
     }
 
@@ -147,7 +147,7 @@ impl Checkpoints {
     pub fn review_turn(&self, turn: u64) -> Result<TurnReview> {
         let inner = self.lock();
         let manifest = self.manifest_in(&inner, turn)?;
-        let later = self.later_manifests(&inner, turn);
+        let later = self.later_manifests(&inner, turn)?;
         let mut files: Vec<ReviewFile> = manifest
             .entries
             .iter()
@@ -224,7 +224,7 @@ impl Checkpoints {
         ensure!(!items.is_empty(), "no files selected; nothing restored");
         let mut inner = self.lock();
         let manifest = self.manifest_in(&inner, turn)?;
-        let later = self.later_manifests(&inner, turn);
+        let later = self.later_manifests(&inner, turn)?;
         let mut picked: Vec<(usize, &Entry, &str, &str)> = Vec::new();
         for (path, token) in items {
             if picked.iter().any(|(_, _, p, _)| p == path) {

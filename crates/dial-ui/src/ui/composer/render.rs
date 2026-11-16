@@ -180,6 +180,51 @@ pub(super) fn layout(text: &str, ghost: &str, cursor: usize, width: usize, shell
     Layout { rows, cursor }
 }
 
+/// Where Up or Down moves the cursor among the rows `text` wraps to at `width` cells, keeping
+/// the display column where the target row allows. `None` at the first or last row, so the
+/// caller can browse history. Rows match [`layout`]: a grapheme that does not fit starts the
+/// next row, and a line break ends one.
+pub(super) fn wrapped_vertical(text: &str, cursor: usize, width: usize, up: bool) -> Option<usize> {
+    let width = width.max(1);
+    // Every cursor position as (row, column, byte offset), in order.
+    let mut stops: Vec<(usize, usize, usize)> = Vec::new();
+    let (mut row, mut col) = (0, 0);
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        if grapheme == "\n" {
+            stops.push((row, col, offset));
+            row += 1;
+            col = 0;
+            continue;
+        }
+        // A grapheme wider than the row is drawn as one `?` cell.
+        let size = match text::width(grapheme) {
+            wide if wide > width => 1,
+            fits => fits,
+        };
+        if col + size > width {
+            row += 1;
+            col = 0;
+        }
+        stops.push((row, col, offset));
+        col += size;
+    }
+    stops.push((row, col, text.len()));
+    let &(here_row, here_col, _) = stops.iter().find(|(_, _, offset)| *offset >= cursor)?;
+    let target = if up {
+        here_row.checked_sub(1)?
+    } else {
+        here_row + 1
+    };
+    let mut on_row = stops.iter().filter(|(r, _, _)| *r == target).peekable();
+    let first = on_row.peek().map(|(_, _, offset)| *offset)?;
+    Some(
+        on_row
+            .take_while(|(_, c, _)| *c <= here_col)
+            .last()
+            .map_or(first, |(_, _, offset)| *offset),
+    )
+}
+
 /// One bottom-border hint: an optional key (drawn amber bold) and its label (muted). A `warn`
 /// hint is drawn whole in the warning color: the next press of its key has a lasting effect.
 pub(super) struct Hint {
@@ -467,6 +512,26 @@ impl Composer {
         let ghost = self.ghost().unwrap_or("");
         if w < MIN_BOX_WIDTH {
             let mut view = self.bare_view(w, ghost, theme);
+            // An open history search or menu still takes keys here, so show its line too.
+            if let Some(search) = &self.search
+                && w > 0
+            {
+                let (rows, col) = self.search_rows(search, w, ctx);
+                view = ComposerView {
+                    rows: rows.into_iter().take(1).collect(),
+                    cursor: (0, col as u16),
+                };
+            } else if let Some((name, _, _)) = self.menu_selection()
+                && w > 0
+            {
+                prepend_rows(
+                    &mut view,
+                    vec![Line::from(Span::styled(
+                        text::ellipsize(&name, w, theme.ascii()),
+                        theme.fg(Tok::Accent),
+                    ))],
+                );
+            }
             if let Some(choice) = &self.choice
                 && w > 0
             {
@@ -497,6 +562,7 @@ impl Composer {
         } else {
             w
         };
+        self.wrap_width.set(inner);
         let laid = layout(
             &self.editor.text,
             ghost,
@@ -869,6 +935,7 @@ impl Composer {
 
     /// Fewer than `MIN_BOX_WIDTH` cells: just the input row around the cursor, no chrome.
     pub(super) fn bare_view(&self, w: usize, ghost: &str, theme: &Theme) -> ComposerView {
+        self.wrap_width.set(w);
         if w == 0 {
             return ComposerView {
                 rows: vec![Line::default()],

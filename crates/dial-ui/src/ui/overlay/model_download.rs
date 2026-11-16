@@ -21,7 +21,7 @@ use crate::ui::{
     text,
     theme::{Theme, Tok},
 };
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -521,13 +521,10 @@ impl ModelDownloads {
             self.query_changed();
             return Step::Handled;
         }
-        if key.code == KeyCode::Backspace {
-            // Backspace always edits the query; from the results it returns focus there, unless
-            // there is nothing to delete.
-            if self.focus == Focus::Query {
-                self.query.pop();
-                self.query_changed();
-            } else if self.query.pop().is_some() {
+        if let Some(changed) = crate::ui::editor::delete_at_end(&mut self.query, key, Some(keys)) {
+            // Deleting always edits the query; from the results it returns focus there, unless
+            // there was nothing to delete.
+            if self.focus == Focus::Query || changed {
                 self.focus = Focus::Query;
                 self.query_changed();
             }

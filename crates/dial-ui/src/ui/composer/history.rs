@@ -10,6 +10,9 @@ use super::{Composer, ComposerCtx, ComposerEvent, HistoryProvider, Search};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{style::Modifier, text::Span};
 
+/// Sent drafts whose chips are kept for recall.
+const MAX_RECALLS: usize = 20;
+
 impl Composer {
     pub fn set_history_provider(&mut self, provider: Option<HistoryProvider>) {
         self.history_provider = provider;
@@ -25,11 +28,59 @@ impl Composer {
 
     pub fn push_history(&mut self, entry: String) {
         let entry = text::sanitize(&entry);
-        if entry.trim().is_empty() || self.history.last() == Some(&entry) {
+        if entry.trim().is_empty() {
+            return;
+        }
+        self.remember_chips(&entry);
+        if self.history.last() == Some(&entry) {
             return;
         }
         self.history.push(entry);
         self.trim_history();
+    }
+
+    /// When the draft being sent holds paste or image chips, keeps it so recalling `sent`
+    /// brings the chips back rather than flooding the box with the expanded text.
+    fn remember_chips(&mut self, sent: &str) {
+        let used: Vec<(String, String)> = self
+            .pastes
+            .iter()
+            .filter(|(marker, _)| self.editor.text.contains(marker.as_str()))
+            .cloned()
+            .collect();
+        if used.is_empty() || super::paste::expand_pastes(&self.editor.text, &used) != sent {
+            return;
+        }
+        self.recalls.retain(|(text, _, _)| text != sent);
+        self.recalls
+            .push((sent.to_owned(), self.editor.text.clone(), used));
+        if self.recalls.len() > MAX_RECALLS {
+            self.recalls.remove(0);
+        }
+    }
+
+    /// The text to show for a recalled history entry: the draft with its chips when it was sent
+    /// from this session with chips (their payloads registered again), else the entry itself.
+    pub(super) fn recall(&mut self, entry: &str) -> String {
+        let Some((_, draft, chips)) = self.recalls.iter().find(|(sent, _, _)| sent == entry) else {
+            return entry.to_owned();
+        };
+        // A marker now standing for different text would expand to the wrong content.
+        let clash = chips.iter().any(|(marker, body)| {
+            self.pastes
+                .iter()
+                .any(|(live, live_body)| live == marker && live_body != body)
+        });
+        if clash {
+            return entry.to_owned();
+        }
+        let draft = draft.clone();
+        for chip in chips.clone() {
+            if !self.pastes.contains(&chip) {
+                self.pastes.push(chip);
+            }
+        }
+        draft
     }
 
     /// Applies a changed `ui.history_limit` to the live history, dropping the oldest entries first.
@@ -65,11 +116,14 @@ impl Composer {
                 }
             };
             self.history_index = Some(index);
-            self.editor.set(&self.history[index]);
+            self.history_index = Some(index);
+            let shown = self.recall(&self.history[index].clone());
+            self.editor.set(&shown);
         } else if let Some(index) = self.history_index {
             if index + 1 < self.history.len() {
                 self.history_index = Some(index + 1);
-                self.editor.set(&self.history[index + 1]);
+                let shown = self.recall(&self.history[index + 1].clone());
+                self.editor.set(&shown);
             } else {
                 self.leave_history();
             }
@@ -116,7 +170,8 @@ impl Composer {
                 .map(|&i| search.entries[i].clone());
             self.search = None;
             if let Some(entry) = entry {
-                self.set_draft(&entry);
+                let shown = self.recall(&entry);
+                self.set_draft(&shown);
             }
             return ComposerEvent::None;
         }
@@ -164,11 +219,24 @@ impl Composer {
         while let Ok((epoch, entries)) = lookup.rx.try_recv() {
             lookup.running = false;
             if epoch == lookup.epoch
+                && let Some(entries) = entries
                 && let Some(search) = &mut self.search
             {
+                // Results arrive after the user may have moved; keep the highlighted entry
+                // when it is still a match, otherwise start at the newest.
+                let query = search.query.text.to_lowercase();
+                let kept =
+                    search_selection(&search.entries, &query, search.selected).and_then(|entry| {
+                        entries
+                            .iter()
+                            .filter(|e| e.to_lowercase().contains(&query))
+                            .position(|e| *e == entry)
+                    });
                 search.entries = entries;
-                search.selected = 0;
-                search.scroll = 0;
+                search.selected = kept.unwrap_or(0);
+                if kept.is_none() {
+                    search.scroll = 0;
+                }
                 changed = true;
             }
         }
@@ -180,12 +248,18 @@ impl Composer {
             && let Some(provider) = self.history_provider.clone()
             && let Some((epoch, query, _)) = lookup.pending.take()
         {
-            lookup.running = true;
             let tx = lookup.tx.clone();
-            std::thread::spawn(move || {
-                let entries = provider(&query, 500);
-                let _ = tx.send((epoch, entries));
-            });
+            // A provider that panics still reports back, so later queries keep searching.
+            let spawned = std::thread::Builder::new()
+                .name("history-search".into())
+                .spawn(move || {
+                    let entries = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        provider(&query, 500)
+                    }))
+                    .ok();
+                    let _ = tx.send((epoch, entries));
+                });
+            lookup.running = spawned.is_ok();
         }
         changed
     }
@@ -258,4 +332,13 @@ impl Composer {
         ));
         (rows, col.min(w - 1))
     }
+}
+
+/// The entry at `selected` among those of `entries` matching the lowercased `query`.
+fn search_selection(entries: &[String], query: &str, selected: usize) -> Option<String> {
+    entries
+        .iter()
+        .filter(|e| e.to_lowercase().contains(query))
+        .nth(selected)
+        .cloned()
 }

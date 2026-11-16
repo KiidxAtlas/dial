@@ -102,6 +102,8 @@ pub struct Dialog<'a> {
     deadline: Option<Instant>,
     paused_timeout: Option<Duration>,
     feedback: String,
+    /// What a timeout chose for the user, one line per question.
+    timeout_notes: Vec<String>,
     hints: Hints,
 }
 impl<'a> Dialog<'a> {
@@ -118,6 +120,7 @@ impl<'a> Dialog<'a> {
             deadline: None,
             paused_timeout: None,
             feedback: String::new(),
+            timeout_notes: Vec::new(),
             hints: Hints::new(&Keymap::defaults()),
         }
     }
@@ -175,14 +178,34 @@ impl<'a> Dialog<'a> {
         }
         let question = &self.request.questions[self.page];
         let answer = &mut self.answers[self.page];
+        let mut note = None;
         if answer.selected_options.is_empty()
             && answer.custom_input.is_none()
             && let Some(option) = question.options.get(question.recommended.unwrap_or(0))
         {
             answer.selected_options.push(option.label.clone());
+            note = Some(format!(
+                "No answer in time to \u{201c}{}\u{201d}; chose \u{201c}{}\u{201d}.",
+                text::one_line(&question.question),
+                text::one_line(&option.label)
+            ));
         }
         answer.timed_out = true;
-        self.advance()
+        let page = self.page;
+        let outcome = self.advance();
+        if let Some(note) = note {
+            // The next page says what was picked on the one that timed out.
+            if self.page != page {
+                self.feedback = note.clone();
+            }
+            self.timeout_notes.push(note);
+        }
+        outcome
+    }
+
+    /// One line per question the timeout answered on the user's behalf, for the transcript.
+    pub fn timeout_notes(&self) -> &[String] {
+        &self.timeout_notes
     }
     fn advance(&mut self) -> Option<QuestionOutcome> {
         let question = &self.request.questions[self.page];

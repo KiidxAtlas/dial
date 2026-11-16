@@ -1,5 +1,6 @@
 use super::*;
 use crate::ui::status::Phase;
+use crossterm::event::KeyModifiers;
 
 struct Env {
     theme: Theme,
@@ -1982,15 +1983,18 @@ fn typing_after_menu_navigation_requires_a_fresh_explicit_selection() {
 }
 
 #[test]
-fn ctrl_c_stops_a_busy_turn_even_in_history_search() {
+fn ctrl_c_closes_history_search_during_a_turn_and_the_next_press_stops() {
     let env = Env::new();
     let mut c = with_commands();
     c.set_busy(true);
     c.set_draft("keep draft");
     ctrl(&mut c, &env, 'r');
     assert!(c.search.is_some());
-    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
+    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::None);
+    assert!(c.search.is_none(), "the first press closes the search");
     assert_eq!(c.draft(), "keep draft");
+    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
+    assert_eq!(c.draft(), "keep draft", "stopping never clears the draft");
 }
 
 #[test]
@@ -4737,4 +4741,199 @@ fn choosing_a_worker_previews_the_message_it_will_get() {
     }
     let rows = screen(&c, &env, 100).join("\n");
     assert!(rows.contains("worker gets “audit the parser”"), "{rows}");
+}
+
+// ---- chips, wrapped rows, search selection, gestures and recall ------------------------
+
+fn thirty_lines() -> String {
+    (0..30).map(|i| format!("line {i}\n")).collect()
+}
+
+#[test]
+fn the_cursor_skips_over_a_chip_and_a_partial_edit_removes_it_whole() {
+    let env = Env::new();
+    let mut c = composer();
+    typed(&mut c, &env, "a ");
+    c.handle_paste(&thirty_lines());
+    let chip = "[Pasted text #1 +30 lines]";
+    assert_eq!(c.draft(), format!("a {chip}"));
+    press(&mut c, &env, KeyCode::Left);
+    assert_eq!(c.editor.cursor, 2, "Left jumps to the chip's start");
+    press(&mut c, &env, KeyCode::Right);
+    assert_eq!(c.editor.cursor, c.draft().len(), "Right jumps past it");
+    // A word kill from the end would cut only `]`; it removes the whole chip instead.
+    ctrl(&mut c, &env, 'w');
+    assert_eq!(c.draft(), "a ");
+    ctrl(&mut c, &env, '-');
+    assert_eq!(
+        c.draft(),
+        format!("a {chip}"),
+        "one undo brings it back intact"
+    );
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit(format!("a {}", thirty_lines()))
+    );
+}
+
+#[test]
+fn typing_inside_a_chip_never_breaks_its_marker() {
+    let env = Env::new();
+    let mut c = composer();
+    c.handle_paste(&thirty_lines());
+    let len = c.draft().len();
+    // Force the cursor inside, as a stale position could, then type.
+    c.editor.move_to(len - 3);
+    typed(&mut c, &env, "x");
+    assert_eq!(c.draft(), "x", "the chip is replaced, not corrupted");
+    assert!(!c.expanded_draft().contains("[Pasted"));
+}
+
+#[test]
+fn up_moves_through_wrapped_rows_before_reaching_history() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["older prompt".into()], 10);
+    let long = "word ".repeat(20);
+    c.set_draft(long.trim_end());
+    c.view(30, &env.ctx());
+    let end = c.editor.cursor;
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), long.trim_end(), "Up stays in the wrapped draft");
+    assert!(c.editor.cursor < end);
+    for _ in 0..10 {
+        press(&mut c, &env, KeyCode::Up);
+    }
+    assert_eq!(
+        c.draft(),
+        "older prompt",
+        "from the top row Up browses history"
+    );
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(c.draft(), long.trim_end());
+}
+
+#[test]
+fn wrapped_vertical_keeps_the_column_and_stops_at_the_edges() {
+    // "abcdefgh" at width 4 wraps to "abcd" / "efgh".
+    assert_eq!(render::wrapped_vertical("abcdefgh", 6, 4, true), Some(2));
+    assert_eq!(render::wrapped_vertical("abcdefgh", 2, 4, false), Some(6));
+    assert_eq!(render::wrapped_vertical("abcdefgh", 2, 4, true), None);
+    assert_eq!(render::wrapped_vertical("abcdefgh", 6, 4, false), None);
+    // A short next line clamps to its end.
+    assert_eq!(render::wrapped_vertical("abcd\nx", 3, 10, false), Some(6));
+}
+
+#[test]
+fn late_history_results_keep_the_highlighted_entry() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["one x".into(), "two x".into(), "three x".into()], 10);
+    c.set_history_provider(Some(std::sync::Arc::new(|_, _| {
+        vec![
+            "newest x".into(),
+            "three x".into(),
+            "two x".into(),
+            "one x".into(),
+        ]
+    })));
+    ctrl(&mut c, &env, 'r');
+    press(&mut c, &env, KeyCode::Down);
+    start_history_lookup_now(&mut c);
+    wait_for_history_lookup(&mut c);
+    assert_eq!(c.search.as_ref().unwrap().entries.len(), 4);
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(c.draft(), "two x", "the selection followed its entry");
+}
+
+#[test]
+fn a_failing_history_provider_does_not_stop_later_searches() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["local x".into()], 10);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    c.set_history_provider(Some(std::sync::Arc::new(move |query, _| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            panic!("provider failed");
+        }
+        vec![format!("found {query}")]
+    })));
+    ctrl(&mut c, &env, 'r');
+    start_history_lookup_now(&mut c);
+    wait_for_history_lookup(&mut c);
+    assert_eq!(
+        c.search.as_ref().unwrap().entries,
+        ["local x"],
+        "a failed lookup keeps the shown entries"
+    );
+    c.handle_paste("x");
+    start_history_lookup_now(&mut c);
+    wait_for_history_lookup(&mut c);
+    assert_eq!(c.search.as_ref().unwrap().entries, ["found x"]);
+}
+
+#[test]
+fn double_left_needs_two_lefts_in_a_row() {
+    let env = Env::new();
+    let mut c = Composer::new(vec![], 10);
+    assert_eq!(press(&mut c, &env, KeyCode::Left), ComposerEvent::None);
+    press(&mut c, &env, KeyCode::Right);
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Left),
+        ComposerEvent::None,
+        "another key in between breaks the pair"
+    );
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Left),
+        ComposerEvent::Action(Action::SubagentsHub)
+    );
+}
+
+#[test]
+fn long_dictation_collapses_to_a_dictation_chip() {
+    let mut c = composer();
+    c.paste_voice(&"spoken words ".repeat(200));
+    assert!(
+        c.draft().starts_with("[Dictation #1 +1 line]"),
+        "{}",
+        c.draft()
+    );
+}
+
+#[test]
+fn a_narrow_composer_still_shows_the_history_search_line() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["entry".into()], 10);
+    c.set_draft("draft");
+    ctrl(&mut c, &env, 'r');
+    let view = c.view(7, &env.ctx());
+    assert_eq!(view.rows.len(), 1);
+    assert!(
+        lines(&view.rows)[0].starts_with("search"),
+        "{:?}",
+        lines(&view.rows)
+    );
+}
+
+#[test]
+fn recalling_a_sent_draft_brings_its_chips_back() {
+    let env = Env::new();
+    let mut c = composer();
+    typed(&mut c, &env, "see ");
+    c.handle_paste(&thirty_lines());
+    let draft = c.draft();
+    let sent = format!("see {}", thirty_lines());
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit(sent.clone())
+    );
+    assert_eq!(
+        c.history().last(),
+        Some(&sent),
+        "history keeps the full text"
+    );
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), draft, "the recalled draft shows the chip");
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit(sent)
+    );
 }

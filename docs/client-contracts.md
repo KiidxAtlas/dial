@@ -122,10 +122,18 @@ so a frontend built on it couples only to the versioned wire protocol, never to 
 It provides:
 
 - `Client::connect`: launch `dial rpc` with `Launch`, read `ready`, pick the highest common version
-  and send `hello`; fail closed when there is none.
+  and send `hello`; fail closed when there is none. Failed handshakes kill and reap the child
+  immediately rather than adding the normal five-second graceful-drop wait to the timeout.
 - `request` and `poll` for toolkit-neutral, non-blocking use (drive `poll` from a background thread
   and forward each `Message` to the UI loop), and `call` for short queries. `call` buffers every
   other message, so no event is lost.
+  Request writes use a bounded FIFO worker queue, so pipe backpressure cannot block `request`,
+  `call` deadlines or shutdown. A full queue returns `ClientError::Io` (`WouldBlock`) without
+  admitting the request; frames larger than `MAX_FRAME_BYTES` return `InvalidInput`.
+  Asynchronous write failures surface through disconnect accounting. `call` timeouts include
+  queue/write waiting: an admitted request remains outstanding and may still reach the engine
+  after timeout. Do not retry mutations automatically; `kill` or bounded `shutdown` terminates
+  an unresponsive engine.
 - `supports(method)` against `ready.methods`; an unadvertised method is refused locally.
 - Typed engine errors (`RpcError.code`, see [protocol 2 codes](rpc-and-acp.md#ready-frame)) and
   helpers for `approval` and `text` events.
@@ -138,6 +146,11 @@ It provides:
 - Typed helpers for common requests (`send`, `steer`, `resume`, `set_setting`, `list_checkpoints`,
   `checkpoint_diff`, `undo`) and `restart_and_resume`, which applies saved settings by replacing
   the engine process and resuming the same session.
+- Interactive authentication uses `mcp_login(server) -> Result<RequestId, ClientError>`. This
+  replaces the blocking `mcp_login(server, timeout)` helper: poll while its id is outstanding,
+  display `auth_url`, answer `auth_prompt` with `auth_code`, and match the eventual login response
+  by id. Do not use blocking `call("mcp_login", ...)` for interactive login: it buffers the very
+  events needed to complete authentication. A caller's UI controls cancellation and deadlines.
 
 `cargo run -p dial-client --example headless -- "prompt"` drives one turn without a terminal UI
 (set `DIAL_BIN` and `DIAL_RPC_ARGS` to choose the engine); it denies every approval request.

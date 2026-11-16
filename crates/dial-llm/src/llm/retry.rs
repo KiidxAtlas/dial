@@ -16,7 +16,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Commands issued during inference or after the wait ends never affect a later retry.
 #[derive(Debug, Clone, Default)]
 pub struct RetryControl {
-    state: Arc<parking_lot::Mutex<WaitState>>,
+    state: Arc<parking_lot::Mutex<WaitSlot>>,
+}
+
+/// The control's current wait. `generation` identifies which [`PendingWait`] owns `state`, so a
+/// finished wait can never clear or consume a newer one.
+#[derive(Debug, Default)]
+struct WaitSlot {
+    state: WaitState,
+    generation: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -31,21 +39,29 @@ impl RetryControl {
     /// Release the current wait, including a server-requested delay. Returns false if there is
     /// no pending wait or an immediate retry has already been requested.
     pub fn request_now(&self) -> bool {
-        let mut state = self.state.lock();
-        if *state != WaitState::Waiting {
+        let mut slot = self.state.lock();
+        if slot.state != WaitState::Waiting {
             return false;
         }
-        *state = WaitState::Requested;
+        slot.state = WaitState::Requested;
         true
     }
 
     pub(crate) fn begin_wait(&self) -> PendingWait {
-        *self.state.lock() = WaitState::Waiting;
-        PendingWait(self.clone())
+        let mut slot = self.state.lock();
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.state = WaitState::Waiting;
+        PendingWait {
+            control: self.clone(),
+            generation: slot.generation,
+        }
     }
 }
 
-pub(crate) struct PendingWait(RetryControl);
+pub(crate) struct PendingWait {
+    control: RetryControl,
+    generation: u64,
+}
 
 impl PendingWait {
     pub(crate) fn wait(
@@ -58,7 +74,7 @@ impl PendingWait {
             if interrupt.load(Ordering::SeqCst) {
                 return Err(super::Interrupted);
             }
-            if *self.0.state.lock() == WaitState::Requested || start.elapsed() >= delay {
+            if self.requested() || start.elapsed() >= delay {
                 return Ok(());
             }
             std::thread::sleep(
@@ -68,11 +84,19 @@ impl PendingWait {
             );
         }
     }
+
+    fn requested(&self) -> bool {
+        let slot = self.control.state.lock();
+        slot.generation == self.generation && slot.state == WaitState::Requested
+    }
 }
 
 impl Drop for PendingWait {
     fn drop(&mut self) {
-        *self.0.state.lock() = WaitState::Idle;
+        let mut slot = self.control.state.lock();
+        if slot.generation == self.generation {
+            slot.state = WaitState::Idle;
+        }
     }
 }
 
@@ -158,10 +182,11 @@ fn hints<'a>(header: impl Fn(&str) -> Option<&'a str>, now: SystemTime) -> Serve
     .filter_map(|name| {
         let value = header(name)?;
         if name.ends_with("-after-seconds") {
-            return number(value).map(|s| now + Duration::from_secs_f64(s));
+            return number(value).and_then(|s| now.checked_add(Duration::from_secs_f64(s)));
         }
-        duration_text(value)
-            .map(|d| now + d)
+        number(value)
+            .and_then(|n| reset_instant(n, false, now))
+            .or_else(|| duration_text(value).and_then(|d| now.checked_add(d)))
             .or_else(|| reset_date(value))
     })
     .filter(|at| *at > now)
@@ -193,17 +218,22 @@ fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
 /// `x-ratelimit-reset[-ms]`: a delta, or an epoch timestamp in seconds/milliseconds.
 fn reset_value(value: &str, millis: bool, now: SystemTime) -> Option<Duration> {
     let n = number(value).filter(|n| *n > 0.0)?;
-    let target = if n > 1e12 {
-        UNIX_EPOCH.checked_add(Duration::from_secs_f64(n / 1000.0))?
-    } else if n > 1e9 {
-        UNIX_EPOCH.checked_add(Duration::from_secs_f64(n))?
-    } else {
-        return Some(Duration::from_secs_f64(if millis { n / 1000.0 } else { n }));
-    };
-    target
+    reset_instant(n, millis, now)?
         .duration_since(now)
         .ok()
         .filter(|delay| !delay.is_zero())
+}
+
+/// A bare reset number: an epoch timestamp in milliseconds or seconds when it is that large,
+/// otherwise a delta from `now` in seconds (milliseconds when `millis`).
+fn reset_instant(n: f64, millis: bool, now: SystemTime) -> Option<SystemTime> {
+    if n > 1e12 {
+        UNIX_EPOCH.checked_add(Duration::from_secs_f64(n / 1000.0))
+    } else if n > 1e9 {
+        UNIX_EPOCH.checked_add(Duration::from_secs_f64(n))
+    } else {
+        now.checked_add(Duration::from_secs_f64(if millis { n / 1000.0 } else { n }))
+    }
 }
 
 fn number(value: &str) -> Option<f64> {
@@ -233,10 +263,8 @@ fn duration_text(mut value: &str) -> Option<Duration> {
     (seconds.is_finite() && seconds < 1e15).then(|| Duration::from_secs_f64(seconds))
 }
 
+/// A UTC RFC3339 reset timestamp; bare numbers are handled by [`reset_instant`].
 fn reset_date(value: &str) -> Option<SystemTime> {
-    if let Some(epoch) = number(value) {
-        return UNIX_EPOCH.checked_add(Duration::from_secs_f64(epoch));
-    }
     // Anthropic emits UTC RFC3339 reset timestamps, optionally with fractional seconds.
     let value = value.trim().strip_suffix('Z')?;
     let whole = value.split('.').next()?;

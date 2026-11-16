@@ -292,7 +292,7 @@ impl Pane {
             }
             KeyCode::Enter => return Some(self.send_draft()),
             KeyCode::Backspace => {
-                self.draft.pop();
+                crate::ui::text::pop_grapheme(&mut self.draft);
             }
             KeyCode::Up => self.chat_back += 1,
             KeyCode::Down => self.chat_back = self.chat_back.saturating_sub(1),

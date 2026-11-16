@@ -215,8 +215,23 @@ pub(super) fn parse_file_diffs(output: &str) -> Vec<crate::ui::rail::FileDiff> {
     out
 }
 
+/// Subcommands that never convert worktree files, so no filter driver can run for them.
+const NO_FILTER_SUBCOMMANDS: &[&str] = &["rev-parse", "symbolic-ref", "ls-files", "ls-tree"];
+
 pub(super) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     use std::io::ErrorKind;
+    // Repository config is untrusted and this read runs outside any sandbox: subcommands that
+    // convert worktree files (`status`, `diff`, `hash-object`) run with every configured filter
+    // driver disabled, and are skipped when one cannot be disabled.
+    let filters_off = if args
+        .first()
+        .is_some_and(|sub| NO_FILTER_SUBCOMMANDS.contains(sub))
+    {
+        Vec::new()
+    } else {
+        crate::tools::vcs::git::filters_off_args(root, &std::sync::atomic::AtomicBool::new(false))
+            .ok()?
+    };
     let mut command = Command::new("git");
     command
         .args([
@@ -225,6 +240,7 @@ pub(super) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
             "-c",
             "core.untrackedCache=false",
         ])
+        .args(&filters_off)
         .arg("-C")
         .arg(root)
         .args(args)

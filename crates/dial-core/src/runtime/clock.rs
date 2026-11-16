@@ -30,3 +30,14 @@ pub fn format_utc(secs: u64) -> String {
         rem % 60
     )
 }
+
+/// The instant `ago` before now, used to make a throttle or cache due at once. A monotonic clock
+/// can start near its origin (shortly after boot), where `Instant::now() - ago` would panic; then
+/// the earliest representable instant, `now`, is returned and the first refresh waits `ago`.
+pub fn instant_ago(ago: std::time::Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_sub(ago).unwrap_or(now)
+}
+
+#[cfg(test)]
+mod tests;

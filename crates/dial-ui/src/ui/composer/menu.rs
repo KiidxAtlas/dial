@@ -375,8 +375,10 @@ impl Composer {
             {
                 pieces.push(hint(Action::Dismiss, "close"));
             }
-            // Mirrors `handle_key`: a shared Ctrl+C clears a draft before it stops the turn.
+            // Mirrors `handle_key`: a shared Ctrl+C clears a draft before it stops the turn,
+            // unless the previous press already armed the stop.
             let clears = self.search.is_none()
+                && !self.stop_armed
                 && !self.editor.text.is_empty()
                 && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
                     keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
@@ -386,6 +388,12 @@ impl Composer {
                 Action::Interrupt,
                 if clears {
                     "clear draft"
+                } else if self.search.is_some()
+                    && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
+                        keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
+                    })
+                {
+                    "close search"
                 } else if self.stop_armed {
                     "again stops"
                 } else {
@@ -398,7 +406,7 @@ impl Composer {
             });
             pieces.push(stop);
             // The draft a busy Ctrl+C just cleared is one undo away.
-            if self.stop_armed && !clears {
+            if self.stop_armed && !clears && self.editor.text.is_empty() {
                 pieces.push(hint(Action::EditorUndo, "restore draft"));
             }
         }

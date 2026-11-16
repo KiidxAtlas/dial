@@ -199,3 +199,56 @@ fn policy_decides_where_the_guard_applies() {
     assert!(refusal.is_error);
     assert_eq!(ToolStatus::from_output(&refusal), ToolStatus::Blocked);
 }
+
+#[test]
+fn revision_paths_forced_removals_and_common_wrappers_are_refused() {
+    for (command, form) in [
+        ("git checkout HEAD src/a.rs", "git checkout <rev> <path>"),
+        (
+            "git checkout main src/a.rs src/b.rs",
+            "git checkout <rev> <path>",
+        ),
+        ("git rm -f src/a.rs", "git rm -f"),
+        ("git rm -rf src", "git rm -f"),
+        ("git rm --force src/a.rs", "git rm -f"),
+        ("git -c clean.requireForce=false clean -d", "git clean -f"),
+        ("git -c Clean.RequireForce=no clean", "git clean -f"),
+        ("git checkout-index -f -a", "git checkout-index -f"),
+        (
+            "git checkout-index --force -- src/a.rs",
+            "git checkout-index -f",
+        ),
+        ("timeout 60 git reset --hard", "git reset --hard"),
+        (
+            "timeout -s KILL -k 5 60s git reset --hard",
+            "git reset --hard",
+        ),
+        ("sudo git reset --hard", "git reset --hard"),
+        ("sudo -u bob -E git stash", "git stash"),
+        ("doas git clean -f", "git clean -f"),
+        ("nice -n 10 git reset --hard", "git reset --hard"),
+        ("nice -10 git stash", "git stash"),
+        ("ionice -c 3 git stash", "git stash"),
+        ("stdbuf -oL git stash", "git stash"),
+        ("stdbuf -o L git stash", "git stash"),
+    ] {
+        assert_eq!(refused(command), form, "{command}");
+    }
+    for command in [
+        "git checkout -b topic main",
+        "git checkout --ours main conflicted.rs",
+        "git rm src/a.rs",
+        "git rm --cached -f src/a.rs",
+        "git rm -n -f src/a.rs",
+        "git -c clean.requireForce=true clean -d",
+        "git -c clean.requireForce=false clean -n",
+        "git checkout-index -a",
+        "git checkout-index -f --temp -a",
+        "git checkout-index -f --prefix=export/ -a",
+        "timeout 60 git status",
+        "sudo -u bob git log",
+        "nice -n 5 git gc",
+    ] {
+        allowed(command);
+    }
+}

@@ -260,12 +260,14 @@ impl InlineTerminal {
         // Clear only the visible screen. The user's scrollback belongs to their terminal.
         let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
-        let key_releases = supports_keyboard_enhancement().unwrap_or(false);
+        // Crossterm's Windows console backend reads native records, not Kitty CSI-u sequences.
+        let keyboard_flags = cfg!(unix);
+        let key_releases = keyboard_flags && supports_keyboard_enhancement().unwrap_or(false);
         let mut out = Sink::queued(Box::new(io::stdout())).context("starting terminal output")?;
-        let setup = terminal_input_setup();
+        let setup = terminal_input_setup(keyboard_flags);
         out.write_all(setup.as_bytes())?;
         out.flush()?;
-        KEYBOARD_FLAGS.store(true, Ordering::SeqCst);
+        KEYBOARD_FLAGS.store(keyboard_flags, Ordering::SeqCst);
         KEY_RELEASES.store(key_releases, Ordering::SeqCst);
         UP_ROWS.store(0, Ordering::SeqCst);
         IN_ALT_SCREEN.store(false, Ordering::SeqCst);
@@ -273,8 +275,8 @@ impl InlineTerminal {
         install_panic_hook();
         let size = crossterm::terminal::size().unwrap_or((80, 24));
         input::start().context("starting terminal input")?;
-        // We requested the protocol even if detection failed; always balance the push on exit.
-        let terminal = Self::build(out, size, true, true);
+        // Balance the push only on backends where it was sent, even if detection failed.
+        let terminal = Self::build(out, size, true, keyboard_flags);
         #[cfg(unix)]
         let terminal = {
             let mut terminal = terminal;
@@ -1247,15 +1249,17 @@ pub fn reports_key_releases() -> bool {
     KEY_RELEASES.load(Ordering::SeqCst)
 }
 
-/// Request disambiguated keys even when the capability query timed out or was filtered by a
-/// multiplexer. Terminals without this protocol ignore the request. Detection remains separate:
-/// hold-to-talk must not assume key releases are available merely because we requested them.
-fn terminal_input_setup() -> String {
+/// Unix parses CSI-u, so request it even when a multiplexer filters the capability probe.
+/// Windows uses native console key records and must not ask for encoded key-release text.
+/// Detection remains separate: requesting reports alone does not prove they are available.
+fn terminal_input_setup(keyboard_flags: bool) -> String {
     let mut setup = String::new();
-    push_command(
-        &mut setup,
-        &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
-    );
+    if keyboard_flags {
+        push_command(
+            &mut setup,
+            &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
+        );
+    }
     push_command(&mut setup, &EnableBracketedPaste);
     push_command(&mut setup, &EnableFocusChange);
     setup

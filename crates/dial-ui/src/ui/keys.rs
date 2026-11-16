@@ -26,6 +26,27 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::HashSet, fs, path::Path};
 
+/// The character a key types into a text field, or `None` for a shortcut chord.
+///
+/// Plain and Shift keys type. Ctrl+Alt also types a printable symbol, because Windows reports
+/// AltGr (`@`, `{`, `€` on many European layouts) as Ctrl+Alt; a Ctrl+Alt letter or digit
+/// stays a shortcut. Callers check their bound actions first, so a bound chord still wins.
+pub fn typed_char(key: &KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    if c.is_control() || key.modifiers.contains(KeyModifiers::SUPER) {
+        return None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match (ctrl, alt) {
+        (false, false) => Some(c),
+        (true, true) if !c.is_ascii_alphanumeric() => Some(c),
+        _ => None,
+    }
+}
+
 fn flatten_bindings(table: &toml::Table) -> Vec<(String, toml::Value)> {
     fn walk(prefix: &str, table: &toml::Table, out: &mut Vec<(String, toml::Value)>) {
         for (key, value) in table {

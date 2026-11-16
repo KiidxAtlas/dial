@@ -10,8 +10,7 @@ use super::{
     error::EditError,
     text::{
         adjust_indentation, count_leading_whitespace, is_non_empty_line, js_trim, js_trim_end,
-        js_trim_start, min_indent, normalize_for_fuzzy, normalize_to_lf, normalize_unicode,
-        utf16_len,
+        js_trim_start, min_indent, normalize_for_fuzzy, normalize_unicode, utf16_len,
     },
 };
 
@@ -1412,6 +1411,11 @@ fn normalization_note(old: &str, matched: &FuzzyMatch) -> Option<String> {
 }
 
 /// Find and replace text using the same exact/fuzzy behavior as `replaceText`.
+///
+/// `content` is the edit pipeline's editable text, in which only `\r\n` pairs were collapsed; it
+/// is used as given so that every offset passed to `witness` addresses that same text, and a lone
+/// `\r` (or the `\r` left from `\r\r\n`) in an untouched line is preserved. `old_text` and
+/// `new_text` get the same CRLF-only normalization.
 pub fn replace_text(
     content: &str,
     old_text: &str,
@@ -1425,9 +1429,9 @@ pub fn replace_text(
         return Err(EditError::apply("oldText must not be empty."));
     }
     let threshold = threshold.unwrap_or(DEFAULT_FUZZY_THRESHOLD);
-    let normalized_content = normalize_to_lf(content);
-    let normalized_old = normalize_to_lf(old_text);
-    let normalized_new = normalize_to_lf(new_text);
+    let normalized_content = std::borrow::Cow::Borrowed(content);
+    let normalized_old = crate::tools::edit::hashline::normalize_body(old_text);
+    let normalized_new = crate::tools::edit::hashline::normalize_body(new_text);
     if all {
         let exact_count = normalized_content
             .match_indices(normalized_old.as_ref())

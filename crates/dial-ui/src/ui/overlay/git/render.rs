@@ -15,7 +15,7 @@ use crate::ui::{
     text,
     theme::{Sym, Theme, Tok},
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -783,16 +783,7 @@ fn pad(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 }
 
 pub(super) fn plain_char(key: &KeyEvent) -> Option<char> {
-    match key.code {
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(c)
-        }
-        _ => None,
-    }
+    crate::ui::keys::typed_char(key)
 }
 
 fn skip_chars(text: &str, count: usize) -> String {

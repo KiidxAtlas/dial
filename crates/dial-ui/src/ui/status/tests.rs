@@ -168,15 +168,24 @@ fn controller_wait_and_retry_override_stale_telemetry_without_inventing_progress
         attempt: 4,
         maximum: "10".into(),
         ready_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        stop_key: "Ctrl+C".into(),
     });
     let label = status.activity_label();
     assert!(
         label.contains("retry 4/10")
             && label.contains("retrying…")
             && !label.contains("next attempt in 0s")
-            && label.contains("/retry"),
+            && label.contains("/retry skips the wait")
+            && label.ends_with("Ctrl+C stops")
+            // `/retry now` is refused with a usage error; the hint must name the real command.
+            && !label.contains("/retry now"),
         "{label}"
     );
+    // An unbound interrupt key still says how to stop.
+    if let Some(retry) = status.provider_retry.as_mut() {
+        retry.stop_key.clear();
+    }
+    assert!(status.activity_label().ends_with("interrupt stops"));
     // Before the ready time the countdown shows.
     if let Some(retry) = status.provider_retry.as_mut() {
         retry.ready_at = Instant::now() + Duration::from_secs(30);

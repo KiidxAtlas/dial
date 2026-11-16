@@ -229,6 +229,28 @@ fn disabled_filter_note(drivers: &[String]) -> String {
     )
 }
 
+/// `-c` overrides that disable every configured clean/smudge/process filter driver at `root`.
+/// For host-side Git reads outside this module (the status probe, `@diff`): commands such as
+/// `status`, `diff` and `hash-object` convert worktree files, and a repository-configured filter
+/// is a program that would run outside any sandbox. Errors when a configured driver name cannot
+/// be overridden with `-c`, so the caller skips the read instead of running it.
+pub fn filters_off_args(root: &Path, cancel: &AtomicBool) -> Result<Vec<String>, String> {
+    let mut drivers = Vec::new();
+    for key in inspect_filter_config(filter_config_query(root, FILTER_CONFIG), cancel)? {
+        let driver = filter_driver(&key).ok_or_else(|| {
+            format!(
+                "filter configuration Dial cannot disable is present ({key}); host-side Git read refused"
+            )
+        })?;
+        if !drivers.contains(&driver) {
+            drivers.push(driver);
+        }
+    }
+    Ok(disabled_filter_args(&drivers))
+}
+
+const FILTER_CONFIG: &str = r"^filter\..*\.(clean|smudge|process)$";
+
 const FILTER_OR_TEXTCONV_CONFIG: &str =
     r"^(filter\..*\.(clean|smudge|process)|diff\..*\.textconv)$";
 const TEXTCONV_CONFIG: &str = r"^diff\..*\.textconv$";
