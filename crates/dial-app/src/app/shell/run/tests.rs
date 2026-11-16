@@ -32,11 +32,13 @@ fn animation_frames_repaint_without_ending_the_wait() {
     let mut steps = Vec::new();
     let ready = wait_frames(
         &mut paints,
-        Duration::from_millis(60),
+        // A wide deadline and short polls keep the frame count independent of runner load: a
+        // loaded CI host can oversleep one 10 ms frame past a tight deadline (seen as 0 paints).
+        Duration::from_millis(400),
         |_| Some(Duration::from_millis(10)),
         |step| {
             steps.push(step);
-            std::thread::sleep(step);
+            std::thread::sleep(step.min(Duration::from_millis(1)));
             Ok(false)
         },
         |paints| {
