@@ -30,9 +30,14 @@ def is_latest(tag, published):
     return all(candidate >= version for version in versions)
 
 
+# CI runs that count as main CI: a push, or a run dispatched on main. Merges made with the workflow
+# token start no push run, so release automation dispatches CI on main after merging.
+MAIN_CI_EVENTS = ("push", "workflow_dispatch")
+
+
 def successful_main_ci(runs, revision):
     return any(
-        run.get("event") == "push"
+        run.get("event") in MAIN_CI_EVENTS
         and run.get("headBranch") == "main"
         and run.get("headSha") == revision
         and run.get("status") == "completed"
@@ -118,12 +123,39 @@ def stable_tag(tag):
     return tag
 
 
+def _changelog_headings(changelog):
+    return list(re.finditer(r"^## \[([^\]\n]+)\][^\n]*$", changelog, re.MULTILINE))
+
+
+def _newest_released(headings):
+    """Newest stable version heading, or None when the changelog has none."""
+    versions = [heading.group(1) for heading in headings if heading.group(1) != "Unreleased"]
+    stable = []
+    for version in versions:
+        try:
+            stable.append(stable_version(f"v{version}"))
+        except ValueError:
+            return None
+    return max(stable) if stable else None
+
+
 def release_notes(tag, changelog):
-    """Select exactly the tagged version's curated section, never Unreleased or other versions."""
+    """Select exactly the tagged version's curated section, never another version.
+
+    Main carries the next version with its notes under Unreleased (the release train): a tag newer
+    than every released section and without its own section publishes the Unreleased notes; the
+    post-release metadata pull request then dates them as that version.
+    """
     stable_version(tag)
     version = tag[1:]
-    headings = list(re.finditer(r"^## \[([^\]\n]+)\][^\n]*$", changelog, re.MULTILINE))
+    headings = _changelog_headings(changelog)
     matches = [index for index, heading in enumerate(headings) if heading.group(1) == version]
+    if not matches:
+        newest = _newest_released(headings)
+        unreleased = [index for index, heading in enumerate(headings) if heading.group(1) == "Unreleased"]
+        if newest is None or len(unreleased) != 1 or unreleased[0] != 0 or stable_version(tag) <= newest:
+            raise ValueError(f"expected exactly one CHANGELOG section for {tag}")
+        matches = unreleased
     if len(matches) != 1:
         raise ValueError(f"expected exactly one CHANGELOG section for {tag}")
     index = matches[0]
@@ -132,6 +164,14 @@ def release_notes(tag, changelog):
     if not notes:
         raise ValueError(f"CHANGELOG section for {tag} is empty")
     return notes
+
+
+def unreleased_version(version, changelog):
+    """True when `version` is the next release: newer than every section and without its own."""
+    headings = _changelog_headings(changelog)
+    newest = _newest_released(headings)
+    return (newest is not None and stable_version(f"v{version}") > newest
+            and not any(heading.group(1) == version for heading in headings))
 
 
 def release_problems(root, tag=None):
@@ -181,7 +221,10 @@ def release_problems(root, tag=None):
     except (OSError, ValueError, KeyError, TypeError) as error:
         problems.append(f"Cargo.lock: {error}")
     try:
-        release_notes(f"v{version}", (root / "CHANGELOG.md").read_text(encoding="utf-8"))
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        # Without a tag, main may carry the next version before any notes exist for it.
+        if tag is not None or not unreleased_version(version, changelog):
+            release_notes(f"v{version}", changelog)
     except (OSError, ValueError) as error:
         problems.append(f"CHANGELOG.md: {error}")
     return problems

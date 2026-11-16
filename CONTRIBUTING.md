@@ -93,8 +93,9 @@ and must keep the hosted core tool offer inside its schema budget (25 KiB) witho
 
 ## Releases
 
-Maintainers prepare release metadata with `scripts/release.sh <version>`; tagging and publication
-are separate explicit steps. See [docs/release-and-install.md](docs/release-and-install.md).
+Releases follow a release train: `main` carries the next version, its CI builds the release
+candidates, and the **Cut release** workflow tags `main` and publishes. Maintainers can still
+prepare metadata with `scripts/release.sh <version>`. See [docs/release-and-install.md](docs/release-and-install.md).
 
 ## Security issues
 

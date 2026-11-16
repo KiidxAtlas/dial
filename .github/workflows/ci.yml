@@ -71,21 +71,29 @@ jobs:
           PATH="$tool_dir:$PATH" make lint-deps
       - name: Select untagged release candidate
         id: candidate
-        # Version-bump pull requests from this repository build candidates too, so a release
-        # tagged right after the merge reuses them instead of waiting for main to rebuild.
+        # Main carries the next, untagged version (the release train), so every main commit builds
+        # candidates and a release is only a tag. Main CI dispatched by release automation counts
+        # as a push. A pull request from this repository builds them only when it changes the
+        # version, so a release tagged right after merging it need not wait for main to rebuild.
         if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') ||
           (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          tag="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          version() { python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])'; }
+          tag="v$(version < Cargo.toml)"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
             exit 0
           fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The checkout is the merge with main; its first parent is the base branch.
+            if [ "v$(git show HEAD^1:Cargo.toml | version)" = "$tag" ]; then
+              echo "Pull request keeps version $tag; main builds its candidates after the merge." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             # Tests run on the merge with main; candidates are built from the head. Record them
             # only when both are the same tree, so a release can match them by tree.
             if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
@@ -365,11 +373,11 @@ jobs:
 
   musl:
     # Release builds ship musl binaries; check them on every push so target-specific type
-    # differences (for example libc's ioctl request type) fail here, not at publish time. A main
-    # push that builds release candidates already compiles both musl targets, so it skips this.
+    # differences (for example libc's ioctl request type) fail here, not at publish time. A run
+    # that builds release candidates already compiles both musl targets, so it skips this.
     name: musl check (${{ matrix.target }})
     needs: validate
-    if: github.event_name != 'push' || needs.validate.outputs.candidate-tag == ''
+    if: needs.validate.outputs.candidate-tag == ''
     strategy:
       fail-fast: false
       matrix:

@@ -67,7 +67,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   packaging:
-    name: Propose package metadata update
+    name: Propose package metadata update and start the next version
     needs: publish
     if: needs.publish.outputs.latest == 'true'
     runs-on: ubuntu-22.04
@@ -78,6 +78,9 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signed-release-assets
@@ -92,7 +95,7 @@ jobs:
           base64 -d dist/SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig"
           openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-public.pem" -rawin \
             -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig"
-      - name: Update and merge Homebrew formula and AUR metadata
+      - name: Update and merge package metadata and the next version
         timeout-minutes: 90
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -106,22 +109,26 @@ jobs:
           git checkout -B "$branch" origin/main
           python3 scripts/update-formula.py --version "$version" --sums dist/SHA256SUMS \
             --formula Formula/dial.rb --aur packaging/aur/dial-bin
+          # Release train: date the published notes and move main to the next patch version, so
+          # every main commit builds release candidates and the next release is only a tag.
+          python3 scripts/advance-release.py --released "$version"
           python3 scripts/check-packaging.py
+          python3 scripts/release-policy.py check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/dial.rb packaging/aur/dial-bin
+          git add Formula/dial.rb packaging/aur/dial-bin CHANGELOG.md Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
-            echo "Package metadata already matches $RELEASE_TAG; no pull request needed"
+            echo "Package metadata and version already advanced past $RELEASE_TAG; no pull request needed"
             exit 0
           fi
-          git commit -m "release: update package metadata for $version"
+          git commit -m "release: package metadata for $version and start the next version"
           git push --force origin "HEAD:refs/heads/$branch"
           if gh pr view "$branch" --json number >/dev/null 2>&1; then
             echo "Pull request for $branch already exists"
           else
             gh pr create --base main --head "$branch" \
-              --title "release: Dial $RELEASE_TAG package metadata" \
-              --body "Automated Homebrew formula and AUR metadata update for $RELEASE_TAG, generated from the signed SHA256SUMS of the published release."
+              --title "release: Dial $RELEASE_TAG package metadata and next version" \
+              --body "Automated after publishing $RELEASE_TAG: Homebrew formula and AUR metadata from the signed SHA256SUMS of the published release, the released notes dated in CHANGELOG.md, and the workspace moved to the next patch version (scripts/advance-release.py)."
           fi
           # main requires CI checks, and a GITHUB_TOKEN push starts no pull_request run (it shows
           # as a failed run with no jobs), so dispatch CI on the branch head and merge once it passes.
@@ -140,6 +147,9 @@ jobs:
           # its verified manifest, so merge now; an unmerged PR leaves Homebrew users on the old version.
           # Publishing to the AUR itself still needs the maintainer's AUR key (packaging/README.md).
           gh pr merge "$branch" --merge --delete-branch
+          # A merge made with GITHUB_TOKEN starts no push run on main either; dispatch main CI so
+          # it tests the new head and builds the next version's release candidates.
+          gh workflow run ci.yml --ref main
 
   container:
     name: Publish signed container with build provenance and SBOM

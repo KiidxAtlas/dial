@@ -1,0 +1,41 @@
+name: Prune superseded caches
+
+# Keep the repository's Actions cache quota for current entries: after main CI, delete Rust caches
+# that a newer entry with the same key prefix replaced (scripts/prune-caches.py). Without this,
+# stale test caches evicted the release-candidate caches and every release build started cold.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-prune
+  cancel-in-progress: true
+
+jobs:
+  prune:
+    name: Delete superseded Rust caches
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Delete superseded entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 1000 --json id,key,ref,createdAt > "$RUNNER_TEMP/caches.json"
+          python3 scripts/prune-caches.py "$RUNNER_TEMP/caches.json" > "$RUNNER_TEMP/stale"
+          while read -r id; do
+            gh cache delete -R "$GITHUB_REPOSITORY" "$id" || echo "::warning::could not delete cache $id"
+          done < "$RUNNER_TEMP/stale"
+          echo "Deleted $(wc -l < "$RUNNER_TEMP/stale") superseded Rust caches." >> "$GITHUB_STEP_SUMMARY"

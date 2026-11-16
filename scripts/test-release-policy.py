@@ -25,6 +25,8 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_only_a_completed_successful_main_push_for_exact_revision_is_accepted(self):
         good = dict(event="push", headBranch="main", headSha="abc", status="completed", conclusion="success")
         self.assertTrue(policy.successful_main_ci([good], "abc"))
+        # Release automation dispatches main CI after merging with GITHUB_TOKEN.
+        self.assertTrue(policy.successful_main_ci([{**good, "event": "workflow_dispatch"}], "abc"))
         for field, value in [("event", "pull_request"), ("headBranch", "feature"),
                              ("headSha", "other"), ("status", "in_progress"),
                              ("conclusion", "failure")]:
@@ -65,6 +67,19 @@ class ReleasePolicyTests(unittest.TestCase):
             ("v0.2.10", changelog + "\n## [0.2.10]\nDuplicate.\n"),
             ("v0.2.10", "## [0.2.10]\n\n## [0.2.9]\nOlder."),
             ("v0.2.10-rc.1", changelog),
+        ]:
+            with self.subTest(tag=tag, source=source), self.assertRaises(ValueError):
+                policy.release_notes(tag, source)
+
+    def test_unreleased_notes_publish_only_the_next_untagged_version(self):
+        changelog = "## [Unreleased]\n\n- Next.\n\n## [0.2.10] - 2026-11-01\n\n- Tagged.\n\n## [0.2.9]\n\nOlder.\n"
+        self.assertEqual(policy.release_notes("v0.2.11", changelog), "- Next.")
+        self.assertEqual(policy.release_notes("v0.3.0", changelog), "- Next.")
+        self.assertEqual(policy.release_notes("v0.2.10", changelog), "- Tagged.")
+        for tag, source in [
+            ("v0.2.11", changelog.replace("- Next.\n", "")),
+            ("v0.2.11", changelog.replace("## [Unreleased]\n", "")),
+            ("v0.2.11", "## [Unreleased]\n\n- Next.\n"),
         ]:
             with self.subTest(tag=tag, source=source), self.assertRaises(ValueError):
                 policy.release_notes(tag, source)
@@ -135,6 +150,18 @@ class ReleaseReadinessTests(unittest.TestCase):
                 self.assertTrue(policy.release_problems(self.root))
                 target.write_text(original)
 
+    def test_untagged_next_version_passes_without_notes_but_its_tag_needs_them(self):
+        manifest = self.manifest.replace('version = "0.3.0"', 'version = "0.3.1"')
+        (self.root / "Cargo.toml").write_text(manifest)
+        (self.root / "Cargo.lock").write_text((self.root / "Cargo.lock").read_text().replace('"0.3.0"', '"0.3.1"'))
+        self.assertEqual(policy.release_problems(self.root), [])
+        self.assertTrue(any("CHANGELOG" in p for p in policy.release_problems(self.root, "v0.3.1")))
+        (self.root / "CHANGELOG.md").write_text('## [Unreleased]\n\n- Next.\n\n## [0.3.0]\n\n- Notes.\n')
+        self.assertEqual(policy.release_problems(self.root, "v0.3.1"), [])
+        # An older version than the newest section never borrows the Unreleased notes.
+        (self.root / "CHANGELOG.md").write_text('## [Unreleased]\n\n- Next.\n\n## [0.3.2]\n\n- Notes.\n')
+        self.assertTrue(policy.release_problems(self.root))
+
     def test_tools_reports_every_missing_prerequisite_without_running_it(self):
         with mock.patch("shutil.which", return_value=None), mock.patch("importlib.util.find_spec", return_value=None):
             self.assertEqual(len(policy.tool_problems()), 7)
@@ -160,7 +187,7 @@ class ReleaseReadinessTests(unittest.TestCase):
             "cargo": 'echo "cargo $*" >> "$CALLS"\n[ "$*" = "update --workspace --offline" ]\n',
             "make": 'echo "make $*" >> "$CALLS"\npython3 scripts/release-policy.py check v0.3.0\n',
             "gh": 'echo "gh $*" >> "$CALLS"\ncase "$*" in\n'
-                  '"run list --workflow ci.yml --commit abc --event push --branch main --json status,conclusion,event,headBranch,headSha")\n'
+                  '"run list --workflow ci.yml --commit abc --branch main --json status,conclusion,event,headBranch,headSha")\n'
                   'printf "%s" "$CI_RUNS";;\n*) exit 0;;\nesac\n',
         }.items():
             path = tools / name
@@ -471,7 +498,7 @@ class CandidatePromotionTests(unittest.TestCase):
         ci = (root / ".github/workflows/ci.yml").read_text()
         candidates = (root / ".github/workflows/release-build.yml").read_text()
         release = (root / ".github/workflows/release.yml").read_text()
-        self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", ci)
+        self.assertIn("(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'", ci)
         self.assertIn("uses: ./.github/workflows/release-build.yml", ci)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", candidates)
         self.assertNotIn("secrets.", candidates)
@@ -523,6 +550,96 @@ class CandidatePromotionTests(unittest.TestCase):
         merge = packaging.index('gh pr merge "$branch" --merge --delete-branch')
         self.assertLess(dispatch, watch)
         self.assertLess(watch, merge)
+        # The merge starts no push run either, so main CI is dispatched after it.
+        self.assertLess(merge, packaging.index('gh workflow run ci.yml --ref main'))
+
+    def test_release_train_advances_main_and_cuts_releases_from_main_candidates(self):
+        workflows = SCRIPT.parent.parent / '.github/workflows'
+        packaging = (workflows / 'release-publish.yml').read_text().split('\n  packaging:\n', 1)[1].split('\n  container:\n', 1)[0]
+        self.assertLess(packaging.index('scripts/advance-release.py --released "$version"'),
+                        packaging.index('git commit -m'))
+        self.assertIn('git add Formula/dial.rb packaging/aur/dial-bin CHANGELOG.md Cargo.toml Cargo.lock', packaging)
+        release = (workflows / 'release.yml').read_text().split('\njobs:\n', 1)[0]
+        self.assertIn("tags: ['v*']", release)
+        self.assertIn('workflow_dispatch:', release)
+        cut = (workflows / 'release-cut.yml').read_text()
+        self.assertIn('ref: main', cut)
+        self.assertIn('make release-check RELEASE_TAG="$tag"', cut)
+        wait = cut.index('scripts/release-policy.py ci "$SHA"')
+        tag = cut.index('git tag -a "$TAG"')
+        start = cut.index('gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref "$TAG"')
+        self.assertLess(wait, tag)
+        self.assertLess(tag, start)
+        ci = (workflows / 'ci.yml').read_text()
+        validate = ci.split("\n  validate:\n", 1)[1].split("\n  release-candidates:\n", 1)[0]
+        # Pull requests build candidates only when they change the version.
+        self.assertIn('git show HEAD^1:Cargo.toml | version', validate)
+        self.assertIn("if: needs.validate.outputs.candidate-tag == ''", ci.split('\n  musl:\n', 1)[1])
+
+
+class ReleaseTrainTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "Cargo.toml").write_text('[package]\nname = "dial"\nversion.workspace = true\n'
+                                              '[workspace]\nmembers = ["."]\n'
+                                              '[workspace.package]\nversion = "0.3.9"\n')
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n\n[[package]]\nname = "arrayref"\nversion = "0.3.9"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            '\n[[package]]\nname = "dial"\nversion = "0.3.9"\n')
+        (self.root / "CHANGELOG.md").write_text(
+            '## [Unreleased]\n\n- Shipped.\n\n## [0.3.8] - 2026-11-14\n\n- Old.\n\n'
+            '[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.8...HEAD\n'
+            '[0.3.8]: https://github.com/KiidxAtlas/dial/tree/v0.3.8\n')
+
+    def advance(self):
+        return subprocess.run([sys.executable, str(SCRIPT.with_name("advance-release.py")), "--released", "0.3.9",
+                               "--date", "2026-11-16", "--root", str(self.root)], capture_output=True, text=True)
+
+    def test_advance_dates_published_notes_and_moves_only_local_versions(self):
+        self.assertEqual(policy.release_notes("v0.3.9", (self.root / "CHANGELOG.md").read_text()), "- Shipped.")
+        result = self.advance()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.root / "CHANGELOG.md").read_text()
+        self.assertIn("## [Unreleased]\n\n## [0.3.9] - 2026-11-16\n\n- Shipped.", log)
+        self.assertIn("[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.9...HEAD", log)
+        self.assertIn("[0.3.9]: https://github.com/KiidxAtlas/dial/tree/v0.3.9", log)
+        self.assertIn('version = "0.3.10"', (self.root / "Cargo.toml").read_text())
+        lock = (self.root / "Cargo.lock").read_text()
+        self.assertIn('name = "arrayref"\nversion = "0.3.9"', lock)
+        self.assertIn('name = "dial"\nversion = "0.3.10"', lock)
+        self.assertEqual(policy.release_problems(self.root), [])
+        snapshot = {name: (self.root / name).read_text() for name in ("CHANGELOG.md", "Cargo.toml", "Cargo.lock")}
+        result = self.advance()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({name: (self.root / name).read_text() for name in snapshot}, snapshot)
+
+    def test_advance_refuses_to_date_missing_notes_without_writing(self):
+        path = self.root / "CHANGELOG.md"
+        path.write_text(path.read_text().replace("- Shipped.\n\n", ""))
+        before = path.read_text()
+        result = self.advance()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_text(), before)
+        self.assertIn('version = "0.3.9"', (self.root / "Cargo.toml").read_text())
+
+    def test_prune_keeps_only_the_newest_rust_cache_per_ref_and_prefix(self):
+        spec = importlib.util.spec_from_file_location("prune_caches", SCRIPT.with_name("prune-caches.py"))
+        prune = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prune)
+        main = "refs/heads/main"
+        caches = [
+            dict(id=1, ref=main, createdAt="2026-11-14T00:00:00Z", key="v0-rust-test-macos-Darwin-arm64-b937-aaaa"),
+            dict(id=2, ref=main, createdAt="2026-11-16T00:00:00Z", key="v0-rust-test-macos-Darwin-arm64-b937-bbbb"),
+            dict(id=3, ref=main, createdAt="2026-11-13T00:00:00Z", key="v0-rust-release-x86_64-Linux-x64-c1-aaaa"),
+            dict(id=4, ref="refs/pull/7/merge", createdAt="2026-11-12T00:00:00Z",
+                 key="v0-rust-test-macos-Darwin-arm64-b937-cccc"),
+            dict(id=5, ref=main, createdAt="2026-11-11T00:00:00Z", key="buildkit-blob-1-sha256:abc"),
+            dict(id=6, ref=main, createdAt="2026-11-10T00:00:00Z", key="buildkit-blob-1-sha256:def"),
+        ]
+        self.assertEqual(prune.superseded(caches), [1])
 
     def test_candidates_keep_artifact_checks_without_repeating_portable_installer_suite(self):
         root = SCRIPT.parent.parent / '.github/workflows'

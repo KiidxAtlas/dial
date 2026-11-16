@@ -528,7 +528,25 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 
 ### Publishing a release (maintainers)
 
-Release preparation, verification and publication are separate:
+**Release train (default).** After each release, the publication workflow's metadata pull
+request dates the published notes, updates Homebrew/AUR metadata and moves `main` to the next
+patch version (`scripts/advance-release.py`). It dispatches CI on that branch, merges once the
+required checks pass, then dispatches CI on `main`. From then on, every `main` commit is
+untagged, so its CI builds and smoke-tests the unsigned candidates for all eight targets next to
+the tests. Write notes under `## [Unreleased]` as usual; for a minor or major release, change the
+workspace version in a pull request first.
+
+To release, run **Cut release** from the Actions tab (`gh workflow run release-cut.yml`), or from
+an up-to-date `main` checkout run `scripts/release.sh <version> --tag --push`. Cut release checks
+the version and its nonempty Unreleased notes, waits for successful `main` CI on the head commit
+(dispatching it if a token-made merge started none), tags that commit and dispatches the release
+workflow on the tag. The tag's tree is the one CI built, so the release reuses those candidates
+and only signs and publishes; once `main` CI is green this takes a few minutes. A tag without its
+own changelog section publishes the Unreleased notes, but only for a version newer than every
+released section.
+
+**Prepared release (still supported).** Preparation, verification and publication can also be
+separate steps:
 
 ```sh
 scripts/release.sh 0.3.0          # metadata only; no build, stage, commit or tag
@@ -603,6 +621,10 @@ restore them; tag-scoped fallback builds restore main caches without creating is
 PR container builds restore the main layer cache but do not export competing PR cache entries.
 The release container no longer needs a Rust compilation cache. Cache availability and speedups
 are not guaranteed; Docker cache mounts are not themselves persisted by the layer-cache exporter.
+Rust cache keys end in a lockfile/toolchain hash, so each dependency change leaves the old entry
+behind. After every `main` CI run, `cache-prune.yml` deletes Rust caches superseded by a newer
+entry with the same key prefix (`scripts/prune-caches.py`), keeping the 10 GB repository quota for
+current entries instead of evicting the release-candidate caches.
 
 Release candidate jobs also cache pip downloads and locally built wheels, keyed by Python and
 `scripts/requirements-ci.lock`, so the Intel macOS packaging job can reuse its source-built
