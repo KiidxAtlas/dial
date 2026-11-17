@@ -723,6 +723,8 @@ pub struct HotkeyRow {
 pub struct Keymap {
     bindings: Vec<(Action, Vec<Chord>)>,
     customized: HashSet<Action>,
+    /// Test override for [`option_glyphs::us_layout`]; `None` reads the system setting.
+    us_layout: Option<bool>,
 }
 
 impl Keymap {
@@ -741,6 +743,9 @@ impl Keymap {
                 })
                 .collect(),
             customized: HashSet::new(),
+            // Unit tests never depend on the host's keyboard layout; they opt in with
+            // `with_us_layout`.
+            us_layout: cfg!(test).then_some(false),
         }
     }
 
@@ -1067,7 +1072,7 @@ impl Keymap {
             .unwrap_or(&[])
     }
     pub fn matches(&self, action: Action, key: &KeyEvent) -> bool {
-        let key = self.voice_key(action, *key);
+        let key = self.option_key(action, *key);
         self.chords(action).iter().any(|c| c.matches(&key))
     }
 
@@ -1085,27 +1090,46 @@ impl Keymap {
 
     /// True when `key` releases one of `action`'s bound keys (see [`Chord::matches_release`]).
     pub fn release_matches(&self, action: Action, key: &KeyEvent) -> bool {
-        let key = self.voice_key(action, *key);
+        let key = self.option_key(action, *key);
         self.chords(action).iter().any(|c| c.matches_release(&key))
     }
 
-    // Legacy macOS terminals send the layout's Option+V character, not an Alt modifier.
-    // Keep this alias scoped to voice and its active Alt+V binding. Bracketed paste
-    // bypasses key matching, so literal square roots can still be pasted into the draft.
-    fn voice_key(&self, action: Action, mut key: KeyEvent) -> KeyEvent {
-        if cfg!(target_os = "macos")
-            && action == Action::VoiceInput
-            && key.code == KeyCode::Char('√')
-            && (key.modifiers - KeyModifiers::ALT).is_empty()
-            && self
-                .chords(action)
-                .iter()
-                .any(|chord| chord.code == KeyCode::Char('v') && chord.mods == KeyModifiers::ALT)
-        {
-            key.code = KeyCode::Char('v');
-            key.modifiers = KeyModifiers::ALT;
+    /// macOS terminals whose Option key types characters send Option+K as `˚`, not Alt+K (see
+    /// [`option_glyphs`]). Such a character counts as its Alt chord only for an action bound to
+    /// that chord, and only on a U.S. or ABC layout, where no plain key types it. `√` (Option+V)
+    /// keeps working on every layout, as voice input always has. Bracketed paste bypasses key
+    /// matching, so these characters can still be pasted into the draft.
+    fn option_key(&self, action: Action, key: KeyEvent) -> KeyEvent {
+        if !cfg!(target_os = "macos") {
+            return key;
         }
-        key
+        let Some(alias) = option_glyphs::as_alt_chord(&key) else {
+            return key;
+        };
+        let press = KeyEvent {
+            kind: KeyEventKind::Press,
+            ..alias
+        };
+        if !self
+            .chords(action)
+            .iter()
+            .any(|chord| chord.matches(&press))
+        {
+            return key;
+        }
+        let us_layout = self.us_layout.unwrap_or_else(option_glyphs::us_layout);
+        if us_layout || key.code == KeyCode::Char('√') {
+            alias
+        } else {
+            key
+        }
+    }
+
+    /// Fix the layout [`Keymap::option_key`] assumes instead of reading the system setting.
+    #[cfg(test)]
+    pub fn with_us_layout(mut self, us: bool) -> Keymap {
+        self.us_layout = Some(us);
+        self
     }
 
     /// Every action bound to this key (a chord may legitimately serve several, e.g. Esc).
@@ -1190,5 +1214,6 @@ impl Keymap {
     }
 }
 
+mod option_glyphs;
 #[cfg(test)]
 mod tests;

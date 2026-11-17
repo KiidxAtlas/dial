@@ -25,14 +25,12 @@ pub(in crate::app) enum ActivityTab {
 }
 
 impl ActivityTab {
-    /// The tabs that Tab/Shift+Tab (and the arrow keys) cycle through. Downloads is not one of
-    /// them: it is the Models panel's Get models view, a different panel with its own keys, so it
-    /// opens only when asked for (`/activity downloads` or an attention item), never by stepping
-    /// sideways from Workers.
-    pub(super) const ALL: [Self; 6] = [
+    /// Activity owns outer navigation; each reused panel keeps its own model and actions.
+    pub(super) const ALL: [Self; 7] = [
         Self::Attention,
         Self::Workers,
         Self::Processes,
+        Self::Downloads,
         Self::Compute,
         Self::Schedule,
         Self::Queue,
@@ -85,7 +83,7 @@ impl ActivityTab {
         match self {
             Self::Workers => Which::Subagents,
             Self::Processes => Which::Jobs,
-            Self::Downloads => Which::ModelDownloads,
+            Self::Downloads => Which::Activity(self),
             Self::Compute => Which::Compute,
             Self::Attention | Self::Schedule | Self::Queue => Which::Activity(self),
         }
@@ -133,21 +131,70 @@ impl ActivityOverlay {
         layout: &crate::config::paths::Layout,
         runtime: &crate::runtime::Tree,
         live: Option<&crate::agent::LiveTaskControl>,
-        jobs: &[crate::ui::overlay::jobs::JobRow],
+        jobs: Option<&[crate::ui::overlay::jobs::JobRow]>,
         context: AttentionContext<'_>,
     ) {
         let workers = self
             .attention
             .snapshot(layout, &self.attention_session, runtime, live);
         if let ActiveOverlay::Palette(panel) = &mut *self.panel {
-            panel.refresh_choices(attention_choices_with_context(
+            let mut spec = attention_choices_with_context(
                 &workers,
-                jobs,
+                jobs.unwrap_or_default(),
                 context.status,
                 context.todo,
                 context.download_failure,
                 context.setup_failure,
-            ));
+            );
+            let workers_state = if live.is_some() {
+                "observed"
+            } else {
+                "observed; live control unavailable"
+            };
+            let processes_state = jobs.map_or_else(
+                || "unavailable".to_owned(),
+                |rows| format!("observed ({} processes)", rows.len()),
+            );
+            let empty = if spec.items.is_empty() {
+                "No attention items in observed sources. "
+            } else {
+                ""
+            };
+            spec.empty_message = format!(
+                "{empty}Workers: {workers_state} ({} workers). Processes: {processes_state}. Main answer: {}. Todos: {}. Downloads: {}. {}",
+                workers.agents.len(),
+                if context.status.is_some() {
+                    "observed"
+                } else {
+                    "unavailable"
+                },
+                if context.todo.is_some() {
+                    "observed"
+                } else {
+                    "unavailable"
+                },
+                if context.downloads_available {
+                    "observed"
+                } else {
+                    "unavailable"
+                },
+                spec.summary
+            );
+            spec.summary = format!(
+                "Workers: {} observed · Processes: {} · Downloads: {}",
+                workers.agents.len(),
+                if jobs.is_some() {
+                    "observed"
+                } else {
+                    "unavailable"
+                },
+                if context.downloads_available {
+                    "observed"
+                } else {
+                    "unavailable"
+                }
+            );
+            panel.refresh_choices(spec);
         }
         self.attention_refreshed = Some(std::time::Instant::now());
     }
@@ -158,7 +205,7 @@ impl ActivityOverlay {
         std::thread::spawn(move || {
             let mut spec = schedule_choices();
             match crate::schedule::Store::new(&layout).and_then(|store| {
-                let state = store.last_runs();
+                let state = store.last_runs()?;
                 Ok((store.load()?, state))
             }) {
                 Ok((entries, state)) => {
@@ -193,7 +240,7 @@ impl ActivityOverlay {
     }
 
     pub(super) fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.keys.draw(frame, ctx, "Activity", "Ctrl+Tab  tabs inside the selected panel\nAttached terminals keep Tab; detach to switch activity tabs.", true, false) {
+        if self.keys.draw(frame, ctx, "Activity", "Ctrl+Shift+F11 / Ctrl+Shift+F12  previous / next tab inside the selected panel\nAlt+PageUp/PageDown or Ctrl+Shift+Tab/Ctrl+Tab also switch inner tabs where the terminal delivers them.\nAttached terminals keep these keys; detach to switch tabs.", true, false) {
             return;
         }
         self.panel.draw(frame, ctx);
@@ -222,13 +269,38 @@ impl ActivityOverlay {
             && key.kind != KeyEventKind::Release
             && !attached
         {
-            // Ctrl+Tab preserves access to tab bars inside reused panels.
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-            {
-                let mut key = *key;
-                key.modifiers.remove(KeyModifiers::CONTROL);
-                return self.panel.handle(&Event::Key(key), keys);
+            // Page chords are encoded portably by terminals that cannot distinguish Ctrl+Tab.
+            let page = key.modifiers == KeyModifiers::ALT
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown);
+            let control_tab = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+            let function = key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::F(11) | KeyCode::F(12));
+            if page || control_tab || function {
+                let previous = key.code == KeyCode::F(11)
+                    || (!function
+                        && (matches!(key.code, KeyCode::PageUp | KeyCode::BackTab)
+                            || key.modifiers.contains(KeyModifiers::SHIFT)));
+                let action = if previous {
+                    Action::TabPrev
+                } else {
+                    Action::TabNext
+                };
+                let mut inner = *key;
+                // Dispatch the panel's configured action, not raw Tab (which some narrow
+                // panels reserve for inspector focus rather than their own tab bar).
+                if let Some(chord) = keys.chords(action).first() {
+                    inner.code = chord.code;
+                    inner.modifiers = chord.mods;
+                } else {
+                    inner.code = if previous {
+                        KeyCode::BackTab
+                    } else {
+                        KeyCode::Tab
+                    };
+                    inner.modifiers = KeyModifiers::NONE;
+                }
+                return self.panel.handle(&Event::Key(inner), keys);
             }
             let previous = panel_keys::matches(keys, Action::TabPrev, key);
             if previous || panel_keys::matches(keys, Action::TabNext, key) {
@@ -238,7 +310,20 @@ impl ActivityOverlay {
                 ));
             }
         }
-        self.panel.handle(event, keys)
+        match self.panel.handle(event, keys) {
+            OverlayEvent::Action(action) if self.tab == ActivityTab::Attention => {
+                // These picker values are internal navigation, not terminal commands. Keeping
+                // them in the overlay path preserves the exact owner and the back stack.
+                if let Some(target) = action.strip_prefix("command:/")
+                    && (target.starts_with("subagent-open:") || target.starts_with("open:process:"))
+                {
+                    OverlayEvent::Action(target.to_owned())
+                } else {
+                    OverlayEvent::Action(action)
+                }
+            }
+            outcome => outcome,
+        }
     }
 }
 
@@ -291,9 +376,15 @@ pub(super) fn title_row(
         keys.label(Action::TabPrev),
         keys.label(Action::TabNext)
     );
-    let mut hint = chrome::key_hint_spans(theme, &[(switch.as_str(), "tabs")]);
-    hint.push(Span::raw(" "));
     let used = spans_width(&spans);
+    let mut hint = chrome::key_hint_spans(
+        theme,
+        &[("Ctrl+Shift+F11/F12", "inner"), (switch.as_str(), "tabs")],
+    );
+    if used + spans_width(&hint) + 3 > width {
+        hint = chrome::key_hint_spans(theme, &[("F1", "inner keys"), (switch.as_str(), "tabs")]);
+    }
+    hint.push(Span::raw(" "));
     let hint_w = spans_width(&hint);
     if used + hint_w + 2 <= width {
         spans.push(Span::raw(" ".repeat(width - used - hint_w)));
@@ -323,15 +414,15 @@ pub(in crate::app) fn schedule_choices() -> ChoiceSpec {
     }
 }
 
-pub(in crate::app) fn queue_choices(items: &[(String, bool)]) -> ChoiceSpec {
+pub(in crate::app) fn queue_choices(items: &[(u64, String, bool)]) -> ChoiceSpec {
     ChoiceSpec {
         title: "Queued messages".into(),
         command: "queue".into(),
         verb: "edit",
         remove: Some("remove"),
         summary: "Enter edits one message; Delete twice removes only that message. An existing composer draft is kept. Queue changes made elsewhere appear when reopened.".into(),
-        items: items.iter().enumerate().map(|(index, (message, follow_up))| ChoiceItem {
-            value: (index + 1).to_string(),
+        items: items.iter().enumerate().map(|(index, (id, message, follow_up))| ChoiceItem {
+            value: format!("@{id}"),
             label: format!("{} {}", index + 1, if *follow_up { "follow-up" } else { "steering" }),
             detail: crate::ui::text::one_line(message),
             current: false,
@@ -342,6 +433,7 @@ pub(in crate::app) fn queue_choices(items: &[(String, bool)]) -> ChoiceSpec {
 
 #[derive(Default)]
 pub(in crate::app) struct AttentionContext<'a> {
+    pub downloads_available: bool,
     pub status: Option<&'a crate::ui::status::StatusData>,
     pub todo: Option<&'a crate::agent::workflow::todo::TodoList>,
     pub download_failure: Option<&'a crate::ui::overlay::models::DownloadFailure>,
@@ -370,7 +462,7 @@ pub(in crate::app) fn attention_choices_with_context(
         .iter()
         .filter(|worker| worker.needs_attention())
         .map(|worker| ChoiceItem {
-            value: "activity workers".into(),
+            value: format!("subagent-open:{}", worker.id),
             label: format!("Worker · {} · {}", worker.name, worker.status.label()),
             detail: worker
                 .config
@@ -385,7 +477,10 @@ pub(in crate::app) fn attention_choices_with_context(
         jobs.iter()
             .filter(|job| job.needs_attention())
             .map(|job| ChoiceItem {
-                value: "activity processes".into(),
+                value: format!(
+                    "open:process:{}",
+                    serde_json::to_string(&job.name).expect("string serialization")
+                ),
                 label: format!("Process · {} · {}", job.name, job.status),
                 detail: job.command.clone(),
                 current: false,

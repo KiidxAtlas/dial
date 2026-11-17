@@ -332,10 +332,12 @@ pub trait Tool: Send + Sync {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JobsView {
     pub jobs: Vec<JobEntry>,
-    /// Rendered rows of the attached PTY job's current screen (empty when none is attached).
+    /// Plain pipe-output rows (PTY jobs use `terminal` without flattening styles).
     pub screen: Vec<String>,
-    /// Cursor `(row, col)` on that screen.
+    /// Legacy custom-provider cursor; built-in PTY views carry their cursor in `terminal`.
     pub cursor: Option<(u16, u16)>,
+    /// Styled emulator cells and child input modes; absent for pipe jobs.
+    pub terminal: Option<crate::runtime::terminal::Screen>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

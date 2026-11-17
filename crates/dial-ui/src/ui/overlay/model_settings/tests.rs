@@ -771,10 +771,10 @@ fn selected_tuning_names_scope_and_routes_connections_without_assigning_main() {
     };
     let shown = screen(&render(180, 30, |frame| overlay.draw(frame, &ctx)));
     assert!(
-        shown.contains("scope: project (example-project)"),
+        shown.contains("Save to: This project (example-project)"),
         "{shown}"
     );
-    assert!(shown.contains("global"), "{shown}");
+    assert!(shown.contains("Ctrl+B: All projects"), "{shown}");
     assert!(shown.contains("connections"), "{shown}");
     assert!(
         matches!(overlay.event(&ch('c'), &rig.keys), OverlayEvent::Action(action) if action == "open:providers")

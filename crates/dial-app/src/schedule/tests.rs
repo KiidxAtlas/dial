@@ -86,16 +86,16 @@ fn intervals_count_from_creation_then_from_the_last_run() {
     let e = entry(Some(100), &[]);
     assert_eq!(s.due(&e, 1099, || None), None);
     assert_eq!(s.due(&e, 1100, || None), Some(Reason::Interval));
-    s.ran(&e, 1100, None);
+    s.ran(&e, 1100, None, None);
     assert_eq!(s.due(&e, 1199, || None), None);
     assert_eq!(s.due(&e, 1200, || None), Some(Reason::Interval));
 }
 
 #[test]
-fn file_changes_must_settle_and_a_runs_own_edits_do_not_retrigger() {
+fn a_runs_own_edits_get_one_followup_then_settle() {
     let mut s = Scheduler::default();
     let e = entry(None, &["*.rs"]);
-    let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+    let (a, b, c, d) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
     assert_eq!(
         s.due(&e, 10, || Some(a)),
         None,
@@ -110,11 +110,22 @@ fn file_changes_must_settle_and_a_runs_own_edits_do_not_retrigger() {
     );
     assert_eq!(s.due(&e, 15, || Some(c)), None);
     assert_eq!(s.due(&e, 16, || Some(c)), Some(Reason::Changed));
-    s.ran(&e, 17, Some(c));
+    s.ran(&e, 17, Some(c), Some(d));
     assert_eq!(
-        s.due(&e, 30, || Some(c)),
+        s.due(&e, 18, || Some(d)),
         None,
-        "edits made by the run itself are the new baseline"
+        "the run's own edit waits to settle before its follow-up"
+    );
+    assert_eq!(
+        s.due(&e, 17 + DEBOUNCE_SECS, || Some(d)),
+        Some(Reason::Changed),
+        "a change made while the run was active gets exactly one follow-up"
+    );
+    s.ran(&e, 30, Some(d), Some(d));
+    assert_eq!(
+        s.due(&e, 60, || Some(d)),
+        None,
+        "a follow-up that changes nothing settles the chain"
     );
 }
 
@@ -233,9 +244,9 @@ fn persisted_watch_restart_detects_changes_instead_of_rebaselining() {
     let e = entry(None, &["*.rs"]);
     let mut scheduler = Scheduler::default();
     scheduler.reconcile(std::slice::from_ref(&e));
-    scheduler.ran(&e, 10, Some([1; 32]));
-    store.save_state(&scheduler);
-    let mut restored = store.load_scheduler();
+    scheduler.ran(&e, 10, Some([1; 32]), Some([1; 32]));
+    store.save_state(&scheduler).unwrap();
+    let mut restored = store.load_scheduler().unwrap();
     restored.reconcile(std::slice::from_ref(&e));
     assert_eq!(restored.due(&e, 20, || Some([2; 32])), None);
     assert_eq!(
@@ -245,7 +256,7 @@ fn persisted_watch_restart_detects_changes_instead_of_rebaselining() {
     // A definition edited while stopped must not inherit its old baseline.
     let mut edited = e.clone();
     edited.watch = vec!["*.toml".into()];
-    let mut restored = store.load_scheduler();
+    let mut restored = store.load_scheduler().unwrap();
     restored.reconcile(std::slice::from_ref(&edited));
     assert_eq!(restored.due(&edited, 30, || Some([3; 32])), None);
     assert_eq!(restored.due(&edited, 40, || Some([3; 32])), None);
@@ -265,16 +276,16 @@ fn legacy_fingerprint_state_survives_initial_definition_load_and_migrates() {
     store
         .write_atomic(store.baseline_path(), &toml::to_string(&legacy).unwrap())
         .unwrap();
-    let mut restored = store.load_scheduler();
+    let mut restored = store.load_scheduler().unwrap();
     restored.reconcile(std::slice::from_ref(&e));
     assert_eq!(restored.due(&e, 10, || Some([2; 32])), None);
     assert_eq!(
         restored.due(&e, 10 + DEBOUNCE_SECS, || Some([2; 32])),
         Some(Reason::Changed)
     );
-    store.save_state(&restored);
+    store.save_state(&restored).unwrap();
     assert!(
-        matches!(store.load_baselines().get(&e.id), Some(SavedBaseline::Bound { definition, .. }) if definition == &e)
+        matches!(store.load_runtime().unwrap().baselines.get(&e.id), Some(SavedBaseline::Bound { definition, .. }) if definition == &e)
     );
 }
 
@@ -283,7 +294,7 @@ fn failed_starts_preserve_watch_and_interval_triggers_with_capped_backoff() {
     for every in [None, Some(100)] {
         let e = entry(every, &["*.rs"]);
         let mut scheduler = Scheduler::default();
-        scheduler.ran(&e, 1000, Some([1; 32]));
+        scheduler.ran(&e, 1000, Some([1; 32]), Some([1; 32]));
         scheduler.due(&e, 1001, || Some([2; 32]));
         let mut at = 1100;
         assert!(scheduler.due(&e, at, || Some([2; 32])).is_some());
@@ -299,7 +310,7 @@ fn failed_starts_preserve_watch_and_interval_triggers_with_capped_backoff() {
             at += delay;
             assert!(scheduler.due(&e, at, || Some([2; 32])).is_some());
         }
-        scheduler.ran(&e, at, Some([2; 32]));
+        scheduler.ran(&e, at, Some([2; 32]), Some([2; 32]));
         assert_eq!(scheduler.due(&e, at + 1, || Some([2; 32])), None);
         scheduler.start_failed(&e, at + 2);
         assert_eq!(
@@ -394,5 +405,295 @@ fn structural_events_rescan_file_globs_even_without_descendant_notifications() {
             notify::Event::new(kind).add_path(root.join("src/generated"))
         ));
         assert!(matches!(inbox.drain(), Changes::Everything), "{kind:?}");
+    }
+}
+
+#[test]
+fn damaged_schedule_history_is_an_error_not_an_empty_history() {
+    // An empty history re-runs every interval schedule and re-baselines every watch, so a damaged
+    // or unreadable state file must stop the load. Errors name the file but never echo its text,
+    // which can contain prompts.
+    let secret = "SECRET-PROMPT-TEXT";
+    for file in [
+        "schedule-state.toml",
+        "schedule-watch.toml",
+        "schedule-runtime.toml",
+    ] {
+        for damage in [Some(format!("prompt = \"{secret}\"\n[[ broken")), None] {
+            let root = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+            let store = Store::new(&layout).unwrap();
+            // A missing history is a fresh start, not an error.
+            assert!(store.load_scheduler().is_ok());
+            fs::create_dir_all(&store.dir).unwrap();
+            let path = store.dir.join(file);
+            match &damage {
+                Some(text) => fs::write(&path, text).unwrap(),
+                // A directory where the file should be is a real I/O failure, not corruption.
+                None => fs::create_dir(&path).unwrap(),
+            }
+            let error = store
+                .load_scheduler()
+                .err()
+                .unwrap_or_else(|| panic!("{file} {damage:?} loaded as an empty history"));
+            let message = format!("{error:#}");
+            assert!(message.contains(file), "{message}");
+            assert!(!message.contains(secret), "{message}");
+            if file != "schedule-watch.toml" {
+                assert!(store.last_runs().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_run_state_save_keeps_the_change_unsaved_until_a_later_save() {
+    let root = tempfile::tempdir().unwrap();
+    // A regular file where the state directory belongs makes every save fail.
+    let blocked = root.path().join("not-a-dir");
+    fs::write(&blocked, "").unwrap();
+    let blocked = Store { dir: blocked };
+    let store = Store {
+        dir: root.path().join("state"),
+    };
+    let e = entry(Some(100), &["*.rs"]);
+    let mut scheduler = Scheduler::default();
+    // First sight of a watch sets a baseline that must be persisted before any run can start.
+    scheduler.reconcile(std::slice::from_ref(&e));
+    assert_eq!(scheduler.due(&e, 10, || Some([1; 32])), None);
+    let mut reported = None;
+    assert!(checkpoint(&blocked, &mut scheduler, &mut reported).is_err());
+    assert!(scheduler.unsaved, "a failed save leaves the change pending");
+    assert!(reported.is_some());
+    checkpoint(&store, &mut scheduler, &mut reported).unwrap();
+    assert!(!scheduler.unsaved && reported.is_none());
+    let restored = store.load_scheduler().unwrap();
+    assert_eq!(restored.watches[&e.id].baseline, Some([1; 32]));
+}
+
+#[test]
+fn run_state_is_saved_as_one_file_and_legacy_files_are_left_alone_and_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let e = entry(None, &["*.rs"]);
+    fs::create_dir_all(&store.dir).unwrap();
+    fs::write(
+        store.state_path(),
+        toml::to_string(&HashMap::from([(e.id.clone(), 10u64)])).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        store.baseline_path(),
+        toml::to_string(&HashMap::from([(e.id.clone(), [1u8; 32])])).unwrap(),
+    )
+    .unwrap();
+    let mut scheduler = store.load_scheduler().unwrap();
+    assert_eq!(scheduler.last_run[&e.id], 10);
+    scheduler.reconcile(std::slice::from_ref(&e));
+    scheduler.ran(&e, 20, Some([2; 32]), Some([2; 32]));
+    store.save_state(&scheduler).unwrap();
+    // Legacy files are never deleted, and once the consolidated file exists they are not read.
+    assert!(store.state_path().exists() && store.baseline_path().exists());
+    fs::write(store.state_path(), "not = [valid").unwrap();
+    fs::write(store.baseline_path(), "garbage = [").unwrap();
+    assert_eq!(store.last_runs().unwrap()[&e.id], 20);
+    let restored = store.load_scheduler().unwrap();
+    assert_eq!(restored.last_run[&e.id], 20);
+    assert_eq!(restored.watches[&e.id].baseline, Some([2; 32]));
+}
+
+#[test]
+fn edit_made_during_a_run_before_its_snapshot_is_followed_up() {
+    // The run starts on `a`; the user edits to `b` while it is still active. The launch-time
+    // fingerprint is the acknowledged baseline, so the edit must not be absorbed into it.
+    let mut s = Scheduler::default();
+    let e = entry(None, &["*.rs"]);
+    s.reconcile(std::slice::from_ref(&e));
+    assert_eq!(s.due(&e, 10, || Some([1; 32])), None);
+    s.ran(&e, 20, Some([1; 32]), Some([2; 32]));
+    assert_eq!(s.due(&e, 20, || Some([2; 32])), None);
+    assert_eq!(
+        s.due(&e, 20 + DEBOUNCE_SECS, || Some([2; 32])),
+        Some(Reason::Changed),
+        "an edit made while the run was active must not be absorbed silently"
+    );
+}
+
+#[test]
+fn followup_that_edits_again_pauses_durably_until_the_schedule_is_readded() {
+    let (a, b, c, d) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+    let e = entry(Some(50), &["*.rs"]);
+    let mut s = Scheduler::default();
+    s.reconcile(std::slice::from_ref(&e));
+    assert_eq!(s.due(&e, 10, || Some(a)), None);
+    s.ran(&e, 20, Some(a), Some(b));
+    assert_eq!(s.due(&e, 23, || Some(b)), Some(Reason::Changed));
+    assert!(
+        s.ran(&e, 23, Some(b), Some(c)),
+        "a change during the follow-up pauses the entry"
+    );
+    // Neither the interval nor a later change may start another run.
+    assert_eq!(s.due(&e, 1000, || Some(d)), None);
+    assert_eq!(s.due(&e, 1000 + DEBOUNCE_SECS, || Some(d)), None);
+}
+
+#[test]
+fn pending_followup_and_review_pause_survive_a_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let (a, b, c, d) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+    let e = entry(Some(50), &["*.rs"]);
+    let mut s = Scheduler::default();
+    s.reconcile(std::slice::from_ref(&e));
+    s.due(&e, 10, || Some(a));
+    s.ran(&e, 20, Some(a), Some(b));
+    store.save_state(&s).unwrap();
+    let mut restored = store.load_scheduler().unwrap();
+    restored.reconcile(std::slice::from_ref(&e));
+    assert_eq!(
+        restored.due(&e, 20 + DEBOUNCE_SECS, || Some(b)),
+        Some(Reason::Changed),
+        "the pending follow-up survives a restart"
+    );
+    assert!(restored.ran(&e, 23, Some(b), Some(c)));
+    store.save_state(&restored).unwrap();
+    let mut again = store.load_scheduler().unwrap();
+    again.reconcile(std::slice::from_ref(&e));
+    assert_eq!(
+        again.due(&e, 1000, || Some(d)),
+        None,
+        "the pause survives a restart"
+    );
+    // Re-adding the schedule (a new definition, new creation time) is the acknowledgment.
+    let mut readded = e.clone();
+    readded.created += 1;
+    again.reconcile(std::slice::from_ref(&readded));
+    assert!(!again.watches.contains_key(&e.id));
+}
+
+#[test]
+fn unobservable_run_keeps_the_last_trustworthy_baseline() {
+    let (a, b) = ([1u8; 32], [2u8; 32]);
+    let e = entry(None, &["*.rs"]);
+    let mut s = Scheduler::default();
+    s.reconcile(std::slice::from_ref(&e));
+    s.due(&e, 10, || Some(a));
+    s.ran(&e, 20, Some(a), None);
+    assert_eq!(s.watches[&e.id].baseline, Some(a), "no silent re-baseline");
+    assert_eq!(
+        s.due(&e, 30, || Some(a)),
+        None,
+        "unchanged content ends the check"
+    );
+    s.ran(&e, 40, Some(a), None);
+    assert_eq!(s.due(&e, 50, || Some(b)), None);
+    assert_eq!(
+        s.due(&e, 50 + DEBOUNCE_SECS, || Some(b)),
+        Some(Reason::Changed),
+        "a change after an unobservable run is still seen"
+    );
+    // A fresh scheduler whose first run cannot be observed keeps the launch content as baseline.
+    let mut fresh = Scheduler::default();
+    fresh.reconcile(std::slice::from_ref(&e));
+    fresh.ran(&e, 20, Some(a), None);
+    assert_eq!(fresh.watches[&e.id].baseline, Some(a));
+}
+
+#[test]
+fn only_real_watch_state_changes_mark_the_run_state_unsaved() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let e = entry(None, &["*.rs"]);
+    let (a, b) = ([1u8; 32], [2u8; 32]);
+    let mut s = Scheduler::default();
+    s.reconcile(std::slice::from_ref(&e));
+    let mut reported = None;
+    // First sight of the baseline is a real change.
+    assert_eq!(s.due(&e, 10, || Some(a)), None);
+    assert!(s.unsaved);
+    checkpoint(&store, &mut s, &mut reported).unwrap();
+    assert!(!s.unsaved);
+    // Unchanged content and an unchanged reload must not dirty the run state.
+    assert_eq!(s.due(&e, 11, || Some(a)), None);
+    s.reconcile(std::slice::from_ref(&e));
+    assert!(
+        !s.unsaved,
+        "an unchanged check must not dirty the run state"
+    );
+    // A new change becomes pending: that is persisted state.
+    assert_eq!(s.due(&e, 12, || Some(b)), None);
+    assert!(s.unsaved);
+    checkpoint(&store, &mut s, &mut reported).unwrap();
+    // The pending change survives a reload and fires once it settles.
+    let mut restored = store.load_scheduler().unwrap();
+    restored.reconcile(std::slice::from_ref(&e));
+    assert!(!restored.unsaved);
+    assert_eq!(
+        restored.due(&e, 12 + DEBOUNCE_SECS, || Some(b)),
+        Some(Reason::Changed)
+    );
+    assert!(
+        !restored.unsaved,
+        "a settled trigger changes no persisted state by itself"
+    );
+}
+
+#[test]
+fn unobservable_follow_up_pauses_and_keeps_the_trustworthy_baseline() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let (a, b) = ([1u8; 32], [2u8; 32]);
+    let e = entry(Some(50), &["*.rs"]);
+    let mut s = Scheduler::default();
+    s.reconcile(std::slice::from_ref(&e));
+    assert_eq!(s.due(&e, 10, || Some(a)), None);
+    // The run's result is unobservable: the next check must compare against the trusted baseline.
+    assert!(!s.ran(&e, 20, Some(a), None));
+    assert_eq!(s.due(&e, 30, || Some(b)), None);
+    assert_eq!(
+        s.due(&e, 30 + DEBOUNCE_SECS, || Some(b)),
+        Some(Reason::Changed)
+    );
+    // Its follow-up is also unobservable: it pauses instead of retrying forever.
+    assert!(
+        s.ran(&e, 33, Some(b), None),
+        "an unobservable follow-up pauses"
+    );
+    assert_eq!(s.watches[&e.id].baseline, Some(a), "no silent re-baseline");
+    checkpoint(&store, &mut s, &mut None).unwrap();
+    // Neither the interval nor a restart may bypass the pause.
+    assert_eq!(s.due(&e, 1000, || Some(b)), None);
+    let mut restored = store.load_scheduler().unwrap();
+    restored.reconcile(std::slice::from_ref(&e));
+    assert_eq!(restored.due(&e, 2000, || Some(b)), None);
+    assert_eq!(restored.due(&e, 2000 + DEBOUNCE_SECS, || Some(a)), None);
+}
+
+#[test]
+fn publication_sync_failure_is_not_acknowledged_or_rolled_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store {
+        dir: temp.path().to_path_buf(),
+    };
+    for path in [store.path(), store.state_path()] {
+        fs::write(&path, "old").unwrap();
+        let error = store
+            .write_atomic_with_sync(path.clone(), "new", |dir| {
+                assert_eq!(dir, store.dir);
+                assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+                anyhow::bail!("injected directory sync failure");
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("durability uncertain"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
     }
 }

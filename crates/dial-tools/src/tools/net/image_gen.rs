@@ -8,9 +8,14 @@
 //! Per-model settings (`[image.models.*]`, edited by `/image settings`) apply to every request for
 //! the matching model; each image API receives only the settings it accepts (`supported`).
 //!
-//! Edits (`image`): MLX-Serve accepts base64 input on `images/generations`, OpenAI Images uses
-//! multipart `images/edits`, Responses gets `input_image`, and Gemini gets `inlineData`.
-//! Other routes refuse before any request. The source file is only read.
+//! Edits (`image`): MLX-Serve accepts base64 input on `images/generations`, OpenAI Images and
+//! Dial-launched stable-diffusion.cpp use multipart `images/edits`, Responses gets `input_image`,
+//! and Gemini gets `inlineData`. Other routes refuse before any request. The source file is only
+//! read.
+//!
+//! A downloaded image checkpoint assigned as the image model (a local path, not an endpoint) runs
+//! on stable-diffusion.cpp's `sd-server`, which Dial starts for the call and stops afterwards
+//! (`crate::llm::server::image`).
 //!
 //! Request validation, path resolution, destination preflight and mutation authority run before
 //! generation. Provider errors or a later filesystem race can still fail a paid request. Returned
@@ -137,6 +142,7 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
             Wire::OpenAi => "OpenAI Images",
             Wire::Xai => "xAI Images",
             Wire::MlxServe => "MLX-Serve",
+            Wire::SdCpp => "stable-diffusion.cpp (started by Dial)",
             Wire::Responses => "Responses image tool",
             Wire::ChatCompletions => "Chat image output",
             Wire::Gemini => "Gemini native image",
@@ -155,7 +161,7 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
 /// Why `target` cannot edit an existing image, when it cannot.
 fn edit_unsupported(target: &Target) -> Option<String> {
     match target.wire {
-        Wire::MlxServe | Wire::Responses | Wire::Gemini => None,
+        Wire::MlxServe | Wire::SdCpp | Wire::Responses | Wire::Gemini => None,
         Wire::OpenAi if target.model.starts_with("dall-e-3") => Some(format!(
             "{} cannot edit images; use gpt-image-1 or dall-e-2",
             target.model
@@ -168,7 +174,7 @@ fn edit_unsupported(target: &Target) -> Option<String> {
         | Wire::ComfyUi
         | Wire::Fal
         | Wire::Replicate => Some(format!(
-            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve, Gemini or Responses image model",
+            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve, local checkpoint, Gemini or Responses image model",
             target.model
         )),
     }
@@ -178,6 +184,7 @@ fn edit_unsupported(target: &Target) -> Option<String> {
 fn supported(wire: Wire, model: &str) -> &'static [&'static str] {
     match wire {
         Wire::MlxServe => &["size", "steps", "seed", "strength", "loras", "cond_weights"],
+        Wire::SdCpp => &["size", "steps", "seed"],
         Wire::OpenAi if model.starts_with("dall-e") => &["size", "quality"],
         Wire::OpenAi | Wire::Responses => &["size", "quality", "background", "moderation"],
         Wire::Xai | Wire::ChatCompletions => &["size"],
@@ -254,6 +261,9 @@ enum Wire {
     Xai,
     /// Native MLX-Serve Images API, returning PNG only.
     MlxServe,
+    /// A local checkpoint served by a Dial-launched stable-diffusion.cpp `sd-server` (OpenAI
+    /// Images shape; steps and seed travel in its `<sd_cpp_extra_args>` prompt extension).
+    SdCpp,
     Responses,
     ChatCompletions,
     Gemini,
@@ -949,6 +959,27 @@ struct Written {
     source: Option<String>,
 }
 
+/// Downloaded checkpoints run on stable-diffusion.cpp's `sd-server`. When none is installed, ask
+/// once and install the pinned, checksum-verified build into Dial's own folder (`/setup sd-cpp`).
+fn ensure_sd_server(ctx: &ToolContext, cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+    if crate::llm::local_format::sd_server().is_some() {
+        return Ok(());
+    }
+    let asked = ctx.confirm.is_some_and(|confirm| {
+        confirm("Local image models run on stable-diffusion.cpp, which is not installed. Install it now? Dial downloads a pinned, checksum-verified build into its own folder (no admin rights).")
+    });
+    ensure!(asked, "{}", crate::llm::server::image::MISSING_RUNTIME);
+    let layout = crate::config::paths::Layout::discover(ctx.workspace.root())
+        .context("finding Dial's folders to install stable-diffusion.cpp")?;
+    crate::setup::deps::run::install_and_save(&layout, "sd-cpp", cancel, &mut |_| {})?;
+    ensure!(
+        crate::llm::local_format::sd_server().is_some(),
+        "stable-diffusion.cpp was installed but its sd-server was not found; {}",
+        crate::llm::server::image::MISSING_RUNTIME
+    );
+    Ok(())
+}
+
 fn generate(
     ctx: &ToolContext,
     args: &Value,
@@ -1004,6 +1035,19 @@ fn generate(
             request.size = "auto";
         }
     }
+    // A local checkpoint runs on an sd-server started for this call; dropping it stops the server.
+    let _server = if target.wire == Wire::SdCpp {
+        ensure_sd_server(ctx, &cancel)?;
+        let server = crate::llm::server::image::ImageServer::start(
+            std::path::Path::new(&target.model),
+            ctx.config.image.timeout_secs,
+            Arc::clone(&cancel),
+        )?;
+        target.base_url = server.base_url().to_owned();
+        Some(server)
+    } else {
+        None
+    };
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("output has no parent directory"))?
@@ -1149,6 +1193,16 @@ fn request_body(target: &Target, request: &Request) -> Value {
         "n": 1,
     });
     match target.wire {
+        Wire::SdCpp => {
+            body["model"] = json!(crate::llm::server::image::REQUEST_MODEL);
+            body["prompt"] = json!(sd_cpp_prompt(target, request.prompt));
+            if request.size != "auto" {
+                body["size"] = json!(request.size);
+            }
+            if request.source.is_none() {
+                body["output_format"] = json!("png");
+            }
+        }
         Wire::OpenAi | Wire::MlxServe => {
             // MLX-Serve edits size the result from the source unless a size was chosen.
             if !(target.wire == Wire::MlxServe
@@ -1194,6 +1248,26 @@ fn request_body(target: &Target, request: &Request) -> Value {
     body
 }
 
+/// The prompt with configured steps and seed in stable-diffusion.cpp's prompt extension, which
+/// its OpenAI-compatible routes read and strip before generating.
+fn sd_cpp_prompt(target: &Target, prompt: &str) -> String {
+    let mut extra = serde_json::Map::new();
+    if let Some(steps) = target.settings.steps {
+        extra.insert("sample_params".into(), json!({ "sample_steps": steps }));
+    }
+    if let Some(seed) = target.settings.seed {
+        extra.insert("seed".into(), json!(seed));
+    }
+    if extra.is_empty() {
+        prompt.to_owned()
+    } else {
+        format!(
+            "{prompt} <sd_cpp_extra_args>{}</sd_cpp_extra_args>",
+            Value::Object(extra)
+        )
+    }
+}
+
 fn request_image(
     target: &Target,
     config: &Config,
@@ -1213,7 +1287,7 @@ fn request_image(
     }
     let base = target.base_url.trim_end_matches('/');
     let edit = match (target.wire, &request.source) {
-        (Wire::OpenAi, Some(source)) => Some(source),
+        (Wire::OpenAi | Wire::SdCpp, Some(source)) => Some(source),
         _ => None,
     };
     let path = match (target.wire, edit) {

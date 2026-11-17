@@ -7,10 +7,12 @@
 //! A session can share the manager with successive panels, so closing a view does not stop work;
 //! dropping the last owner cancels it. Enter on an installed model or embedding model returns a
 //! [`Step`] for the panel to turn into the same assignment or setup event as `/models`.
+//! Ctrl+D on an installed model returns [`Step::Delete`]; the models panel asks to confirm and then
+//! calls [`ModelDownloads::delete`], which refuses models the configuration selects.
 use super::settings::{filled, fit, hint, list_row, pair_label, typed_char};
 use crate::config::paths::Layout;
-use crate::llm::catalog::ModelEntry;
-use crate::llm::download::{self, Choice, Family, Hit, Quant};
+use crate::llm::catalog::{LocalRemoval, ModelEntry};
+use crate::llm::download::{self, Choice, Family, Hit, Quant, image::Original};
 use crate::llm::local_fit::Fit;
 use crate::llm::model_config::ModelSelection;
 use crate::setup::embeddings;
@@ -21,7 +23,7 @@ use crate::ui::{
     text,
     theme::{Theme, Tok},
 };
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -53,6 +55,8 @@ pub enum Step {
     SetupEmbedding(String),
     /// Assign this discovered, served embedding model to the embedding role.
     UseEmbedding(ModelSelection),
+    /// Ask to delete the installed model at this path from disk (Ctrl+D).
+    Delete(String),
     /// Leave the group: the panel focuses its groups column (or closes when that column is hidden).
     Back,
 }
@@ -163,6 +167,25 @@ enum Task {
     Download(Download),
 }
 
+/// What a download fetches: a chat model by [`Choice`], or exactly these image checkpoint files.
+enum Plan {
+    Model(Choice),
+    Image(Vec<String>),
+}
+
+/// The original weights offered for an installed MLX-quantized image pack Dial cannot run: looked
+/// up in the background, then downloaded once the user answers yes.
+enum Offer {
+    Resolving {
+        pack: String,
+        rx: Receiver<Result<Original, String>>,
+    },
+    Ready {
+        pack: String,
+        original: Original,
+    },
+}
+
 struct Download {
     repo: String,
     family: Family,
@@ -241,6 +264,10 @@ pub struct ModelDownloads {
     rescan: bool,
     /// [`InstalledFacts`] per row of `dashboard.models`, refreshed by [`ModelDownloads::classify_installed`].
     installed_facts: Vec<InstalledFacts>,
+    /// The runnable original offered for an image pack, waiting for its lookup or a yes/no.
+    offer: Option<Offer>,
+    /// Model paths the configuration selects (main and roles); deleting them is refused.
+    in_use: Vec<String>,
 }
 
 /// A session retains one handle while Models views come and go. This shares the existing manager,
@@ -311,6 +338,8 @@ impl ModelDownloads {
             known_models: Vec::new(),
             downloaded_images: BTreeSet::new(),
             image_repos: BTreeSet::new(),
+            offer: None,
+            in_use: Vec::new(),
             pulled_rx: None,
             discovered: Vec::new(),
             rescan: false,
@@ -358,10 +387,12 @@ impl ModelDownloads {
                     facts.image |= entry.metadata.kind == crate::llm::catalog::ModelKind::Image;
                     facts.image_capable |= entry.supports_images();
                     facts.not_chat |= !entry.supports_chat();
+                    // Endpoint-served image models, and local checkpoints Dial runs on sd-server.
                     if facts.image_entry.is_none()
                         && entry.available
                         && entry.supports_images()
-                        && entry.selection.base_url.is_some()
+                        && (entry.selection.base_url.is_some()
+                            || entry.metadata.kind == crate::llm::catalog::ModelKind::Image)
                     {
                         facts.image_entry = Some(*index);
                     }
@@ -492,11 +523,158 @@ impl ModelDownloads {
         self.poll_search();
         self.poll_metadata();
         self.poll_pulled();
+        self.poll_offer();
         if let Some(task) = self.task.take()
             && let Some(task) = self.advance(task)
         {
             self.task = Some(task);
         }
+    }
+
+    /// Offers the original weights of the installed image pack at `path`, which Dial cannot run:
+    /// opens the Images shelf and looks the original up. Nothing downloads before a yes.
+    pub fn offer_original(&mut self, path: &str) {
+        if self.shelf != Shelf::Images {
+            self.switch_shelf(Shelf::Images);
+        }
+        self.focus = Focus::Results;
+        let Some(pack) = download::image::repo_of(std::path::Path::new(path)) else {
+            self.message = "Dial cannot run these image weights, and they do not name the Hugging Face model they came from. Download the original Diffusers weights from this Images shelf.".into();
+            return;
+        };
+        if self.source.is_none() {
+            self.message = "Downloads are unavailable in this view.".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let lookup = pack.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                download::image::runnable_original(&lookup).map_err(|error| format!("{error:#}")),
+            );
+        });
+        self.message = format!(
+            "{pack} is an MLX-quantized pack that Dial cannot run; looking up its original weights…"
+        );
+        self.offer = Some(Offer::Resolving { pack, rx });
+    }
+
+    /// Replaces the group's status line, for outcomes the models panel reports here.
+    pub fn set_message(&mut self, text: String) {
+        self.message = text;
+    }
+
+    /// Whether a yes/no about downloading original image weights is waiting.
+    pub fn has_offer(&self) -> bool {
+        matches!(self.offer, Some(Offer::Ready { .. }))
+    }
+
+    /// The model paths the configuration selects now; deleting one of them is refused.
+    pub fn set_in_use(&mut self, models: Vec<String>) {
+        self.in_use = models;
+    }
+
+    /// What deleting the installed model at `path` removes, refused up front when a download is
+    /// running, discovery did not find the model, or the configuration still selects it.
+    pub fn plan_delete(&self, path: &str) -> Result<LocalRemoval, String> {
+        if self.is_downloading() {
+            return Err(
+                "wait for the download to finish (or cancel it with Esc) before deleting a model"
+                    .into(),
+            );
+        }
+        let removal = crate::llm::catalog::plan_local_model_removal(path)
+            .map_err(|error| format!("{error:#}"))?;
+        crate::llm::catalog::ensure_not_in_use(&removal, &self.in_use)
+            .map_err(|error| error.to_string())?;
+        Ok(removal)
+    }
+
+    /// Deletes a model [`Self::plan_delete`] planned and the user confirmed, then refreshes the
+    /// installed list and asks the panel for a rescan.
+    pub fn delete(&mut self, removal: &LocalRemoval) -> Result<LocalRemoval, String> {
+        if self.is_downloading() {
+            return Err("a download started; nothing was deleted".into());
+        }
+        let result = crate::llm::catalog::remove_local_model(&removal.model, &self.in_use)
+            .map_err(|error| format!("{error:#}"));
+        match &result {
+            Ok(removed) => {
+                self.message = format!(
+                    "Deleted {} and freed {}.",
+                    removed.label,
+                    human_bytes(removed.bytes)
+                );
+                if let Some(source) = &self.source {
+                    self.dashboard = local_models::collect(
+                        &source.layout,
+                        &source.settings,
+                        crate::stats::now_ms(),
+                    );
+                }
+                self.downloaded_images
+                    .retain(|path| !std::path::Path::new(path).starts_with(&removed.folder));
+                self.classify_installed();
+                self.cursor = self.cursor.min(self.picks().len().saturating_sub(1));
+                self.rescan = true;
+            }
+            Err(error) => self.message = format!("Did not delete {}: {error}", removal.label),
+        }
+        result
+    }
+
+    fn poll_offer(&mut self) {
+        let Some(Offer::Resolving { pack, rx }) = &self.offer else {
+            return;
+        };
+        let pack = pack.clone();
+        match rx.try_recv() {
+            Ok(Ok(original)) => {
+                self.message = format!(
+                    "{pack} is an MLX-quantized pack that Dial cannot run. Download the original {} ({}) that Dial runs on stable-diffusion.cpp? y download · n no",
+                    original.repo,
+                    human_bytes(original.bytes)
+                );
+                self.offer = Some(Offer::Ready { pack, original });
+            }
+            Ok(Err(error)) => {
+                self.message = format!(
+                    "{pack} is an MLX-quantized pack that Dial cannot run, and no runnable original was found: {error}"
+                );
+                self.offer = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.message = format!("Looking up the original of {pack} stopped unexpectedly.");
+                self.offer = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// `y` downloads the offered original into the Images shelf; `n` declines. Other keys are
+    /// left to the shelf.
+    fn offer_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(answer) = typed_char(key).map(|c| c.to_ascii_lowercase()) else {
+            return false;
+        };
+        if !matches!(answer, 'y' | 'n') {
+            return false;
+        }
+        let Some(Offer::Ready { pack, original }) = self.offer.take() else {
+            return false;
+        };
+        if answer == 'n' {
+            self.message = format!("Kept {pack}; nothing was downloaded.");
+            return true;
+        }
+        self.image_repos.insert(original.repo.clone());
+        self.begin_download(
+            original.repo,
+            Plan::Image(original.files),
+            original.bytes,
+            Family::Mlx,
+        );
+        true
     }
 
     /// Pasted text goes to the query, like typed characters.
@@ -507,12 +685,29 @@ impl ModelDownloads {
     }
 
     pub fn key(&mut self, key: &KeyEvent, keys: &Keymap) -> Step {
+        if self.has_offer() && self.offer_key(key) {
+            return Step::Handled;
+        }
         if keys.matches(Action::SelectCancel, key) {
+            if self.offer.take().is_some() {
+                self.message = "Nothing was downloaded.".into();
+                return Step::Handled;
+            }
             return self.escape();
         }
         if self.picker.is_some() {
             self.picker_key(key, keys);
             return Step::Handled;
+        }
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            return match self.current() {
+                Some(Pick::Installed(index)) if self.focus == Focus::Results => self
+                    .dashboard
+                    .models
+                    .get(index)
+                    .map_or(Step::Handled, |row| Step::Delete(row.path.clone())),
+                _ => Step::Ignored,
+            };
         }
         // Typing goes to the query first, so a letter bound to a navigation key still types.
         if let Some(c) = typed_char(key) {
@@ -550,6 +745,13 @@ impl ModelDownloads {
 
     /// Key hints for the group's footer (the panel adds its own group hints).
     pub fn footer(&self, keys: &Keymap) -> Vec<String> {
+        if self.has_offer() {
+            return vec![
+                "y download the original".into(),
+                "n no".into(),
+                hint(keys, Action::SelectCancel, "no"),
+            ];
+        }
         if self.picker.is_some() {
             return vec![
                 format!(
@@ -603,6 +805,9 @@ impl ModelDownloads {
             ),
             hint(keys, Action::SelectCancel, back),
         ];
+        if self.focus == Focus::Results && matches!(self.current(), Some(Pick::Installed(_))) {
+            hints.insert(hints.len() - 1, "Ctrl+D delete".into());
+        }
         hints.retain(|hint| !hint.is_empty());
         hints
     }
@@ -948,15 +1153,21 @@ impl ModelDownloads {
         }
         match self.current() {
             Some(Pick::Installed(index)) => match self.dashboard.models.get(index) {
-                Some(_) if self.shelf == Shelf::Images || self.facts(index).image => {
+                Some(row) if self.shelf == Shelf::Images || self.facts(index).image => {
                     if let Some(entry) = self
                         .facts(index)
                         .image_entry
                         .and_then(|entry| self.known_models.get(entry))
                     {
                         Step::UseImage(entry.selection.clone())
+                    } else if crate::llm::server::image::components(std::path::Path::new(&row.path))
+                        .is_ok()
+                    {
+                        // Downloaded before the catalog rescan caught up: Dial runs it directly.
+                        Step::UseImage(ModelSelection::new("mlx", &row.path))
                     } else {
-                        self.message = "Image weights are in the Hugging Face cache. Import/serve them in MLX-Serve, then F5 rescan and choose the endpoint in Images.".into();
+                        let path = row.path.clone();
+                        self.offer_original(&path);
                         Step::Handled
                     }
                 }
@@ -1036,7 +1247,12 @@ impl ModelDownloads {
         };
         let repo = picker.repo.clone();
         self.picker = None;
-        self.begin_download(repo, Choice::Files(quant.files), quant.bytes, Family::Gguf);
+        self.begin_download(
+            repo,
+            Plan::Model(Choice::Files(quant.files)),
+            quant.bytes,
+            Family::Gguf,
+        );
     }
 
     /// Moves to another shelf. Hugging Face shelves show the query's results (or the curated list);
@@ -1134,7 +1350,7 @@ impl ModelDownloads {
         let images = self.shelf == Shelf::Images;
         std::thread::spawn(move || {
             let result = if images {
-                download::search_images(&query)
+                download::image::search(&query)
             } else {
                 download::search(family, &query)
             };
@@ -1223,15 +1439,15 @@ impl ModelDownloads {
     }
 
     /// Starts a download unless one is already running.
-    fn begin_download(&mut self, repo: String, choice: Choice, expected: u64, family: Family) {
+    fn begin_download(&mut self, repo: String, plan: Plan, expected: u64, family: Family) {
         if self.task.is_some() {
             self.message = "A download is already running; Esc cancels it.".into();
             return;
         }
-        self.start_download(repo, choice, expected, family);
+        self.start_download(repo, plan, expected, family);
     }
 
-    fn start_download(&mut self, repo: String, choice: Choice, expected: u64, family: Family) {
+    fn start_download(&mut self, repo: String, plan: Plan, expected: u64, family: Family) {
         let Some(source) = self.source.as_ref() else {
             self.message = "Downloads are unavailable in this view.".into();
             return;
@@ -1246,13 +1462,22 @@ impl ModelDownloads {
             let progress = |line: &str| {
                 let _ = line_tx.send(line.to_owned());
             };
-            let result = download::ensure_local_model_with(
-                &python,
-                &worker_repo,
-                &choice,
-                &worker_cancel,
-                &progress,
-            );
+            let result = match &plan {
+                Plan::Model(choice) => download::ensure_local_model_with(
+                    &python,
+                    &worker_repo,
+                    choice,
+                    &worker_cancel,
+                    &progress,
+                ),
+                Plan::Image(files) => download::image::download(
+                    &python,
+                    &worker_repo,
+                    files,
+                    &worker_cancel,
+                    &progress,
+                ),
+            };
             let _ = done_tx.send(result.map_err(|error| format!("{error:#}")));
         });
         let baseline = download::cached_bytes(&repo);
@@ -1451,8 +1676,15 @@ impl ModelDownloads {
                 }
             }
             Family::Mlx => {
+                // Diffusers image repositories fetch only what stable-diffusion.cpp loads.
+                if self.image_repos.contains(&repo)
+                    && let Some((files, bytes)) = download::image::files(files)
+                {
+                    self.begin_download(repo, Plan::Image(files), bytes, family);
+                    return;
+                }
                 let expected = download::snapshot_bytes(files);
-                self.begin_download(repo, Choice::Auto, expected, family);
+                self.begin_download(repo, Plan::Model(Choice::Auto), expected, family);
             }
         }
     }
@@ -1491,7 +1723,7 @@ impl ModelDownloads {
             .unwrap_or(0);
         self.message = if image {
             format!(
-                "Downloaded {repo} to the Hugging Face cache. Serve/import it in MLX-Serve, then F5 rescan and choose Images. Compatibility depends on the server's supported packs."
+                "Downloaded {repo}. Enter makes it the image model; Dial runs it on stable-diffusion.cpp and offers to install that on first use."
             )
         } else if memory {
             format!("Downloaded {repo}. Enter assigns it to the memory role.")
@@ -1544,7 +1776,7 @@ impl ModelDownloads {
 
     fn facts_line(&self, width: usize, theme: &Theme) -> Line<'static> {
         let facts = match self.shelf {
-            Shelf::Images => " MLX text-to-image weights · Enter downloads to HF cache · requires a compatible image server, not Dial's chat runner".to_owned(),
+            Shelf::Images => " MLX text-to-image weights · Enter downloads to HF cache · Dial runs original safetensors on stable-diffusion.cpp; MLX-quantized packs need MLX-Serve".to_owned(),
             Shelf::Memory => {
                 let installed = self.dashboard.models.len();
                 let memory = match self.dashboard.memory_bytes {
@@ -1787,7 +2019,7 @@ fn canonical_path(path: &str) -> PathBuf {
 }
 
 /// `1.5 GiB`, `312 MiB`, `8 KiB` or `12 B`.
-fn human_bytes(bytes: u64) -> String {
+pub(super) fn human_bytes(bytes: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;

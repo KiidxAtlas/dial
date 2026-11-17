@@ -59,7 +59,7 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
     } else {
         None
     };
-    let text = shell.side.command(args, snapshot.as_ref());
+    let text = crate::app::side::command(&mut shell.side, args, snapshot.as_ref());
     shell.note("BTW", text);
     Ok(Step::Done)
 }

@@ -28,8 +28,7 @@ const PRESENTATION: &str = "presentation the client renders itself";
 const PANEL: &str = "terminal panel or workflow; not an RPC method yet";
 const GIT: &str = "git workflows run in the terminal or through `dial commit` / `git`";
 const LEARNING: &str = "learning and evaluation tooling runs from the terminal or the `dial` CLI";
-const COLLAB: &str = "live collaboration rooms are a terminal feature";
-const MODES: &str = "session working mode toggled in the terminal; plan mode is the `plan` method";
+const COLLAB: &str = "relay administration and peer workflows remain terminal-only; use collaboration_status for room metadata";
 
 /// The RPC surface of the canonical command `name`; `None` for a command not classified yet.
 pub(super) fn parity(name: &str) -> Option<Parity> {
@@ -52,6 +51,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "new" => Method("new_session"),
         "usage" => Method("usage"),
         "sessions" => Method("list_sessions"),
+        "search" => Method("search_sessions"),
         "fork" => Method("fork_session"),
         "rename" => Method("rename"),
         "export" => Method("export"),
@@ -73,6 +73,26 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "extensions" => Method("extension_action"),
         "mcp" => Method("mcp_login"),
         "exit" => Method("shutdown"),
+        "checks" => Method("list_checks"),
+        "evidence" => Method("evidence"),
+        "policy" => Method("policy"),
+        "reliability" => Method("reliability"),
+        "skills" => Method("list_skills"),
+        "archive" => Method("archive"),
+        "pack" => Method("pack_session"),
+        "branch" => Method("branch_session"),
+        "label" => Method("label_session"),
+        "move" => Method("move_session"),
+        "schedule" => Method("list_schedules"),
+        "btw" => Method("side_thread"),
+        "handoff" => Method("compact"),
+        "goal" | "guided-goal" => Method("goal"),
+        "join" => Method("collaboration_join"),
+        "leave" => Method("collaboration_leave"),
+        "collab" => Method("collaboration_start"),
+        "mode" => Client("mode navigation hub; use get_modes, set_mode and set_approval"),
+        "vibe" | "skillful" | "drafter" | "advisor" | "external-thinking" | "plan-yolo"
+        | "fast" | "slow" | "extended-context" | "prewalk" => Method("set_mode"),
         "activity" | "controls" | "help" | "theme" | "hotkeys" | "copy" | "queue" | "draft"
         | "attachments" | "watch" => Client(PRESENTATION),
         "restart" => Client("restart the `dial rpc` process; `resume` reopens the session"),
@@ -85,18 +105,12 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "commit" | "git" | "wt" | "changes" | "code-history" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
-        "collab" | "join" | "leave" | "relay" | "peers" => Terminal(COLLAB),
-        "mode" | "vibe" | "skillful" | "drafter" | "advisor" | "external-thinking"
-        | "plan-yolo" | "fast" | "slow" | "extended-context" | "prewalk" => Terminal(MODES),
-        "compute" | "review" | "seance" | "archive" | "tree" | "profile" | "permissions"
-        | "todo" | "skills" | "reliability" | "policy" | "understanding" | "search"
-        | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
-        | "evidence" | "modelpreset" | "ssh" | "checks" | "branch" | "label" | "move" | "pack"
-        | "stats" | "changelog" | "loop" | "fresh" | "handoff" | "shake" | "btw" | "tan"
-        | "debug" | "rule" | "plan-review" | "goal" | "guided-goal" | "contract" | "cleanse"
-        | "schedule" | "gc" | "anonymize" | "images" | "hooks" | "marketplace" | "inbox" => {
-            Terminal(PANEL)
-        }
+        "relay" | "peers" => Terminal(COLLAB),
+        "compute" | "review" | "seance" | "tree" | "profile" | "permissions" | "todo"
+        | "understanding" | "accounts" | "share" | "dump" | "trace" | "security" | "graphify"
+        | "image" | "modelpreset" | "ssh" | "stats" | "changelog" | "loop" | "fresh" | "shake"
+        | "tan" | "debug" | "rule" | "plan-review" | "contract" | "cleanse" | "gc"
+        | "anonymize" | "images" | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
         _ => return None,
     })
 }

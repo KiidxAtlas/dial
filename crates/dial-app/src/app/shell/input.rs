@@ -20,24 +20,21 @@ impl Shell {
     /// input, Enter picks, Esc leaves. `None` passes the key on; `Some(Some(command))` asks to run it.
     pub(super) fn home_key(&mut self, key: &crossterm::event::KeyEvent) -> Option<Option<String>> {
         let home = self.home.as_mut()?;
-        if key.code == KeyCode::Esc && home.info.tour {
+        if !self.composer.is_resting() {
+            return None;
+        }
+        if self.keys.matches(Action::Dismiss, key) && home.info.tour {
             home.dismiss_tour();
             home.deselect();
             return Some(None);
         }
-        if !key.modifiers.is_empty()
-            || !self.composer.draft().is_empty()
-            || self.composer.menu_open()
-        {
+        if !key.modifiers.is_empty() {
             return None;
         }
         match key.code {
             KeyCode::Down => home.down().then_some(None),
             KeyCode::Up => home.up().then_some(None),
-            KeyCode::Esc => {
-                let dismissed = home.dismiss_tour();
-                (home.deselect() || dismissed).then_some(None)
-            }
+            KeyCode::Esc => home.deselect().then_some(None),
             KeyCode::Enter => match home.pick()? {
                 welcome::Pick::Resume(id) => Some(Some(format!("/resume {id}"))),
                 welcome::Pick::Draft(text) => {
@@ -356,7 +353,8 @@ impl Shell {
         match ran {
             Ok(Ok(status)) if status.success() => {
                 if let Ok(text) = std::fs::read_to_string(&path) {
-                    self.composer.set_draft(text.trim_end_matches('\n'));
+                    self.composer
+                        .replace_draft_content(text.trim_end_matches('\n'));
                 }
             }
             Ok(Ok(status)) => self.note(

@@ -125,6 +125,36 @@ pub struct VerificationCommand {
     pub timeout_secs: u64,
 }
 
+impl VerificationCommand {
+    /// A project check as `/checks add` and `add_check` build it: the name is one word that does
+    /// not start with `--` (the option prefix `/checks` reads), the command is not blank, and
+    /// extensions drop a leading dot and blank entries.
+    pub fn new(
+        name: &str,
+        command: &str,
+        file_extensions: Vec<String>,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Self> {
+        if name.is_empty() || name.starts_with("--") || name.chars().any(char::is_whitespace) {
+            anyhow::bail!("check name must be one word that does not start with --");
+        }
+        let command = command.trim();
+        if command.is_empty() {
+            anyhow::bail!("check command must not be empty");
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            command: command.to_owned(),
+            file_extensions: file_extensions
+                .into_iter()
+                .map(|ext| ext.trim().trim_start_matches('.').to_owned())
+                .filter(|ext| !ext.is_empty())
+                .collect(),
+            timeout_secs,
+        })
+    }
+}
+
 fn default_verification_timeout() -> u64 {
     0
 }

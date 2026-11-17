@@ -237,7 +237,14 @@ the existing delete-confirmation flow.
 Approval and recovery choices pause confirmation below 36 columns or 11 terminal rows. Resize
 to reveal the details and choices; cancellation remains available. `Enter` and approval hotkeys
 cannot authorize an option hidden by the resize message. Above that minimum, page keys scroll
-long details and navigation keeps the current choice visible. Question dialogs likewise window
-their current choice rather than truncating it out of view.
+long details and navigation keeps the current choice visible. Question dialogs pin the current
+choice or active input and reserve space for confirm/back/cancel keys. Switching choices keeps
+the detail area and controls at a stable height, including options without previews. Page Up/Down
+scroll the complete question, selected description and preview without changing the answer;
+the displayed bindings follow `/hotkeys`. Other/custom answers, notes and image paths use
+labelled, bordered fields with normal-contrast input text; very short views retain side rails
+when a full box cannot fit. Returning from a field restores the choices for reading details.
+Narrow fields keep the cursor and concise validation feedback in view; secondary shortcuts
+yield space before the active control and essential keys.
 
 See the [visual review sheet](tui-rendering.md#visual-review-sheet) for the terminal cell gallery.

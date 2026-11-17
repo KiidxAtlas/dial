@@ -122,6 +122,25 @@ fn typed_notice_adds_lane_and_keeps_plain_text_and_tokens() {
 }
 
 #[test]
+fn retry_boundary_and_call_correlated_tool_events_have_wire_shape() {
+    use crate::agent::ui::ui_event::{EventKind, UiEvent};
+    let retry = typed_notice(&UiEvent::new(EventKind::Retry, "partial discarded"));
+    assert_eq!(retry["event"], "notice");
+    assert_eq!(retry["kind"], "retry");
+    assert_eq!(retry["lane"], "context");
+    assert_eq!(retry["message"], "partial discarded");
+    let output = super::tool_output_event("call_2", "bash", "out-2\n");
+    assert_eq!(output["event"], "tool_output");
+    assert_eq!(output["call_id"], "call_2");
+    assert_eq!(output["name"], "bash");
+    assert_eq!(output["delta"], "out-2\n");
+    let progress = super::tool_progress_event("call_1", "bash", "step 2");
+    assert_eq!(progress["event"], "tool_progress");
+    assert_eq!(progress["call_id"], "call_1");
+    assert_eq!(progress["text"], "step 2");
+}
+
+#[test]
 fn node_metadata_ignores_text_growth_and_tracks_every_other_field() {
     use crate::runtime::{Node, Phase, ResultBody};
     let mut node = Node {
@@ -245,6 +264,7 @@ fn emitted_events() -> std::collections::BTreeSet<String> {
         include_str!("host_uris.rs"),
         include_str!("auth.rs"),
         include_str!("extensions.rs"),
+        include_str!("side_control.rs"),
     ] {
         for piece in source.split("\"event\":\"").skip(1) {
             found.insert(piece.split('"').next().unwrap().to_owned());
@@ -342,6 +362,30 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
     assert_eq!(acp["limits"]["max_request_bytes"], MAX_ACP_REQUEST);
     assert!(!capability(&acp, "questions") && !capability(&acp, "live_voice"));
     assert!(capability(&acp, "prompt"));
+    // The new workflow capabilities are native-only: ACP never announces or serves them.
+    for capability_name in ["checks", "evidence", "diagnostics", "skills"] {
+        assert!(!capability(&acp, capability_name), "{capability_name}");
+        assert!(capability(&rpc, capability_name), "{capability_name}");
+    }
+    let acp_methods = acp["methods"].as_array().unwrap();
+    for method in [
+        "list_checks",
+        "add_check",
+        "remove_check",
+        "evidence",
+        "evidence_correct",
+        "evidence_compare",
+        "policy",
+        "reliability",
+        "list_skills",
+        "skill_action",
+    ] {
+        assert!(!acp_methods.contains(&json!(method)), "{method}");
+        assert!(
+            rpc["methods"].as_array().unwrap().contains(&json!(method)),
+            "{method}"
+        );
+    }
     let methods = acp["methods"].as_array().unwrap();
     assert!(!methods.contains(&json!("live_start")) && methods.contains(&json!("send")));
     assert_eq!(acp["question_input"]["supported"], false);
@@ -408,6 +452,53 @@ fn client_request_examples_validate_against_the_published_schema() {
 }
 
 #[test]
+fn collaboration_turn_schema_requires_one_complete_outcome() {
+    let schema = schema();
+    for (payload, valid) in [
+        (
+            json!({"outcome":"completed","result":{"local_turn":true}}),
+            true,
+        ),
+        (
+            json!({"outcome":"failed","error":{"code":"refused","message":"not admitted"}}),
+            true,
+        ),
+        (json!({"outcome":"completed"}), false),
+        (json!({"outcome":"failed"}), false),
+        (
+            json!({"outcome":"completed","result":[],"error":null}),
+            false,
+        ),
+        (
+            json!({"outcome":"completed","result":{},"error":{"code":"failed","message":"mixed"}}),
+            false,
+        ),
+        (
+            json!({"outcome":"failed","result":{},"error":{"code":"failed","message":"mixed"}}),
+            false,
+        ),
+        (
+            json!({"outcome":"failed","error":{"message":"missing code"}}),
+            false,
+        ),
+        (json!({"outcome":"failed","error":{"code":"failed"}}), false),
+        (
+            json!({"outcome":"failed","error":{"code":"failed","message":"bad","secret":"unexpected"}}),
+            false,
+        ),
+    ] {
+        let mut event =
+            json!({"event":"collaboration_turn","seq":1,"session_id":"s","request_id":null});
+        event
+            .as_object_mut()
+            .unwrap()
+            .extend(payload.as_object().unwrap().clone());
+        let result = crate::runtime::schema::validate(&schema, &event);
+        assert_eq!(result.is_ok(), valid, "event={event}: {result:?}");
+    }
+}
+
+#[test]
 fn revisioned_snapshot_retains_partial_output_and_interrupted_outcome() {
     use crate::runtime::{Phase, Tree};
     let tree = Tree::default();
@@ -443,6 +534,23 @@ fn only_listed_methods_are_known_before_dispatch() {
     // ACP-internal actor methods are not native RPC methods.
     assert!(!known_method("close_session"));
     assert!(known_method("fork_session") && known_method("list_sessions"));
+    assert!(known_method("search_sessions"));
+    assert!(Admin::reads("search_sessions"));
+    assert!(dial_protocol::is_read_only("search_sessions"));
+    let native = ready_frame("s", "m", json!([]), false, false);
+    assert!(
+        native["methods"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("search_sessions"))
+    );
+    let acp = ready_frame("s", "m", json!([]), false, true);
+    assert!(
+        !acp["methods"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("search_sessions"))
+    );
 }
 
 #[test]
@@ -479,6 +587,38 @@ fn envelope_numbers_events_and_attributes_them_without_touching_replies() {
     envelope.stamp(&mut reply);
     assert_eq!(reply, json!({"id":1,"result":{}}));
     assert_eq!(envelope.seq, 3);
+}
+
+#[test]
+fn ready_and_side_events_cannot_inherit_stale_session_or_turn_attribution() {
+    let mut envelope = Envelope {
+        session_id: Some("old".into()),
+        request_id: json!("old-turn"),
+        ..Default::default()
+    };
+    let mut ready = ready_frame("new", "m", json!([]), false, false);
+    envelope.stamp(&mut ready);
+    assert!(ready["request_id"].is_null());
+    let mut text = json!({"event":"text","delta":"new work"});
+    envelope.stamp(&mut text);
+    assert_eq!(text["session_id"], "new");
+    envelope.request_id = json!("new-turn");
+    let mut side = json!({"event":"side_state","session_id":"old","request_id":null,"state":{"threads":[]},"notices":[]});
+    envelope.stamp(&mut side);
+    assert_eq!(side["session_id"], "old");
+    assert!(side["request_id"].is_null());
+    let mut next = json!({"event":"text","delta":"still new"});
+    envelope.stamp(&mut next);
+    assert_eq!(next["session_id"], "new");
+    assert_eq!(next["request_id"], "new-turn");
+    let mut active = json!({"event":"active_session","session_id":"third"});
+    envelope.stamp(&mut active);
+    envelope.stamp(&mut next);
+    // Explicitly attributed events keep their original owner, even after a switch.
+    assert_eq!(next["session_id"], "new");
+    let mut third = json!({"event":"notice","message":"current"});
+    envelope.stamp(&mut third);
+    assert_eq!(third["session_id"], "third");
 }
 
 #[test]

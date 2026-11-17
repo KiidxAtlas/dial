@@ -40,6 +40,7 @@ pub(super) fn run_command(
         let args = args.strip_prefix("open ").unwrap_or(args).trim();
         if args == "read-all" {
             let count = shell.inbox.read_all();
+            shell.status.inbox_unread = shell.inbox.unread();
             shell.note(
                 "Inbox",
                 if count == 0 {
@@ -72,8 +73,9 @@ pub(super) fn run_command(
         {
             return Some(shell.open(app, agent, Which::Choice(Box::new(choices))));
         }
-        if args.trim().is_empty() {
-            return Some(shell.open(app, agent, Which::Choice(Box::new(shell.inbox.choices()))));
+        if matches!(args, "" | "all" | "unread") {
+            let choices = shell.inbox.choices_filtered(args == "unread");
+            return Some(shell.open(app, agent, Which::Choice(Box::new(choices))));
         }
         let message = args
             .trim()
@@ -81,6 +83,7 @@ pub(super) fn run_command(
             .ok()
             .and_then(|id| shell.inbox.read(id))
             .map(|(title, text)| (title.to_owned(), text.to_owned()));
+        shell.status.inbox_unread = shell.inbox.unread();
         if let Some((title, text)) = message {
             // Reading a notice must not feed it back into the inbox.
             shell.transcript.notice(&title, &text);

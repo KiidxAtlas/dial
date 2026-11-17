@@ -31,7 +31,16 @@ OTLP/HTTP JSON export is disabled unless `[telemetry].enabled = true`. Configure
 
 The same controller facts feed OTLP fact, byte and integration-transition counters. They never
 include tool payloads, credential material, changed paths or artifact IDs. Telemetry ingress is
-bounded (1,024 messages) and nonblocking: queue overflow is counted rather than delaying execution.
-Ingress drops, local-statistics write failures and export losses have process-lifetime counters
-and loss metrics. Delivery remains best effort, not a durable export queue; missing telemetry is
-not evidence of successful execution. Existing SQLite and optional OTLP remain the only backends.
+bounded (1,024 messages). Event ingress is nonblocking: queue overflow is counted rather than delaying
+execution. Flush and shutdown barriers are never dropped on a full queue: they wait up to 15 seconds
+for room and for the worker's acknowledgement, and a barrier that still cannot be delivered is reported
+on stderr and counted as a `control` loss. Ingress drops, control losses, local-statistics write failures
+and export losses have process-lifetime counters and loss metrics. Delivery remains best effort, not a
+durable export queue; missing telemetry is not evidence of successful execution. Existing SQLite and
+optional OTLP remain the only backends.
+
+When the export target changes (a reloaded `[telemetry]` endpoint, or telemetry being disabled),
+turns still open on the old target are closed first as `interrupted` (`dial.agent.outcome`, not an
+error) and exported there, so their child spans keep a parent. A turn that continues after the
+change is traced on the new target as a new trace. Telemetry headers (credentials) are never written
+into exported payloads.

@@ -242,11 +242,13 @@ fn captures_and_specs_honor_deny_read_policy() {
                 deny_read: vec![path.clone()],
                 extra_write: vec![],
                 allow_network: false,
+                serial_ports: false,
             },
             Policy::Strict {
                 deny_read: vec![path.clone()],
                 extra_write: vec![],
                 allow_network: false,
+                serial_ports: false,
             },
         ] {
             let restricted = ws.clone().with_policy(policy);

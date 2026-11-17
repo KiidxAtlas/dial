@@ -131,26 +131,21 @@ pub(super) fn rank_until(
                 stopped.set(true);
                 return None;
             }
-            // A scattered subsequence (`settings` in `skill:file-structure-cleanup`) is noise for
-            // commands: their names must match tightly or at a word start, their descriptions as
-            // a word piece. File paths keep plain fuzzy matching (`mrs` finds `src/main.rs`).
-            let name = text::fuzzy(query, &command.name).filter(|(_, hits)| {
-                command.kind == CommandKind::File
-                    || tier(&command.name) > 0
-                    || hits.first().zip(hits.last()).is_none_or(|(first, last)| {
-                        let span = last - first + 1;
-                        let n = query.chars().count();
-                        n < 3 || span <= n + n / 2 + 1
-                    })
-            });
+            // A scattered subsequence (`settings` in `skill:file-structure-cleanup`, `se` in
+            // `shake`) is noise for commands: their names must match tightly or at a word start,
+            // their descriptions as a word piece. File paths keep plain fuzzy matching (`mrs`
+            // finds `src/main.rs`).
+            let name = if command.kind == CommandKind::File || tier(&command.name) > 0 {
+                text::fuzzy(query, &command.name)
+            } else {
+                text::fuzzy_compact(query, &command.name)
+            };
             // A file's description is the same for every file, so matching it would offer every
             // file for any query that happens to fit "project file".
-            let desc = if command.kind == CommandKind::File
-                || !command.description.to_lowercase().contains(&lower)
-            {
+            let desc = if command.kind == CommandKind::File {
                 None
             } else {
-                text::fuzzy(query, &command.description)
+                text::fuzzy_prose(query, &command.description)
             };
             if name.is_none() && desc.is_none() {
                 return None;
@@ -532,11 +527,21 @@ impl Composer {
         let total = menu.matches.len();
         if total == 0 {
             let message = if menu.file_start.is_some() {
-                "  No matching files"
+                "  No matching files".to_owned()
             } else if menu.arguments.is_some() {
-                "  No matching subcommands or options"
+                "  No matching subcommands or options".to_owned()
             } else {
-                "  No matching commands"
+                // Point at the next step: the actions palette also searches settings and help.
+                let key = ctx.keys.label(Action::CommandPalette);
+                let key = if key.is_empty() {
+                    "/help".to_owned()
+                } else {
+                    key
+                };
+                format!(
+                    "  No matching commands {} {key} searches settings and help",
+                    theme.sym(Sym::Dot)
+                )
             };
             return vec![finish_row(
                 vec![Span::styled(message, theme.fg(Tok::Dim))],

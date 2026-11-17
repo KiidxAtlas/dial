@@ -23,7 +23,7 @@ fn named_checks_use_only_the_recorded_immutable_reference() {
             {"name":"lint", "status":"failed", "evidence_ref":"artifact://other"}
         ]});
         assert_eq!(
-            check_request(&summary, "cargo test").unwrap(),
+            workbench::check_inspect_request(&summary, "cargo test").unwrap(),
             json!({"action":"inspect", "references":[reference]})
         );
         let list = check_list(&summary);
@@ -47,7 +47,10 @@ fn absent_and_ambiguous_checks_do_not_fall_back_to_other_output() {
         json!({"recorded_checks":[{"name":"test", "evidence_ref":""}]}),
         json!({"recorded_checks":[{"name":"test", "evidence_ref":"artifact://a"}, {"name":"test", "evidence_ref":"artifact://b"}]}),
     ] {
-        assert!(check_request(&summary, "test").is_err(), "{summary}");
+        assert!(
+            workbench::check_inspect_request(&summary, "test").is_err(),
+            "{summary}"
+        );
     }
     assert!(check_list(&Value::Null).contains("Exact logs unavailable"));
     assert!(

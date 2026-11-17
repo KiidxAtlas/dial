@@ -148,4 +148,25 @@ mod activation_fixtures {
         drop(first);
         assert!(lock_install_dir(root.path()).is_ok());
     }
+
+    #[test]
+    fn dropping_the_install_lock_releases_inherited_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let first = lock_install_dir(root.path()).unwrap();
+        // A clone shares the open-file description just like a concurrent fork's
+        // inherited descriptor, without forking a multithreaded test process.
+        let inherited = first._file.try_clone().unwrap();
+        assert!(lock_install_dir(root.path()).is_err());
+        drop(first);
+
+        let next = lock_install_dir(root.path())
+            .expect("an inherited descriptor must not extend the finished updater's lease");
+        drop(inherited);
+        assert!(
+            lock_install_dir(root.path()).is_err(),
+            "closing the inherited descriptor must not release the next updater's lease"
+        );
+        drop(next);
+        assert!(lock_install_dir(root.path()).is_ok());
+    }
 }

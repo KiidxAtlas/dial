@@ -749,3 +749,72 @@ fn reset_provider_accepts_local_reset_records_but_not_local_endpoints() {
         );
     }
 }
+
+#[test]
+fn history_budget_counts_json_escaping_and_retains_recent_submissions() {
+    let (_home, _project, layout) = fixture();
+    let large = "\u{0000}".repeat(1024 * 1024);
+    let history = vec![large.clone(), format!("{large}x"), "recent".into()];
+    save_history(&layout, &history, 0).unwrap();
+    let loaded = load_history(&layout, 0).unwrap();
+    assert_eq!(loaded, history[1..]);
+    save_history(&layout, &["x".repeat(9 * 1024 * 1024), "newest".into()], 0).unwrap();
+    let loaded = load_history(&layout, 0).unwrap();
+    assert_eq!(loaded.last().unwrap(), "newest");
+    assert!(serde_json::to_vec(&loaded).unwrap().len() <= 8 * 1024 * 1024);
+}
+
+#[test]
+fn uncertain_project_publication_restores_both_model_layers() {
+    for (existing, failure) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+        let (_home, _project, layout) = fixture();
+        let files = layout.config_files();
+        for file in &files {
+            private_dir(file.parent().unwrap()).unwrap();
+            if existing {
+                write_private(file, b"model = 'old'\n").unwrap();
+            }
+        }
+        let original = files.each_ref().map(|file| fs::read(file).ok());
+        let mut count = 0;
+        let error = publish_model_layers(&files, [b"model = 'new'\n", b""], |path, bytes| {
+            count += 1;
+            write_private(path, bytes)?;
+            if count == failure {
+                anyhow::bail!("injected post-rename sync failure");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected"));
+        assert_eq!(files.each_ref().map(|file| fs::read(file).ok()), original);
+    }
+}
+
+#[test]
+fn rollback_failure_still_reconciles_the_other_layer_and_reports_uncertainty() {
+    let (_home, _project, layout) = fixture();
+    let files = layout.config_files();
+    for file in &files {
+        private_dir(file.parent().unwrap()).unwrap();
+        write_private(file, b"model = 'old'\n").unwrap();
+    }
+    let mut count = 0;
+    let error = publish_model_layers(&files, [b"model = 'new'\n", b""], |path, bytes| {
+        count += 1;
+        if count == 3 {
+            anyhow::bail!("injected project rollback failure");
+        }
+        write_private(path, bytes)?;
+        if count == 2 {
+            anyhow::bail!("injected project publication sync failure");
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("rollback durability uncertain"));
+    assert!(!diagnostic.contains("not saved"));
+    assert_eq!(fs::read(&files[0]).unwrap(), b"model = 'old'\n");
+    assert_eq!(fs::read(&files[1]).unwrap(), b"");
+}

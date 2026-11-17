@@ -1323,3 +1323,27 @@ fn approval_mode_outlasts_path_git_and_cost_at_narrow_widths() {
         assert!(line.contains("Full auto"), "{width}: {line}");
     }
 }
+
+#[test]
+fn compact_default_hides_account_identity_but_expansion_and_custom_preserve_it() {
+    let mut status = StatusData {
+        model: "gpt-6 [account account-identifier] [plan]".into(),
+        provider: "hosted".into(),
+        ..data()
+    };
+    let cfg = cfg_with(StatusPreset::Default);
+    let compact = plain(&render(&cfg, &status, 240));
+    assert!(compact.contains("gpt-6"));
+    assert!(compact.contains("[plan]"));
+    assert!(!compact.contains("account"), "{compact}");
+    status.status_expanded = true;
+    assert!(plain(&render(&cfg, &status, 240)).contains("[account "));
+    status.status_expanded = false;
+    let custom = UiConfig {
+        status: StatusPreset::Custom,
+        status_left: vec!["model".into()],
+        status_right: Vec::new(),
+        ..UiConfig::default()
+    };
+    assert!(plain(&render(&custom, &status, 240)).contains("[account "));
+}

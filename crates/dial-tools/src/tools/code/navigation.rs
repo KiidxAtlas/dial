@@ -110,6 +110,10 @@ impl Tool for Find {
             if let Some(error) = &self.embedding.error {
                 return ToolOutput::err(error.clone());
             }
+            let prepared = match vector::prepare(ctx.workspace, args) {
+                Ok(prepared) => prepared,
+                Err(error) => return ToolOutput::err(error),
+            };
             let mut slot = self
                 .embedding
                 .embedder
@@ -123,7 +127,9 @@ impl Tool for Find {
             } else {
                 format!("remote endpoint {}", self.embedding.endpoint)
             };
-            return match vector::search(ctx.workspace, args, embedder.as_mut(), &endpoint) {
+            let indexed = prepared.embed(embedder.as_mut());
+            drop(slot);
+            return match indexed.and_then(|indexed| indexed.render(&endpoint)) {
                 Ok(text) => ToolOutput::ok(text),
                 Err(error) => ToolOutput::err(error),
             };

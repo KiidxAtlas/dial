@@ -84,6 +84,17 @@ impl Shell {
             self.draft_command(app, args);
             return false;
         }
+        // Opening a search hit and returning from an excursion both switch the agent's
+        // session. Keep the running owner intact and use the idle command path afterwards;
+        // these reserved forms must never become searches for the literal words "open/back".
+        if name == "search" && (args == "back" || args.starts_with("open ")) {
+            self.note(
+                "Search",
+                "Conversation navigation will run when this turn finishes.",
+            );
+            self.deferred.push_back(text);
+            return false;
+        }
         if name == "search" && args == "results" {
             if let Some(panel) = self.take_search_panel(&app.layout) {
                 if let Err(error) = self.start_busy_overlay(app, Which::HistorySearch(panel)) {
@@ -154,7 +165,11 @@ impl Shell {
             from_hub: false,
         };
         if let Err(error) = self.start_busy_overlay(app, viewer) {
-            self.note("Workers", format!("{error:#}"));
+            self.notify(
+                crate::ui::overlay::inbox::Category::Error,
+                "Workers",
+                format!("{error:#}"),
+            );
         }
     }
 
@@ -230,9 +245,10 @@ impl Shell {
                     return true;
                 }
                 let snapshot = self.side.busy_snapshot();
-                let text = self.side.command(&args, snapshot.as_deref());
+                let text = crate::app::side::command(&mut self.side, &args, snapshot.as_deref());
                 self.note("BTW", text);
             }
+            ("search", "more") => self.more_search(&app.layout),
             ("search", query) if !query.is_empty() => self.start_search(&app.layout, query),
             ("improve", "status") => {
                 let text = self.improve_status_text(app);

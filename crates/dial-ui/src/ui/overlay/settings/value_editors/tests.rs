@@ -127,8 +127,24 @@ fn folder_lists_add_through_the_browser() {
     assert_eq!(rows(list.view(5)), ["+ Add a folder…"]);
     press(&mut list, KeyCode::Enter);
     assert!(list.view(10).browser.is_some());
+    let wait_for_folder = |list: &mut ListEditor| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            list.poll();
+            let Some(Adding::Folder(browser)) = &list.adding else {
+                panic!("expected folder browser")
+            };
+            if !browser.is_loading() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    wait_for_folder(&mut list);
     type_text(&mut list, "out");
     press(&mut list, KeyCode::Enter); // opens out/
+    wait_for_folder(&mut list);
     press(&mut list, KeyCode::Enter); // "Use this folder"
     assert_eq!(
         list.value(),

@@ -26,11 +26,13 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
+use transport_queue::{Receiver, Sender as SyncSender};
 
 mod conversation;
+mod transport_queue;
 pub use conversation::{
     AssistantEntry, Conversation, Entry, NoticeEntry, PendingApproval, ToolCard, ToolEntry,
     ToolOutcome, UserEntry,
@@ -56,10 +58,21 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Frames buffered between the reader thread and the owner before the reader waits.
 const QUEUED_FRAMES: usize = 1024;
 
+/// Most unrelated messages one [`Client::call`] buffers before it returns [`ClientError::Backlog`].
+const DEFERRED_MESSAGES: usize = QUEUED_FRAMES;
+
+/// Approximate bytes of unrelated messages one [`Client::call`] buffers before it returns
+/// [`ClientError::Backlog`]. A call stops reading once the bound is reached, so the buffer can
+/// exceed it by at most one frame (itself at most [`MAX_FRAME_BYTES`]).
+const DEFERRED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Bound queued writes as well as each frame; a full queue refuses admission without blocking.
 const QUEUED_REQUESTS: usize = 8;
 
-/// How long a dropped client waits for a graceful exit after closing stdin before killing.
+/// Wire payload budget per transport queue; one larger legal frame occupies a queue alone.
+const TRANSPORT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Grace the background reaper gives a dropped client's engine after stdin closes.
 const DROP_GRACE: Duration = Duration::from_secs(5);
 
 /// Whether `method` only reads state, so repeating it after a lost response is safe. Every other
@@ -458,6 +471,20 @@ pub enum ClientError {
         /// Bound that elapsed.
         timeout: Duration,
     },
+    /// The bound on unrelated messages one call buffers was reached before the reply. The request
+    /// is still outstanding: its reply, and every message deferred so far, arrive through
+    /// [`Client::poll`].
+    #[error(
+        "{method} is behind more than {messages} unread messages or {bytes} bytes; poll before waiting again"
+    )]
+    Backlog {
+        /// Method awaited.
+        method: String,
+        /// Message bound one call buffers at most.
+        messages: usize,
+        /// Byte bound one call buffers at most, before one overshooting frame.
+        bytes: usize,
+    },
     /// The connection ended. `effect` says whether the request could have taken effect.
     #[error("connection closed before {method} completed ({effect:?})")]
     Disconnected {
@@ -471,6 +498,111 @@ pub enum ClientError {
     Io(#[from] io::Error),
 }
 
+/// The old connection after a restart. It still owns the messages it produced and did not have
+/// polled, and hands them out one step at a time through [`Handoff::poll`]. Nothing is copied
+/// ahead of time, so the connection's own bounds keep applying. Its sequence numbers belong to
+/// that connection: deliver these messages before the new connection's, and call
+/// [`Conversation::new_connection`] between the two streams.
+///
+/// Dropping an unfinished handoff discards the messages it still holds, so poll it until
+/// [`HandoffPoll::Finished`].
+#[derive(Debug)]
+#[must_use = "unpolled messages of the old connection are discarded on drop; poll until Finished"]
+pub struct Handoff {
+    connection: Box<Client>,
+    ended: bool,
+}
+
+/// One step of [`Handoff::poll`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandoffPoll {
+    /// The next message of the old connection, in arrival order. Its end is delivered as
+    /// [`Message::Disconnected`], the last message the handoff produces.
+    Message(Message),
+    /// Nothing arrived within the timeout and the old connection has not ended: poll again.
+    /// This is the explicit incomplete state; no message was lost.
+    TimedOut,
+    /// The old connection's end was already delivered; nothing more will come.
+    Finished,
+}
+
+impl Handoff {
+    /// The next unpolled message, waiting at most `timeout`. See [`HandoffPoll`].
+    pub fn poll(&mut self, timeout: Duration) -> HandoffPoll {
+        if self.ended {
+            return HandoffPoll::Finished;
+        }
+        match self.connection.poll(timeout) {
+            Some(message @ Message::Disconnected { .. }) => {
+                self.ended = true;
+                HandoffPoll::Message(message)
+            }
+            Some(message) => HandoffPoll::Message(message),
+            None if self.connection.is_closed() => {
+                self.ended = true;
+                HandoffPoll::Finished
+            }
+            None => HandoffPoll::TimedOut,
+        }
+    }
+
+    /// Whether the old connection's end has been delivered.
+    pub fn is_finished(&self) -> bool {
+        self.ended
+    }
+
+    /// Sequence numbers the old connection skipped ([`Client::lost_events`]). Non-zero means its
+    /// view needs a reload.
+    pub fn lost_events(&self) -> u64 {
+        self.connection.lost_events()
+    }
+}
+
+/// A successful [`Client::restart_and_resume`].
+#[derive(Debug)]
+pub struct Restarted {
+    /// The replacement connection, resumed on the same session.
+    pub client: Client,
+    /// The old connection's unpolled messages. Deliver them before `client`'s messages.
+    pub handoff: Handoff,
+}
+
+/// A failed [`Client::restart_and_resume`]. `client` hands back a running engine whenever one
+/// exists, so a refused restart loses neither the engine nor its buffered messages.
+#[derive(Debug, thiserror::Error)]
+#[error("restart failed: {error}")]
+pub struct RestartError {
+    /// Why the restart did not complete.
+    pub error: ClientError,
+    /// The connection that still owns an engine, or `None` once no engine is running. After a
+    /// [`ClientError::Backlog`] refusal the engine has been asked to shut down and its stdin is
+    /// closed, so this connection takes no requests: poll it to drain, then [`Client::shutdown`].
+    /// Boxed so that the error stays small on the `Result` path.
+    pub client: Option<Box<Client>>,
+    /// The old connection's unpolled messages, present once the old engine has exited or the
+    /// restart was stopped after it began to exit. `None` while `client` is still the old
+    /// connection, which keeps its own buffer.
+    pub handoff: Option<Handoff>,
+}
+
+impl RestartError {
+    fn running(client: Client, error: ClientError) -> Self {
+        Self {
+            error,
+            client: Some(Box::new(client)),
+            handoff: None,
+        }
+    }
+
+    fn stopped(error: ClientError, handoff: Handoff) -> Self {
+        Self {
+            error,
+            client: None,
+            handoff: Some(handoff),
+        }
+    }
+}
+
 enum Line {
     Frame(Value),
     Malformed(String),
@@ -480,14 +612,15 @@ enum Line {
 /// A connected engine process.
 #[derive(Debug)]
 pub struct Client {
-    child: Child,
+    child: Option<Child>,
     /// Failed handshakes kill immediately; only established connections get graceful EOF time.
     drop_grace: Duration,
     stdin: Option<SyncSender<String>>,
     lines: Receiver<LineSlot>,
     next_id: u64,
     pending: BTreeMap<u64, String>,
-    buffered: VecDeque<Message>,
+    /// Messages a call deferred, each with its approximate size. Drained before any new line.
+    buffered: VecDeque<(Message, usize)>,
     ready: Ready,
     protocol: u32,
     closed: bool,
@@ -497,7 +630,7 @@ pub struct Client {
 }
 
 /// Opaque wrapper so `Client` can derive `Debug` without exposing the reader's line type.
-struct LineSlot(Line);
+struct LineSlot(Line, usize);
 
 impl std::fmt::Debug for LineSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -529,7 +662,7 @@ impl Client {
         };
         let (stdin, lines) = spawn_transport(stdin, stdout, MAX_FRAME_BYTES);
         let mut client = Self {
-            child,
+            child: Some(child),
             drop_grace: Duration::ZERO,
             stdin: Some(stdin),
             lines,
@@ -552,13 +685,13 @@ impl Client {
         };
         let deadline = Instant::now() + timeout;
         let first = match client.lines.recv_timeout(timeout) {
-            Ok(LineSlot(Line::Frame(frame))) => frame,
-            Ok(LineSlot(Line::Malformed(error))) => {
+            Ok(LineSlot(Line::Frame(frame), _)) => frame,
+            Ok(LineSlot(Line::Malformed(error), _)) => {
                 return Err(ClientError::Handshake(format!(
                     "malformed first frame: {error}"
                 )));
             }
-            Ok(LineSlot(Line::End)) | Err(RecvTimeoutError::Disconnected) => {
+            Ok(LineSlot(Line::End, _)) | Err(RecvTimeoutError::Disconnected) => {
                 return Err(ClientError::Handshake(
                     "engine exited before `ready`".into(),
                 ));
@@ -685,14 +818,14 @@ impl Client {
     /// Next message, waiting at most `timeout`. Returns `None` on timeout, and after
     /// [`Message::Disconnected`] has been delivered.
     pub fn poll(&mut self, timeout: Duration) -> Option<Message> {
-        if let Some(message) = self.buffered.pop_front() {
+        if let Some((message, _)) = self.buffered.pop_front() {
             return Some(message);
         }
         if self.closed {
             return None;
         }
         let line = match self.lines.recv_timeout(timeout) {
-            Ok(LineSlot(line)) => line,
+            Ok(LineSlot(line, _)) => line,
             Err(RecvTimeoutError::Timeout) => return None,
             Err(RecvTimeoutError::Disconnected) => Line::End,
         };
@@ -724,10 +857,15 @@ impl Client {
     /// Meant for quick queries. Long operations such as `send` stream events while they run; a
     /// GUI should use [`Client::request`] and [`Client::poll`] for them instead.
     ///
+    /// One call buffers at most `DEFERRED_MESSAGES` messages and about `DEFERRED_BYTES` bytes.
+    /// Past either bound it stops reading and returns [`ClientError::Backlog`]: nothing is
+    /// dropped, and only a single frame can overshoot the byte bound.
+    ///
     /// # Errors
     /// [`ClientError::Rpc`] for an engine error reply, [`ClientError::Timeout`] when no reply
-    /// arrives in time (the request stays outstanding), and [`ClientError::Disconnected`] when
-    /// the connection ends first.
+    /// arrives in time, [`ClientError::Backlog`] when too many other messages arrive first (both
+    /// leave the request outstanding), and [`ClientError::Disconnected`] when the connection ends
+    /// first.
     pub fn call(
         &mut self,
         method: &str,
@@ -736,7 +874,8 @@ impl Client {
     ) -> Result<Value, ClientError> {
         let deadline = Instant::now() + timeout;
         let wanted = self.request(method, params)?;
-        let mut deferred = Vec::new();
+        let mut deferred: Vec<(Message, usize)> = Vec::new();
+        let mut deferred_bytes = 0usize;
         let outcome = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -746,33 +885,43 @@ impl Client {
                 });
             }
             let next = match self.buffered.pop_front() {
-                Some(message) => Some(message),
+                Some(entry) => Some(entry),
                 None if self.closed => None,
+                None if deferred.len() >= DEFERRED_MESSAGES || deferred_bytes >= DEFERRED_BYTES => {
+                    break Err(ClientError::Backlog {
+                        method: method.to_owned(),
+                        messages: DEFERRED_MESSAGES,
+                        bytes: DEFERRED_BYTES,
+                    });
+                }
                 None => match self.lines.recv_timeout(left) {
-                    Ok(LineSlot(line)) => Some(self.classify(line)),
+                    Ok(LineSlot(line, _)) => Some(sized(self.classify(line))),
                     Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => Some(self.classify(Line::End)),
+                    Err(RecvTimeoutError::Disconnected) => Some(sized(self.classify(Line::End))),
                 },
             };
             match next {
-                Some(Message::Response { id, result, .. }) if id == wanted => {
+                Some((Message::Response { id, result, .. }, _)) if id == wanted => {
                     break result.map_err(|error| ClientError::Rpc {
                         method: method.to_owned(),
                         error,
                     });
                 }
-                Some(Message::Disconnected { outstanding }) => {
+                Some((Message::Disconnected { outstanding }, bytes)) => {
                     let lost = outstanding
                         .iter()
                         .find(|o| o.id == wanted)
                         .map_or(Effect::ReadOnly, |o| o.effect);
-                    deferred.push(Message::Disconnected { outstanding });
+                    deferred.push((Message::Disconnected { outstanding }, bytes));
                     break Err(ClientError::Disconnected {
                         method: method.to_owned(),
                         effect: lost,
                     });
                 }
-                Some(other) => deferred.push(other),
+                Some(entry) => {
+                    deferred_bytes += entry.1;
+                    deferred.push(entry);
+                }
                 None => {
                     break Err(ClientError::Disconnected {
                         method: method.to_owned(),
@@ -782,8 +931,8 @@ impl Client {
             }
         };
         // Keep arrival order: messages deferred here precede anything still buffered.
-        for message in deferred.into_iter().rev() {
-            self.buffered.push_front(message);
+        for entry in deferred.into_iter().rev() {
+            self.buffered.push_front(entry);
         }
         outcome
     }
@@ -1028,32 +1177,140 @@ impl Client {
     /// this engine down, launch a new one with `launch` and resume that session there.
     ///
     /// Refuses while requests are outstanding, so a running turn is never cut off; abort or let
-    /// it settle first. Approval and question ids from this connection are void afterwards.
+    /// it settle first. Approval, question and turn ids from this connection are void afterwards;
+    /// [`Conversation::new_connection`] drops them on the view side.
+    ///
+    /// The old engine is not killed while output it wrote is unread. The restart first sends
+    /// `shutdown` and closes the engine's stdin, then reads its output into the same bounded queue
+    /// [`Client::call`] uses, until it exits. If that queue fills while the engine still runs, the
+    /// restart is refused with [`ClientError::Backlog`]. That refusal is not a rollback: the
+    /// engine is winding down, so [`RestartError::client`] takes no requests (they fail as
+    /// `Disconnected`). Poll it until its end arrives, reap it with [`Client::shutdown`], then
+    /// reconnect with [`Client::connect`] and [`Client::resume`] to the session you read before
+    /// restarting. Calling `restart_and_resume` again on that client cannot work, because its
+    /// `state` call fails. An engine that exited is never refused for its buffered messages:
+    /// those come back through [`Restarted::handoff`] (or [`RestartError::handoff`]), read in
+    /// bounded steps by [`Handoff::poll`]. An inherited stdout held open by a grandchild cannot
+    /// stall the restart.
+    ///
+    /// Failures before the wind-down begins keep the running engine reachable:
+    /// [`RestartError::client`] is the old connection (a refusal because requests are
+    /// outstanding, or a failed `state`), and retrying is possible. A replacement that started
+    /// but did not resume the session is returned as `client`, so `resume` can be retried. When
+    /// the old engine has exited and no replacement runs, `client` is `None` and
+    /// [`RestartError::handoff`] holds the old connection's messages.
     ///
     /// # Errors
-    /// [`ClientError::Unsupported`] while requests are outstanding (`restart_and_resume`), or any
-    /// error from [`Client::state`], [`Client::connect`] or [`Client::resume`].
+    /// [`RestartError`] wrapping [`ClientError::Unsupported`] while requests are outstanding,
+    /// [`ClientError::Backlog`] as described above, or the error from [`Client::state`],
+    /// [`Client::connect`] or [`Client::resume`].
     pub fn restart_and_resume(
         mut self,
         launch: &Launch,
         timeout: Duration,
-    ) -> Result<Client, ClientError> {
+    ) -> Result<Restarted, RestartError> {
         if !self.pending.is_empty() {
-            return Err(ClientError::Unsupported(
-                "restart_and_resume while requests are outstanding".into(),
+            return Err(RestartError::running(
+                self,
+                ClientError::Unsupported(
+                    "restart_and_resume while requests are outstanding".into(),
+                ),
             ));
         }
-        let state = self.state(timeout)?;
+        let state = match self.state(timeout) {
+            Ok(state) => state,
+            Err(error) => return Err(RestartError::running(self, error)),
+        };
         let session_id = state["session_id"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| self.ready.session_id.clone());
-        self.shutdown(timeout)?;
-        let mut next = Client::connect(launch, timeout)?;
-        if next.ready.session_id != session_id {
-            next.resume(&session_id, timeout)?;
+        if let Err(error) = self.wind_down_for_restart(timeout) {
+            return Err(RestartError::running(self, error));
         }
-        Ok(next)
+        let old = Handoff {
+            connection: Box::new(self),
+            ended: false,
+        };
+        let mut next = match Client::connect(launch, timeout) {
+            Ok(next) => next,
+            Err(error) => return Err(RestartError::stopped(error, old)),
+        };
+        if next.ready.session_id != session_id
+            && let Err(error) = next.resume(&session_id, timeout)
+        {
+            return Err(RestartError {
+                error,
+                client: Some(Box::new(next)),
+                handoff: Some(old),
+            });
+        }
+        Ok(Restarted {
+            client: next,
+            handoff: old,
+        })
+    }
+
+    /// Request shutdown, then read the engine's output into the bounded queue until the process
+    /// exits. The exit is checked before the queue's bound: an engine that already exited hands
+    /// its buffered messages over, and nothing is refused or read further. A full queue while the
+    /// engine still runs refuses with `Backlog`. Once `timeout` passes, the engine is killed; what
+    /// it already wrote stays readable.
+    fn wind_down_for_restart(&mut self, timeout: Duration) -> Result<(), ClientError> {
+        let deadline = Instant::now() + timeout;
+        if !self.closed && self.supports("shutdown") {
+            // The reply and everything before it are read by the loop below, so the call's own
+            // outcome (a timeout, a backlog or a refusal) needs no separate handling.
+            let _ = self.call("shutdown", json!({}), timeout);
+        }
+        self.stdin = None;
+        loop {
+            if self
+                .child
+                .as_mut()
+                .expect("owned child")
+                .try_wait()?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if self.buffer_full() {
+                return Err(ClientError::Backlog {
+                    method: "shutdown".into(),
+                    messages: DEFERRED_MESSAGES,
+                    bytes: DEFERRED_BYTES,
+                });
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let _ = self.child.as_mut().expect("owned child").kill();
+                self.child.as_mut().expect("owned child").wait()?;
+                return Ok(());
+            }
+            let step = left.min(Duration::from_millis(20));
+            if self.closed {
+                // The reader has finished; only the process exit remains to wait for.
+                thread::sleep(step);
+                continue;
+            }
+            match self.lines.recv_timeout(step) {
+                Ok(LineSlot(line, _)) => self.buffer_next(line),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => self.buffer_next(Line::End),
+            }
+        }
+    }
+
+    /// Classify one line and queue the message for [`Client::poll`].
+    fn buffer_next(&mut self, line: Line) {
+        let message = self.classify(line);
+        self.buffered.push_back(sized(message));
+    }
+
+    /// Whether the deferred queue has reached the bound a single [`Client::call`] stops at.
+    fn buffer_full(&self) -> bool {
+        self.buffered.len() >= DEFERRED_MESSAGES
+            || self.buffered.iter().map(|(_, bytes)| *bytes).sum::<usize>() >= DEFERRED_BYTES
     }
 
     /// Ask the engine to close, then wait for the process to exit; kills it when it does not exit
@@ -1062,6 +1319,11 @@ impl Client {
     /// # Errors
     /// Fails only when waiting for or killing the process fails.
     pub fn shutdown(mut self, timeout: Duration) -> Result<ExitStatus, ClientError> {
+        self.shutdown_in_place(timeout)
+    }
+
+    /// Shared by [`Client::shutdown`] and [`Client::restart_and_resume`].
+    fn shutdown_in_place(&mut self, timeout: Duration) -> Result<ExitStatus, ClientError> {
         let deadline = Instant::now() + timeout;
         if !self.closed && self.supports("shutdown") {
             let _ = self.call("shutdown", json!({}), timeout);
@@ -1078,7 +1340,7 @@ impl Client {
     /// Fails when the process cannot be signalled.
     pub fn kill(&mut self) -> io::Result<()> {
         self.stdin = None;
-        match self.child.kill() {
+        match self.child.as_mut().expect("owned child").kill() {
             Err(error) if error.kind() != io::ErrorKind::InvalidInput => Err(error),
             _ => Ok(()),
         }
@@ -1087,12 +1349,12 @@ impl Client {
     fn wait_or_kill(&mut self, grace: Duration) -> io::Result<ExitStatus> {
         let deadline = Instant::now() + grace;
         loop {
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = self.child.as_mut().expect("owned child").try_wait()? {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                return self.child.wait();
+                let _ = self.child.as_mut().expect("owned child").kill();
+                return self.child.as_mut().expect("owned child").wait();
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1101,10 +1363,55 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // Closing stdin is the engine's graceful EOF path; kill only if it does not settle.
+        // Do not stall a frontend's event loop. The reaper owns the process until it has been
+        // waited on; explicit shutdown still performs the graceful wait on the caller's thread.
         self.stdin = None;
-        let _ = self.wait_or_kill(self.drop_grace);
+        if let Some(mut child) = self.child.take() {
+            let grace = self.drop_grace;
+            thread::spawn(move || {
+                let deadline = Instant::now() + grace;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return;
+                        }
+                    }
+                }
+            });
+        }
     }
+}
+
+/// Pair a message with its approximate size, the unit `call` bounds its deferred backlog by.
+fn sized(message: Message) -> (Message, usize) {
+    let bytes = message_bytes(&message);
+    (message, bytes)
+}
+
+/// Approximate size of a message: its payload text plus a fixed overhead for its envelope.
+fn message_bytes(message: &Message) -> usize {
+    const OVERHEAD: usize = 64;
+    OVERHEAD
+        + match message {
+            Message::Event(event) => event.body.to_string().len(),
+            Message::Response { method, result, .. } => {
+                method.len()
+                    + match result {
+                        Ok(value) => value.to_string().len(),
+                        Err(error) => error.message.len(),
+                    }
+            }
+            Message::ProtocolError(error) => error.message.len(),
+            Message::Disconnected { outstanding } => {
+                outstanding.iter().map(|o| OVERHEAD + o.method.len()).sum()
+            }
+        }
 }
 
 fn effect(method: &str) -> Effect {
@@ -1177,8 +1484,9 @@ fn spawn_transport(
     stdout: ChildStdout,
     limit: usize,
 ) -> (SyncSender<String>, Receiver<LineSlot>) {
-    let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
-    let (requests, writes) = mpsc::sync_channel::<String>(QUEUED_REQUESTS);
+    let (tx, rx) = transport_queue::channel(QUEUED_FRAMES, TRANSPORT_BYTES, line_bytes);
+    let (requests, writes) =
+        transport_queue::channel::<String>(QUEUED_REQUESTS, TRANSPORT_BYTES, String::len);
     let reader = tx.clone();
     thread::spawn(move || read_frames(BufReader::new(stdout), limit, &reader));
     // Only this thread owns the pipe: complete frames stay FIFO and never interleave. Blocking
@@ -1190,7 +1498,7 @@ fn spawn_transport(
                 .and_then(|()| stdin.flush())
                 .is_err()
             {
-                let _ = tx.send(LineSlot(Line::End));
+                let _ = tx.send(LineSlot(Line::End, 1));
                 break;
             }
         }
@@ -1210,9 +1518,10 @@ fn read_frames(mut reader: impl BufRead, limit: usize, tx: &SyncSender<LineSlot>
         let line = match read {
             Ok(0) | Err(_) => break,
             Ok(_) if buffer.len() > limit => {
-                let _ = tx.send(LineSlot(Line::Malformed(format!(
-                    "frame exceeds {limit} bytes; connection closed"
-                ))));
+                let _ = tx.send(LineSlot(
+                    Line::Malformed(format!("frame exceeds {limit} bytes; connection closed")),
+                    64,
+                ));
                 break;
             }
             Ok(_) => {
@@ -1227,11 +1536,11 @@ fn read_frames(mut reader: impl BufRead, limit: usize, tx: &SyncSender<LineSlot>
                 }
             }
         };
-        if tx.send(LineSlot(line)).is_err() {
+        if tx.send(LineSlot(line, buffer.len().max(1))).is_err() {
             return;
         }
     }
-    let _ = tx.send(LineSlot(Line::End));
+    let _ = tx.send(LineSlot(Line::End, 1));
 }
 
 fn clip(text: &str) -> String {
@@ -1244,4 +1553,10 @@ fn clip(text: &str) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+// The parser records the original wire length; avoid serializing every frame a second time
+// merely to account for queue admission. Decoded JSON has additional bounded overhead.
+fn line_bytes(slot: &LineSlot) -> usize {
+    slot.1
 }

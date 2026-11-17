@@ -122,6 +122,13 @@ const LLAMA_SERVER: &str = if cfg!(windows) {
     "llama-server"
 };
 
+/// stable-diffusion.cpp's server binary on this platform (downloaded image checkpoints run on it).
+const SD_SERVER: &str = if cfg!(windows) {
+    "sd-server.exe"
+} else {
+    "sd-server"
+};
+
 pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "bun",
@@ -402,6 +409,22 @@ pub const RECIPES: &[Recipe] = &[
             Method::Download(prebuilt::LLAMA_CPP),
             Method::Manual(
                 "install llama.cpp from https://github.com/ggml-org/llama.cpp/releases and set DIAL_LLAMA_SERVER to its llama-server",
+            ),
+        ],
+    },
+    Recipe {
+        id: "sd-cpp",
+        title: "stable-diffusion.cpp (sd-server)",
+        requires: &[],
+        program: SD_SERVER,
+        base: Base::Install,
+        artifact: SD_SERVER,
+        // No package manager ships sd-server; the pinned release archive covers macOS arm64,
+        // Linux x64 and Windows x64.
+        methods: &[
+            Method::Download(prebuilt::SD_CPP),
+            Method::Manual(
+                "install stable-diffusion.cpp from https://github.com/leejet/stable-diffusion.cpp/releases and set DIAL_SD_SERVER to its sd-server",
             ),
         ],
     },

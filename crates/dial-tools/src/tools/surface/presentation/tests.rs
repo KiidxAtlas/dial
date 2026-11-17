@@ -115,3 +115,51 @@ fn skill_reference_reads_are_distinct_from_loading_the_core_skill() {
         assert_eq!(view.body, BodyStyle::Quiet);
     }
 }
+
+#[test]
+fn desktop_calls_name_the_operation_without_dumping_input_or_code() {
+    let view = render_call(
+        "computer",
+        &serde_json::json!({
+            "action": "call", "chain": [
+                {"method":"window", "args":["42"]},
+                {"method":"type", "args":["private draft"]}
+            ]
+        }),
+    );
+    assert_eq!(view.label, "Desktop");
+    assert_eq!(view.target, "window 42 · type");
+    assert!(!view.target.contains("private draft"));
+    let script = render_call(
+        "computer",
+        &serde_json::json!({"action":"run", "code":"private code"}),
+    );
+    assert_eq!(script.target, "script");
+}
+
+#[test]
+fn desktop_results_summarize_windows_and_captures_without_replacing_evidence() {
+    let data = serde_json::json!({
+        "value":[{"id":"42", "app":"Editor", "title":"Project"}],
+        "screenshots":[{"width":800,"height":600,"target":"42"}]
+    });
+    let output = ToolOutput::structured(data.clone());
+    let view = render_result(
+        "computer",
+        &serde_json::json!({"action":"call", "chain":[{"method":"windows"}]}),
+        &output,
+    );
+    assert!(view.facts.contains(&"1 window".to_owned()));
+    assert!(view.facts.contains(&"1 screenshot".to_owned()));
+    assert_eq!(view.preview.as_deref(), Some("Editor · Project"));
+    assert_eq!(output.data, Some(data));
+    let failed = render_result(
+        "computer",
+        &serde_json::json!({"action":"run"}),
+        &ToolOutput::err("capture refused"),
+    );
+    assert!(
+        failed.preview.is_none(),
+        "errors must retain their actual evidence"
+    );
+}

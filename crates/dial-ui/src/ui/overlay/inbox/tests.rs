@@ -1,24 +1,62 @@
 use super::*;
 
 #[test]
-fn deduplicates_without_reopening_read_notices_and_bounds_session_memory() {
+fn repeats_reopen_read_notices_and_retain_bounded_occurrences() {
     let mut inbox = Inbox::default();
     inbox.push("Workers", "finished");
     inbox.push("Workers", "finished");
     assert_eq!(inbox.unread(), 1);
     assert_eq!(inbox.read(1), Some(("Workers", "finished")));
     inbox.push("Workers", "finished");
-    // Adding typed metadata later does not reopen an existing read notice.
-    inbox.push_category("Workers", "finished", Category::Completion);
-    assert_eq!(inbox.unread(), 0);
-    assert!(inbox.read(999).is_none());
+    assert_eq!(inbox.unread(), 1);
+    assert_eq!(inbox.entries.len(), 1);
+    assert_eq!(inbox.entries[0].occurrences, 3);
+    assert_eq!(inbox.entries[0].id, 1, "open menu references stay valid");
+    assert!(
+        inbox
+            .choices()
+            .items
+            .iter()
+            .any(|i| i.detail.contains("3 occurrences"))
+    );
+}
+
+#[test]
+fn capacity_evicts_read_notices_first_and_reports_unread_overflow() {
+    let mut inbox = Inbox::default();
     for i in 0..LIMIT {
         inbox.push("Background", &format!("job {i}"));
     }
-    // Notices, mark-all-read and the general settings row.
-    assert_eq!(inbox.choices().items.len(), LIMIT + 2);
-    assert!(inbox.read(1).is_none());
-    assert_eq!(inbox.choices().items[0].value, format!("{}", LIMIT + 1));
+    inbox.read(2).unwrap();
+    inbox.push("Background", "next");
+    assert!(inbox.entries.iter().any(|entry| entry.id == 1));
+    assert!(!inbox.entries.iter().any(|entry| entry.id == 2));
+    assert_eq!(inbox.unread(), LIMIT);
+    inbox.push("Background", "overflow");
+    assert_eq!(inbox.entries.len(), LIMIT);
+    assert_eq!(inbox.overflow_unread, 1);
+    assert!(inbox.choices().summary.contains("1 unread notice evicted"));
+    assert_eq!(inbox.read_all(), LIMIT);
+    assert_eq!(
+        inbox.overflow_unread, 1,
+        "mark-all must not conceal lost notices"
+    );
+}
+
+#[test]
+fn repeat_coalescing_has_a_fixed_time_window() {
+    let mut inbox = Inbox::default();
+    let now = std::time::Instant::now();
+    inbox.push_at("Job", "done", Category::General, now);
+    inbox.push_at("Job", "done", Category::General, now + COALESCE_WINDOW);
+    assert_eq!(inbox.entries.len(), 1);
+    inbox.push_at(
+        "Job",
+        "done",
+        Category::General,
+        now + COALESCE_WINDOW + std::time::Duration::from_secs(1),
+    );
+    assert_eq!(inbox.entries.len(), 2);
 }
 
 #[test]
@@ -63,7 +101,10 @@ fn individual_preferences_use_explicit_categories_without_reading_or_dismissing(
         let mut inbox = Inbox::default();
         inbox.push_category("Same title", "Same body", category);
         let top = inbox.choices();
-        assert_eq!(top.items[0].value, "1", "Enter reads the notice directly");
+        assert_eq!(
+            top.items[2].value, "1",
+            "Enter on a notice reads it directly"
+        );
         let menu = inbox.notice_choices(1).unwrap();
         assert_eq!(menu.command, "inbox");
         assert_eq!(
@@ -136,8 +177,8 @@ fn enter_reads_directly_unread_is_a_mark_and_mark_all_read_clears_every_notice()
     let values: Vec<_> = spec.items.iter().map(|i| i.value.as_str()).collect();
     assert_eq!(
         values,
-        ["2", "1", "read-all", "notifications 2", "notifications"],
-        "per-category settings appear only for categories present"
+        ["read-all", "unread", "2", "1", "notifications"],
+        "one settings row; per-category preferences live on each notice's menu"
     );
     assert_eq!(inbox.read_all(), 2);
     assert_eq!(inbox.unread(), 0);
@@ -181,4 +222,41 @@ fn return_digest_lists_only_notices_that_arrived_during_a_real_focus_loss() {
     let digest = inbox.returned(true).unwrap();
     assert!(digest.starts_with("Background: job 4\nBackground: job 3\nBackground: job 2\n"));
     assert!(digest.ends_with("+2 more; /inbox lists them"), "{digest}");
+}
+
+#[test]
+fn repeated_notice_arriving_while_away_is_in_the_return_digest() {
+    let mut inbox = Inbox::default();
+    inbox.returned(true);
+    inbox.push("Worker", "done");
+    inbox.read(1).unwrap();
+    inbox.returned(false);
+    inbox.push("Worker", "done");
+    assert_eq!(inbox.returned(true).as_deref(), Some("Worker: done"));
+    assert_eq!(inbox.unread(), 1);
+}
+
+#[test]
+fn unread_filter_keeps_actions_and_only_unread_notice_rows_without_reading() {
+    let mut inbox = Inbox::default();
+    inbox.push(
+        "Read",
+        "unread appears in this body but must not match the filter",
+    );
+    inbox.push("Unread", "new");
+    inbox.read(1).unwrap();
+    let filtered = inbox.choices_filtered(true);
+    let values: Vec<_> = filtered
+        .items
+        .iter()
+        .map(|item| item.value.as_str())
+        .collect();
+    assert_eq!(values, ["read-all", "all", "2", "notifications"]);
+    assert_eq!(inbox.unread(), 1);
+    let all = inbox.choices();
+    assert_eq!(
+        all.items[0].value, "read-all",
+        "bulk action stays prominent"
+    );
+    assert!(all.items.iter().any(|item| item.value == "1"));
 }

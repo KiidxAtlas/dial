@@ -111,8 +111,13 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 pub struct PeersOverlay {
     panel_keys: super::panel_keys::PanelKeys,
+    hits: super::panel_keys::RowHits,
     view: PeersView,
     cursor: usize,
+    scroll: usize,
+    manual_scroll: bool,
+    page: usize,
+    total: usize,
     /// The message being typed to the selected peer.
     compose: Option<Editor>,
     message: Option<(String, bool)>,
@@ -127,8 +132,13 @@ impl PeersOverlay {
     pub fn new(view: PeersView) -> Self {
         Self {
             panel_keys: Default::default(),
+            hits: Default::default(),
             view,
             cursor: 0,
+            scroll: 0,
+            manual_scroll: false,
+            page: 1,
+            total: 0,
             compose: None,
             message: None,
             refreshed: Instant::now(),
@@ -153,7 +163,11 @@ impl PeersOverlay {
         self.view = view;
         self.cursor = self.cursor.min(self.view.peers.len().saturating_sub(1));
         if let Some(id) = selected {
+            let manual = self.manual_scroll;
             self.select(&id);
+            if self.selected() == Some(id.as_str()) {
+                self.manual_scroll = manual;
+            }
         }
     }
 
@@ -161,6 +175,7 @@ impl PeersOverlay {
     pub fn select(&mut self, id: &str) {
         if let Some(index) = self.view.peers.iter().position(|peer| peer.id == id) {
             self.cursor = index;
+            self.manual_scroll = false;
         }
     }
 
@@ -196,6 +211,18 @@ impl PeersOverlay {
         if keys.matches(Action::SelectCancel, key) {
             return OverlayEvent::Close;
         }
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            self.manual_scroll = true;
+            self.scroll = if key.code == KeyCode::PageDown {
+                self.scroll
+                    .saturating_add(self.page)
+                    .min(self.total.saturating_sub(self.page))
+            } else {
+                self.scroll.saturating_sub(self.page)
+            };
+            return OverlayEvent::None;
+        }
+        let old_cursor = self.cursor;
         let last = self.view.peers.len().saturating_sub(1);
         if keys.matches(Action::SelectUp, key) {
             self.cursor = self.cursor.saturating_sub(1);
@@ -221,6 +248,9 @@ impl PeersOverlay {
                 Some('c') => return self.request(PeerAction::Clear),
                 _ => {}
             }
+        }
+        if old_cursor != self.cursor {
+            self.manual_scroll = false;
         }
         OverlayEvent::None
     }
@@ -256,8 +286,28 @@ impl PeersOverlay {
         OverlayEvent::None
     }
 
+    /// Select a rendered peer, keeping message sending explicit.
+    pub fn click(&mut self, x: u16, y: u16) -> OverlayEvent {
+        if !self.panel_keys.open()
+            && self.compose.is_none()
+            && let Some(index) = self.hits.hit(x, y)
+        {
+            self.cursor = index;
+            self.manual_scroll = false;
+        }
+        OverlayEvent::None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(frame, ctx, "Project peers", "Enter writes a message to the selected session; it reaches that session's model at its next request.\nClaims show which files each session is working on; overlapping claims are marked.", false, false) {
+        self.hits.begin(frame.area());
+        self.panel_keys.set_footer(vec![
+            "Enter message".into(),
+            "r refresh".into(),
+            "c clear my claims".into(),
+            "PgUp/PgDn scroll board".into(),
+            "Esc close".into(),
+        ]);
+        if self.panel_keys.draw(frame, ctx, "Project peers", "Enter writes a message to the selected session; it reaches that session's model at its next request.\nClaims show which files each session is working on; overlapping claims are marked. PageUp/PageDown scroll the board without changing the message recipient.", false, false) {
             return;
         }
         let dot = ctx.theme.sym(Sym::Dot);
@@ -284,7 +334,7 @@ impl PeersOverlay {
         );
     }
 
-    fn body(&self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
+    fn body(&mut self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(width), usize::from(height));
         if w == 0 || h == 0 {
             return Vec::new();
@@ -315,9 +365,11 @@ impl PeersOverlay {
                 lines.push(indented(theme, &line, Tok::Muted, w));
             }
         }
+        let mut targets = Vec::new();
         for (index, peer) in self.view.peers.iter().enumerate() {
             let start = lines.len();
             lines.extend(session_lines(theme, peer, Some(index == self.cursor), w));
+            targets.push((start, lines.len(), index));
             if index == self.cursor {
                 selected = (start, lines.len());
             }
@@ -325,7 +377,19 @@ impl PeersOverlay {
         // Footer: an optional message row, an optional compose row, then the key hints.
         let footer = 1 + usize::from(self.compose.is_some()) + usize::from(self.message.is_some());
         let room = h.saturating_sub(footer);
-        let offset = selected.1.saturating_sub(room).min(selected.0);
+        let offset = if self.manual_scroll {
+            self.scroll.min(lines.len().saturating_sub(room))
+        } else {
+            selected.1.saturating_sub(room).min(selected.0)
+        };
+        self.scroll = offset;
+        self.page = room.max(1);
+        self.total = lines.len();
+        for (start, end, index) in targets {
+            for row in start.max(offset)..end.min(offset + room) {
+                self.hits.row(0, row - offset, w, index);
+            }
+        }
         let total = lines.len();
         let mut out: Vec<Line<'static>> = lines
             .into_iter()

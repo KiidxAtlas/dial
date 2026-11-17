@@ -168,11 +168,15 @@ impl Shell {
         // A joined guest's prompts belong to the host agent: send them there or refuse. The local
         // agent never runs them.
         if !automatic && let Some(routed) = crate::collab::room::route_guest_prompt(text) {
-            let message = match routed {
-                Ok(()) => "Sent to the host agent; its replies arrive as collab entries.",
-                Err(message) => message,
+            use crate::ui::overlay::inbox::Category;
+            let (category, message) = match routed {
+                Ok(()) => (
+                    Category::General,
+                    "Sent to the host agent; its replies arrive as collab entries.",
+                ),
+                Err(message) => (Category::Error, message),
             };
-            self.note("Collab", message);
+            self.notify(category, "Collab", message);
             return Ok(Step::Done);
         }
         if !automatic {
@@ -346,8 +350,13 @@ impl Shell {
         }
         // Inbox availability is independent of terminal notification preferences. Use the
         // authoritative typed outcome, not message text, to attach its settings destination.
-        // A delivered reply is already on screen, so only work outcomes reach the inbox.
-        if outcome != crate::agent::TurnOutcome::Answered
+        // A finished foreground turn (a reply or completed work) already shows its answer and
+        // handoff on screen, so an unread inbox entry would only repeat it; completed work is
+        // kept only when the terminal reported the user looked away, for the return digest.
+        // Outcomes that need the user (a question, a failure, a block, unfinished work) are kept.
+        let on_screen =
+            turn_shown_on_screen(outcome, crate::ui::termcaps::terminal_reported_unfocused());
+        if !on_screen
             && let Some(notice) = crate::ui::termcaps::turn_end_notice(outcome, true, true)
         {
             use crate::ui::overlay::inbox::Category;
@@ -415,6 +424,17 @@ impl Shell {
             anyhow::bail!("terminal draw failed; the screen was restored");
         }
         Ok(Step::Done)
+    }
+}
+
+/// Whether a foreground turn's ending is already in front of the user, so the inbox need not
+/// repeat it: a reply always is; completed work is unless the terminal reported the user looked
+/// away (then the return digest names it). Questions, failures and unfinished work stay in the inbox.
+fn turn_shown_on_screen(outcome: crate::agent::TurnOutcome, reported_unfocused: bool) -> bool {
+    match outcome {
+        crate::agent::TurnOutcome::Answered => true,
+        crate::agent::TurnOutcome::Completed => !reported_unfocused,
+        _ => false,
     }
 }
 

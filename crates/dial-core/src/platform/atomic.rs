@@ -106,7 +106,7 @@ pub fn validate_private_path(dir: &Path) -> Result<()> {
 
 /// Owner-private state larger than this is refused. Callers that can defer work (such as stream
 /// reclamation) check it before publishing, so a refusal never corrupts or latches their state.
-pub(crate) const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
+pub const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Owner-private publication rejects links and foreign owners. It never creates parent directories
 /// or acquires a lock: the transaction owner must prepare the private directory and hold its lock.

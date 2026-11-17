@@ -4,13 +4,17 @@ use ring::signature::KeyPair;
 use serde_json::json;
 
 #[test]
-fn reset_provider_forgets_chatgpt_account_registrations_and_tokens() {
+fn reset_provider_forgets_chatgpt_account_registrations_tokens_and_model_lists() {
     let dir = tempfile::tempdir().unwrap();
     test_account(dir.path(), false);
+    save_catalog(dir.path(), "oaiapp_test", &ModelCatalog::default()).unwrap();
     assert!(!accounts(dir.path()).unwrap().is_empty());
     crate::llm::catalog::remove_provider_credentials(dir.path(), "chatgpt", &[]).unwrap();
     assert!(accounts(dir.path()).unwrap().is_empty());
     assert!(resolve_account(dir.path(), None).is_err());
+    let cache =
+        std::fs::read(crate::config::paths::chatgpt_model_catalog_file(dir.path())).unwrap();
+    assert_eq!(cache, b"{}");
 }
 fn attempt() -> Attempt {
     Attempt {
@@ -164,8 +168,9 @@ fn codex_model_discovery_sends_dial_account_headers_and_normalizes_catalog() {
     )]);
     let token = SecretToken::new(test_access("workspace-1"));
     let url = format!(
-        "{}/codex/models?client_version={CLIENT_VERSION}",
-        server.url
+        "{}/codex/models?client_version={}",
+        server.url,
+        client_version()
     );
     let mut response = codex_request("workspace-1", &token, &url, 5).unwrap();
     let models =
@@ -176,7 +181,7 @@ fn codex_model_discovery_sends_dial_account_headers_and_normalizes_catalog() {
     let request = server.requests().remove(0);
     assert_eq!(
         crate::llm::fake::request_line(&request),
-        format!("GET /codex/models?client_version={CLIENT_VERSION} HTTP/1.1")
+        format!("GET {} HTTP/1.1", url.trim_start_matches(&server.url))
     );
     assert_eq!(
         crate::llm::fake::header(&request, "chatgpt-account-id").as_deref(),
@@ -454,14 +459,23 @@ fn account_switching_is_isolated_and_corrupt_or_symlink_storage_fails_closed() {
     }
     assert!(select_account(dir.path(), "oaiapp_two").is_err());
     assert!(accounts(dir.path()).unwrap()[0].active);
+    save_catalog(dir.path(), "oaiapp_two", &ModelCatalog::default()).unwrap();
+    save_catalog(dir.path(), "oaiapp_test", &ModelCatalog::default()).unwrap();
     assert!(
         sign_out(dir.path(), "oaiapp_two", Arc::new(AtomicBool::new(false)))
             .unwrap()
-            .contains("Signed out")
+            .contains("removed the account")
     );
     let state = load(dir.path()).unwrap();
+    assert!(!state.accounts.contains_key("oaiapp_two"));
     assert_eq!(state.active.as_deref(), Some("oaiapp_test"));
     assert!(state.accounts["oaiapp_test"].tokens.is_some());
+    let cache: BTreeMap<String, Value> = serde_json::from_slice(
+        &std::fs::read(crate::config::paths::chatgpt_model_catalog_file(dir.path())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cache.keys().collect::<Vec<_>>(), ["oaiapp_test"]);
+    assert!(sign_out(dir.path(), "oaiapp_two", Arc::new(AtomicBool::new(false))).is_err());
     #[cfg(unix)]
     {
         let other = tempfile::tempdir().unwrap();

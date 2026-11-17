@@ -61,7 +61,8 @@ const GOALS: &[Goal] = &[
     Goal {
         title: "Start or continue work",
         blurb: "begin, resume or plan a conversation",
-        commands: &["new", "sessions", "model", "plan", "rename", "fork", "help"],
+        // `help` is left out: this panel is what it opens.
+        commands: &["new", "sessions", "model", "plan", "rename", "fork"],
         custom: false,
     },
     Goal {
@@ -168,6 +169,9 @@ pub struct ChoiceSpec {
     pub items: Vec<ChoiceItem>,
     pub prompt: String,
     pub summary: String,
+    /// Wrapped copy for an unfiltered empty picker (for example loading or unavailable sources).
+    /// Filtering still uses the standard no-match message.
+    pub empty_message: String,
     pub current_tag: Option<String>,
 }
 
@@ -194,6 +198,7 @@ enum View {
 enum Row {
     Goal(usize),
     AllActions,
+    LocalSearch,
     Entry(usize),
     Unified(usize),
 }
@@ -263,7 +268,7 @@ fn action_label(command: &CommandEntry) -> &str {
     match command.name.as_str() {
         "model" => "Choose a model",
         "providers" => "Connect a provider",
-        "settings" => "Customize Dial",
+        "settings" => "Open all settings",
         "setup" => "Set up optional tools",
         "sessions" | "resume" => "Continue a conversation",
         "new" => "Start a conversation",
@@ -552,6 +557,7 @@ impl PaletteOverlay {
                         .map(|&index| Row::Entry(index))
                         .chain((0..GOALS.len()).map(Row::Goal))
                         .chain(std::iter::once(Row::AllActions))
+                        .chain(self.unified.is_some().then_some(Row::LocalSearch))
                         .collect();
                 }
                 View::Goal(goal) => {
@@ -582,8 +588,10 @@ impl PaletteOverlay {
                 {
                     return None;
                 }
-                let name = text::fuzzy(query, &entry.command.name);
-                let other = text::fuzzy(
+                // Names match tightly; the longer label, description and group text only on a
+                // word piece, so a query never surfaces rows that merely contain its letters.
+                let name = text::fuzzy_compact(query, &entry.command.name);
+                let other = text::fuzzy_prose(
                     query,
                     &format!(
                         "{} {} {}",
@@ -878,6 +886,11 @@ impl PaletteOverlay {
     /// Open a goal or the tabs, or run the entry (or ask for its required arguments first).
     fn activate(&mut self, row: Row) -> OverlayEvent {
         match row {
+            Row::LocalSearch => {
+                self.search.set("all:");
+                self.reset_selection();
+                OverlayEvent::None
+            }
             Row::Unified(index) => {
                 let result = &self.unified.as_ref().unwrap().entries[index];
                 OverlayEvent::Action(format!("command:/{}", result.command))
@@ -948,6 +961,8 @@ impl PaletteOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        // A help sheet must never retain click targets from the underlying action list.
+        self.list_bounds = None;
         if self.panel_keys.draw(
             frame,
             ctx,
@@ -976,8 +991,19 @@ impl PaletteOverlay {
             &[""]
         };
         let extra = title_extra(ctx.theme, &title, frame.area().width, extras);
-        let area = frame.area();
-        self.list_bounds = None;
+        let mut area = frame.area();
+        if self.is_action_search() {
+            // Keep a short action list and its controls together. Longer lists scroll; the
+            // Plan/Progress inspector retains its full-height presentation.
+            let height = self.rows().len().clamp(1, 10) as u16 + 10;
+            area.height = area.height.min(height + u16::from(self.shows_tabs()));
+        } else if self.choice.is_some() && self.progress.is_none() {
+            // A short picker (the inbox, session controls) ends under its last row and detail
+            // instead of leaving the rest of the screen as an empty panel. Its summary can wrap,
+            // so it keeps a few more rows of chrome than the action list.
+            let height = self.rows().len().clamp(1, 16) as u16 + 13;
+            area.height = area.height.min(height);
+        }
         let inner = (area.width >= 5 && area.height >= 5).then(|| {
             chrome::panel_block_titled(ctx.theme, Section::Dial, &title, &extra).inner(area)
         });
@@ -995,6 +1021,12 @@ impl PaletteOverlay {
             let mut lines = self.compose(body.width, body.height, ctx);
             lines.truncate(usize::from(body.height));
             frame.render_widget(ratatui::widgets::Paragraph::new(lines), body);
+        } else if let Some(body) = inner {
+            let block = chrome::panel_block_titled(ctx.theme, Section::Dial, &title, &extra);
+            frame.render_widget(block, area);
+            let mut lines = self.compose(body.width, body.height, ctx);
+            lines.truncate(usize::from(body.height));
+            frame.render_widget(ratatui::widgets::Paragraph::new(lines), body);
         } else {
             panel(frame, ctx.theme, Section::Dial, &title, &extra, |w, h| {
                 self.compose(w, h, ctx)
@@ -1002,6 +1034,7 @@ impl PaletteOverlay {
         }
         if let Some(inner) = inner
             && self.arguments.is_none()
+            && !self.progress_tab
         {
             let headers = self.list_top() as u16 - 1;
             let visible = self.page.min(self.rows().len().saturating_sub(self.scroll)) as u16;
@@ -1077,6 +1110,12 @@ impl PaletteOverlay {
             );
         }
         let searching = !self.search.text.trim().is_empty();
+        if !searching
+            && let Some(spec) = &self.choice
+            && !spec.empty_message.is_empty()
+        {
+            return spec.empty_message.clone();
+        }
         match (self.choice.is_some(), searching, self.view) {
             (true, true, _) => " No choices match. Esc clears the search.",
             (true, false, _) => " No choices to pick from.",
@@ -1284,6 +1323,12 @@ impl PaletteOverlay {
                         Style::default()
                     };
                     let (name, description, right, current) = match picked {
+                        Row::LocalSearch => (
+                            "Search local".to_owned(),
+                            "Actions, Settings, Sessions, Help".to_owned(),
+                            "all:".to_owned(),
+                            false,
+                        ),
                         Row::Unified(index) => {
                             let result = &self.unified.as_ref().unwrap().entries[index];
                             (
@@ -1331,9 +1376,19 @@ impl PaletteOverlay {
                                     {
                                         "recent".into()
                                     } else {
+                                        // The right column holds a key when the action has
+                                        // one; a category only where rows span categories
+                                        // (all actions, or a search), never mixed into a
+                                        // goal or one category's tab where it repeats itself.
+                                        let across = !self.search.text.is_empty()
+                                            || (self.view == View::Tabs && self.group == 0);
                                         shortcut(&entry.command.name)
                                             .map(|a| ctx.keys.label(a))
-                                            .unwrap_or_else(|| group(&entry.command).into())
+                                            .filter(|key| !key.is_empty())
+                                            .or_else(|| {
+                                                across.then(|| group(&entry.command).into())
+                                            })
+                                            .unwrap_or_default()
                                     },
                                     false,
                                 ),
@@ -1430,6 +1485,11 @@ impl PaletteOverlay {
                     out.push(Line::default());
                 }
                 let (header, description, note) = match picked {
+                    Row::LocalSearch => (
+                        " Search local".to_owned(),
+                        "Actions, Settings, Sessions, Help".to_owned(),
+                        " Enter opens local search (all:). No model or network request.".to_owned(),
+                    ),
                     Row::Unified(index) => {
                         let result = &self.unified.as_ref().unwrap().entries[index];
                         (

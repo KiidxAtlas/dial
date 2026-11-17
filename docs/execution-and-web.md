@@ -293,6 +293,17 @@ Computer helpers in JavaScript and Python consume the host's raw structured tool
 values, display text, and screenshot artifacts remain available through the same approval-gated
 bridge; a denied or malformed response raises an error rather than returning an empty result.
 
+A native eval cell handed to a background job retains the workspace serialization lease until
+completion or teardown. It cannot overlap a conflicting serialized operation merely because the
+foreground call returned. Paused foreground host callbacks release/reacquire that lease through the
+existing callback path; background cells continue to refuse host callbacks.
+
+Ranged text-data reads bound both retained output and scanning: each page consumes at most 64 MiB
+of input, including skipped lines, and refuses larger scans explicitly rather than reporting false
+EOF. For farther offsets, select a smaller source or use an approved streaming shell operation.
+Host inventory probes share a total deadline, retain at most 4 KiB of output per probe and clean up
+owned process groups; macOS version/memory probes use the same runner.
+
 ### Execution ownership and transport
 
 Every forked execution owner gets independent Python, JavaScript, browser and computer session
@@ -463,13 +474,14 @@ network settlement. A missing or non-actionable click target must not wait indef
 `[browser] timeout_secs` to a larger value (up to 3600) for slower operations; an explicit configured
 value of `0` retains unlimited waits. Per-call `timeout` can shorten, but not exceed, a nonzero
 configured cap; per-call `0` still uses that cap. Existing configurations explicitly saving `0`
-must be updated to enable the deadline. Deadline/cancellation failures may retire Dial's owned
-browser session; inspect current tabs before further actions and never blindly retry a click that
-may already have taken effect.
+must be updated to enable the deadline. Never blindly retry a timed-out click: it may already have
+taken effect. Ordinary action errors retain Playwright's diagnostic and preserve the tab.
 
-Action errors (for example, a selector that never becomes actionable) retain Playwright's diagnostic
-and preserve the tab. The action deadline leaves a small response margin before the outer watchdog;
-only transport failure/cancellation or an unresponsive action requires session retirement.
+A timed-out `run` or `call` quarantines the adapter before returning: further actions are refused,
+WebSocket bridge authority is revoked, and Dial-owned contexts are closed best-effort. Use
+`shutdown`, then open a fresh browser session. Attached operator contexts are not closed; their
+JavaScript may still be running and must be stopped by the operator. Quarantine is not proof that
+attached execution stopped. Transport failure/cancellation can also retire the session.
 After successful navigation (`open`, `navigate`, `reload`, `back`, `forward`), background HTTP gets
 up to 15 seconds to settle, including response delivery to Chromium and 500 ms without requests.
 Other completed actions retain the separate one-second budget. Both budgets respect the remaining
@@ -528,4 +540,8 @@ as skipped.
 
 ### Captures, recording and performance
 
-`screenshot` accepts `format` (`png` or `jpeg`), `quality` (1–100, JPEG only), `annotate` (overlays numbered boxes on visible interactive elements and returns each label with its CSS selector, which DOM actions accept) and `if_changed` (returns no image when the capture matches the previous one of the same tab and options). `pdf` writes a PDF to the session artifacts directory. `record_start` begins a screencast and `record_stop` encodes it to an MP4 with `ffmpeg`, which must be on `PATH`; a missing `ffmpeg` is reported as an error. `record_start` fails while a recording runs unless `record_restart` is set. `profile_start`/`profile_stop` write a CPU profile (`.cpuprofile`). `metrics` returns the page's Performance counters. `vitals` reports TTFB, FCP, LCP, CLS, INP and load timings from the buffered performance timeline, which can differ from the page's own live observers.
+`screenshot` accepts `format` (`png` or `jpeg`), `quality` (1–100, JPEG only), `annotate` (numbered boxes with CSS selectors) and `if_changed` (no image when the same tab/options are unchanged). Snapshot, annotation and accessibility text clipping preserves Unicode character boundaries. `pdf` writes to session artifacts.
+
+`record_start` begins a screencast; `record_stop` encodes it to MP4 using `ffmpeg` on `PATH` (absence is an error). Starting while recording requires `record_restart`. Recording is bounded to five minutes, 128 MiB, 9,000 frames, 5 MiB per frame and four pending write/ack operations. Receipts report `bytes` and `capped`; a capped recording is not a complete recording of the requested interval.
+
+`profile_start`/`profile_stop` write a CPU profile (`.cpuprofile`); `metrics` returns Performance counters. `vitals` uses bounded observers installed at document start where possible, with availability and capping metadata. Unsupported/unobserved metrics are `null`, not fabricated zero measurements; INP is provisional. Existing attached documents have late/partial-history coverage and installation timing metadata: nonzero cumulative values are lower bounds, and unknown cumulative zero values are `null`. These snapshots are not guaranteed document-lifetime or final Core Web Vitals measurements.

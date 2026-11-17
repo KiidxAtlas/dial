@@ -2,6 +2,221 @@ use super::super::settings::testkit::*;
 use super::*;
 
 use crossterm::event::KeyModifiers;
+// Extract the rendered secondary rows, excluding pinned input, footer and paging hint.
+// Clamped last pages overlap; retain each first-seen row to reconstruct the reviewed copy.
+fn collect_form_copy(seen: &mut Vec<String>, shown: &str) {
+    for row in shown.lines().skip(3).take(5) {
+        let row = row.trim().to_owned();
+        if !row.is_empty() && !row.starts_with("PageUp/PageDown") && !seen.contains(&row) {
+            seen.push(row);
+        }
+    }
+}
+
+#[test]
+fn narrow_provider_forms_page_complete_copy_with_input_and_actions_pinned() {
+    let rig = Rig::new();
+    for width in [38, 60, 80] {
+        for (step, current) in STEPS.iter().enumerate() {
+            let mut o = overlay();
+            let mut wizard = Wizard::new();
+            wizard.step = step;
+            wizard.editor.set("ACTIVE_INPUT");
+            wizard.error = Some(
+                "Validation failed: choose a different value before continuing; ERROR_TAIL".into(),
+            );
+            o.mode = Mode::Wizard(wizard);
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                let shown = draw(&mut o, &rig, width, 10);
+                assert!(shown.contains("ACTIVE_INPUT"), "{shown}");
+                assert!(shown.contains("Esc") && shown.contains("Enter"), "{shown}");
+                // The pinned row must identify the field even after its help scrolls away.
+                let heading = shown.lines().nth(1).expect("pinned wizard heading");
+                let field = match current {
+                    Step::Id => "Provider id",
+                    Step::Label => "Display name",
+                    Step::Url => "Base URL",
+                    Step::Env => "API key environment variable",
+                };
+                assert!(heading.contains(field), "{shown}");
+                assert!(heading.contains(&format!("{}/4", step + 1)), "{shown}");
+                collect_form_copy(&mut seen, &shown);
+                assert!(matches!(
+                    send(&mut o, &rig, key(KeyCode::PageDown)),
+                    OverlayEvent::None
+                ));
+            }
+            let seen = seen.join(" ");
+            assert!(seen.contains("ERROR_TAIL"), "{seen}");
+            let compact: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+            let help: String = current
+                .help()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(compact.contains(&help), "step {step}: {seen}");
+            assert!(matches!(o.mode, Mode::Wizard(_)));
+        }
+        let mut o = overlay();
+        let mut entry = o.entries().remove(0);
+        entry.base_url = Some(
+            "https://example.com/a/long/endpoint/that/must/remain/inspectable/ENDPOINT_TAIL".into(),
+        );
+        let mut secret = Secret::new();
+        for c in "secret-token".chars() {
+            secret.push(c);
+        }
+        o.mode = Mode::Key {
+            entry,
+            secret,
+            error: Some(
+                "Cannot save yet: correct the configuration before trying again; ERROR_TAIL".into(),
+            ),
+        };
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let shown = draw(&mut o, &rig, width, 10);
+            assert!(
+                shown.contains('•') && shown.contains("Esc") && shown.contains("Enter"),
+                "{shown}"
+            );
+            assert!(!shown.contains("secret-token"));
+            collect_form_copy(&mut seen, &shown);
+            assert!(matches!(
+                send(&mut o, &rig, key(KeyCode::PageDown)),
+                OverlayEvent::None
+            ));
+        }
+        let seen = seen.join(" ");
+        let compact: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(
+                "https://example.com/a/long/endpoint/that/must/remain/inspectable/ENDPOINT_TAIL"
+            ),
+            "{seen}"
+        );
+        for tail in ["ERROR_TAIL", "after you press Enter"] {
+            assert!(seen.contains(tail), "{tail}: {seen}");
+        }
+        let Mode::Key { secret, .. } = &o.mode else {
+            panic!("key form changed mode")
+        };
+        assert_eq!(secret.0, "secret-token");
+        for _ in 0..20 {
+            assert!(matches!(
+                send(&mut o, &rig, key(KeyCode::PageUp)),
+                OverlayEvent::None
+            ));
+            draw(&mut o, &rig, width, 10);
+        }
+        assert!(draw(&mut o, &rig, width, 10).contains("Cannot save yet"));
+    }
+}
+
+#[test]
+fn paging_provider_form_copy_preserves_editor_navigation_and_does_not_advance() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let mut wizard = Wizard::new();
+    wizard.editor.set("middle");
+    o.mode = Mode::Wizard(wizard);
+    let first = draw(&mut o, &rig, 38, 10);
+    send(&mut o, &rig, key(KeyCode::PageDown));
+    assert_ne!(draw(&mut o, &rig, 38, 10), first);
+    let mut release = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    let paged = draw(&mut o, &rig, 38, 10);
+    send(&mut o, &rig, Event::Key(release));
+    assert_eq!(draw(&mut o, &rig, 38, 10), paged);
+    send(&mut o, &rig, key(KeyCode::PageUp));
+    assert_eq!(draw(&mut o, &rig, 38, 10), first);
+    send(&mut o, &rig, key(KeyCode::Home));
+    send(&mut o, &rig, ch('A'));
+    send(&mut o, &rig, key(KeyCode::End));
+    send(&mut o, &rig, ch('Z'));
+    let Mode::Wizard(w) = &o.mode else {
+        panic!("wizard closed")
+    };
+    assert_eq!(w.step, 0);
+    assert_eq!(w.editor.text, "AmiddleZ");
+    send(&mut o, &rig, key(KeyCode::F(1)));
+    draw(&mut o, &rig, 38, 10);
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(draw(&mut o, &rig, 38, 10).contains("AmiddleZ"));
+}
+
+#[test]
+fn short_provider_forms_keep_active_input_and_error_visible() {
+    let rig = Rig::new();
+    for height in [10, 12] {
+        let mut o = overlay();
+        select(&mut o, "work");
+        send(&mut o, &rig, ch('k'));
+        send(&mut o, &rig, key(KeyCode::Enter));
+        let shown = draw(&mut o, &rig, 80, height);
+        assert!(shown.contains("Type or paste the key first"), "{shown}");
+        send(&mut o, &rig, ch('x'));
+        assert!(draw(&mut o, &rig, 80, height).contains('•'));
+        for step in 0..STEPS.len() {
+            let mut wizard = Wizard::new();
+            wizard.step = step;
+            wizard.editor.set("ACTIVE_INPUT");
+            wizard.error = Some("FORM_ERROR".into());
+            o.mode = Mode::Wizard(wizard);
+            let shown = draw(&mut o, &rig, 80, height);
+            assert!(
+                shown.contains("ACTIVE_INPUT") && shown.contains("FORM_ERROR"),
+                "step {step}: {shown}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_removal_review_reaches_all_consequences_without_changing_scope() {
+    let rig = Rig::new();
+    for (width, height) in [(60, 6), (80, 8)] {
+        let mut o = overlay();
+        select(&mut o, "work");
+        send(&mut o, &rig, ch('x'));
+        let mut seen = String::new();
+        for _ in 0..30 {
+            seen.push_str(&draw(&mut o, &rig, width, height));
+            send(&mut o, &rig, key(KeyCode::Down));
+        }
+        let seen = seen.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(seen.contains("shared across projects"), "{seen}");
+        assert!(seen.contains("model files stay unchanged"), "{seen}");
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::RemoveProvider {
+                scope: Scope::Global,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn tiny_provider_review_cannot_confirm_but_can_cancel() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    select(&mut o, "work");
+    send(&mut o, &rig, ch('x'));
+    draw(&mut o, &rig, 12, 3);
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Confirm(..)));
+    send(&mut o, &rig, key(KeyCode::Esc));
+    assert!(matches!(o.mode, Mode::List));
+}
+
 #[test]
 fn a_local_server_that_is_not_running_is_expected_but_real_failures_stay_red() {
     let entry = |base: &str, state: &str, detail: &str, configured: bool| Entry {
@@ -427,7 +642,7 @@ fn list_shows_status_chips_counts_and_key_state() {
     );
     assert!(
         shown.contains("+ Add provider")
-            && shown.contains("scope: global")
+            && shown.contains("Save to: All projects")
             && shown.contains("● reachable")
             && shown.contains("○ not set up")
             && shown.contains("○ not running")
@@ -779,7 +994,7 @@ fn removing_a_configured_provider_needs_confirmation() {
         OverlayEvent::None
     ));
     assert!(matches!(o.mode, Mode::List));
-    send(&mut o, &rig, ctrl('s'));
+    send(&mut o, &rig, ctrl('b'));
     send(&mut o, &rig, key(KeyCode::Delete));
     match send(&mut o, &rig, key(KeyCode::Enter)) {
         OverlayEvent::RemoveProvider { id, scope } => {
@@ -1017,7 +1232,7 @@ fn before_discovery_configured_providers_show_as_unknown() {
     assert!(
         shown.contains("unknown")
             && shown.contains("Waiting for the first scan")
-            && shown.contains("scope: project"),
+            && shown.contains("Save to: This project"),
         "{shown}"
     );
     let mut empty = ProviderOverlay::new(None, BTreeMap::new(), Box::new(|_| false), Scope::Global);
@@ -1390,10 +1605,13 @@ fn narrow_scope_caption_does_not_overwrite_the_provider_title() {
             let title = shown.lines().next().unwrap();
             assert!(title.contains("Providers"), "{shown}");
             assert!(
-                title.contains(&format!("scope: {}", scope_name(scope))),
+                title.contains(match scope {
+                    Scope::Global => "Save to: All projects",
+                    Scope::Project => "Save to: This project",
+                }),
                 "{shown}"
             );
-            if width == 60 {
+            if width == 60 && scope == Scope::Project {
                 assert!(title.contains(project), "{shown}");
             }
         }
@@ -1417,8 +1635,8 @@ fn named_scope_and_connection_actions_separate_endpoint_credentials_and_status()
     )]));
     let shown = draw(&mut o, &rig, 120, 30);
     for expected in [
-        "scope: global",
-        "project (example-project)",
+        "Save to: All projects",
+        "Ctrl+B: This project (example-project)",
         "Endpoint:",
         "Status:",
         "Credential:",
@@ -1430,11 +1648,11 @@ fn named_scope_and_connection_actions_separate_endpoint_credentials_and_status()
         send(
             &mut o,
             &rig,
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
         ),
         OverlayEvent::None
     ));
-    assert!(draw(&mut o, &rig, 120, 30).contains("scope: project (example-project)"));
+    assert!(draw(&mut o, &rig, 120, 30).contains("Save to: This project (example-project)"));
     o.open_menu();
     let Mode::Menu(menu) = &o.mode else {
         panic!("provider actions");
@@ -1547,4 +1765,17 @@ fn cancelling_builtin_provider_reset_changes_nothing() {
     ));
     assert_eq!(o.selected().unwrap().state, "reachable");
     assert!(!o.configured.contains_key("lm-studio"));
+}
+
+#[test]
+fn mouse_selects_provider_without_opening_actions() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let shown = draw(&mut o, &rig, 110, 30);
+    let (x, y) = position(&shown, "OpenAI");
+    assert!(matches!(o.click(x, y), OverlayEvent::None));
+    assert_eq!(o.entries()[o.cursor].id, "openai");
+    assert!(matches!(o.mode, Mode::List));
+    o.click(0, 0);
+    assert_eq!(o.entries()[o.cursor].id, "openai");
 }

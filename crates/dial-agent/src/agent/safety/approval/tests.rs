@@ -859,6 +859,8 @@ fn read_only_inspection_batches_split_only_at_unquoted_separators() {
         r#"ls "a;rm x""#,
         r"ls \;",
         mixed_git.as_str(),
+        // Pipelines of inspections and line filters write nothing either.
+        "ls | wc -l",
     ] {
         assert!(read_only_inspection_batch(command), "{command}");
     }
@@ -867,7 +869,7 @@ fn read_only_inspection_batches_split_only_at_unquoted_separators() {
         "ls; find . -delet?",
         "ls; cat ~/key.pem",
         "ls > out.txt",
-        "ls | wc -l",
+        "ls | tee out.txt",
         "ls &",
         "ls && rm x",
         "ls; rm -rf target",

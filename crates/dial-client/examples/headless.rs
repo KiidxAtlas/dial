@@ -6,7 +6,8 @@
 //!
 //! Set `DIAL_BIN` to choose the engine binary (default: `dial` on `PATH`) and `DIAL_RPC_ARGS`
 //! for extra space-separated flags after `rpc`, such as `--model local`. Approval requests are
-//! denied: an unattended example must never grant permission on the user's behalf.
+//! denied: an unattended example must never grant permission on the user's behalf. The exit status
+//! is non-zero when the turn fails or the engine exits before it settles.
 
 use dial_client::{Client, Decision, Launch, Message};
 use serde_json::json;
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let turn = client.request("send", json!({ "text": prompt }))?;
     let mut stdout = std::io::stdout();
-    loop {
+    let outcome: Result<(), Box<dyn std::error::Error>> = loop {
         let Some(message) = client.poll(Duration::from_millis(250)) else {
             continue;
         };
@@ -53,10 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Message::Response { id, result, .. } if id == turn => {
                 writeln!(stdout)?;
                 match result {
-                    Ok(reply) => eprintln!("[turn finished: {}]", reply["outcome"]),
-                    Err(error) => eprintln!("[turn failed: {error}]"),
+                    Ok(reply) => {
+                        eprintln!("[turn finished: {}]", reply["outcome"]);
+                        break Ok(());
+                    }
+                    // A failed turn is a failed run: the exit status must say so.
+                    Err(error) => {
+                        eprintln!("[turn failed: {error}]");
+                        break Err(error.into());
+                    }
                 }
-                break;
             }
             Message::Response { .. } => {}
             Message::ProtocolError(error) => eprintln!("\n[protocol error: {error}]"),
@@ -71,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("engine exited".into());
             }
         }
-    }
+    };
     client.shutdown(REPLY)?;
-    Ok(())
+    outcome
 }

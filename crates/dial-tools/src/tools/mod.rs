@@ -38,6 +38,8 @@ pub mod fs;
 pub mod integrations;
 pub mod knowledge;
 pub mod net;
+mod serial_operation;
+pub use serial_operation::SerialOperation;
 pub mod surface;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -63,7 +65,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool};
 
 /// Selected tools withheld from the default per-request offer. They stay in the catalog, so the
 /// system prompt lists them under "Loadable tools" and `tool_load` (or `tool_search`) enables them
@@ -245,7 +247,7 @@ pub struct Workspace {
     cargo_session: Option<String>,
     /// Shared ownership prevents maintenance while this workspace or its jobs can use the target.
     cargo_lease: Option<Arc<std::fs::File>>,
-    operations: Arc<Mutex<()>>,
+    operations: Arc<AtomicBool>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
     /// Named sessions a background shell job holds, or settled since their last use.
     shell_busy: Arc<Mutex<BTreeMap<String, exec::shell::session::SessionBusy>>>,
@@ -344,15 +346,12 @@ impl Workspace {
             .as_deref()
             .map(|session| exec::cargo_target::dir_for(&self.root, session))
     }
-    pub fn serial_operation(&self) -> MutexGuard<'_, ()> {
-        self.operations.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn serial_operation(&self) -> SerialOperation {
+        self.serial_operation_checked(|| Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
     }
-    pub(crate) fn try_serial_operation(&self) -> Option<MutexGuard<'_, ()>> {
-        match self.operations.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
+    pub(crate) fn try_serial_operation(&self) -> Option<SerialOperation> {
+        SerialOperation::try_acquire(&self.operations)
     }
 
     /// Wait for workspace ownership without losing cancellation or deadline checks. The caller
@@ -360,7 +359,7 @@ impl Workspace {
     pub fn serial_operation_checked<E>(
         &self,
         mut check: impl FnMut() -> std::result::Result<(), E>,
-    ) -> std::result::Result<MutexGuard<'_, ()>, E> {
+    ) -> std::result::Result<SerialOperation, E> {
         loop {
             check()?;
             if let Some(guard) = self.try_serial_operation() {
@@ -442,6 +441,7 @@ impl Workspace {
                 deny_read,
                 extra_write,
                 allow_network,
+                serial_ports,
             }) => exec::sandbox::Policy::Dev {
                 deny_read: deny_read
                     .iter()
@@ -450,11 +450,13 @@ impl Workspace {
                     .collect(),
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
                 allow_network: *allow_network,
+                serial_ports: *serial_ports,
             },
             Some(exec::sandbox::Policy::Strict {
                 allow_network,
                 deny_read,
                 extra_write,
+                serial_ports,
             }) => exec::sandbox::Policy::Strict {
                 allow_network: *allow_network,
                 deny_read: deny_read
@@ -463,11 +465,13 @@ impl Workspace {
                     .cloned()
                     .collect(),
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
+                serial_ports: *serial_ports,
             },
             None => exec::sandbox::Policy::Strict {
                 allow_network: self.allow_network,
                 deny_read: self.protected_paths.clone(),
                 extra_write: roots.collect(),
+                serial_ports: false,
             },
         }
     }
@@ -2032,6 +2036,7 @@ pub fn apply_sandbox_config(
             allow_network: false,
             deny_read: Vec::new(),
             extra_write: Vec::new(),
+            serial_ports: config.serial_ports,
         }),
         SandboxMode::Dev => {
             let home = std::env::var_os("HOME")
@@ -2058,6 +2063,7 @@ pub fn apply_sandbox_config(
                 deny_read,
                 extra_write,
                 allow_network: config.allow_network,
+                serial_ports: config.serial_ports,
             })
         }
     })

@@ -27,6 +27,1238 @@
       "oneOf": [
         {
           "type": "object",
+          "description": "Native RPC read-only full-text search in the launched project. Runs on a bounded read job (busy when full). Returns {query,limit,hits:[{session_id,entry_id,role,snippet,preview,when,title}],has_more}. Titles are best-effort. Increase limit to expand the ranked window; refine query beyond 1000. Each request queries the current index, not a stable snapshot. Invalid parameters return invalid_params; index failures return failed.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "search_sessions"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "query": {"type": "string", "minLength": 1, "description": "Nonblank query, at most 4096 UTF-8 bytes after trimming."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}
+              },
+              "required": ["query"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Host the active session archive after explicit consent. Defaults to a read-only room; writable rooms retain configured guest-steering gates. Returns {hosting:true,read_only,session_id}, never a room link or signing key. Setup is cancellable. The connection owns the host: disconnect or replacing its session closes the room.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_start"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask before sending true."
+                },
+                "read_only": {
+                  "type": "boolean",
+                  "default": true
+                }
+              },
+              "required": [
+                "confirm"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Stop this connection's hosted room or pending host setup; never stops a guest or a host owned elsewhere. Returns {stopped:true}; no owned host or pending setup returns not_pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_stop"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Disclose this connection's hosted-room bearer link only after explicit consent. Returns {link,read_only}; treat link as a secret. A writable link grants admission and steering only under the host owner's configured gates. Start and status remain metadata-only. No owned host returns not_pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_invite"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask before sending true."
+                }
+              },
+              "required": [
+                "confirm"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Read session mode coordinators and plan state; returns {plan, modes, advisor, external_thinking, plan_yolo_target}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "get_modes"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Idle-only mode transition through the engine owner; returns {state, notices}. Advisor, external_thinking and plan_yolo are session controls; plan_yolo target requires enabled=true. Drafter saves project turn-optimizer settings; fast, slow and extended_context save global preferences through the actor settings-adoption boundary. Never changes approval policy.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "set_mode"
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "vibe"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "skillful"
+                    },
+                    "enabled": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ],
+                      "description": "Omit or send null to toggle."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "plan"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "prewalk"
+                    },
+                    "action": {
+                      "enum": [
+                        "arm",
+                        "restart",
+                        "off"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "advisor"
+                    },
+                    "state": {
+                      "enum": [
+                        "on",
+                        "completion",
+                        "off"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "state"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "external_thinking"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "plan_yolo"
+                    },
+                    "enabled": {
+                      "const": true
+                    },
+                    "target": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "pattern": "\\S"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "plan_yolo"
+                    },
+                    "enabled": {
+                      "const": false
+                    },
+                    "target": {
+                      "type": "null"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "drafter"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "fast"
+                    },
+                    "state": {
+                      "enum": [
+                        "on",
+                        "ultra",
+                        "off"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "state"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "slow"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "const": "extended_context"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "enabled"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Inspect or change the persistent goal. Actions returning a prompt run through the normal turn lifecycle before the response; other actions return {goal}. Goal transitions can be refused without partial mutation.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "goal"
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "get"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "set"
+                    },
+                    "objective": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    },
+                    "token_budget": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "maximum": 18446744073709551615,
+                      "description": "Positive token budget, or null/omitted for no budget."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "objective"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "guided"
+                    },
+                    "idea": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "idea"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "pause"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "resume"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "drop"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "budget"
+                    },
+                    "token_budget": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "maximum": 18446744073709551615,
+                      "description": "Positive token budget, or null/omitted for no budget."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Idle-only coherent recovery view containing the live event projection, messages, busy=false and todo. Refuses with busy while workers are running. Sequence values describe this connection only; this is not replay or an exactly-once acknowledgement.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "recovery_snapshot"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Read user-wide archive projects (default), sessions or prompts; returns the archive owner report. Limit defaults to 30. Project paths resolve relative to the active project. Never deletes or moves a session.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "archive"
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "view": {
+                      "const": "projects",
+                      "default": "projects"
+                    },
+                    "project": {
+                      "type": "null"
+                    },
+                    "query": {
+                      "type": "null"
+                    },
+                    "limit": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "maximum": 500
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "view": {
+                      "const": "sessions"
+                    },
+                    "project": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "query": {
+                      "type": "null"
+                    },
+                    "limit": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "maximum": 500
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "view"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "view": {
+                      "const": "prompts"
+                    },
+                    "project": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "query": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "limit": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "maximum": 500
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "view"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Pack the active actor-owned journal. Path defaults to session-<id>.dialpack relative to the project root; existing outputs are not overwritten. Returns {session_id, path, members, artifacts, subagents, bytes}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "pack_session"
+            },
+            "params": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Rewind conversation only through the session-change gate. Turns cannot exceed available branchable user messages. Returns {session_id, turns, dropped, note, files_restored:false}; does not restore workspace files.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "branch_session"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "turns": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask the user before sending true."
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "turns",
+                "confirm"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Label the active leaf; whitespace is normalized and an empty label clears it. Returns {session_id, entry_id, label}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "label_session"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "label"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Transactionally relocate the active session to a project using the shared relocation owner. Target configuration is validated before mutation; the actor adopts the new layout and rebuilds runtime owners. A session-change gate can refuse the operation.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "move_session"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask the user before sending true."
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "confirm"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Manage connection-owned side conversations even during a main turn, using its frozen snapshot. List/open return the side state, ask returns {message,state}, answer returns {answer}, cancel returns {cancelled}. Ask is refused with busy without a usable snapshot or while a side answer streams. Changes publish side_state events.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "side_thread"
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "list"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "ask"
+                    },
+                    "question": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    },
+                    "new": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "question"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "open"
+                    },
+                    "thread_id": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "thread_id"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "answer"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "cancel"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Fork an answered side thread at its saved ancestry without changing the main session. Wait for the side answer first. Returns {thread_id, session_id}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "side_promote"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "thread_id": {
+                  "type": "string",
+                  "pattern": "\\S"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "thread_id"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. List persisted definitions with access descriptions and last-run timestamps; returns {schedules}. Does not start a runner.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "list_schedules"
+            },
+            "params": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Save a schedule with explicit user consent. Needs a non-null every interval or a nonempty watch list; prompt and trigger byte limits and syntax are validated by the owner. Read-only by default; allow and approve_all explicitly broaden unattended access. Returns {id,saved,access,requires_runner:true}; does not launch the runner.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "add_schedule"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[A-Za-z0-9_-]{0,32}$",
+                  "description": "Omit, null or empty to assign an id."
+                },
+                "prompt": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "every": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Interval as seconds or a number with s/m/h/d suffix; minimum interval and overflow validated by the schedule owner."
+                },
+                "watch": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string",
+                    "pattern": "\\S",
+                    "description": "Project-relative glob, at most 256 UTF-8 bytes."
+                  },
+                  "default": []
+                },
+                "allow": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Tool names, optionally comma-separated; validated by the schedule owner."
+                  },
+                  "default": []
+                },
+                "approve_all": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask the user before sending true."
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "prompt",
+                "confirm"
+              ],
+              "anyOf": [
+                {
+                  "properties": {
+                    "every": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "every"
+                  ]
+                },
+                {
+                  "properties": {
+                    "watch": {
+                      "type": "array",
+                      "minItems": 1
+                    }
+                  },
+                  "required": [
+                    "watch"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Remove a persisted definition; does not interrupt a child already running. Returns {id,removed:true}; unknown ids return not_found.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "remove_schedule"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask the user before sending true."
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "confirm"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Read scheduler lease ownership, definition count and last-run timestamps; returns {running,entries,last_runs}. Does not launch unattended work.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "schedule_status"
+            },
+            "params": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Read stored learning evidence and steering status without initializing state, loading a model or running a gate; returns {model,learning,steering,session_version}. Stored admission is distinct from the session's bound version and steering.runtime.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "research_status"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Run evaluation-gated admission or promote a pending steering vector after explicit consent. Evaluation can admit only a pending candidate against the active version; conflicts are coded. Foreground compute is released while the owner runs; cancellation does not record an operator stop or rejection verdict. Evaluate returns the admission and stored active version; steering promotion returns the owner report. Success reports activation (unchanged, next_turn, stored_only or next_model_load_if_enabled) and foreground_compute_restored: a rejected candidate leaves serving unchanged, a passed candidate is adopted on the next turn only when runtime improvement is enabled, otherwise it remains stored without changing serving state. Steering adoption follows its enabled configuration and model-load boundary. Disabled improvement does not open a serving version store or apply its pinned model. If restoring foreground compute fails after admission, the successful outcome is retained with foreground_compute_error. Progress is emitted as research_progress.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "research_action"
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "evaluate"
+                    },
+                    "candidate": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9223372036854775807
+                    },
+                    "confirm": {
+                      "const": true,
+                      "description": "Explicit user consent is required; ask the user before sending true."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "candidate",
+                    "confirm"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "const": "promote_steering"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "replace": {
+                      "type": "boolean",
+                      "default": false
+                    },
+                    "confirm": {
+                      "const": true,
+                      "description": "Explicit user consent is required; ask the user before sending true."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "action",
+                    "name",
+                    "confirm"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Read room metadata and admitted peer state; returns {room,local_hosts}. Never returns room links, signing keys or proofs.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_status"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Join as a guest after explicit consent to contacting the relay and sharing the chosen name. Returns {joining:true,admission_pending:true}, not write admission. Setup is bounded and cancellable; leave invalidates an in-flight join.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_join"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "link": {
+                  "type": "string",
+                  "description": "Collaboration link, at most 8192 UTF-8 bytes; parsed before network access. Treat as a secret."
+                },
+                "name": {
+                  "type": "string",
+                  "pattern": "\\S",
+                  "maxLength": 64,
+                  "default": "guest",
+                  "description": "Printable guest name, no control characters."
+                },
+                "confirm": {
+                  "const": true,
+                  "description": "Explicit user consent is required; ask the user before sending true."
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "link",
+                "confirm"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Native RPC only. Leave only a joined guest or pending join, never a hosted room. Returns {left:true}; no guest returns not_pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_leave"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Open, query or stop the local comparison workspace without starting inference. Returns status and a capability-scoped loopback URL. Confirm and start selected runs through that workspace; Python 3.11+ and a Dial benchmark checkout are required. Native RPC only; busy open and invalid actions have coded refusals.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },
@@ -1043,6 +2275,17 @@
         },
         {
           "type": "object",
+          "description": "Delete a downloaded local model that discovery lists (Hugging Face cache, LM Studio or MLX-Serve), as Ctrl+D in /models → Get models does. `model` is the model path from list_models or its label. Removes the model's whole folder in its store: the `models--owner--name` repository of the Hugging Face cache, or `publisher/model` of LM Studio and MLX-Serve. With `dry_run` nothing is removed. Result: {label, model, folder, bytes, source, deleted}. Refusals: unknown or out-of-store model `not_found`; a model the configuration or session selects `refused`; malformed params `invalid_params`; a failed delete `failed`. Native RPC only.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "delete_local_model"},
+            "params": {"type": "object", "properties": {"model": {"type": "string", "minLength": 1}, "dry_run": {"type": "boolean"}}, "additionalProperties": false, "required": ["model"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "settings_schema"},
@@ -1543,6 +2786,183 @@
             "method"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The project verification checks, as /checks shows them: the automatic checks planned for the uncommitted changes (selected from the changed files; empty outside a repository or with no changes) and the configured verification.commands. Read-only. Result: {enabled, changed_files:[path], automatic:[{name,command,timeout_secs}], configured:[{name,command,file_extensions,timeout_secs}]}. Answered off the controller.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "list_checks" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Add one project check, as /checks add does. A check is a shell command that runs after edits, so it needs confirm: true. name is one word that does not start with --; command is not blank. Saved to the project configuration; apply_settings applies it. Refused as conflict when the name exists (remove it first). Result: {name, scope:'project', saved, apply_settings}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "add_check" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "command": { "type": "string", "minLength": 1 },
+                "file_extensions": { "type": "array", "items": { "type": "string" } },
+                "timeout_secs": { "type": "integer", "minimum": 0 },
+                "confirm": { "type": "boolean", "description": "Must be true: the user agreed to a command that runs after edits." }
+              },
+              "required": ["name", "command", "confirm"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Remove one project check, as /checks remove does. Checks from the user configuration must be removed from that file. Needs confirm: true. Saved to the project configuration; apply_settings applies it. Result: {name, scope:'project', removed, apply_settings}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "remove_check" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "confirm": { "type": "boolean", "description": "Must be true." }
+              },
+              "required": ["name", "confirm"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Read-only skill package views, as /skills shows them: list (default, installed skills and their state), sources (skill folders found in common local locations), installed, or search (matches in each configured registry index). search fetches each configured registry over the network; it changes nothing locally, so repeating it is safe. Result: {action, text} where text is the owner's text. Answered off the controller, also during a turn. Changes use skill_action.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "list_skills" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "action": { "enum": ["list", "sources", "installed", "search"] },
+                "query": { "type": "string", "minLength": 1, "maxLength": 200, "description": "search only: one to eight words, none starting with '-'." }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Change skill packages, as /skills does: enable and disable a skill (scope project or user), import a local skill folder (path; dry_run previews, update replaces), install a package (spec), update one or all installed packages (name optional), or remove an installed package (name). Changes that write files, download a package, disable, or remove need confirm: true; a dry-run import and enable do not. Runs on a worker thread, one change at a time; a second request while one runs is refused busy. Answered when it finishes with {ok, action, text, progress:[line]}. Refused invalid_params for a malformed request, before anything runs.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "skill_action" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "action": { "enum": ["enable", "disable", "import", "install", "update", "remove"] },
+                "name": { "type": "string", "minLength": 1 },
+                "spec": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "scope": { "enum": ["project", "user"] },
+                "dry_run": { "type": "boolean" },
+                "update": { "type": "boolean" },
+                "confirm": { "type": "boolean" }
+              },
+              "required": ["action"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Read-only evidence workbench, as /evidence shows it. checks lists the checks recorded at turn completion (exact logs are not rerun; checks_current says whether they match the final edits); check inspects the retained log of one recorded check by exact name (name); inspect shows one citation (reference, an artifact:// or evidence reference); lineage walks up to sixteen citations (references). It writes no evidence. Comparing two citations is the separate write method evidence_compare. Text is redacted. Answered on the agent actor, so it waits for a running turn. Result: {action, text} or {checks_current, recorded_checks}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "evidence" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "action": { "enum": ["checks", "check", "inspect", "lineage"] },
+                "name": { "type": "string", "minLength": 1 },
+                "reference": { "type": "string", "minLength": 1 },
+                "references": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1 } },
+                "other": { "type": "string", "minLength": 1 }
+              },
+              "required": ["action"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Record a human correction for one citation, as /evidence correct does. Evidence is append-only: the correction is stored beside it and never rewrites it. The workbench result is also added to the conversation as unverified evidence data (not an instruction). Answered on the agent actor. Result: {action:'correct', text}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "evidence_correct" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "reference": { "type": "string", "minLength": 1 },
+                "correction": { "type": "string", "minLength": 1, "maxLength": 8192 }
+              },
+              "required": ["reference", "correction"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Compare two citations through the semantic investigator, as /evidence compare does, with one difference: the result is not added to the conversation. It stores a new investigation record, so it is a write: repeating it after a lost response may store another record. Answered on the agent actor. Result: {action:'compare', text} (text is redacted and marked untrusted).",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "evidence_compare" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "reference": { "type": "string", "minLength": 1 },
+                "other": { "type": "string", "minLength": 1 }
+              },
+              "required": ["reference", "other"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The adaptive request policy, as /policy shows it: the policy configuration, the last request's settings and recent request metrics. Read-only; answered on the agent actor. Result: {config, last_request, history, scope}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "policy" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Tool reliability for this session, as /reliability shows it: whether it is enabled, measured results, the route, this session's counters and the contract-failure limit. Read-only; answered on the agent actor. Result: {enabled, measured, route, session, max_contract_failures, strict_tools}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "reliability" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
         }
       ]
     },
@@ -1594,6 +3014,417 @@
     },
     "event": {
       "oneOf": [
+        {
+          "type": "object",
+          "description": "Native RPC completion of a host-admitted collaboration prompt. This is an asynchronous event, not a response to a client request. Outcomes describe the local turn; guest write admission remains governed by the host owner.",
+          "properties": {
+            "event": {
+              "const": "collaboration_turn"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "#/$defs/id"
+            },
+            "outcome": {
+              "enum": [
+                "completed",
+                "failed"
+              ]
+            },
+            "result": {
+              "type": "object"
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "description": "Stable machine code; unknown newer values should be treated as failed.",
+                  "x-known-values": [
+                    "busy",
+                    "invalid_params",
+                    "not_pending",
+                    "not_found",
+                    "refused",
+                    "conflict",
+                    "unknown_method",
+                    "unsupported_protocol_version",
+                    "internal_error",
+                    "failed"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "event",
+            "seq",
+            "session_id",
+            "request_id",
+            "outcome"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "outcome": {
+                  "const": "completed"
+                },
+                "error": false
+              },
+              "required": [
+                "result"
+              ]
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "failed"
+                },
+                "result": false
+              },
+              "required": [
+                "error"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "collaboration_state"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "#/$defs/id"
+            },
+            "room": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "const": "none"
+                    },
+                    "joining": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "joining"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "const": "guest"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    },
+                    "admitted": {
+                      "type": "boolean"
+                    },
+                    "ended": {
+                      "type": "boolean"
+                    },
+                    "replicated_entries": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "read_only",
+                    "admitted",
+                    "ended",
+                    "replicated_entries"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "const": "host"
+                    },
+                    "read_only": {
+                      "type": "boolean"
+                    },
+                    "peers": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 4294967295
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "writable": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "writable"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "read_only",
+                    "peers"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "notices": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "event",
+            "seq",
+            "session_id",
+            "request_id",
+            "room",
+            "notices"
+          ],
+          "additionalProperties": false,
+          "description": "Native RPC collaboration state after processing queued relay frames. Role-specific peer state excludes room links, signing keys and proofs. Background notices carry a null request_id."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "research_progress"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "#/$defs/id"
+            },
+            "phase": {
+              "const": "evaluation"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "seq",
+            "session_id",
+            "request_id",
+            "phase",
+            "text"
+          ],
+          "additionalProperties": false,
+          "description": "Native RPC progress from the foreground research action. Correlated with its request; not an admission verdict or confirmation of activation."
+        },
+        {
+          "type": "object",
+          "description": "Native RPC side conversation projection. Streamed answer prefixes are durably saved before publication. Background events can have a null request_id.",
+          "properties": {
+            "event": {
+              "const": "side_state"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "$ref": "#/$defs/id"
+            },
+            "state": {
+              "type": "object",
+              "properties": {
+                "open_thread_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "threads": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "anchor": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "context_prompt": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "exchanges": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "question": {
+                              "type": "string"
+                            },
+                            "answer": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "enum": [
+                                "answered",
+                                "cancelled",
+                                "failed",
+                                "interrupted"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "required": [
+                            "question",
+                            "answer",
+                            "outcome"
+                          ]
+                        }
+                      },
+                      "promoted_session": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "id",
+                      "title",
+                      "anchor",
+                      "context_prompt",
+                      "exchanges",
+                      "promoted_session"
+                    ]
+                  }
+                },
+                "streaming": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "thread_id": {
+                          "type": "string"
+                        },
+                        "question": {
+                          "type": "string"
+                        },
+                        "answer": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "thread_id",
+                        "question",
+                        "answer"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "open_thread_id",
+                "threads",
+                "streaming"
+              ]
+            },
+            "notices": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "title",
+                  "text"
+                ]
+              }
+            }
+          },
+          "required": [
+            "event",
+            "seq",
+            "session_id",
+            "request_id",
+            "state",
+            "notices"
+          ],
+          "additionalProperties": false
+        },
         {
           "type": "object",
           "description": "Asks the host to run a host-declared tool; answer with host_tool_result using the same call_id.",
@@ -1955,10 +3786,34 @@
             "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
             "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
             "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "call_id": {"type": "string", "description": "Model tool-call id this output belongs to; empty when the producing dispatch had no call id, so clients fall back to name."},
             "name": {
               "type": "string"
             },
             "delta": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "description": "Latest live status snapshot for one running tool call. Each event replaces the previous snapshot for the same call_id; it is not a log.",
+          "properties": {
+            "event": {
+              "const": "tool_progress"
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "call_id": {"type": "string", "description": "Model tool-call id this snapshot belongs to."},
+            "name": {
+              "type": "string"
+            },
+            "text": {
               "type": "string"
             }
           },

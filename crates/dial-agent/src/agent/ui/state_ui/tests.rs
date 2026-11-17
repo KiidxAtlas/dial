@@ -90,6 +90,176 @@ fn a_retried_attempts_partial_answer_is_interrupted_not_continued() {
     );
 }
 #[test]
+fn call_correlated_output_and_progress_reach_their_own_row() {
+    #[derive(Default)]
+    struct Recorder {
+        outputs: Vec<(String, String)>,
+        progress: Vec<(String, String)>,
+    }
+    impl Ui for Recorder {
+        fn tool_output_with_id(&mut self, call_id: &str, _: &str, text: &str) {
+            self.outputs.push((call_id.into(), text.into()));
+        }
+        fn tool_progress_with_id(&mut self, call_id: &str, _: &str, text: &str) {
+            self.progress.push((call_id.into(), text.into()));
+        }
+    }
+    let mut recorder = Recorder::default();
+    let tree = Tree::default();
+    let mut ui = StateUi::new(&mut recorder, tree.clone(), None);
+    ui.tool_call_with_id("c1", "bash", "first");
+    ui.tool_call_with_id("c2", "bash", "second");
+    // Two running calls of one tool: each id owns its own body.
+    ui.tool_output_with_id("c2", "bash", "out-2\n");
+    ui.tool_output_with_id("c1", "bash", "out-1\n");
+    ui.tool_progress_with_id("c1", "bash", "step 1");
+    ui.tool_progress_with_id("c1", "bash", "step 2");
+    // Name-only dispatch keeps the legacy projection: the newest running row of that name.
+    ui.tool_output("bash", "legacy\n");
+    drop(ui);
+    let tools = tree
+        .snapshots()
+        .into_iter()
+        .filter(|node| node.kind == "tool")
+        .collect::<Vec<_>>();
+    let row = |id: &str| {
+        tools
+            .iter()
+            .find(|node| node.call_id.as_deref() == Some(id))
+            .unwrap()
+    };
+    assert_eq!(row("c1").result.text, "out-1\n");
+    assert_eq!(row("c2").result.text, "out-2\nlegacy\n");
+    // Progress is a replacement snapshot: only the latest one survives for the call.
+    assert_eq!(
+        row("c1").result.data.as_ref().unwrap()["progress"],
+        "step 2"
+    );
+    assert!(
+        row("c2")
+            .result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("progress"))
+            .is_none()
+    );
+    assert_eq!(
+        recorder.outputs,
+        [
+            ("c2".into(), "out-2\n".into()),
+            ("c1".into(), "out-1\n".into())
+        ]
+    );
+    assert_eq!(recorder.progress.len(), 2);
+}
+/// Records each typed event with the prose and reasoning states visible at the moment it arrives.
+#[derive(Default)]
+struct BoundaryRecorder {
+    tree: Option<Tree>,
+    delivered: Vec<(crate::agent::ui::ui_event::EventKind, Vec<(String, Phase)>)>,
+}
+impl Ui for BoundaryRecorder {
+    fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+        let states = self
+            .tree
+            .as_ref()
+            .expect("recorder tree")
+            .snapshots()
+            .into_iter()
+            .filter(|node| node.kind == "assistant" || node.kind == "reasoning")
+            .map(|node| (node.kind, node.result.phase))
+            .collect();
+        self.delivered.push((event.kind, states));
+    }
+}
+#[test]
+fn retry_boundary_arrives_after_the_partial_answer_of_each_kind_is_interrupted() {
+    use crate::agent::ui::ui_event::EventKind;
+    type Delta = fn(&mut StateUi<'_>, &str);
+    // Node kind of the answer body, paired with the delta that streams it.
+    let cases: [(&str, Delta); 2] = [
+        ("assistant", |ui, text| ui.text_delta(text)),
+        ("reasoning", |ui, text| ui.reasoning_delta(text)),
+    ];
+    for (kind, delta) in cases {
+        let tree = Tree::default();
+        let mut recorder = BoundaryRecorder {
+            tree: Some(tree.clone()),
+            ..Default::default()
+        };
+        let mut ui = StateUi::new(&mut recorder, tree.clone(), None);
+        ui.request_phase(crate::agent::RequestPhase::Waiting);
+        delta(&mut ui, "half an answer");
+        ui.request_phase(crate::agent::RequestPhase::Backoff);
+        ui.request_phase(crate::agent::RequestPhase::Retrying);
+        drop(ui);
+        assert_eq!(
+            recorder.delivered.len(),
+            1,
+            "{kind}: one boundary per discarded attempt"
+        );
+        let (event, states) = &recorder.delivered[0];
+        assert_eq!(*event, EventKind::Retry);
+        assert_eq!(states, &[(kind.to_owned(), Phase::Interrupted)], "{kind}");
+    }
+}
+#[test]
+fn closed_prose_of_a_failed_attempt_is_interrupted_with_the_boundary() {
+    let tree = Tree::default();
+    let mut recorder = BoundaryRecorder {
+        tree: Some(tree.clone()),
+        ..Default::default()
+    };
+    let mut ui = StateUi::new(&mut recorder, tree.clone(), None);
+    ui.request_phase(crate::agent::RequestPhase::Waiting);
+    ui.text_delta("first, then thinking");
+    // Reasoning closes the answer as completed; the failed attempt still owns that text.
+    ui.reasoning_delta("considering");
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    drop(ui);
+    let (_, states) = &recorder.delivered[0];
+    assert!(
+        states.contains(&("assistant".to_owned(), Phase::Interrupted)),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&("reasoning".to_owned(), Phase::Interrupted)),
+        "{states:?}"
+    );
+}
+#[test]
+fn attempt_without_streamed_output_and_worker_retries_announce_nothing() {
+    // Foreground attempt with no streamed output: nothing to discard, so no boundary.
+    let tree = Tree::default();
+    let mut silent = BoundaryRecorder {
+        tree: Some(tree.clone()),
+        ..Default::default()
+    };
+    let mut ui = StateUi::new(&mut silent, tree.clone(), None);
+    ui.request_phase(crate::agent::RequestPhase::Waiting);
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    drop(ui);
+    assert!(silent.delivered.is_empty());
+    // Worker surface: the partial answer is still interrupted, but the parent is not told.
+    let tree = Tree::default();
+    let mut worker = BoundaryRecorder {
+        tree: Some(tree.clone()),
+        ..Default::default()
+    };
+    let mut ui = StateUi::new(&mut worker, tree.clone(), None).without_retry_notice();
+    ui.request_phase(crate::agent::RequestPhase::Waiting);
+    ui.text_delta("worker partial");
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    drop(ui);
+    assert!(worker.delivered.is_empty());
+    let answer = tree
+        .snapshots()
+        .into_iter()
+        .find(|node| node.kind == "assistant")
+        .unwrap();
+    assert_eq!(answer.result.phase, Phase::Interrupted);
+}
+#[test]
 fn coherent_runtime_extensions_own_call_and_result_presentation() {
     use crate::tools::{
         integrations::ext::{Registry, Tool, ToolContext},
@@ -369,4 +539,34 @@ fn discarded_request_retains_failed_latency_without_reopening_its_node() {
         1
     );
     assert_eq!(ui.request_latency()["failed_requests"], 1);
+}
+
+#[test]
+fn arguments_only_retry_announces_one_boundary_without_executed_tool_results() {
+    #[derive(Default)]
+    struct Observer {
+        retries: usize,
+        results: usize,
+    }
+    impl Ui for Observer {
+        fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+            if event.kind == crate::agent::ui::ui_event::EventKind::Retry {
+                self.retries += 1;
+            }
+        }
+        fn tool_result(&mut self, _: &str, _: &ToolOutput) {
+            self.results += 1;
+        }
+    }
+    let mut observer = Observer::default();
+    let tree = Tree::default();
+    let mut ui = StateUi::new(&mut observer, tree.clone(), None);
+    ui.request_phase(crate::agent::RequestPhase::Waiting);
+    ui.tool_arguments_delta(0, "draft", "write", "{");
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    drop(ui);
+    assert_eq!(observer.retries, 1);
+    assert_eq!(observer.results, 0);
+    assert!(!tree.snapshots().iter().any(|node| node.kind == "tool"));
 }

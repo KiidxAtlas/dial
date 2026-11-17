@@ -22,16 +22,31 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-/// How many hits `/search` lists.
-const SEARCH_LIMIT: usize = 8;
+/// Grow the ranked result window on demand; retain a bounded amount of preview text.
+const SEARCH_LIMIT: usize = 50;
+const SEARCH_MAX: usize = 1000;
 
-/// The search a worker runs. Production uses `Session::search`; tests inject results.
-type Runner = Arc<dyn Fn(&Layout, &str) -> anyhow::Result<Vec<SearchHit>> + Send + Sync>;
+/// Tests inject the index query; production calls the existing storage search owner.
+type Runner = Arc<dyn Fn(&Layout, &str, usize) -> anyhow::Result<Vec<SearchHit>> + Send + Sync>;
+
+#[derive(Debug)]
+struct Page {
+    hits: Vec<SearchHit>,
+    titles: std::collections::HashMap<String, String>,
+    has_more: bool,
+    limit: usize,
+}
+
+impl AsRef<[SearchHit]> for Page {
+    fn as_ref(&self) -> &[SearchHit] {
+        &self.hits
+    }
+}
 
 /// A finished search that still belongs to the latest request in the current context.
 pub(in crate::app) struct Outcome {
     pub(in crate::app) query: String,
-    pub(in crate::app) result: anyhow::Result<Vec<SearchHit>>,
+    result: anyhow::Result<Page>,
 }
 
 struct Request {
@@ -39,13 +54,14 @@ struct Request {
     revision: u64,
     layout: Layout,
     query: String,
+    limit: usize,
 }
 
 struct Running {
     id: u64,
     revision: u64,
     query: String,
-    events: Receiver<anyhow::Result<Vec<SearchHit>>>,
+    events: Receiver<anyhow::Result<Page>>,
 }
 
 /// Latest-request search state: at most one running worker and one waiting request.
@@ -59,15 +75,14 @@ pub(in crate::app) struct Search {
     running: Option<Running>,
     queued: Option<Request>,
     runner: Runner,
-    ready: Option<(String, Vec<SearchHit>)>,
+    ready: Option<(String, Page)>,
+    window: Option<(String, usize)>,
     origin: Option<String>,
 }
 
 impl Default for Search {
     fn default() -> Self {
-        Self::with_runner(Arc::new(|layout, query| {
-            Session::search(layout, query, SEARCH_LIMIT)
-        }))
+        Self::with_runner(Arc::new(Session::search))
     }
 }
 
@@ -82,6 +97,7 @@ impl Search {
             queued: None,
             runner,
             ready: None,
+            window: None,
             origin: None,
         }
     }
@@ -96,6 +112,7 @@ impl Search {
     pub(in crate::app) fn invalidate(&mut self) {
         self.revision += 1;
         self.ready = None;
+        self.window = None;
     }
 
     /// Records the context a request or poll sees; a difference counts as a change.
@@ -116,7 +133,12 @@ impl Search {
 
     /// Makes `query` the latest request in the current context and returns at once.
     pub(in crate::app) fn request(&mut self, layout: &Layout, session: &str, query: &str) {
+        self.request_window(layout, session, query, SEARCH_LIMIT);
+    }
+
+    fn request_window(&mut self, layout: &Layout, session: &str, query: &str, limit: usize) {
         self.sync(layout, session);
+        self.window = Some((query.to_owned(), limit));
         self.ready = None;
         self.next_id += 1;
         self.latest = self.next_id;
@@ -126,6 +148,7 @@ impl Search {
             revision: self.revision,
             layout: layout.clone(),
             query: query.to_owned(),
+            limit,
         });
         if self.running.is_none() {
             self.start_queued();
@@ -172,7 +195,27 @@ impl Search {
         let layout = request.layout;
         let query = request.query.clone();
         std::thread::spawn(move || {
-            let _ = events_tx.send(runner(&layout, &query));
+            let result = runner(&layout, &query, request.limit + 1).map(|mut hits| {
+                let has_more = hits.len() > request.limit;
+                hits.truncate(request.limit);
+                let mut titles = std::collections::HashMap::new();
+                for hit in &hits {
+                    titles.entry(hit.session_id.clone()).or_insert_with(|| {
+                        Session::find_prefix(&layout, &hit.session_id)
+                            .ok()
+                            .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
+                            .map(|s| s.title)
+                            .unwrap_or_default()
+                    });
+                }
+                Page {
+                    hits,
+                    titles,
+                    has_more,
+                    limit: request.limit,
+                }
+            });
+            let _ = events_tx.send(result);
         });
         self.running = Some(Running {
             id: request.id,
@@ -185,7 +228,7 @@ impl Search {
 
     /// Publishes a result only when it answers the latest request and the context has not changed
     /// since that request started.
-    fn finish(&self, run: Running, result: anyhow::Result<Vec<SearchHit>>) -> Option<Outcome> {
+    fn finish(&self, run: Running, result: anyhow::Result<Page>) -> Option<Outcome> {
         (run.id == self.latest && run.revision == self.revision).then_some(Outcome {
             query: run.query,
             result,
@@ -228,10 +271,14 @@ impl Search {
 }
 
 /// The `/search` transcript text for a finished search. Errors stay visible with their full chain.
-pub(super) fn search_text(query: &str, result: &anyhow::Result<Vec<SearchHit>>) -> String {
+pub(super) fn search_text<T: AsRef<[SearchHit]>>(
+    query: &str,
+    result: &anyhow::Result<T>,
+) -> String {
     match result {
-        Ok(hits) if hits.is_empty() => format!("No past messages match \"{query}\"."),
+        Ok(hits) if hits.as_ref().is_empty() => format!("No past messages match \"{query}\"."),
         Ok(hits) => hits
+            .as_ref()
             .iter()
             .map(|hit| format!("{} [{}] {}", short(&hit.session_id), hit.role, hit.snippet))
             .collect::<Vec<_>>()
@@ -258,34 +305,46 @@ impl Shell {
         self.search.request(layout, &self.session_id, query);
     }
 
-    /// Consume only the latest valid result. Call through ordinary overlay admission so a
-    /// late result cannot steal focus from a newly started draft or a running turn. Rows show
-    /// session titles read from the matching journals in `layout`; a session that cannot be read
-    /// keeps its short id.
+    /// Increase the existing query's ranked window through the same worker and context checks.
+    pub(super) fn more_search(&mut self, layout: &Layout) {
+        self.search.sync(layout, &self.session_id);
+        if let Some((query, limit)) = self.search.window.clone() {
+            if limit < SEARCH_MAX {
+                self.search.request_window(
+                    layout,
+                    &self.session_id,
+                    &query,
+                    (limit + SEARCH_LIMIT).min(SEARCH_MAX),
+                );
+                self.note(
+                    "Search",
+                    "Loading more matches… Use /search results when ready.",
+                );
+            } else {
+                self.note(
+                    "Search",
+                    "Result window limit reached. Refine with /search <query>.",
+                );
+            }
+        } else {
+            self.note("Search", "No current search. Use /search <query> first.");
+        }
+    }
+
+    /// Consume hydrated results without any journal access on the UI path.
     pub(in crate::app) fn take_search_panel(
         &mut self,
-        layout: &Layout,
+        _layout: &Layout,
     ) -> Option<crate::ui::overlay::history_search::HistorySearchOverlay> {
-        let (query, hits) = self.search.ready.take()?;
-        let mut titles = std::collections::HashMap::new();
-        for hit in &hits {
-            if titles.contains_key(&hit.session_id) {
-                continue;
-            }
-            let title = Session::find_prefix(layout, &hit.session_id)
-                .ok()
-                .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
-                .map(|s| s.title)
-                .unwrap_or_default();
-            titles.insert(hit.session_id.clone(), title);
-        }
+        let (query, page) = self.search.ready.take()?;
         Some(
             crate::ui::overlay::history_search::HistorySearchOverlay::new(
                 query,
-                hits,
+                page.hits,
                 self.search.origin.is_some(),
             )
-            .with_titles(titles),
+            .with_titles(page.titles)
+            .with_more(page.has_more, page.limit < SEARCH_MAX),
         )
     }
 
@@ -296,10 +355,26 @@ impl Shell {
         for outcome in outcomes {
             let text = search_text(&outcome.query, &outcome.result);
             self.note("Search", text);
-            if let Ok(hits) = outcome.result
-                && !hits.is_empty()
+            if let Ok(page) = outcome.result
+                && !page.hits.is_empty()
             {
-                self.search.ready = Some((outcome.query, hits));
+                let count = page.hits.len();
+                self.note(
+                    "Search",
+                    format!(
+                        "{count} loaded{}",
+                        if page.has_more {
+                            if page.limit < SEARCH_MAX {
+                                "; more matches exist. Use /search more."
+                            } else {
+                                "; result window limit reached. Refine with /search <query>."
+                            }
+                        } else {
+                            "; all current matches."
+                        }
+                    ),
+                );
+                self.search.ready = Some((outcome.query, page));
                 self.note(
                     "Search",
                     "Use /search results to inspect matches and open a conversation.",

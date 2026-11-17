@@ -11,6 +11,8 @@ use super::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{style::Modifier, text::Span};
 
+pub(super) mod items;
+
 /// How long a recorded steer or started worker stays in the strip: long enough to read that it
 /// landed, short enough that the strip only ever shows what is still in flight.
 pub(super) const STEER_FADE: std::time::Duration = std::time::Duration::from_secs(4);
@@ -137,17 +139,7 @@ impl Composer {
         {
             return Vec::new();
         }
-        let mut steering = Vec::new();
-        for _ in 0..self.queued.len() {
-            if let Some((text, follow_up)) = self.queued.pop_front() {
-                if follow_up {
-                    self.queued.push_back((text, true));
-                } else {
-                    steering.push(text);
-                }
-            }
-        }
-        steering
+        self.queued.take_steering()
     }
 
     /// Explicit "Steer now" messages not yet handed to the agent, oldest first.
@@ -302,6 +294,16 @@ impl Composer {
         self.queued.iter().cloned().collect()
     }
 
+    /// Opaque session-local handles for panel selections. Unlike display positions, handles
+    /// never start referring to the next message when earlier input is consumed.
+    pub fn queued_items(&self) -> Vec<(u64, String, bool)> {
+        self.queued.snapshot()
+    }
+
+    pub fn queued_index(&self, id: u64) -> Option<usize> {
+        self.queued.index(id)
+    }
+
     pub fn remove_queued(&mut self, index: usize) -> bool {
         let removed = self.queued.remove(index).is_some();
         if removed {
@@ -349,7 +351,10 @@ impl Composer {
             return false;
         }
         let text = &self.editor.text;
-        let at_edge = if up {
+        let width = self.wrap_width.get();
+        let at_edge = if width > 0 {
+            super::render::wrapped_vertical(text, self.editor.cursor, width, up).is_none()
+        } else if up {
             !text[..self.editor.cursor].contains('\n')
         } else {
             !text[self.editor.cursor..].contains('\n')

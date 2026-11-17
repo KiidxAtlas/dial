@@ -82,7 +82,7 @@ pub(super) const PLACEHOLDERS: [&str; 3] = [
 /// The launch input asks the home screen's question itself, so the hero carries no second copy.
 pub(super) const LANDING_PLACEHOLDERS: [&str; 2] = ["What are we building?", "Ask anything"];
 
-/// Text rows the launch input shows even when empty (see `view_with`).
+/// Text rows the launch input shows even when empty (see `view_parts`).
 pub(super) const LANDING_INPUT_ROWS: usize = 2;
 
 // ---------------------------------------------------------------------------------------------
@@ -497,16 +497,44 @@ impl Composer {
 
     /// The composer box plus the menu or history-search rows below it, and the cursor within them.
     pub fn view(&self, width: u16, ctx: &ComposerCtx) -> ComposerView {
-        self.view_with(width, ctx, false)
+        self.view_parts(width, ctx, false, width as usize).0
     }
 
     /// A quiet launch input. Editing, menus, search and notices use the normal composer path,
     /// without repeating the conversation status line and shortcut catalog on the home screen.
     pub fn home_view(&self, width: u16, ctx: &ComposerCtx) -> ComposerView {
-        self.view_with(width, ctx, true)
+        self.view_parts(width, ctx, true, width as usize).0
     }
 
-    pub(super) fn view_with(&self, width: u16, ctx: &ComposerCtx, landing: bool) -> ComposerView {
+    /// [`Self::home_view`] whose command menu may use `menu_width` cells, wider than the narrow
+    /// launch input, so command descriptions are not cut to the input's measure. Returns the view
+    /// and how many leading rows were drawn at `menu_width` (the caller centers those separately).
+    pub fn home_view_wide(
+        &self,
+        width: u16,
+        menu_width: u16,
+        ctx: &ComposerCtx,
+    ) -> (ComposerView, usize) {
+        let menu_width = menu_width.max(width) as usize;
+        // Only the menu is widened, and only while it leads the view: rows other features stack
+        // above it keep the input's measure.
+        let wide = self.choice.is_none()
+            && self.queue_notice.is_none()
+            && self.search.is_none()
+            && self.queued.is_empty()
+            && self.attachments.summary().is_none();
+        let menu_width = if wide { menu_width } else { width as usize };
+        self.view_parts(width, ctx, true, menu_width)
+    }
+
+    /// The view, and how many leading menu rows were drawn at `menu_w` rather than `width`.
+    fn view_parts(
+        &self,
+        width: u16,
+        ctx: &ComposerCtx,
+        landing: bool,
+        menu_w: usize,
+    ) -> (ComposerView, usize) {
         let w = width as usize;
         let theme = ctx.theme;
         let ghost = self.ghost().unwrap_or("");
@@ -548,7 +576,7 @@ impl Composer {
                 );
                 view.cursor.0 += 1;
             }
-            return view;
+            return (view, 0);
         }
 
         // The launch input is the concept's wide rounded pill; in a conversation the configured
@@ -775,6 +803,7 @@ impl Composer {
             ));
         }
         let mut cursor = cursor;
+        let mut wide = 0;
         // Rows stacked above the activity row (menus, the chooser, a notice), so the steer strip
         // can sit right under the activity it changes instead of above everything.
         let mut lead = 0usize;
@@ -793,7 +822,10 @@ impl Composer {
         } else if let Some(menu) = &self.menu {
             // The menu opens upward, into the space above the input, so the input never moves
             // down and the closest rows to the cursor are the selected command's details.
-            let mut menu_rows = self.menu_rows(menu, w, ctx);
+            let mut menu_rows = self.menu_rows(menu, menu_w, ctx);
+            if menu_w != w {
+                wide = menu_rows.len();
+            }
             cursor.0 += menu_rows.len() as u16;
             lead += menu_rows.len();
             menu_rows.append(&mut rows);
@@ -930,7 +962,7 @@ impl Composer {
             );
             cursor.0 += 1;
         }
-        ComposerView { rows, cursor }
+        (ComposerView { rows, cursor }, wide)
     }
 
     /// Fewer than `MIN_BOX_WIDTH` cells: just the input row around the cursor, no chrome.

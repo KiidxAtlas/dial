@@ -67,11 +67,13 @@ fn strict_and_dev_deny_nested_private_state_without_blocking_ordinary_files() {
             deny_read: vec![private.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![private.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let (code, output) = fx.run(
@@ -169,11 +171,13 @@ fn strict_and_dev_keep_git_metadata_read_only_inside_the_workspace() {
             deny_read: vec![],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let (code, output) = fx.run(
@@ -240,6 +244,7 @@ fn filtered_network_allows_only_proxied_permitted_hosts() {
             deny_read: vec![],
             extra_write: vec![],
             allow_network: true,
+            serial_ports: false,
         },
     ] {
         let script = format!(
@@ -330,6 +335,7 @@ impl Fixture {
             deny_read: vec![self.denied.clone()],
             extra_write: vec![self.extra.clone()],
             allow_network,
+            serial_ports: false,
         }
     }
 
@@ -473,6 +479,7 @@ fn unavailable_sandbox_refuses_dev_commands() {
         deny_read: vec![],
         extra_write: vec![],
         allow_network: false,
+        serial_ports: false,
     };
     assert!(
         sandbox
@@ -483,6 +490,7 @@ fn unavailable_sandbox_refuses_dev_commands() {
         deny_read: Vec::new(),
         allow_network: false,
         extra_write: Vec::new(),
+        serial_ports: false,
     };
     assert!(
         sandbox
@@ -521,6 +529,37 @@ fn dev_reads_widely_but_not_denied_paths() {
     assert_eq!(code, Some(0), "{out}");
 }
 
+/// The serial grant must compile into both profiles and leave every other device closed.
+#[cfg(target_os = "macos")]
+#[test]
+fn serial_ports_policy_runs_and_keeps_other_devices_closed() {
+    if !require_for_test() {
+        return;
+    }
+    let fx = Fixture::new();
+    let script = r#"if : > /dev/cu.debug-console 2>/dev/null; then exit 40; fi
+                    if /bin/cat {denied}/canary 2>/dev/null; then exit 41; fi
+                    echo ok > written || exit 42
+                    exit 0"#
+        .replace("{denied}", &fx.denied.display().to_string());
+    let dev = Policy::Dev {
+        deny_read: vec![fx.denied.clone()],
+        extra_write: vec![fx.extra.clone()],
+        allow_network: false,
+        serial_ports: true,
+    };
+    let strict = Policy::Strict {
+        deny_read: vec![fx.denied.clone()],
+        allow_network: false,
+        extra_write: vec![],
+        serial_ports: true,
+    };
+    for policy in [dev, strict] {
+        let (code, out) = fx.run(&policy, &script);
+        assert_eq!(code, Some(0), "{policy:?}: {out}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn dev_denied_path_given_via_symlink_or_dotdot_is_enforced() {
@@ -532,6 +571,7 @@ fn dev_denied_path_given_via_symlink_or_dotdot_is_enforced() {
             deny_read: vec![spelled.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         };
         let (code, out) = fx.run(&policy, &format!("/bin/cat {}/canary", fx.denied.display()));
         assert_ne!(code, Some(0), "{spelled:?}: {out}");
@@ -601,6 +641,7 @@ fn dev_denial_beats_extra_write_and_workspace() {
         deny_read: vec![in_ws.clone(), in_extra.clone()],
         extra_write: vec![fx.extra.clone()],
         allow_network: false,
+        serial_ports: false,
     };
     let script = format!(
         r#"echo ok > fine.txt || exit 10
@@ -825,6 +866,7 @@ fn probe_policy_reports_enforceable_policies_and_rejects_broken_ones() {
                     deny_read: Vec::new(),
                     allow_network,
                     extra_write: Vec::new(),
+                    serial_ports: false,
                 },
             ),
             Sandbox::Available,
@@ -836,6 +878,7 @@ fn probe_policy_reports_enforceable_policies_and_rejects_broken_ones() {
         deny_read: vec![fx.ws.parent().unwrap().to_path_buf()],
         extra_write: vec![],
         allow_network: false,
+        serial_ports: false,
     };
     match Sandbox::probe_policy(&fx.ws, &broken) {
         Sandbox::Unavailable(reason) => {
@@ -857,6 +900,7 @@ fn strict_policy_through_command_with_policy_matches_command() {
                 deny_read: Vec::new(),
                 allow_network: false,
                 extra_write: Vec::new(),
+                serial_ports: false,
             },
             "/bin/cat",
             &[target.to_str().unwrap()],

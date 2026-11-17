@@ -266,3 +266,55 @@ fn legacy_model_presets_keep_the_same_change_plan_and_redact_review_auth() {
     assert!(review.contains("[redacted]"));
     assert!(!review.contains("secret-value"));
 }
+
+#[test]
+fn usage_summary_keeps_bucket_identity_and_unlimited_notes() {
+    use crate::llm::usage_report::{UsageAmount, UsageLimit, UsageScope, UsageUnit, UsageWindow};
+    let limit = |label: &str, fraction: Option<f64>, notes: Vec<String>| UsageLimit {
+        id: label.into(),
+        label: label.into(),
+        scope: UsageScope::default(),
+        window: Some(UsageWindow {
+            label: "Monthly".into(),
+            ..Default::default()
+        }),
+        amount: UsageAmount {
+            used: None,
+            limit: None,
+            remaining: None,
+            used_fraction: fraction,
+            remaining_fraction: None,
+            unit: UsageUnit::Requests,
+        },
+        status: None,
+        notes,
+    };
+    let report = UsageReport {
+        provider: "copilot".into(),
+        fetched_at_ms: 0,
+        limits: vec![
+            limit("Premium Requests", None, vec!["Unlimited".into()]),
+            limit(
+                "Chat Requests",
+                Some(12.14),
+                vec!["Overage requests: 1114".into()],
+            ),
+            limit("Completions", Some(0.0), vec![]),
+        ],
+        reset_credits: None,
+        notes: vec![],
+        metadata: Default::default(),
+    };
+    let text = report_text(&report);
+    assert!(
+        text.contains("Premium Requests · Monthly: Unlimited"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Chat Requests · Monthly: 1214% used"),
+        "{text}"
+    );
+    assert!(text.contains("Overage requests: 1114"), "{text}");
+    assert!(text.contains("Completions · Monthly: 0% used"), "{text}");
+    assert!(!text.contains("usage unknown"), "{text}");
+}

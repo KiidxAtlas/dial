@@ -100,6 +100,38 @@ fn bounded_queue_keeps_overflow_draft_and_manages_only_selected_item() {
 }
 
 #[test]
+fn queued_handles_survive_shifts_but_never_retarget_replacement_messages() {
+    let mut composer = Composer::new(Vec::new(), 100);
+    composer.set_busy(true);
+    for follow_up in [false, true, true] {
+        composer.set_draft("duplicate text");
+        composer.submit_queued(follow_up);
+    }
+    let ids: Vec<_> = composer
+        .queued_items()
+        .into_iter()
+        .map(|item| item.0)
+        .collect();
+    assert_ne!(
+        ids[1], ids[2],
+        "duplicate contents still have distinct identities"
+    );
+    assert_eq!(composer.take_steering(), vec!["duplicate text"]);
+    assert_eq!(composer.queued_index(ids[0]), None);
+    assert_eq!(composer.queued_index(ids[1]), Some(0));
+    assert_eq!(composer.queued_index(ids[2]), Some(1));
+    assert!(composer.remove_queued(0));
+    composer.set_draft("duplicate text");
+    composer.submit_queued(true);
+    assert_eq!(
+        composer.queued_index(ids[1]),
+        None,
+        "old handle must not select identical replacement"
+    );
+    assert_eq!(composer.queued_index(ids[2]), Some(0));
+}
+
+#[test]
 fn cancelling_a_queued_edit_restores_the_original_item_in_place() {
     let env = Env::new();
     let mut c = composer();
@@ -135,6 +167,66 @@ fn cancelling_a_queued_edit_restores_the_original_item_in_place() {
             ("third".into(), false)
         ]
     );
+}
+
+#[test]
+fn external_content_replacement_keeps_the_queued_edit_transaction() {
+    let env = Env::new();
+    for replacement in ["middle", "middle edited"] {
+        let mut c = composer();
+        c.set_busy(true);
+        for (text, route) in [("first", false), ("middle", true), ("last", false)] {
+            c.set_draft(text);
+            c.submit_queued(route);
+        }
+        assert!(c.edit_queued(1));
+        c.replace_draft_content(replacement);
+        assert_eq!(
+            c.queued_messages().len(),
+            2,
+            "editor restored original prematurely"
+        );
+        press(&mut c, &env, KeyCode::Enter);
+        assert_eq!(
+            c.queued_messages(),
+            vec![
+                ("first".into(), false),
+                (replacement.into(), true),
+                ("last".into(), false)
+            ]
+        );
+        assert!(c.edit_queued(1));
+        c.replace_draft_content("cancelled edit");
+        press(&mut c, &env, KeyCode::Esc);
+        assert_eq!(c.queued_messages().len(), 3);
+        assert_eq!(c.queued_messages()[1], (replacement.into(), true));
+    }
+}
+
+#[test]
+fn unchanged_queue_edits_move_across_wrapped_rows_before_stepping() {
+    let env = Env::new();
+    for text in [
+        "abcdefghijklmnopqrstuvwxyz0123456789",
+        "第一行第二行第三行第四行第五行",
+        "first line\nabcdefghijklmnopqrstuvwxyz",
+    ] {
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("older queue");
+        c.submit_queued(true);
+        c.set_draft(text);
+        c.submit_queued(true);
+        c.view(18, &env.ctx());
+        press(&mut c, &env, KeyCode::Up);
+        let end = c.editor.cursor;
+        press(&mut c, &env, KeyCode::Up);
+        assert_eq!(c.draft(), text, "Up skipped wrapped row for {text:?}");
+        assert!(c.editor.cursor < end);
+        press(&mut c, &env, KeyCode::Down);
+        assert_eq!(c.draft(), text, "Down skipped wrapped row for {text:?}");
+        assert_eq!(c.editor.cursor, end);
+    }
 }
 
 #[test]
@@ -2496,7 +2588,12 @@ fn slash_opens_a_grouped_menu_above_the_box_that_filters_fuzzily_as_you_type() {
     typed(&mut c, &env, "/zzz");
     assert!(!c.menu_open(), "no match, no selectable menu");
     assert_eq!(screen(&c, &env, 80).len(), 4);
-    assert!(screen(&c, &env, 80)[0].contains("No matching commands"));
+    let empty = &screen(&c, &env, 80)[0];
+    assert!(empty.contains("No matching commands"), "{empty}");
+    assert!(
+        empty.contains("searches settings and help"),
+        "the empty menu names the next step: {empty}"
+    );
 }
 
 #[test]
@@ -3844,6 +3941,29 @@ fn the_launch_input_is_a_rounded_pill_without_status_or_shortcuts() {
         rows[0].chars().all(|c| "╭╮─".contains(c)),
         "no status line in the launch pill: {rows:?}"
     );
+}
+
+#[test]
+fn the_launch_menu_may_be_wider_than_the_launch_input() {
+    let env = Env::new();
+    let mut c = with_commands();
+    typed(&mut c, &env, "/");
+    assert!(c.menu_open());
+    let (narrow, none) = c.home_view_wide(40, 40, &env.ctx());
+    assert_eq!(none, 0, "the same width draws nothing wide");
+    let (wide, lead) = c.home_view_wide(40, 90, &env.ctx());
+    assert!(lead > 0, "the menu rows lead the view");
+    assert_eq!(wide.rows.len(), narrow.rows.len());
+    assert_eq!(wide.cursor, narrow.cursor, "the input itself does not move");
+    let widest = wide.rows[..lead]
+        .iter()
+        .map(crate::ui::text::line_width)
+        .max()
+        .unwrap();
+    assert!(widest > 40 && widest <= 90, "{widest}");
+    for row in &wide.rows[lead..] {
+        assert!(crate::ui::text::line_width(row) <= 40);
+    }
 }
 
 #[test]

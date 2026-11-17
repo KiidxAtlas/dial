@@ -168,21 +168,6 @@ impl Agent<'_> {
         } else {
             "small"
         };
-        let config = self.auth_config.for_role(role);
-        // A classifier is optional control-plane work. Never queue it behind a worker holding
-        // the single local-provider slot; steering is the safe immediate fallback instead.
-        let _slot = if config.endpoint.is_some()
-            || main.supports_adapters()
-            || config.provider.as_deref() == Some(crate::llm::apple::PROVIDER)
-            || self.role_selection(role).is_some()
-        {
-            Some(
-                crate::agent::model::provider_slots::try_acquire(&config)
-                    .context("routing provider is busy")?,
-            )
-        } else {
-            None
-        };
         self.bounded_role_chat(main, role, llm::usage::Purpose::Judgment, chat, ui, budget)
             .and_then(|text| decision(&text))
     }

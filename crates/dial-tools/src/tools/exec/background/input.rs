@@ -30,7 +30,11 @@ impl Handle {
         }
         #[cfg(windows)]
         {
-            Self::Pipe(crate::platform::io::QueuedWriter::new(writer, 64 * 1024))
+            Self::Pipe(crate::platform::io::QueuedWriter::with_notify(
+                writer,
+                64 * 1024,
+                wake::notify,
+            ))
         }
     }
     pub(super) fn terminal_input(writer: File) -> Self {
@@ -40,7 +44,11 @@ impl Handle {
         }
         #[cfg(windows)]
         {
-            Self::Terminal(crate::platform::io::QueuedWriter::new(writer, 64 * 1024))
+            Self::Terminal(crate::platform::io::QueuedWriter::with_notify(
+                writer,
+                64 * 1024,
+                wake::notify,
+            ))
         }
     }
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -170,8 +178,15 @@ impl Input {
         }
         #[cfg(windows)]
         {
-            let _ = handle;
+            // Register before checking readiness: delivery can finish between WouldBlock and
+            // entering this function, or between this check and the condvar sleep.
             let seen = wake::generation();
+            if handle
+                .drain(Duration::ZERO)
+                .map_err(|e| format!("writing child stdin: {e}; {written} bytes written"))?
+            {
+                return Ok(());
+            }
             self.interrupted(end, cancel, interrupt, written)?;
             wake::wait_past(seen, end);
         }
@@ -373,3 +388,6 @@ impl Input {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests;

@@ -671,6 +671,54 @@ fn mac_option_v_text_fallback_respects_platform_modifiers_and_remaps() {
 }
 
 #[test]
+fn mac_option_characters_trigger_their_bound_alt_shortcuts_on_us_layouts() {
+    let us = Keymap::defaults().with_us_layout(true);
+    let other = Keymap::defaults().with_us_layout(false);
+    let mac = cfg!(target_os = "macos");
+    for (glyph, action) in [
+        ('˚', Action::CommandPalette),
+        ('µ', Action::ModelSelect),
+        ('®', Action::ModelRoles),
+        ('π', Action::ProviderSetup),
+        ('ø', Action::ToolsToggle),
+        ('ß', Action::StatusExpand),
+        ('å', Action::SubagentsHub),
+        ('Å', Action::SubagentsRecent),
+        ('∑', Action::WorkTab),
+        ('¬', Action::DisplayReset),
+        ('‘', Action::ModelFavoriteNext),
+        ('∫', Action::EditorWordLeft),
+        ('ƒ', Action::EditorWordRight),
+        ('∂', Action::EditorDeleteWordForward),
+        ('¥', Action::EditorYankPop),
+        ('–', Action::EditorRedo),
+    ] {
+        let press = key(KeyCode::Char(glyph), KeyModifiers::NONE);
+        assert_eq!(us.matches(action, &press), mac, "{glyph} {action:?}");
+        assert_eq!(us.triggers(action, &press), mac, "{glyph} {action:?}");
+        // Other layouts type some of these characters with plain keys (ß, å, ø), so they stay text.
+        assert!(!other.matches(action, &press), "{glyph} {action:?}");
+    }
+    // A character only matches the action bound to its chord.
+    let palette = key(KeyCode::Char('˚'), KeyModifiers::NONE);
+    let expected: Vec<Action> = if mac {
+        vec![Action::CommandPalette]
+    } else {
+        vec![]
+    };
+    assert_eq!(us.actions_for(&palette), expected);
+    // Rebinding the action away from Alt+K stops the character from triggering it.
+    let mut rebound = Keymap::defaults().with_us_layout(true);
+    rebound.rebind(Action::CommandPalette, &["F1"]).unwrap();
+    assert!(!rebound.matches(Action::CommandPalette, &palette));
+    // Ordinary letters still type.
+    assert!(
+        us.actions_for(&key(KeyCode::Char('k'), KeyModifiers::NONE))
+            .is_empty()
+    );
+}
+
+#[test]
 fn work_tab_defaults_lead_with_a_non_option_chord() {
     let map = Keymap::defaults();
     assert_eq!(map.label(Action::WorkTab), "Ctrl+X");

@@ -269,3 +269,68 @@ fn binary_artifact_sources_use_raw_bytes_and_stay_create_only() {
     assert!(write(&ctx, &args, &AtomicBool::new(false)).is_err());
     assert!(!dir.path().join("no-retry").exists());
 }
+
+#[test]
+fn ranged_scanning_stops_at_budget_and_skips_without_collecting() {
+    use std::io::{BufReader, Read};
+    // A virtual oversized line; the reader must stop before consuming its remainder.
+    let input = std::io::repeat(b'x').take(4 * MAX_BYTES as u64);
+    let mut reader = BufReader::with_capacity(8192, input);
+    let mut output = Vec::new();
+    let mut scan_left = MAX_SCAN_BYTES;
+    assert!(!scan_line(&mut reader, Some(&mut output), MAX_BYTES, &mut scan_left).unwrap());
+    assert!(output.len() <= MAX_BYTES);
+    assert!(reader.get_ref().limit() >= 3 * MAX_BYTES as u64 - 8192);
+
+    let mut reader =
+        BufReader::with_capacity(17, std::io::Cursor::new(b"skipped long line\r\nkept\r\n"));
+    assert!(scan_line(&mut reader, None, 0, &mut scan_left).unwrap());
+    output.clear();
+    assert!(scan_line(&mut reader, Some(&mut output), MAX_BYTES, &mut scan_left).unwrap());
+    assert_eq!(output, b"kept\r\n");
+}
+
+#[test]
+fn line_pages_defer_oversized_lines_and_skip_them_losslessly() {
+    let (dir, ws) = testkit::workspace();
+    let text = format!("first\r\n{}\r\nlast", "x".repeat(MAX_BYTES + 1));
+    std::fs::write(dir.path().join("lines"), text).unwrap();
+    let page = |offset| {
+        read(
+            &ws,
+            &json!({"path":"lines","format":"text","offset":offset}),
+        )
+    };
+    let first = page(1).unwrap().data.unwrap();
+    assert_eq!(first["content"], "first\r\n");
+    assert_eq!(first["next_offset"], 2);
+    assert!(page(2).unwrap_err().contains("line 2 alone exceeds"));
+    let last = page(3).unwrap().data.unwrap();
+    assert_eq!(last["content"], "last");
+    assert!(last["next_offset"].is_null());
+}
+
+#[test]
+fn ranged_offset_refuses_an_excessive_skipped_prefix() {
+    let (dir, ws) = testkit::workspace();
+    // Sparse, newline-free input is cheap to create and exceeds the scan ceiling without
+    // allocating a matching buffer or relying on a slow device or a timing assertion.
+    let file = std::fs::File::create(dir.path().join("huge-prefix")).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let error = read(
+        &ws,
+        &json!({"path":"huge-prefix","format":"text","offset":2}),
+    )
+    .unwrap_err();
+    assert!(error.contains("64 MiB scan budget"), "{error}");
+}
+
+#[test]
+fn ranged_scan_budget_is_shared_across_skipped_lines() {
+    let mut reader = std::io::Cursor::new(b"a\r\nb\r\nlast");
+    let mut scan_left = 5;
+    assert!(scan_line(&mut reader, None, 0, &mut scan_left).unwrap());
+    let error = scan_line(&mut reader, None, 0, &mut scan_left).unwrap_err();
+    assert!(error.to_string().contains("scan budget"), "{error}");
+    assert_eq!(reader.position(), 3);
+}

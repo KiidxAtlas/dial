@@ -508,6 +508,8 @@ pub(in crate::agent) fn chat_attempt_with_ui(
         let mut backing_off = false;
         let mut stalled = None;
         let mut partial_text = String::new();
+        // Text, reasoning or argument previews in this attempt; the boundary fallback needs it.
+        let mut streamed_output = false;
         let result = loop {
             // Cancellation is checked for every delivery, not only the timed heartbeat:
             // fast providers can leave many late text/reasoning/tool events queued.
@@ -570,7 +572,16 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     telemetry = TelemetryProgress::default();
                     backing_off = waiting;
                     if waiting {
+                        let discarded_output = std::mem::take(&mut streamed_output);
                         partial_text.clear();
+                        // StateUi announces the boundary itself, after interrupting the bodies. A raw
+                        // surface has no such reducer, so the request loop announces it here.
+                        if discarded_output && !ui.owns_attempt_boundary() {
+                            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                                crate::agent::ui::ui_event::EventKind::Retry,
+                                "Provider retry: the partial answer from the failed attempt was discarded; the next attempt starts fresh.",
+                            ));
+                        }
                         if let Some(stream) = stream.as_deref_mut() {
                             stream.restart();
                         }
@@ -640,6 +651,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         continue;
                     }
                     partial_text.push_str(&text);
+                    streamed_output |= !text.is_empty();
                     if !text.is_empty() {
                         if let Some(mut guard) = reasoning_loop.take()
                             && thinking_loop_reason.is_none()
@@ -690,6 +702,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         ui.inference_discarded("Portable guidance intercepted this inference (match or coverage limit); no attempted tools will execute.");
                         continue;
                     }
+                    streamed_output = true;
                     if thinking_loop_reason.is_none()
                         && let Some(guard) = &mut reasoning_loop
                     {
@@ -772,6 +785,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         ui.model_progress(&progress.value);
                     }
                     if render_text {
+                        streamed_output = true;
                         if let Some(context) = &mut context {
                             ui.context_usage(context.observe(&delta), context.estimated());
                         }

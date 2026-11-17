@@ -93,7 +93,7 @@ fn tiny_review_cannot_authorize_hidden_removal_and_scope_stays_frozen() {
                 OverlayEvent::None
             ));
         }
-        send(&mut o, &rig.keys, ctrl('s'));
+        send(&mut o, &rig.keys, ctrl('b'));
         assert_eq!(o.scope, Scope::Global);
         draw(&mut o, &rig, 100, 30);
         send(&mut o, &rig.keys, key(KeyCode::Enter));

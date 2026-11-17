@@ -11,6 +11,7 @@ pub use bundled::{
 mod cache;
 mod credentials;
 mod local_models;
+mod local_removal;
 mod local_servers;
 mod metadata;
 mod probe;
@@ -31,6 +32,10 @@ pub(crate) use local_models::{chat_template, hf_cache, local_model_entries, read
 pub use local_models::{
     downloaded_local_models, is_embedding_checkpoint, local_lora_support, local_model_metadata,
     resolve_local_model,
+};
+pub use local_removal::{
+    LocalRemoval, ModelInUse, ensure_not_in_use, models_in_use, plan_local_model_removal,
+    remove_local_model,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use local_servers::forget_llama_props;

@@ -31,6 +31,8 @@ pub struct HistorySearchOverlay {
     cursor: usize,
     preview_scroll: usize,
     return_available: bool,
+    has_more: bool,
+    can_load_more: bool,
 }
 
 impl HistorySearchOverlay {
@@ -47,12 +49,21 @@ impl HistorySearchOverlay {
             cursor: 0,
             preview_scroll: 0,
             return_available,
+            has_more: false,
+            can_load_more: false,
         }
     }
 
     /// Session titles by session id; rows show a title instead of the raw id when one is known.
     pub fn with_titles(mut self, titles: HashMap<String, String>) -> Self {
         self.titles = titles;
+        self
+    }
+
+    /// The controller queried one lookahead row, so this is not an inferred total.
+    pub fn with_more(mut self, has_more: bool, can_load_more: bool) -> Self {
+        self.has_more = has_more;
+        self.can_load_more = can_load_more;
         self
     }
 
@@ -147,6 +158,8 @@ impl HistorySearchOverlay {
             }
         } else if key.code == KeyCode::Char('/') {
             self.filtering = true;
+        } else if key.code == KeyCode::Char('m') && self.has_more && self.can_load_more {
+            return OverlayEvent::Action("history-more".into());
         } else if key.code == KeyCode::Char('b') && self.return_available {
             return OverlayEvent::Action("history-return".into());
         }
@@ -154,7 +167,7 @@ impl HistorySearchOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(frame, ctx, "Search history", "Enter opens the conversation (read-only preview here; nothing is rewound). PgUp/PgDn scroll the preview.\nb returns to the session you came from when offered.", false, true) {
+        if self.panel_keys.draw(frame, ctx, "Search history", "Enter opens the conversation (read-only preview here; nothing is rewound). PgUp/PgDn scroll the preview.\n/ filters loaded hits only. m loads 50 more when offered (reopen /search results when ready).\nb returns to the session you came from when offered.", false, true) {
             return;
         }
         panel(
@@ -186,6 +199,9 @@ impl HistorySearchOverlay {
         }
         if !self.filtering {
             hints.push("/ filter".into());
+            if self.has_more && self.can_load_more {
+                hints.push("m more".into());
+            }
         }
         hints.push(
             if self.filtering || !self.filter.is_empty() {
@@ -226,10 +242,22 @@ impl HistorySearchOverlay {
         let theme = ctx.theme;
         let muted = |value: String| Line::from(Span::styled(value, theme.fg(Tok::Muted)));
         let count = if self.filter.is_empty() {
-            format!("{} matches", self.hits.len())
+            format!("{} loaded", self.hits.len())
         } else {
-            format!("{} of {} matches", self.shown.len(), self.hits.len())
+            format!("{} of {} loaded", self.shown.len(), self.hits.len())
         };
+        let count = format!(
+            "{count}{}",
+            if self.has_more {
+                if self.can_load_more {
+                    " · more available"
+                } else {
+                    " · limit reached; refine /search query"
+                }
+            } else {
+                " · all current matches"
+            }
+        );
         let mut rows = vec![Line::from(vec![
             Span::styled(
                 format!(" {}", text::one_line(&self.query)),

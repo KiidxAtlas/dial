@@ -1990,3 +1990,108 @@ fn responses_gif_names_a_gif_capable_image_model_in_the_hosted_tool() {
             .contains("animated GIF")
     );
 }
+
+/// A minimal safetensors file (header only) at `path`.
+fn safetensors(path: &std::path::Path, tensors: &[&str]) {
+    let mut header = serde_json::Map::new();
+    for name in tensors {
+        header.insert(
+            (*name).to_owned(),
+            json!({"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}),
+        );
+    }
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&[0, 0]);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn checkpoint_role_config(model: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.model_roles.insert(
+        "image".into(),
+        crate::llm::model_config::ModelSelection::new("mlx", model.to_str().unwrap()),
+    );
+    config
+}
+
+#[test]
+fn downloaded_checkpoint_role_runs_on_sd_cpp_with_settings_in_its_prompt_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    for part in ["unet", "vae"] {
+        safetensors(
+            &dir.path()
+                .join(part)
+                .join("diffusion_pytorch_model.safetensors"),
+            &["w"],
+        );
+    }
+    safetensors(&dir.path().join("text_encoder/model.safetensors"), &["w"]);
+    let config = checkpoint_role_config(dir.path());
+    let mut target = resolve(&config).unwrap();
+    assert_eq!(target.wire, Wire::SdCpp);
+    let route = super::current_route(&config).unwrap();
+    assert!(route.edits && route.api.contains("stable-diffusion.cpp"));
+
+    let request = Request {
+        animation: None,
+        prompt: "a lighthouse",
+        size: "512x512",
+        output: "out.png",
+        source: None,
+    };
+    let body = request_body(&target, &request);
+    assert_eq!(body["model"], "sd-cpp-local");
+    assert_eq!(body["prompt"], "a lighthouse");
+    assert_eq!(body["size"], "512x512");
+    assert_eq!(body["output_format"], "png");
+
+    target.settings.steps = Some(4);
+    target.settings.seed = Some(7);
+    let body = request_body(&target, &request);
+    let prompt = body["prompt"].as_str().unwrap();
+    let extra = prompt
+        .strip_prefix("a lighthouse <sd_cpp_extra_args>")
+        .and_then(|rest| rest.strip_suffix("</sd_cpp_extra_args>"))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(extra).unwrap(),
+        json!({"sample_params": {"sample_steps": 4}, "seed": 7})
+    );
+    assert!(body.get("steps").is_none() && body.get("seed").is_none());
+}
+
+#[test]
+fn mlx_quantized_checkpoint_role_is_refused_before_any_server_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    safetensors(
+        &dir.path().join("transformer/0.safetensors"),
+        &["blocks.0.weight", "blocks.0.scales", "blocks.0.biases"],
+    );
+    safetensors(&dir.path().join("vae/0.safetensors"), &["d"]);
+    safetensors(&dir.path().join("text_encoder/0.safetensors"), &["e"]);
+    let error = resolve(&checkpoint_role_config(dir.path()))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("MLX-quantized"), "{error}");
+}
+
+#[test]
+#[ignore = "starts the real sd-server (DIAL_SD_SERVER or /setup sd-cpp) on DIAL_TEST_IMAGE_CHECKPOINT and generates one image"]
+fn generates_with_a_dial_launched_sd_server() {
+    let model = std::env::var("DIAL_TEST_IMAGE_CHECKPOINT").expect("downloaded image checkpoint");
+    let (_dir, ws) = testkit::workspace();
+    let config = checkpoint_role_config(std::path::Path::new(&model));
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a red apple on a table", "output": "apple.png", "size": "auto"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let bytes = std::fs::read(ws.root().join("apple.png")).unwrap();
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert!(decoded.width() >= 256 && decoded.height() >= 256);
+}

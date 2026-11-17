@@ -115,6 +115,7 @@ fn refuses_every_sandbox_mode_other_than_off_and_runs_nothing() {
         allow_network: false,
         deny_read: Vec::new(),
         extra_write: Vec::new(),
+        serial_ports: false,
     };
     for ws in [
         ws.clone().with_shell_backend(ShellBackend::InProcess),

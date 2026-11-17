@@ -244,14 +244,17 @@ fn is_image_checkpoint(path: &Path) -> bool {
 }
 pub(super) fn snapshot(path: &Path) -> Option<Option<u32>> {
     if is_image_checkpoint(path) {
-        let transformer = if path.join("transformer").is_dir() {
-            path.join("transformer")
-        } else if path.join("unet").is_dir() {
-            path.join("unet")
-        } else {
-            path.to_owned()
-        };
-        for component in [transformer, path.join("vae"), path.join("text_encoder")] {
+        // A transformer layout counts as downloaded when the folder the image server reads (which
+        // may be the root's original checkpoint) or its Diffusers `transformer/` is complete; whether
+        // stable-diffusion.cpp can run it is reported by `annotate_image_checkpoints`.
+        let source = crate::llm::server::image::transformer_source(path);
+        let transformer = path.join("transformer");
+        if path.join("unet").is_dir() && !transformer.is_dir() {
+            complete_safetensors(&path.join("unet"))?;
+        } else if complete_safetensors(&source).is_none() {
+            complete_safetensors(&transformer)?;
+        }
+        for component in [path.join("vae"), path.join("text_encoder")] {
             complete_safetensors(&component)?;
         }
         for component in ["text_encoder_2", "text_encoder_3"] {
@@ -476,7 +479,7 @@ pub(super) fn lora_support(architectures: Option<&Path>, model: &Path) -> Option
         .then_some(true)
 }
 /// LM Studio's download folder: its `downloadsFolder` setting, else `~/.lmstudio/models`.
-fn lmstudio_folder() -> Option<PathBuf> {
+pub(super) fn lmstudio_folder() -> Option<PathBuf> {
     let home = crate::config::paths::home_dir()?;
     let configured = read_json(&home.join(".lmstudio/settings.json")).and_then(|settings| {
         settings["downloadsFolder"]
@@ -634,15 +637,42 @@ pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
             }
         }
     }
-    for entry in &mut models {
-        if entry.metadata.kind == ModelKind::Image && entry.selection.base_url.is_none() {
-            entry.available = false;
-            if !entry.source.starts_with("MLX-Serve download") {
-                entry.source.push_str(
-                    " · image checkpoint, not served: import/serve in MLX-Serve, then F5 rescan",
-                );
+    annotate_image_checkpoints(&mut models);
+    models
+}
+
+/// Downloaded diffusion checkpoints run on a Dial-launched stable-diffusion.cpp `sd-server` when
+/// their files are a layout it loads. Packs it cannot read (MLX-quantized mflux/MLX-Serve packs)
+/// stay listed but unavailable, with the reason.
+pub(super) fn annotate_image_checkpoints(models: &mut [ModelEntry]) {
+    for entry in models {
+        if entry.metadata.kind != ModelKind::Image
+            || entry.selection.base_url.is_some()
+            || entry.source.starts_with("MLX-Serve download")
+        {
+            continue;
+        }
+        match crate::llm::server::image::components(Path::new(&entry.selection.model)) {
+            Ok(_) => {
+                entry.available = true;
+                entry.source.push_str(if crate::llm::local_format::sd_server().is_some() {
+                    " · image checkpoint, run by Dial on stable-diffusion.cpp"
+                } else {
+                    " · image checkpoint, run by Dial on stable-diffusion.cpp (installs with /setup sd-cpp)"
+                });
+            }
+            Err(error) => {
+                entry.available = false;
+                let reason = format!("{error:#}");
+                let reason = if reason.contains("MLX-quantized") {
+                    "MLX-quantized pack: stable-diffusion.cpp cannot read it; serve it with MLX-Serve, or download the original safetensors".to_owned()
+                } else {
+                    reason
+                };
+                entry
+                    .source
+                    .push_str(&format!(" · image checkpoint, not runnable: {reason}"));
             }
         }
     }
-    models
 }

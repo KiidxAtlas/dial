@@ -48,6 +48,24 @@ fn coherent_runtime_custom_cards_keep_state_preview_and_expanded_evidence() {
         !expanded.contains("\u{1b}") && !compact.contains("\u{1b}"),
         "Tool-owned labels are still untrusted terminal text"
     );
+    assert_eq!(
+        transcript.retained_tool_calls(),
+        vec![(
+            "custom-call".into(),
+            "extension_name".into(),
+            "opaque summary".into()
+        )]
+    );
+    transcript.finish_turn();
+    transcript.take_settled(100, &env.ctx());
+    let evidence = transcript.retained_tool("custom-call").unwrap();
+    assert_eq!(evidence.output, "FULL_EVIDENCE_SENTINEL\nsecond line");
+    assert_eq!(evidence.state, ToolState::Incomplete);
+    assert_eq!(
+        evidence.presentation.preview.as_deref(),
+        Some("short finding")
+    );
+    assert!(transcript.retained_tool("missing").is_none());
 }
 
 #[test]
@@ -892,6 +910,27 @@ fn errors_and_notices_wrap_with_hanging_indent() {
     assert!(text[1].starts_with("  "));
     assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Error).fg);
     assert!(text.iter().any(|l| l.to_uppercase().contains("HEADS UP")));
+}
+
+#[test]
+fn typed_notice_severity_survives_delivery_and_deduplication() {
+    let env = Env::new();
+    let mut transcript = Transcript::new();
+    transcript.notice("Report", "retry later");
+    transcript.notice_with_severity("Report", "retry later", NoticeSeverity::Error);
+    let rows = transcript.all_rows(60, &env.ctx());
+    assert_fits(&rows, 60);
+    let text = plain(&rows);
+    assert!(
+        text.iter().any(|row| row.contains("REPORT")),
+        "quiet notice retained"
+    );
+    let card = text
+        .iter()
+        .position(|row| row.starts_with('╭'))
+        .expect("explicit error card");
+    assert!(text[card].contains("Report"));
+    assert_eq!(rows[card].spans[0].style.fg, env.theme.fg(Tok::Error).fg);
 }
 
 #[test]
@@ -2835,4 +2874,24 @@ fn consecutive_skill_loads_fold_into_one_row_per_skill() {
         },
     ));
     assert!(expanded.contains("references/a.md") && expanded.contains("references/b.md"));
+}
+
+#[test]
+fn provider_retry_retires_only_argument_drafts_and_allows_reused_call_ids() {
+    let mut t = Transcript::new();
+    t.tool_arguments_delta("draft", "write", "{");
+    t.tool_start("running", "bash", "sleep", "{}");
+    t.event(&crate::agent::ui::ui_event::UiEvent::new(
+        crate::agent::ui::ui_event::EventKind::Retry,
+        "retry",
+    ));
+    assert!(!t.blocks[0].active);
+    assert!(t.blocks[1].active);
+    let Kind::Tool(draft) = &t.blocks[0].kind else {
+        panic!()
+    };
+    assert!(draft.progress.is_none());
+    assert!(draft.outcome.is_none(), "draft never executed");
+    t.tool_arguments_delta("draft", "write", "{}");
+    assert_eq!(t.blocks.len(), 4);
 }

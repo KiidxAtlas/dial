@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const MAX_BYTES: usize = 1024 * 1024;
 /// Lines one ranged text read returns at most (also bounded by [`MAX_BYTES`]).
 const MAX_LINES: u64 = 100_000;
+/// Maximum consumed input per ranged page, including skipped lines. The read-data path has
+/// no cancellation/deadline context, so refuse expensive offsets rather than scan indefinitely.
+/// The buffered reader may read ahead by one fixed-size buffer beyond this ceiling.
+const MAX_SCAN_BYTES: usize = 64 * MAX_BYTES;
 
 /// Structured data is returned to code, while the model-facing text stays a compact receipt.
 pub(in crate::tools) fn read(ws: &Workspace, args: &Value) -> Result<ToolOutput, String> {
@@ -76,9 +80,9 @@ pub(in crate::tools) fn read(ws: &Workspace, args: &Value) -> Result<ToolOutput,
     })
 }
 
-/// Lines `offset..offset+limit` (1-based) of a text file of any size, streamed and returned
-/// exactly (line endings kept) up to [`MAX_BYTES`]. `next_offset` continues the page; it is null
-/// at the end of the file.
+/// Lines `offset..offset+limit` (1-based), preserving line endings up to [`MAX_BYTES`].
+/// Each page scans at most [`MAX_SCAN_BYTES`] input bytes, including skipped lines;
+/// offsets beyond that work budget are refused. `next_offset` is null at EOF.
 fn read_lines(ws: &Workspace, input: &str, args: &Value) -> Result<ToolOutput, String> {
     use std::io::BufRead;
     let offset = crate::tools::opt_u64(args, "offset")?.unwrap_or(1);
@@ -92,31 +96,40 @@ fn read_lines(ws: &Workspace, input: &str, args: &Value) -> Result<ToolOutput, S
         .map_err(|error| format!("reading data: {error:#}"))?;
     let mut reader = std::io::BufReader::new(file);
     let (mut line_no, mut taken) = (0u64, 0u64);
-    let (mut content, mut line) = (Vec::new(), Vec::new());
+    let mut content = Vec::new();
+    let mut scan_left = MAX_SCAN_BYTES;
     let mut next = None;
     loop {
-        line.clear();
         if reader
-            .read_until(b'\n', &mut line)
+            .fill_buf()
             .map_err(|error| format!("reading data: {error}"))?
-            == 0
+            .is_empty()
         {
             break;
         }
         line_no += 1;
         if line_no < offset {
+            scan_line(&mut reader, None, 0, &mut scan_left)
+                .map_err(|error| format!("reading data: {error}"))?;
             continue;
         }
-        if taken == limit || (taken > 0 && content.len() + line.len() > MAX_BYTES) {
+        if taken == limit {
             next = Some(line_no);
             break;
         }
-        if line.len() > MAX_BYTES {
+        let before = content.len();
+        if !scan_line(&mut reader, Some(&mut content), MAX_BYTES, &mut scan_left)
+            .map_err(|error| format!("reading data: {error}"))?
+        {
+            content.truncate(before);
+            if taken > 0 {
+                next = Some(line_no);
+                break;
+            }
             return Err(format!(
                 "line {line_no} alone exceeds 1 MiB; read it with format=base64 or a shell tool"
             ));
         }
-        content.extend_from_slice(&line);
         taken += 1;
     }
     let content = String::from_utf8(content)
@@ -132,6 +145,41 @@ fn read_lines(ws: &Workspace, input: &str, args: &Value) -> Result<ToolOutput, S
         is_error: false,
         execution: Default::default(),
     })
+}
+
+/// Consume one line without allocating for skipped bytes. A selected line stops at the
+/// output budget rather than materializing an arbitrarily large line before checking it.
+/// `false` means the line did not fit; the caller must discard its partial contribution.
+fn scan_line(
+    reader: &mut impl std::io::BufRead,
+    mut output: Option<&mut Vec<u8>>,
+    budget: usize,
+    scan_left: &mut usize,
+) -> std::io::Result<bool> {
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(true);
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(chunk.len(), |index| index + 1);
+        if let Some(output) = output.as_mut() {
+            if count > budget.saturating_sub(output.len()) {
+                return Ok(false);
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+        if count > *scan_left {
+            return Err(std::io::Error::other(
+                "ranged read exceeds the 64 MiB scan budget, including skipped lines; use a shell tool to select a smaller source",
+            ));
+        }
+        *scan_left -= count;
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
 }
 
 /// Best-effort initial task preservation. Only direct regular root files, with explicit file,

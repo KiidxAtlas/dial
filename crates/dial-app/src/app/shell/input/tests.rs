@@ -115,3 +115,67 @@ fn a_windows_editor_path_with_spaces_is_quoted_but_a_command_line_is_not() {
     );
     assert_eq!(editor_invocation("code --wait", false), "& code --wait");
 }
+
+#[test]
+fn home_yields_to_history_search_before_navigation_or_tour_dismissal() {
+    let (_home, _project, _app, mut shell) = shell();
+    shell.home = Some(welcome::Home::new(
+        welcome::WelcomeInfo {
+            tour: true,
+            ..Default::default()
+        },
+        vec![],
+        false,
+    ));
+    shell.composer = crate::ui::composer::Composer::new(vec!["older".into(), "newer".into()], 100);
+    shell.composer_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    ));
+    for code in [KeyCode::Down, KeyCode::Enter] {
+        let key = crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(shell.home_key(&key), None, "home stole {code:?}");
+        shell.composer_key(key);
+    }
+    assert_eq!(shell.composer.draft(), "older");
+    assert_eq!(shell.home.as_ref().unwrap().selected(), None);
+    shell.composer.clear();
+    shell.composer_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    ));
+    let escape = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(shell.home_key(&escape), None);
+    shell.composer_key(escape);
+    assert!(shell.home.as_ref().unwrap().info.tour);
+    assert_eq!(shell.home_key(&escape), Some(None));
+    assert!(!shell.home.as_ref().unwrap().info.tour);
+}
+
+#[test]
+fn home_tour_dismissal_follows_its_binding_and_yields_to_the_draft() {
+    let (_home, _project, _app, mut shell) = shell();
+    for bound in [true, false] {
+        shell.home = Some(welcome::Home::new(
+            welcome::WelcomeInfo {
+                tour: true,
+                ..Default::default()
+            },
+            vec![],
+            false,
+        ));
+        shell
+            .keys
+            .rebind(Action::Dismiss, if bound { &["F10"] } else { &[] })
+            .unwrap();
+        let escape = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(shell.home_key(&escape), None);
+        assert!(shell.home.as_ref().unwrap().info.tour);
+        let dismiss = crossterm::event::KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE);
+        shell.composer.set_draft("draft");
+        assert_eq!(shell.home_key(&dismiss), None);
+        shell.composer.clear();
+        assert_eq!(shell.home_key(&dismiss), bound.then_some(None));
+        assert_eq!(shell.home.as_ref().unwrap().info.tour, !bound);
+    }
+}

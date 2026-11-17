@@ -33,8 +33,9 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CALLBACK_PORT: u16 = 1455;
-/// Shared Codex compatibility version for model listing, inference, compaction and usage.
-pub(super) const CLIENT_VERSION: &str = "0.159.0";
+mod client_version;
+/// The Codex compatibility version for model listing, inference, compaction and usage.
+pub(super) use client_version::current as client_version;
 pub(super) const ORIGINATOR: &str = "dial";
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const MAX_JSON: u64 = 256 * 1024;
@@ -1016,12 +1017,14 @@ fn token_locked(
         renewal,
     ))
 }
+/// Signs one account out and forgets it: the registration, its tokens and its cached model list.
+/// Remote revocation is attempted first; a failure there still removes the local entry.
 pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String> {
     let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut state = load(dir)?;
     let account = state
         .accounts
-        .get_mut(id)
+        .get(id)
         .ok_or_else(|| anyhow::anyhow!("ChatGPT account registration no longer exists"))?;
     let revoked = if let Some(tokens) = &account.tokens {
         (|| -> Result<()> {
@@ -1055,18 +1058,45 @@ pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String>
     } else {
         true
     };
-    account.tokens = None;
+    state.accounts.remove(id);
     if state.active.as_deref() == Some(id) {
         state.active = None;
     }
     save(dir, &state)?;
-    Ok(if revoked { "Signed out of ChatGPT; account registration retained for later sign-in." } else { "Signed out locally. Remote revocation was not confirmed; disconnect Dial in ChatGPT Settings if needed." }.into())
+    forget_cached_catalogs(dir, Some(id))?;
+    Ok(if revoked { "Signed out of ChatGPT and removed the account from Dial." } else { "Removed the ChatGPT account from Dial. Remote revocation was not confirmed; disconnect Dial in ChatGPT Settings if needed." }.into())
 }
 
-/// Forget all local account registrations and tokens without a network request.
+/// Drops cached model lists for one account, or for every account when `id` is `None`. The file
+/// is rewritten rather than deleted so a legacy copy is not migrated back in.
+fn forget_cached_catalogs(dir: &Path, id: Option<&str>) -> Result<()> {
+    let path = crate::config::paths::chatgpt_model_catalog_file(dir);
+    let _lock = locked_cancellable(&path, &AtomicBool::new(false))?;
+    let Some(bytes) = crate::platform::atomic::read_private(&path)? else {
+        return Ok(());
+    };
+    let mut catalogs: BTreeMap<String, Value> = match id {
+        // An unreadable cache holds nothing worth keeping once every account is forgotten.
+        None => BTreeMap::new(),
+        Some(_) => serde_json::from_slice(&bytes).map_err(|_| {
+            anyhow::anyhow!("ChatGPT model metadata cache is invalid; rescan from /models")
+        })?,
+    };
+    if let Some(id) = id
+        && catalogs.remove(id).is_none()
+    {
+        return Ok(());
+    }
+    write_private(&path, &serde_json::to_vec(&catalogs)?)
+}
+
+/// Forget all local account registrations, tokens and cached model lists without a network request.
 pub fn forget_accounts(dir: &Path) -> Result<()> {
-    let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
-    save(dir, &State::default())
+    {
+        let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
+        save(dir, &State::default())?;
+    }
+    forget_cached_catalogs(dir, None)
 }
 fn codex_request(
     account_id: &str,
@@ -1080,7 +1110,7 @@ fn codex_request(
         .header("chatgpt-account-id", account_id)
         .header("OpenAI-Beta", "responses=experimental")
         .header("originator", ORIGINATOR)
-        .header("version", CLIENT_VERSION)
+        .header("version", client_version())
         .header("Accept", "application/json")
         .call()
         .map_err(|_| anyhow::anyhow!("OpenAI Codex model discovery unavailable"))
@@ -1105,16 +1135,19 @@ pub fn discover(
             Renew::OlderThan(DISCOVERY_RENEW_AGE),
         );
         let (id, token) = account_token_at(dir, Arc::new(AtomicBool::new(false)), TOKEN_URL)?;
+        // The backend lists (and serves) newer models only to a recent enough client version.
+        let supplemental = codex_model_metadata();
+        let version =
+            client_version::refresh(dir, supplemental.as_ref(), client_version::REGISTRY_URL);
         let urls = [
-            format!("{BASE_URL}/codex/models?client_version={CLIENT_VERSION}"),
-            format!("{BASE_URL}/models?client_version={CLIENT_VERSION}"),
+            format!("{BASE_URL}/codex/models?client_version={version}"),
+            format!("{BASE_URL}/models?client_version={version}"),
         ];
         let mut response = urls
             .iter()
             .find_map(|url| codex_request(&id, &token, url, 5).ok())
             .ok_or_else(|| anyhow::anyhow!("OpenAI Codex model discovery failed"))?;
         let value = limited_json(&mut response, MAX_CATALOG_JSON, "model catalog")?;
-        let supplemental = codex_model_metadata();
         let catalog = build_catalog(&value, supplemental.as_ref())?;
         save_catalog(dir, &id, &catalog)?;
         let models = catalog.models;

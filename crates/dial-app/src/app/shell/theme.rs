@@ -54,7 +54,8 @@ impl Shell {
             return Ok(Step::Done);
         }
         if self.themes.names().iter().all(|entry| entry.name != args) && args != "auto" {
-            self.note(
+            self.notify(
+                crate::ui::overlay::inbox::Category::Error,
                 "Theme",
                 format!("unknown theme {args:?}; /theme lists them"),
             );
@@ -70,7 +71,11 @@ impl Shell {
                 Ok(step)
             }
             Err(error) => {
-                self.note("Theme", format!("not changed: {error:#}"));
+                self.notify(
+                    crate::ui::overlay::inbox::Category::Error,
+                    "Theme",
+                    format!("not changed: {error:#}"),
+                );
                 Ok(Step::Done)
             }
         }

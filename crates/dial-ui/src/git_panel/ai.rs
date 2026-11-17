@@ -6,21 +6,15 @@ use crate::commit::ai_stage::{StageUnit, UNIT_CHARS, UnitKind, changed_lines, cl
 use crate::commit::repo_context::generation_context;
 use crate::commit::{GenerationConfig, GenerationInput, format_conventional_commit, generate};
 use crate::tools::vcs::git::run_checked;
-use std::{
-    path::Path,
-    sync::mpsc::{self, Receiver},
-};
+use std::{path::Path, sync::mpsc::Receiver};
 
-/// Generates a commit message for the staged changes. With nothing staged, stages everything
-/// first.
+/// Generates a message only for explicitly staged changes; never changes the index.
 fn generate_in(root: &Path, config: &Config) -> Result<Generated, String> {
-    let mut staged_all = false;
     if run_checked(root, &["diff", "--cached", "--name-only"], false)?
         .trim()
         .is_empty()
     {
-        run_checked(root, &["add", "-A"], true)?;
-        staged_all = true;
+        return Err("Stage changes before generating a commit message".to_owned());
     }
     let diff = run_checked(
         root,
@@ -67,7 +61,6 @@ fn generate_in(root: &Path, config: &Config) -> Result<Generated, String> {
     Ok(Generated {
         text: format_conventional_commit(&result.commit),
         validation_error: result.validation_error,
-        staged_all,
     })
 }
 
@@ -300,12 +293,9 @@ fn untracked_head(root: &Path, path: &str) -> Option<String> {
 impl Repo {
     /// Generates a commit message for the staged changes on a worker thread.
     pub(crate) fn spawn_generate(&self) -> Receiver<Result<Generated, String>> {
-        let (sender, receiver) = mpsc::channel();
-        let (root, config) = (self.root.clone(), self.config.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(generate_in(&root, &config));
-        });
-        receiver
+        self.spawn_job("Commit message generation", |repo| {
+            generate_in(&repo.root, &repo.config)
+        })
     }
 
     /// Classifies the unstaged `changes` against `instruction` on a worker thread.
@@ -314,12 +304,9 @@ impl Repo {
         instruction: String,
         changes: Vec<Change>,
     ) -> Receiver<Result<AiSummary, String>> {
-        let (sender, receiver) = mpsc::channel();
-        let (root, config) = (self.root.clone(), self.config.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(ai_stage_in(&root, &config, &instruction, &changes));
-        });
-        receiver
+        self.spawn_job("AI staging", move |repo| {
+            ai_stage_in(&repo.root, &repo.config, &instruction, &changes)
+        })
     }
 }
 

@@ -112,6 +112,20 @@ pub trait Ui {
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     /// Latest progress snapshot for a running tool; replaces the previous one in place.
     fn tool_progress(&mut self, _name: &str, _text: &str) {}
+    /// Call-correlated output: surfaces that track calls by id route it to that call's row.
+    /// Legacy surfaces keep the name-based projection.
+    fn tool_output_with_id(&mut self, _call_id: &str, name: &str, text: &str) {
+        self.tool_output(name, text);
+    }
+    /// Call-correlated progress snapshot; replaces the previous snapshot for the same call.
+    fn tool_progress_with_id(&mut self, _call_id: &str, name: &str, text: &str) {
+        self.tool_progress(name, text);
+    }
+    /// Whether this surface announces a discarded attempt's boundary itself. Only the reducer
+    /// (`StateUi`) does; raw surfaces rely on the request loop's fallback.
+    fn owns_attempt_boundary(&self) -> bool {
+        false
+    }
     fn background_notice(&mut self, _message: &str) {}
     fn reasoning_delta(&mut self, _text: &str) {}
     /// Observational progress only: incomplete arguments are never dispatched as tool calls.

@@ -1,9 +1,9 @@
 use super::cache::selection_cache_key;
 use super::credentials::env_token;
 use super::local_models::{
-    lmstudio_gguf_models, lmstudio_gguf_models_where, lmstudio_mlx_models,
-    lmstudio_mlx_models_where, local_models, local_models_where, model_card_kind_in,
-    resolve_local_model_in,
+    annotate_image_checkpoints, lmstudio_gguf_models, lmstudio_gguf_models_where,
+    lmstudio_mlx_models, lmstudio_mlx_models_where, local_models, local_models_where,
+    model_card_kind_in, resolve_local_model_in,
 };
 use super::local_servers::{
     annotate_lmstudio, declared_kind, kind_from_declared, ollama_show, parse_lmstudio,
@@ -2191,6 +2191,45 @@ fn krea_root_transformer_layout_is_an_image_not_chat() {
     }
     assert_eq!(snapshot(dir.path()), Some(None));
     assert_eq!(local_model_metadata(dir.path()).kind, ModelKind::Image);
+}
+
+#[test]
+fn image_checkpoints_are_available_when_stable_diffusion_cpp_can_load_them() {
+    let runnable = tempfile::tempdir().unwrap();
+    for part in ["transformer", "vae", "text_encoder"] {
+        fs::create_dir_all(runnable.path().join(part)).unwrap();
+        fs::write(runnable.path().join(part).join("model.safetensors"), b"w").unwrap();
+    }
+    let quantized = tempfile::tempdir().unwrap();
+    fs::write(
+        quantized.path().join("config.json"),
+        r#"{"quantization":{"bits":4,"method":"mflux"}}"#,
+    )
+    .unwrap();
+    let entry = |path: &Path| ModelEntry {
+        selection: ModelSelection {
+            provider: "mlx".into(),
+            model: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        label: "image".into(),
+        source: "Hugging Face cache (MLX)".into(),
+        available: false,
+        metadata: ModelMetadata {
+            kind: ModelKind::Image,
+            ..ModelMetadata::default()
+        },
+    };
+    let mut models = vec![entry(runnable.path()), entry(quantized.path())];
+    annotate_image_checkpoints(&mut models);
+    assert!(models[0].available, "{}", models[0].source);
+    assert!(models[0].source.contains("stable-diffusion.cpp"));
+    assert!(!models[1].available);
+    assert!(
+        models[1].source.contains("not runnable: MLX-quantized"),
+        "{}",
+        models[1].source
+    );
 }
 
 /// Direct provider discovery: an exact documented id is annotated only when the live row declares

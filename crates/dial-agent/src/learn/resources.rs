@@ -15,7 +15,7 @@ use std::{
 };
 
 /// Seconds since the epoch.
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -178,6 +178,41 @@ fn day(at: u64) -> u64 {
     at / 86_400
 }
 
+/// UTC day attribution over monotonic samples. Wall time detects a day transition, never the
+/// duration of compute. Once a midnight is observed, corrections within that day cannot erase
+/// its accumulated compute. Forward jumps charge at most compute since the preceding sample;
+/// reversing the UTC day conservatively charges the whole lease rather than forgiving debt.
+pub(super) struct UsageClock {
+    day: u64,
+    day_started_elapsed: u64,
+    last_elapsed: u64,
+}
+
+impl UsageClock {
+    pub(super) fn new(started_at: u64) -> Self {
+        Self {
+            day: day(started_at),
+            day_started_elapsed: 0,
+            last_elapsed: 0,
+        }
+    }
+
+    pub(super) fn sample(&mut self, elapsed: u64, at: u64) -> u64 {
+        let today = day(at);
+        if today > self.day {
+            let since_sample = elapsed.saturating_sub(self.last_elapsed);
+            self.day_started_elapsed = elapsed.saturating_sub(since_sample.min(at % 86_400));
+            self.day = today;
+        }
+        self.last_elapsed = elapsed;
+        if today < self.day {
+            elapsed
+        } else {
+            elapsed.saturating_sub(self.day_started_elapsed)
+        }
+    }
+}
+
 fn read_usage(user_dir: &Path, at: u64) -> u64 {
     read_usage_checked(user_dir, at).unwrap_or(0)
 }
@@ -207,19 +242,23 @@ pub fn used_today_checked(user_dir: &Path) -> Result<u64> {
     read_usage_checked(user_dir, now())
 }
 
+pub(super) fn used_at_checked(user_dir: &Path, at: u64) -> Result<u64> {
+    read_usage_checked(user_dir, at)
+}
+
 /// Add background compute time to today's total.
 pub fn record_usage(user_dir: &Path, secs: u64) -> Result<()> {
     record_usage_at(user_dir, secs, now())
 }
 
-fn record_usage_at(user_dir: &Path, secs: u64, at: u64) -> Result<()> {
+pub(super) fn record_usage_at(user_dir: &Path, secs: u64, at: u64) -> Result<()> {
     if secs == 0 {
         return Ok(());
     }
     std::fs::create_dir_all(user_dir)?;
     // The stable settings lock covers the whole read-modify-write, independent of compute_locks.
     let _lock = settings_store::locked(&usage_path(user_dir))?;
-    let total = read_usage_checked(user_dir, at)? + secs;
+    let total = read_usage_checked(user_dir, at)?.saturating_add(secs);
     settings_store::write_private(
         &usage_path(user_dir),
         serde_json::json!({"day": day(at), "secs": total})

@@ -235,3 +235,30 @@ fn session_results_use_the_picker_rank_and_never_fuzzy_match_summary_or_path() {
         assert_eq!(palette.rows(), expected);
     }
 }
+
+#[test]
+fn local_search_is_discoverable_and_opens_the_existing_lazy_scope() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut palette = PaletteOverlay::new(vec![entry("model")], false).with_unified_search(
+        vec![help()],
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        },
+    );
+    let shown = rendered(&mut palette);
+    assert!(shown.contains("Search local"), "{shown}");
+    assert!(
+        shown.contains("Actions, Settings, Sessions, Help"),
+        "{shown}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // The additional door follows the existing goals and category door.
+    palette.cursor = palette.rows().len() - 1;
+    assert!(matches!(enter(&mut palette), OverlayEvent::None));
+    assert_eq!(palette.unified_query(), Some(""));
+    rendered(&mut palette);
+    settle(&mut palette);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

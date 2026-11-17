@@ -80,6 +80,51 @@ pub(super) fn list(layout: &Layout, current: Option<&str>, params: &Value) -> Re
     }))
 }
 
+/// Read-only history window, run through the controller's bounded read jobs.
+pub(super) fn search(layout: &Layout, params: &Value) -> Result<Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        query: String,
+        limit: Option<usize>,
+    }
+    if params.get("limit").is_some_and(Value::is_null) {
+        return Err(invalid("limit must be an integer in 1..=1000"));
+    }
+    let params: Params = serde_json::from_value(params.clone()).map_err(invalid)?;
+    let query = params.query.trim();
+    if query.is_empty() || query.len() > 4096 {
+        return Err(invalid(
+            "query must contain 1..=4096 UTF-8 bytes after trimming",
+        ));
+    }
+    let limit = params.limit.unwrap_or(50);
+    if !(1..=1000).contains(&limit) {
+        return Err(invalid("limit must be an integer in 1..=1000"));
+    }
+    let mut hits = Session::search(layout, query, limit + 1)
+        .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    let has_more = hits.len() > limit;
+    hits.truncate(limit);
+    let mut titles = std::collections::HashMap::new();
+    let hits: Vec<Value> = hits
+        .into_iter()
+        .map(|hit| {
+            let title = titles.entry(hit.session_id.clone()).or_insert_with(|| {
+                Session::find_prefix(layout, &hit.session_id)
+                    .ok()
+                    .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
+                    .map(|s| s.title)
+                    .unwrap_or_default()
+            });
+            json!({"session_id": hit.session_id, "entry_id": hit.entry_id,
+            "role": hit.role, "snippet": hit.snippet, "preview": hit.preview,
+            "when": hit.when, "title": title})
+        })
+        .collect();
+    Ok(json!({"query": query, "limit": limit, "hits": hits, "has_more": has_more}))
+}
+
 /// The one journal of this project whose id is exactly `wanted`.
 fn find(layout: &Layout, wanted: &str) -> Result<crate::storage::session::SessionInfo> {
     if wanted.is_empty() {

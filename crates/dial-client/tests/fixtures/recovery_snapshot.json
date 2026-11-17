@@ -1,0 +1,13 @@
+{
+  "session_id": "s1",
+  "seq": 6,
+  "messages": [
+    {"role": "user", "content": "saved prompt"},
+    {"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "c", "content": "legacy result without outcome metadata"}
+  ],
+  "busy": false,
+  "pending_approvals": [],
+  "question": null,
+  "todo": [{"content": "current task", "status": "pending"}]
+}

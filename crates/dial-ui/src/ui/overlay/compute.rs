@@ -107,6 +107,8 @@ struct Pending {
 }
 pub struct ComputeOverlay {
     snapshot: Value,
+    hits: super::panel_keys::RowHits,
+    tab_hits: super::panel_keys::RowHits,
     tab: usize,
     cursor: usize,
     /// Cursor of the list the item menu was opened from; Esc returns to it.
@@ -119,6 +121,8 @@ pub struct ComputeOverlay {
 impl ComputeOverlay {
     pub fn new() -> Self {
         Self {
+            hits: Default::default(),
+            tab_hits: Default::default(),
             snapshot: Value::Null,
             tab: 0,
             cursor: 0,
@@ -373,7 +377,27 @@ impl ComputeOverlay {
         }
         OverlayEvent::None
     }
+    /// Select a compute owner; action menus still require Enter.
+    pub fn click(&mut self, x: u16, y: u16) -> OverlayEvent {
+        if self.menu.is_none()
+            && self.confirm.is_none()
+            && let Some(index) = self.hits.hit(x, y)
+        {
+            self.cursor = index;
+        }
+        if self.menu.is_none()
+            && self.confirm.is_none()
+            && let Some(tab) = self.tab_hits.hit(x, y)
+        {
+            self.tab = tab;
+            self.cursor = 0;
+        }
+        OverlayEvent::None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        self.hits.begin(frame.area());
+        self.tab_hits.begin(frame.area());
         panel(
             frame,
             ctx.theme,
@@ -622,8 +646,29 @@ impl ComputeOverlay {
                         ));
                     }
                 }
+                let mut selectable = Vec::new();
+                let mut item_index = 0;
+                if self.menu.is_none() {
+                    for (row_index, row) in rows.iter().enumerate() {
+                        if matches!(row, ListRow::Text(_, _)) && item_index < self.items().len() {
+                            selectable.push((row_index, item_index));
+                            item_index += 1;
+                        }
+                    }
+                }
                 let header_limit = h.saturating_sub(5);
                 let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, &TABS, self.tab, w)];
+                let mut x = 0;
+                for span in &output[0].spans {
+                    let cells = text::width(&span.content);
+                    if let Some(tab) = TABS
+                        .iter()
+                        .position(|name| *name == span.content.trim_matches(['[', ']']))
+                    {
+                        self.tab_hits.row(x, 0, cells, tab);
+                    }
+                    x += cells;
+                }
                 output.extend(header.into_iter().take(header_limit).map(|(line, token)| {
                     filled(
                         vec![Span::styled(
@@ -637,6 +682,9 @@ impl ComputeOverlay {
                 let available = h.saturating_sub(output.len() + 2);
                 let scroll = selected_row.saturating_sub(available.saturating_sub(1));
                 for (i, row) in rows.into_iter().enumerate().skip(scroll).take(available) {
+                    if let Some((_, index)) = selectable.iter().find(|(row, _)| *row == i) {
+                        self.hits.row(0, output.len(), w, *index);
+                    }
                     let selected = self.menu.is_none() && i == selected_row;
                     output.push(match row {
                         ListRow::Heading(name) => section_heading(ctx.theme, &name, w),

@@ -32,21 +32,27 @@ pub(in crate::app) fn stage_settings(
 
 impl Shell {
     pub(in crate::app) fn note(&mut self, title: &str, text: impl AsRef<str>) {
-        if matches!(
-            title,
-            "Workers"
-                | "Background"
-                | "Notice"
-                | "Collab"
-                | "Project peers"
-                | "Setup"
-                | "Key bindings"
-                | "Theme"
-        ) {
-            self.inbox.push(title, text.as_ref());
-            self.status.inbox_unread = self.inbox.unread();
-        }
         self.transcript.notice(title, text.as_ref());
+    }
+
+    /// An explicit notification producer, independent of the user-visible title.
+    pub(in crate::app) fn notify(
+        &mut self,
+        category: crate::ui::overlay::inbox::Category,
+        title: &str,
+        text: impl AsRef<str>,
+    ) {
+        use crate::ui::{overlay::inbox::Category, transcript::NoticeSeverity};
+        self.inbox.push_category(title, text.as_ref(), category);
+        self.status.inbox_unread = self.inbox.unread();
+        self.transcript.notice_with_severity(
+            title,
+            text.as_ref(),
+            match category {
+                Category::Error => NoticeSeverity::Error,
+                Category::General | Category::Completion => NoticeSeverity::Info,
+            },
+        );
     }
 
     pub(in crate::app) fn take_runtime_update_report(&mut self) -> Option<String> {
@@ -132,10 +138,24 @@ impl Shell {
         changes: &[Change],
         scope: Scope,
     ) -> Result<Step> {
+        self.save_with(app, agent, |app| app.save_settings(scope, changes, None))
+    }
+
+    /// [`Shell::save`] for a write that `write` performs itself, such as a shared owner that reads
+    /// and changes the file under the settings locks. Reload, display and turn adoption are those
+    /// of `save`, so the write is the only difference.
+    pub(crate) fn save_with(
+        &mut self,
+        app: &App,
+        agent: Option<&mut Agent<'_>>,
+        write: impl FnOnce(&App) -> Result<()>,
+    ) -> Result<Step> {
         if let Some(agent) = agent {
-            return self.persist(app, agent, changes, scope);
+            write(app)?;
+            let fresh = app.reload()?;
+            return Ok(self.config_changed(app, agent, fresh));
         }
-        app.save_settings(scope, changes, None)?;
+        write(app)?;
         let fresh = app.reload()?.for_coding();
         self.apply_display(app, &fresh);
         self.adopt_after_turn(app, Step::Rebuild(Box::new(fresh)));
@@ -160,3 +180,6 @@ impl Shell {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

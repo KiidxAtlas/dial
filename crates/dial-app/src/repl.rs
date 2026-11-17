@@ -266,6 +266,25 @@ impl PrintUi {
         }
     }
 
+    /// Text mode streams tool output to stderr. Stream-json carries it with `call_id` when the
+    /// dispatch had one, so each delta stays attributable to its call.
+    fn tool_output_event(&mut self, call_id: Option<&str>, name: &str, text: &str) {
+        if self.format == OutputFormat::Text {
+            eprint!("{text}");
+            if let Err(error) = io::stderr().flush() {
+                self.write_error = Some(error);
+                self.terminal.cancel_output();
+            }
+        }
+        self.event(|| {
+            let mut value = serde_json::json!({"type":"tool_output","name":name,"delta":text});
+            if let Some(id) = call_id.filter(|id| !id.is_empty()) {
+                value["call_id"] = serde_json::json!(id);
+            }
+            value
+        });
+    }
+
     pub fn system(&mut self, session: &str, model: &str, cwd: &std::path::Path, tools: &[String]) {
         self.event(|| serde_json::json!({"type":"system", "session_id":session, "model":model, "cwd":cwd, "tools":tools}));
     }
@@ -354,14 +373,10 @@ impl Ui for PrintUi {
         );
     }
     fn tool_output(&mut self, name: &str, text: &str) {
-        if self.format == OutputFormat::Text {
-            eprint!("{text}");
-            if let Err(error) = io::stderr().flush() {
-                self.write_error = Some(error);
-                self.terminal.cancel_output();
-            }
-        }
-        self.event(|| serde_json::json!({"type":"tool_output","name":name,"delta":text}));
+        self.tool_output_event(None, name, text);
+    }
+    fn tool_output_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        self.tool_output_event(Some(call_id), name, text);
     }
     fn background_notice(&mut self, message: &str) {
         if self.format == OutputFormat::Text {

@@ -46,6 +46,7 @@ fn icon(kind: EventKind, theme: &Theme) -> String {
         (Compaction | ContextReset, false) => "⟲",
         (Draft, false) => "✎",
         (Wait, false) => "◷",
+        (Retry, false) => "↺",
         (Steering, true) => ">",
         (Compaction | ContextReset, true) => "~",
         (_, true) => "*",

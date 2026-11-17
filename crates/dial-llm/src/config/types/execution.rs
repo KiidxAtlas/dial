@@ -159,6 +159,9 @@ pub struct SandboxConfig {
     pub network_allow: Vec<String>,
     /// Domains sandboxed commands may never reach; wins over `network_allow`.
     pub network_deny: Vec<String>,
+    /// Let sandboxed commands open USB serial adapters (Arduino, ESP32 and similar boards) so
+    /// build tools can flash them and read their serial output. Off by default.
+    pub serial_ports: bool,
 }
 
 impl Default for SandboxConfig {
@@ -169,6 +172,7 @@ impl Default for SandboxConfig {
             extra_write: vec![],
             network_allow: vec![],
             network_deny: vec![],
+            serial_ports: false,
         }
     }
 }

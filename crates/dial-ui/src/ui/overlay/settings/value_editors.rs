@@ -151,6 +151,12 @@ impl ListEditor {
         self.cursor = self.items.len().saturating_sub(1);
     }
 
+    pub(super) fn poll(&mut self) {
+        if let Some(Adding::Folder(browser)) = &mut self.adding {
+            browser.poll();
+        }
+    }
+
     pub(super) fn paste(&mut self, text: &str) {
         match &mut self.adding {
             Some(Adding::Text(editor)) => editor.insert(text),

@@ -48,7 +48,7 @@ use workspace_edit::{Plan, Snapshot};
 
 /// Post-commit owners, one binding per workspace instance (see [`bind_write_owner`]). Each edit is
 /// published only to the service of the session that executed it, never a sibling's.
-type WriteThroughOwners = Vec<(Weak<Mutex<()>>, Weak<LspTool>)>;
+type WriteThroughOwners = Vec<(Weak<AtomicBool>, Weak<LspTool>)>;
 static WRITE_THROUGH: LazyLock<Mutex<WriteThroughOwners>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -569,10 +569,10 @@ fn operation_lock<'a>(
     }
 }
 
-fn workspace_lock<'a>(
-    ws: &'a Workspace,
+fn workspace_lock(
+    ws: &Workspace,
     cancel: &AtomicBool,
-) -> Result<MutexGuard<'a, ()>, String> {
+) -> Result<crate::tools::SerialOperation, String> {
     loop {
         check_cancel(cancel)?;
         if let Some(guard) = ws.try_serial_operation() {

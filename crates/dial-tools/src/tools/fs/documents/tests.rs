@@ -581,11 +581,13 @@ fn source_snapshot_cache_never_bypasses_current_read_denials() {
             deny_read: vec![path.clone()],
             allow_network: false,
             extra_write: vec![],
+            serial_ports: false,
         },
         Policy::Strict {
             deny_read: vec![path],
             allow_network: false,
             extra_write: vec![],
+            serial_ports: false,
         },
     ] {
         ws.policy = Some(policy);

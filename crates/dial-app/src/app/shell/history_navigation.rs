@@ -52,6 +52,10 @@ impl Shell {
                 }
             };
         }
+        if args == "more" {
+            self.more_search(agent.layout().unwrap_or(&app.layout));
+            return Ok(Step::Done);
+        }
         let back = args == "back";
         if back || args == "open" || args.starts_with("open ") {
             let target = if back {
@@ -76,7 +80,7 @@ impl Shell {
         if args.is_empty() {
             self.note(
                 "Search",
-                "Usage: /search <query> | /search results | /search open <id> | /search back",
+                "Usage: /search <query> | /search results | /search more | /search open <id> | /search back",
             );
         } else {
             self.start_search(agent.layout().unwrap_or(&app.layout), args);

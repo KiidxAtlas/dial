@@ -11,6 +11,11 @@ const MAX_ANNOTATIONS = 60;
 const MAX_METRICS = 200;
 const RECORD_QUALITY = 80;
 const RECORD_EVERY_NTH_FRAME = 2;
+const RECORD_MAX_DURATION_MS = 5 * 60 * 1000;
+const RECORD_MAX_BYTES = 128 * 1024 * 1024;
+const RECORD_MAX_FRAMES = 9000;
+const RECORD_MAX_PENDING = 4;
+const RECORD_MAX_FRAME_BYTES = 5 * 1024 * 1024;
 const CAPTURE_ACTIONS = new Set(['screenshot', 'locate', 'pdf', 'record_start', 'record_stop', 'profile_start', 'profile_stop', 'metrics', 'vitals']);
 
 const fail = message => { throw new Error(message); };
@@ -92,6 +97,7 @@ async function locateCapture(ctx) {
 // Self-contained: serialized into the page. Returns visible interactive elements addressed by a CSS
 // selector that the other DOM actions accept, so an annotation label can be acted on afterwards.
 function collectAnnotationTargets({ limit, fullPage }) {
+  const cut = (value, limit) => { const text = String(value).slice(0, limit); return /[\uD800-\uDBFF]$/.test(text) ? text.slice(0, -1) : text; };
   const selectorFor = node => {
     const parts = [];
     while (node && node.nodeType === 1 && parts.length < 12) {
@@ -112,7 +118,7 @@ function collectAnnotationTargets({ limit, fullPage }) {
     if (!fullPage && (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth)) continue;
     const style = getComputedStyle(element);
     if (style.visibility === 'hidden' || style.display === 'none' || element.closest('[aria-hidden="true"],[hidden]')) continue;
-    const name = (element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || element.getAttribute('placeholder') || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const name = cut((element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || element.getAttribute('placeholder') || element.textContent || '').replace(/\s+/g, ' ').trim(), 120);
     targets.push({ label: targets.length + 1, role: element.getAttribute('role') || element.localName, name, selector: selectorFor(element), x: rect.left, y: rect.top, width: rect.width, height: rect.height });
   }
   return targets;
@@ -160,6 +166,16 @@ function concatList(frames, endedMs) {
   return lines.join('\n') + '\n';
 }
 
+// One stop promise shared by automatic caps, explicit stop, restart and write failures.
+function stopRecording(cdp, rec, capped = null) {
+  if (rec.stop) return rec.stop;
+  rec.endedMs = Date.now();
+  rec.capped = capped;
+  clearTimeout(rec.timer);
+  cdp.removeListener('Page.screencastFrame', rec.onFrame);
+  rec.stop = cdp.send('Page.stopScreencast').catch(error => { rec.stopError = error; });
+  return rec.stop;
+}
 async function recordStart(ctx) {
   const { tab, page, request } = ctx;
   if (tab.recording) {
@@ -169,20 +185,36 @@ async function recordStart(ctx) {
   const cdp = requireCdp(tab);
   const stamp = Date.now();
   const artifacts = artifactsDir();
-  const dir = path.join(artifacts, `recording-${stamp}-frames`);
+  const recordingId = `${stamp}-${crypto.randomUUID()}`;
+  const dir = path.join(artifacts, `recording-${recordingId}-frames`);
   await fs.promises.mkdir(dir, { recursive: true });
   const viewport = page.viewportSize();
   const rec = {
-    dir, output: path.join(artifacts, `recording-${stamp}.mp4`), startedMs: stamp,
-    frames: [], pending: [], seq: 0, error: null, onFrame: null,
+    dir, output: path.join(artifacts, `recording-${recordingId}.mp4`), startedMs: stamp,
+    frames: [], pending: new Set(), seq: 0, bytes: 0, error: null, onFrame: null, capped: null,
   };
   rec.onFrame = event => {
+    if (rec.stop) return;
+    const cap = Date.now() - rec.startedMs >= RECORD_MAX_DURATION_MS ? 'duration'
+      : rec.frames.length >= RECORD_MAX_FRAMES ? 'frames'
+      : rec.pending.size >= RECORD_MAX_PENDING ? 'pending_writes'
+      : typeof event.data !== 'string' || event.data.length > Math.ceil(RECORD_MAX_FRAME_BYTES / 3) * 4 ? 'frame_bytes' : null;
+    if (cap) { stopRecording(cdp, rec, cap); return; }
+    const bytes = Buffer.from(event.data, 'base64');
+    if (bytes.length > RECORD_MAX_FRAME_BYTES || rec.bytes + bytes.length > RECORD_MAX_BYTES) {
+      stopRecording(cdp, rec, bytes.length > RECORD_MAX_FRAME_BYTES ? 'frame_bytes' : 'bytes'); return;
+    }
+    rec.bytes += bytes.length;
     const file = path.join(dir, `frame-${String(rec.seq++).padStart(8, '0')}.jpg`);
-    const timestamp = event.metadata?.timestamp;
-    rec.frames.push({ file, timestamp_ms: Number.isFinite(timestamp) ? Math.round(timestamp * 1000) : Date.now() });
-    rec.pending.push(fs.promises.writeFile(file, Buffer.from(event.data, 'base64')).catch(error => { rec.error = rec.error || error.message; }));
-    cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => {});
+    // Host time bounds ffmpeg duration too; renderer timestamps are not a trusted clock.
+    rec.frames.push({ file, timestamp_ms: Date.now() });
+    const pending = fs.promises.writeFile(file, bytes)
+      .then(() => cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }))
+      .catch(error => { rec.error ||= error.message; stopRecording(cdp, rec); })
+      .finally(() => rec.pending.delete(pending));
+    rec.pending.add(pending);
   };
+  rec.timer = setTimeout(() => stopRecording(cdp, rec, 'duration'), RECORD_MAX_DURATION_MS);
   cdp.on('Page.screencastFrame', rec.onFrame);
   try {
     await cdp.send('Page.startScreencast', {
@@ -191,6 +223,8 @@ async function recordStart(ctx) {
     });
   } catch (error) {
     cdp.removeListener('Page.screencastFrame', rec.onFrame);
+    clearTimeout(rec.timer);
+    await Promise.all(rec.pending);
     await fs.promises.rm(dir, { recursive: true, force: true });
     throw error;
   }
@@ -201,9 +235,8 @@ async function recordStart(ctx) {
 async function discardRecording(tab) {
   const rec = tab.recording;
   tab.recording = null;
-  tab.cdp.removeListener('Page.screencastFrame', rec.onFrame);
   try {
-    await tab.cdp.send('Page.stopScreencast');
+    await stopRecording(tab.cdp, rec);
   } finally {
     await Promise.all(rec.pending);
     await fs.promises.rm(rec.dir, { recursive: true, force: true });
@@ -215,18 +248,25 @@ async function recordStop(ctx) {
   const rec = tab.recording;
   if (!rec) fail('recording is not running');
   tab.recording = null;
-  requireCdp(tab).removeListener('Page.screencastFrame', rec.onFrame);
-  let stopError = null;
-  await tab.cdp.send('Page.stopScreencast').catch(error => { stopError = error; });
+  await stopRecording(requireCdp(tab), rec);
   await Promise.all(rec.pending);
-  if (stopError) throw stopError;
-  if (rec.error) fail(`recording frame write failed: ${rec.error}`);
-  const endedMs = Date.now();
+  if (rec.stopError || rec.error) {
+    await fs.promises.rm(rec.dir, { recursive: true, force: true });
+    if (rec.stopError) throw rec.stopError;
+    fail(`recording frame write failed: ${rec.error}`);
+  }
+  const endedMs = rec.endedMs;
   let frames = rec.frames;
   if (frames.length === 0) {
     // A page that never repainted still yields one frame, so the output is a real still.
     const file = path.join(rec.dir, 'frame-00000000.jpg');
-    await fs.promises.writeFile(file, await ctx.page.screenshot({ type: 'jpeg', quality: RECORD_QUALITY }));
+    const bytes = await ctx.page.screenshot({ type: 'jpeg', quality: RECORD_QUALITY, timeout: ctx.request.timeout_ms });
+    if (bytes.length > RECORD_MAX_FRAME_BYTES) {
+      await fs.promises.rm(rec.dir, { recursive: true, force: true });
+      fail('recording fallback frame exceeds 5 MiB');
+    }
+    await fs.promises.writeFile(file, bytes);
+    rec.bytes = bytes.length;
     frames = [{ file, timestamp_ms: rec.startedMs }];
   }
   const concat = path.join(rec.dir, 'concat.txt');
@@ -234,6 +274,7 @@ async function recordStop(ctx) {
   return {
     tab: ctx.id, recording: clip(rec.output), concat: clip(concat), frames: frames.length,
     duration_ms: Math.max(endedMs - frames[0].timestamp_ms, 0),
+    capped: rec.capped, bytes: rec.bytes,
   };
 }
 
@@ -283,38 +324,67 @@ async function vitals(ctx) {
   return { tab: ctx.id, url: clip(ctx.page.url()), vitals: await ctx.page.evaluate(collectVitals) };
 }
 
-// Self-contained: reads the buffered performance timeline, not live observers, so values can differ
-// from what a page's own observers reported. INP here is the worst interaction latency recorded,
-// which matches the INP definition for pages with fewer than 50 interactions.
+// Self-contained init script. Online aggregates retain no entry arrays or DOM nodes. The hard
+// sample budget stops observer delivery and marks the resulting metrics as capped, never exact.
+function installVitals({documentStart = false} = {}) {
+  if (globalThis.__dialVitalsV1) return;
+  const state = { available: {}, capped: {}, observers: [], lcp: null, cls: 0, inp: null,
+    tasks: 0, taskMs: 0, windowValue: 0, windowStart: 0, lastShift: 0,
+    coverage: {history:documentStart ? 'document_start' : 'partial', installed_at_ms:performance.now?.() ?? null,
+      note:documentStart ? 'Observed since document initialization' : 'Late installation; buffered replay may omit earlier entries; cumulative metrics are lower bounds'} };
+  globalThis.__dialVitalsV1 = state;
+  if (typeof PerformanceObserver !== 'function') return;
+  for (const type of ['largest-contentful-paint','layout-shift','event','longtask']) {
+    state.available[type] = false;
+    if (!PerformanceObserver.supportedEntryTypes?.includes(type)) continue;
+    let count = 0;
+    const consume = entries => {
+      for (const entry of entries) {
+        if (++count > 10000) { state.capped[type] = true; observer.disconnect(); break; }
+        if (type === 'largest-contentful-paint') state.lcp = entry.startTime;
+        if (type === 'layout-shift' && !entry.hadRecentInput) {
+          if (state.windowValue > 0 && (entry.startTime-state.lastShift > 1000 || entry.startTime-state.windowStart > 5000)) state.windowValue = 0;
+          if (state.windowValue === 0) state.windowStart = entry.startTime;
+          state.windowValue += entry.value;
+          state.lastShift = entry.startTime;
+          state.cls = Math.max(state.cls,state.windowValue);
+        }
+        if (type === 'event' && entry.interactionId > 0) state.inp = Math.max(state.inp || 0,entry.duration);
+        if (type === 'longtask') { state.tasks++; state.taskMs += entry.duration; }
+      }
+    };
+    const observer = new PerformanceObserver(list => consume(list.getEntries()));
+    try {
+      observer.observe({type,buffered:true,...(type === 'event' ? {durationThreshold:16} : {})});
+      state.available[type] = true;
+      state.observers.push({observer,consume});
+    } catch (_) { observer.disconnect(); }
+  }
+}
+
+// This is a provisional snapshot, not final CWV: INP is the worst observed interaction (not
+// the percentile for 50+ interactions), and Event Timing cannot report durations below 16 ms.
 function collectVitals() {
   const round = (value, digits) => Math.round(value * 10 ** digits) / 10 ** digits;
   const navigation = performance.getEntriesByType('navigation')[0];
   const paint = performance.getEntriesByName('first-contentful-paint')[0];
-  const lcp = performance.getEntriesByType('largest-contentful-paint').at(-1);
-  // Session windows (gap <= 1 s, span <= 5 s) as in the Core Web Vitals CLS definition.
-  let cls = 0, windowValue = 0, windowStart = 0, lastShift = 0;
-  for (const shift of performance.getEntriesByType('layout-shift')) {
-    if (shift.hadRecentInput) continue;
-    if (windowValue > 0 && (shift.startTime - lastShift > 1000 || shift.startTime - windowStart > 5000)) windowValue = 0;
-    if (windowValue === 0) windowStart = shift.startTime;
-    windowValue += shift.value;
-    lastShift = shift.startTime;
-    cls = Math.max(cls, windowValue);
-  }
-  let inp = 0;
-  for (const event of performance.getEntriesByType('event')) if (event.interactionId > 0) inp = Math.max(inp, event.duration);
-  const longTasks = performance.getEntriesByType('longtask');
+  const state = globalThis.__dialVitalsV1;
+  for (const item of state?.observers || []) item.consume(item.observer.takeRecords());
+  const available = type => state?.available[type] === true;
   return {
     ttfb_ms: navigation ? round(navigation.responseStart, 2) : null,
     fcp_ms: paint ? round(paint.startTime, 2) : null,
-    lcp_ms: lcp ? round(lcp.startTime, 2) : null,
-    cls: round(cls, 4),
-    inp_ms: inp ? round(inp, 2) : null,
+    lcp_ms: available('largest-contentful-paint') && state.lcp !== null ? round(state.lcp, 2) : null,
+    cls: available('layout-shift') && (state.cls > 0 || state.coverage.history === 'document_start') ? round(state.cls, 4) : null,
+    inp_ms: available('event') && state.inp !== null ? round(state.inp, 2) : null,
     dom_content_loaded_ms: navigation ? round(navigation.domContentLoadedEventEnd, 2) : null,
     load_ms: navigation ? round(navigation.loadEventEnd, 2) : null,
-    long_tasks: longTasks.length,
-    long_task_total_ms: round(longTasks.reduce((sum, task) => sum + task.duration, 0), 2),
+    long_tasks: available('longtask') && (state.tasks > 0 || state.coverage.history === 'document_start') ? state.tasks : null,
+    long_task_total_ms: available('longtask') && (state.tasks > 0 || state.coverage.history === 'document_start') ? round(state.taskMs, 2) : null,
+    available: state?.available || {}, capped: state?.capped || {}, provisional: true,
+    coverage: state?.coverage || {history:'unavailable',installed_at_ms:null},
+    inp_method: 'worst observed interaction; duration threshold 16 ms',
   };
 }
 
-module.exports = { handles, run };
+module.exports = { handles, run, installVitals, discardRecording };

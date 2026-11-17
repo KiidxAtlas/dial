@@ -1394,6 +1394,46 @@ fn ids_from_disk_never_reach_paths_and_oversized_lines_are_skipped() {
 }
 
 #[test]
+fn search_supports_bounded_large_result_windows() {
+    let e = env();
+    let mut a = new_session(&e);
+    let mut b = new_session(&e);
+    for _ in 0..501 {
+        a.append(user("platypus habitat")).unwrap();
+        b.append(user("platypus habitat")).unwrap();
+    }
+
+    for (limit, expected) in [
+        (0, 1),
+        (1, 1),
+        (100, 100),
+        (101, 101),
+        (1000, 1000),
+        (1001, 1001),
+        (usize::MAX, 1001),
+    ] {
+        let hits = Session::search(&e.layout, "platypus", limit).unwrap();
+        assert_eq!(hits.len(), expected, "requested limit {limit}");
+        let entries: HashSet<_> = hits
+            .iter()
+            .map(|hit| (&hit.session_id, &hit.entry_id))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            expected,
+            "hits must have distinct identities"
+        );
+    }
+    // The fallback query must respect the same larger bounded window.
+    assert_eq!(
+        Session::search(&e.layout, "platypus absentword", 1001)
+            .unwrap()
+            .len(),
+        1001
+    );
+}
+
+#[test]
 fn search_ranks_stems_and_follows_new_appends() {
     let e = env();
     let mut a = new_session(&e);
@@ -1997,6 +2037,32 @@ fn resume_opens_an_unowned_journal_in_place_without_forking() {
         Resumed::Forked { .. } => panic!("an unowned journal must open in place"),
     }
     assert_eq!(session_files(&e), before);
+}
+
+#[test]
+fn exact_resume_preserves_identity_and_refuses_busy_or_moved_sources_without_writing() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("exact identity")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let id = owner.id().to_owned();
+    let bytes = fs::read(&path).unwrap();
+    let files = session_files(&e);
+    assert!(Session::open_exact(&e.layout, &path).is_err());
+    drop(owner);
+    let resumed = Session::open_exact(&e.layout, &path).unwrap();
+    assert_eq!(resumed.id(), id);
+    drop(resumed);
+    transfers::record(
+        &e.layout,
+        &id,
+        &path,
+        &e.layout.sessions_dir().join("destination.jsonl"),
+    )
+    .unwrap();
+    assert!(Session::open_exact(&e.layout, &path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(session_files(&e), files);
 }
 
 #[test]

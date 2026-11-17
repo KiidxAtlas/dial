@@ -40,6 +40,26 @@ pub(super) fn scan(command: &str) -> Option<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut chars = command.char_indices().peekable();
     while let Some((start, c)) = chars.peek().copied() {
+        // A bare `{}` (find's placeholder) is an ordinary literal word in the shell, not a group.
+        if c == '{' && command[start..].starts_with("{}") {
+            let end = start + 2;
+            if command[end..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+            {
+                chars.next();
+                chars.next();
+                tokens.push(Token {
+                    span: start..end,
+                    kind: Kind::Word {
+                        value: "{}".into(),
+                        literal: true,
+                    },
+                });
+                continue;
+            }
+        }
         if operator_char(c) {
             chars.next();
             let mut end = start + c.len_utf8();

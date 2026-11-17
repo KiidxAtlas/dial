@@ -2,6 +2,7 @@ use super::*;
 use crate::storage::memory_backend::test_support::{FakeRunner, authority, scope};
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 /// Deterministic embedder: vectors come from a table; `fail` simulates an outage.
@@ -91,6 +92,7 @@ fn semantic_with(embedder: Option<Box<dyn Embedder>>) -> Semantic {
         recall_note: None,
         project_cache: RecallCache::default(),
         user_cache: RecallCache::default(),
+        query_vectors: QueryVectorCache::default(),
         last_recall: None,
     }
 }
@@ -206,7 +208,7 @@ fn failing_extraction_backs_off_and_consolidation_still_runs() {
         .unwrap();
     semantic
         .store
-        .retain("Use the staging database for billing tests now", "test", 2)
+        .retain("use the Staging database  for billing tests", "test", 2)
         .unwrap();
     semantic
         .store
@@ -686,20 +688,6 @@ fn id_of(saved: Saved) -> i64 {
     }
 }
 
-fn token_set(text: &str) -> HashSet<String> {
-    query_tokens(text).into_iter().collect()
-}
-
-#[test]
-fn similarity_threshold_is_inclusive_at_eighty_percent() {
-    let four = token_set("alpha beta gamma delta");
-    let five = token_set("alpha beta gamma delta epsilon");
-    assert!(similar(&four, &five), "4 of 5 shared tokens is exactly 0.8");
-    let three = token_set("alpha beta gamma");
-    assert!(!similar(&three, &four), "3 of 4 shared tokens is 0.75");
-    assert!(!similar(&HashSet::new(), &HashSet::new()));
-}
-
 #[test]
 fn merge_keeps_the_older_fact_and_forgets_the_newer_near_copy() {
     let mut store = store();
@@ -710,7 +698,7 @@ fn merge_keeps_the_older_fact_and_forgets_the_newer_near_copy() {
     );
     let newer = id_of(
         store
-            .retain("Use the staging database for billing tests now", "test", 2)
+            .retain("use  the Staging database for billing tests", "test", 2)
             .unwrap(),
     );
     let other = id_of(
@@ -1079,5 +1067,197 @@ fn a_paused_autostart_does_not_retry_starting_the_server() {
     assert!(
         !dir.path().join("state").exists(),
         "no server state is touched while paused"
+    );
+}
+
+#[test]
+fn merge_keeps_facts_unless_they_are_exactly_equal_after_case_and_whitespace() {
+    // (older, newer, whether the newer one is merged into the older)
+    let cases = [
+        (
+            "Use the staging database for billing tests",
+            "use  the   Staging database for billing tests",
+            true,
+        ),
+        // Near duplicates are kept: a word added, dropped or moved can change the meaning.
+        (
+            "Use the staging database for billing tests",
+            "Use the staging database for billing tests now",
+            false,
+        ),
+        (
+            "Use the staging database for billing tests",
+            "Use the production database for billing tests",
+            false,
+        ),
+        (
+            "Production deployments require approval from the project owner",
+            "Production deployments rarely require approval from the project owner",
+            false,
+        ),
+        (
+            "Production deployments require approval from the project owner",
+            "Production deployments only require approval from the project owner",
+            false,
+        ),
+        (
+            "The API limit is enforced for admins",
+            "The API limit is not enforced for admins",
+            false,
+        ),
+        (
+            "The API limit is enforced for admins",
+            "The API limit isn't enforced for admins",
+            false,
+        ),
+        (
+            "Alice reports to Bob for the billing service",
+            "Bob reports to Alice for the billing service",
+            false,
+        ),
+        (
+            "The rate limit is 1 rps for the public API",
+            "The rate limit is 2 rps for the public API",
+            false,
+        ),
+        ("Use pnpm for installs", "Use pnpm for installs.", false),
+    ];
+    for (older, newer, duplicate) in cases {
+        let mut store = store();
+        store.retain(older, "test", 1).unwrap();
+        store.retain(newer, "test", 2).unwrap();
+        let merged = merge_duplicates(&mut store, 3).unwrap();
+        assert_eq!(merged, usize::from(duplicate), "{older:?} vs {newer:?}");
+        assert_eq!(store.recent(10).unwrap().len(), 2 - merged);
+    }
+}
+
+/// Counts embedding calls; `fail` simulates an outage while set.
+struct Counting {
+    model: String,
+    calls: Arc<AtomicUsize>,
+    fail: Arc<AtomicBool>,
+}
+
+impl Embedder for Counting {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ensure!(!self.fail.load(Ordering::SeqCst), "endpoint down");
+        Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+}
+
+#[test]
+fn route_identity_changes_with_credentials_and_headers() {
+    let headers = |value: &str| {
+        vec![RequestHeader {
+            name: "X-Route-Pool".into(),
+            value: HeaderValue::Literal(value.into()),
+        }]
+    };
+    let url = "http://127.0.0.1:1/v1/embeddings";
+    let base = http_embedder(url, EmbeddingWire::OpenAi, Some("sk-a"), headers("eval"));
+    let same = http_embedder(url, EmbeddingWire::OpenAi, Some("sk-a"), headers("eval"));
+    let new_key = http_embedder(url, EmbeddingWire::OpenAi, Some("sk-b"), headers("eval"));
+    let new_header = http_embedder(url, EmbeddingWire::OpenAi, Some("sk-a"), headers("prod"));
+    assert_eq!(base.route(), same.route());
+    assert_ne!(
+        base.route(),
+        new_key.route(),
+        "a rotated key is another route"
+    );
+    assert_ne!(
+        base.route(),
+        new_header.route(),
+        "a changed header is another route"
+    );
+    assert!(
+        !base.route().contains("sk-a"),
+        "the route never holds the credential itself"
+    );
+}
+
+#[test]
+fn repeated_queries_reuse_their_vector_until_the_route_changes() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    let counting = |model: &str| -> Box<dyn Embedder> {
+        Box::new(Counting {
+            model: model.into(),
+            calls: calls.clone(),
+            fail: fail.clone(),
+        })
+    };
+    let mut semantic = semantic_with(Some(counting("route-a")));
+    semantic
+        .store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let op = Operation::for_test(authority("s"), scope(), None);
+    let search = |semantic: &mut Semantic, query: &str| {
+        semantic
+            .search(&op, query, 8, &mut FakeRunner::new("{}"))
+            .unwrap()
+    };
+    for query in [
+        "deploy vault",
+        "deploy vault",
+        "deploy vault",
+        "vault token",
+    ] {
+        assert_eq!(search(&mut semantic, query)["mode"], "hybrid");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one request per distinct query"
+    );
+
+    // A failed embedding is not cached: the next identical query asks again.
+    fail.store(true, Ordering::SeqCst);
+    assert_eq!(search(&mut semantic, "rotation")["mode"], "lexical");
+    assert_eq!(search(&mut semantic, "rotation")["mode"], "lexical");
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(search(&mut semantic, "rotation")["mode"], "hybrid");
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // Another model or endpoint is another route: nothing cached for route-a is reused.
+    semantic.embedder = Some(counting("route-b"));
+    assert_eq!(search(&mut semantic, "deploy vault")["mode"], "hybrid");
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(search(&mut semantic, "deploy vault")["mode"], "hybrid");
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+}
+
+#[test]
+fn query_vector_cache_is_bounded_and_expires() {
+    let mut cache = QueryVectorCache::default();
+    let start = Instant::now();
+    let vector = QueryVector {
+        model: "m".into(),
+        vector: vec![1.0],
+    };
+    for index in 0..=query_vectors::MAX_QUERY_VECTORS {
+        cache.put("route", &format!("q{index}"), vector.clone(), start);
+    }
+    assert!(
+        cache.get("route", "q0", start).is_none(),
+        "oldest entry evicted"
+    );
+    assert!(cache.get("route", "q1", start).is_some());
+    assert!(
+        cache.get("other-route", "q1", start).is_none(),
+        "route change drops entries"
+    );
+    cache.put("route", "q1", vector.clone(), start);
+    let later = start + query_vectors::TTL;
+    assert!(
+        cache.get("route", "q1", later).is_none(),
+        "expired entries are not served"
     );
 }

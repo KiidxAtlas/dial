@@ -204,3 +204,29 @@ fn publishing_is_incremental_and_resets_rewritten_history() {
         session.archived_messages()
     );
 }
+
+#[test]
+fn taking_one_prompt_preserves_following_work_and_abort() {
+    let mut host = Host {
+        room_id: "fixture".into(),
+        socket: Socket::detached(),
+        link: String::new(),
+        write_token: None,
+        allow_steering: true,
+        entries: Arc::default(),
+        message_cursor: None,
+        guests: BTreeMap::new(),
+        challenges: BTreeMap::new(),
+        steering: vec![
+            Steer::Abort,
+            Steer::Prompt("first".into()),
+            Steer::Prompt("second".into()),
+        ],
+        published: None,
+    };
+    assert_eq!(host.take_prompt().as_deref(), Some("first"));
+    assert!(host.take_aborts());
+    assert_eq!(host.take_prompt().as_deref(), Some("second"));
+    assert_eq!(host.take_prompt(), None);
+    assert!(!host.take_aborts());
+}

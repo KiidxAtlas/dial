@@ -433,3 +433,159 @@ fn lifecycle_leads_process_rows_and_retains_native_diagnostic_when_attached() {
     assert!(shown.contains("Completed"), "{shown}");
     assert!(shown.contains("exited (exit code 0)"), "{shown}");
 }
+
+#[test]
+fn modified_navigation_uses_xterm_parameters_not_alt_prefixes() {
+    for (code, modifiers, expected) in [
+        (KeyCode::Left, KeyModifiers::CONTROL, "\x1b[1;5D"),
+        (KeyCode::Up, KeyModifiers::ALT, "\x1b[1;3A"),
+        (KeyCode::Home, KeyModifiers::SHIFT, "\x1b[1;2H"),
+        (
+            KeyCode::Delete,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            "\x1b[3;7~",
+        ),
+        (KeyCode::F(1), KeyModifiers::SHIFT, "\x1b[1;2P"),
+        (KeyCode::F(12), KeyModifiers::CONTROL, "\x1b[24;5~"),
+    ] {
+        assert_eq!(
+            key_bytes(&key(code, modifiers)).unwrap(),
+            expected.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn attached_input_tracks_child_modes_and_resets_between_jobs() {
+    use crate::runtime::terminal::Screen;
+    let keys = Keymap::defaults();
+    let mut overlay = JobsOverlay::new();
+    overlay.set_jobs(vec![row("editor", true)]);
+    overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+    for enabled in [true, false] {
+        overlay.set_terminal(Some(Screen {
+            bracketed_paste: enabled,
+            application_cursor: enabled,
+            ..Screen::default()
+        }));
+        for (event, expected) in [
+            (
+                Event::Paste("a\r\nb\nc".into()),
+                if enabled {
+                    b"\x1b[200~a\r\nb\nc\x1b[201~".to_vec()
+                } else {
+                    b"a\rb\rc".to_vec()
+                },
+            ),
+            (
+                Event::Key(key(KeyCode::Up, KeyModifiers::NONE)),
+                if enabled {
+                    b"\x1bOA".to_vec()
+                } else {
+                    b"\x1b[A".to_vec()
+                },
+            ),
+            (
+                Event::Key(key(KeyCode::Up, KeyModifiers::CONTROL)),
+                b"\x1b[1;5A".to_vec(),
+            ),
+        ] {
+            assert!(
+                matches!(overlay.handle(&event, &keys), OverlayEvent::JobInput { bytes, .. } if bytes == expected)
+            );
+        }
+    }
+    overlay.set_terminal(Some(Screen {
+        bracketed_paste: true,
+        application_cursor: true,
+        ..Screen::default()
+    }));
+    overlay.handle(
+        &Event::Key(key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+    assert!(
+        matches!(overlay.handle(&Event::Paste("a\nb".into()), &keys), OverlayEvent::JobInput { bytes, .. } if bytes == b"a\rb")
+    );
+}
+
+#[test]
+fn terminal_cells_preserve_styles_blanks_and_wide_graphemes_in_buffer() {
+    use crate::runtime::terminal::{Cell, Color};
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+    let cells = vec![
+        Cell {
+            contents: "界".into(),
+            width: 2,
+            foreground: Color::Indexed(196),
+            background: Color::Rgb(1, 2, 3),
+            bold: true,
+            italic: true,
+            underline: true,
+            inverse: true,
+        },
+        Cell {
+            width: 0,
+            ..Cell::default()
+        },
+        Cell {
+            contents: "e\u{301}".into(),
+            width: 1,
+            ..Cell::default()
+        },
+        Cell {
+            width: 1,
+            background: Color::Indexed(22),
+            ..Cell::default()
+        },
+    ];
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    terminal_row(&cells, Some(1), 4).render(area, &mut buffer);
+    let first = &buffer[(0, 0)];
+    assert_eq!(first.symbol(), "界");
+    assert_eq!(first.fg, ratatui::style::Color::Indexed(196));
+    assert_eq!(first.bg, ratatui::style::Color::Rgb(1, 2, 3));
+    assert!(
+        first
+            .modifier
+            .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)
+    );
+    assert!(
+        !first.modifier.contains(Modifier::REVERSED),
+        "cursor toggles inverse on the wide cell"
+    );
+    assert_eq!(buffer[(2, 0)].symbol(), "e\u{301}");
+    assert_eq!(buffer[(3, 0)].bg, ratatui::style::Color::Indexed(22));
+    let narrow = Rect::new(0, 0, 1, 1);
+    let mut buffer = Buffer::empty(narrow);
+    terminal_row(&cells, None, 1).render(narrow, &mut buffer);
+    assert_eq!(
+        buffer[(0, 0)].symbol(),
+        " ",
+        "never draw half a wide character"
+    );
+}
+
+#[test]
+fn requested_process_is_selected_without_attaching_and_missing_target_is_reported() {
+    let mut panel = JobsOverlay::new();
+    panel.select_when_available("target".into());
+    panel.set_jobs(vec![row("other", false), row("target", false)]);
+    assert_eq!(panel.jobs[panel.cursor].name, "target");
+    assert!(panel.attached().is_none());
+    panel.set_jobs(vec![row("target", false), row("other", false)]);
+    assert_eq!(panel.jobs[panel.cursor].name, "target");
+    panel.select_when_available("gone".into());
+    panel.set_jobs(vec![row("target", false)]);
+    assert!(
+        panel
+            .message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("gone is no longer available")
+    );
+    assert!(panel.attached().is_none());
+}

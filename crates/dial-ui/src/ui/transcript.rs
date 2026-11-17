@@ -122,6 +122,8 @@ struct Retiring {
     end: usize,
 }
 
+pub use super::notice::Severity as NoticeSeverity;
+
 enum Kind {
     User(String),
     Assistant(String),
@@ -130,6 +132,7 @@ enum Kind {
     Notice {
         title: String,
         text: String,
+        severity: NoticeSeverity,
     },
     /// A typed controller event, drawn in its lane (context line, alert, or divider).
     Event(crate::agent::ui::ui_event::UiEvent),
@@ -187,6 +190,8 @@ const REVEAL_EASE: f64 = 0.12;
 /// Longest frame gap one step accounts for (the slowest paint interval), so a stalled UI resumes
 /// at pace instead of leaping.
 const REVEAL_MAX_STEP: f64 = 0.25;
+/// What a card held at the approval prompt says instead of output.
+const APPROVAL_WAIT: &str = "waiting for your approval";
 
 struct Block {
     kind: Kind,
@@ -205,6 +210,8 @@ struct Block {
     breaks_run: bool,
     /// When a tool call started, for the live elapsed time of a running card.
     started: Option<Instant>,
+    /// The call is held at the approval prompt: it shows that, not a running clock.
+    awaiting_approval: bool,
     /// The reasoning toggle's key label, named by a collapsed reasoning block's hint.
     thinking_key: Option<Arc<str>>,
 }
@@ -239,6 +246,7 @@ impl Block {
             reveal: None,
             breaks_run: false,
             started: None,
+            awaiting_approval: false,
             thinking_key: None,
         }
     }
@@ -391,7 +399,15 @@ impl Block {
             // Work rows put their own status glyph in the shared icon gutter.
             Kind::Tool(_) => Arc::new(self.tool_view().map_or_else(Vec::new, |view| {
                 let w = w.min(WORK_MAX_W);
-                if live_secs >= 1 {
+                if self.awaiting_approval {
+                    // Nothing runs until the user answers, so the card neither spins nor counts.
+                    let mut view = view.into_owned();
+                    view.state = ToolState::NeedsInput;
+                    view.progress = None;
+                    view.presentation.preview = None;
+                    APPROVAL_WAIT.clone_into(&mut view.output);
+                    tool_rows(&view, w, ctx)
+                } else if live_secs >= 1 {
                     let mut view = view.into_owned();
                     view.elapsed = Some(live_secs as f64);
                     tool_rows(&view, w, ctx)
@@ -399,7 +415,13 @@ impl Block {
                     tool_rows(&view, w, ctx)
                 }
             })),
-            Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
+            Kind::Notice {
+                title,
+                text,
+                severity,
+            } => Arc::new(super::notice::rows_with_severity(
+                title, text, w, ctx, *severity,
+            )),
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w.min(WORK_MAX_W), ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
@@ -1645,6 +1667,19 @@ impl Transcript {
         })
     }
 
+    /// Hold or release the running card for call `id` at the approval prompt. While held it reads
+    /// as waiting for the user with no clock; on release the clock restarts, so the run time it
+    /// shows excludes the time spent deciding.
+    pub fn tool_awaiting_approval(&mut self, id: &str, waiting: bool) {
+        let Some(index) = self.live_running_index(id) else {
+            return;
+        };
+        let block = &mut self.blocks[index];
+        block.awaiting_approval = waiting;
+        block.started = (!waiting).then(Instant::now);
+        self.invalidate_tail();
+    }
+
     /// Retain the newest partial argument text, so a long streamed write stays bounded.
     fn append_partial(target: &mut String, text: &str) {
         target.push_str(text);
@@ -1827,6 +1862,32 @@ impl Transcript {
             })
     }
 
+    /// Retained calls in transcript order, including calls already handed to scrollback.
+    /// Only metadata is copied when populating an inspector picker; output stays with its owner.
+    pub fn retained_tool_calls(&self) -> Vec<(String, String, String)> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                Kind::Tool(tool) => {
+                    Some((tool.id.clone(), tool.name.clone(), tool.summary.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Read-only evidence for one stable call ID, using the same shared runtime projection as
+    /// the tool card. Inspecting a retired call neither expands cards nor changes retirement.
+    pub fn retained_tool(&self, id: &str) -> Option<std::borrow::Cow<'_, Tool>> {
+        self.blocks
+            .iter()
+            .rev()
+            .find_map(|block| match &block.kind {
+                Kind::Tool(tool) if tool.id == id => block.tool_view(),
+                _ => None,
+            })
+    }
+
     /// Replace a call's input with richer data the controller found (e.g. what a write created).
     pub fn tool_input(&mut self, id: &str, input: String) {
         self.invalidate_tail();
@@ -1942,6 +2003,23 @@ impl Transcript {
 
     /// A typed controller event in its own lane.
     pub fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+        if event.kind == crate::agent::ui::ui_event::EventKind::Retry {
+            // Argument previews have no runtime tool body and never executed. Retire them without
+            // inventing an execution result or touching dispatched calls (whose clock has started).
+            self.invalidate_tail();
+            for block in &mut self.blocks[self.cursor..] {
+                if block.shared.is_none()
+                    && block.started.is_none()
+                    && let Kind::Tool(tool) = &mut block.kind
+                    && tool.state == ToolState::Running
+                {
+                    tool.state = ToolState::Interrupted;
+                    tool.progress = None;
+                    tool.output = "Arguments discarded before execution (provider retry).".into();
+                    block.active = false;
+                }
+            }
+        }
         self.close_streaming_text();
         if self.blocks.last().is_some_and(|block| matches!(&block.kind, Kind::Event(previous) if previous.kind == event.kind && previous.text == event.text)) {
             return; // Presentation only: the execution journal keeps the original events.
@@ -1950,16 +2028,22 @@ impl Transcript {
     }
 
     pub fn notice(&mut self, title: &str, text: &str) {
+        self.notice_with_severity(title, text, NoticeSeverity::Info);
+    }
+
+    /// Producer-supplied notice urgency, independent of display wording.
+    pub fn notice_with_severity(&mut self, title: &str, text: &str, severity: NoticeSeverity) {
         let brief = super::text::brief_chain(text);
         let text = brief.as_str();
         self.close_streaming_text();
-        if self.blocks.last().is_some_and(|block| matches!(&block.kind, Kind::Notice { title: previous, text: body } if previous == title && body == text)) {
+        if self.blocks.last().is_some_and(|block| matches!(&block.kind, Kind::Notice { title: previous, text: body, severity: previous_severity } if previous == title && body == text && *previous_severity == severity)) {
             return; // Presentation only: the execution journal keeps the original events.
         }
         self.push(
             Kind::Notice {
                 title: title.to_owned(),
                 text: text.to_owned(),
+                severity,
             },
             false,
         );
@@ -1985,7 +2069,7 @@ impl Transcript {
             }
         } else {
             let cut = text.ceil_char_boundary(text.len().saturating_sub(LIMIT));
-            self.push(Kind::Notice { title, text: text[cut..].to_owned() }, false);
+            self.push(Kind::Notice { title, text: text[cut..].to_owned(), severity: NoticeSeverity::Info }, false);
         }
     }
 
@@ -2001,6 +2085,7 @@ impl Transcript {
             Kind::Notice {
                 title: title.to_owned(),
                 text: Self::JOB_STARTED.to_owned(),
+                severity: NoticeSeverity::Info,
             },
             true,
         );
@@ -2037,7 +2122,7 @@ impl Transcript {
     /// Whether the job panel titled `title` already carries output.
     pub fn notice_has_output(&self, title: &str) -> bool {
         self.blocks[self.cursor..].iter().rev().any(|block| {
-            matches!(&block.kind, Kind::Notice { title: previous, text } if previous == title && text != Self::JOB_STARTED)
+            matches!(&block.kind, Kind::Notice { title: previous, text, .. } if previous == title && text != Self::JOB_STARTED)
         })
     }
 
@@ -2045,7 +2130,7 @@ impl Transcript {
     pub fn job_waiting(&self, title: &str) -> bool {
         self.blocks[self.cursor..].iter().any(|block| {
             block.active
-                && matches!(&block.kind, Kind::Notice { title: previous, text } if previous == title && text == Self::JOB_STARTED)
+                && matches!(&block.kind, Kind::Notice { title: previous, text, .. } if previous == title && text == Self::JOB_STARTED)
         })
     }
 

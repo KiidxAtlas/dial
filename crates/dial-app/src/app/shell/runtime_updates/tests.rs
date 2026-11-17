@@ -153,6 +153,22 @@ fn dropping_the_shell_cancels_without_waiting_for_the_worker() {
 fn automatic_reports_do_not_enter_the_streamed_conversation() {
     let (_home, _project, mut app, mut shell) = super::super::testkit::shell();
     app.config.sandbox.allow_network = true;
+    // Both automatic checkers stay local: the release is cached and the runtime result is
+    // delivered below. Fresh stamps prevent either checker starting a real network query.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        crate::config::paths::release_check_file(&app.layout.user_dir),
+        format!("{now}\nv999.0.0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        crate::config::paths::runtime_update_check_file(&app.layout.user_dir),
+        now.to_string(),
+    )
+    .unwrap();
     let (send, receive) = mpsc::channel();
     shell.runtime_updates.pending = Some(receive);
     send.send("MAINTENANCE-DETAILS-MUST-STAY-OUTSIDE-ANSWER".into())
@@ -162,6 +178,21 @@ fn automatic_reports_do_not_enter_the_streamed_conversation() {
         .transcript
         .assistant_delta("The streamed answer stays continuous.");
     shell.refresh_resources(&app, false, true);
+    assert!(shell.release_notice.notice().is_some());
+    assert!(shell.runtime_updates.notice().is_some());
+    assert_eq!(
+        shell.inbox.read_all(),
+        2,
+        "one publication per update source"
+    );
+    for _ in 0..3 {
+        shell.refresh_resources(&app, false, true);
+        assert_eq!(
+            shell.inbox.unread(),
+            0,
+            "retained reports are not new arrivals"
+        );
+    }
     shell.paint(None).unwrap();
     let ctx = crate::ui::transcript::TranscriptCtx {
         theme: shell.themes.current(),

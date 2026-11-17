@@ -40,7 +40,7 @@ server supports them. Runtime offers and normal approvals remain authoritative.
 | Provider sign-in | Native setup | `auth` methods after protocol 2 negotiation, for every provider (typed values arrive as `auth_prompt`, masked when `secret`) | Existing external configuration only; no terminal/OAuth bridge |
 | Extensions and MCP sign-in | `/extensions`, `/mcp login` | `list_extensions`, `extension_action` (with `confirm` for risky actions), `mcp_login`/`mcp_logout`, then `apply_settings` (`reconnect: true` after a sign-in) | Not exposed |
 | Session administration | Session picker | `list_sessions`, `pin_session`, `delete_session`, `fork_session` | `session/list`, `session/fork`, `session/close`; no pin or delete |
-| Models and thinking | `/model`, `/thinking` | `list_models`, `set_model`, `set_thinking`, `state.current_model` | `model` and `thought_level` config options |
+| Models and thinking | `/model`, `/thinking` | `list_models`, `delete_local_model`, `set_model`, `set_thinking`, `state.current_model` | `model` and `thought_level` config options |
 | Settings | `/settings` | `settings_schema`, `get_settings`, `set_setting`, `reset_setting`, then `apply_settings` to apply in the running session | Not exposed |
 | Approval mode, retry, managed model | `/approval`, `/retry`, `/model restart` | `set_approval`, `retry`, `restart_model`; `state.approval` | Not exposed |
 | Workspace directories | `/add-dir`, `/remove-dir`, `/dirs`, directory-access prompts | `add_dir`, `remove_dir`, `list_dirs`; directory-access prompts after `hello {interactive: true}` | Not exposed |
@@ -124,10 +124,17 @@ It provides:
 
 - `Client::connect`: launch `dial rpc` with `Launch`, read `ready`, pick the highest common version
   and send `hello`; fail closed when there is none. Failed handshakes kill and reap the child
-  immediately rather than adding the normal five-second graceful-drop wait to the timeout.
+  immediately rather than adding the normal graceful-shutdown interval to the timeout.
 - `request` and `poll` for toolkit-neutral, non-blocking use (drive `poll` from a background thread
-  and forward each `Message` to the UI loop), and `call` for short queries. `call` buffers every
-  other message, so no event is lost.
+  and forward each `Message` to the UI loop), and `call` for short queries. `call` buffers the other
+  messages it sees, so no event is lost, up to 1024 messages and about 16 MiB per call (a single
+  frame may overshoot the byte bound). Past either bound it returns `ClientError::Backlog` with its
+  request still outstanding: poll to drain the buffered
+  messages and the reply arrives through `poll`. The bound keeps memory finite without dropping any
+  response or approval.
+  Reader and writer FIFO queues each enforce a 16 MiB wire-payload budget plus a frame-count limit.
+  A legal frame above the budget (up to 64 MiB) occupies its queue alone; each worker can also
+  hold one in-flight frame. These are wire-byte budgets, not a total JSON heap-memory bound.
   Request writes use a bounded FIFO worker queue, so pipe backpressure cannot block `request`,
   `call` deadlines or shutdown. A full queue returns `ClientError::Io` (`WouldBlock`) without
   admitting the request; frames larger than `MAX_FRAME_BYTES` return `InvalidInput`.
@@ -141,12 +148,33 @@ It provides:
 - `Message::Disconnected { outstanding }`, which lists each request left without a response as
   `ReadOnly` (safe to repeat on a new connection) or `MayHaveApplied` (outcome unknown, never
   retried automatically). Reconnect is `Client::connect` again followed by `resume`.
-- A bounded frame size, graceful shutdown (`shutdown`, or EOF on drop) and `kill`.
+- A bounded frame size, graceful explicit `shutdown`, and `kill`. `Drop` closes input and transfers
+  child ownership to a background reaper, which waits briefly before killing and reaping an
+  unresponsive engine; destruction does not wait for that grace interval on the caller thread.
 - `RpcError::kind()` as a typed `ErrorCode`, and envelope accessors on `Event` (`seq`,
   `session_id`, `request_id`); `lost_events()` counts sequence gaps.
 - Typed helpers for common requests (`send`, `steer`, `resume`, `set_setting`, `list_checkpoints`,
   `checkpoint_diff`, `undo`) and `restart_and_resume`, which applies saved settings by replacing
-  the engine process and resuming the same session.
+  the engine process and resuming the same session. It takes the client by value and returns
+  `Restarted { client, handoff }`. This replaces the earlier `Result<Client, _>` return: the old
+  connection's unread output is no longer copied into a list. The restart first sends `shutdown`
+  and closes the engine's stdin, then reads its output into the bounded queue `call` uses until the
+  engine exits. An engine that has already exited hands its buffered messages over; it is never
+  refused for them. If the queue fills while the engine still runs, the restart is refused with
+  `ClientError::Backlog`. That refusal is not a rollback: the engine is winding down, and
+  `RestartError::client` takes no requests (they fail as `Disconnected`). Recover by polling it to
+  drain, then `shutdown` to reap it, then `connect` and `resume` the session you read from `state`
+  before the restart. Retrying `restart_and_resume` on that connection cannot work, because its
+  `state` call fails. After the old engine exits, `handoff` owns the messages it left unread.
+  `Handoff::poll(timeout)` returns `HandoffPoll::Message` (the end of the connection arrives last
+  as `Message::Disconnected`), `TimedOut` (incomplete; poll again, nothing was lost) or `Finished`.
+  Drain it before the new client's messages, then call `Conversation::new_connection`. Dropping an
+  unfinished handoff discards its messages, which the type marks `must_use`. Output held open by an
+  inherited stdout does not stall the restart. Other failures return `RestartError`: `client` is the
+  old connection while it may still run (a failed `state`, or an I/O error while waiting for the
+  process), or the replacement when it started but did not resume the session, so `resume` can be
+  retried. When the old engine has exited and no replacement runs, `client` is `None` and `handoff`
+  holds its messages; reconnect with `connect`.
 - Interactive authentication uses `mcp_login(server) -> Result<RequestId, ClientError>`. This
   replaces the blocking `mcp_login(server, timeout)` helper: poll while its id is outstanding,
   display `auth_url`, answer `auth_prompt` with `auth_code`, and match the eventual login response
@@ -157,12 +185,51 @@ It provides:
 (set `DIAL_BIN` and `DIAL_RPC_ARGS` to choose the engine); it denies every approval request.
 
 The `Client` renders nothing. `dial_client::Conversation` is the shared view model: feed it
-`messages` history (`load_history`), the prompts you send (`push_user`) and every received
+`messages` history (`load_history`), the prompts you send (`push_turn(text, images, request_id)`,
+with the `RequestId` that `send` returned, so only that response settles the turn; `push_user`
+does not correlate and is kept for compatibility), and every received
 message (`apply`), then draw `entries()` (user, assistant with reasoning, tool cards with their
-results, notices) next to `pending_approvals()`, `question()` and `todo()`. When
-`needs_reload()` reports an event-sequence gap, reload `messages` and call `load_history` again.
+results, notices) next to `pending_approvals()`, `question()` and `todo()`.
+`needs_reload()` reports an event-sequence gap. `load_history` refreshes transcript rows but cannot
+recover pending approvals, questions or todo, and therefore does not clear that flag. Request
+`recovery_snapshot` once the actor and its workers are idle, process all messages preceding its
+response, then pass the response to `Conversation::load_snapshot`. It validates the same-session,
+same-connection sequence and replaces transcript and live interaction state together. Incomplete,
+stale or wrong-session snapshots are refused without changing the view. Older engines without
+this method cannot certify complete recovery from a history query alone. `state.live` is an
+interaction-only snapshot, not a full transcript recovery fence.
+Each connection has its own `seq` space (`ready` is `seq` 1 and the first event is 2). After
+a reconnect or restart, feed the old connection's handoff messages, then call
+`new_connection(client.ready())` before the new connection's messages. That voids the old
+connection's ids: its pending approvals, open question and turn tracking are dropped, and a
+streaming answer is settled, so text from the new connection starts a new row. A turn still
+running gets an error row because its outcome is unknown. Rows already shown, tool results and
+history are kept. The `ready` frame's `seq` becomes the baseline, so a reconnect to the same
+session continues without a reload, a different session replaces the rows as `active_session`
+does, and a gap on either connection still raises `needs_reload()`. Without this call, the first
+event of the new connection would be compared with the old connection's last `seq` and look like
+a gap.
 Execution-tree reduction (`state_*` events) remains the frontend's job, following the state rules
 above.
+
+`expect_turn(request_id)` tracks any turn-starting request, including `retry` and `goal`; its
+correlated response settles that turn independently of method naming. Remote collaboration results
+and errors remain visible without settling a separately tracked local turn. The wire cannot always
+attribute interleaved text fragments to a remote turn, so clients must not guess that attribution.
+Each tool row carries `effects` (`none`, `known`, `unknown`, when the engine says) and structured
+`data` next to `status` and `changed_paths`. Output and progress route by `call_id`; settlement clears
+progress. Disconnect/reconnect marks unresolved tool outcomes and effects unknown, not failed.
+
+An automatic retry notice (`kind: "retry"`) marks every assistant fragment from that failed model
+attempt `abandoned: true`. Argument-only tool drafts retire as skipped with no effects; dispatched
+or completed tools are preserved. Later text and reused draft call IDs create fresh rows. Successful
+foreground inference `state_node` events delimit model rounds, preserving earlier successful answers;
+older engines lacking those boundaries cannot provide that distinction. Response text remains the
+fallback when the successful turn has no streamed answer.
+Historical tool rows preserve explicit status, effects and structured data. Use
+`ToolOutcome::succeeded() -> Option<bool>` or `outcome_known` to distinguish unknown legacy
+outcomes from known failures. The compatibility field `is_error` remains conservatively true
+when success is not established. Do not infer outcomes from output prose.
 
 ## Executable conformance map
 

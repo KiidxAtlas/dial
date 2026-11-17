@@ -273,6 +273,9 @@ The runtime usage ledger keeps independent main/worker and model breakdowns, plu
 (recall, capture and maintenance inference), `repair` (constrained or coach repair), `judgment`
 (model-backed judgments), and `auxiliary` (side questions/rule generation). Purpose follows the
 operation, not the configured model role: the same `small` model can rank source or compact history.
+Auxiliary inference acquires a cancellable provider slot for its actual route, including requests
+reusing the main backend. Classification uses nonblocking admission; compaction and routing do not
+take a duplicate outer permit that could deadlock a single-slot backend.
 Each breakdown partitions `all`; adding breakdowns together double-counts usage. Retries, failed
 requests, cache counts and observed prices retain the request's original purpose and turn, including
 late worker results. Purpose attribution does not alter shared worker budgets or permissions.

@@ -635,9 +635,17 @@ impl Agent<'_> {
                                     event.kind == "background_progress",
                                 );
                             } else if event.kind == "output" {
-                                ui.tool_output(&event.name, &event.text);
+                                ui.tool_output_with_id(
+                                    &calls[position].id,
+                                    &event.name,
+                                    &event.text,
+                                );
                             } else if event.kind == "progress" {
-                                ui.tool_progress(&event.name, &event.text);
+                                ui.tool_progress_with_id(
+                                    &calls[position].id,
+                                    &event.name,
+                                    &event.text,
+                                );
                             } else if event.kind != "start" {
                                 // Job starts are already visible in the launching tool's card.
                                 ui.background_notice(&format!(

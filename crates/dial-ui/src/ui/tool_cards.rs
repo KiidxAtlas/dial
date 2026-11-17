@@ -14,6 +14,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub use crate::runtime::Phase as ToolState;
 
@@ -1265,6 +1266,7 @@ fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize
         return None;
     }
     let theme = ctx.theme;
+    #[derive(Clone, Copy)]
     enum Row<'a> {
         File(&'a str),
         Note(&'a str),
@@ -1355,57 +1357,78 @@ fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize
     let single_file = items.iter().filter(|i| matches!(i, Row::File(_))).count() == 1;
     let totals_in_header = change_totals(t, theme).is_some();
     let code_w = inner.saturating_sub(gutter + 1).max(1);
-    // Rows per source line, so the hidden count names lines rather than wrapped rows.
-    let mut all: Vec<Rows> = Vec::new();
-    for item in items {
-        match item {
-            Row::File(path) if single_file && same_path(&header_target, path) => {}
-            Row::Note(text) if totals_in_header && text.starts_with("updated (") => {}
-            Row::File(path) => all.push(text::wrap(
-                vec![Line::from(Span::styled(
-                    path.to_owned(),
-                    theme.fg(Tok::Accent),
-                ))],
-                inner.max(1),
-            )),
-            Row::Note(text) => all.push(
-                text::wrap_words(text, inner.max(1))
+    // Filter structural rows before counting hidden evidence, then render only the window.
+    items.retain(|item| {
+        !matches!(item,
+            Row::File(path) if single_file && same_path(&header_target, path)
+        ) && !matches!(item, Row::Note(text) if totals_in_header && text.starts_with("updated ("))
+    });
+    Some(row_window(
+        items.iter().copied(),
+        items.len(),
+        limit,
+        false,
+        |item| {
+            let (item, clipped) = match item {
+                Row::File(path) => {
+                    let (value, cut) = bounded_line(path, inner, limit, false);
+                    (Row::File(value), cut)
+                }
+                Row::Note(note) => {
+                    let (value, cut) = bounded_line(note, inner, limit, false);
+                    (Row::Note(value), cut)
+                }
+                Row::Line(sign, n, code) => {
+                    let (value, cut) = bounded_line(code, code_w, limit, false);
+                    (Row::Line(sign, n, value), cut)
+                }
+                Row::Gap => (Row::Gap, false),
+            };
+            let rows = match item {
+                Row::File(path) => text::wrap(
+                    vec![Line::from(Span::styled(
+                        path.to_owned(),
+                        theme.fg(Tok::Accent),
+                    ))],
+                    inner.max(1),
+                ),
+                Row::Note(text) => text::wrap_words(text, inner.max(1))
                     .into_iter()
                     .map(|row| Line::from(Span::styled(row, theme.fg(Tok::Dim))))
                     .collect(),
-            ),
-            Row::Gap => all.push(vec![Line::from(Span::styled(
-                format!("{:>gutter$}", theme.sym(Sym::Ellipsis)),
-                theme.fg(Tok::Dim),
-            ))]),
-            Row::Line(sign, n, text) => {
-                let style = match sign {
-                    '+' => theme.fg(Tok::DiffAdded),
-                    '-' => theme.fg(Tok::DiffRemoved),
-                    _ => theme.fg(Tok::DiffContext),
-                };
-                let number = format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string()));
-                let code = vec![Line::from(Span::styled(format!("{sign}{text}"), style))];
-                // Wrapped code hangs under the code column, never under the line numbers.
-                let rows = text::wrap(code, code_w)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(k, piece)| {
-                        let lead = if k == 0 {
-                            number.clone()
-                        } else {
-                            " ".repeat(gutter + 1)
-                        };
-                        let mut spans = vec![Span::styled(lead, theme.fg(Tok::Dim))];
-                        spans.extend(piece.spans);
-                        Line::from(spans)
-                    })
-                    .collect();
-                all.push(rows);
-            }
-        }
-    }
-    Some(take_lines(all, limit, false))
+                Row::Gap => vec![Line::from(Span::styled(
+                    format!("{:>gutter$}", theme.sym(Sym::Ellipsis)),
+                    theme.fg(Tok::Dim),
+                ))],
+                Row::Line(sign, n, text) => {
+                    let style = match sign {
+                        '+' => theme.fg(Tok::DiffAdded),
+                        '-' => theme.fg(Tok::DiffRemoved),
+                        _ => theme.fg(Tok::DiffContext),
+                    };
+                    let number =
+                        format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string()));
+                    let code = vec![Line::from(Span::styled(format!("{sign}{text}"), style))];
+                    // Wrapped code hangs under the code column, never under the line numbers.
+                    text::wrap(code, code_w)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, piece)| {
+                            let lead = if k == 0 {
+                                number.clone()
+                            } else {
+                                " ".repeat(gutter + 1)
+                            };
+                            let mut spans = vec![Span::styled(lead, theme.fg(Tok::Dim))];
+                            spans.extend(piece.spans);
+                            Line::from(spans)
+                        })
+                        .collect()
+                }
+            };
+            (rows, clipped)
+        },
+    ))
 }
 
 /// Whole source lines (each given as its wrapped rows) that fit in `limit` rows, taken from the
@@ -1481,6 +1504,104 @@ fn split_trailer(output: &str) -> String {
         .join("\n")
 }
 
+/// Lay out only the visible source lines plus one row of lookahead. Counting hidden source
+/// lines needs a scan, not allocation of styled rows for the entire output.
+fn output_window(
+    body: &str,
+    limit: usize,
+    tail: bool,
+    width: usize,
+    mut render: impl FnMut(&str) -> Rows,
+) -> (Rows, usize) {
+    let total = body.split('\n').count();
+    row_window(body.split('\n'), total, limit, tail, |line| {
+        let (visible, clipped) = bounded_line(line, width, limit, tail);
+        (render(visible), clipped)
+    })
+}
+
+/// Bound wrapper allocations independently of source line length. Expansion bypasses the window.
+fn bounded_line(line: &str, width: usize, limit: usize, tail: bool) -> (&str, bool) {
+    let budget = limit
+        .saturating_add(2)
+        .saturating_mul(width.max(1))
+        .saturating_mul(16)
+        .max(4096);
+    let clipped = limit != usize::MAX && line.len() > budget;
+    (
+        if clipped {
+            line_window(line, budget, tail)
+        } else {
+            line
+        },
+        clipped,
+    )
+}
+
+/// Keep selection and hidden-source accounting identical for plain output and numbered diffs.
+fn row_window<T>(
+    source: impl DoubleEndedIterator<Item = T>,
+    total: usize,
+    limit: usize,
+    tail: bool,
+    mut render: impl FnMut(T) -> (Rows, bool),
+) -> (Rows, usize) {
+    let ordered: Box<dyn Iterator<Item = T> + '_> = if tail {
+        Box::new(source.rev())
+    } else {
+        Box::new(source)
+    };
+    let mut lines = Vec::new();
+    let mut row_count = 0usize;
+    let mut clipped_line = false;
+    for item in ordered {
+        let (rows, clipped) = render(item);
+        clipped_line = clipped;
+        row_count = row_count.saturating_add(rows.len());
+        lines.push(rows);
+        if clipped || row_count > limit.saturating_add(1) {
+            break;
+        }
+    }
+    let unrendered = total - lines.len();
+    let limit = if !clipped_line && unrendered == 0 && row_count == limit.saturating_add(1) {
+        row_count
+    } else {
+        limit
+    };
+    if tail {
+        lines.reverse();
+    }
+    let (rows, hidden) = take_lines(lines, limit, tail);
+    // A byte-windowed source line remains incomplete even if its visible portion takes
+    // fewer rows than the limit (for example one enormous combining grapheme).
+    (rows, hidden.max(usize::from(clipped_line)) + unrendered)
+}
+
+/// A byte-bounded window at complete grapheme boundaries (not UTF-8 scalar boundaries).
+fn line_window(line: &str, budget: usize, tail: bool) -> &str {
+    let mut used = 0usize;
+    if tail {
+        let mut start = line.len();
+        for (index, g) in line.grapheme_indices(true).rev() {
+            if used.saturating_add(g.len()) > budget {
+                break;
+            }
+            used += g.len();
+            start = index;
+        }
+        &line[start..]
+    } else {
+        for g in line.graphemes(true) {
+            if used.saturating_add(g.len()) > budget {
+                break;
+            }
+            used += g.len();
+        }
+        &line[..used]
+    }
+}
+
 /// Tool output wrapped to `inner` cells and capped at the configured tool output length. `tail`
 /// keeps the last lines instead of the first (a failure's cause is at its end) and puts the hint
 /// for the earlier lines above them; otherwise returns the rows and how many source lines follow.
@@ -1509,34 +1630,22 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, tail: bool) -> (Rows
     } else {
         ctx.ui.tool_output_lines.max(1)
     };
-    let lines: Vec<Rows> = body
-        .trim_start_matches('\n')
-        .split('\n')
-        .map(|line| {
-            // Output wraps at word boundaries and keeps its indentation; edit previews are code.
-            if diffy {
-                text::wrap(vec![Line::from(edit_spans(theme, line))], inner.max(1))
+    let (rows, hidden) = output_window(body.trim_start_matches('\n'), limit, tail, inner, |line| {
+        // Output wraps at word boundaries and keeps its indentation; edit previews are code.
+        if diffy {
+            text::wrap(vec![Line::from(edit_spans(theme, line))], inner.max(1))
+        } else {
+            let style = if err {
+                theme.fg(Tok::Error)
             } else {
-                let style = if err {
-                    theme.fg(Tok::Error)
-                } else {
-                    theme.fg(Tok::ToolOutput)
-                };
-                wrap_indented(line, inner)
-                    .into_iter()
-                    .map(|text| Line::from(Span::styled(text, style)))
-                    .collect()
-            }
-        })
-        .collect();
-    // Hiding a single line costs the same row as showing it.
-    let total: usize = lines.iter().map(Vec::len).sum();
-    let limit = if total == limit.saturating_add(1) {
-        total
-    } else {
-        limit
-    };
-    let (rows, hidden) = take_lines(lines, limit, tail);
+                theme.fg(Tok::ToolOutput)
+            };
+            wrap_indented(line, inner)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, style)))
+                .collect()
+        }
+    });
     if tail && hidden > 0 {
         let mut out = vec![Line::from(more_hint(
             hidden,

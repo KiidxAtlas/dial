@@ -77,7 +77,7 @@ pub(in crate::app) enum DraftStep {
 }
 
 pub(in crate::app) const ATTENTION_HINT: &str =
-    "F6: read-only Attention (keeps this prompt pending)";
+    "F6 check workers, jobs and todos (this prompt stays open)";
 
 pub(in crate::app) fn attention_key(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release && key.code == KeyCode::F(6) && key.modifiers.is_empty()
@@ -152,15 +152,14 @@ impl Shell {
                         mode: "session".into(),
                     })
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         let failure = self
             .model_downloads
             .as_ref()
             .and_then(|downloads| downloads.borrow().last_failure().cloned());
         let projection = crate::app::overlay::activity::attention_choices_with_context(
             &workers,
-            &jobs,
+            jobs.as_deref().unwrap_or_default(),
             Some(&self.status),
             Some(&self.todo),
             failure.as_ref(),
@@ -169,6 +168,10 @@ impl Shell {
         let mut text = format!(
             "F6 / Esc: Return to original prompt · Ctrl+C: cancel original prompt\nRead-only frozen snapshot. Enter, approval letters and paste do nothing.\n\nMain prompt · waiting for you\n{title}\n{body}"
         );
+        text.push_str(&format!("\n\nSources · Workers: last observed ({}). Processes: {}. Downloads: {}. Main answer and todos: observed.",
+            workers.agents.len(),
+            if jobs.is_some() { "observed" } else { "unavailable" },
+            if self.model_downloads.is_some() { "observed" } else { "unavailable" }));
         for item in projection.items {
             text.push_str(&format!("\n\n{}\n{}", item.label, item.detail));
         }

@@ -125,6 +125,7 @@ fn backend(policy: &Policy) -> Backend<'_> {
             deny_read,
             extra_write,
             allow_network: true,
+            ..
         } => Backend::LowIntegrity {
             deny_read,
             extra_write,
@@ -723,6 +724,7 @@ mod imp {
             deny_read: vec![denied.clone()],
             extra_write: Vec::new(),
             allow_network: true,
+            serial_ports: false,
         };
         let script = r"
 $ErrorActionPreference = 'SilentlyContinue'

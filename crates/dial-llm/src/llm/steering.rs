@@ -119,6 +119,10 @@ pub fn strength(config: &AppConfig, bundle: &Value) -> f64 {
     }
 }
 
+/// Prepare the evaluated artifact for runtime loading. `model` selects engine capability, not
+/// weight identity: it may be a download ID or a resolved snapshot path. This preflight does not
+/// authorize activation; the Python runtime must validate the payload and bind its canonical
+/// weight/adapter fingerprints before installing hooks.
 pub fn specification(config: &AppConfig, model: &str) -> Result<Option<Specification>> {
     if (!config.steering.enabled && !config.steering.automatic) || config.steering.strength == 0.0 {
         return Ok(None);
@@ -147,10 +151,10 @@ pub fn specification(config: &AppConfig, model: &str) -> Result<Option<Specifica
     if !config.steering.enabled && bundle["origin"] != "automatic verified repairs" {
         return Ok(None);
     }
-    ensure!(
-        bundle["model_name"] == model,
-        "vector belongs to a different model"
-    );
+    // model_name is extraction provenance (often a download ID), not weight identity: the
+    // provider loads a canonical snapshot path. Python apply_server_vector validates the artifact
+    // payload and calls bind(model_path, adapter_path) against the canonical metadata fingerprints
+    // before installing hooks. Keep that single identity owner rather than comparing labels here.
     let strength = strength(config, &bundle);
     check(&bundle, strength)?;
     let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&bundle)?));
@@ -187,3 +191,6 @@ pub fn runtime(base_url: &str) -> Result<Value> {
         .read_to_string()?;
     Ok(serde_json::from_str(&raw)?)
 }
+
+#[cfg(test)]
+mod tests;

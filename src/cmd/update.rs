@@ -411,6 +411,14 @@ struct InstallLock {
     _file: fs::File,
 }
 
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open-file description until exec.
+        // End our lease explicitly rather than waiting for all those copies to close.
+        let _ = self._file.unlock();
+    }
+}
+
 fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
     let path = dir.join(".dial-update.lock");
     let file = fs::OpenOptions::new()

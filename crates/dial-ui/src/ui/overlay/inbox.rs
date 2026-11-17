@@ -2,6 +2,7 @@
 use super::palette::{ChoiceItem, ChoiceSpec};
 
 const LIMIT: usize = 200;
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Explicit producer metadata, never inferred from a title or message body.
 /// Categories without their own supported preference retain the general destination.
@@ -26,6 +27,7 @@ impl Category {
 pub struct Inbox {
     next_id: u64,
     entries: Vec<Notice>,
+    overflow_unread: u64,
     /// A focus report has said the terminal is focused; before that the state is unknown.
     seen_focus: bool,
     /// The newest notice id when the terminal lost focus.
@@ -41,30 +43,52 @@ pub struct Notice {
     pub text: String,
     pub unread: bool,
     pub category: Category,
+    pub occurrences: u64,
+    first_seen: std::time::Instant,
+    last_arrival: u64,
 }
 
 impl Inbox {
-    /// Exact repeats do not become unread again, even after the user has read them.
+    /// Repeats within one minute coalesce, updating recency and reopening read notices.
     pub fn push(&mut self, title: &str, text: &str) {
         self.push_category(title, text, Category::General);
     }
 
     pub fn push_category(&mut self, title: &str, text: &str, category: Category) {
+        self.push_at(title, text, category, std::time::Instant::now());
+    }
+
+    fn push_at(&mut self, title: &str, text: &str, category: Category, now: std::time::Instant) {
+        if text.trim().is_empty() {
+            return;
+        }
         // A busy turn does not poll `returned`, so the absence is also marked on arrival.
         if !crate::ui::termcaps::terminal_focused() {
             self.mark_away();
         }
-        if text.trim().is_empty()
-            || self
-                .entries
-                .iter()
-                .any(|entry| entry.title == title && entry.text == text)
-        {
+        self.next_id = self.next_id.saturating_add(1);
+        if let Some(index) = self.entries.iter().rposition(|entry| {
+            entry.title == title
+                && entry.text == text
+                && entry.category == category
+                && now.saturating_duration_since(entry.first_seen) <= COALESCE_WINDOW
+        }) {
+            let mut entry = self.entries.remove(index);
+            entry.last_arrival = self.next_id;
+            entry.unread = true;
+            entry.occurrences = entry.occurrences.saturating_add(1);
+            self.entries.push(entry);
             return;
         }
-        self.next_id = self.next_id.saturating_add(1);
         if self.entries.len() == LIMIT {
-            self.entries.remove(0);
+            let index = self
+                .entries
+                .iter()
+                .position(|entry| !entry.unread)
+                .unwrap_or(0);
+            if self.entries.remove(index).unread {
+                self.overflow_unread = self.overflow_unread.saturating_add(1);
+            }
         }
         self.entries.push(Notice {
             id: self.next_id,
@@ -72,6 +96,9 @@ impl Inbox {
             text: text.to_owned(),
             unread: true,
             category,
+            occurrences: 1,
+            first_seen: now,
+            last_arrival: self.next_id,
         });
     }
 
@@ -95,7 +122,7 @@ impl Inbox {
             .entries
             .iter()
             .rev()
-            .filter(|entry| entry.id > since)
+            .filter(|entry| entry.last_arrival > since)
             .collect();
         if arrived.is_empty() {
             return None;
@@ -183,23 +210,15 @@ impl Inbox {
         count
     }
 
-    /// The inbox picker. Enter on a notice reads it at once (shows it in the transcript and marks
-    /// it read); unread notices carry the picker's `unread` mark and the cursor starts on the
-    /// newest one. Mark-all-read and the notification settings for each category present follow
-    /// the notices. Every row runs `/inbox open <value>`.
+    /// The inbox picker. Bulk actions precede notices; unread notices carry a searchable mark.
+    /// Every row runs `/inbox open <value>`.
     pub fn choices(&self) -> ChoiceSpec {
+        self.choices_filtered(false)
+    }
+
+    pub fn choices_filtered(&self, unread_only: bool) -> ChoiceSpec {
         let unread = self.unread();
-        let mut items: Vec<ChoiceItem> = self
-            .entries
-            .iter()
-            .rev()
-            .map(|entry| ChoiceItem {
-                value: entry.id.to_string(),
-                label: entry.title.clone(),
-                detail: entry.text.clone(),
-                current: entry.unread,
-            })
-            .collect();
+        let mut items = Vec::new();
         if unread > 0 {
             items.push(ChoiceItem {
                 value: "read-all".into(),
@@ -211,30 +230,67 @@ impl Inbox {
                 current: false,
             });
         }
-        for (category, label) in [
-            (Category::Error, "Error notification settings"),
-            (Category::Completion, "Completion notification settings"),
-        ] {
-            if let Some(entry) = self.entries.iter().rev().find(|e| e.category == category) {
-                items.push(ChoiceItem {
-                    value: format!("notifications {}", entry.id),
-                    label: label.into(),
-                    detail: "Change these notification preferences without reading notices".into(),
-                    current: false,
-                });
+        items.push(ChoiceItem {
+            value: if unread_only { "all" } else { "unread" }.into(),
+            label: if unread_only {
+                "Show all notices"
+            } else {
+                "Show unread only"
             }
-        }
+            .into(),
+            detail: "Filter retained notices without changing their read state".into(),
+            current: false,
+        });
+        items.extend(
+            self.entries
+                .iter()
+                .rev()
+                .filter(|entry| !unread_only || entry.unread)
+                .map(|entry| {
+                    let mut detail = if entry.unread {
+                        "unread · ".to_owned()
+                    } else {
+                        String::new()
+                    };
+                    if entry.occurrences > 1 {
+                        detail.push_str(&format!("{} occurrences · ", entry.occurrences));
+                    }
+                    detail.push_str(&entry.text);
+                    ChoiceItem {
+                        value: entry.id.to_string(),
+                        label: entry.title.clone(),
+                        detail,
+                        current: entry.unread,
+                    }
+                }),
+        );
+        // One settings row. It opens settings at `ui.notify`, beside `ui.notify_errors`, so every
+        // category's preference is one step away without a settings row per kind of notice.
         items.push(ChoiceItem {
             value: "notifications".into(),
             label: "Notification settings".into(),
-            detail: "Change notification preferences without reading or dismissing notices".into(),
+            detail: "Change when Dial notifies you; notices keep their read state".into(),
             current: false,
         });
         ChoiceSpec {
-            title: format!("Inbox · {unread} unread"),
             command: "inbox".into(),
+            title: format!(
+                "Inbox{} · {unread} unread",
+                if unread_only { " · unread only" } else { "" }
+            ),
             verb: "open",
-            summary: "Session notifications; Enter shows a notice and marks it read. Opening the inbox or preferences never marks notices read.".into(),
+            summary: format!(
+                "Enter shows a notice and marks it read; opening the inbox or settings marks nothing read.{}",
+                if self.overflow_unread > 0 {
+                    format!(
+                        " {} unread notice{} evicted at the {LIMIT}-notice limit; transcript delivery is unchanged.",
+                        self.overflow_unread,
+                        if self.overflow_unread == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             current_tag: Some("unread".into()),
             items,
             ..Default::default()

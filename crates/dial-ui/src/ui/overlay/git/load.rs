@@ -213,6 +213,13 @@ impl GitOverlay {
             self.flash("The commit view is read-only", true);
             return false;
         }
+        if self.mutation.is_some() || self.ai_job.is_some() || self.generating.is_some() {
+            self.flash(
+                "Git operation in progress; wait before changing files",
+                true,
+            );
+            return false;
+        }
         if self.loading || self.reads.busy() {
             self.flash("Repository read pending; wait before changing files", true);
             return false;
@@ -289,6 +296,7 @@ impl GitOverlay {
         if let Some(error) = &self.watch_error {
             self.flash(Self::watch_notice(error), true);
         }
+        self.poll_repo_job();
     }
 
     #[cfg(test)]

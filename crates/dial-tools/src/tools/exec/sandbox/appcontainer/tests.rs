@@ -16,6 +16,7 @@ fn strict_and_offline_policies_keep_their_paths_and_network_setting() {
         deny_read: deny.clone(),
         allow_network: true,
         extra_write: extra.clone(),
+        serial_ports: false,
     };
     assert_eq!(
         plan(&strict),
@@ -29,6 +30,7 @@ fn strict_and_offline_policies_keep_their_paths_and_network_setting() {
         deny_read: deny.clone(),
         extra_write: extra.clone(),
         allow_network: false,
+        serial_ports: false,
     };
     assert!(!plan(&offline).network);
     assert!(capabilities(false).is_empty());

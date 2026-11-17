@@ -338,7 +338,7 @@ impl OverlayEnv<'_> {
                         let config = self.reload_saved()?;
                         return Ok(if config.role_selection(&role).is_some() {
                             format!(
-                                "{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+S switches scope"
+                                "{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+B switches scope"
                             )
                         } else {
                             format!("{role} assignment cleared")
@@ -715,7 +715,15 @@ impl OverlayEnv<'_> {
                     return false;
                 }
                 if action.starts_with("subagent-open:") || action.starts_with("subagent-hub") {
-                    self.next = Some(action);
+                    self.next = Some(
+                        if action == "subagent-hub"
+                            && matches!(self.history.last(), Some(ActiveOverlay::Activity(_)))
+                        {
+                            "navigate:back".to_owned()
+                        } else {
+                            action
+                        },
+                    );
                     return true;
                 }
                 if let ActiveOverlay::SubagentViewer(viewer) = &mut *overlay
@@ -752,6 +760,7 @@ impl OverlayEnv<'_> {
                     || action.starts_with("peers:")
                     || action.starts_with("history-open:")
                     || action == "history-return"
+                    || action == "history-more"
                 {
                     self.next = Some(action);
                     return true;

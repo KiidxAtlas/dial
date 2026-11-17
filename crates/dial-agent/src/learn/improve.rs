@@ -2445,6 +2445,7 @@ pub fn apply(
     proposal: &Proposal,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Admission> {
+    super::auto::check_stop(config)?;
     let active = store.active()?;
     validate_proposal(config, &active, proposal)?;
     verify_adapter(store, &active)?;
@@ -2482,19 +2483,34 @@ pub fn apply(
     ) {
         Ok(judgment) => judgment.admission,
         Err(error) => {
-            let rejected = Admission {
-                candidate: candidate.id,
-                baseline: active.id,
-                passed: false,
-                reason: format!("evaluation failed: {error:#}"),
-                scores: vec![],
-            };
+            let rejected = evaluation_failure(config, &active, &candidate, error)?;
             store.admit(&rejected)?;
             return Ok(rejected);
         }
     };
+    super::auto::check_stop(config)?;
     store.admit_with_training(&admission, pending.as_ref())?;
     Ok(admission)
+}
+
+/// A stop is not an evaluation verdict: preserve pending candidates on every admission path.
+fn evaluation_failure(
+    config: &Config,
+    active: &Version,
+    candidate: &Version,
+    error: anyhow::Error,
+) -> Result<Admission> {
+    super::auto::check_stop(config)?;
+    if error.is::<crate::llm::Interrupted>() {
+        return Err(error);
+    }
+    Ok(Admission {
+        candidate: candidate.id,
+        baseline: active.id,
+        passed: false,
+        reason: format!("evaluation failed: {error:#}"),
+        scores: vec![],
+    })
 }
 
 /// Run the existing gate on an already-queued candidate (for example an imported pack).
@@ -2506,6 +2522,7 @@ pub fn evaluate_queued(
     candidate_id: i64,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Admission> {
+    super::auto::check_stop(config)?;
     let candidate = store.version(candidate_id)?;
     ensure!(
         candidate.status == "candidate",
@@ -2531,14 +2548,9 @@ pub fn evaluate_queued(
         progress,
     ) {
         Ok(judgment) => judgment.admission,
-        Err(error) => Admission {
-            candidate: candidate.id,
-            baseline: active.id,
-            passed: false,
-            reason: format!("evaluation failed: {error:#}"),
-            scores: vec![],
-        },
+        Err(error) => evaluation_failure(config, &active, &candidate, error)?,
     };
+    super::auto::check_stop(config)?;
     store.admit(&admission)?;
     Ok(admission)
 }

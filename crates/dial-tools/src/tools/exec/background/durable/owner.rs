@@ -136,6 +136,8 @@ struct Launch {
     writes: Vec<PathBuf>,
     network: bool,
     #[serde(default)]
+    serial_ports: bool,
+    #[serde(default)]
     network_rules: Option<crate::tools::exec::sandbox::netproxy::NetworkRules>,
     unsandboxed: bool,
     backend: crate::config::types::ShellBackend,
@@ -552,16 +554,20 @@ fn start_with_owner(
     );
     make_dir(&directory).context("job name already retained or cannot be created")?;
     drop(lock);
-    let (strict, mut deny, writes, network) = match ws.sandbox_policy() {
+    let policy = ws.sandbox_policy();
+    let serial_ports = policy.serial_ports();
+    let (strict, mut deny, writes, network) = match policy {
         Policy::Strict {
             deny_read,
             extra_write,
             allow_network,
+            ..
         } => (true, deny_read, extra_write, allow_network),
         Policy::Dev {
             deny_read,
             extra_write,
             allow_network,
+            ..
         } => (false, deny_read, extra_write, allow_network),
     };
     deny.push(registry.parent().context("registry parent")?.to_owned());
@@ -576,6 +582,7 @@ fn start_with_owner(
         deny,
         writes,
         network,
+        serial_ports,
         network_rules: ws.network_rules().cloned(),
         unsandboxed: ws.unsandboxed,
         backend: ws.shell_backend,
@@ -792,12 +799,14 @@ fn run_owner(launch: Launch) -> Result<()> {
                 deny_read: launch.deny,
                 extra_write: launch.writes,
                 allow_network: launch.network,
+                serial_ports: launch.serial_ports,
             }
         } else {
             Policy::Dev {
                 deny_read: launch.deny,
                 extra_write: launch.writes,
                 allow_network: launch.network,
+                serial_ports: launch.serial_ports,
             }
         })
         .with_shell_backend(launch.backend)

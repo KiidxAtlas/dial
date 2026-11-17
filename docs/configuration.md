@@ -82,8 +82,12 @@ and adopted at the next safe turn boundary.
 
 Settings saves and prompt-history access wait at most 250 ms for each occupied storage lock.
 Brief concurrent saves still serialize; longer contention reports a retryable error rather than
-freezing command dispatch. A failed settings save leaves the effective setting unchanged; a failed
-history save is reported without preventing the command from running.
+freezing command dispatch. Model-selection saves snapshot both affected layers and attempt to
+restore both after publication failure. If compensation or directory synchronization is uncertain,
+the diagnostic says so; inspect/reload settings rather than assuming nothing changed. This is not
+a crash-atomic transaction across two files. A failed history save is reported without preventing
+the command from running. History drops oldest entries to fit the 8 MiB serialized JSON limit,
+including escaping and array overhead, as well as its entry-count limit.
 
 Agent-bound settings such as `/drafter` rebuild the agent. Configured MCP servers stay connected
 across that rebuild when the change leaves their configuration (the `mcp` table, project root and
@@ -394,6 +398,7 @@ allow_network = true
 extra_write = ["~/.cargo", "~/.npm"]
 # network_allow = ["crates.io", "*.crates.io", "github.com"]  # optional: filter command traffic by domain
 # network_deny = ["pastebin.com"]
+# serial_ports = true     # let sandboxed commands open USB serial boards (Arduino, ESP32)
 [shell]
 backend = "auto"         # auto | system | embedded | inprocess (sandbox.mode = "off" only) | powershell
 [endpoint]                # optional: OpenAI-compatible server instead of local MLX

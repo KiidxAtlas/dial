@@ -282,3 +282,39 @@ fn hints_name_what_x_and_enter_do_on_the_selected_row() {
     let shown = rows(&render(150, 35, |frame| overlay.draw(frame, &ctx))).join("\n");
     assert!(shown.contains("x remove"), "{shown}");
 }
+
+#[test]
+fn mouse_selects_compute_owner_without_control_effects() {
+    let rig = Rig::new();
+    let mut o = ComputeOverlay::new();
+    o.update(fixture());
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let shown = screen(&render(120, 35, |f| o.draw(f, &ctx)));
+    let (x, y) = position(&shown, "big-model");
+    assert!(matches!(o.click(x, y), OverlayEvent::None));
+    assert!(matches!(&o.items()[o.cursor].target, Target::Process(p) if p["pid"] == 70));
+    assert!(o.menu.is_none() && o.confirm.is_none());
+}
+
+#[test]
+fn mouse_switches_visible_compute_tabs() {
+    let rig = Rig::new();
+    let mut o = ComputeOverlay::new();
+    o.update(fixture());
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let shown = screen(&render(120, 35, |f| o.draw(f, &ctx)));
+    let (x, y) = position(&shown, "Models");
+    o.click(x, y);
+    assert_eq!(o.tab, 1);
+    assert_eq!(o.cursor, 0);
+}

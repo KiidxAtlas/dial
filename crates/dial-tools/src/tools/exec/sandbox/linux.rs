@@ -26,22 +26,31 @@ struct Mounts {
     masks: Vec<(PathBuf, bool)>,
     /// Git metadata inside writable roots, re-bound read-only after the writable binds.
     read_only: Vec<PathBuf>,
+    /// USB serial adapters bound into the private `/dev` (`sandbox.serial_ports`).
+    devices: Vec<PathBuf>,
 }
 
 impl Mounts {
     fn new(workspace: &Path, policy: &Policy) -> Result<Self, String> {
         let workspace = directory(workspace)?;
-        let (network, denied, extra) = match policy {
+        let (network, denied, extra, serial_ports) = match policy {
             Policy::Strict {
                 deny_read,
                 allow_network,
                 extra_write,
-            } => (*allow_network, deny_read.as_slice(), extra_write.as_slice()),
-            Policy::Dev {
+                serial_ports,
+            }
+            | Policy::Dev {
                 deny_read,
                 extra_write,
                 allow_network,
-            } => (*allow_network, deny_read.as_slice(), extra_write.as_slice()),
+                serial_ports,
+            } => (
+                *allow_network,
+                deny_read.as_slice(),
+                extra_write.as_slice(),
+                *serial_ports,
+            ),
         };
         let mut read = Vec::new();
         for path in SYSTEM_READ {
@@ -166,6 +175,11 @@ impl Mounts {
             denied,
             masks,
             read_only,
+            devices: if serial_ports {
+                super::serial::linux_devices()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -332,16 +346,12 @@ pub(super) fn command_mode(
     for (source, target) in mounts.read {
         command.arg("--ro-bind").arg(source).arg(target);
     }
-    command.args([
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--remount-ro",
-        "/proc",
-        "--remount-ro",
-        "/dev",
-    ]);
+    command.args(["--proc", "/proc", "--dev", "/dev"]);
+    // Device binds keep their device nodes usable and must exist before /dev turns read-only.
+    for device in &mounts.devices {
+        command.arg("--dev-bind").arg(device).arg(device);
+    }
+    command.args(["--remount-ro", "/proc", "--remount-ro", "/dev"]);
     for path in mounts.write {
         command.arg("--bind").arg(&path).arg(path);
     }
@@ -470,6 +480,7 @@ fn self_test(network: bool) -> Result<(), String> {
         deny_read: vec![outside.clone(), base.join("not-created-yet")],
         extra_write: vec![extra.clone()],
         allow_network: network,
+        serial_ports: false,
     };
     let outside = outside.to_str().ok_or("probe path is not UTF-8")?;
     let extra = extra.to_str().ok_or("probe path is not UTF-8")?;
@@ -501,11 +512,13 @@ fn self_test(network: bool) -> Result<(), String> {
             deny_read: vec![private.clone()],
             extra_write: vec![],
             allow_network: network,
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![private.clone()],
             extra_write: vec![],
             allow_network: network,
+            serial_ports: false,
         },
     ] {
         let (code, output) = run(
@@ -529,6 +542,7 @@ fn self_test(network: bool) -> Result<(), String> {
         deny_read: Vec::new(),
         allow_network: false,
         extra_write: Vec::new(),
+        serial_ports: false,
     };
     let (code, output) = run(
         &workspace,

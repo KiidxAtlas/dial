@@ -210,6 +210,7 @@ fn command_check_runs_in_the_sandbox() {
                     allow_network: false,
                     deny_read: Vec::new(),
                     extra_write: Vec::new(),
+                    serial_ports: false,
                 });
             tools::execute(
                 &ws,

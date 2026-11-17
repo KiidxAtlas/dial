@@ -9,6 +9,7 @@ pub(in crate::agent) struct RoleChatCall<'a> {
     purpose: llm::usage::Purpose,
     request: &'a Chat,
     timeout_secs: u64,
+    wait_for_slot: bool,
 }
 
 /// Source-specific candidates share model routing, budgeting and index-only response validation.
@@ -323,6 +324,7 @@ impl<'a> Agent<'a> {
                 purpose,
                 request,
                 timeout_secs,
+                wait_for_slot: true,
             },
             ui,
             self.interrupt.clone(),
@@ -340,13 +342,23 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         timeout_secs: u64,
     ) -> Result<String> {
-        self.bounded_role_chat_with_cancel(
-            main,
-            role,
-            purpose,
-            request,
-            ui,
-            (timeout_secs, self.interrupt.clone()),
+        with_request_deadline(
+            self.interrupt.clone(),
+            Duration::from_secs(timeout_secs),
+            |cancel| {
+                self.role_chat_with_control(
+                    main,
+                    RoleChatCall {
+                        role,
+                        purpose,
+                        request,
+                        timeout_secs,
+                        wait_for_slot: false,
+                    },
+                    ui,
+                    cancel,
+                )
+            },
         )
     }
 
@@ -369,6 +381,7 @@ impl<'a> Agent<'a> {
                     purpose,
                     request,
                     timeout_secs,
+                    wait_for_slot: true,
                 },
                 ui,
                 cancel,
@@ -469,8 +482,33 @@ impl<'a> Agent<'a> {
             purpose,
             request,
             timeout_secs,
+            wait_for_slot,
         } = call;
         let selection = self.role_selection(role).cloned();
+        // Reused-main roles must reserve the loaded main route, not the configured side model
+        // that local reuse deliberately skipped. Admission belongs here so callers cannot take
+        // a second permit around this same request (a deadlock on single-slot local servers).
+        let route = if selection.is_some() {
+            self.auth_config.for_role(role)
+        } else {
+            self.auth_config.clone()
+        };
+        let provider_slot = if wait_for_slot {
+            crate::agent::model::provider_slots::acquire_checked(
+                &route,
+                || -> Result<()> {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(llm::Interrupted.into());
+                    }
+                    Ok(())
+                },
+                || ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
+            )?
+        } else {
+            ensure!(!cancel.load(Ordering::SeqCst), "{role} request cancelled");
+            crate::agent::model::provider_slots::try_acquire(&route)
+                .context("routing provider is busy")?
+        };
         let Some(selection) = selection else {
             self.prepare_reused_role_request(main, role, request.max_tokens, main_profile)?;
             let rewritten = self.provider_request_with(request, ui)?;
@@ -512,6 +550,7 @@ impl<'a> Agent<'a> {
                     &mut |ui| self.pump_subagents(ui),
                 )
             };
+            drop(provider_slot);
             self.record_aux_request(main, &result, started);
             let reply = result?;
             if let Some(cost) = main.reply_cost(&reply) {
@@ -585,6 +624,7 @@ impl<'a> Agent<'a> {
                 &mut |ui| self.pump_subagents(ui),
             )
         };
+        drop(provider_slot);
         self.record_aux_request(&backend, &result, started);
         if let Ok(reply) = &result
             && let Some(cost) = backend.reply_cost(reply)

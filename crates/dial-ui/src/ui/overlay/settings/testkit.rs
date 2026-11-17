@@ -73,3 +73,15 @@ pub fn style_of(buffer: &Buffer, needle: &str) -> Option<Style> {
     }
     None
 }
+
+/// Terminal coordinates of a visible label in a rendered test screen.
+pub fn position(shown: &str, needle: &str) -> (u16, u16) {
+    shown
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            line.find(needle)
+                .map(|byte| (crate::ui::text::width(&line[..byte]) as u16, y as u16))
+        })
+        .unwrap_or_else(|| panic!("missing {needle:?}:\n{shown}"))
+}

@@ -21,15 +21,25 @@ use std::{
 mod actor;
 mod auth;
 mod checkpoints;
+mod checks;
 mod client_fs;
+mod collaboration;
+mod diagnostics;
 mod extensions;
 mod host_tools;
 mod host_uris;
 mod jobs;
+mod live_snapshot;
+mod maintenance;
 mod models;
 mod parity;
+mod read_jobs;
+mod research;
 mod sessions;
 mod settings;
+mod side_control;
+mod skills;
+mod workflows;
 /// Wire vocabulary shared with clients: versions, the method table and error codes.
 pub use dial_protocol::PROTOCOL_VERSION;
 use dial_protocol::{DEFAULT_PROTOCOL_VERSION, ErrorCode, METHODS, SUPPORTED_PROTOCOL_VERSIONS};
@@ -73,7 +83,16 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "session_control"
                 | "schema"
                 | "benchmarks"
+                | "workflows"
+                | "side_threads"
+                | "schedules"
+                | "research"
+                | "collaboration"
                 | "usage"
+                | "checks"
+                | "evidence"
+                | "diagnostics"
+                | "skills"
         ))
 }
 
@@ -131,6 +150,43 @@ pub(crate) fn ready_frame(
         "question_input":question_input,
     })
 }
+/// Admission and pending input share one lock so settlement cannot race a late steer.
+#[derive(Default)]
+struct Steering {
+    turn: Option<(String, Value)>,
+    pending: Vec<String>,
+}
+impl Steering {
+    fn begin(&mut self, session: &str, request: Value) {
+        self.pending.clear();
+        self.turn = Some((session.to_owned(), request));
+    }
+
+    fn end(&mut self) -> usize {
+        self.turn = None;
+        let discarded = self.pending.len();
+        self.pending.clear();
+        discarded
+    }
+
+    fn enqueue(&mut self, text: &str, session: Option<&str>) -> Result<()> {
+        let Some((active, _)) = &self.turn else {
+            return Err(coded(ErrorCode::NotPending, "no active steerable turn"));
+        };
+        if session.is_some_and(|session| session != active) {
+            return Err(coded(
+                ErrorCode::NotPending,
+                "that session has no active turn",
+            ));
+        }
+        if self.pending.len() >= MAX_STEERING {
+            return Err(coded(ErrorCode::Busy, "steering queue full"));
+        }
+        self.pending.push(text.to_owned());
+        Ok(())
+    }
+}
+
 struct Output {
     acp: Option<crate::acp::Adapter>,
     /// Negotiated protocol version; `DEFAULT_PROTOCOL_VERSION` until the client sends `hello`.
@@ -150,12 +206,23 @@ struct Envelope {
     session_id: Option<String>,
     /// Id of the actor request in flight, or null for background work between requests.
     request_id: Value,
+    live: live_snapshot::LiveSnapshot,
 }
 impl Envelope {
     fn stamp(&mut self, value: &mut Value) {
         let Some(event) = value.as_object_mut().filter(|v| v.contains_key("event")) else {
             return;
         };
+        if matches!(
+            event.get("event").and_then(Value::as_str),
+            Some("ready" | "active_session")
+        ) && let Some(session) = event.get("session_id").and_then(Value::as_str)
+        {
+            self.session_id = Some(session.to_owned());
+            if event.get("event").and_then(Value::as_str) == Some("ready") {
+                self.request_id = Value::Null;
+            }
+        }
         self.seq += 1;
         event.insert("seq".into(), json!(self.seq));
         if !event.contains_key("session_id")
@@ -163,7 +230,10 @@ impl Envelope {
         {
             event.insert("session_id".into(), json!(session));
         }
-        event.insert("request_id".into(), self.request_id.clone());
+        event
+            .entry("request_id")
+            .or_insert_with(|| self.request_id.clone());
+        self.live.observe(value);
     }
 }
 /// A request failure with a stable machine code. Protocol 2 clients receive the code next to the
@@ -225,6 +295,39 @@ struct Sender {
     writer: crate::output::StdoutWriter,
     failed: Arc<AtomicBool>,
     failure: Arc<OnceLock<String>>,
+}
+
+/// A response position fenced under the same lock as its snapshot's event watermark.
+/// An abandoned reservation publishes no bytes, but must still release all later tickets.
+struct ReservedReply {
+    sender: Sender,
+    ticket: Option<u64>,
+    protocol: u32,
+}
+
+impl ReservedReply {
+    fn complete(mut self, id: &Value, result: Result<Value>) {
+        let frame = Sender::result_frame(id, result, self.protocol);
+        let published = self.sender.publish(
+            self.ticket.expect("reserved response"),
+            Batch::Single(frame),
+        );
+        // json_batch closes its ticket even when publication returns an error.
+        self.ticket = None;
+        if let Err(error) = published {
+            self.sender.fail(&error);
+        }
+    }
+}
+
+impl Drop for ReservedReply {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take()
+            && let Err(error) = self.sender.publish(ticket, Batch::Mapped(Vec::new()))
+        {
+            self.sender.fail(&error);
+        }
+    }
 }
 impl Sender {
     fn unavailable(&self) -> bool {
@@ -336,11 +439,25 @@ impl Sender {
             output.envelope.request_id = request_id;
         }
     }
+    fn reserve_reply(&self, output: &Output) -> Result<ReservedReply> {
+        if output.acp.is_some() {
+            return Err(unknown_method());
+        }
+        Ok(ReservedReply {
+            sender: self.clone(),
+            ticket: Some(self.writer.reserve()),
+            protocol: output.protocol,
+        })
+    }
+
     fn result(&self, id: &Value, result: Result<Value>) {
-        let v2 = self.protocol() >= 2;
-        self.emit(match result {
+        self.emit(Self::result_frame(id, result, self.protocol()));
+    }
+
+    fn result_frame(id: &Value, result: Result<Value>, protocol: u32) -> Value {
+        match result {
             Ok(v) => json!({"id":id,"result":v}),
-            Err(e) if v2 => {
+            Err(e) if protocol >= 2 => {
                 let code = e
                     .downcast_ref::<RequestError>()
                     .map_or(ErrorCode::Failed, |error| error.code)
@@ -348,7 +465,7 @@ impl Sender {
                 json!({"id":id,"error":{"code":code,"message":format!("{e:#}")}})
             }
             Err(e) => json!({"id":id,"error":{"message":format!("{e:#}")}}),
-        });
+        }
     }
     fn protocol_error(&self, message: &str, parse: bool) {
         let result = (|| -> Result<()> {
@@ -382,7 +499,7 @@ struct RpcUi {
     pending_question: Arc<Mutex<Option<PendingQuestion>>>,
     interrupt: Arc<AtomicBool>,
     input_disconnected: Arc<AtomicBool>,
-    steering: Arc<Mutex<Vec<String>>>,
+    steering: Arc<Mutex<Steering>>,
     prompt_queued: Arc<AtomicBool>,
     next: u64,
     node_cursors: std::collections::BTreeMap<String, usize>,
@@ -563,6 +680,12 @@ impl Ui for RpcUi {
         self.out
             .emit(json!({"event":"tool_output","name":name,"delta":text}));
     }
+    fn tool_output_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        self.out.emit(tool_output_event(call_id, name, text));
+    }
+    fn tool_progress_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        self.out.emit(tool_progress_event(call_id, name, text));
+    }
     fn background_notice(&mut self, message: &str) {
         self.out
             .emit(json!({"event":"background","message":message}));
@@ -594,11 +717,13 @@ impl Ui for RpcUi {
     fn take_steering(&mut self) -> Vec<String> {
         self.steering
             .lock()
-            .map(|mut q| std::mem::take(&mut *q))
+            .map(|mut q| std::mem::take(&mut q.pending))
             .unwrap_or_default()
     }
     fn pending_input(&mut self) -> bool {
-        self.steering.lock().is_ok_and(|queue| !queue.is_empty())
+        self.steering
+            .lock()
+            .is_ok_and(|queue| !queue.pending.is_empty())
     }
     fn policy_explanation(
         &mut self,
@@ -849,6 +974,7 @@ fn state_projection(agent: &Agent<'_>) -> Value {
     let workspace = agent.workspace();
     json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
         "plan_mode":agent.plan_mode(),"approval":agent.approval(),"cost":agent.session_cost(),
+        "working_modes":workflows::modes(agent),
         "cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage",
         "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
         "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree(),
@@ -868,13 +994,20 @@ fn schema_document() -> Result<Value> {
 /// run on it, so a later request observes an earlier write. `current` is the active session and
 /// model from the worker's cached projection. `config` is replaced when `apply_settings` rebuilds.
 struct Admin {
-    layout: Layout,
+    layout: Arc<std::sync::RwLock<Layout>>,
     config: Arc<std::sync::RwLock<Config>>,
     /// Command-line settings, kept when a method reads the saved configuration again.
     overlay: toml::Table,
 }
 
 impl Admin {
+    fn layout(&self) -> Layout {
+        self.layout
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     fn current(
         projection: &QueryProjection,
     ) -> (Option<String>, crate::llm::model_config::ModelSelection) {
@@ -893,7 +1026,7 @@ impl Admin {
     /// The configuration as saved now (with this launch's command-line settings), so a change
     /// saved by an earlier request is visible before `apply_settings`.
     fn saved_config(&self) -> Result<Config> {
-        crate::config::settings_store::load_config(&self.layout, &self.overlay)
+        crate::config::settings_store::load_config(&self.layout(), &self.overlay)
             .map_err(|error| coded(ErrorCode::InvalidParams, error))
     }
 
@@ -902,10 +1035,13 @@ impl Admin {
         matches!(
             method,
             "list_sessions"
+                | "search_sessions"
                 | "list_models"
                 | "settings_schema"
                 | "get_settings"
                 | "list_extensions"
+                | "list_checks"
+                | "list_skills"
                 | "get_schema"
         )
     }
@@ -918,10 +1054,12 @@ impl Admin {
     ) -> Result<Value> {
         let (session, model) = current;
         let config = self.config.read().unwrap_or_else(|p| p.into_inner());
+        let layout = self.layout();
         match method {
-            "list_sessions" => sessions::list(&self.layout, session.as_deref(), params),
-            "delete_session" => sessions::delete(&self.layout, session.as_deref(), params),
-            "pin_session" => sessions::pin(&self.layout, params),
+            "list_sessions" => sessions::list(&layout, session.as_deref(), params),
+            "search_sessions" => sessions::search(&layout, params),
+            "delete_session" => sessions::delete(&layout, session.as_deref(), params),
+            "pin_session" => sessions::pin(&layout, params),
             "list_models" => {
                 let provider = match params.get("provider").filter(|value| !value.is_null()) {
                     Some(value) => Some(
@@ -933,26 +1071,33 @@ impl Admin {
                     None => None,
                 };
                 let models = if model.provider.is_empty() {
-                    models::list(
-                        &config,
-                        &config.selection(),
-                        &self.layout.user_dir,
-                        provider,
-                    )
+                    models::list(&config, &config.selection(), &layout.user_dir, provider)
                 } else {
-                    models::list(&config, &model, &self.layout.user_dir, provider)
+                    models::list(&config, &model, &layout.user_dir, provider)
                 };
                 Ok(json!({"models":models}))
             }
+            "delete_local_model" => {
+                drop(config);
+                let mut in_use = crate::llm::catalog::models_in_use(&self.saved_config()?);
+                if !model.model.is_empty() {
+                    in_use.push(model.model.clone());
+                }
+                models::delete_local(params, &in_use)
+            }
             "settings_schema" => Ok(settings::schema()),
-            "get_settings" => settings::get(&self.layout, params),
-            "set_setting" => settings::set(&self.layout, params),
-            "reset_setting" => settings::reset(&self.layout, params),
+            "get_settings" => settings::get(&layout, params),
+            "set_setting" => settings::set(&layout, params),
+            "reset_setting" => settings::reset(&layout, params),
             "list_extensions" => {
                 drop(config);
-                Ok(extensions::list(&self.layout, &self.saved_config()?))
+                Ok(extensions::list(&layout, &self.saved_config()?))
             }
             "get_schema" => schema_document(),
+            "list_checks" => Ok(checks::list(&config)),
+            "add_check" => checks::add(&layout, params),
+            "remove_check" => checks::remove(&layout, params),
+            "list_skills" => skills::list(&layout, &config.skills.registries, params),
             _ => Err(unknown_method()),
         }
     }
@@ -1032,6 +1177,15 @@ fn messages_page(messages: &[Value], params: &Value) -> Result<Value> {
 /// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane` and `tokens` are additive.
 pub(crate) fn typed_notice(event: &crate::agent::ui::ui_event::UiEvent) -> Value {
     json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens})
+}
+/// Call-correlated `tool_output`: `call_id` names the model call whose row the delta belongs to.
+/// `name` stays for clients that predate ids.
+pub(crate) fn tool_output_event(call_id: &str, name: &str, text: &str) -> Value {
+    json!({"event":"tool_output","call_id":call_id,"name":name,"delta":text})
+}
+/// Latest live status snapshot of one running call; each event replaces the previous one.
+pub(crate) fn tool_progress_event(call_id: &str, name: &str, text: &str) -> Value {
+    json!({"event":"tool_progress","call_id":call_id,"name":name,"text":text})
 }
 /// Live voice state of one control connection. `speech` cancels the reply being read aloud.
 #[derive(Default)]
@@ -1130,7 +1284,7 @@ fn run_control(
     let busy = Arc::new(AtomicBool::new(false));
     let prompt_queued = Arc::new(AtomicBool::new(false));
     let closing = Arc::new(AtomicBool::new(false));
-    let steering = Arc::new(Mutex::new(Vec::new()));
+    let steering = Arc::new(Mutex::new(Steering::default()));
     let (commands, rx) = mpsc::sync_channel::<Value>(8);
     let (approval_tx, approval_rx) = mpsc::channel();
     let pending_approval = Arc::new(Mutex::new(None::<String>));
@@ -1146,13 +1300,13 @@ fn run_control(
     let (question_tx, question_rx) = mpsc::channel();
     let pending_question = Arc::new(Mutex::new(None::<PendingQuestion>));
     let worker_questions = pending_question.clone();
-    let question_root = layout.project_root.clone();
     let input_disconnected = Arc::new(AtomicBool::new(false));
     let query_cache = Arc::new(Mutex::new(QueryProjection::default()));
     let worker_query_cache = query_cache.clone();
     let worker_disconnected = input_disconnected.clone();
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let live: Arc<Mutex<LiveState>> = Arc::new(Mutex::new(LiveState::default()));
+    let sides = Arc::new(side_control::SideControl::default());
     let worker_live = live.clone();
     let voice_env = crate::voice::VoiceEnv::from_config(&config);
     let worker_out = out.clone();
@@ -1161,12 +1315,15 @@ fn run_control(
     let worker_closing = closing.clone();
     let worker_prompt_queued = prompt_queued.clone();
     let admin_config = Arc::new(std::sync::RwLock::new(config.clone()));
+    let admin_layout = Arc::new(std::sync::RwLock::new(layout.clone()));
     let admin = Arc::new(Admin {
-        layout: layout.clone(),
+        layout: admin_layout.clone(),
         config: admin_config.clone(),
         overlay: overlay.clone(),
     });
+    let read_jobs = read_jobs::ReadJobs::new();
     let extension_jobs = Arc::new(extensions::ExtensionJobs::default());
+    let skill_jobs = Arc::new(skills::SkillJobs::default());
     let queue = steering.clone();
     let actor = actor::Actor {
         layout,
@@ -1192,7 +1349,9 @@ fn run_control(
         worker_live,
         queue,
         admin_config,
+        admin_layout,
         worker_fs,
+        sides: sides.clone(),
     };
     let worker = thread::spawn(move || actor.run());
     let (mut task_control, mut maintenance_control, mut background) = match control_rx.recv() {
@@ -1243,6 +1402,8 @@ fn run_control(
     });
     let input_result = (|| -> Result<()> {
         let mut cancelling = None::<Instant>;
+        // A connection begins outside a room; publish transitions, not a spurious idle event.
+        let mut collaboration_state = json!({"role":"none","joining":false});
         loop {
             if out.unavailable() || worker.is_finished() {
                 break;
@@ -1250,6 +1411,55 @@ fn run_control(
             // `apply_settings` rebuilds the agent and publishes its controls before it replies.
             while let Ok((tasks, maintenance, jobs)) = control_rx.try_recv() {
                 (task_control, maintenance_control, background) = (tasks, maintenance, jobs);
+            }
+            if !acp {
+                sides.poll(&out)?;
+                let mut state = crate::collab::room::status();
+                let notices = state
+                    .as_object_mut()
+                    .and_then(|state| state.remove("notices"))
+                    .unwrap_or_else(|| json!([]));
+                if state != collaboration_state
+                    || notices.as_array().is_some_and(|notes| !notes.is_empty())
+                {
+                    out.emit(json!({"event":"collaboration_state","room":state,"notices":notices}));
+                    collaboration_state = state;
+                }
+                if collaboration::hosting::take_abort() {
+                    maintenance_control.cancel();
+                    interrupt.store(true, Ordering::SeqCst);
+                    for (job, running) in task_control.list() {
+                        if running {
+                            let _ = task_control.cancel(&job);
+                        }
+                    }
+                    if let Ok(mut pending) = pending_approval.lock() {
+                        *pending = None;
+                    }
+                    if let Ok(mut pending) = pending_question.lock() {
+                        *pending = None;
+                    }
+                    cancelling = Some(Instant::now());
+                }
+                // The controller is the one turn-admission owner. Keep guest prompts queued
+                // in their bounded host owner while busy, then use the ordinary actor channel.
+                if busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if let Some(text) = collaboration::hosting::take_prompt() {
+                        prompt_queued.store(true, Ordering::SeqCst);
+                        maintenance_control.note_input();
+                        interrupt.store(false, Ordering::SeqCst);
+                        if commands.send(json!({"method":"send","params":{"text":text},"_collaboration":true})).is_err() {
+                            prompt_queued.store(false, Ordering::SeqCst);
+                            busy.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    } else {
+                        busy.store(false, Ordering::SeqCst);
+                    }
+                }
             }
             if let Some(started) = cancelling {
                 if !busy.load(Ordering::SeqCst)
@@ -1286,16 +1496,45 @@ fn run_control(
                     continue;
                 }
             };
-            let Some(request) = out.receive(wire)? else {
+            let Some(mut request) = out.receive(wire)? else {
                 continue;
             };
+            // Only the controller may create an uncorrelated hosted turn. Wire clients cannot
+            // suppress their own replies by forging this internal routing marker.
+            if let Some(fields) = request.as_object_mut() {
+                fields.remove("_collaboration");
+            }
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             match request["method"].as_str().unwrap_or("") {
+                "collaboration_status" if !acp => {
+                    out.result(&id, collaboration::status(&admin.layout()));
+                }
+                "collaboration_leave" if !acp => {
+                    out.result(&id, collaboration::leave());
+                }
+                "collaboration_stop" if !acp => {
+                    out.result(&id, collaboration::hosting::stop());
+                }
+                "collaboration_invite" if !acp => {
+                    out.result(&id, collaboration::hosting::invite(&request["params"]));
+                }
+                "side_thread" if !acp => {
+                    out.result(&id, sides.handle(&request["params"]));
+                }
                 "state" | "messages" | "messages_page" | "list_dirs" => {
                     let result = (|| -> Result<Value> {
                         let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         match request["method"].as_str().unwrap_or("") {
-                            "state" => state_reply(&projection, busy.load(Ordering::SeqCst)),
+                            "state" => {
+                                let mut state =
+                                    state_reply(&projection, busy.load(Ordering::SeqCst))?;
+                                let output = out.mapping()?;
+                                state["live"] = output.envelope.live.snapshot(
+                                    output.envelope.session_id.as_deref(),
+                                    output.envelope.seq,
+                                );
+                                Ok(state)
+                            }
                             "messages" => Ok(json!({"messages":projection.messages.clone()})),
                             "list_dirs" => Ok(projection.state["workspace"].clone()),
                             _ => messages_page(
@@ -1311,6 +1550,10 @@ fn run_control(
                     out.result(&id, result);
                 }
                 "abort" => {
+                    if !acp && let Some(result) = collaboration::abort() {
+                        out.result(&id, result);
+                        continue;
+                    }
                     maintenance_control.cancel();
                     interrupt.store(true, Ordering::SeqCst);
                     for (job, running) in task_control.list() {
@@ -1338,20 +1581,19 @@ fn run_control(
                     out.result(&id, Ok(json!({"requested":true})));
                 }
                 "steer" => {
+                    if !acp && let Some(result) = collaboration::prompt("send", &request["params"])
+                    {
+                        out.result(&id, result);
+                        continue;
+                    }
                     let result = (|| -> Result<Value> {
-                        if !busy.load(Ordering::SeqCst) {
-                            return Err(coded(ErrorCode::NotPending, "no active turn"));
-                        }
                         let text = request["params"]["text"].as_str().ok_or_else(|| {
                             coded(ErrorCode::InvalidParams, "steer requires params.text")
                         })?;
                         let mut q = steering
                             .lock()
                             .map_err(|_| anyhow::anyhow!("steering unavailable"))?;
-                        if q.len() >= MAX_STEERING {
-                            return Err(coded(ErrorCode::Busy, "steering queue full"));
-                        }
-                        q.push(text.to_owned());
+                        q.enqueue(text, request["params"]["session_id"].as_str())?;
                         maintenance_control.note_input();
                         Ok(json!({"queued":true}))
                     })();
@@ -1429,7 +1671,7 @@ fn run_control(
                             question.request.clone()
                         };
                         let outcome = submission
-                            .outcome(&question, &question_root)
+                            .outcome(&question, &admin.layout().project_root)
                             .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
                         let mut pending = pending_question
                             .lock()
@@ -1501,13 +1743,18 @@ fn run_control(
                 }
                 "usage" if !acp => {
                     // Each signed-in provider is asked over the network; answer off the
-                    // controller so other requests keep flowing.
-                    let (out, dir) = (out.clone(), auth_dir.clone());
-                    thread::spawn(move || {
-                        let cancel = Arc::new(AtomicBool::new(false));
-                        let outcomes = crate::llm::usage_report::fetch_all(&dir, &cancel);
-                        out.result(&id, Ok(crate::llm::usage_report::outcomes_json(&outcomes)));
-                    });
+                    // controller so other requests keep flowing. The connection's cancel token
+                    // reaches the fetch, and its answer is dropped if the connection ends first.
+                    let (reply, answer_id, dir) = (out.clone(), id.clone(), auth_dir.clone());
+                    if let Err(error) = read_jobs.spawn(
+                        move |cancel| {
+                            let outcomes = crate::llm::usage_report::fetch_all(&dir, &cancel);
+                            Ok(crate::llm::usage_report::outcomes_json(&outcomes))
+                        },
+                        move |result| reply.result(&answer_id, result),
+                    ) {
+                        out.result(&id, Err(error));
+                    }
                 }
                 "login" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {
@@ -1684,12 +1931,27 @@ fn run_control(
                     drop(state);
                     out.result(&id, Ok(json!({"live":false,"stopped":stopped})));
                 }
+                "skill_action" if !acp => {
+                    let result = admin.saved_config().and_then(|config| {
+                        skills::start(
+                            &skill_jobs,
+                            &out,
+                            &admin.layout(),
+                            config.skills.registries.clone(),
+                            &id,
+                            &request["params"],
+                        )
+                    });
+                    if let Err(error) = result {
+                        out.result(&id, Err(error));
+                    }
+                }
                 "extension_action" if !acp => {
                     let result = admin.saved_config().and_then(|config| {
                         extensions::start(
                             &extension_jobs,
                             &out,
-                            &admin.layout,
+                            &admin.layout(),
                             config,
                             &id,
                             &request["params"],
@@ -1743,14 +2005,16 @@ fn run_control(
                             "wait for the current turn before opening benchmarks",
                         ))
                     } else {
-                        crate::benchmark::dashboard::handle(&question_root, action)
+                        crate::benchmark::dashboard::handle(&admin.layout().project_root, action)
                             .map_err(|error| coded(ErrorCode::Failed, error))
                     };
                     out.result(&id, result);
                 }
                 "list_jobs" | "stop_job" | "list_sessions" | "delete_session" | "pin_session"
-                | "list_models" | "settings_schema" | "get_settings" | "set_setting"
-                | "reset_setting" | "list_extensions" | "get_schema"
+                | "list_models" | "delete_local_model" | "settings_schema" | "get_settings"
+                | "set_setting" | "reset_setting" | "list_extensions" | "get_schema"
+                | "list_checks" | "add_check" | "remove_check" | "list_skills"
+                | "search_sessions"
                     if !acp =>
                 {
                     let method = request["method"].as_str().unwrap_or_default().to_owned();
@@ -1764,11 +2028,18 @@ fn run_control(
                     let current =
                         Admin::current(&query_cache.lock().unwrap_or_else(|p| p.into_inner()));
                     if Admin::reads(&method) {
-                        let (admin, out, params) =
-                            (admin.clone(), out.clone(), request["params"].clone());
-                        thread::spawn(move || {
-                            out.result(&id, admin.handle(&method, &params, current));
-                        });
+                        let (admin, reply, answer_id, params) = (
+                            admin.clone(),
+                            out.clone(),
+                            id.clone(),
+                            request["params"].clone(),
+                        );
+                        if let Err(error) = read_jobs.spawn(
+                            move |_| admin.handle(&method, &params, current),
+                            move |result| reply.result(&answer_id, result),
+                        ) {
+                            out.result(&id, Err(error));
+                        }
                     } else {
                         out.result(&id, admin.handle(&method, &request["params"], current));
                     }
@@ -1859,7 +2130,16 @@ fn run_control(
         Ok(())
     })();
     input_disconnected.store(true, Ordering::SeqCst);
+    // The connection is over: refuse further reads and drop answers still in flight.
+    read_jobs.close();
+    sides.cancel();
     interrupt.store(true, Ordering::SeqCst);
+    if !acp {
+        // Invalidate any join still being installed before closing actor input. Never stop a
+        // hosted room through the guest operation, and never leave an orphan socket on EOF.
+        let _ = crate::collab::room::leave();
+        collaboration::hosting::disconnect();
+    }
     maintenance_control.cancel();
     for (job, running) in task_control.list() {
         if running {

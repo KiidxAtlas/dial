@@ -68,6 +68,15 @@ screenshot, remix), import the versioned `art-to-ui` example skill with
 | `fal` | fal model endpoint and queue | No |
 | `replicate` | Replicate prediction | No |
 
+A downloaded image checkpoint assigned to the `image` role (a local path rather than an endpoint)
+needs no declaration: `image_gen` starts stable-diffusion.cpp's `sd-server` on loopback for the
+call, sends the OpenAI Images request, and stops the server afterwards. Edits upload the source to
+its `images/edits` route. Configured `steps` and `seed` travel in sd-server's
+`<sd_cpp_extra_args>` prompt extension, and `image.timeout_secs` bounds the model load and then the
+generation. When no `sd-server` is installed, the call asks to install one (as `/setup sd-cpp` does)
+and fails with that hint if declined or unattended; `DIAL_SD_SERVER` selects another build.
+MLX-quantized packs are refused before any server starts. See [model downloads](model-downloads.md).
+
 Edit support in this table is what **Dial's adapter** accepts, not a statement that other APIs or
 workflows cannot edit images. Unsupported edits fail before submission. Nothing is uploaded merely
 by choosing an image role or opening image settings.

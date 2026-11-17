@@ -25,7 +25,7 @@ use std::time::Instant;
 
 mod landing;
 mod mark;
-pub use landing::{content_width, frame};
+pub use landing::{content_width, frame, menu_width};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WelcomeInfo {
@@ -49,6 +49,10 @@ pub struct WelcomeInfo {
     pub sandbox: String,
     /// The key that cycles the approval mode (`Shift+Tab`); empty hides the home's mode hint.
     pub approval_key: String,
+    /// Bound composer actions for launch hints; empty labels omit unbound actions.
+    pub submit_key: String,
+    pub actions_key: String,
+    pub dismiss_key: String,
     /// Cheap, already-known startup diagnostics; never runs a probe while drawing.
     pub doctor_issues: usize,
     /// First-run guidance, dismissed persistently by the application.
@@ -246,6 +250,9 @@ pub struct View {
     pub max_rows: usize,
     /// Live in the viewport, where list rows can be picked, rather than a scrollback banner.
     pub live: bool,
+    /// Leading composer rows drawn at [`landing::menu_width`] (an open command menu), centered at
+    /// that measure rather than the input's.
+    pub wide_lead: usize,
 }
 
 impl Default for View {
@@ -256,6 +263,7 @@ impl Default for View {
             idle: 0,
             max_rows: usize::MAX,
             live: false,
+            wide_lead: 0,
         }
     }
 }
@@ -818,15 +826,17 @@ impl Home {
         self.motion && self.settled
     }
 
-    /// Compose the centered launch screen with the live input and auxiliary rows.
+    /// Compose the centered launch screen with the live input and auxiliary rows. The first
+    /// `wide_lead` composer rows were drawn at [`menu_width`] (see `Composer::home_view_wide`).
     pub fn frame(
         &mut self,
         width: u16,
         height: u16,
         theme: &Theme,
-        composer: super::composer::ComposerView,
+        composer: (super::composer::ComposerView, usize),
         auxiliary: Rows,
     ) -> super::composer::ComposerView {
+        let (composer, wide_lead) = composer;
         let sweep = self.sweep();
         let idle = self.idle();
         frame(
@@ -840,6 +850,7 @@ impl Home {
                 idle,
                 max_rows: height as usize,
                 live: true,
+                wide_lead,
             },
             composer,
             auxiliary,
@@ -882,6 +893,7 @@ impl Home {
                 idle: 0,
                 max_rows,
                 live: true,
+                wide_lead: 0,
             },
         )
     }

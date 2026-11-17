@@ -88,11 +88,12 @@ fn arrow_keys_cycle_activity_tabs_without_leaving_for_the_models_panel() {
             .strip_prefix("open:activity:")
             .and_then(ActivityTab::parse)
             .expect("an activity tab");
-        assert_ne!(next, ActivityTab::Downloads);
-        assert!(!matches!(
-            crate::app::overlay::overlay_destination(&action),
-            Some(Which::ModelDownloads | Which::Models)
-        ));
+        if next == ActivityTab::Downloads {
+            assert!(matches!(
+                crate::app::overlay::overlay_destination(&action),
+                Some(Which::Activity(ActivityTab::Downloads))
+            ));
+        }
         tab = next;
     }
     assert_eq!(tab, ActivityTab::Workers);
@@ -126,7 +127,11 @@ fn title_row_is_one_surface_row_with_the_active_tab_styled_at_every_width() {
                 plain.contains("Processes") && plain.contains("tabs"),
                 "{plain:?}"
             );
-            assert!(!plain.contains("Downloads"), "{plain:?}");
+            assert!(plain.contains("Downloads"), "{plain:?}");
+            assert!(plain.contains("inner"), "{plain:?}");
+            if width >= 200 {
+                assert!(plain.contains("Ctrl+Shift+F11/F12"), "{plain:?}");
+            }
         }
     }
 }
@@ -183,11 +188,11 @@ fn activity_over_the_worker_hub_draws_one_styled_title_row() {
 fn queued_message_picker_reuses_edit_and_remove_commands() {
     let keys = Keymap::defaults();
     for (code, expected) in [
-        (KeyCode::Enter, "command:/queue edit 1"),
-        (KeyCode::Delete, "command:/queue remove 1"),
+        (KeyCode::Enter, "command:/queue edit @42"),
+        (KeyCode::Delete, "command:/queue remove @42"),
     ] {
         let mut panel =
-            PaletteOverlay::choice(queue_choices(&[("keep this message".into(), true)]));
+            PaletteOverlay::choice(queue_choices(&[(42, "keep this message".into(), true)]));
         let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
         if code == KeyCode::Delete {
             assert!(matches!(panel.handle(&event, &keys), OverlayEvent::None));
@@ -245,20 +250,40 @@ fn attention_aggregates_available_inputs_without_replaying_work() {
         mode: "session".into(),
     })
     .collect();
-    let spec = attention_choices(&workers, &jobs);
+    let mut spec = attention_choices(&workers, &jobs);
     assert_eq!(spec.items.len(), 4);
     assert_eq!(
         spec.items
             .iter()
-            .filter(|item| item.value == "activity workers")
+            .filter(|item| item.value.starts_with("subagent-open:"))
             .count(),
         3
     );
     let keys = Keymap::defaults();
-    let mut picker = PaletteOverlay::choice(spec);
+    let process = spec.items.remove(3);
+    let mut process_picker = ActivityOverlay::new(
+        ActivityTab::Attention,
+        ActiveOverlay::Palette(PaletteOverlay::choice(ChoiceSpec {
+            items: vec![process],
+            ..Default::default()
+        })),
+    );
+    let OverlayEvent::Action(action) = process_picker.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &keys,
+    ) else {
+        panic!("process navigation");
+    };
+    assert!(
+        matches!(crate::app::overlay::overlay_destination(&action), Some(Which::Job(name)) if name == jobs[1].name)
+    );
+    let mut picker = ActivityOverlay::new(
+        ActivityTab::Attention,
+        ActiveOverlay::Palette(PaletteOverlay::choice(spec)),
+    );
     assert!(
         matches!(picker.handle(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), &keys),
-        OverlayEvent::Action(action) if action == "command:/activity workers")
+        OverlayEvent::Action(action) if action == "subagent-open:1")
     );
     assert!(
         attention_choices(&HubSnapshot::default(), &[])
@@ -357,7 +382,7 @@ fn observed_download_failure_opens_downloads_without_retrying() {
     );
     assert!(matches!(
         command_panel("activity", "downloads"),
-        Some(Which::ModelDownloads)
+        Some(Which::Activity(ActivityTab::Downloads))
     ));
 }
 
@@ -380,4 +405,201 @@ fn historical_setup_failure_opens_settings_for_inspection_only() {
         command_panel("settings", ""),
         Some(Which::Settings)
     ));
+}
+
+#[test]
+fn portable_inner_tab_navigation_stays_inside_the_selected_panel() {
+    let theme = crate::ui::theme::Theme::dark();
+    let keys = Keymap::defaults();
+    let status = crate::ui::status::StatusData::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &|_, _| Line::default(),
+    };
+    let mut panel = ActivityOverlay::new(
+        ActivityTab::Workers,
+        ActiveOverlay::Subagents(Box::new(crate::ui::subagent_hub::SubagentHub::new(
+            "session".into(),
+        ))),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    for (code, modifiers, expected) in [
+        (KeyCode::PageDown, KeyModifiers::ALT, "No activity yet"),
+        (KeyCode::PageUp, KeyModifiers::ALT, "No workers yet"),
+        (
+            KeyCode::F(12),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "No activity yet",
+        ),
+        (
+            KeyCode::F(11),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "No workers yet",
+        ),
+    ] {
+        assert!(matches!(
+            panel.handle(&Event::Key(KeyEvent::new(code, modifiers)), &keys),
+            OverlayEvent::None
+        ));
+        assert_eq!(panel.tab, ActivityTab::Workers);
+        terminal.draw(|frame| panel.draw(frame, &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains(expected), "{text}");
+    }
+    panel.handle(
+        &Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+        &keys,
+    );
+    terminal.draw(|frame| panel.draw(frame, &ctx)).unwrap();
+    let sheet: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        sheet.contains("Ctrl+Shift+F11") && sheet.contains("Ctrl+Shift+F12"),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn attention_empty_refresh_names_observed_and_unavailable_sources() {
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let theme = crate::ui::theme::Theme::dark();
+    let keys = Keymap::defaults();
+    let status = crate::ui::status::StatusData::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &|_, _| Line::default(),
+    };
+    for jobs in [None, Some(&[][..])] {
+        let mut panel = ActivityOverlay::new(
+            ActivityTab::Attention,
+            ActiveOverlay::Palette(PaletteOverlay::choice(attention_choices(
+                &Default::default(),
+                &[],
+            ))),
+        );
+        panel.refresh_attention(
+            &layout,
+            &crate::runtime::Tree::default(),
+            None,
+            jobs,
+            AttentionContext::default(),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|frame| panel.draw(frame, &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("No attention items in observed sources"),
+            "{text}"
+        );
+        assert!(
+            text.contains(if jobs.is_some() {
+                "Processes: observed (0 processes)"
+            } else {
+                "Processes: unavailable"
+            }),
+            "{text}"
+        );
+        assert!(text.contains("Downloads: unavailable"), "{text}");
+    }
+}
+
+#[test]
+fn attached_process_keeps_inner_tab_function_keys() {
+    use crate::ui::overlay::jobs::{JobRow, JobsOverlay};
+    let keys = Keymap::defaults();
+    let attached = || {
+        let mut jobs = JobsOverlay::new();
+        jobs.set_jobs(vec![JobRow {
+            name: "terminal".into(),
+            command: "fixture".into(),
+            status: "running".into(),
+            process_outcome: None,
+            running: true,
+            stop_requested: false,
+            terminal: true,
+            mode: "session".into(),
+        }]);
+        jobs.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &keys,
+        );
+        assert_eq!(jobs.attached(), Some("terminal"));
+        jobs
+    };
+    let mut direct = attached();
+    let mut activity = ActivityOverlay::new(
+        ActivityTab::Processes,
+        ActiveOverlay::Jobs(Box::new(attached())),
+    );
+    for code in [KeyCode::F(11), KeyCode::F(12)] {
+        let key = KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(
+            keys.actions_for(&key).is_empty(),
+            "fallback must not shadow a default global binding"
+        );
+        let event = Event::Key(key);
+        match (direct.handle(&event, &keys), activity.handle(&event, &keys)) {
+            (OverlayEvent::None, OverlayEvent::None) => {}
+            (
+                OverlayEvent::JobInput {
+                    name: expected_name,
+                    bytes: expected_bytes,
+                },
+                OverlayEvent::JobInput { name, bytes },
+            ) => {
+                assert_eq!(name, expected_name);
+                assert_eq!(bytes, expected_bytes);
+            }
+            _ => panic!("Activity must leave attached terminal input unchanged"),
+        }
+        assert_eq!(activity.tab, ActivityTab::Processes);
+        assert!(
+            matches!(&*activity.panel, ActiveOverlay::Jobs(jobs) if jobs.attached() == Some("terminal"))
+        );
+    }
+}
+
+#[test]
+fn activity_retains_drilldowns_but_never_sibling_tabs() {
+    for tab in ActivityTab::ALL {
+        let panel = ActiveOverlay::Activity(Box::new(ActivityOverlay::new(
+            tab,
+            ActiveOverlay::Palette(PaletteOverlay::choice(queue_choices(&[]))),
+        )));
+        for action in ["open:process:\"job\"", "subagent-open:worker"] {
+            assert_eq!(
+                panel.retains_navigation(action),
+                tab == ActivityTab::Attention,
+                "{tab:?}: {action}"
+            );
+        }
+        for sibling in ActivityTab::ALL {
+            assert!(
+                !panel.retains_navigation(&format!("open:activity:{}", sibling.name())),
+                "{tab:?} -> {sibling:?}"
+            );
+        }
+    }
 }

@@ -70,6 +70,13 @@ impl SideSnapshot {
         self.pending_prompt.as_deref()
     }
 
+    /// Whether inference under this frozen configuration needs foreground compute admission.
+    /// A controller without an independently owned lease must refuse rather than borrowing a
+    /// main turn's lease: this snapshot and its request can outlive that turn.
+    pub fn requires_compute_lock(&self) -> bool {
+        self.config.requires_compute_lock()
+    }
+
     /// Builds a side request from this snapshot. `prior` holds earlier `(question, answer)`
     /// exchanges of the same side thread, replayed before the new question.
     pub fn request(&self, prior: &[(String, String)], question: &str) -> Result<SideRequest> {

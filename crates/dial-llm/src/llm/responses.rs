@@ -1220,6 +1220,7 @@ fn stream_body_inner(
         super::host_of(url).is_some_and(|h| super::is_local_host(&h)),
     );
     let routing_hint = format!("model={model}");
+    let version = super::chatgpt::client_version();
     ensure!(
         codex_account_id.is_none() || custom_headers.is_empty(),
         "ChatGPT subscription does not permit custom request headers"
@@ -1230,7 +1231,7 @@ fn stream_body_inner(
                 ("chatgpt-account-id", id),
                 ("OpenAI-Beta", "responses=experimental"),
                 ("originator", super::chatgpt::ORIGINATOR),
-                ("version", super::chatgpt::CLIENT_VERSION),
+                ("version", version.as_str()),
                 ("x-codex-routing-hint", routing_hint.as_str()),
             ]
         })
@@ -1495,6 +1496,7 @@ pub(super) fn compact(
     };
     let mut headers = Vec::new();
     let routing = format!("model={}", endpoint.model);
+    let version = super::chatgpt::client_version();
     if let Some(account) = endpoint.account_id {
         ensure!(
             endpoint.headers.is_empty(),
@@ -1504,7 +1506,7 @@ pub(super) fn compact(
             ("chatgpt-account-id", account),
             ("OpenAI-Beta", "responses=experimental"),
             ("originator", super::chatgpt::ORIGINATOR),
-            ("version", super::chatgpt::CLIENT_VERSION),
+            ("version", version.as_str()),
             ("x-codex-routing-hint", routing.as_str()),
         ]);
         if v2 {

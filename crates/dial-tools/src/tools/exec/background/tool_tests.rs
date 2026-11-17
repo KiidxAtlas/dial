@@ -23,6 +23,24 @@ fn run(tool: &Background, ws: &Workspace, args: Value) -> ToolOutput {
 }
 
 #[test]
+fn oversized_terminal_is_refused_before_start_or_resize() {
+    let (_dir, ws) = workspace();
+    let tool = owner();
+    let output = run(
+        &tool,
+        &ws,
+        json!({"action": "start", "name": "absent", "command": "exit 0", "pty": true,
+            "rows": 513, "cols": 513}),
+    );
+    assert!(output.is_error);
+    assert!(output.text.contains("terminal size"), "{}", output.text);
+    let error = match tool.table().resize("absent", 65535, 65535) {
+        Ok(_) => panic!("oversized resize must be refused"),
+        Err(error) => error,
+    };
+    assert!(error.contains("terminal size"), "{error}");
+}
+#[test]
 fn structured_success_and_failure_survive_wait_and_output_without_process_facts() {
     let (_dir, ws) = workspace();
     for failed in [false, true] {

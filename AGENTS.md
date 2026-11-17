@@ -7,9 +7,10 @@ is the authority for crate layers, module ownership and invariants; read it befo
 
 One Cargo workspace. The root package `dial` holds the binary, a facade library re-exporting every
 crate, and the integration tests (`tests/integration`). Crates under `crates/` are layered
-`dial-build-info` → `dial-core` → `dial-llm` → `dial-storage` → `dial-tools` → `dial-computer` →
-`dial-agent` → `dial-ui` → `dial-app`; a crate may depend only on lower layers. `dial-client`
-is the separate Rust client for `dial rpc` and depends on no other workspace crate.
+`dial-protocol` → `dial-build-info` → `dial-core` → `dial-llm` → `dial-storage` → `dial-tools` →
+`dial-computer` → `dial-agent` → `dial-ui` → `dial-app`; a crate may depend only on lower layers.
+`dial-client` is the separate Rust client for `dial rpc` and depends only on `dial-protocol`,
+not engine crates.
 `tests/integration/architecture.rs` enforces the layering and module rules.
 
 ## Repository rules and checks

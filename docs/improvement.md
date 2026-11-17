@@ -928,6 +928,9 @@ this artifact and exact strength. Model/adapter metadata changes invalidate the 
 fingerprint uses paths, file sizes/timestamps and selected config content, not a full hash of every
 weight byte. If using LoRA, pass the same `--adapter /absolute/path` to both maintenance commands;
 a base-model vector is bypassed when an adapter is loaded.
+Download IDs and resolved snapshot paths are compared through the runtime's canonical
+model/adapter fingerprint validation, not Rust display-label equality. This accepts aliases of the
+same admitted identity without accepting changed weights or missing/changed adapters.
 
 For a manually extracted vector, after evaluation open `/improve settings` → Activation steering
 to enable the manual vector and select

@@ -775,7 +775,14 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
         );
         o.set_roles(roles);
         for selected in [false, true] {
-            let line = o.model_line(&rig.theme, &model, &[], selected, 100, true);
+            let line = o.model_line(
+                &rig.theme,
+                &model,
+                &[],
+                selected,
+                100,
+                Columns::new(100, o.learning, true),
+            );
             let icons = line.spans.last().unwrap();
             assert_eq!(icons.content, capability_cell(&rig.theme, &model, 8));
             // On the selection fill every detail takes the body color.
@@ -820,7 +827,18 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
             rig.theme.sym(Sym::IconEmbedding)
         );
         for w in [28, 40, 60, 80, 100] {
-            assert!(o.model_line(&rig.theme, &model, &[], true, w, true).width() <= w);
+            assert!(
+                o.model_line(
+                    &rig.theme,
+                    &model,
+                    &[],
+                    true,
+                    w,
+                    Columns::new(w, o.learning, true)
+                )
+                .width()
+                    <= w
+            );
         }
     }
 }
@@ -863,7 +881,7 @@ fn rows_and_details_show_lora_compatibility_and_the_main_adapter() {
     let row = |name: &str| {
         shown
             .lines()
-            .find(|l| l.contains(name))
+            .find(|l| l.contains(name) && !l.contains("ACTIVE SESSION"))
             .unwrap_or_else(|| panic!("{name} missing:\n{shown}"))
             .to_owned()
     };
@@ -885,7 +903,7 @@ fn rows_and_details_show_lora_compatibility_and_the_main_adapter() {
     assert!(
         rejected
             .lines()
-            .find(|line| line.contains("mlx/qwen-mlx"))
+            .find(|line| line.contains("mlx/qwen-mlx") && !line.contains("ACTIVE SESSION"))
             .unwrap()
             .contains("unsupported")
     );
@@ -895,7 +913,7 @@ fn rows_and_details_show_lora_compatibility_and_the_main_adapter() {
     assert!(
         unchecked
             .lines()
-            .find(|line| line.contains("mlx/qwen-mlx"))
+            .find(|line| line.contains("mlx/qwen-mlx") && !line.contains("ACTIVE SESSION"))
             .unwrap()
             .contains("unverified")
     );
@@ -999,7 +1017,7 @@ fn left_column_shows_roles_all_models_and_providers_with_counts_and_state_glyphs
     let shown = draw(&mut o, &rig, 110, 30);
     for needle in [
         "MODELS",
-        "scope: global",
+        "Save to: All projects",
         "Roles",
         "All models",
         "LM Studio",
@@ -1086,7 +1104,7 @@ fn right_pane_orders_main_first_then_loaded_then_available_then_unavailable() {
     assert!(
         shown
             .lines()
-            .find(|l| l.contains("ollama/llama3"))
+            .find(|l| l.contains("ollama/llama3") && !l.contains("ACTIVE SESSION"))
             .unwrap()
             .contains('●'),
         "main model is marked"
@@ -1142,7 +1160,7 @@ fn typing_filters_fuzzily_and_highlights_matches() {
         "matched characters are emphasized: {plain:?} vs {matched:?}\n{}",
         screen(&buf)
     );
-    assert!(screen(&buf).contains(&format!("{} qw", rig.theme.sym(Sym::Prompt))));
+    assert!(screen(&buf).contains("Search: qw"));
     send(&mut o, &rig, key(KeyCode::Backspace));
     send(&mut o, &rig, key(KeyCode::Backspace));
     assert_eq!(names(&o).len(), 5);
@@ -1245,8 +1263,8 @@ fn enter_assigns_main_with_the_active_scope_and_ctrl_s_changes_it() {
         }
         other => panic!("{other:?}"),
     }
-    send(&mut o, &rig, ctrl('s'));
-    assert!(draw(&mut o, &rig, 120, 30).contains("scope: project"));
+    send(&mut o, &rig, ctrl('b'));
+    assert!(draw(&mut o, &rig, 120, 30).contains("Save to: This project"));
     match send(&mut o, &rig, key(KeyCode::Enter)) {
         OverlayEvent::AssignModel { scope, .. } => assert_eq!(scope, Scope::Project),
         other => panic!("{other:?}"),
@@ -1496,6 +1514,9 @@ fn empty_states_explain_themselves() {
     for _ in 0..6 {
         send(&mut o, &rig, key(KeyCode::Down));
     }
+    send(&mut o, &rig, key(KeyCode::Tab));
+    // Tab now visits the detail viewport between groups and the model list.
+    assert!(o.detail_focus);
     send(&mut o, &rig, key(KeyCode::Tab));
     assert_eq!(o.group, Group::Provider("ollama".into()));
     assert_eq!(o.kind, KindFilter::Embedding);
@@ -2166,12 +2187,15 @@ fn detail_lines_label_unknown_values_and_groups_skip_zero_counts() {
     let mut o = overlay();
     let shown = draw(&mut o, &rig, 120, 40);
     // Missing metadata stays visible rather than implying unsupported or zero.
-    let detail = shown
-        .lines()
-        .find(|l| l.contains("ollama/llama3") && l.contains("available") && !l.contains('›'))
-        .unwrap_or_else(|| panic!("{shown}"));
-    assert!(detail.contains("capabilities not reported"), "{detail}");
-    assert!(detail.contains("context unknown"), "{detail}");
+    // Responsive facts need not share a physical row with the selected model name.
+    for fact in [
+        "Selected: ollama/llama3",
+        "capabilities not reported",
+        "context unknown",
+        "max output unknown",
+    ] {
+        assert!(shown.contains(fact), "missing {fact}: {shown}");
+    }
     // Empty groups show no count rather than a column of zeros.
     let favorites = shown.lines().find(|l| l.contains("Favorites")).unwrap();
     assert!(!favorites.contains(" 0 "), "{favorites}");
@@ -2230,23 +2254,43 @@ fn images_group_lists_generators_and_enter_assigns_image_not_main() {
 }
 
 #[test]
-fn unserved_local_image_checkpoints_explain_how_to_serve_them() {
+fn mlx_quantized_image_packs_open_the_offer_of_their_original_weights() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    let mut image = image_entry();
+    image.selection.model = "/hub/models--Runpod--FLUX.2-klein-4B-mflux-4bit/snapshots/abc".into();
+    image.selection.base_url = None;
+    image.available = false;
+    image.source = "LM Studio download (MLX) · image checkpoint, not runnable: /hub/… is an MLX-quantized image pack (declares mflux quantization); stable-diffusion.cpp cannot read its packed weights".into();
+    d.models.push(image);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.group = Group::Images;
+    assert!(matches!(o.confirm(), OverlayEvent::None));
+    // Enter moves to Get models, which looks the original up (this view has no download source).
+    assert_eq!(o.group, Group::Download);
+    let shown = draw(&mut o, &rig, 220, 35);
+    assert!(shown.contains("Downloads are unavailable"), "{shown}");
+}
+
+#[test]
+fn unrunnable_local_image_checkpoints_explain_why() {
     let rig = Rig::new();
     let mut d = discovery();
     let mut image = image_entry();
     image.selection.base_url = None;
     image.available = false;
-    image.source = "LM Studio download (MLX) · image checkpoint, not served: import/serve in MLX-Serve, then F5 rescan".into();
+    image.source = "downloaded · image checkpoint, not runnable: /m holds several checkpoint files; select one file as the image model".into();
     d.models.push(image);
     let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
     o.group = Group::Images;
     assert!(matches!(o.confirm(), OverlayEvent::None));
+    assert_eq!(o.group, Group::Images);
     let shown = draw(&mut o, &rig, 220, 35);
-    assert!(shown.contains("serve it with MLX-Serve"), "{shown}");
     assert!(
-        !shown.contains("provider reports it as unavailable"),
+        shown.contains("Dial cannot run this image checkpoint"),
         "{shown}"
     );
+    assert!(shown.contains("several checkpoint files"), "{shown}");
 }
 
 #[test]
@@ -2320,7 +2364,7 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
     assert_eq!(carried, selected);
     assert_eq!(o.role_selection("main"), main.as_ref());
     let shown = draw(&mut o, &rig, 180, 30);
-    assert!(shown.contains("ACTIVE SESSION: OLLAMA/LLAMA3"), "{shown}");
+    assert!(shown.contains("ACTIVE SESSION: ollama/llama3"), "{shown}");
     assert!(shown.contains("Selected: lm-studio/qwen-warm"), "{shown}");
     assert!(
         o.footer(&rig.keys)
@@ -2424,8 +2468,8 @@ fn named_scope_and_role_connection_reasoning_details_stay_visible_without_secret
     );
     let shown = draw(&mut o, &rig, 220, 35);
     for expected in [
-        "scope: global",
-        "project (example-project)",
+        "Save to: All projects",
+        "Ctrl+B: This project (example-project)",
         "reasoning: high",
         "1 masked row(s)",
         "Composer reasoning is main-only",
@@ -2434,9 +2478,9 @@ fn named_scope_and_role_connection_reasoning_details_stay_visible_without_secret
         assert!(shown.contains(expected), "missing {expected}: {shown}");
     }
     assert!(!shown.contains("never-render-this"));
-    let event = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let event = Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
     assert!(matches!(send(&mut o, &rig, event), OverlayEvent::None));
-    assert!(draw(&mut o, &rig, 220, 35).contains("scope: project (example-project)"));
+    assert!(draw(&mut o, &rig, 220, 35).contains("Save to: This project (example-project)"));
     o.set_roles(roles_with_main());
     o.message = None;
     let shown = draw(&mut o, &rig, 220, 35);
@@ -2526,7 +2570,7 @@ fn model_list_columns_are_labelled_above_their_values() {
 }
 
 #[test]
-fn the_lora_column_appears_only_when_a_listed_model_has_something_to_show() {
+fn metadata_columns_disappear_when_they_do_not_help_compare_models() {
     let rig = Rig::new();
     let header = |models: Vec<ModelEntry>| {
         let mut o = ModelOverlay::new(
@@ -2545,7 +2589,14 @@ fn the_lora_column_appears_only_when_a_listed_model_has_something_to_show() {
         entry("ollama", "llama3.2", "Ollama", true, Some(32768)),
     ]);
     assert!(!hosted.contains("LoRA"), "{hosted}");
-    assert!(hosted.contains("state"), "{hosted}");
+    let columns = hosted
+        .lines()
+        .find(|line| line.contains("Type to search models"))
+        .unwrap();
+    assert!(
+        !columns.contains("state"),
+        "uniform availability stays in details: {hosted}"
+    );
     // A local MLX checkpoint reports its LoRA compatibility, so the column returns.
     let mut local = entry("mlx", "qwen-local", "Downloaded", true, Some(32768));
     local.selection.base_url = None;
@@ -2554,4 +2605,416 @@ fn the_lora_column_appears_only_when_a_listed_model_has_something_to_show() {
         entry("openai", "gpt-5-mini", "OpenAI", true, Some(32768)),
     ]);
     assert!(mixed.contains("LoRA"), "{mixed}");
+    let mut local = entry("mlx", "qwen-local", "Downloaded", true, Some(32768));
+    local.selection.base_url = None;
+    let sparse = header(vec![
+        entry("openai", "gpt-a", "OpenAI", true, None),
+        entry("openai", "gpt-b", "OpenAI", true, None),
+        entry("openai", "gpt-c", "OpenAI", true, None),
+        local,
+    ]);
+    let columns = sparse
+        .lines()
+        .find(|line| line.contains("Type to search models"))
+        .unwrap();
+    assert!(
+        !columns.contains("LoRA"),
+        "mostly empty adapter column: {sparse}"
+    );
+    assert!(
+        !columns.contains("state"),
+        "uniform availability is in selected details: {sparse}"
+    );
+}
+
+fn with_local_model() -> ModelOverlay {
+    let mut d = discovery();
+    d.models.push(ModelEntry {
+        selection: ModelSelection {
+            provider: "mlx".into(),
+            model: "/nowhere/models--org--local/snapshots/r".into(),
+            ..ModelSelection::default()
+        },
+        label: "org/local".into(),
+        source: "Hugging Face cache (MLX)".into(),
+        available: true,
+        metadata: Default::default(),
+    });
+    ModelOverlay::new(Some(d), roles_with_main(), Scope::Global)
+}
+
+fn pending(o: &mut ModelOverlay) {
+    o.deletion = Some(LocalRemoval {
+        label: "org/local".into(),
+        model: "/nowhere/models--org--local/snapshots/r".into(),
+        folder: PathBuf::from("/nowhere/models--org--local"),
+        bytes: 3 << 30,
+        source: "Hugging Face cache (MLX)".into(),
+    });
+}
+
+#[test]
+fn ctrl_d_is_offered_on_downloaded_local_models_in_the_model_lists() {
+    let rig = Rig::new();
+    let mut o = with_local_model();
+    o.type_text("org/local");
+    assert_eq!(names(&o), ["org/local"]);
+    assert!(
+        o.footer(&rig.keys)
+            .iter()
+            .any(|hint| hint == "Ctrl+D delete")
+    );
+    // The store check runs on Ctrl+D: a path discovery no longer lists is refused with a reason.
+    assert!(matches!(send(&mut o, &rig, ctrl('d')), OverlayEvent::None));
+    assert!(o.deletion.is_none());
+    let (message, ok) = o.message.clone().unwrap();
+    assert!(!ok && message.starts_with("Cannot delete:"), "{message}");
+
+    let mut remote = overlay();
+    remote.type_text("llama3");
+    assert!(
+        !remote
+            .footer(&rig.keys)
+            .iter()
+            .any(|hint| hint == "Ctrl+D delete")
+    );
+    send(&mut remote, &rig, ctrl('d'));
+    assert!(remote.deletion.is_none());
+}
+
+#[test]
+fn a_delete_shows_what_it_removes_and_needs_an_explicit_confirmation() {
+    let rig = Rig::new();
+    let mut o = with_local_model();
+    pending(&mut o);
+    let shown = draw(&mut o, &rig, 120, 30);
+    assert!(shown.contains("Delete local model: org/local"), "{shown}");
+    assert!(shown.contains("/nowhere/models--org--local"), "{shown}");
+    assert!(
+        shown.contains("3.0 GiB") || shown.contains("3 GiB"),
+        "{shown}"
+    );
+    assert!(shown.contains("cannot be undone"), "{shown}");
+    assert!(o.footer(&rig.keys)[0].contains("delete from disk"));
+    // Other keys leave the question open and are not typed into the search.
+    send(&mut o, &rig, key(KeyCode::Char('f')));
+    assert!(o.deletion.is_some() && o.search.is_empty());
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(o.deletion.is_none());
+    assert_eq!(
+        o.message.clone().unwrap().0,
+        "Kept org/local; nothing was deleted."
+    );
+
+    pending(&mut o);
+    send(&mut o, &rig, key(KeyCode::Char('n')));
+    assert!(o.deletion.is_none());
+
+    // Confirming re-checks the stores; a folder that is gone is reported, never claimed deleted.
+    pending(&mut o);
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(o.deletion.is_none());
+    let (message, ok) = o.message.clone().unwrap();
+    assert!(
+        !ok && message.starts_with("Did not delete org/local:"),
+        "{message}"
+    );
+}
+
+#[test]
+fn responsive_model_details_keep_consequences_capabilities_and_prices_reachable() {
+    let rig = Rig::new();
+    for (w, h) in [(48, 18), (100, 24)] {
+        let mut d = discovery();
+        d.models[0] = priced(d.models[0].clone(), 3e-6, 15e-6);
+        d.models[0].metadata.tools = Some(false);
+        let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+        let main = o.role_selection("main").cloned();
+        let mut seen = String::new();
+        for _ in 0..80 {
+            let shown = draw(&mut o, &rig, w, h);
+            seen.push_str(
+                &shown
+                    .replace('│', " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            seen.push(' ');
+            assert!(matches!(
+                send(
+                    &mut o,
+                    &rig,
+                    Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+                ),
+                OverlayEvent::None
+            ));
+        }
+        for expected in [
+            "after review",
+            "other sessions unchanged",
+            "max output unknown",
+            "no tool calls",
+            "$15",
+            "no recorded requests",
+        ] {
+            assert!(seen.contains(expected), "missing {expected} at {w}x{h}");
+        }
+        assert_eq!(o.role_selection("main"), main.as_ref());
+        assert_eq!(o.cursor, 0, "detail scrolling must not change selection");
+    }
+}
+
+#[test]
+fn responsive_model_rows_reserve_space_for_meaningful_names() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.models[0].label = "qwen3.6-35b-a3b-instruct".into();
+    d.models[0].selection.model = d.models[0].label.clone();
+    let mut o = ModelOverlay::new(Some(d), vec![], Scope::Global);
+    for w in [64, 72, 96, 108] {
+        let row = o.model_line(
+            &rig.theme,
+            &o.discovery.as_ref().unwrap().models[0],
+            &[],
+            true,
+            w,
+            Columns::new(w, o.learning, true),
+        );
+        let shown: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(shown.contains("qwen3.6-35b-a3b"), "width {w}: {shown}");
+    }
+    assert!(draw(&mut o, &rig, 100, 24).contains("qwen3.6-35b-a3b"));
+}
+
+#[test]
+fn detail_focus_has_a_terminal_safe_key_and_never_navigates_or_assigns_models() {
+    for (w, h, conflict) in [(48, 18, false), (100, 24, true)] {
+        let mut rig = Rig::new();
+        if conflict {
+            rig.keys.rebind(Action::SubagentsHub, &["F12"]).unwrap();
+        } else {
+            rig.keys.rebind(Action::WorkTab, &[]).unwrap();
+        }
+        let mut d = discovery();
+        d.models[0] = priced(d.models[0].clone(), 3e-6, 15e-6);
+        let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+        draw(&mut o, &rig, w, h);
+        // Plain Tab is the terminal-safe route even when all function keys remain global.
+        send(&mut o, &rig, key(KeyCode::Tab));
+        if !o.narrow {
+            send(&mut o, &rig, key(KeyCode::Tab));
+        }
+        assert!(o.detail_focus);
+        send(&mut o, &rig, key(KeyCode::Tab));
+        assert!(!o.detail_focus);
+        if conflict {
+            send(&mut o, &rig, key(KeyCode::F(12)));
+            assert!(
+                !o.detail_focus,
+                "the claimed global chord must not focus details"
+            );
+        }
+        let toggle = if conflict {
+            shifted_function(12)
+        } else {
+            key(KeyCode::F(12))
+        };
+        send(&mut o, &rig, toggle);
+        send(&mut o, &rig, Event::Paste("not a model search".into()));
+        assert!(
+            o.search.is_empty(),
+            "detail focus must not accept list input"
+        );
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+            assert!(matches!(send(&mut o, &rig, key(code)), OverlayEvent::None));
+            assert_eq!(o.cursor, 0, "detail navigation must retain the model");
+        }
+        let shown = draw(&mut o, &rig, w, h);
+        assert!(
+            shown.contains("$15") && shown.contains("no recorded requests"),
+            "{shown}"
+        );
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        for code in [KeyCode::Up, KeyCode::PageUp, KeyCode::Home] {
+            send(&mut o, &rig, key(code));
+            assert_eq!(o.cursor, 0);
+        }
+        assert!(draw(&mut o, &rig, w, h).contains("Assign Conversation"));
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
+        send(&mut o, &rig, key(KeyCode::Down));
+        assert_eq!(o.cursor, 1, "Escape restores model-list navigation");
+        if conflict {
+            rig.keys.rebind(Action::SubagentsHub, &[]).unwrap();
+            rig.keys
+                .rebind(Action::WorkTab, &["F12", "Shift+F12"])
+                .unwrap();
+            assert!(detail_binding(&rig.keys).is_none());
+            send(&mut o, &rig, key(KeyCode::Tab));
+            if !o.narrow {
+                send(&mut o, &rig, key(KeyCode::Tab));
+            }
+            assert!(
+                o.detail_focus,
+                "Tab remains available when both direct shortcuts are claimed"
+            );
+            send(&mut o, &rig, key(KeyCode::End));
+            assert!(draw(&mut o, &rig, w, h).contains("no recorded requests"));
+            assert_eq!(o.cursor, 1);
+        }
+    }
+}
+
+#[test]
+fn mouse_selects_visible_models_without_assigning_and_ignores_help() {
+    let rig = Rig::new();
+    for width in [45, 100] {
+        let mut o = overlay();
+        let shown = draw(&mut o, &rig, width, 35);
+        let (x, y) = position(&shown, "qwen-chat");
+        assert!(matches!(o.click(x, y), OverlayEvent::None));
+        assert_eq!(o.highlighted().unwrap().selection.model, "qwen-chat");
+        o.handle(&key(KeyCode::F(1)), &rig.keys);
+        draw(&mut o, &rig, width, 35);
+        o.click(x, y);
+        assert_eq!(o.highlighted().unwrap().selection.model, "qwen-chat");
+    }
+}
+
+#[test]
+fn mouse_switches_groups_through_the_same_assignment_owner() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.target_role = Some("feedback".into());
+    let shown = draw(&mut o, &rig, 100, 35);
+    let (x, y) = position(&shown, "Favorites");
+    o.click(x, y);
+    assert_eq!(o.group, Group::Favorites);
+    assert_eq!(o.target_role.as_deref(), Some("feedback"));
+    let shown = draw(&mut o, &rig, 100, 35);
+    let (x, y) = position(&shown, "Roles");
+    o.click(x, y);
+    assert_eq!(o.group, Group::Roles);
+    assert!(o.target_role.is_none());
+}
+
+#[test]
+fn short_model_deletion_review_can_reach_irreversible_warning() {
+    let rig = Rig::new();
+    let mut o = with_local_model();
+    pending(&mut o);
+    o.deletion.as_mut().unwrap().folder = PathBuf::from(format!(
+        "/cache/{}/END_OF_FOLDER",
+        "long-folder/".repeat(12)
+    ));
+    let mut seen = String::new();
+    for _ in 0..40 {
+        seen.push_str(&draw(&mut o, &rig, 60, 10));
+        send(&mut o, &rig, key(KeyCode::Down));
+    }
+    let seen = seen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(seen.contains("END_OF_FOLDER"), "{seen}");
+    assert!(seen.contains("cannot be undone"), "{seen}");
+    send(&mut o, &rig, key(KeyCode::Esc));
+    assert!(o.deletion.is_none());
+}
+
+#[test]
+fn tiny_model_deletion_review_cannot_confirm_or_edit_hidden_search() {
+    let rig = Rig::new();
+    let mut o = with_local_model();
+    pending(&mut o);
+    draw(&mut o, &rig, 12, 3);
+    for event in [
+        key(KeyCode::Enter),
+        ch('y'),
+        Event::Paste("hidden search".into()),
+    ] {
+        assert!(matches!(send(&mut o, &rig, event), OverlayEvent::None));
+        assert!(o.deletion.is_some());
+        assert!(o.search.is_empty());
+    }
+    send(&mut o, &rig, ch('n'));
+    assert!(o.deletion.is_none());
+}
+
+#[test]
+fn a_failed_provider_names_its_reason_and_ids_keep_their_case() {
+    let rig = Rig::new();
+    let mut found = discovery();
+    found.providers[2].detail = "no key in OPENAI_API_KEY".into();
+    let mut o = ModelOverlay::new(Some(found), roles_with_main(), Scope::Global);
+    o.group = Group::Provider("openai".into());
+    let shown = draw(&mut o, &rig, 160, 30);
+    assert!(
+        shown.contains("auth-required: no key in OPENAI_API_KEY"),
+        "{shown}"
+    );
+    assert!(shown.contains("ACTIVE SESSION: ollama/llama3"), "{shown}");
+    // Only the focused pane carries a pointer.
+    let pointer = rig.theme.sym(Sym::Pointer);
+    assert_eq!(shown.matches(pointer).count(), 1, "{shown}");
+}
+
+#[test]
+fn capability_icons_keep_their_columns_from_row_to_row() {
+    let theme = Rig::new().theme;
+    let with = |vision, tools, reasoning| {
+        let mut model = entry("p", "m", "P", true, None);
+        model.metadata.vision = vision;
+        model.metadata.tools = tools;
+        model.metadata.reasoning = reasoning;
+        capability_cell(&theme, &model, 8)
+    };
+    let all = with(Some(true), Some(true), Some(true));
+    let tools_only = with(Some(false), Some(true), Some(false));
+    let unknown = with(None, Some(true), None);
+    assert_eq!(text::width(&all), 8);
+    assert_eq!(text::width(&tools_only), 8);
+    let tools = theme.sym(Sym::IconTools);
+    let column = |cell: &str| cell.find(tools).map(|at| text::width(&cell[..at]));
+    assert_eq!(column(&all), column(&tools_only), "{all:?} {tools_only:?}");
+    assert_eq!(column(&all), column(&unknown));
+    assert!(unknown.trim_end().ends_with('?'));
+}
+
+#[test]
+fn favorite_route_policy_joins_the_name_only_when_names_collide() {
+    let mut keyed = discovery().models[0].selection.clone();
+    keyed.api_key_env = Some("OLLAMA_KEY".into());
+    let mut o = overlay();
+    o.set_favorites(favorite_routes(vec![keyed.clone()]));
+    let labels: Vec<String> = o
+        .favorite_entries
+        .iter()
+        .map(|entry| entry.model.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["llama3".to_owned()]);
+    assert!(
+        o.favorite_entries[0]
+            .summary
+            .contains("key env(OLLAMA_KEY)")
+    );
+
+    let mut other = keyed.clone();
+    other.api_key_env = Some("OTHER_KEY".into());
+    o.set_favorites(favorite_routes(vec![keyed, other]));
+    assert!(
+        o.favorite_entries
+            .iter()
+            .all(|entry| entry.model.label.contains("key env(")),
+        "two favorites of one model stay distinguishable"
+    );
 }

@@ -14,7 +14,9 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   ordered by journal activity rather than creation time. Empty sessions are hidden unless pinned;
   **Tab** includes them, and the hidden count appears only when some are hidden. Titles take priority
   over IDs and model details; the selected conversation shows its latest prompt and answer, and in
-  wide terminals (100+ columns, 18+ rows) a preview pane shows its first and last turns. Search
+  wide terminals (100+ columns, 18+ rows) a preview pane shows its first and last turns instead.
+  Across projects the title reads **Resume · all projects**; on the current session Enter is labelled
+  **return to it**. Search
   matches words in any order across titles, prompt/answer previews, model and ID, with exact title
   matches first. The header reads `showing N of M` when the first page (200 per kind) does not hold
   every journal; **Ctrl-A** loads all of them, and a search that matches nothing in the loaded set
@@ -25,7 +27,9 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   current session is deleted with `/delete`); **Ctrl-G** toggles this project and all projects (all
   projects shows each session's project directory; resuming a session from another project is
   refused with a pointer to `/move`); **Home/End** and **PageUp/PageDown** navigate; **Enter**
-  resumes; **F1** shows the picker's key help. Picker navigation follows your keymap (`/hotkeys`).
+  resumes; **F1** shows the picker's key help. **Up/Down**, **PageUp/PageDown** and **Home/End**
+  scroll that help on short terminals; **Esc**, **Enter** or **F1** returns to the unchanged picker.
+  Picker navigation follows your keymap (`/hotkeys`).
   A session another Dial process has open is marked `[open elsewhere]`; choosing it creates
   an independent sibling fork and identifies the source, without taking over its writer or changing its bytes.
   `/resume <id-prefix>` opens a unique ID directly, including empty sessions; an ambiguous prefix
@@ -47,15 +51,23 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   same-size, same-inode rewrites with restored timestamps invalidate old message text. Appends
   are parsed incrementally, but verification still reads prior indexed bytes; its cost grows with
   history size. No search-latency improvement is asserted.
-  Results retain their text transcript summary and can be inspected with `/search results`: use
-  **Up/Down** to select a hit, **PageUp/PageDown** to read the full bounded matching message,
-  and **Enter** to open its conversation through normal safe resume. Each hit shows its session's
-  title, and **/** starts a filter over the listed hits. The preview identifies the
+  Results retain their text transcript summary and can be inspected with `/search results`.
+  The first window loads up to 50 ranked matches; the count says **loaded**, not a global total.
+  When more exist, **m** (or `/search more`) expands the window by 50 through the same background
+  worker; reopen `/search results` when ready. At 1,000 loaded matches, refine `/search <query>`
+  instead. Each expansion reruns the current index query, so newly recorded messages may change
+  the ranking. **/** filters only the loaded window, not the full history.
+  Use **Up/Down** to select a hit, **PageUp/PageDown** to read the full bounded matching message,
+  and **Enter** to open its conversation through normal safe resume. Session titles are resolved
+  in the search worker, never while opening or drawing the results panel. The preview identifies the
   immutable matching entry; inspecting it never rewinds or appends branch markers, including for
   matches on abandoned branches. **Esc** closes the panel without touching the composer; **F1** or
   **?** shows its keys.
   `/search open <id>` opens a conversation directly; `/search back` returns to the conversation
   where the search excursion started. Drafts stay bound to their conversations, not to search hits.
+  During a turn, opening a hit or returning with **b** queues conversation navigation until the
+  turn finishes, with a visible notice; loading more matches still runs in the background without
+  interrupting work.
   The first index query after upgrading rebuilds the advisory full-text cache to retain entry IDs.
 - `/draft` (also `/draft preview`, `/draft restore` or `/draft replace`) opens a read-only,
   scrollable review of this session's oldest saved unsent draft and queue beside current input.
@@ -120,6 +132,12 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   format or journal schema is newer than this Dial, and never overwrites an existing file. The transfer is
   recorded, so reopening the original path after the session moved away forks a sibling instead of
   reattaching to it.
+  Worker-only artifact references are included. Orphan side/stream/transcript destinations are
+  conflicts even when absent from the archive. If transfer-ledger publication may already have
+  happened, the installed destination is retained and the error reports uncertainty; inspect it
+  before retrying. Only definitely unpublished failures roll installation back.
+  Import also recomputes direct and transitive evidence dependencies from the staged journal,
+  stream and worker transcripts; omitted blobs are refused even if already cached locally.
 - `dial sessions export`, `pack` and `unpack` resolve relative paths, and the default
   `session-<id>.md`/`.html`/`.dialpack` file name, in the current directory (or `-C <dir>`), not the project root.
   `dial sessions` hides sessions with no messages (left by launches that never sent a prompt) and says how

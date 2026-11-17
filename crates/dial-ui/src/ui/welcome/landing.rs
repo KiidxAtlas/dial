@@ -28,6 +28,15 @@ pub fn content_width(width: u16) -> u16 {
         .min(56)
 }
 
+/// The measure of the launch screen's command menu: wider than the input, so a command's
+/// description reads whole, yet still a column rather than the full terminal width.
+pub fn menu_width(width: u16) -> u16 {
+    width
+        .saturating_sub(if width >= 24 { 4 } else { 0 })
+        .min(100)
+        .max(content_width(width))
+}
+
 fn centered(spans: Vec<Span<'static>>, width: usize, theme: &Theme) -> Line<'static> {
     let spans = truncate_spans(spans, width, theme.sym(Sym::Ellipsis));
     let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
@@ -146,6 +155,8 @@ fn hero(info: &WelcomeInfo, width: usize, budget: usize, theme: &Theme, view: &V
 
 /// Assemble the actual launch viewport, including input cursor translation. Callers render the
 /// composer at [`content_width`] first. Auxiliary work rows keep their full terminal width.
+/// The first `view.wide_lead` composer rows (a command menu drawn at [`menu_width`]) are centered
+/// at that wider measure, so command descriptions are not cut to the narrow input.
 pub fn frame(
     info: &WelcomeInfo,
     width: u16,
@@ -175,16 +186,8 @@ pub fn frame(
             theme.fg(Tok::Warning),
         )]);
     }
-    if info.approval == "auto" || info.sandbox.eq_ignore_ascii_case("off") {
-        notices.push(vec![Span::styled(
-            format!(
-                "approval {} · sandbox {}",
-                text::one_line(crate::ui::status::approval_label(&info.approval)),
-                text::one_line(&info.sandbox)
-            )
-            .replace('·', if theme.ascii() { ":" } else { "·" }),
-            theme.fg(Tok::Warning),
-        )]);
+    if let Some(warning) = safety_notice(&info.approval, &info.sandbox) {
+        notices.push(vec![Span::styled(warning, theme.fg(Tok::Warning))]);
     }
     let place = place(info, theme, inner);
     // Warnings keep room for their card's two edges, so a tall window never trades them away.
@@ -209,7 +212,16 @@ pub fn frame(
         rows.len() as u16 + composer.cursor.0,
         inset as u16 + composer.cursor.1,
     );
-    rows.extend(composer.rows.into_iter().map(&indent));
+    let wide_inset = (width - menu_width(width as u16) as usize) / 2;
+    for (i, line) in composer.rows.into_iter().enumerate() {
+        if i < view.wide_lead {
+            let mut line = line;
+            line.spans.insert(0, Span::raw(" ".repeat(wide_inset)));
+            rows.push(line);
+        } else {
+            rows.push(indent(line));
+        }
+    }
 
     let budget = height.saturating_sub(rows.len() + auxiliary.len());
     let mut context = Vec::new();
@@ -254,29 +266,45 @@ pub fn frame(
     let wants_list = view.selected.is_some() || (!info.recent.is_empty() && limit >= 4) || starters;
     if view.selected.is_none() && limit > 0 {
         let browse = if items(info) > 0 && !wants_list {
-            if theme.ascii() {
-                "  Down browse"
+            let what = if info.recent.is_empty() {
+                "suggestions"
             } else {
-                "  ↓ browse"
-            }
+                "recent"
+            };
+            format!("  {} {what}", if theme.ascii() { "Down" } else { "↓" })
         } else {
-            ""
+            String::new()
         };
-        // How Dial will act on the first request, and the key that changes it, before it is sent.
-        let mode = if info.approval.is_empty() || info.approval_key.is_empty() {
+        let send = if info.submit_key.is_empty() {
             String::new()
         } else {
-            format!(
-                "  {} mode: {}",
-                text::one_line(&info.approval_key),
-                crate::ui::status::approval_label(&info.approval)
-            )
+            format!("{} send  ", text::one_line(&info.submit_key))
         };
-        let full = format!("Enter send  / commands{browse}{mode}");
-        let hint = if text::width(&full) <= inner {
-            full
+        let base = format!("{send}/ commands{browse}");
+        // How Dial will act on the first request, and the key that changes it, before it is sent.
+        // The mode name is padded to the longest one, so cycling never shifts the centered row.
+        let hint = if info.approval.is_empty() || info.approval_key.is_empty() {
+            base
         } else {
-            format!("Enter send  / commands{browse}")
+            let key = text::one_line(&info.approval_key);
+            let label = crate::ui::status::approval_label(&info.approval);
+            let longest = ["ask", "write", "auto", "readonly"]
+                .into_iter()
+                .map(|mode| text::width(crate::ui::status::approval_label(mode)))
+                .max()
+                .unwrap_or(0);
+            let label = format!(
+                "{label}{}",
+                " ".repeat(longest.saturating_sub(text::width(label)))
+            );
+            [
+                format!("{base}  {key} mode: {label}"),
+                format!("{base}  {key} {label}"),
+                base.clone(),
+            ]
+            .into_iter()
+            .find(|hint| text::width(hint.trim_end()) <= inner)
+            .unwrap_or(base)
         };
         context.push(centered(
             vec![Span::styled(hint, theme.fg(Tok::Dim))],
@@ -321,12 +349,36 @@ pub fn frame(
     }
     let left = budget.saturating_sub(context.len());
     if info.tour && view.selected.is_none() && left >= 4 {
-        let hints = [
-            ("1", "Type a request in your own words"),
-            ("2", "Enter sends · F1 opens actions"),
-            ("3", "/models picks a model · Esc dismisses"),
+        let actions = [
+            (&info.submit_key, "sends"),
+            (&info.actions_key, "opens actions"),
         ]
-        .map(|(n, hint)| (n, hint.replace('·', theme.sym(Sym::Dot))));
+        .into_iter()
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, label)| format!("{} {label}", text::one_line(key)))
+        .collect::<Vec<_>>()
+        .join(&format!(" {} ", theme.sym(Sym::Dot)));
+        let dismiss = if info.dismiss_key.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} {} dismisses",
+                theme.sym(Sym::Dot),
+                text::one_line(&info.dismiss_key)
+            )
+        };
+        let hints = [
+            ("1", "Type a request in your own words".to_owned()),
+            (
+                "2",
+                if actions.is_empty() {
+                    "/ opens commands".into()
+                } else {
+                    actions
+                },
+            ),
+            ("3", format!("/models picks a model{dismiss}")),
+        ];
         let steps: Vec<Vec<Span<'static>>> = hints
             .iter()
             .map(|(n, hint)| {
@@ -378,6 +430,23 @@ pub fn frame(
     // than merely centered inside a short block at the top of the terminal.
     rows.resize(rows.len().max(height), Line::default());
     ComposerView { rows, cursor }
+}
+
+/// The one-line safety warning the landing shows, or `None` when the mode itself keeps the user
+/// in control. Without a sandbox only the modes that run commands unasked are worth a warning:
+/// Ask first and Read-only never run a command the user did not approve.
+pub(super) fn safety_notice(approval: &str, sandbox: &str) -> Option<String> {
+    let unsandboxed = sandbox.trim().eq_ignore_ascii_case("off");
+    match (approval, unsandboxed) {
+        ("auto", true) => {
+            Some("Full auto, no sandbox: tools run unasked and unisolated".to_owned())
+        }
+        ("auto", false) => Some("Full auto: tools run without asking".to_owned()),
+        ("write", true) => {
+            Some("No sandbox: commands that run unasked are not isolated".to_owned())
+        }
+        _ => None,
+    }
 }
 
 /// What will answer and where it will work: the model, then the current directory and branch.

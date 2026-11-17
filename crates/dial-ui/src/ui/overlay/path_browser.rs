@@ -1,12 +1,15 @@
 //! A keyboard file browser for path-valued settings. It lists one directory at a time (folders
-//! first), filters as you type, and returns the chosen absolute path. Typing a path that contains
-//! `/` (or starts with `~`) and pressing Enter jumps to it, so a known path never needs browsing.
+//! first), filters as you type, and returns the chosen absolute path. Enter checks a typed path
+//! asynchronously: folders open when ready, and a second Enter chooses a checked file.
 //! Reading is bounded and read-only; the caller decides what to save.
 use crate::config::schema::PathKind;
 use crate::ui::editor::Editor;
 use crate::ui::keys::{Action, Keymap};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::{Path, PathBuf};
+
+mod loader;
+use loader::{Loader, Reply, Request};
 
 /// Directory entries read at most; a larger folder is listed partially with a note.
 const MAX_ENTRIES: usize = 2000;
@@ -57,41 +60,40 @@ pub struct PathBrowser {
     filter: Editor,
     note: Option<String>,
     home: Option<PathBuf>,
+    listing_note: Option<String>,
+    loader: Option<Loader>,
+    loading: bool,
+    validating: bool,
+    validated: Option<PathBuf>,
 }
 
 impl PathBrowser {
     /// Open beside `current` (a saved value, possibly empty or relative to `base`), else in `base`.
     pub fn open(kind: PathKind, current: &str, base: &Path) -> Self {
-        let home = crate::config::paths::home_dir();
-        let mut browser = PathBrowser {
+        let loader = Loader::new(kind);
+        let (loader, note) = match loader {
+            Ok(loader) => (Some(loader), None),
+            Err(error) => (None, Some(error)),
+        };
+        let browser = PathBrowser {
             kind,
             dir: base.to_path_buf(),
             entries: Vec::new(),
             cursor: 0,
             filter: Editor::default(),
             note: None,
-            home,
+            home: crate::config::paths::home_dir(),
+            listing_note: note,
+            loading: loader.is_some(),
+            loader,
+            validating: false,
+            validated: None,
         };
-        let start = browser.resolve(current.trim(), base);
-        let dir = match start {
-            Some(path) if path.is_dir() => path,
-            Some(path) => path
-                .parent()
-                .filter(|parent| parent.is_dir())
-                .map_or_else(|| base.to_path_buf(), Path::to_path_buf),
-            None => base.to_path_buf(),
-        };
-        browser.enter(dir);
-        // Land on the saved file itself when it is listed.
-        if let Some(name) = Path::new(current.trim())
-            .file_name()
-            .and_then(|n| n.to_str())
-            && let Some(at) = browser
-                .rows()
-                .iter()
-                .position(|row| matches!(row, Row::Entry(i) if browser.entries[*i].name == name))
-        {
-            browser.cursor = at;
+        if let Some(loader) = &browser.loader {
+            loader.request(Request::Open {
+                path: browser.resolve(current.trim(), base),
+                base: base.to_path_buf(),
+            });
         }
         browser
     }
@@ -107,52 +109,93 @@ impl PathBrowser {
         }
         let path = if typed == "~" {
             self.home.clone()?
-        } else if let Some(rest) = typed.strip_prefix("~/") {
+        } else if let Some(rest) = typed
+            .strip_prefix("~/")
+            .or_else(|| cfg!(windows).then(|| typed.strip_prefix("~\\")).flatten())
+        {
             self.home.as_ref()?.join(rest)
         } else {
             base.join(typed)
         };
-        Some(normalize(&path))
+        Some(path)
     }
 
     fn enter(&mut self, dir: PathBuf) {
-        self.dir = normalize(&dir);
+        if self.loader.is_none() {
+            return;
+        }
+        self.dir = dir.clone();
         self.cursor = 0;
         self.filter.set("");
         self.note = None;
+        self.listing_note = None;
         self.entries.clear();
-        match std::fs::read_dir(&self.dir) {
-            Ok(read) => {
-                for entry in read.filter_map(Result::ok).take(MAX_ENTRIES + 1) {
-                    if self.entries.len() == MAX_ENTRIES {
-                        self.note = Some(format!(
-                            "Showing the first {MAX_ENTRIES} entries; type to filter or type a path"
-                        ));
-                        break;
-                    }
-                    let Ok(name) = entry.file_name().into_string() else {
-                        continue;
-                    };
-                    // Follow symlinks so a linked folder can be opened.
-                    let meta = std::fs::metadata(entry.path()).ok();
-                    let dir = meta.as_ref().is_some_and(std::fs::Metadata::is_dir);
-                    if self.kind == PathKind::Directory && !dir {
-                        continue;
-                    }
-                    self.entries.push(Entry {
-                        name,
-                        dir,
-                        executable: !dir && meta.as_ref().is_some_and(is_executable),
-                    });
+        self.validated = None;
+        self.validating = false;
+        self.loading = self.loader.is_some();
+        if let Some(loader) = &self.loader {
+            loader.request(Request::List { dir, select: None });
+        }
+    }
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Collect only ready results; this never waits for filesystem work.
+    pub fn poll(&mut self) {
+        let Some(reply) = self.loader.as_ref().and_then(Loader::collect) else {
+            return;
+        };
+        let was_validating = self.validating;
+        self.loading = false;
+        self.validating = false;
+        match reply {
+            Reply::Listing {
+                dir,
+                entries,
+                note,
+                select,
+            } => {
+                // A typed directory was validated; discard its old path/filter now, not sooner.
+                if was_validating {
+                    self.filter.set("");
+                }
+                self.dir = dir;
+                self.entries = entries;
+                self.listing_note = note;
+                self.note = None;
+                if let Some(name) = select {
+                    self.select_name(&name);
                 }
             }
-            Err(error) => self.note = Some(format!("Cannot read this folder: {error}")),
+            Reply::Validated(path) => {
+                self.validated = Some(path);
+                self.note = Some("Path checked; Enter chooses it".to_owned());
+            }
+            Reply::Error(error) => self.note = Some(error),
         }
-        self.entries.sort_by(|a, b| {
-            b.dir
-                .cmp(&a.dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+    }
+
+    fn select_name(&mut self, name: &str) {
+        if let Some(at) = self
+            .rows()
+            .iter()
+            .position(|row| matches!(row, Row::Entry(i) if self.entries[*i].name == name))
+        {
+            self.cursor = at;
+        }
+    }
+
+    fn edited(&mut self) {
+        self.validated = None;
+        if self.validating {
+            if let Some(loader) = &self.loader {
+                loader.cancel();
+            }
+            self.validating = false;
+            self.loading = false;
+        }
+        self.note = None;
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -214,6 +257,7 @@ impl PathBrowser {
     }
 
     pub fn key(&mut self, key: &KeyEvent, keys: &Keymap) -> BrowseStep {
+        self.poll();
         let rows = self.rows();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         let filter_empty = self.filter.text.is_empty();
@@ -225,12 +269,15 @@ impl PathBrowser {
                 return BrowseStep::Cancel;
             }
             self.filter.set("");
-            self.note = None;
+            self.edited();
             return BrowseStep::Stay;
         }
         if keys.matches(Action::SelectConfirm, key) {
             if is_typed_path(self.filter.text.trim()) {
                 return self.go_typed();
+            }
+            if self.loading {
+                return BrowseStep::Stay;
             }
             return match rows.get(self.cursor) {
                 Some(Row::Here) => BrowseStep::Chosen(self.dir.clone()),
@@ -297,7 +344,7 @@ impl PathBrowser {
         let before = self.filter.text.clone();
         if self.filter.key_with(*key, keys) && self.filter.text != before {
             self.cursor = 0;
-            self.note = None;
+            self.edited();
         }
         BrowseStep::Stay
     }
@@ -306,6 +353,7 @@ impl PathBrowser {
     pub fn paste(&mut self, text: &str) {
         self.filter.insert(text);
         self.cursor = 0;
+        self.edited();
     }
 
     fn up(&mut self) {
@@ -313,35 +361,33 @@ impl PathBrowser {
         if let Some(parent) = from.parent() {
             self.enter(parent.to_path_buf());
             if let Some(name) = from.file_name().and_then(|n| n.to_str())
-                && let Some(at) = self
-                    .rows()
-                    .iter()
-                    .position(|row| matches!(row, Row::Entry(i) if self.entries[*i].name == name))
+                && let Some(loader) = &self.loader
             {
-                self.cursor = at;
+                loader.request(Request::List {
+                    dir: parent.to_path_buf(),
+                    select: Some(name.to_owned()),
+                });
             }
         }
     }
 
     fn go_typed(&mut self) -> BrowseStep {
-        let typed = self.filter.text.trim().to_owned();
-        let base = self.dir.clone();
-        let Some(path) = self.resolve(&typed, &base) else {
+        if let Some(path) = self.validated.take() {
+            return BrowseStep::Chosen(path);
+        }
+        if self.validating {
+            return BrowseStep::Stay;
+        }
+        let Some(path) = self.resolve(self.filter.text.trim(), &self.dir) else {
             return BrowseStep::Stay;
         };
-        if path.is_dir() {
-            self.enter(path);
-            BrowseStep::Stay
-        } else if path.exists() && self.kind != PathKind::Directory {
-            BrowseStep::Chosen(path)
-        } else {
-            self.note = Some(if path.exists() {
-                format!("{} is not a folder", self.display(&path))
-            } else {
-                format!("{} does not exist", self.display(&path))
-            });
-            BrowseStep::Stay
+        if let Some(loader) = &self.loader {
+            loader.request(Request::Validate(path));
+            self.loading = true;
+            self.validating = true;
+            self.note = None;
         }
+        BrowseStep::Stay
     }
 
     /// The visible window of at most `height` rows around the cursor.
@@ -364,31 +410,36 @@ impl PathBrowser {
                 .take(height)
                 .map(|(n, row)| (self.label(row), n == cursor))
                 .collect(),
-            note: self.note.clone().or_else(|| {
-                is_typed_path(self.filter.text.trim())
-                    .then(|| "Enter opens the typed path".to_owned())
-            }),
+            note: {
+                let status = if self.loading {
+                    Some(
+                        if self.validating {
+                            "Checking typed path…"
+                        } else {
+                            "Loading folder…"
+                        }
+                        .to_owned(),
+                    )
+                } else {
+                    self.note.clone().or_else(|| {
+                        is_typed_path(self.filter.text.trim())
+                            .then(|| "Enter checks/opens the typed path".to_owned())
+                    })
+                };
+                match (&self.listing_note, status) {
+                    (Some(listing), Some(status)) => Some(format!("{listing} · {status}")),
+                    (Some(listing), None) => Some(listing.clone()),
+                    (None, status) => status,
+                }
+            },
         }
     }
 }
 
 fn is_typed_path(filter: &str) -> bool {
-    filter.contains('/') || filter.starts_with('~')
-}
-
-/// Remove `.` and `..` components without touching the filesystem (symlinks stay as typed).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    filter.contains('/')
+        || filter.starts_with('~')
+        || (cfg!(windows) && (filter.contains('\\') || filter.as_bytes().get(1) == Some(&b':')))
 }
 
 #[cfg(unix)]

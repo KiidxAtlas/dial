@@ -70,3 +70,58 @@ fn long_reports_scroll_by_wrapped_row_with_an_indicator_and_themed_tabs() {
     assert!(last.contains("line 39"));
     assert!(!last.contains("line 0 "));
 }
+
+#[test]
+fn report_cache_reuses_layout_and_tracks_tab_query_and_width() {
+    let mut panel = StatsOverlay::new(vec![
+        ("Usage", "中文 👩‍💻 cafe\u{301}\nOther entry\n".into()),
+        ("Tools", "read 2".into()),
+    ]);
+    let initial = panel.report(8).to_vec();
+    let allocation = panel.report(8).as_ptr();
+    panel.scroll = 1;
+    assert_eq!(
+        panel.report(8).as_ptr(),
+        allocation,
+        "scrolling reuses layout"
+    );
+    assert_eq!(panel.report(8), initial);
+    panel.query = "OTHER".into();
+    assert_eq!(panel.report(80), ["Other entry"]);
+    panel.query.clear();
+    assert_eq!(panel.report(80), ["中文 👩‍💻 cafe\u{301}", "Other entry"]);
+    assert!(panel.report(3).iter().all(|line| text::width(line) <= 3));
+    panel.active = 1;
+    assert_eq!(panel.report(80), ["read 2"]);
+    panel.query = "missing".into();
+    assert!(panel.report(80).is_empty());
+    let mut empty = StatsOverlay::new(Vec::new());
+    assert!(empty.report(1).is_empty());
+}
+
+#[test]
+fn mouse_tabs_reuse_report_navigation_and_ignore_help_and_borders() {
+    let rig = Rig::new();
+    let mut panel = StatsOverlay::new(vec![("Usage", "first".into()), ("Tools", "read 2".into())]);
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let buffer = render(80, 20, |f| panel.draw(f, &ctx));
+    let text = screen(&buffer);
+    let (x, y) = super::super::settings::testkit::position(&text, "Tools");
+    let (usage_x, usage_y) = super::super::settings::testkit::position(&text, "Usage");
+    panel.scroll = 10;
+    panel.searching = true;
+    panel.click(x, y);
+    assert_eq!((panel.active, panel.scroll, panel.searching), (1, 0, false));
+    assert!(screen(&render(80, 20, |f| panel.draw(f, &ctx))).contains("read 2"));
+    panel.click(0, 0);
+    assert_eq!(panel.active, 1);
+    panel.handle(&key(KeyCode::Char('?')), &rig.keys);
+    render(80, 20, |f| panel.draw(f, &ctx));
+    panel.click(usage_x, usage_y);
+    assert_eq!(panel.active, 1);
+}

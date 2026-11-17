@@ -63,6 +63,23 @@ pub(super) fn resolve(config: &Config) -> Result<Option<Target>> {
 /// Resolve a concrete candidate without reapplying the image role.
 pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
     let selection = config.selection();
+    // A downloaded checkpoint (a path, no endpoint) runs on a Dial-launched sd-server per call.
+    if selection.provider == "mlx"
+        && selection.base_url.is_none()
+        && llm::server::image::is_checkpoint_path(Path::new(&selection.model))
+    {
+        llm::server::image::components(Path::new(&selection.model))?;
+        return Ok(Some(Target {
+            // Replaced by the launched server's address before any request.
+            base_url: "http://127.0.0.1".into(),
+            model: selection.model,
+            wire: Wire::SdCpp,
+            key: String::new(),
+            account_id: None,
+            headers: Vec::new(),
+            settings: Default::default(),
+        }));
+    }
     if !super::provider_enabled(config, &selection.provider) {
         ensure!(
             config.role_selection("image").is_none(),

@@ -8,6 +8,7 @@ fn linux_policy_rejects_root_missing_and_secret_overlaps() {
         deny_read: Vec::new(),
         allow_network: false,
         extra_write: vec![],
+        serial_ports: false,
     };
     assert!(Mounts::new(Path::new("/"), &strict).is_err());
     assert!(Mounts::new(&ws.join("missing"), &strict).is_err());
@@ -16,6 +17,7 @@ fn linux_policy_rejects_root_missing_and_secret_overlaps() {
             deny_read: vec![denied.to_owned()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         };
         assert!(Mounts::new(&ws, &policy).is_err(), "{denied:?}");
     }
@@ -23,6 +25,7 @@ fn linux_policy_rejects_root_missing_and_secret_overlaps() {
         deny_read: vec![],
         extra_write: vec![PathBuf::from("/usr")],
         allow_network: false,
+        serial_ports: false,
     };
     assert!(Mounts::new(&ws, &policy).is_err());
 }
@@ -40,11 +43,13 @@ fn both_policies_mask_nested_private_trees_and_files() {
             deny_read: vec![private.clone(), secret.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![private.clone(), secret.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let mut mounts = Mounts::new(&ws, &policy).unwrap();
@@ -71,11 +76,13 @@ fn outer_private_mask_covers_absent_nested_state_before_metadata_checks() {
             deny_read: vec![absent.clone(), private.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![absent.clone(), private.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let mounts = Mounts::new(&ws, &policy).unwrap();
@@ -93,6 +100,7 @@ fn absent_top_level_credentials_fail_closed_without_creating_host_paths() {
         deny_read: vec![absent.clone()],
         extra_write: vec![],
         allow_network: false,
+        serial_ports: false,
     };
     let error = Mounts::new(&ws, &policy)
         .err()
@@ -150,6 +158,7 @@ fn strict_extra_write_roots_become_writable_mounts() {
         deny_read: Vec::new(),
         allow_network: false,
         extra_write: vec![extra.clone()],
+        serial_ports: false,
     };
     let mounts = Mounts::new(&ws, &policy).unwrap();
     assert!(mounts.write.contains(&ws.canonicalize().unwrap()));
@@ -166,11 +175,13 @@ fn git_metadata_in_writable_roots_is_rebound_read_only() {
             deny_read: Vec::new(),
             allow_network: false,
             extra_write: Vec::new(),
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: Vec::new(),
             extra_write: Vec::new(),
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let mounts = Mounts::new(&ws, &policy).unwrap();
@@ -180,6 +191,7 @@ fn git_metadata_in_writable_roots_is_rebound_read_only() {
         deny_read: Vec::new(),
         extra_write: vec![ws.join(".git")],
         allow_network: false,
+        serial_ports: false,
     };
     assert!(Mounts::new(&ws, &opted_out).unwrap().read_only.is_empty());
 }

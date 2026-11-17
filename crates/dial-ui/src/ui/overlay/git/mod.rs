@@ -17,6 +17,7 @@ use crate::{
     git_panel::{AiSummary, Generated, Repo, Watch},
     ui::{
         chrome::{self, Section},
+        editor::Editor,
         keys::{Action, Keymap},
         text,
         theme::{Theme, Tok},
@@ -69,6 +70,8 @@ impl GitTab {
 
 pub struct GitOverlay {
     repo: Repo,
+    repo_job: Option<crate::git_panel::JobNotice>,
+    show_repo_outcome: bool,
     commit: Option<Commit>,
     log_open: bool,
     recent: Result<Vec<(String, String)>, String>,
@@ -95,7 +98,10 @@ pub struct GitOverlay {
     view: View,
     whitespace: view::Whitespace,
     wrap: bool,
-    message: String,
+    message: Editor,
+    mutation: Option<Receiver<Result<(String, bool), String>>>,
+    commit_draft: Option<String>,
+    discard_patch: Option<String>,
     amend: bool,
     editing: bool,
     /// A discard waiting for a second press of `delete`.
@@ -117,7 +123,7 @@ pub struct GitOverlay {
     /// Result of a running AI staging pass, until it is applied.
     ai_job: Option<Receiver<Result<AiSummary, String>>>,
     /// The instruction typed for AI staging (`A`); `None` when the prompt is closed.
-    ai_prompt: Option<String>,
+    ai_prompt: Option<Editor>,
     /// At most one status and one diff read are active; newer requests replace pending work.
     reads: load::Reads,
     revision: Option<String>,
@@ -126,6 +132,8 @@ pub struct GitOverlay {
 
 impl GitOverlay {
     pub fn select_tab(&mut self, tab: GitTab) {
+        self.confirm = None;
+        self.discard_patch = None;
         self.log_open = tab == GitTab::Log;
         self.editing = tab == GitTab::Commit && self.revision.is_none();
         self.focus = if tab == GitTab::Diff {
@@ -152,6 +160,8 @@ impl GitOverlay {
     pub fn open(repo: Repo, revision: Option<&str>) -> Result<Self, String> {
         let mut overlay = Self {
             repo,
+            repo_job: None,
+            show_repo_outcome: false,
             commit: None,
             log_open: false,
             recent: Ok(Vec::new()),
@@ -174,7 +184,10 @@ impl GitOverlay {
             view: View::Inline,
             whitespace: view::Whitespace::Off,
             wrap: false,
-            message: String::new(),
+            message: Editor::default(),
+            mutation: None,
+            commit_draft: None,
+            discard_patch: None,
             amend: false,
             editing: false,
             confirm: None,
@@ -281,6 +294,11 @@ impl GitOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if matches!(event, Event::Paste(_) | Event::Mouse(_))
+            || matches!(event, Event::Key(key) if pressed(key))
+        {
+            self.show_repo_outcome = false;
+        }
         if self.loading || (self.revision.is_some() && self.commit.is_none()) {
             return match event {
                 Event::Key(key) if pressed(key) && keys.matches(Action::SelectCancel, key) => {
@@ -291,8 +309,14 @@ impl GitOverlay {
         }
         match event {
             Event::Paste(value) if self.editing => {
-                self.message
-                    .push_str(&value.replace("\r\n", "\n").replace('\r', "\n"));
+                self.message.insert(value);
+                OverlayEvent::None
+            }
+            Event::Paste(value) if self.ai_prompt.is_some() => {
+                self.ai_prompt
+                    .as_mut()
+                    .unwrap()
+                    .insert(&text::one_line(value));
                 OverlayEvent::None
             }
             // Auto-repeat from a held key must never act on a destructive shortcut: the first
@@ -307,6 +331,8 @@ impl GitOverlay {
             }
             Event::Key(key) if pressed(key) => self.key(key, keys),
             Event::Mouse(mouse) if !self.help => {
+                self.confirm = None;
+                self.discard_patch = None;
                 self.mouse(*mouse);
                 OverlayEvent::None
             }
@@ -394,7 +420,9 @@ impl GitOverlay {
             }
             return OverlayEvent::None;
         }
-        if self.ai_prompt.is_none() {
+        if self.ai_prompt.is_none()
+            && (!self.editing || matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
+        {
             let previous = super::panel_keys::matches(keys, Action::TabPrev, key);
             if previous || super::panel_keys::matches(keys, Action::TabNext, key) {
                 let tab = if self.revision.is_some() {
@@ -449,6 +477,9 @@ impl GitOverlay {
             }
             return OverlayEvent::None;
         }
+        if plain_char(key) != Some('x') {
+            self.discard_patch = None;
+        }
         let pending = self.confirm.take();
         if key.code == KeyCode::Delete {
             self.discard_request(pending);
@@ -463,6 +494,37 @@ impl GitOverlay {
         }
         if keys.matches(Action::SelectCancel, key) || ch == Some('q') {
             return OverlayEvent::Close;
+        }
+        let direction = if keys.matches(Action::SelectUp, key) {
+            Some((-1, false))
+        } else if keys.matches(Action::SelectDown, key) {
+            Some((1, false))
+        } else if keys.matches(Action::SelectPageUp, key) {
+            Some((-1, true))
+        } else if keys.matches(Action::SelectPageDown, key) {
+            Some((1, true))
+        } else {
+            None
+        };
+        if let Some((direction, page)) = direction {
+            let delta = direction
+                * if page {
+                    self.body_h.get().saturating_sub(2).max(1) as isize
+                } else {
+                    1
+                };
+            match self.focus {
+                Focus::Diff => self.move_cursor(delta),
+                Focus::Sidebar => self.move_side(delta),
+            }
+            return OverlayEvent::None;
+        }
+        if keys.matches(Action::SelectConfirm, key) {
+            match self.focus {
+                Focus::Sidebar => self.side_enter(),
+                Focus::Diff => self.jump_hunk(1),
+            }
+            return OverlayEvent::None;
         }
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
@@ -522,23 +584,25 @@ impl GitOverlay {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('s') => self.commit(),
-                KeyCode::Char('t') => self.amend = !self.amend,
-                KeyCode::Char('g') => self.generate_message(),
+                KeyCode::Char('s') => {
+                    self.commit();
+                    return OverlayEvent::None;
+                }
+                KeyCode::Char('t') => {
+                    self.amend = !self.amend;
+                    return OverlayEvent::None;
+                }
+                KeyCode::Char('g') => {
+                    self.generate_message();
+                    return OverlayEvent::None;
+                }
                 _ => {}
             }
-            return OverlayEvent::None;
         }
-        match key.code {
-            KeyCode::Enter => self.message.push('\n'),
-            _ if crate::ui::editor::delete_at_end(&mut self.message, key, Some(keys)).is_some() => {
-            }
-            KeyCode::Tab => {
-                self.editing = false;
-                self.focus = Focus::Diff;
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => self.message.push(c),
-            _ => {}
+        if key.code == KeyCode::Enter {
+            self.message.insert("\n");
+        } else {
+            self.message.key_with(*key, keys);
         }
         OverlayEvent::None
     }
@@ -546,34 +610,18 @@ impl GitOverlay {
     fn ai_prompt_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         if keys.matches(Action::SelectCancel, key) {
             self.ai_prompt = None;
-            return OverlayEvent::None;
-        }
-        match key.code {
-            KeyCode::Enter => {
-                let instruction = self.ai_prompt.take().unwrap_or_default();
-                let instruction = instruction.trim().to_owned();
-                if instruction.is_empty() {
-                    self.flash("Describe what to stage", true);
-                } else {
-                    self.start_ai_stage(instruction);
+        } else if keys.matches(Action::SelectConfirm, key) {
+            let instruction = self.ai_prompt.as_ref().unwrap().text.trim().to_owned();
+            if instruction.is_empty() {
+                self.flash("Describe what to stage", true);
+            } else {
+                self.start_ai_stage(instruction);
+                if self.ai_job.is_some() {
+                    self.ai_prompt = None;
                 }
             }
-            _ if self.ai_prompt.as_mut().is_some_and(|prompt| {
-                crate::ui::editor::delete_at_end(prompt, key, Some(keys)).is_some()
-            }) => {}
-            _ if crate::ui::keys::typed_char(key).is_some() => {
-                if let Some(prompt) = self.ai_prompt.as_mut() {
-                    prompt.extend(crate::ui::keys::typed_char(key));
-                }
-            }
-            _ => {}
-        }
-        let shown = self
-            .ai_prompt
-            .as_ref()
-            .map(|prompt| format!("Stage what? {prompt}_"));
-        if let Some(shown) = shown {
-            self.flash(shown, false);
+        } else if let Some(prompt) = self.ai_prompt.as_mut() {
+            prompt.key_with(*key, keys);
         }
         OverlayEvent::None
     }
@@ -582,19 +630,13 @@ impl GitOverlay {
         if self.line_key(key, ch) {
             return;
         }
-        let page = self.body_h.get().saturating_sub(2).max(1) as isize;
         match (key.code, ch) {
-            (KeyCode::Up, _) | (_, Some('k')) => self.move_cursor(-1),
-            (KeyCode::Down, _) | (_, Some('j')) => self.move_cursor(1),
-            (KeyCode::PageUp, _) => self.move_cursor(-page),
-            (KeyCode::PageDown, _) => self.move_cursor(page),
             (KeyCode::Home, _) | (_, Some('g')) => self.cursor_to(0),
             (KeyCode::End, _) | (_, Some('G')) => self.cursor_to(usize::MAX),
             (KeyCode::Left, _) | (_, Some('h')) if !self.wrap => {
                 self.hscroll = self.hscroll.saturating_sub(8);
             }
             (KeyCode::Right, _) | (_, Some('l')) if !self.wrap => self.hscroll += 8,
-            (KeyCode::Enter, _) => self.jump_hunk(1),
             (KeyCode::Char(' '), _) | (_, Some('s')) | (_, Some('u')) => self.stage_current(),
             (_, Some('x')) => self.discard_hunk(),
             _ => {}
@@ -603,9 +645,6 @@ impl GitOverlay {
 
     fn sidebar_key(&mut self, key: &KeyEvent, ch: Option<char>) {
         match (key.code, ch) {
-            (KeyCode::Up, _) | (_, Some('k')) => self.move_side(-1),
-            (KeyCode::Down, _) | (_, Some('j')) => self.move_side(1),
-            (KeyCode::Enter, _) => self.side_enter(),
             (KeyCode::Left, _) | (_, Some('h')) => self.side_left(),
             (KeyCode::Right, _) | (_, Some('l')) => self.side_right(),
             (KeyCode::Char(' '), _) => self.toggle_file(),
@@ -630,6 +669,9 @@ impl GitOverlay {
 
     /// Request status off-thread. Repeated refreshes coalesce while a read is running.
     fn sync(&mut self) {
+        self.confirm = None;
+        self.discard_patch = None;
+        self.line_sel = None;
         // No old diff may be applied once a newer status snapshot was requested.
         self.reads.generation = self.reads.generation.wrapping_add(1);
         self.reads.pending_diff = None;
@@ -654,6 +696,8 @@ impl GitOverlay {
     }
 
     fn load_shown(&mut self) {
+        self.confirm = None;
+        self.discard_patch = None;
         self.reads.generation = self.reads.generation.wrapping_add(1);
         self.reads.pending_diff = self.selected().cloned().map(|change| load::DiffRequest {
             repo: self.repo.clone(),

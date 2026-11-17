@@ -117,7 +117,7 @@ fn slash_filters_the_hits_titles_replace_ids_and_no_fixed_branch_note() {
     ));
     panel.handle(&key(KeyCode::Backspace), &rig.keys);
     let content = screen(&render(100, 24, |frame| panel.draw(frame, &ctx)));
-    assert!(content.contains("1 of 2 matches"), "{content}");
+    assert!(content.contains("1 of 2 loaded"), "{content}");
     panel.handle(&key(KeyCode::Enter), &rig.keys);
     assert!(
         matches!(panel.handle(&key(KeyCode::Enter), &rig.keys), OverlayEvent::Action(v) if v == "history-open:session-two")
@@ -145,4 +145,38 @@ fn filter_backspace_removes_a_whole_grapheme() {
     assert_eq!(panel.filter, "ne\u{301}");
     panel.handle(&key(KeyCode::Backspace), &keys);
     assert_eq!(panel.filter, "n");
+}
+
+#[test]
+fn result_count_describes_loaded_window_not_global_total() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let mut panel = HistorySearchOverlay::new("needle".into(), vec![hit("one", "entry")], false);
+    let content = screen(&render(100, 24, |frame| panel.draw(frame, &ctx)));
+    assert!(content.contains("1 loaded"), "{content}");
+}
+
+#[test]
+fn more_action_only_exists_for_expandable_windows_and_is_text_while_filtering() {
+    let keys = Keymap::defaults();
+    for (has_more, can_load, emits) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let mut panel =
+            HistorySearchOverlay::new("needle".into(), vec![], false).with_more(has_more, can_load);
+        assert_eq!(
+            matches!(panel.handle(&ch('m'), &keys), OverlayEvent::Action(v) if v == "history-more"),
+            emits
+        );
+        panel.handle(&ch('/'), &keys);
+        assert!(matches!(panel.handle(&ch('m'), &keys), OverlayEvent::None));
+        assert_eq!(panel.filter, "m");
+    }
 }

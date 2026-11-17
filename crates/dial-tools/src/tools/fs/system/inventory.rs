@@ -2,7 +2,7 @@
 //! Collected locally without network access; toolchain versions come from bounded, parallel
 //! `--version` probes of executables already on `PATH`.
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Toolchains whose version is worth one probe.
@@ -230,33 +230,38 @@ pub(super) enum Probe {
     Failed,
 }
 
-/// One version probe with a deadline. The child is killed, not abandoned, when it overruns.
+/// One version probe with bounded pipes and process-group cleanup, even after the leader exits.
 pub(super) fn version(executable: &Path, args: &[&str], deadline: Instant) -> Probe {
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let Ok(mut child) = dial_core::platform::process::spawn(&mut command) else {
-        return Probe::Failed;
-    };
+    use dial_core::runtime::process::{Policy, run_with_control};
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let exited = dial_core::platform::process::wait_exited(&child, remaining).unwrap_or(false);
-    if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+    if remaining.is_zero() {
         return Probe::TimedOut;
     }
-    match child.wait_with_output() {
-        Ok(output) if output.status.success() => {
+    let mut command = Command::new(executable);
+    command.args(args);
+    let policy = Policy {
+        stderr_cap: 4096,
+        stderr_tail: false,
+        may_mutate: false,
+        ..Policy::bounded(remaining, 4096)
+    };
+    let result = run_with_control(
+        command,
+        None,
+        policy,
+        &|| Instant::now() >= deadline,
+        &mut |_, _| {},
+    );
+    match result {
+        Ok(output) if output.timed_out || output.cancelled => Probe::TimedOut,
+        Ok(output) if output.success() => {
             Probe::Ran(first_line(&output.stdout).or_else(|| first_line(&output.stderr)))
         }
         _ => Probe::Failed,
     }
 }
 
-fn os_name() -> String {
+fn os_name(deadline: Instant) -> String {
     if let Ok(release) = std::fs::read_to_string("/etc/os-release")
         && let Some(name) = release
             .lines()
@@ -265,8 +270,8 @@ fn os_name() -> String {
         return name.trim_matches('"').to_owned();
     }
     if cfg!(target_os = "macos")
-        && let Ok(out) = Command::new("sw_vers").arg("-productVersion").output()
-        && let Some(version) = first_line(&out.stdout)
+        && let Probe::Ran(Some(version)) =
+            version(Path::new("sw_vers"), &["-productVersion"], deadline)
     {
         return format!("macOS {version}");
     }
@@ -296,7 +301,7 @@ fn kernel() -> Option<String> {
     None
 }
 
-fn memory() -> (Option<u64>, Option<u64>) {
+fn memory(deadline: Instant) -> (Option<u64>, Option<u64>) {
     if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
         let field = |key: &str| {
             info.lines()
@@ -310,12 +315,10 @@ fn memory() -> (Option<u64>, Option<u64>) {
         return (field("MemTotal:"), field("MemAvailable:"));
     }
     if cfg!(target_os = "macos")
-        && let Ok(out) = Command::new("sysctl").args(["-n", "hw.memsize"]).output()
+        && let Probe::Ran(Some(total)) =
+            version(Path::new("sysctl"), &["-n", "hw.memsize"], deadline)
     {
-        return (
-            first_line(&out.stdout).and_then(|text| text.parse().ok()),
-            None,
-        );
+        return (total.parse().ok(), None);
     }
     (None, None)
 }
@@ -386,7 +389,8 @@ pub fn inventory(disk_root: Option<&Path>) -> Inventory {
             )
         })
         .collect();
-    let (memory_total, memory_available) = memory();
+    let (memory_total, memory_available) = memory(deadline);
+    let os = os_name(deadline);
     let disk = disk_root
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
@@ -420,7 +424,7 @@ pub fn inventory(disk_root: Option<&Path>) -> Inventory {
         .map(|tool| (*tool).to_owned())
         .collect();
     Inventory {
-        os: os_name(),
+        os,
         kernel: kernel(),
         arch: std::env::consts::ARCH.to_owned(),
         cpus: std::thread::available_parallelism().map_or(1, usize::from),

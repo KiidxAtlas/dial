@@ -202,7 +202,11 @@ impl Bridge<'_> {
         self.shell.pump_jobs_during_turn(self.app);
         // Hosted guests reach a running turn only through here: an abort stops it, prompts wait.
         for notice in crate::collab::room::pump() {
-            self.shell.note("Collab", notice);
+            self.shell.notify(
+                crate::ui::overlay::inbox::Category::General,
+                "Collab",
+                notice,
+            );
         }
         if crate::collab::room::take_aborts() {
             self.stop_from_pump(Some("stopped by a collab guest"));

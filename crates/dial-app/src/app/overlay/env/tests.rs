@@ -448,6 +448,7 @@ fn history_panel_actions_close_and_reach_the_shell_controller() {
     for (key, expected) in [
         (KeyCode::Enter, "history-open:conversation"),
         (KeyCode::Char('b'), "history-return"),
+        (KeyCode::Char('m'), "history-more"),
     ] {
         let mut panel = HistorySearchOverlay::new(
             "needle".into(),
@@ -460,7 +461,8 @@ fn history_panel_actions_close_and_reach_the_shell_controller() {
                 when: String::new(),
             }],
             true,
-        );
+        )
+        .with_more(true, true);
         let event = panel.handle(
             &Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
             env.keys,
@@ -687,4 +689,69 @@ fn removing_builtin_provider_refreshes_config_and_clears_saved_key() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn idle_and_busy_attention_viewer_back_restores_retained_browser() {
+    use crate::app::overlay::activity::{ActivityOverlay, ActivityTab, queue_choices};
+    use crate::ui::overlay::OverlayEvent;
+    use crate::ui::overlay::palette::PaletteOverlay;
+    use crate::ui::status::Phase;
+    for phase in [Phase::Idle, Phase::Working] {
+        let (_home, _project, app) = app();
+        let mut keys = Keymap::defaults();
+        let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+        let mut catalog = Catalog::new();
+        let runtime = crate::runtime::Tree::default();
+        let status = StatusData {
+            phase,
+            ..Default::default()
+        };
+        let origin = ActiveOverlay::Activity(Box::new(ActivityOverlay::new(
+            ActivityTab::Attention,
+            ActiveOverlay::Palette(PaletteOverlay::choice(queue_choices(&[]))),
+        )));
+        assert!(origin.retains_navigation("subagent-open:worker"));
+        let mut history = vec![origin];
+        let mut auth_job = None;
+        let mut extensions_pending = None;
+        let mut extensions_job = None;
+        let mut scope = Scope::Global;
+        let mut env = OverlayEnv {
+            history: &mut history,
+            runtime: &runtime,
+            todo: &Default::default(),
+            model_downloads: None,
+            compute_monitor: None,
+            first_run: false,
+            live_tasks: None,
+            verify_lora: None,
+            auth_job: &mut auth_job,
+            last_setup_failure: &mut None,
+            extensions_pending: &mut extensions_pending,
+            extensions_job: &mut extensions_job,
+            background_control: None,
+            pty_approval: Approval::Write,
+            app: &app,
+            themes: &mut themes,
+            keys: &mut keys,
+            status: &status,
+            catalog: &mut catalog,
+            scope: &mut scope,
+            dark: None,
+            latest: None,
+            next: None,
+            seen_generation: 0,
+            release_compute: None,
+            peer_source: None,
+        };
+        // The viewer emits this action for Esc: pop Attention instead of opening the hub.
+        let mut viewer = ActiveOverlay::Palette(PaletteOverlay::choice(queue_choices(&[])));
+        assert!(env.apply(OverlayEvent::Action("subagent-hub".into()), &mut viewer));
+        assert_eq!(env.next.as_deref(), Some("navigate:back"), "{phase:?}");
+        for action in ["history-open:worker", "history-return", "history-more"] {
+            assert!(env.apply(OverlayEvent::Action(action.into()), &mut viewer));
+            assert_eq!(env.next.as_deref(), Some(action), "{phase:?}: {action}");
+        }
+    }
 }

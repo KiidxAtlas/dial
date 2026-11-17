@@ -455,3 +455,91 @@ fn cell_label_defaults_to_the_runtime_and_checks_titles() {
     assert!(cell_label(&json!({"title": 3}), "py").is_err());
     assert!(cell_label(&json!({"title": "x".repeat(257)}), "py").is_err());
 }
+
+#[test]
+fn background_handoff_retains_workspace_ownership_until_settled() {
+    for (accepted, cancelled) in [(false, false), (true, false), (true, true)] {
+        let (_dir, workspace) = crate::tools::testkit::workspace();
+        let session = Arc::new(Mutex::new(Some(process())));
+        let busy = Arc::new(Mutex::new(None));
+        let pending = Mutex::new(None);
+        let adopt = |job| {
+            if !accepted {
+                return Err("table full".to_owned());
+            }
+            let AdoptedJob::Cell(job) = job else {
+                panic!("expected cell")
+            };
+            *pending.lock() = Some(job);
+            Ok("test-cell".to_owned())
+        };
+        let policy = BackgroundPolicy::from_args(&json!({"background":true}), 0).unwrap();
+        let end = Arc::new(Deadline::new(Some(Instant::now() + Duration::from_secs(5))));
+        let interrupt = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let callback_wait = AtomicBool::new(false);
+        let scope = CellScope {
+            workspace: &workspace,
+            prelude_mode: preludes::PreludeMode::Portable,
+            end: &end,
+            interrupt: &interrupt,
+            cancel: &cancel,
+            callback_wait: &callback_wait,
+        };
+        let handoff = Handoff {
+            label: "test-cell".into(),
+            policy: &policy,
+            adopt: &adopt,
+            session: session.clone(),
+            busy: busy.clone(),
+            pid: Arc::new(AtomicI32::new(0)),
+        };
+        let callback_unlocked = AtomicBool::new(false);
+        let outcome = native_cell(
+            session.lock().as_mut().unwrap(),
+            &scope,
+            if accepted {
+                "import time; time.sleep(0.1); print('finished')"
+            } else {
+                "import time; time.sleep(0.1); tool.probe({}); 42"
+            },
+            &mut |_| {
+                callback_unlocked.store(
+                    workspace.try_serial_operation().is_some(),
+                    Ordering::Release,
+                );
+                ToolOutput::structured(json!({"ok":true}))
+            },
+            &handoff,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        if accepted {
+            assert!(matches!(outcome, CellOutcome::Moved(_)));
+            let protected = workspace.try_serial_operation().is_none();
+            // Always settle the finite cell before asserting, including when ownership regresses.
+            let job = pending.lock().take().unwrap();
+            let text = (job.work)(Arc::new(AtomicBool::new(cancelled)));
+            assert!(
+                protected,
+                "workspace ownership was lost before the job started"
+            );
+            assert!(
+                workspace.try_serial_operation().is_some(),
+                "ownership leaked after {text}"
+            );
+            assert!(busy.lock().is_none());
+            assert_eq!(session.lock().is_none(), cancelled, "{text}");
+        } else {
+            let CellOutcome::Value(value) = outcome else {
+                panic!("refused cell detached")
+            };
+            assert_eq!(value["value"], "42");
+            assert!(
+                callback_unlocked.load(Ordering::Acquire),
+                "callback retained workspace ownership"
+            );
+            assert!(workspace.try_serial_operation().is_some());
+        }
+    }
+}

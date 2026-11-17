@@ -27,6 +27,14 @@ fn streaming(
     (state, cancel, tx)
 }
 
+/// An unresolved side stream; retaining the sender keeps it pending without a provider/service.
+pub(crate) fn pending_request(session: &Session) -> (SideThreadState, impl Sized) {
+    let (mut state, _, sender) = streaming(session.id(), Vec::new());
+    state.session = Some(session.id().to_owned());
+    state.path = session.path().map(side_thread::path_for);
+    (state, sender)
+}
+
 #[test]
 fn answered_request_is_recorded_for_its_session() {
     let (mut state, _, _events) = streaming(
@@ -192,16 +200,31 @@ fn a_streamed_prefix_survives_owner_drop_without_reissuing_the_request() {
 #[test]
 fn streamed_side_text_is_saved_and_shown_at_a_bounded_rate() {
     let (mut state, _, events) = streaming("s1", vec![Event::Text("first".to_string())]);
+    let before = state.revision();
     // The first text is shown at once.
     assert!(state.drain(Some("s1")).is_empty());
     assert_eq!(state.streamed().map(|(_, text)| text), Some("first"));
+    assert_ne!(state.revision(), before);
+    let published = state.revision();
+    assert!(state.drain(Some("s1")).is_empty());
+    assert_eq!(
+        state.revision(),
+        published,
+        "idle polling must not invalidate publication"
+    );
     // More text within the save interval waits for the next save.
     events.send(Event::Text(" second".to_string())).unwrap();
     assert!(state.drain(Some("s1")).is_empty());
     assert_eq!(state.streamed().map(|(_, text)| text), Some("first"));
+    assert_eq!(
+        state.revision(),
+        published,
+        "unsaved text is not externally visible"
+    );
     std::thread::sleep(SIDE_SAVE_INTERVAL);
     assert!(state.drain(Some("s1")).is_empty());
     assert_eq!(state.streamed().map(|(_, text)| text), Some("first second"));
+    assert_ne!(state.revision(), published);
     // A burst larger than the byte threshold is saved immediately.
     events
         .send(Event::Text("x".repeat(SIDE_SAVE_BYTES)))

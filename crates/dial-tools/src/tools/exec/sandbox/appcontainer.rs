@@ -64,11 +64,13 @@ pub(super) fn plan(policy: &Policy) -> Plan<'_> {
             deny_read,
             allow_network,
             extra_write,
+            ..
         }
         | Policy::Dev {
             deny_read,
             extra_write,
             allow_network,
+            ..
         } => Plan {
             deny_read,
             extra_write,
@@ -674,6 +676,7 @@ mod imp {
         let policy = Policy::Strict {
             deny_read: vec![denied.clone()],
             allow_network: false,
+            serial_ports: false,
             extra_write: Vec::new(),
         };
         let script = r"

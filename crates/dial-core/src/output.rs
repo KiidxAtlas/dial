@@ -69,7 +69,7 @@ fn spool_read(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<
 
 /// Queued bytes held in memory before new frames spill to disk.
 const MEMORY_LIMIT: usize = 4 * 1024 * 1024;
-/// Disk the spool may use before the stalled reader is treated as gone.
+/// Maximum outstanding spooled bytes and physical size of its circular file.
 const SPOOL_LIMIT: u64 = 1024 * 1024 * 1024;
 const READ_CHUNK: u64 = 64 * 1024;
 
@@ -211,17 +211,29 @@ impl Pipe {
             }
             let limit = self.spool_limit;
             let spool = state.spool.as_mut().expect("spool exists");
-            if spool.written.saturating_add(bytes.len() as u64) > limit {
+            if (spool.written - spool.read).saturating_add(bytes.len() as u64) > limit {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     format!(
-                        "stdout reader made no progress while {} MiB of output was spooled",
+                        "stdout backlog exceeded the {} MiB spool budget",
                         limit / (1024 * 1024)
                     ),
                 ));
             }
-            spool_write(&spool.file, &bytes, spool.written)?;
-            spool.written += bytes.len() as u64;
+            // Keep delivered prefixes reusable even when the queue never becomes empty.
+            // `read` advances only after stdout accepts a chunk, so an in-flight read
+            // remains reserved and cannot be overwritten by a producer wrapping around.
+            let end = spool
+                .written
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("stdout spool position overflow"))?;
+            let offset = spool.written % limit;
+            let first = bytes.len().min((limit - offset) as usize);
+            spool_write(&spool.file, &bytes[..first], offset)?;
+            if first < bytes.len() {
+                spool_write(&spool.file, &bytes[first..], 0)?;
+            }
+            spool.written = end;
             Ok(())
         })();
         match result {
@@ -251,7 +263,9 @@ impl Pipe {
             if let Some(spool) = &state.spool {
                 if spool.read < spool.written {
                     let start = spool.read;
-                    let end = (start + READ_CHUNK).min(spool.written);
+                    let available = spool.written - start;
+                    let contiguous = self.spool_limit - start % self.spool_limit;
+                    let end = start + available.min(READ_CHUNK).min(contiguous);
                     match spool.file.try_clone() {
                         Ok(file) => {
                             state.busy = true;
@@ -282,7 +296,7 @@ impl Pipe {
                 Chunk::Memory(bytes) => write_blocking(&mut out, bytes),
                 Chunk::Spool { file, start, end } => {
                     let mut bytes = vec![0; (end - start) as usize];
-                    spool_read(file, &mut bytes, *start)
+                    spool_read(file, &mut bytes, *start % self.spool_limit)
                         .and_then(|()| write_blocking(&mut out, &bytes))
                 }
             };

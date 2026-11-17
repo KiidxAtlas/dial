@@ -363,7 +363,7 @@ fn pack_current(shell: &mut Shell, agent: &Agent<'_>, args: &str) -> Result<Step
 }
 
 /// Whether the project transition moved the session, or refused and left it where it was.
-pub(super) enum MoveOutcome {
+pub(crate) enum MoveOutcome {
     /// The session now lives in this project root.
     Moved(PathBuf),
     /// Nothing moved; the message says why.
@@ -395,7 +395,7 @@ pub(super) fn move_session(agent: &mut Agent<'_>, args: &str) -> Result<MoveOutc
     move_session_checked(agent, args, |_| Ok(()))
 }
 
-fn move_session_checked(
+pub(crate) fn move_session_checked(
     agent: &mut Agent<'_>,
     args: &str,
     validate: impl FnOnce(&Layout) -> Result<()>,

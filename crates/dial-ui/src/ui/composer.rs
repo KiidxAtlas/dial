@@ -274,7 +274,7 @@ pub struct Composer {
     search: Option<Search>,
     busy: bool,
     busy_send: BusySend,
-    queued: std::collections::VecDeque<(String, bool)>,
+    queued: queue::items::Items,
     recovery_held: bool,
     recovery_sink: Option<recovery::RecoverySink>,
     /// Explicit steer / independent messages sent this turn, shown with their stage. Not part of the queue.
@@ -354,7 +354,7 @@ impl Composer {
             clipboard_read: None,
             paste_count: 0,
             pasted_images: Vec::new(),
-            queued: std::collections::VecDeque::new(),
+            queued: Default::default(),
             recovery_held: false,
             recovery_sink: None,
             explicit: Vec::new(),
@@ -415,6 +415,14 @@ impl Composer {
     }
 
     pub fn set_draft(&mut self, text: &str) {
+        // Replacing unrelated work abandons an edit; updating its contents must not.
+        self.restore_queued_edit();
+        self.replace_draft_content(text);
+    }
+
+    /// Replace the current draft's contents (for example after external editing), preserving
+    /// an active queued-message edit, its original content for cancellation, position and route.
+    pub fn replace_draft_content(&mut self, text: &str) {
         self.editor.set(text);
         self.history_index = None;
         self.saved_draft = None;
@@ -424,8 +432,6 @@ impl Composer {
         self.dismissed = None;
         self.prune_pastes();
         self.choice = None;
-        // Replacing the draft abandons an in-progress queue edit: put the original back, never drop it.
-        self.restore_queued_edit();
         self.queue_notice = None;
         self.refresh();
     }

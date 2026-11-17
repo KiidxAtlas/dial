@@ -34,6 +34,7 @@ vt100.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+plist.workspace = true
 
 [dev-dependencies]
 dial-core = { workspace = true, features = ["test-support"] }
@@ -41,6 +42,7 @@ dial-llm = { workspace = true, features = ["test-support"] }
 dial-storage = { workspace = true, features = ["test-support"] }
 dial-tools = { workspace = true, features = ["test-support"] }
 dial-agent = { workspace = true, features = ["test-support"] }
+plist.workspace = true
 
 [features]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).

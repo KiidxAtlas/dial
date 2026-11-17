@@ -43,6 +43,8 @@ pub enum EventKind {
     Draft,
     /// The controller parked or resumed a turn at an owned-work boundary.
     Wait,
+    /// A failed provider attempt's partial answer was discarded; the next attempt starts fresh.
+    Retry,
 }
 
 /// Where a surface should place an event.
@@ -87,6 +89,7 @@ impl EventKind {
             Self::ContextReset => "new context",
             Self::Draft => "draft",
             Self::Wait => "wait",
+            Self::Retry => "retry",
         }
     }
 }

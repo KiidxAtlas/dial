@@ -3,7 +3,7 @@
 //! sensibly. Layout is done here, not by the terminal: every row is at most `width` cells, prose is
 //! wrapped on word boundaries with its styles intact, code and tables are wrapped hard.
 use super::{
-    Rows, chrome, text,
+    Rows, text,
     theme::{Glyphs, Sym, Theme, Tok},
 };
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -1109,7 +1109,8 @@ impl<'a> Renderer<'a> {
             if !label.is_empty() {
                 rows.push(Line::from(vec![
                     Span::styled(format!("{bar} "), gutter),
-                    chrome::label(theme, &label),
+                    // The fence's language as written (`rust`, `tsx`): an identifier, not a heading.
+                    Span::styled(label, theme.fg(Tok::Muted)),
                 ]));
             }
             let continued = Span::styled(

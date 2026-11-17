@@ -91,6 +91,12 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   only reads the plan; it never changes it.
 - The launch input is a rounded box that asks "What are we building?". It shows no status line
   or shortcut catalog. An active tab in any panel's tab strip is drawn as a filled pill.
+  Launch send/action/tour-dismiss hints follow your configured shortcuts and omit unbound actions.
+  Active composer layers, including history search, receive navigation and dismissal before the
+  home list or first-run tour does.
+  While editing a queued message, Up/Down move through wrapped screen rows before stepping to
+  another item. Returning from an external editor keeps that queued edit's position and route;
+  saving replaces it once, and cancelling restores the original message.
 - Skill tool lines include the bundled reference-file path when one is read, for example
   `rust-best-practices · references/handbook-11.md`, so separate reference reads do not look like
   repeated loads of the core skill.

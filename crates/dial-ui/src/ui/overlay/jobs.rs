@@ -66,8 +66,10 @@ pub struct JobsOverlay {
     jobs: Vec<JobRow>,
     cursor: usize,
     attached: Option<String>,
+    pending_selection: Option<String>,
     screen: Vec<String>,
     screen_cursor: Option<(u16, u16)>,
+    terminal: Option<crate::runtime::terminal::Screen>,
     /// Distance from the newest pipe-output row; zero follows live output.
     output_scroll: usize,
     message: Option<(String, bool)>,
@@ -86,6 +88,11 @@ impl JobsOverlay {
         Self::default()
     }
 
+    /// Focus a requested process when its producer snapshot arrives; never attach or type.
+    pub fn select_when_available(&mut self, name: String) {
+        self.pending_selection = Some(name);
+    }
+
     /// Replace the list, keeping the selection on the same job when it still exists.
     pub fn set_jobs(&mut self, jobs: Vec<JobRow>) {
         let selected = self.jobs.get(self.cursor).map(|job| job.name.clone());
@@ -96,12 +103,20 @@ impl JobsOverlay {
             self.cursor = index;
         }
         self.cursor = self.cursor.min(self.jobs.len().saturating_sub(1));
+        if let Some(name) = self.pending_selection.take() {
+            if let Some(index) = self.jobs.iter().position(|job| job.name == name) {
+                self.cursor = index;
+            } else {
+                self.message = Some((format!("{name} is no longer available"), true));
+            }
+        }
         if let Some(name) = &self.attached
             && !self.jobs.iter().any(|job| &job.name == name)
         {
             self.message = Some((format!("{name} is no longer in the job table"), true));
             self.attached = None;
             self.screen.clear();
+            self.terminal = None;
             self.screen_cursor = None;
         }
     }
@@ -113,7 +128,12 @@ impl JobsOverlay {
 
     pub fn set_screen(&mut self, rows: Vec<String>, cursor: Option<(u16, u16)>) {
         self.screen = rows;
+        self.terminal = None;
         self.screen_cursor = cursor;
+    }
+
+    pub fn set_terminal(&mut self, terminal: Option<crate::runtime::terminal::Screen>) {
+        self.terminal = terminal;
     }
 
     pub fn banner(&mut self, message: String, is_error: bool) {
@@ -141,6 +161,7 @@ impl JobsOverlay {
                     if is_detach(key) || (!interactive && keys.matches(Action::SelectCancel, key)) {
                         self.attached = None;
                         self.screen.clear();
+                        self.terminal = None;
                         self.screen_cursor = None;
                         self.output_scroll = 0;
                         self.message = None;
@@ -166,14 +187,24 @@ impl JobsOverlay {
                             .min(self.screen.len().saturating_sub(page));
                         return OverlayEvent::None;
                     }
-                    match key_bytes(key) {
+                    match key_bytes_mode(
+                        key,
+                        self.terminal
+                            .as_ref()
+                            .is_some_and(|screen| screen.application_cursor),
+                    ) {
                         Some(bytes) => OverlayEvent::JobInput { name, bytes },
                         None => OverlayEvent::None,
                     }
                 }
                 Event::Paste(value) if interactive => OverlayEvent::JobInput {
                     name,
-                    bytes: value.replace("\r\n", "\r").replace('\n', "\r").into_bytes(),
+                    bytes: paste_bytes(
+                        value,
+                        self.terminal
+                            .as_ref()
+                            .is_some_and(|screen| screen.bracketed_paste),
+                    ),
                 },
                 _ => OverlayEvent::None,
             };
@@ -223,6 +254,7 @@ impl JobsOverlay {
         {
             self.attached = Some(job.name.clone());
             self.screen.clear();
+            self.terminal = None;
             self.screen_cursor = None;
             self.output_scroll = 0;
             self.message = (!job.running).then(|| {
@@ -261,6 +293,7 @@ impl JobsOverlay {
             let job = &self.jobs[index];
             self.attached = Some(job.name.clone());
             self.screen.clear();
+            self.terminal = None;
             self.screen_cursor = None;
             self.output_scroll = 0;
             self.message = (!job.running).then(|| {
@@ -369,6 +402,17 @@ impl JobsOverlay {
                     .saturating_sub(self.output_scroll)
             };
             for row in 0..body_h {
+                if let Some(screen) = &self.terminal {
+                    out.push(terminal_row(
+                        screen.rows.get(row).map(Vec::as_slice).unwrap_or_default(),
+                        screen
+                            .cursor
+                            .filter(|(r, _)| interactive && usize::from(*r) == row)
+                            .map(|(_, c)| usize::from(c)),
+                        w,
+                    ));
+                    continue;
+                }
                 let content = self
                     .screen
                     .get(start + row)
@@ -564,6 +608,51 @@ fn screen_row(content: &str, cursor: Option<usize>, width: usize, style: Style) 
 
 /// The bytes a terminal sends for `key` (xterm conventions), or `None` for keys with no encoding.
 pub fn key_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    key_bytes_mode(key, false)
+}
+
+fn key_bytes_mode(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+    let modifier = 1
+        + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(key.modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(key.modifiers.contains(KeyModifiers::CONTROL));
+    let final_byte = match key.code {
+        KeyCode::Up => Some('A'),
+        KeyCode::Down => Some('B'),
+        KeyCode::Right => Some('C'),
+        KeyCode::Left => Some('D'),
+        KeyCode::Home => Some('H'),
+        KeyCode::End => Some('F'),
+        KeyCode::F(n @ 1..=4) => Some(char::from(b'P' + n - 1)),
+        _ => None,
+    };
+    if let Some(final_byte) = final_byte {
+        return Some(if modifier != 1 {
+            format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+        } else if application_cursor || matches!(key.code, KeyCode::F(_)) {
+            format!("\x1bO{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[{final_byte}").into_bytes()
+        });
+    }
+    let tilde = match key.code {
+        KeyCode::Insert => Some(2),
+        KeyCode::Delete => Some(3),
+        KeyCode::PageUp => Some(5),
+        KeyCode::PageDown => Some(6),
+        KeyCode::F(n @ 5..=12) => Some([15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)]),
+        _ => None,
+    };
+    if let Some(code) = tilde {
+        return Some(
+            if modifier == 1 {
+                format!("\x1b[{code}~")
+            } else {
+                format!("\x1b[{code};{modifier}~")
+            }
+            .into_bytes(),
+        );
+    }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let mut bytes = match key.code {
@@ -587,27 +676,69 @@ pub fn key_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(n @ 1..=4) => vec![0x1b, b'O', b'P' + (n - 1)],
-        KeyCode::F(n @ 5..=12) => {
-            let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)];
-            format!("\x1b[{code}~").into_bytes()
-        }
         _ => return None,
     };
     if alt {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+fn paste_bytes(value: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        format!("\x1b[200~{value}\x1b[201~").into_bytes()
+    } else {
+        value.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+/// Render emulated cells, including styled blanks, without interpreting child escapes.
+fn terminal_row(
+    cells: &[crate::runtime::terminal::Cell],
+    cursor: Option<usize>,
+    width: usize,
+) -> Line<'static> {
+    use crate::runtime::terminal::Color;
+    let color = |value| match value {
+        Color::Default => ratatui::style::Color::Reset,
+        Color::Indexed(index) => ratatui::style::Color::Indexed(index),
+        Color::Rgb(r, g, b) => ratatui::style::Color::Rgb(r, g, b),
+    };
+    let mut spans = Vec::new();
+    for (column, cell) in cells.iter().enumerate().take(width) {
+        if cell.width == 0 {
+            continue;
+        }
+        let mut style = Style::default()
+            .fg(color(cell.foreground))
+            .bg(color(cell.background));
+        for (enabled, modifier) in [
+            (cell.bold, Modifier::BOLD),
+            (cell.italic, Modifier::ITALIC),
+            (cell.underline, Modifier::UNDERLINED),
+            (cell.inverse, Modifier::REVERSED),
+        ] {
+            if enabled {
+                style = style.add_modifier(modifier);
+            }
+        }
+        if cursor
+            .is_some_and(|cursor| cursor >= column && cursor < column + usize::from(cell.width))
+        {
+            style = if cell.inverse {
+                style.remove_modifier(Modifier::REVERSED)
+            } else {
+                style.add_modifier(Modifier::REVERSED)
+            };
+        }
+        let contents = if cell.contents.is_empty() || column + usize::from(cell.width) > width {
+            " ".to_owned()
+        } else {
+            cell.contents.clone()
+        };
+        spans.push(Span::styled(contents, style));
+    }
+    filled(spans, width, Style::default())
 }
 
 #[cfg(test)]

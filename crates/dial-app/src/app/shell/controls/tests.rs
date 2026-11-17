@@ -130,3 +130,38 @@ fn controls_name_the_direct_key_of_each_status_fact() {
         );
     }
 }
+
+#[test]
+fn planning_offers_only_the_change_and_context_reads_as_a_share() {
+    let (_home, _project, app, mut shell) = shell();
+    let values = |shell: &crate::app::shell::Shell| -> Vec<String> {
+        shell
+            .controls_picker(&app.config)
+            .items
+            .into_iter()
+            .map(|item| item.value)
+            .collect()
+    };
+    shell.status.planning = Some(false);
+    let off = values(&shell);
+    assert!(off.contains(&"plan on".into()) && !off.contains(&"plan off".into()));
+    shell.status.planning = Some(true);
+    let on = values(&shell);
+    assert!(on.contains(&"plan off".into()) && !on.contains(&"plan on".into()));
+    shell.status.planning = None;
+    let unknown = values(&shell);
+    assert!(unknown.contains(&"plan on".into()) && unknown.contains(&"plan off".into()));
+    // Explanations that change nothing come after every control.
+    let help = unknown.iter().position(|v| v.starts_with("help ")).unwrap();
+    assert!(
+        unknown[help..].iter().all(|v| v.starts_with("help ")),
+        "{unknown:?}"
+    );
+
+    assert_eq!(
+        context_use(Some(12_345), 200_000),
+        "12k of 200k tokens (6%)"
+    );
+    assert_eq!(context_use(Some(1_500), 8_192), "1.5k of 8.2k tokens (18%)");
+    assert_eq!(context_use(None, 0), "unknown");
+}

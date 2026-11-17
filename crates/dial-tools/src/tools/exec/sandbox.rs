@@ -89,6 +89,7 @@ pub use appcontainer::LAUNCH_ARG as APPCONTAINER_LAUNCH_ARG;
 #[cfg(any(windows, test))]
 pub mod low_integrity;
 pub mod netproxy;
+mod serial;
 
 /// The filtering proxy a sandboxed command must route through, if any.
 #[cfg(unix)]
@@ -147,6 +148,8 @@ pub enum Policy {
         deny_read: Vec<PathBuf>,
         allow_network: bool,
         extra_write: Vec<PathBuf>,
+        /// Let commands open USB serial adapters (`sandbox.serial_ports`); see [`serial`].
+        serial_ports: bool,
     },
     /// Developer-friendly: allow-by-default, then writes are limited to the
     /// workspace, its scratch dir, a few devices and `extra_write`; reads *and
@@ -157,7 +160,18 @@ pub enum Policy {
         deny_read: Vec<PathBuf>,
         extra_write: Vec<PathBuf>,
         allow_network: bool,
+        /// Let commands open USB serial adapters (`sandbox.serial_ports`); see [`serial`].
+        serial_ports: bool,
     },
+}
+
+impl Policy {
+    /// Whether commands under this policy may open USB serial adapters.
+    pub fn serial_ports(&self) -> bool {
+        match self {
+            Policy::Strict { serial_ports, .. } | Policy::Dev { serial_ports, .. } => *serial_ports,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +219,7 @@ impl Sandbox {
             deny_read: Vec::new(),
             allow_network,
             extra_write: Vec::new(),
+            serial_ports: false,
         };
         self.command_mode(
             workspace,
@@ -239,6 +254,7 @@ impl Sandbox {
                 deny_read,
                 allow_network,
                 extra_write,
+                serial_ports,
             } = policy
             else {
                 return Err("command_mode requires a Strict policy on this platform".into());
@@ -254,6 +270,9 @@ impl Sandbox {
                 profile.push_str(&proxy_rule(proxy.port()));
             }
             profile.push_str(&program_rule(program)?);
+            if *serial_ports {
+                profile.push_str(serial::MACOS_RULE);
+            }
             if let Some(fd) = mode.owned_terminal {
                 profile.push_str(&owned_terminal_rule(fd)?);
             }
@@ -343,7 +362,7 @@ impl Sandbox {
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
-        let (allow_network, deny_read, extra_write) = match policy {
+        let (allow_network, deny_read, extra_write, serial_ports) = match policy {
             Policy::Strict { .. } => {
                 return self.command_mode(workspace, policy, program, args, mode, proxy);
             }
@@ -351,7 +370,13 @@ impl Sandbox {
                 deny_read,
                 extra_write,
                 allow_network,
-            } => (*allow_network, deny_read, extra_write.clone()),
+                serial_ports,
+            } => (
+                *allow_network,
+                deny_read,
+                extra_write.clone(),
+                *serial_ports,
+            ),
         };
         let mut extra_write = extra_write;
         // Toolchains (uv, pip, npm, go) refuse to start when their home-directory cache is
@@ -367,11 +392,12 @@ impl Sandbox {
             deny_read: deny_read.clone(),
             extra_write: extra_write.clone(),
             allow_network,
+            serial_ports,
         };
         let extra_write = &extra_write;
         #[cfg(windows)]
         {
-            let _ = (deny_read, extra_write, proxy, mode);
+            let _ = (deny_read, extra_write, proxy, mode, serial_ports);
             low_integrity::command(workspace, policy, program, args, env, cache.as_deref())
         }
         #[cfg(not(windows))]
@@ -391,8 +417,12 @@ impl Sandbox {
             }
             #[cfg(not(target_os = "linux"))]
             profile.push_str(&program_rule(program)?);
+            #[cfg(not(target_os = "linux"))]
+            if serial_ports {
+                profile.push_str(serial::MACOS_RULE);
+            }
             #[cfg(target_os = "linux")]
-            let _ = (allow_network, deny_read, extra_write);
+            let _ = (allow_network, deny_read, extra_write, serial_ports);
             let scratch = workspace.join(crate::workspace_copy::SCRATCH_DIR);
             std::fs::create_dir_all(&scratch)
                 .map_err(|e| format!("creating scratch directory: {e}"))?;
@@ -456,6 +486,7 @@ impl Sandbox {
                     deny_read,
                     allow_network,
                     extra_write,
+                    ..
                 } => {
                     if let Sandbox::Unavailable(reason) = Sandbox::detect() {
                         return Sandbox::Unavailable(reason);
@@ -469,6 +500,7 @@ impl Sandbox {
                     deny_read,
                     extra_write,
                     allow_network,
+                    ..
                 } => {
                     static DEV_PROBES: [LazyLock<Result<(), String>>; 2] = [
                         LazyLock::new(|| dev_self_test(false)),

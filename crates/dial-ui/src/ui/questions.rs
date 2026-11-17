@@ -7,6 +7,7 @@ use super::{
 use crate::agent::workflow::questions::{self, QuestionAnswer, QuestionOutcome, QuestionRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -41,6 +42,7 @@ struct Hints {
     next: String,
     newline: String,
     attach: String,
+    page: String,
     interrupt: String,
 }
 
@@ -70,6 +72,11 @@ impl Hints {
             next: name(Action::TabNext),
             newline: keys.reachable_label(Action::Newline, super::term::reports_key_releases()),
             attach: name(Action::PasteImage),
+            page: [name(Action::SelectPageUp), name(Action::SelectPageDown)]
+                .into_iter()
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+                .join("/"),
             interrupt: name(Action::Interrupt),
         }
     }
@@ -96,7 +103,8 @@ pub struct Dialog<'a> {
     root: PathBuf,
     page: usize,
     cursor: usize,
-    preview_scroll: usize,
+    /// Rendering clamps this presentation-only offset to the current wrapped content.
+    preview_scroll: Cell<usize>,
     mode: Mode,
     presented: bool,
     deadline: Option<Instant>,
@@ -114,7 +122,7 @@ impl<'a> Dialog<'a> {
             root: root.to_owned(),
             page: 0,
             cursor: request.questions[0].recommended.unwrap_or(0),
-            preview_scroll: 0,
+            preview_scroll: Cell::new(0),
             mode: Mode::Choices,
             presented: false,
             deadline: None,
@@ -236,7 +244,7 @@ impl<'a> Dialog<'a> {
     fn change_page(&mut self, page: usize) {
         self.page = page;
         self.cursor = self.request.questions[page].recommended.unwrap_or(0);
-        self.preview_scroll = 0;
+        self.preview_scroll.set(0);
         self.presented = false;
         self.deadline = None;
         self.paused_timeout = None;
@@ -372,10 +380,12 @@ impl<'a> Dialog<'a> {
                         return Some(QuestionOutcome::Cancelled);
                     }
                     _ if keys.matches(Action::SelectUp, &key) => {
-                        self.cursor = self.cursor.saturating_sub(1)
+                        self.cursor = self.cursor.saturating_sub(1);
+                        self.preview_scroll.set(0);
                     }
                     _ if keys.matches(Action::SelectDown, &key) => {
-                        self.cursor = (self.cursor + 1).min(count + 3)
+                        self.cursor = (self.cursor + 1).min(count + 3);
+                        self.preview_scroll.set(0);
                     }
                     _ if keys.matches(Action::TabPrev, &key) => {
                         if self.page > 0 {
@@ -383,12 +393,12 @@ impl<'a> Dialog<'a> {
                         }
                     }
                     _ if keys.matches(Action::TabNext, &key) => return self.advance(),
-                    _ if keys.matches(Action::SelectPageUp, &key) => {
-                        self.preview_scroll = self.preview_scroll.saturating_sub(5)
-                    }
-                    _ if keys.matches(Action::SelectPageDown, &key) => {
-                        self.preview_scroll = self.preview_scroll.saturating_add(5)
-                    }
+                    _ if keys.matches(Action::SelectPageUp, &key) => self
+                        .preview_scroll
+                        .set(self.preview_scroll.get().saturating_sub(1)),
+                    _ if keys.matches(Action::SelectPageDown, &key) => self
+                        .preview_scroll
+                        .set(self.preview_scroll.get().saturating_add(1)),
                     KeyCode::Char('o') if key.modifiers.is_empty() => {
                         self.start_text(Field::Custom)
                     }
@@ -438,187 +448,294 @@ impl<'a> Dialog<'a> {
         }
         None
     }
+    /// Lay out within the final panel dimensions, including [`framed`]'s inset and fill row.
+    /// Essential controls and the active choice/input take precedence over secondary hints.
     pub fn rows(&self, width: usize, height: usize) -> Vec<String> {
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        // Match framed's inset and bottom fill before allocating any body rows. The active
+        // control and essential keys are pinned; only explanatory content scrolls.
+        let inner = if width >= 8 { width - 4 } else { width }.max(1);
+        let capacity = height.saturating_sub(usize::from(width >= 8 && height > 1));
         let question = &self.request.questions[self.page];
         let answer = &self.answers[self.page];
-        // The first row is the panel title; the model's internal question id is not shown. A lone
-        // question needs no `1/1` counter: its header (if any) titles the panel instead.
         let total = self.request.questions.len();
         let header = question
             .header
             .as_deref()
             .map(text::one_line)
             .filter(|header| !header.trim().is_empty());
-        let mut rows = vec![match (total, header) {
+        let mut title = match (total, header) {
             (1, Some(header)) => header,
             (1, None) => "Question".to_owned(),
             (_, Some(header)) => format!("Question {}/{total} · {header}", self.page + 1),
             (_, None) => format!("Question {}/{total}", self.page + 1),
-        }];
-        rows.extend(
-            text::wrap_words(&question.question, width.max(1))
-                .into_iter()
-                .take(3),
-        );
-        match &self.mode {
-            Mode::Text(field, editor) => {
-                rows.push(
-                    match field {
-                        Field::Custom => "Other/custom input",
-                        Field::Note => "Note",
+        };
+        let mut context = text::wrap_words(&question.question, inner);
+        let mut context_extent = context.len();
+        let hints = &self.hints;
+        let mut extra_keys = Vec::new();
+        let mut choices = Vec::new();
+        let mut input = Vec::new();
+        let mut cursor_row = 0;
+        let essential =
+            match &self.mode {
+                Mode::Choices => {
+                    let count = question.options.len();
+                    for index in 0..count + 4 {
+                        let label = if let Some(option) = question.options.get(index) {
+                            format!(
+                                "{} {}{}",
+                                if answer.selected_options.contains(&option.label) {
+                                    "[x]"
+                                } else {
+                                    "[ ]"
+                                },
+                                text::one_line(&option.label),
+                                if question.recommended == Some(index) {
+                                    " (Recommended)"
+                                } else {
+                                    ""
+                                }
+                            )
+                        } else {
+                            match index - count {
+                                0 => "Other (type your own)",
+                                1 => "Add/edit note",
+                                2 => "Chat about this",
+                                _ if self.page + 1 == total => "Done selecting",
+                                _ => "Next →",
+                            }
+                            .into()
+                        };
+                        choices.push(format!(
+                            "{} {label}",
+                            if index == self.cursor { ">" } else { " " }
+                        ));
                     }
-                    .into(),
-                );
-                let enter = match field {
-                    Field::Custom => "submit",
-                    Field::Note => "save",
-                };
-                let hints = &self.hints;
-                rows.push(
+                    // Reserve the largest option's detail area, not the current option's.
+                    // Otherwise every navigation key moves the choices and transcript above us.
+                    let mut largest_detail = 0;
+                    let mut selected_detail = 0;
+                    for (index, option) in question.options.iter().enumerate() {
+                        let mut detail_rows = Vec::new();
+                        if let Some(detail) = &option.description {
+                            detail_rows.extend(text::wrap_words(detail, inner));
+                        }
+                        if let Some(preview) = &option.preview {
+                            detail_rows
+                                .extend(text::wrap_words(&format!("Preview: {preview}"), inner));
+                        }
+                        largest_detail = largest_detail.max(detail_rows.len());
+                        if index == self.cursor {
+                            selected_detail = detail_rows.len();
+                            context.extend(detail_rows);
+                        }
+                    }
+                    if let Some(custom) = &answer.custom_input {
+                        context.extend(text::wrap_words(&format!("Custom: {custom}"), inner));
+                    }
+                    if let Some(note) = &answer.note {
+                        context.extend(text::wrap_words(&format!("Note: {note}"), inner));
+                    }
+                    if let Some(deadline) = self.deadline {
+                        context.extend(text::wrap_words(&format!(
+                        "Answers itself in {}s with your selection or the recommended choice",
+                        deadline.saturating_duration_since(Instant::now()).as_secs()), inner));
+                    }
+                    context_extent = context.len() + largest_detail - selected_detail;
+                    extra_keys.push(keyed(&hints.select, "choose"));
+                    if self.page > 0 {
+                        extra_keys.push(keyed(&hints.back, "back"));
+                    }
+                    extra_keys.push(keyed(
+                        &hints.next,
+                        if self.page + 1 == total {
+                            "done"
+                        } else {
+                            "next"
+                        },
+                    ));
+                    extra_keys.extend(["o other", "n note", "c chat"].map(|s| Some(s.to_owned())));
                     [
-                        keyed(&hints.confirm, enter),
+                        keyed(&hints.confirm, "select"),
+                        keyed(&hints.cancel, "cancel"),
+                    ]
+                }
+                Mode::Text(field, editor) => {
+                    title.push_str(match field {
+                        Field::Custom => " · Other/custom input",
+                        Field::Note => " · Note",
+                    });
+                    (input, cursor_row) = input_rows(editor, inner.saturating_sub(4).max(1));
+                    extra_keys.extend([
                         keyed(&hints.newline, "newline"),
                         keyed(&hints.attach, "attach image path"),
                         keyed(&hints.interrupt, "cancel turn"),
+                    ]);
+                    [
+                        keyed(
+                            &hints.confirm,
+                            match field {
+                                Field::Custom => "submit",
+                                Field::Note => "save",
+                            },
+                        ),
                         keyed(&hints.cancel, "back"),
                     ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                );
-                let before = &editor.text[..editor.cursor];
-                let after = &editor.text[editor.cursor..];
-                let lines = text::wrap_words(&format!("{before}│{after}"), width.max(1));
-                let cursor_row = text::wrap_words(before, width.max(1))
-                    .len()
-                    .saturating_sub(1);
-                rows.extend(
-                    lines
-                        .into_iter()
-                        .skip(cursor_row.saturating_sub(height.saturating_sub(7) / 2))
-                        .take(height.saturating_sub(6).max(1)),
-                );
-            }
-            Mode::Attach(_, _, editor) => {
-                rows.push(
-                    "Explicit human image path (PNG/JPEG/GIF/WebP; no clipboard ingestion)".into(),
-                );
-                rows.push(
+                }
+                Mode::Attach(_, _, editor) => {
+                    title.push_str(" · Image path");
+                    (input, cursor_row) = input_rows(editor, inner.saturating_sub(4).max(1));
+                    extra_keys.push(keyed(&hints.interrupt, "cancel turn"));
                     [
-                        keyed(&self.hints.confirm, "attach verified reference"),
-                        keyed(&self.hints.cancel, "back"),
+                        keyed(&hints.confirm, "attach"),
+                        keyed(&hints.cancel, "back"),
                     ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                );
-                rows.push(editor.text.clone());
+                }
+            };
+        let mut footer = hint_rows(essential.into_iter().flatten(), inner);
+        let body_capacity = capacity.saturating_sub(1);
+        // Leave at least one active row even when every hint cannot fit.
+        footer.truncate(body_capacity.saturating_sub(1));
+        let mut room = body_capacity.saturating_sub(footer.len());
+        let feedback = text::wrap_words(&self.feedback, inner);
+        let feedback_count = if self.feedback.is_empty() {
+            0
+        } else {
+            feedback.len().min(room.saturating_sub(1)).min(2)
+        };
+        room = room.saturating_sub(feedback_count);
+        let mut rows = vec![title];
+        if matches!(self.mode, Mode::Choices) {
+            // One context row is enough to reach every line with page keys. Larger dialogs
+            // also show neighbouring options; the selected option never leaves the viewport.
+            let extra_rows = hint_rows(extra_keys.iter().flatten().cloned(), inner)
+                .len()
+                .min(room.saturating_sub(2));
+            let choice_rows = room
+                .saturating_sub(extra_rows + 1)
+                .clamp(1, 5)
+                .min(choices.len());
+            let context_room = room.saturating_sub(extra_rows + choice_rows);
+            let scroll_hint = keyed(&hints.page, "scroll details");
+            if context_extent > context_room && room >= 3 {
+                extra_keys.insert(0, scroll_hint);
             }
-            Mode::Choices => {
-                let available = height.saturating_sub(rows.len() + 9).max(3);
-                let count = question.options.len();
-                let start = self
-                    .cursor
-                    .saturating_sub(available / 2)
-                    .min((count + 4).saturating_sub(available));
-                for index in start..(start + available).min(count + 4) {
-                    let label = if index < count {
-                        let option = &question.options[index];
-                        format!(
-                            "{} {}{}",
-                            if answer.selected_options.contains(&option.label) {
-                                "[x]"
-                            } else {
-                                "[ ]"
-                            },
-                            option.label,
-                            if question.recommended == Some(index) {
-                                " (Recommended)"
-                            } else {
-                                ""
-                            }
-                        )
-                    } else {
-                        match index - count {
-                            0 => "Other (type your own)",
-                            1 => "Add/edit note",
-                            2 => "Chat about this",
-                            _ if self.page + 1 == self.request.questions.len() => "Done selecting",
-                            _ => "Next →",
-                        }
-                        .into()
-                    };
-                    rows.push(format!(
-                        "{} {label}",
-                        if index == self.cursor { ">" } else { " " }
-                    ));
-                }
-                let option = question.options.get(self.cursor);
-                let detail = option
-                    .and_then(|option| option.description.as_deref())
-                    .unwrap_or("");
-                let preview = option
-                    .and_then(|option| option.preview.as_deref())
-                    .unwrap_or("");
-                // Only what the highlighted option adds: its description, then its preview.
-                let mut extra = String::new();
-                if !detail.trim().is_empty() {
-                    extra.push_str(detail.trim());
-                }
-                if !preview.trim().is_empty() {
-                    if !extra.is_empty() {
-                        extra.push('\n');
-                    }
-                    extra.push_str(&format!("Preview: {}", preview.trim()));
-                }
-                if !extra.is_empty() {
-                    let lines = text::wrap_words(&extra, width.max(1));
-                    rows.extend(lines.into_iter().skip(self.preview_scroll).take(4));
-                }
-                if let Some(custom) = &answer.custom_input {
-                    rows.push(format!("Custom: {}", text::one_line(custom)));
-                }
-                if let Some(note) = &answer.note {
-                    rows.push(format!("Note: {}", text::one_line(note)));
-                }
-                // Only keys that do something on this page are advertised.
-                let hints = &self.hints;
-                let mut keys = vec![
-                    keyed(&hints.select, "choose"),
-                    keyed(&hints.confirm, "select"),
-                ];
-                if self.page > 0 {
-                    keys.push(keyed(&hints.back, "back"));
-                }
-                keys.push(keyed(
-                    &hints.next,
-                    if self.page + 1 == total {
-                        "done"
-                    } else {
-                        "next"
-                    },
+            let extras = hint_rows(extra_keys.into_iter().flatten(), inner);
+            let extras_count = extras.len().min(room.saturating_sub(2));
+            let choice_room = room
+                .saturating_sub(extras_count)
+                .saturating_sub(1)
+                .clamp(1, 5)
+                .min(choices.len());
+            let context_room = room
+                .saturating_sub(extras_count + choice_room)
+                .min(context_extent);
+            let start = self
+                .preview_scroll
+                .get()
+                .min(context.len().saturating_sub(context_room.max(1)));
+            self.preview_scroll.set(start);
+            rows.extend(context.into_iter().skip(start).take(context_room));
+            rows.resize(1 + context_room, String::new());
+            let start = self
+                .cursor
+                .saturating_sub(choice_room / 2)
+                .min(choices.len().saturating_sub(choice_room));
+            rows.extend(choices.into_iter().skip(start).take(choice_room.min(room)));
+            footer.splice(0..0, extras.into_iter().take(extras_count));
+        } else {
+            let extras = hint_rows(extra_keys.into_iter().flatten(), inner);
+            let extras_count = extras.len().min(room.saturating_sub(3));
+            let context_room = context.len().min(room.saturating_sub(extras_count + 3));
+            rows.extend(context.into_iter().take(context_room));
+            let input_room = room.saturating_sub(extras_count + context_room).max(1);
+            let boxed = inner >= 8 && input_room >= 3;
+            let content_room = input_room.saturating_sub(if boxed { 2 } else { 0 }).max(1);
+            let start = cursor_row.saturating_sub(content_room.saturating_sub(1));
+            if boxed {
+                let label = match self.mode {
+                    Mode::Text(Field::Custom, _) => "Your answer",
+                    Mode::Text(Field::Note, _) => "Your note",
+                    _ => "Image path",
+                };
+                let label = text::clip(label, inner.saturating_sub(5));
+                rows.push(format!(
+                    "┌─ {label} {}┐",
+                    "─".repeat(inner - text::width(&label) - 5)
                 ));
-                keys.extend(["o other", "n note", "c chat"].map(|hint| Some(hint.to_owned())));
-                // The way out goes last.
-                keys.push(keyed(&hints.cancel, "cancel"));
-                rows.push(keys.into_iter().flatten().collect::<Vec<_>>().join(" · "));
             }
+            for line in input.into_iter().skip(start).take(content_room.min(room)) {
+                if inner >= 8 {
+                    let pad = inner.saturating_sub(4 + text::width(&line));
+                    rows.push(format!("│ {line}{} │", " ".repeat(pad)));
+                } else {
+                    rows.push(line);
+                }
+            }
+            if boxed {
+                rows.push(format!("└{}┘", "─".repeat(inner - 2)));
+            }
+            footer.splice(0..0, extras.into_iter().take(extras_count));
         }
-        if !self.feedback.is_empty() {
-            rows.push(self.feedback.clone());
-        }
-        if let Some(deadline) = self.deadline
-            && matches!(self.mode, Mode::Choices)
-        {
-            rows.push(format!(
-                "Answers itself in {}s with your selection or the recommended choice",
-                deadline.saturating_duration_since(Instant::now()).as_secs()
-            ));
-        }
+        rows.extend(feedback.into_iter().take(feedback_count));
+        rows.extend(footer);
+        rows.truncate(capacity);
         rows
     }
+}
+
+/// Keep each binding next to its action when packing narrow footer rows.
+fn hint_rows(hints: impl IntoIterator<Item = String>, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for hint in hints {
+        if let Some(last) = rows.last_mut()
+            && text::width(last) + 3 + text::width(&hint) <= width
+        {
+            last.push_str(" · ");
+            last.push_str(&hint);
+        } else {
+            rows.extend(text::wrap_words(&hint, width));
+        }
+    }
+    rows
+}
+
+/// Wrap both fields with the cursor as a distinct span, so pasted cursor glyphs and word
+/// wrapping cannot misidentify the active row. Hard wrapping preserves input whitespace.
+fn input_rows(editor: &Editor, width: usize) -> (Vec<String>, usize) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+    };
+    let mut paragraphs: Vec<Line<'static>> = editor.text[..editor.cursor]
+        .split('\n')
+        .map(|line| Line::from(line.to_owned()))
+        .collect();
+    let active = paragraphs
+        .last_mut()
+        .expect("split always yields one paragraph");
+    active.spans.push(Span::styled(
+        "│",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    let mut after = editor.text[editor.cursor..].split('\n');
+    active
+        .spans
+        .push(Span::raw(after.next().unwrap_or_default().to_owned()));
+    paragraphs.extend(after.map(|line| Line::from(line.to_owned())));
+    let wrapped = text::wrap(paragraphs, width);
+    let cursor = wrapped
+        .iter()
+        .position(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+        })
+        .unwrap_or(0);
+    (wrapped.iter().map(ToString::to_string).collect(), cursor)
 }
 
 /// [`Dialog::rows`] as an inset panel on the panel surface: the first row becomes the bold
@@ -669,6 +786,37 @@ pub fn framed(
     let last = rows.len() - 1;
     for (index, row) in rows.into_iter().enumerate().skip(1) {
         let row = text::one_line(&row);
+        // Input boundaries are emitted by rows(), including on cramped viewports where only
+        // the side rails fit. Keep editable text at normal contrast, unlike explanatory copy.
+        if (row.starts_with("│ ") && row.ends_with(" │"))
+            || (row.starts_with("┌─") && row.ends_with('┐'))
+            || (row.starts_with('└') && row.ends_with('┘'))
+        {
+            let input = row.starts_with('│');
+            let row = if ascii {
+                if input {
+                    format!("|{}|", &row['│'.len_utf8()..row.len() - '│'.len_utf8()])
+                } else {
+                    row.replace(['┌', '┐', '└', '┘'], "+").replace('─', "-")
+                }
+            } else {
+                row
+            };
+            let row = text::clip(&row, inner);
+            let pad = inner.saturating_sub(text::width(&row));
+            out.push(Line::from(super::chrome::on_surface(
+                theme,
+                vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        row,
+                        theme.fg(if input { Tok::Text } else { Tok::BorderAccent }),
+                    ),
+                    Span::raw(" ".repeat(pad + 2)),
+                ],
+            )));
+            continue;
+        }
         let footer = index == last && row.contains(" · ") && !row.starts_with('>');
         let (selected, body) = match row.strip_prefix("> ") {
             Some(rest) => (true, rest.to_owned()),

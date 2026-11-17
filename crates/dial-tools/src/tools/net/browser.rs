@@ -1214,6 +1214,7 @@ fn driver_command(
         deny_read,
         mut extra_write,
         allow_network,
+        serial_ports,
     } = workspace.sandbox_policy()
     else {
         return Err("browser on Windows supports sandbox.mode = \"dev\" or \"off\"".into());
@@ -1223,6 +1224,7 @@ fn driver_command(
         deny_read,
         extra_write,
         allow_network,
+        serial_ports,
     };
     let node = node.to_str().ok_or("Node executable path is not UTF-8")?;
     let script = script.to_str().ok_or("browser state path is not UTF-8")?;

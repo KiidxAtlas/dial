@@ -263,6 +263,8 @@ const EMBEDDING_OVERRIDE_ROWS: [&str; 2] =
 
 pub struct SettingsOverlay {
     panel_keys: super::panel_keys::PanelKeys,
+    hits: super::panel_keys::RowHits,
+    tab_hits: super::panel_keys::RowHits,
     effective: Table,
     /// Display-only differences from the actual active config. Sensitive values are never retained.
     application_changes: BTreeMap<&'static str, (String, String)>,
@@ -298,10 +300,12 @@ pub struct SettingsOverlay {
     notes: BTreeMap<String, String>,
     /// Read-only findings under a row (for example whether a program is on PATH); not cleared by edits.
     hints: BTreeMap<String, String>,
-    /// Missing-dependency offers by setting path; Ctrl+L shows the plan, then starts the install.
+    /// Missing-dependency offers by setting path; Ctrl+L opens a dedicated plan review.
     setup_offers: BTreeMap<String, SetupOffer>,
-    /// The dependency whose plan is showing; the next Ctrl+L on it starts the install.
+    /// The dependency whose plan is showing; review navigation never changes the setting.
     setup_armed: Option<String>,
+    setup_scroll: usize,
+    setup_usable: bool,
     /// True while a setup job this overlay started is running; the controller clears it once it settles.
     setup_pending: bool,
     /// A memory backend the user chose whose required fields are still empty. Its section is
@@ -443,6 +447,8 @@ impl SettingsOverlay {
     ) -> Self {
         SettingsOverlay {
             panel_keys: Default::default(),
+            hits: Default::default(),
+            tab_hits: Default::default(),
             effective: values,
             application_changes: BTreeMap::new(),
             application_busy: false,
@@ -471,6 +477,8 @@ impl SettingsOverlay {
             hints: BTreeMap::new(),
             setup_offers: BTreeMap::new(),
             setup_armed: None,
+            setup_scroll: 0,
+            setup_usable: false,
             setup_pending: false,
             memory_intent: None,
             advanced_open: BTreeSet::new(),
@@ -567,6 +575,8 @@ impl SettingsOverlay {
     pub fn set_setup_offers(&mut self, offers: BTreeMap<String, SetupOffer>) {
         self.setup_offers = offers;
         self.setup_armed = None;
+        self.setup_scroll = 0;
+        self.setup_usable = false;
     }
 
     /// Whether a setup job started from this overlay is still running.
@@ -1103,6 +1113,39 @@ impl SettingsOverlay {
         if self.bulk_review.is_some() {
             return self.bulk_handle(event, keys);
         }
+        if self.setup_armed.is_some() {
+            if let Event::Key(key) = event
+                && pressed(key)
+            {
+                if keys.matches(Action::SelectCancel, key) {
+                    self.setup_armed = None;
+                    self.setup_scroll = 0;
+                    self.setup_usable = false;
+                    self.feedback = Some("Cancelled; nothing installed".into());
+                } else if keys.matches(Action::SelectConfirm, key) || is_ctrl(key, 'l') {
+                    if self.setup_usable {
+                        let id = self.setup_armed.take().unwrap_or_default();
+                        self.setup_scroll = 0;
+                        self.setup_usable = false;
+                        self.feedback = Some("Installing in the background".into());
+                        return OverlayEvent::SetupDep { id };
+                    }
+                } else if keys.matches(Action::SelectDown, key) {
+                    self.setup_scroll = self.setup_scroll.saturating_add(1);
+                } else if keys.matches(Action::SelectUp, key) {
+                    self.setup_scroll = self.setup_scroll.saturating_sub(1);
+                } else if keys.matches(Action::SelectPageDown, key) {
+                    self.setup_scroll = self.setup_scroll.saturating_add(self.page);
+                } else if keys.matches(Action::SelectPageUp, key) {
+                    self.setup_scroll = self.setup_scroll.saturating_sub(self.page);
+                } else if key.code == KeyCode::Home {
+                    self.setup_scroll = 0;
+                } else if key.code == KeyCode::End {
+                    self.setup_scroll = usize::MAX;
+                }
+            }
+            return OverlayEvent::None;
+        }
         if self.panel_keys.handle_key(
             event,
             !matches!(self.mode, Mode::Browse) || !self.search.is_empty(),
@@ -1190,7 +1233,7 @@ impl SettingsOverlay {
             .copied()
     }
 
-    /// Ctrl+L on a row whose program is missing: the first press shows the plan, the second starts the install.
+    /// Ctrl+L on a missing dependency opens its controller-supplied installation plan.
     fn setup_key(&mut self) -> OverlayEvent {
         let Some(Row::Setting(i)) = self.current_row() else {
             return OverlayEvent::None;
@@ -1200,16 +1243,11 @@ impl SettingsOverlay {
             self.feedback = Some("Nothing to set up on this row".to_owned());
             return OverlayEvent::None;
         };
-        if self.setup_armed.as_deref() == Some(offer.id.as_str()) {
-            self.setup_armed = None;
-            self.feedback = Some(format!("Installing {} in the background", offer.title));
-            return OverlayEvent::SetupDep {
-                id: offer.id.clone(),
-            };
-        }
         self.setup_armed = Some(offer.id.clone());
+        self.setup_scroll = 0;
+        self.setup_usable = false;
         self.feedback = Some(format!(
-            "Review the plan below, then press Ctrl+L again to install {}",
+            "Review the plan, then press Enter or Ctrl+L to install {}",
             offer.title
         ));
         OverlayEvent::None
@@ -1602,7 +1640,7 @@ impl SettingsOverlay {
                 self.notes.insert(
                     def.path.to_owned(),
                     format!(
-                        "Set in the {} scope; press Ctrl+S to switch scope, then Delete",
+                        "Set in the {} scope; press Ctrl+B to switch scope, then Delete",
                         scope_name(other_scope(self.scope))
                     ),
                 );
@@ -1613,7 +1651,38 @@ impl SettingsOverlay {
 
     // ---- drawing --------------------------------------------------------------------------
 
+    /// Select a visible setting without applying or opening it.
+    pub fn click(&mut self, x: u16, y: u16) -> OverlayEvent {
+        if !self.panel_keys.open()
+            && matches!(self.mode, Mode::Browse)
+            && self.bulk_review.is_none()
+            && !self.appearance_preview
+            && let Some(index) = self.hits.hit(x, y)
+        {
+            self.cursor = index;
+        }
+        if !self.panel_keys.open()
+            && matches!(self.mode, Mode::Browse)
+            && self.bulk_review.is_none()
+            && !self.appearance_preview
+            && let Some(tab) = self.tab_hits.hit(x, y)
+        {
+            self.tab = tab;
+            self.cursor = 0;
+            self.scroll = 0;
+            self.search.clear();
+        }
+        OverlayEvent::None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        self.hits.begin(frame.area());
+        self.tab_hits.begin(frame.area());
+        match &mut self.mode {
+            Mode::Path { browser, .. } => browser.poll(),
+            Mode::List { editor, .. } => editor.poll(),
+            _ => {}
+        }
         if let Some(review) = &mut self.bulk_review {
             review.display_ready = false;
         }
@@ -1622,7 +1691,7 @@ impl SettingsOverlay {
             frame,
             ctx,
             "Settings",
-            "Type to search every setting; there is no separate search key.\nCtrl+S changes save scope · Ctrl+O filters saved overrides across categories · Delete resets the selected setting · Ctrl+L reviews available setup",
+            "Type to search every setting; there is no separate search key.\nCtrl+B changes save scope · Ctrl+O filters saved overrides across categories · Delete resets the selected setting · Ctrl+L reviews available setup",
             true,
             false,
         ) {
@@ -1640,7 +1709,7 @@ impl SettingsOverlay {
             format!(" · {count} pending")
         };
         let full = format!(
-            "Save to: {scope}{pending} {} Ctrl+S",
+            "Save to: {scope}{pending} {} Ctrl+B",
             ctx.theme.sym(Sym::Dot)
         );
         let short = format!("Save to: {scope}{pending}");

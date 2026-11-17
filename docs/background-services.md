@@ -6,7 +6,20 @@ The `bg` tool starts process-group-owned jobs with a bounded live output ring an
 
 Jobs are session-owned unless a call explicitly supplies `persist: true`: use `list`, `output`, `wait`, `input`, `resize`, and `kill` while the session is active. The `/bg` panel lists ordinary session jobs and their status, and shows a PTY job's rendered screen. Enter on a PTY job attaches the keyboard to it; Ctrl-] (or Ctrl-5) detaches. Pipe input and PTY input are explicit tool actions. Processes are stopped when their owning background tool is dropped.
 
+The PTY viewer preserves the emulator's indexed/RGB foreground and background colours, bold,
+italic, underline and inverse attributes, styled blanks, wide characters and cursor visibility.
+It follows the child's application-cursor mode and sends xterm modifier parameters for navigation
+and function keys (for example Ctrl+Left). When the child enables bracketed paste, pasted text is
+sent unchanged between paste delimiters; otherwise newlines are converted to terminal carriage
+returns. Detaching or changing jobs clears the previous child's input modes. The panel does not
+enable child modes itself or interpret process output as host-terminal escape sequences.
+
 Readers settle for at most 300 ms after leader exit. On cleanup they drain for at most another 300 ms, with a bounded join wait; a descendant retaining an output descriptor cannot hold the controller's readers indefinitely. Incomplete captures are marked partial. POSIX descendants that escape their process group remain a residual cleanup limitation (Linux's sandbox PID namespace adds containment).
+
+PTY start and resize require at most 262,144 cells (`rows × cols`), in addition to individual axis
+limits, and reject larger screens before allocation. Windows output readers use nonblocking pipe
+inspection so quiet open pipes cannot defeat cleanup deadlines; queued input delivery and failure
+wake waiting controllers rather than relying on another output event.
 
 PTY starts without explicit `ready` automatically observe the newly started job for up to one second after spawn, returning its rendered initial screen and controller-owned process/capture status. Observed exit ends the observation sooner; a nonzero or signal exit is reported as an error while retaining the job handle for inspection. The existing reader-settlement allowance can add up to 300 ms, plus spawn/scheduling overhead. The wait is interruptible and never sends input or starts a replacement process. A running screen is neither explicit readiness nor behavioral verification. Explicit readiness retains its existing wait path; ordinary pipe starts remain asynchronous. The same observation applies to `bash` with `pty: true`.
 

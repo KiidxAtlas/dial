@@ -57,7 +57,11 @@ impl Shell {
                 .into_iter()
                 .chain(crate::llm::oauth::take_notice())
             {
-                self.note("Notice", notice);
+                self.notify(
+                    crate::ui::overlay::inbox::Category::General,
+                    "Notice",
+                    notice,
+                );
                 dirty = true;
             }
             if let Some(config) = self.pending_config.take() {

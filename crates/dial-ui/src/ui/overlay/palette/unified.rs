@@ -103,8 +103,8 @@ impl UnifiedSearch {
                         &crate::ui::session_picker::search_text(session),
                     )? as i64)
                 } else {
-                    let name = text::fuzzy(query, &entry.label);
-                    let other = text::fuzzy(
+                    let name = text::fuzzy_compact(query, &entry.label);
+                    let other = text::fuzzy_prose(
                         query,
                         &format!(
                             "{} {} {}",

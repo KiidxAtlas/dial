@@ -288,6 +288,7 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
         deny_read: Vec::new(),
         extra_write: Vec::new(),
         allow_network: false,
+        serial_ports: false,
     };
     let sandbox = crate::tools::exec::sandbox::Sandbox::detect();
     sandbox.available().unwrap();

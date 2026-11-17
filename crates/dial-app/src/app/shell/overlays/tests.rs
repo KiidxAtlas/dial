@@ -825,3 +825,348 @@ fn settings_pending_rows_compare_active_app_not_reloaded_saved_config() {
         .collect::<String>();
     assert!(!shown.contains("after this turn"), "{shown}");
 }
+
+#[test]
+fn controls_inspect_one_retired_tool_without_expanding_either_card() {
+    use crate::runtime::presentation::{BodyStyle, Presentation};
+    use crate::ui::{
+        keys::Keymap,
+        overlay::{DrawCtx, OverlayEvent},
+        transcript::TranscriptCtx,
+    };
+
+    fn compact(shell: &Shell) -> String {
+        let ctx = TranscriptCtx {
+            theme: shell.themes.current(),
+            ui: &shell.ui,
+            tick: 0,
+            tools_expanded: shell.tools_expanded,
+            expand_key: "Ctrl+O",
+        };
+        shell
+            .transcript
+            .document(100, &ctx)
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let (_home, _project, app, mut shell) = shell();
+    shell.composer.set_draft("keep my draft");
+    shell.ui.show_tools = true;
+    shell.tools_expanded = false;
+    for (id, preview, output) in [
+        (
+            "first:\"/中文",
+            "FIRST_PREVIEW",
+            "FIRST_FULL\nUnicode 👩‍💻 e\u{301}\n\u{1b}[31mterminal safe",
+        ),
+        ("second", "SECOND_PREVIEW", "SECOND_FULL"),
+    ] {
+        shell
+            .transcript
+            .tool_start(id, "custom", id, "{\"argument\":\"retained\"}");
+        shell.transcript.tool_end(id, output, false, 0.1);
+        shell.transcript.tool_presentation(
+            id,
+            &Presentation {
+                label: "Inspect".into(),
+                body: BodyStyle::Text,
+                preview: Some(preview.into()),
+                ..Default::default()
+            },
+        );
+    }
+    shell.transcript.finish_turn();
+    {
+        let ctx = TranscriptCtx {
+            theme: shell.themes.current(),
+            ui: &shell.ui,
+            tick: 0,
+            tools_expanded: false,
+            expand_key: "Ctrl+O",
+        };
+        shell.transcript.take_settled_with_images(100, &ctx);
+    }
+    let before = compact(&shell);
+    assert!(
+        before.contains("FIRST_PREVIEW") && before.contains("SECOND_PREVIEW"),
+        "{before}"
+    );
+    assert!(!before.contains("FIRST_FULL") && !before.contains("SECOND_FULL"));
+    let keys = Keymap::defaults();
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let mut controls = shell.controls_picker(&app.config);
+    controls
+        .items
+        .retain(|item| item.value == "open:tool-evidence");
+    assert_eq!(controls.items.len(), 1);
+    let OverlayEvent::Action(action) = PaletteOverlay::choice(controls).handle(&enter, &keys)
+    else {
+        panic!("controls navigation");
+    };
+    let mut picker = shell
+        .make_overlay(&app, overlay_destination(&action).unwrap())
+        .unwrap();
+    let OverlayEvent::Action(action) = picker.handle(&enter, &keys) else {
+        panic!("call navigation");
+    };
+    let mut evidence = shell
+        .make_overlay(&app, overlay_destination(&action).unwrap())
+        .unwrap();
+    assert_eq!(evidence.title(), "Tool evidence");
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let ctx = DrawCtx {
+        theme: shell.themes.current(),
+        keys: &keys,
+        status: &shell.status,
+        preview_status: &|_, _| Line::default(),
+    };
+    terminal.draw(|frame| evidence.draw(frame, &ctx)).unwrap();
+    let shown: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        shown.contains("FIRST_FULL") && shown.contains("terminal safe"),
+        "{shown}"
+    );
+    assert!(!shown.contains("SECOND_FULL") && !shown.contains("FIRST_PREVIEW"));
+    assert!(!shown.contains('\u{1b}'));
+    assert!(matches!(
+        evidence.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &keys
+        ),
+        OverlayEvent::Close
+    ));
+    assert_eq!(compact(&shell), before);
+    assert!(!shell.tools_expanded);
+    assert_eq!(shell.composer.draft(), "keep my draft");
+
+    // A stale picker handle is a read-only refusal, never a different call by row number.
+    let mut stale = shell
+        .make_overlay(&app, Which::ToolEvidenceCall("gone".into()))
+        .unwrap();
+    let ctx = DrawCtx {
+        theme: shell.themes.current(),
+        keys: &keys,
+        status: &shell.status,
+        preview_status: &|_, _| Line::default(),
+    };
+    terminal.draw(|frame| stale.draw(frame, &ctx)).unwrap();
+    let shown: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(shown.contains("no longer retained"));
+    assert!(!shown.contains("FIRST_FULL") && !shown.contains("SECOND_FULL"));
+}
+
+#[test]
+fn queue_picker_handles_do_not_remove_a_shifted_or_replacement_message() {
+    let (_home, _project, _app, mut shell) = shell();
+    shell
+        .composer
+        .restore_pending_messages(vec!["consumed".into(), "keep".into()]);
+    let id = shell.composer.queued_items()[0].0;
+    assert_eq!(shell.composer.take_follow_up().as_deref(), Some("consumed"));
+    shell.queue_command(&format!("/queue remove @{id}"));
+    assert_eq!(
+        shell.composer.queued_messages(),
+        vec![("keep".into(), false)]
+    );
+    shell
+        .composer
+        .restore_pending_messages(vec!["consumed".into()]);
+    shell.queue_command(&format!("/queue edit @{id}"));
+    assert_eq!(shell.composer.draft(), "");
+    assert_eq!(shell.composer.queued_messages().len(), 2);
+}
+
+#[test]
+fn downloads_remain_an_activity_panel_with_the_existing_model_owner() {
+    let (_home, _project, app, mut shell) = shell();
+    for which in [
+        Which::ModelDownloads,
+        Which::Activity(crate::app::overlay::activity::ActivityTab::Downloads),
+    ] {
+        let mut overlay = shell.make_overlay(&app, which).unwrap();
+        assert!(matches!(overlay, ActiveOverlay::Activity(_)));
+        assert!(matches!(overlay.content_mut(), ActiveOverlay::Models(_)));
+    }
+}
+
+#[test]
+fn downloads_escape_returns_to_the_retained_origin_without_losing_the_draft() {
+    let (_home, _project, app, mut shell) = shell();
+    shell
+        .composer
+        .set_draft("keep this while inspecting downloads");
+    shell.start_busy_overlay(&app, Which::Settings).unwrap();
+    shell.busy_overlay.as_mut().unwrap().next = Some("open:activity:workers".into());
+    shell.finish_busy_overlay(&app).unwrap();
+    let press = |code| Some(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    // Activity siblings replace one another, but keep the retained settings origin. Use real
+    // tab routing and Esc, including the existing Models owner in Downloads.
+    shell
+        .step_busy_overlay(&app, press(KeyCode::Right))
+        .unwrap();
+    assert!(matches!(
+        shell.busy_overlay.as_mut().unwrap().overlay.content_mut(),
+        ActiveOverlay::Jobs(_)
+    ));
+    shell
+        .step_busy_overlay(&app, press(KeyCode::Right))
+        .unwrap();
+    let state = shell.busy_overlay.as_mut().unwrap();
+    assert!(matches!(state.overlay, ActiveOverlay::Activity(_)));
+    assert!(matches!(
+        state.overlay.content_mut(),
+        ActiveOverlay::Models(_)
+    ));
+    assert_eq!(state.history.len(), 1);
+    shell.step_busy_overlay(&app, press(KeyCode::Esc)).unwrap();
+    let state = shell.busy_overlay.as_mut().unwrap();
+    // On a wide panel, the download owner first returns focus to its groups. A second Esc
+    // leaves that owner and restores the retained origin, exactly like standalone Models.
+    assert!(matches!(
+        state.overlay.content_mut(),
+        ActiveOverlay::Models(_)
+    ));
+    assert_eq!(state.history.len(), 1);
+    shell.step_busy_overlay(&app, press(KeyCode::Esc)).unwrap();
+    let state = shell.busy_overlay.as_mut().unwrap();
+    assert!(matches!(state.overlay, ActiveOverlay::Settings(_)));
+    assert!(state.history.is_empty());
+    assert_eq!(
+        shell.composer.draft(),
+        "keep this while inspecting downloads"
+    );
+    assert!(shell.deferred.is_empty() && shell.startup.is_none());
+}
+
+#[test]
+fn busy_history_navigation_waits_for_idle_and_more_reports_its_outcome() {
+    for (action, command) in [
+        ("history-open:fixture", "/search open fixture"),
+        ("history-return", "/search back"),
+        ("history-more", "/search more"),
+    ] {
+        let (_home, _project, app, mut shell) = shell();
+        let panel = crate::ui::overlay::history_search::HistorySearchOverlay::new(
+            "query".into(),
+            vec![],
+            true,
+        );
+        shell
+            .start_busy_overlay(&app, Which::HistorySearch(panel))
+            .unwrap();
+        shell.busy_overlay.as_mut().unwrap().next = Some(action.into());
+        assert!(!shell.finish_busy_overlay(&app).unwrap());
+        assert!(shell.startup.is_none());
+        if action == "history-more" {
+            let ctx = crate::ui::transcript::TranscriptCtx {
+                theme: shell.themes.current(),
+                ui: &shell.ui,
+                tick: 0,
+                tools_expanded: false,
+                expand_key: "Ctrl+O",
+            };
+            let text = shell
+                .transcript
+                .document(100, &ctx)
+                .0
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("No current search"), "{text}");
+        } else {
+            assert_eq!(
+                shell.deferred.front().map(String::as_str),
+                Some(command),
+                "{action}"
+            );
+        }
+    }
+}
+
+#[test]
+fn attention_drilldown_returns_to_its_origin_but_tabs_replace_it() {
+    use crate::app::overlay::activity::{ActivityOverlay, ActivityTab};
+    use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
+    for target in ["open:process:\"fixture\"", "subagent-open:fixture"] {
+        let (_home, _project, app, mut shell) = shell();
+        shell
+            .start_busy_overlay(&app, Which::Activity(ActivityTab::Attention))
+            .unwrap();
+        let mut picker = PaletteOverlay::choice(ChoiceSpec {
+            title: "Attention".into(),
+            items: ["one", "two"]
+                .into_iter()
+                .map(|name| ChoiceItem {
+                    value: format!("keep-{name}"),
+                    label: format!("Keep {name}"),
+                    detail: String::new(),
+                    current: false,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        for code in [KeyCode::Char('k'), KeyCode::Down] {
+            picker.handle(
+                &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                &shell.keys,
+            );
+        }
+        shell.busy_overlay.as_mut().unwrap().overlay = ActiveOverlay::Activity(Box::new(
+            ActivityOverlay::new(ActivityTab::Attention, ActiveOverlay::Palette(picker)),
+        ));
+        shell.busy_overlay.as_mut().unwrap().next = Some(target.into());
+        shell.finish_busy_overlay(&app).unwrap();
+        assert_eq!(
+            shell.busy_overlay.as_ref().unwrap().history.len(),
+            1,
+            "{target}"
+        );
+        shell
+            .step_busy_overlay(
+                &app,
+                Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            )
+            .unwrap();
+        let state = shell.busy_overlay.as_mut().unwrap();
+        assert!(
+            matches!(state.overlay, ActiveOverlay::Activity(_)),
+            "return to Attention: {target}"
+        );
+        assert!(state.history.is_empty());
+        let event = state.overlay.content_mut().handle(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &shell.keys,
+        );
+        assert!(
+            matches!(event, crate::ui::overlay::OverlayEvent::Action(ref value) if value == "command:/keep-two"),
+            "{event:?}"
+        );
+        let cleared = state.overlay.content_mut().handle(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &shell.keys,
+        );
+        assert!(
+            matches!(cleared, crate::ui::overlay::OverlayEvent::None),
+            "the retained filter clears before leaving: {cleared:?}"
+        );
+        state.next = Some("open:activity:processes".into());
+        shell.finish_busy_overlay(&app).unwrap();
+        assert!(shell.busy_overlay.as_ref().unwrap().history.is_empty());
+    }
+}

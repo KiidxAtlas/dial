@@ -20,6 +20,9 @@ use ratatui::{
 #[derive(Default)]
 pub struct PanelKeys {
     help: bool,
+    scroll: std::cell::Cell<usize>,
+    page: std::cell::Cell<usize>,
+    total: std::cell::Cell<usize>,
     /// The panel's full footer while its key sheet is open (see [`Self::set_footer`]).
     footer: Vec<String>,
 }
@@ -68,14 +71,38 @@ pub fn sheet(
             chrome::label(theme, group.title),
         ]));
         for (keys, label) in &group.rows {
-            let pad = key_w.saturating_sub(text::width(keys));
-            out.push(Line::from(vec![
-                Span::styled(
-                    format!("   {keys}{}", " ".repeat(pad)),
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {label}"), theme.fg(Tok::Text)),
-            ]));
+            let indent = 3.min(width.saturating_sub(1));
+            if key_w + 5 < width {
+                let prefix = format!("{}{}  ", " ".repeat(indent), text::pad(keys, key_w));
+                let label_rows =
+                    text::wrap_words(label, width.saturating_sub(text::width(&prefix)).max(1));
+                for (i, row) in label_rows.into_iter().enumerate() {
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            if i == 0 {
+                                prefix.clone()
+                            } else {
+                                " ".repeat(text::width(&prefix))
+                            },
+                            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(row, theme.fg(Tok::Text)),
+                    ]));
+                }
+            } else {
+                for row in text::wrap_words(keys, width.saturating_sub(indent).max(1)) {
+                    out.push(Line::from(Span::styled(
+                        format!("{}{row}", " ".repeat(indent)),
+                        theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                for row in text::wrap_words(label, width.saturating_sub(1).max(1)) {
+                    out.push(Line::from(Span::styled(
+                        format!(" {row}"),
+                        theme.fg(Tok::Text),
+                    )));
+                }
+            }
         }
     }
     let notes: Vec<&str> = notes.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -96,7 +123,7 @@ pub fn sheet(
         chrome::hint_line(theme, &[(back, "back to panel")], width.saturating_sub(1)).spans,
     );
     out.push(Line::from(footer));
-    out
+    text::wrap(out, width.max(1))
 }
 
 /// Most hints a panel footer shows; the rest live in the key sheet.
@@ -141,6 +168,21 @@ impl PanelKeys {
             return self.help;
         }
         if self.help {
+            let max = self.total.get().saturating_sub(self.page.get());
+            let step = self.page.get().max(1);
+            match key.code {
+                KeyCode::Down => self
+                    .scroll
+                    .set(self.scroll.get().saturating_add(1).min(max)),
+                KeyCode::Up => self.scroll.set(self.scroll.get().saturating_sub(1)),
+                KeyCode::PageDown => self
+                    .scroll
+                    .set(self.scroll.get().saturating_add(step).min(max)),
+                KeyCode::PageUp => self.scroll.set(self.scroll.get().saturating_sub(step)),
+                KeyCode::Home => self.scroll.set(0),
+                KeyCode::End => self.scroll.set(max),
+                _ => {}
+            }
             if matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?')
@@ -150,10 +192,39 @@ impl PanelKeys {
             return true;
         }
         if key.code == KeyCode::F(1) || (key.code == KeyCode::Char('?') && !text_focused) {
+            self.scroll.set(0);
             self.help = true;
             return true;
         }
         false
+    }
+
+    /// Bound a rendered key sheet to the available rows, keeping scroll hints pinned.
+    pub(crate) fn viewport(
+        &self,
+        mut lines: Vec<Line<'static>>,
+        w: usize,
+        h: usize,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        if h == 0 {
+            return Vec::new();
+        }
+        // The way back is chrome, not part of the scrollable reference.
+        lines.pop();
+        let page = h.saturating_sub(1);
+        self.page.set(page);
+        self.total.set(lines.len());
+        let offset = self.scroll.get().min(lines.len().saturating_sub(page));
+        self.scroll.set(offset);
+        let mut out: Vec<_> = lines.into_iter().skip(offset).take(page).collect();
+        out.resize(page, Line::default());
+        out.push(chrome::hint_line(
+            theme,
+            &[("↑↓/PgUp/PgDn", "scroll"), ("Esc", "back")],
+            w,
+        ));
+        out
     }
 
     /// Whether the key sheet is showing.
@@ -234,8 +305,13 @@ impl PanelKeys {
             rows: Self::rows(ctx.keys, tabs, search),
         });
         let title = format!("{title} · keys");
-        panel(frame, ctx.theme, Section::Dial, &title, "", |w, _| {
-            sheet(ctx.theme, &groups, extra, "Esc", usize::from(w))
+        panel(frame, ctx.theme, Section::Dial, &title, "", |w, h| {
+            self.viewport(
+                sheet(ctx.theme, &groups, extra, "Esc", usize::from(w)),
+                usize::from(w),
+                usize::from(h),
+                ctx.theme,
+            )
         });
         true
     }
@@ -243,3 +319,39 @@ impl PanelKeys {
 
 #[cfg(test)]
 mod tests;
+
+/// Hit targets from the last rendered panel, in terminal coordinates. Only real selectable rows
+/// are recorded: headers, padding, clipped rows and modal editors cannot accidentally select.
+#[derive(Default)]
+pub(super) struct RowHits {
+    area: ratatui::layout::Rect,
+    rows: Vec<(ratatui::layout::Rect, usize)>,
+}
+impl RowHits {
+    pub fn begin(&mut self, area: ratatui::layout::Rect) {
+        self.area = if area.width >= 5 && area.height >= 5 {
+            area.inner(ratatui::layout::Margin::new(1, 1))
+        } else {
+            area
+        };
+        self.rows.clear();
+    }
+    pub fn row(&mut self, x: usize, y: usize, width: usize, index: usize) {
+        if y >= usize::from(self.area.height) {
+            return;
+        }
+        let rect = ratatui::layout::Rect::new(
+            self.area.x.saturating_add(x as u16),
+            self.area.y.saturating_add(y as u16),
+            width.min(usize::from(self.area.width).saturating_sub(x)) as u16,
+            1,
+        );
+        self.rows.push((rect, index));
+    }
+    pub fn hit(&self, x: u16, y: u16) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|(rect, _)| rect.contains((x, y).into()))
+            .map(|(_, index)| *index)
+    }
+}
