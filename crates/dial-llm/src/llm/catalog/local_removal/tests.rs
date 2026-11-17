@@ -1,4 +1,4 @@
-use super::{LocalRemoval, Store, plan_in, remove_planned};
+use super::{Store, plan_in, remove_planned};
 use crate::llm::catalog::ModelEntry;
 use crate::llm::model_config::ModelSelection;
 use std::fs;
@@ -150,7 +150,7 @@ fn a_linked_model_folder_is_not_followed() {
     let entries = [entry("pub/linked", &link)];
     assert!(plan_in("pub/linked", &entries, &s.stores).is_err());
     // A plan made before the folder was replaced by a link is re-checked before deleting.
-    let plan = LocalRemoval {
+    let plan = super::LocalRemoval {
         label: "pub/linked".into(),
         model: link.to_string_lossy().into_owned(),
         folder: link.clone(),

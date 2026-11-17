@@ -207,6 +207,7 @@ fn linux_sandbox_keeps_git_metadata_read_only() {
         deny_read: Vec::new(),
         extra_write: Vec::new(),
         allow_network: false,
+        serial_ports: false,
     };
     let (code, _) = run(
         &ws,
