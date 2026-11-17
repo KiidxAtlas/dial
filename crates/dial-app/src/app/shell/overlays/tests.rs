@@ -1155,7 +1155,7 @@ fn attention_drilldown_returns_to_its_origin_but_tabs_replace_it() {
         );
         assert!(
             matches!(event, crate::ui::overlay::OverlayEvent::Action(ref value) if value == "command:/keep-two"),
-            "{event:?}"
+            "Enter should run the retained command: {target}"
         );
         let cleared = state.overlay.content_mut().handle(
             &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -1163,7 +1163,7 @@ fn attention_drilldown_returns_to_its_origin_but_tabs_replace_it() {
         );
         assert!(
             matches!(cleared, crate::ui::overlay::OverlayEvent::None),
-            "the retained filter clears before leaving: {cleared:?}"
+            "the retained filter clears before leaving: {target}"
         );
         state.next = Some("open:activity:processes".into());
         shell.finish_busy_overlay(&app).unwrap();

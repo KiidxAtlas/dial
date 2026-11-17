@@ -1000,7 +1000,7 @@ fn removing_a_configured_provider_needs_confirmation() {
         OverlayEvent::RemoveProvider { id, scope } => {
             assert_eq!((id.as_str(), scope), ("work", Scope::Project))
         }
-        other => panic!("{other:?}"),
+        _ => panic!("confirming the reset should emit RemoveProvider"),
     }
     // Built-ins use the same confirmed reset without an explicit config entry.
     select(&mut o, "lm-studio");
@@ -1748,7 +1748,7 @@ fn reset_builtin_servers_are_immediately_not_set_up_and_can_be_set_up_again() {
                 assert!(spec.enabled);
                 assert_eq!(spec.base_url, url);
             }
-            other => panic!("{other:?}"),
+            _ => panic!("setting up {id} again should emit AddProvider"),
         }
     }
 }
