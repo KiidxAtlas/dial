@@ -2,10 +2,12 @@ use super::*;
 use std::io::Cursor;
 
 fn frames(input: &str, limit: usize) -> Vec<Line> {
-    let (tx, rx) = mpsc::sync_channel(64);
+    let (tx, rx) = transport_queue::channel(64, TRANSPORT_BYTES, line_bytes);
     read_frames(Cursor::new(input.as_bytes().to_vec()), limit, &tx);
     drop(tx);
-    rx.into_iter().map(|LineSlot(line)| line).collect()
+    std::iter::from_fn(|| rx.recv_timeout(Duration::ZERO).ok())
+        .map(|LineSlot(line, _)| line)
+        .collect()
 }
 
 #[test]
@@ -336,4 +338,424 @@ fn write_failure_reports_disconnect_even_when_stdout_stays_open() {
     assert_eq!(outstanding[0].effect, Effect::MayHaveApplied);
     assert!(client.outstanding().is_empty());
     assert!(client.poll(Duration::ZERO).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_restart_returns_the_running_engine() {
+    let (_dir, mut client) = nonreading_engine();
+    client
+        .request("send", json!({"text":"x"}))
+        .expect("request admitted");
+    let refusal = client
+        .restart_and_resume(&Launch::new("/nonexistent/dial"), Duration::from_millis(20))
+        .expect_err("a turn in flight refuses the restart");
+    assert!(matches!(refusal.error, ClientError::Unsupported(_)));
+    let mut running = refusal
+        .client
+        .expect("a refused restart hands the running engine back");
+    assert!(!running.is_closed());
+    assert_eq!(running.outstanding().len(), 1);
+    running.kill().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn call_stops_reading_at_the_backlog_bound_and_keeps_every_message() {
+    let events = QUEUED_FRAMES + 76;
+    let script = format!(
+        "printf '%s\\n' '{{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"state\"]}}'\nIFS= read -r request\ni=0\nwhile [ $i -lt {events} ]; do printf '%s\\n' '{{\"event\":\"text\",\"delta\":\"x\"}}'; i=$((i+1)); done\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"ok\":true}}}}'"
+    );
+    let (_dir, mut client) = engine_script(&script);
+    let result = client.call("state", json!({}), Duration::from_secs(5));
+    assert!(
+        matches!(result, Err(ClientError::Backlog { .. })),
+        "{result:?}"
+    );
+    let mut texts = 0;
+    let mut reply = None;
+    while let Some(message) = client.poll(Duration::from_secs(5)) {
+        match message {
+            Message::Event(event) if event.kind == "text" => texts += 1,
+            Message::Response { result, .. } => {
+                reply = Some(result);
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+    assert_eq!(texts, events, "no deferred event may be dropped");
+    assert_eq!(reply, Some(Ok(json!({"ok":true}))));
+}
+
+#[cfg(unix)]
+#[test]
+fn call_bounds_deferred_bytes_not_only_message_count() {
+    // 40 MiB of unrelated events is far below the message-count bound, so only the byte bound can
+    // stop this call from buffering the whole stream.
+    let script = "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"state\"]}'\nIFS= read -r request\nbig=$(head -c 1048576 /dev/zero | tr '\\0' 'x')\ni=0\nwhile [ $i -lt 40 ]; do printf '{\"event\":\"text\",\"delta\":\"%s\"}\\n' \"$big\"; i=$((i+1)); done\nprintf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}'";
+    let (_dir, mut client) = engine_script(script);
+    let result = client.call("state", json!({}), Duration::from_secs(20));
+    assert!(
+        matches!(result, Err(ClientError::Backlog { .. })),
+        "a 40 MiB backlog must hit the byte bound: {result:?}"
+    );
+    let mut texts = 0;
+    let mut reply = None;
+    while let Some(message) = client.poll(Duration::from_secs(10)) {
+        match message {
+            Message::Event(event) if event.kind == "text" => texts += 1,
+            Message::Response { result, .. } => {
+                reply = Some(result);
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+    assert_eq!(texts, 40, "no deferred event may be dropped");
+    assert_eq!(reply, Some(Ok(json!({"ok":true}))));
+}
+
+/// Writes an executable engine script named `name` in `dir` and returns its launch.
+#[cfg(unix)]
+fn write_engine(dir: &tempfile::TempDir, name: &str, script: &str) -> Launch {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.path().join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    Launch::new(path)
+}
+
+/// An old engine that defers events inside its own `state` and `shutdown` calls and then exits.
+/// `seq` skips 4 and 5 before the deferred `c`, so the old connection reports two lost events.
+#[cfg(unix)]
+const RESTARTABLE_ENGINE: &str = r##"printf '%s\n' '{"event":"ready","seq":1,"session_id":"s1","protocol_version":1,"methods":["state","shutdown"]}'
+IFS= read -r state
+printf '%s\n' '{"event":"text","seq":2,"session_id":"s1","delta":"a"}' '{"event":"text","seq":3,"session_id":"s1","delta":"b"}' '{"id":1,"result":{"session_id":"s1"}}'
+IFS= read -r shutdown
+printf '%s\n' '{"event":"text","seq":6,"session_id":"s1","delta":"c"}' '{"id":2,"result":{}}' '{"event":"text","seq":7,"session_id":"s1","delta":"d"}'"##;
+
+/// A replacement engine that announces `session` and then serves one more event before waiting.
+#[cfg(unix)]
+fn replacement_engine(session: &str, methods: &str) -> String {
+    format!(
+        "printf '%s\\n' '{{\"event\":\"ready\",\"seq\":1,\"session_id\":\"{session}\",\"protocol_version\":1,\"methods\":[{methods}]}}' '{{\"event\":\"text\",\"seq\":2,\"session_id\":\"{session}\",\"delta\":\"e\"}}'\nexec cat >/dev/null"
+    )
+}
+
+/// Text deltas of the event messages, in order; other message kinds are skipped.
+#[cfg(unix)]
+fn deltas(messages: &[Message]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Event(event) => event.text_delta(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Polls a handoff to its end. A timeout here would mean the old connection never ended, so it
+/// fails the test instead of ending the drain early.
+#[cfg(unix)]
+fn drain(handoff: &mut Handoff) -> Vec<Message> {
+    let mut messages = Vec::new();
+    loop {
+        match handoff.poll(Duration::from_secs(5)) {
+            HandoffPoll::Message(message) => messages.push(message),
+            HandoffPoll::Finished => return messages,
+            HandoffPoll::TimedOut => panic!("the old connection never ended: {messages:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_successful_restart_hands_over_every_unpolled_message_in_order() {
+    let (dir, client) = engine_script(RESTARTABLE_ENGINE);
+    let next = write_engine(
+        &dir,
+        "next",
+        &replacement_engine("s1", "\"state\",\"shutdown\""),
+    );
+    let mut restarted = client
+        .restart_and_resume(&next, Duration::from_secs(5))
+        .expect("a restart whose replacement starts succeeds");
+    let messages = drain(&mut restarted.handoff);
+    // a and b (deferred by `state`), c (deferred by `shutdown`), d (after its reply), then the end.
+    assert_eq!(messages.len(), 5, "{messages:?}");
+    assert_eq!(deltas(&messages), ["a", "b", "c", "d"]);
+    assert!(matches!(
+        messages.last(),
+        Some(Message::Disconnected { outstanding }) if outstanding.is_empty()
+    ));
+    assert!(restarted.handoff.is_finished());
+    assert_eq!(
+        restarted.handoff.lost_events(),
+        2,
+        "the old connection skipped seq 4 and 5"
+    );
+    assert_eq!(restarted.client.ready().session_id, "s1");
+    assert_eq!(
+        restarted.client.lost_events(),
+        0,
+        "a sequence space starts fresh"
+    );
+    // The replacement's own messages carry its own sequence numbers, separate from the handoff.
+    let Some(Message::Event(event)) = restarted.client.poll(Duration::from_secs(2)) else {
+        panic!("the replacement's event must be polled after the handoff");
+    };
+    assert_eq!((event.seq(), event.text_delta()), (Some(2), Some("e")));
+    restarted.client.kill().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_restart_after_shutdown_still_hands_over_the_unpolled_messages() {
+    let (_dir, client) = engine_script(RESTARTABLE_ENGINE);
+    let mut error = client
+        .restart_and_resume(&Launch::new("/nonexistent/dial"), Duration::from_secs(1))
+        .expect_err("no replacement can start");
+    assert!(error.client.is_none(), "the old engine is gone");
+    let mut handoff = error.handoff.take().expect("the old connection's handoff");
+    assert_eq!(deltas(&drain(&mut handoff)), ["a", "b", "c", "d"]);
+    assert_eq!(handoff.lost_events(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_resume_hands_back_the_replacement_connection() {
+    let (dir, client) = engine_script(RESTARTABLE_ENGINE);
+    // The replacement serves no `resume`, so it cannot take over session s1.
+    let next = write_engine(
+        &dir,
+        "next",
+        &replacement_engine("s2", "\"state\",\"shutdown\""),
+    );
+    let mut error = client
+        .restart_and_resume(&next, Duration::from_secs(5))
+        .expect_err("the replacement cannot resume s1");
+    assert!(
+        matches!(error.error, ClientError::Unsupported(_)),
+        "{:?}",
+        error.error
+    );
+    let mut handoff = error.handoff.take().expect("the old connection's handoff");
+    assert_eq!(deltas(&drain(&mut handoff)), ["a", "b", "c", "d"]);
+    let mut running = error
+        .client
+        .expect("the replacement keeps running for a retry");
+    assert_eq!(running.ready().session_id, "s2");
+    assert!(!running.is_closed());
+    running.kill().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unread_shutdown_output_refuses_the_restart_and_keeps_every_message() {
+    // 3000 lines of about 1 KB each: far more than the bounded queue and the pipe can hold, so the
+    // engine cannot exit until its output is read, and the restart must refuse rather than kill it.
+    let ready = r#"{"event":"ready","seq":1,"session_id":"s1","protocol_version":1,"methods":["state","shutdown"]}"#;
+    let line = format!("{{\"event\":\"text\",\"delta\":\"{}\"}}", "x".repeat(1024));
+    let script = format!(
+        "printf '%s\\n' '{ready}'\nIFS= read -r state\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"session_id\":\"s1\"}}}}'\nIFS= read -r shutdown\nprintf '%s\\n' '{{\"id\":2,\"result\":{{}}}}'\nyes '{line}' | head -n 3000\nexit 0"
+    );
+    let (dir, client) = engine_script(&script);
+    let next = write_engine(
+        &dir,
+        "next",
+        &replacement_engine("s1", "\"state\",\"shutdown\""),
+    );
+    let refusal = client
+        .restart_and_resume(&next, Duration::from_secs(10))
+        .expect_err("unread output must refuse the restart");
+    assert!(
+        matches!(refusal.error, ClientError::Backlog { .. }),
+        "{:?}",
+        refusal.error
+    );
+    assert!(
+        refusal.handoff.is_none(),
+        "the old connection still owns its buffer"
+    );
+    let mut running = *refusal.client.expect("the old engine keeps running");
+    assert!(
+        matches!(
+            running.request("state", json!({})),
+            Err(ClientError::Disconnected { .. })
+        ),
+        "a winding-down engine takes no requests"
+    );
+    assert!(!running.is_closed());
+    let (mut events, mut ended) = (0, false);
+    while let Some(message) = running.poll(Duration::from_secs(5)) {
+        match message {
+            Message::Event(event) if event.text_delta().is_some() => events += 1,
+            Message::Disconnected { outstanding } => {
+                assert!(outstanding.is_empty(), "{outstanding:?}");
+                ended = true;
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+    assert_eq!(events, 3000, "no unread line may be dropped");
+    assert!(ended, "the engine's end must follow its output");
+    assert!(
+        running
+            .shutdown(Duration::from_secs(5))
+            .expect("the drained engine exits")
+            .success()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_from_a_grandchild_holding_the_pipe_is_handed_over_in_steps() {
+    // The engine exits at once, but a background child keeps stdout open and writes one event
+    // later. The restart must not wait for that end of stream, and the handoff reports the wait
+    // as TimedOut rather than as finished.
+    let ready = r#"{"event":"ready","seq":1,"session_id":"s1","protocol_version":1,"methods":["state","shutdown"]}"#;
+    let state_reply = r#"{"id":1,"result":{"session_id":"s1"}}"#;
+    let shutdown_reply = r#"{"id":2,"result":{}}"#;
+    let late = r#"{"event":"text","seq":2,"session_id":"s1","delta":"late"}"#;
+    let script = format!(
+        "printf '%s\\n' '{ready}'\nIFS= read -r state\nprintf '%s\\n' '{state_reply}'\nIFS= read -r shutdown\nprintf '%s\\n' '{shutdown_reply}'\n(sleep 2; printf '%s\\n' '{late}') &\nexit 0"
+    );
+    let (dir, client) = engine_script(&script);
+    let next = write_engine(
+        &dir,
+        "next",
+        &replacement_engine("s1", "\"state\",\"shutdown\""),
+    );
+    let started = Instant::now();
+    let mut restarted = client
+        .restart_and_resume(&next, Duration::from_secs(5))
+        .expect("the restart completes while the pipe is still open");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "restart waited for the grandchild: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            restarted.handoff.poll(Duration::ZERO),
+            HandoffPoll::TimedOut
+        ),
+        "the late line has not arrived, and the handoff is not finished"
+    );
+    assert!(!restarted.handoff.is_finished());
+    let messages = drain(&mut restarted.handoff);
+    assert_eq!(deltas(&messages), ["late"], "{messages:?}");
+    assert!(matches!(
+        messages.last(),
+        Some(Message::Disconnected { .. })
+    ));
+    assert_eq!(messages.len(), 2);
+    restarted.client.kill().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_exited_engine_with_a_full_buffer_hands_over_its_messages() {
+    // No `shutdown` method is advertised, so the wind-down sends nothing and only waits for the
+    // exit. The exit must win over the full queue: a refusal here would tell the caller to drain
+    // a process that is already gone.
+    let (_dir, mut client) = engine_script(
+        "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"state\"]}'",
+    );
+    client.child.as_mut().unwrap().wait().unwrap();
+    let total = DEFERRED_MESSAGES + 76;
+    for n in 0..total {
+        let body = json!({"event":"text","delta":n.to_string()});
+        client.buffered.push_back(sized(Message::Event(Event {
+            kind: "text".into(),
+            body,
+        })));
+    }
+    assert!(
+        client.buffer_full(),
+        "the queue must already be at its bound"
+    );
+    client
+        .wind_down_for_restart(Duration::from_secs(5))
+        .expect("an exited engine hands its buffer over instead of refusing");
+    let mut handoff = Handoff {
+        connection: Box::new(client),
+        ended: false,
+    };
+    let messages = drain(&mut handoff);
+    let expected: Vec<String> = (0..total).map(|n| n.to_string()).collect();
+    let got: Vec<String> = deltas(&messages).into_iter().map(str::to_owned).collect();
+    assert_eq!(got, expected, "every buffered message, in order");
+    assert!(matches!(
+        messages.last(),
+        Some(Message::Disconnected { outstanding }) if outstanding.is_empty()
+    ));
+    assert_eq!(messages.len(), total + 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_an_unresponsive_engine_does_not_block_the_owner() {
+    let (_dir, mut client) = nonreading_engine();
+    client.drop_grace = Duration::from_millis(400);
+    let start = Instant::now();
+    drop(client);
+    assert!(start.elapsed() < Duration::from_millis(200));
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_response_reconciles_a_gap_using_the_server_wire_contract() {
+    let snapshot: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/recovery_snapshot.json")).unwrap();
+    let reply = json!({"id":1,"result":snapshot});
+    let script = format!(
+        r#"printf '%s\n' '{{"event":"ready","session_id":"s1","seq":1,"protocol_version":1,"methods":["recovery_snapshot"]}}' '{{"event":"approval","seq":2,"approval_id":"a","tool":"read","summary":"read","call_id":"c"}}' '{{"event":"todo","seq":4,"tasks":[{{"content":"stale task"}}]}}'
+IFS= read -r request
+printf '%s\n' '{reply}' '{{"event":"notice","seq":7,"message":"after snapshot"}}'
+exec cat >/dev/null"#
+    );
+    let (_dir, mut client) = engine_script(&script);
+    let mut view = Conversation::new();
+    view.new_connection(client.ready());
+    for _ in 0..2 {
+        view.apply(&client.poll(Duration::from_secs(2)).unwrap());
+    }
+    assert!(view.needs_reload());
+    assert_eq!(view.pending_approvals()[0].request.approval_id, "a");
+    view.load_history(Some("s1"), &[]);
+    assert!(view.needs_reload());
+    let id = client.request("recovery_snapshot", json!({})).unwrap();
+    let message = client.poll(Duration::from_secs(2)).unwrap();
+    let Message::Response {
+        id: response_id,
+        result: Ok(result),
+        ..
+    } = message
+    else {
+        panic!("expected recovery response")
+    };
+    assert_eq!(id, response_id);
+    assert!(view.load_snapshot(&result));
+    assert!(!view.needs_reload());
+    assert!(!view.turn_running());
+    assert!(view.pending_approvals().is_empty());
+    assert!(view.question().is_none());
+    assert_eq!(view.todo()[0]["content"], "current task");
+    assert_eq!(view.entries().len(), 2);
+    let Entry::Tool(tool) = &view.entries()[1] else {
+        panic!("expected recovered tool")
+    };
+    assert_eq!(tool.result.as_ref().unwrap().status, None);
+    assert_eq!(tool.result.as_ref().unwrap().succeeded(), None);
+    view.apply(&client.poll(Duration::from_secs(2)).unwrap());
+    assert!(
+        !view.needs_reload(),
+        "snapshot sequence becomes the new baseline"
+    );
+    assert!(
+        matches!(view.entries().last(), Some(Entry::Notice(notice)) if notice.message == "after snapshot")
+    );
 }

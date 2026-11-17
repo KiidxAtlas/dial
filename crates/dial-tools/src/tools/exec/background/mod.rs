@@ -218,20 +218,24 @@ impl Background {
                 terminal: proc.terminal,
             })
             .collect();
-        let (screen, cursor) = attached
+        let (screen, cursor, terminal) = attached
             .and_then(|name| table.procs.iter().find(|proc| proc.name == name))
             .map(|proc| {
                 let ring = lock(&proc.ring);
-                let rows = ring
-                    .screen_rows()
-                    .unwrap_or_else(|| ring.text().lines().map(str::to_owned).collect());
-                (rows, ring.screen_cursor())
+                let terminal = ring.terminal_view();
+                let rows = if terminal.is_some() {
+                    Vec::new()
+                } else {
+                    ring.text().lines().map(str::to_owned).collect()
+                };
+                (rows, None, terminal)
             })
             .unwrap_or_default();
         JobsView {
             jobs,
             screen,
             cursor,
+            terminal,
         }
     }
 

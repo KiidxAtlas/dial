@@ -3,7 +3,6 @@ use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
 use crate::collab::registry;
 use crate::collab::{
-    guest::Guest,
     host::Host,
     room::{self, Room},
 };
@@ -221,48 +220,19 @@ fn join(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
         .ok()
         .filter(|user| !user.trim().is_empty())
         .unwrap_or_else(|| "guest".to_owned());
-    // The room lock covers only this check; the connection itself runs on the job thread.
-    let busy = room::with(|slot| match slot {
-        Some(Room::Guest(_)) => Some("Already in a collab session as a guest (/leave first)"),
-        Some(Room::Host(_)) => Some("Stop hosting first (/collab stop)"),
-        None => None,
-    });
-    if let Some(message) = busy {
-        shell.note("Collab", message);
-        return Ok(Step::Done);
-    }
     let relay = app.config.collab.relay_url.clone();
     let link = link.to_owned();
-    super::extensions::spawn_job(shell, "Collab", move |_cancel| {
-        let guest = Guest::join(&relay, &link, &name)?;
-        // Re-check under the lock: a host may have claimed the room while the connection opened.
-        room::with(|slot| -> Result<()> {
-            if slot.is_some() {
-                guest.leave();
-                bail!(
-                    "Another collab session started while joining; the joined session was closed"
-                );
-            }
-            *slot = Some(Room::Guest(guest));
-            Ok(())
-        })?;
+    super::extensions::spawn_job(shell, "Collab", move |cancel| {
+        room::join(&relay, &link, &name, &cancel)?;
         Ok("Joining collab session; waiting for the host to admit you".to_owned())
     });
     Ok(Step::Done)
 }
 
 fn leave(shell: &mut Shell) -> Result<Step> {
-    let outcome = room::with(|slot| match slot.take() {
-        Some(Room::Guest(guest)) => {
-            guest.leave();
-            Ok("Left the collab session")
-        }
-        Some(other) => {
-            *slot = Some(other);
-            Err("This session is hosted here; use /collab stop")
-        }
-        None => Err("Not in a collab session"),
-    });
+    let outcome = room::leave()
+        .map(|()| "Left the collab session".to_owned())
+        .map_err(|error| error.to_string());
     match outcome {
         Ok(text) | Err(text) => shell.note("Collab", text),
     }

@@ -794,8 +794,13 @@ fn image_download_stays_image_after_switching_shelves_before_completion() {
     group.shelf = Shelf::Memory;
     group.finish_download("org/image", Family::Mlx, "/models/image");
     assert_eq!(group.shelf, Shelf::Images);
+    // Not loadable and not from a Hugging Face snapshot: the shelf says what to download instead.
     assert_eq!(group.confirm(), Step::Handled);
-    assert!(group.message.contains("MLX-Serve"));
+    assert!(
+        group.message.contains("original Diffusers weights"),
+        "{}",
+        group.message
+    );
     group.shelf = Shelf::Hub(Family::Mlx);
     assert!(group.installed_rows().is_empty());
     group.shelf = Shelf::Memory;
@@ -868,4 +873,126 @@ fn retained_download_failure_redacts_credentials_before_truncation() {
             .contains("abcdefghijklmnopqrstuvwxyz1234567890")
     );
     assert!(failure.detail.chars().count() <= 2048);
+}
+
+fn offered(group: &mut ModelDownloads) {
+    group.offer = Some(Offer::Ready {
+        pack: "Runpod/FLUX.2-klein-4B-mflux-4bit".into(),
+        original: Original {
+            repo: "black-forest-labs/FLUX.2-klein-4B".into(),
+            files: vec!["model_index.json".into()],
+            bytes: 16_000_000_000,
+        },
+    });
+}
+
+#[test]
+fn image_pack_offer_downloads_the_original_on_yes_and_nothing_on_no() {
+    let keys = Keymap::defaults();
+    let mut group = selection_pane(vec![row("a")]);
+    offered(&mut group);
+    assert!(group.has_offer());
+    assert!(group.footer(&keys)[0].contains("y download"));
+    assert_eq!(group.key(&key(KeyCode::Char('n')), &keys), Step::Handled);
+    assert!(!group.has_offer());
+    assert!(
+        group.message.contains("nothing was downloaded"),
+        "{}",
+        group.message
+    );
+    assert!(
+        group.query.is_empty(),
+        "the answer is not typed into the search"
+    );
+
+    offered(&mut group);
+    group.key(&key(KeyCode::Esc), &keys);
+    assert!(!group.has_offer());
+
+    offered(&mut group);
+    group.key(&key(KeyCode::Char('y')), &keys);
+    assert!(!group.has_offer());
+    // The fixed pane has no download source, so the yes reaches the download and stops there.
+    assert!(
+        group
+            .image_repos
+            .contains("black-forest-labs/FLUX.2-klein-4B")
+    );
+    assert_eq!(group.message, "Downloads are unavailable in this view.");
+}
+
+#[test]
+fn other_letters_still_search_while_an_offer_waits() {
+    let keys = Keymap::defaults();
+    let mut group = selection_pane(vec![row("a")]);
+    offered(&mut group);
+    group.key(&key(KeyCode::Char('f')), &keys);
+    assert_eq!(group.query, "f");
+    assert!(group.has_offer());
+}
+
+fn on_installed(group: &mut ModelDownloads, index: usize) {
+    group.cursor = group
+        .picks()
+        .iter()
+        .position(|pick| matches!(pick, Pick::Installed(i) if *i == index))
+        .unwrap();
+}
+
+#[test]
+fn ctrl_d_on_an_installed_model_asks_the_panel_to_delete_it() {
+    let keys = Keymap::defaults();
+    let mut group = selection_pane(vec![row("a")]);
+    on_installed(&mut group, 0);
+    assert!(
+        group
+            .footer(&keys)
+            .iter()
+            .any(|hint| hint == "Ctrl+D delete")
+    );
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(group.key(&ctrl_d, &keys), Step::Delete("/models/a".into()));
+    assert!(
+        group.query.is_empty(),
+        "Ctrl+D is not typed into the search"
+    );
+    // On a suggested download there is nothing to delete.
+    group.cursor = 0;
+    assert!(matches!(group.current(), Some(Pick::Hit(_))));
+    assert!(
+        !group
+            .footer(&keys)
+            .iter()
+            .any(|hint| hint == "Ctrl+D delete")
+    );
+    assert_eq!(group.key(&ctrl_d, &keys), Step::Ignored);
+}
+
+#[test]
+fn deleting_refuses_unknown_models_and_reports_a_vanished_folder_without_claiming_success() {
+    let mut group = selection_pane(vec![row("a")]);
+    let error = group.plan_delete("/models/a").unwrap_err();
+    assert!(error.contains("not a downloaded local model"), "{error}");
+    let gone = LocalRemoval {
+        label: "org/a".into(),
+        model: "/nowhere/models--org--a/snapshots/r".into(),
+        folder: PathBuf::from("/nowhere/models--org--a"),
+        bytes: 1,
+        source: "test".into(),
+    };
+    assert!(group.delete(&gone).is_err());
+    assert!(
+        group.message.starts_with("Did not delete org/a:"),
+        "{}",
+        group.message
+    );
+    assert!(!group.take_rescan());
+}
+
+#[test]
+fn deleting_waits_for_a_running_download() {
+    let mut group = selection_pane(vec![row("a")]);
+    let (_cancel, _done) = group.fake_download("org/model");
+    let error = group.plan_delete("/models/a").unwrap_err();
+    assert!(error.contains("wait for the download"), "{error}");
 }

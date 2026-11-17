@@ -459,6 +459,50 @@ pub fn save_config_checked(
     )
 }
 
+/// Read-modify-write one project array (for example `verification.commands`) under both layer
+/// locks, so a concurrent save cannot interleave. `update` sees the stored array and the
+/// effective configuration it would replace (both layers, user entries included); an error from
+/// `update` publishes nothing. The new project layer is validated with the same migrations and
+/// effective-config checks as every save before it is written.
+pub fn update_project_array(
+    layout: &Layout,
+    path: &str,
+    update: impl FnOnce(&mut Vec<toml::Value>, &crate::config::types::Config) -> Result<()>,
+) -> Result<crate::config::types::Config> {
+    layout.ensure_project_outside_storage()?;
+    let files = layout.config_files();
+    let _global = interactive_lock(&files[0])?;
+    let _project = interactive_lock(&files[1])?;
+    let (layers, current) = prepare_config(layout, Scope::Project, &[], &[])?;
+    let mut items = array_at(&layers[1], path)?;
+    update(&mut items, &current)?;
+    let (layers, config) = prepare_config(
+        layout,
+        Scope::Project,
+        &[Change::Set {
+            path: path.into(),
+            value: toml::Value::Array(items),
+        }],
+        &[],
+    )?;
+    write_private(&files[1], toml::to_string_pretty(&layers[1])?.as_bytes())?;
+    Ok(config)
+}
+
+/// The array stored at dotted `path`; absent is empty, any other value is refused.
+fn array_at(table: &toml::Table, path: &str) -> Result<Vec<toml::Value>> {
+    let mut parts = path.split('.');
+    let mut found = parts.next().and_then(|first| table.get(first));
+    for part in parts {
+        found = found.and_then(|value| value.get(part));
+    }
+    match found {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(items)) => Ok(items.clone()),
+        Some(_) => anyhow::bail!("settings path `{path}` is not an array; no changes saved"),
+    }
+}
+
 fn model_project_resets(role: &str) -> Result<Vec<Change>> {
     ensure!(
         crate::llm::model_config::ROLES
@@ -520,27 +564,67 @@ fn save_config_with_project_resets(
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
         let project_bytes = toml::to_string_pretty(&layers[1])?;
-        let original = crate::platform::atomic::read_private(&files[0])?;
-        write_private(&files[0], selected_bytes.as_bytes())?;
-        if let Err(error) = write_private(&files[1], project_bytes.as_bytes()) {
-            // Roll back the first publication if the second fails. Never hide partial saves.
-            let rollback = match original {
-                Some(bytes) => write_private(&files[0], &bytes),
-                None => fs::remove_file(&files[0]).map_err(anyhow::Error::from),
-            };
-            if let Err(rollback_error) = rollback {
-                anyhow::bail!(
-                    "project model override could not be cleared: {error:#}; global settings changed and rollback failed: {rollback_error:#}"
-                );
-            }
-            return Err(
-                error.context("model choice not saved: project override could not be cleared")
-            );
-        }
+        publish_model_layers(
+            &files,
+            [selected_bytes.as_bytes(), project_bytes.as_bytes()],
+            write_private,
+        )?;
     } else {
         write_private(&files[selected], selected_bytes.as_bytes())?;
     }
     Ok(config)
+}
+
+/// Both locks remain held while publication and any compensating writes are reconciled.
+fn publish_model_layers(
+    files: &[PathBuf; 2],
+    bytes: [&[u8]; 2],
+    mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let originals = [
+        crate::platform::atomic::read_private(&files[0])?,
+        crate::platform::atomic::read_private(&files[1])?,
+    ];
+    for index in 0..2 {
+        if let Err(error) = write(&files[index], bytes[index]) {
+            // A private write may fail after rename. Compensate BOTH layers, including
+            // the failed publication, and never let one rollback failure skip the other.
+            let mut failures = Vec::new();
+            for layer in (0..=index).rev() {
+                let restored = match &originals[layer] {
+                    Some(original) => write(&files[layer], original),
+                    None => remove_model_layer(&files[layer]),
+                };
+                if let Err(rollback) = restored {
+                    failures.push(format!("{}: {rollback:#}", files[layer].display()));
+                }
+            }
+            if !failures.is_empty() {
+                return Err(error.context(format!(
+                    "model settings publication failed; rollback durability uncertain ({}); settings may have changed; reload both layers before retrying",
+                    failures.join("; ")
+                )));
+            }
+            return Err(error.context(
+                "model settings publication failed; both original settings layers restored",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_model_layer(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // An absent original is restored only once removal is durable too.
+    #[cfg(unix)]
+    platform_fs::sync_file(&File::open(
+        path.parent().context("settings path has no parent")?,
+    )?)?;
+    Ok(())
 }
 
 fn prepare_config(
@@ -771,6 +855,20 @@ fn bound(history: &mut Vec<String>, limit: usize) {
     };
     let excess = history.len().saturating_sub(cap);
     history.drain(..excess);
+    // JSON escaping can make a prompt six times larger than its UTF-8 text. Charge the
+    // actual serialized string, its comma, and the enclosing array before publication.
+    let mut bytes = 2usize;
+    let mut start = history.len();
+    for (index, prompt) in history.iter().enumerate().rev() {
+        let encoded = serde_json::to_vec(prompt).expect("serializing a string cannot fail");
+        let cost = encoded.len() + usize::from(start < history.len());
+        if bytes.saturating_add(cost) > crate::platform::atomic::PRIVATE_LIMIT {
+            break;
+        }
+        bytes += cost;
+        start = index;
+    }
+    history.drain(..start);
 }
 pub fn load_history(layout: &Layout, limit: usize) -> Result<Vec<String>> {
     let path = history_path(layout)?;

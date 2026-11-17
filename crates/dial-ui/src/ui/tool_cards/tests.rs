@@ -504,3 +504,159 @@ fn one_hidden_line_is_shown_instead_of_a_hint() {
     let rows = plain(&tool_rows(&t, 60, &ctx_for(&theme, &ui, false))).join("\n");
     assert!(rows.contains("2 more lines"), "{rows}");
 }
+
+#[test]
+fn collapsed_output_only_layouts_visible_source_lines() {
+    let body = (0..10_000)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for tail in [false, true] {
+        let mut rendered = 0;
+        let (rows, hidden) = output_window(&body, 3, tail, 20, |line| {
+            rendered += 1;
+            vec![Line::from(line.to_owned())]
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(hidden, 9_997);
+        assert!(
+            rendered <= 5,
+            "laid out {rendered} source lines for a three-row preview (tail={tail})"
+        );
+        assert_eq!(plain(&rows)[0], if tail { "line 9997" } else { "line 0" });
+    }
+}
+
+#[test]
+fn output_window_matches_eager_whole_line_selection() {
+    let theme = ascii_theme();
+    for body in [
+        "",
+        "one\ntwo\nthree",
+        "long long word\na\nb",
+        "a\nb\nlong long word",
+        "a\n\n b",
+        "中文 👩‍💻 a\nlast",
+    ] {
+        for width in [1, 2, 5, 12] {
+            let render = |line: &str| text::wrap(vec![Line::from(edit_spans(&theme, line))], width);
+            let all: Vec<Rows> = body.split('\n').map(render).collect();
+            let total: usize = all.iter().map(Vec::len).sum();
+            for limit in [1usize, 2, 3, 5, usize::MAX] {
+                for tail in [false, true] {
+                    let effective = if total == limit.saturating_add(1) {
+                        total
+                    } else {
+                        limit
+                    };
+                    let expected = take_lines(all.clone(), effective, tail);
+                    let actual = output_window(body, limit, tail, width, render);
+                    assert_eq!(
+                        actual, expected,
+                        "body={body:?}, width={width}, limit={limit}, tail={tail}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_single_output_line_has_a_bounded_layout_window() {
+    let body = format!("head {} tail", "中文 👩‍💻 e\u{301} ".repeat(100_000));
+    for tail in [false, true] {
+        let mut bytes = 0;
+        let (_, hidden) = output_window(&body, 3, tail, 20, |line| {
+            bytes += line.len();
+            text::wrap_words(line, 20)
+                .into_iter()
+                .map(Line::from)
+                .collect()
+        });
+        assert!(
+            bytes <= 4096,
+            "laid out {bytes} bytes for one collapsed line"
+        );
+        assert_eq!(hidden, 1);
+    }
+}
+
+#[test]
+fn bounded_line_windows_preserve_graphemes_and_expansion_retains_evidence() {
+    let theme = ascii_theme();
+    let ui = UiConfig {
+        tool_output_lines: 3,
+        ..UiConfig::default()
+    };
+    let output = format!("HEAD {} TAIL", "中文 👩‍💻 e\u{301} ".repeat(1000));
+    for tail in [false, true] {
+        let window = line_window(&output, 128, tail);
+        assert!(window.len() <= 128);
+        let graphemes: Vec<_> = output.graphemes(true).collect();
+        let expected = if tail {
+            graphemes
+                .into_iter()
+                .rev()
+                .take(window.graphemes(true).count())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>()
+        } else {
+            graphemes
+                .into_iter()
+                .take(window.graphemes(true).count())
+                .collect::<String>()
+        };
+        assert_eq!(window, expected);
+        let t = settled("bash", r#"{"command":"./x"}"#, &output, tail, 0.2);
+        let (rows, hidden) = output_rows(&t, 20, &ctx_for(&theme, &ui, false), tail);
+        let shown = plain(&rows).join("\n");
+        assert!(
+            shown.contains(if tail { "TAIL" } else { "HEAD" }),
+            "{shown}"
+        );
+        assert!(if tail {
+            shown.contains("earlier line")
+        } else {
+            hidden == 1
+        });
+        let (full, hidden) = output_rows(&t, 20, &ctx_for(&theme, &ui, true), tail);
+        let full = plain(&full).join("\n");
+        assert_eq!(hidden, 0);
+        assert!(full.contains("HEAD") && full.contains("TAIL"));
+        assert_eq!(full.matches('中').count(), 1000);
+        assert_eq!(
+            t.output, output,
+            "preview must not change recorded evidence"
+        );
+    }
+    // A pathological cluster may exceed the whole preview budget; never cut it in half.
+    let cluster = format!("e{}", "\u{301}".repeat(5000));
+    assert!(line_window(&cluster, 128, false).is_empty());
+    assert!(line_window(&cluster, 128, true).is_empty());
+}
+
+#[test]
+fn numbered_diffs_bound_long_lines_without_losing_expanded_evidence() {
+    let theme = ascii_theme();
+    let ui = UiConfig {
+        tool_output_lines: 3,
+        ..UiConfig::default()
+    };
+    let output = format!(
+        "change preview (+2 -0)\n[src/x.rs#ABCD]\n@@ -0,0 +1,2 @@\n+HEAD {} TAIL\n+LAST",
+        "中文 👩‍💻 e\u{301} ".repeat(1000)
+    );
+    let t = settled("edit", r#"{"path":"src/x.rs"}"#, &output, false, 0.2);
+    let (rows, hidden) = diff_rows(&t, 20, &ctx_for(&theme, &ui, false)).unwrap();
+    assert!(rows.len() <= 3);
+    assert!(hidden >= 2, "the partially shown line and LAST are hidden");
+    assert!(plain(&rows).join("\n").contains("HEAD"));
+    let (rows, hidden) = diff_rows(&t, 20, &ctx_for(&theme, &ui, true)).unwrap();
+    let full = plain(&rows).join("\n");
+    assert_eq!(hidden, 0);
+    assert!(full.contains("TAIL") && full.contains("LAST"));
+    assert_eq!(full.matches('中').count(), 1000);
+    assert_eq!(t.output, output);
+}

@@ -127,6 +127,71 @@ fn writes_decoded_png_and_sends_model_prompt_and_key() {
 }
 
 #[test]
+fn every_returned_image_is_written_beside_the_output_without_overwriting() {
+    let (_dir, ws) = testkit::workspace();
+    std::fs::create_dir(ws.root().join("art")).unwrap();
+    // `fox-2.png` is taken, so the second image skips to the next free name.
+    std::fs::write(ws.root().join("art/fox-2.png"), b"keep").unwrap();
+    let png = image_bytes(image::ImageFormat::Png);
+    let jpeg = image_bytes(image::ImageFormat::Jpeg);
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let body = json!({"data": [
+        {"b64_json": encode(&png)},
+        {"b64_json": encode(&jpeg)},
+        {"b64_json": encode(&png)}
+    ]})
+    .to_string();
+    let (base, server) = serve_once(200, body);
+    let user_dir = user_dir_with_key(&base);
+    let config = config_for(&base, user_dir.path());
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a red fox", "output": "art/fox.png"}),
+    );
+    server.join().unwrap();
+
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("Wrote 3 PNG images"), "{}", out.text);
+    for name in ["art/fox.png", "art/fox-3.png", "art/fox-4.png"] {
+        assert!(out.text.contains(name), "{name}: {}", out.text);
+        let saved = std::fs::read(ws.root().join(name)).unwrap();
+        assert_eq!(
+            image::guess_format(&saved).unwrap(),
+            image::ImageFormat::Png,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(ws.root().join("art/fox-2.png")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(std::fs::read_dir(ws.root().join("art")).unwrap().count(), 4);
+}
+
+#[test]
+fn an_oversized_batch_is_refused_and_writes_nothing() {
+    let (_dir, ws) = testkit::workspace();
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(image_bytes(image::ImageFormat::Png));
+    let body =
+        json!({"data": vec![json!({"b64_json": encoded}); super::MAX_IMAGES + 1]}).to_string();
+    let (base, server) = serve_once(200, body);
+    let user_dir = user_dir_with_key(&base);
+    let config = config_for(&base, user_dir.path());
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a fox", "output": "fox.png"}),
+    );
+    server.join().unwrap();
+    assert!(out.is_error);
+    assert!(out.text.contains("at most"), "{}", out.text);
+    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+}
+
+#[test]
 fn converts_native_output_to_the_requested_format() {
     for (native, output, expected) in [
         (
@@ -906,6 +971,69 @@ fn native_mlx_serve_can_save_non_png_output() {
     assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 1);
 }
 
+/// The Images picker assigns a served MLX-Serve image model to the image role without writing a
+/// model profile; generation must find its transport in the saved listing and call that server.
+#[test]
+fn image_role_assigned_from_a_served_listing_generates_through_mlx_serve() {
+    use crate::llm::{
+        catalog::{ModelEntry, ModelKind, ModelMetadata},
+        model_config::ModelSelection,
+        profiles::ImageGenerationApi,
+    };
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = tempfile::tempdir().unwrap();
+    let selection = ModelSelection {
+        provider: "mlx-serve".into(),
+        model: "mlx-community/flux2-klein-9b-4bit".into(),
+        base_url: Some(base.clone()),
+        ..Default::default()
+    };
+    let listing = std::collections::BTreeMap::from([(
+        "mlx-serve".to_owned(),
+        vec![ModelEntry {
+            selection: selection.clone(),
+            label: selection.model.clone(),
+            source: "MLX-Serve".into(),
+            available: true,
+            metadata: ModelMetadata {
+                kind: ModelKind::Image,
+                image_generation: Some(ImageGenerationApi::MlxServe),
+                ..Default::default()
+            },
+        }],
+    )]);
+    crate::config::settings_store::write_private(
+        &crate::config::paths::model_catalog_file(user.path()),
+        &serde_json::to_vec(&listing).unwrap(),
+    )
+    .unwrap();
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "local-chat".into(),
+        ..Default::default()
+    };
+    config.model_roles.insert("image".into(), selection);
+    assert!(
+        config.model_profiles.is_empty(),
+        "no profile declares the transport"
+    );
+
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("POST /v1/images/generations "),
+        "{request}"
+    );
+    assert!(
+        request.contains("mlx-community/flux2-klein-9b-4bit"),
+        "{request}"
+    );
+    assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+}
+
 fn chatgpt_session(user_dir: &std::path::Path) -> Config {
     use crate::llm::{chatgpt, model_config::ModelSelection};
     let config = Config {
@@ -1122,6 +1250,54 @@ fn configured_chatgpt_route_is_shared_with_local_main() {
     config.model = "another-text-model".into();
     assert!(!registry.sync_image_generation(&config).unwrap());
     assert!(registry.contains(TOOL));
+}
+
+#[test]
+fn chatgpt_hosted_tool_refusal_is_recognised() {
+    use super::selected::refuses_hosted_tool;
+    let refusal = anyhow::anyhow!(
+        "model server returned HTTP 400: Tool choice 'image_generation' not found in 'tools' parameter."
+    )
+    .context("requesting image generation");
+    assert!(refuses_hosted_tool(&refusal));
+    for other in [
+        "model server returned HTTP 400: Invalid size",
+        "model server returned HTTP 429: rate limited",
+        "model server returned HTTP 500: Tool choice 'image_generation' not found",
+    ] {
+        assert!(!refuses_hosted_tool(&anyhow::anyhow!("{other}")), "{other}");
+    }
+}
+
+#[test]
+fn chatgpt_account_that_refused_hosted_images_withdraws_image_gen() {
+    use crate::llm::chatgpt;
+    let user = tempfile::tempdir().unwrap();
+    chatgpt::test_account(user.path(), false);
+    let config = chatgpt_session(user.path());
+    let mut registry = Registry::default();
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(registry.contains(TOOL));
+
+    let dir = crate::config::paths::subscription_auth_dir(user.path()).unwrap();
+    super::selected::record_refusal(&dir, "oaiapp_test");
+
+    let error = resolve(&config)
+        .err()
+        .expect("refused account no longer resolves");
+    assert!(
+        error.is::<super::selected::HostedImageRefused>(),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("/models"), "{error:#}");
+    assert!(auto_tools(&config).unwrap().is_empty());
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(!registry.contains(TOOL), "withdrawn after the refusal");
+
+    // Another sign-in is unaffected.
+    let other = tempfile::tempdir().unwrap();
+    chatgpt::test_account(other.path(), false);
+    assert_eq!(auto_tools(&chatgpt_session(other.path())).unwrap().len(), 1);
 }
 
 #[test]
@@ -1813,4 +1989,109 @@ fn responses_gif_names_a_gif_capable_image_model_in_the_hosted_tool() {
             .unwrap()
             .contains("animated GIF")
     );
+}
+
+/// A minimal safetensors file (header only) at `path`.
+fn safetensors(path: &std::path::Path, tensors: &[&str]) {
+    let mut header = serde_json::Map::new();
+    for name in tensors {
+        header.insert(
+            (*name).to_owned(),
+            json!({"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}),
+        );
+    }
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&[0, 0]);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn checkpoint_role_config(model: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.model_roles.insert(
+        "image".into(),
+        crate::llm::model_config::ModelSelection::new("mlx", model.to_str().unwrap()),
+    );
+    config
+}
+
+#[test]
+fn downloaded_checkpoint_role_runs_on_sd_cpp_with_settings_in_its_prompt_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    for part in ["unet", "vae"] {
+        safetensors(
+            &dir.path()
+                .join(part)
+                .join("diffusion_pytorch_model.safetensors"),
+            &["w"],
+        );
+    }
+    safetensors(&dir.path().join("text_encoder/model.safetensors"), &["w"]);
+    let config = checkpoint_role_config(dir.path());
+    let mut target = resolve(&config).unwrap();
+    assert_eq!(target.wire, Wire::SdCpp);
+    let route = super::current_route(&config).unwrap();
+    assert!(route.edits && route.api.contains("stable-diffusion.cpp"));
+
+    let request = Request {
+        animation: None,
+        prompt: "a lighthouse",
+        size: "512x512",
+        output: "out.png",
+        source: None,
+    };
+    let body = request_body(&target, &request);
+    assert_eq!(body["model"], "sd-cpp-local");
+    assert_eq!(body["prompt"], "a lighthouse");
+    assert_eq!(body["size"], "512x512");
+    assert_eq!(body["output_format"], "png");
+
+    target.settings.steps = Some(4);
+    target.settings.seed = Some(7);
+    let body = request_body(&target, &request);
+    let prompt = body["prompt"].as_str().unwrap();
+    let extra = prompt
+        .strip_prefix("a lighthouse <sd_cpp_extra_args>")
+        .and_then(|rest| rest.strip_suffix("</sd_cpp_extra_args>"))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(extra).unwrap(),
+        json!({"sample_params": {"sample_steps": 4}, "seed": 7})
+    );
+    assert!(body.get("steps").is_none() && body.get("seed").is_none());
+}
+
+#[test]
+fn mlx_quantized_checkpoint_role_is_refused_before_any_server_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    safetensors(
+        &dir.path().join("transformer/0.safetensors"),
+        &["blocks.0.weight", "blocks.0.scales", "blocks.0.biases"],
+    );
+    safetensors(&dir.path().join("vae/0.safetensors"), &["d"]);
+    safetensors(&dir.path().join("text_encoder/0.safetensors"), &["e"]);
+    let error = resolve(&checkpoint_role_config(dir.path()))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("MLX-quantized"), "{error}");
+}
+
+#[test]
+#[ignore = "starts the real sd-server (DIAL_SD_SERVER or /setup sd-cpp) on DIAL_TEST_IMAGE_CHECKPOINT and generates one image"]
+fn generates_with_a_dial_launched_sd_server() {
+    let model = std::env::var("DIAL_TEST_IMAGE_CHECKPOINT").expect("downloaded image checkpoint");
+    let (_dir, ws) = testkit::workspace();
+    let config = checkpoint_role_config(std::path::Path::new(&model));
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a red apple on a table", "output": "apple.png", "size": "auto"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let bytes = std::fs::read(ws.root().join("apple.png")).unwrap();
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert!(decoded.width() >= 256 && decoded.height() >= 256);
 }

@@ -8,7 +8,7 @@ the chosen role; Enter assigns to that role, and Escape returns to its row witho
 changing it. Background catalog refreshes preserve the selected role. Selecting the
 Roles group explicitly leaves the current assignment flow.
 
-Use Ctrl+S in the picker to choose Global or Project scope. An explicit model assignment
+Use Ctrl+B in the picker to choose Global or Project scope. An explicit model assignment
 in either scope takes effect in the current project. A Global assignment saves the new
 default and clears only this project's override for the selected role (including an
 explicit “follow main” marker); other roles, settings, and other projects' overrides
@@ -107,7 +107,7 @@ In the picker, `Tab` switches between the sidebar and list; `Enter` or `Right` e
 | `tester` | Reviewer subagent (including `/security` scan batches and finding validation), test-runner subagent and review-workflow model calls | Task-tool reviewer/test-runner: `coach`, `task`, `small`, then `main`; other review workflows: `main` |
 | `memory` | Memory extraction and consolidation (`local`) and sharpshooter model calls, including sharpshooter decision memory (`memory.sharpshooter.model_role`). Required when a model-calling memory backend is enabled | No chat fallback for model-calling memory; backend stays inactive until assigned |
 | `embedding` | Semantic memory recall through an embedding-capable endpoint | Lexical recall |
-| `image` | Image generation through `image_gen`, including image models served by MLX-Serve | Try `main`, then shared configured image profiles and keyed provider defaults. ChatGPT may offer an unverified hosted-image attempt when metadata is absent. Explicit `[image]` overrides still win. |
+| `image` | Image generation through `image_gen`, including image models served by MLX-Serve and downloaded checkpoints Dial runs on stable-diffusion.cpp | Try `main`, then shared configured image profiles and keyed provider defaults. ChatGPT may offer an unverified hosted-image attempt when metadata is absent. Explicit `[image]` overrides still win. |
 | `turn_drafter` | Experimental turn optimizer: rewrites each user message into a structured prompt before the main model sees it. Listed in /roles only while `experimental.turn_optimizer` is on (see [agent-loop](agent-loop.md#turn-optimizer-experimental)) | `main` (a separate request with the drafter's own system prompt) |
 
 ### Task-tool routing and deliberate overrides

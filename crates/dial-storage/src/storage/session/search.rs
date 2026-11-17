@@ -5,6 +5,8 @@ use super::*;
 /// Tool outputs larger than this are not searchable (their names and the model's replies are).
 const MAX_INDEXED_TOOL_BODY: usize = 2048;
 const MAX_INDEXED_TEXT: usize = 16 * 1024;
+/// Largest result window, including one lookahead hit for callers displaying up to 1000 hits.
+const MAX_SEARCH_HITS: usize = 1001;
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: String,
@@ -239,13 +241,16 @@ impl<R: Read> BufRead for IndexReader<R> {
 
 impl Session {
     /// Full-text search over every session of the project, best match first.
+    ///
+    /// `limit` is clamped to `1..=1001`; callers can request one lookahead hit beyond a
+    /// 1000-hit display window without an unbounded query or allocation.
     pub fn search(layout: &Layout, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let dir = layout.sessions_dir();
         let terms = query_terms(query);
         if terms.is_empty() || !dir.is_dir() {
             return Ok(Vec::new());
         }
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, MAX_SEARCH_HITS);
         let mut conn = open_index(layout)?;
         sync_index(&mut conn, &dir)?;
         // Every term is a quoted FTS string, so no query syntax from the caller reaches the parser.

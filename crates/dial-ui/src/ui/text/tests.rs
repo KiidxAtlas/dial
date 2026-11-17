@@ -99,6 +99,27 @@ fn fuzzy_ranks_prefix_and_boundary_matches_first_and_rejects_non_subsequences() 
 }
 
 #[test]
+fn prose_and_compact_matches_reject_scattered_letters() {
+    assert!(word_prefix("them", "ui.theme colors"));
+    assert!(word_prefix("ui the", "ui.theme colors"));
+    assert!(word_prefix("ui.the", "ui.theme colors"));
+    assert!(!word_prefix("hm", "ui.theme colors"));
+    assert!(!word_prefix("", "anything"));
+    assert!(fuzzy_prose("theme", "the model chooses each request").is_none());
+    assert!(fuzzy_prose("theme", "Color theme for the terminal").is_some());
+    assert!(fuzzy_prose("", "anything").is_some());
+    assert!(fuzzy_compact("st", "settings").is_some());
+    assert!(fuzzy_compact("sndbx", "sandbox").is_some());
+    assert!(fuzzy_compact("se", "sessions").is_some());
+    assert!(fuzzy_compact("se", "shake").is_none());
+    assert!(fuzzy_compact("se", "skill:debugging").is_none());
+    assert!(
+        fuzzy_compact("deb", "skill:debugging").is_some(),
+        "word start"
+    );
+}
+
+#[test]
 fn word_wrap_breaks_on_spaces_and_hard_splits_long_words() {
     assert_eq!(wrap_words("aaa bbb ccc", 7), vec!["aaa bbb", "ccc"]);
     assert_eq!(wrap_words("abcdefgh", 3), vec!["abc", "def", "gh"]);

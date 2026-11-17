@@ -222,6 +222,9 @@ fn main() -> anyhow::Result<()> {
             branch: "main".into(),
             approval: "write".into(),
             sandbox: "dev".into(),
+            submit_key: keys.label(dial_ui::ui::keys::Action::Submit),
+            actions_key: keys.label(dial_ui::ui::keys::Action::CommandPalette),
+            dismiss_key: keys.label(dial_ui::ui::keys::Action::Dismiss),
             tips: vec![
                 (
                     keys.label(dial_ui::ui::keys::Action::CommandPalette),
@@ -712,6 +715,25 @@ fn main() -> anyhow::Result<()> {
                 picker.rows(width as usize, height as usize, &theme),
                 width,
                 height,
+            ),
+            light,
+        );
+        let mut help_picker = Picker::new(vec![], vec![], "", "", false).with_keys(&keys);
+        let help_height = 10;
+        help_picker.handle(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::F(1),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            help_height,
+        );
+        screen(
+            &mut out,
+            &format!("Short session help / {name}"),
+            &rows_buffer(
+                help_picker.rows(width as usize, help_height, &theme),
+                width,
+                help_height as u16,
             ),
             light,
         );
@@ -1245,6 +1267,54 @@ fn main() -> anyhow::Result<()> {
             terminal.backend().buffer(),
             light,
         );
+        // Drive the actual wizard without dispatching effects to application services.
+        let mut wizard =
+            ProviderOverlay::new(None, Default::default(), Box::new(|_| false), Scope::Global);
+        let mut wizard_keys = vec![crossterm::event::KeyCode::Char('a')];
+        for value in [
+            "review-endpoint",
+            "Review endpoint",
+            "http://127.0.0.1:1234/v1",
+            "invalid-env-name",
+        ] {
+            wizard_keys.extend(value.chars().map(crossterm::event::KeyCode::Char));
+            wizard_keys.push(crossterm::event::KeyCode::Enter);
+        }
+        for code in wizard_keys {
+            let outcome = wizard.handle(
+                &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                    code,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &keys,
+            );
+            assert!(matches!(outcome, dial_ui::ui::overlay::OverlayEvent::None));
+        }
+        let mut short_terminal = Terminal::new(TestBackend::new(width, 10))?;
+        short_terminal.draw(|f| wizard.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Short provider form error / {name}"),
+            short_terminal.backend().buffer(),
+            light,
+        );
+        for _ in 0..8 {
+            let outcome = wizard.handle(
+                &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::PageDown,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &keys,
+            );
+            assert!(matches!(outcome, dial_ui::ui::overlay::OverlayEvent::None));
+            short_terminal.draw(|f| wizard.draw(f, &ctx))?;
+        }
+        screen(
+            &mut out,
+            &format!("Short provider form details / {name}"),
+            short_terminal.backend().buffer(),
+            light,
+        );
         let mut shortcuts = ShortcutOverlay::new();
         terminal.draw(|f| shortcuts.draw(f, &ctx))?;
         screen(
@@ -1451,6 +1521,141 @@ fn main() -> anyhow::Result<()> {
             &format!("Diagrams / {name}"),
             &rows_buffer(rows, width, 24),
             light,
+        );
+    }
+    // Compact workflow reviews use only synthetic records and never dispatch effects.
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let status = StatusData::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &|_, _| ratatui::text::Line::default(),
+    };
+    let mut setup = SettingsOverlay::new(
+        toml::Table::new(),
+        toml::Table::new(),
+        toml::Table::new(),
+        Scope::Global,
+        vec![],
+    );
+    setup.set_setup_offers(std::collections::BTreeMap::from([(
+        "voice.tts.backend".into(),
+        dial_ui::ui::overlay::settings::SetupOffer {
+            id: "piper".into(),
+            title: "Piper".into(),
+            preview: "Install the selected speech backend.\nDestination: /synthetic/long-project-name/optional-runtime/programs/piper\nRuns: uv tool install --python /synthetic/python/bin/python3 piper-tts\nDownloads the runtime and its declared dependencies.\nExisting configuration remains unchanged until installation completes.".into(),
+        },
+    )]));
+    assert!(setup.focus_path("voice.tts.backend"));
+    let outcome = setup.handle(
+        &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+        &keys,
+    );
+    assert!(matches!(outcome, dial_ui::ui::overlay::OverlayEvent::None));
+    let mut terminal = Terminal::new(TestBackend::new(60, 10))?;
+    terminal.draw(|f| setup.draw(f, &ctx))?;
+    screen(
+        &mut out,
+        "Short installation review / 60 × 10",
+        terminal.backend().buffer(),
+        false,
+    );
+    let request = QuestionRequest {
+        question_id: "long-review".into(),
+        generation: 0,
+        session_id: "fixture".into(),
+        owner_task_id: None,
+        questions: vec![Question {
+            id: "direction".into(),
+            header: None,
+            question: "Which approach should we use? The explanation needs to remain available even in a short terminal. Consider maintenance cost, compatibility with existing callers, and what should happen when dependencies are unavailable. Keep the existing behavior until the proposed replacement has been checked. Final constraint: do not discard the saved draft.".into(),
+            options: vec![QuestionOption {
+                label: "Keep compatibility".into(),
+                description: Some("Preserve existing callers while improving the implementation.".into()),
+                preview: None,
+            }],
+            multi: false,
+            recommended: None,
+        }],
+        timeout_seconds: 0,
+        notify: false,
+    };
+    let mut dialog = Dialog::new(&request, std::path::Path::new(".")).with_keys(&keys);
+    for (title, pages) in [
+        ("Long question / first page", 0),
+        ("Long question / last page", 20),
+    ] {
+        for _ in 0..pages {
+            assert!(
+                dialog
+                    .key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::PageDown,
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                        &keys
+                    )
+                    .is_none()
+            );
+        }
+        screen(
+            &mut out,
+            title,
+            &rows_buffer(
+                dial_ui::ui::questions::framed(dialog.rows(38, 10), 38, 10, &theme),
+                38,
+                10,
+            ),
+            false,
+        );
+    }
+    let mut request = request.clone();
+    request.questions[0].question = "Which approach should we use?".into();
+    request.questions[0].options[0].preview =
+        Some("Long preview with compatibility details. ".repeat(12));
+    request.questions[0].options.push(QuestionOption {
+        label: "Short alternative".into(),
+        description: None,
+        preview: None,
+    });
+    let mut dialog = Dialog::new(&request, std::path::Path::new(".")).with_keys(&keys);
+    for (title, key) in [
+        ("Question stability / long preview", None),
+        (
+            "Question stability / short preview",
+            Some(crossterm::event::KeyCode::Down),
+        ),
+        (
+            "Question custom answer / bordered input",
+            Some(crossterm::event::KeyCode::Char('o')),
+        ),
+    ] {
+        if let Some(key) = key {
+            assert!(
+                dialog
+                    .key(
+                        crossterm::event::KeyEvent::new(key, crossterm::event::KeyModifiers::NONE),
+                        &keys
+                    )
+                    .is_none()
+            );
+            if key == crossterm::event::KeyCode::Char('o') {
+                dialog.paste("This is my answer, not agent output.\nKeep the existing behavior.");
+            }
+        }
+        screen(
+            &mut out,
+            title,
+            &rows_buffer(
+                dial_ui::ui::questions::framed(dialog.rows(70, 18), 70, 18, &theme),
+                70,
+                18,
+            ),
+            false,
         );
     }
     let dir = std::env::temp_dir().join("dial-ux-review");

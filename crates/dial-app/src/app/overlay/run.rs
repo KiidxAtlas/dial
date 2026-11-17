@@ -62,8 +62,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                             mode: "session".into(),
                         })
                         .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                });
             let download_failure = env.model_downloads.and_then(|downloads| {
                 let mut downloads = downloads.borrow_mut();
                 downloads.poll();
@@ -73,8 +72,9 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                 env.app.layout(),
                 env.runtime,
                 env.live_tasks,
-                &jobs,
+                jobs.as_deref(),
                 crate::app::overlay::activity::AttentionContext {
+                    downloads_available: env.model_downloads.is_some(),
                     status: Some(env.status),
                     todo: Some(env.todo),
                     download_failure: download_failure.as_ref(),
@@ -178,6 +178,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                     .collect(),
             );
             panel.set_screen(view.screen, view.cursor);
+            panel.set_terminal(view.terminal);
         }
     }
     if let (Some(source), ActiveOverlay::Peers(panel)) = (env.peer_source.as_mut(), &mut *overlay) {

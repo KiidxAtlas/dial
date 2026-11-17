@@ -131,6 +131,30 @@ impl Session {
         }
     }
 
+    /// Resume only the requested journal identity. Unlike interactive resume, contention or a
+    /// recorded move is refused without creating a sibling or mutating the stale source.
+    pub fn open_exact(layout: &Layout, path: &Path) -> Result<Session> {
+        ensure!(
+            Self::moved_snapshot(layout, path)?.is_none(),
+            "session moved away from this project; resume it at its destination"
+        );
+        Self::open(path)
+    }
+
+    fn moved_snapshot(layout: &Layout, path: &Path) -> Result<Option<Session>> {
+        let moved = transfers::moved_away_from(layout, path)?;
+        if !moved.is_empty() {
+            let snapshot = Self::read(path)?;
+            if moved
+                .iter()
+                .any(|transfer| transfer.session_id == snapshot.id)
+            {
+                return Ok(Some(snapshot));
+            }
+        }
+        Ok(None)
+    }
+
     /// Interactive resume. An owned journal opens for appending exactly as `open` does. Only when
     /// another live writer holds the journal lock does the caller get a sibling fork of the active
     /// branch: a new file whose header names this session as `forked_from`, carrying the branch's
@@ -139,12 +163,8 @@ impl Session {
     pub fn open_or_fork(layout: &Layout, path: &Path) -> Result<Resumed> {
         // A journal whose recorded move left this path is stale: its history lives at the
         // destination, so resuming it in place would fork the destination's writer. Fork instead.
-        let moved = transfers::moved_away_from(layout, path)?;
-        if !moved.is_empty() {
-            let snapshot = Self::read(path)?;
-            if moved.iter().any(|t| t.session_id == snapshot.id) {
-                return Self::fork_snapshot(layout, path, snapshot, "moved away", "");
-            }
+        if let Some(snapshot) = Self::moved_snapshot(layout, path)? {
+            return Self::fork_snapshot(layout, path, snapshot, "moved away", "");
         }
         match Self::claim_open(path)? {
             Claimed::Owned(session) => Ok(Resumed::Owned(*session)),

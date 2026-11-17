@@ -7,7 +7,7 @@ pub(super) fn request(
     client: &Client<'_>,
     target: &Target,
     request: &Request<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     ensure!(
         request.source.is_none(),
         "ComfyUI image edits require an image-upload workflow and are not supported"
@@ -61,29 +61,38 @@ pub(super) fn request(
                 );
                 let images = entry["outputs"][&settings.output_node]["images"]
                     .as_array()
+                    .filter(|images| !images.is_empty())
                     .context("ComfyUI output node produced no images")?;
                 ensure!(
-                    images.len() == 1,
-                    "ComfyUI workflow must produce exactly one image at output_node"
+                    images.len() <= super::MAX_IMAGES,
+                    "ComfyUI output_node produced {} images; image_gen writes at most {}",
+                    images.len(),
+                    super::MAX_IMAGES
                 );
-                let image = &images[0];
-                let filename = image["filename"]
-                    .as_str()
-                    .context("ComfyUI output has no filename")?;
-                let subfolder = image["subfolder"].as_str().unwrap_or_default();
-                let kind = image["type"]
-                    .as_str()
-                    .context("ComfyUI output has no folder type")?;
-                ensure!(
-                    !filename.is_empty() && matches!(kind, "output" | "temp"),
-                    "ComfyUI returned an invalid image location"
-                );
-                let query = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("filename", filename)
-                    .append_pair("subfolder", subfolder)
-                    .append_pair("type", kind)
-                    .finish();
-                return client.download(&client.endpoint(&format!("view?{query}")));
+                // Every location is checked before anything is downloaded.
+                let views = images
+                    .iter()
+                    .map(|image| {
+                        let filename = image["filename"]
+                            .as_str()
+                            .context("ComfyUI output has no filename")?;
+                        let subfolder = image["subfolder"].as_str().unwrap_or_default();
+                        let kind = image["type"]
+                            .as_str()
+                            .context("ComfyUI output has no folder type")?;
+                        ensure!(
+                            !filename.is_empty() && matches!(kind, "output" | "temp"),
+                            "ComfyUI returned an invalid image location"
+                        );
+                        let query = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("filename", filename)
+                            .append_pair("subfolder", subfolder)
+                            .append_pair("type", kind)
+                            .finish();
+                        Ok(client.endpoint(&format!("view?{query}")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return views.iter().map(|view| client.download(view)).collect();
             }
             client.pause()?;
         }

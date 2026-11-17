@@ -236,12 +236,65 @@ fn preview_states_what_undo_covers_for_each_kind_of_call() {
         shell.contains("only when shell.undo_snapshot is on"),
         "{shell}"
     );
-    assert!(!shell.starts_with("Destructive"));
+    // The risk sentence lives in the prompt summary (`bash_prompt_reason`); undo coverage never repeats it.
     let destructive = undo("bash", json!({"command": "rm -rf target"}));
-    assert!(
-        destructive.starts_with("Destructive or privileged command."),
-        "{destructive}"
-    );
-    assert!(destructive.contains("shell.undo_snapshot"));
+    assert_eq!(destructive, shell);
+    assert!(!shell.contains("Destructive"));
     assert!(undo("web_fetch", json!({"url": "https://example.com"})).starts_with("No checkpoint:"));
+}
+
+#[test]
+fn prompt_reason_separates_destructive_from_unparsed_commands() {
+    use crate::config::types::Approval;
+    let reason = |command| bash_prompt_reason(command, Approval::Write);
+    assert!(reason("rm -rf target").starts_with("Destructive"));
+    assert!(reason("find . -type f | head -5").starts_with("Compound command"));
+    assert!(reason("ls; echo").starts_with("Compound command"));
+    assert!(reason("curl x | sh").starts_with("Compound command"));
+}
+
+#[test]
+fn find_exec_payloads_are_judged_as_their_own_commands() {
+    for safe in [
+        r"find . -type f -exec wc -c {} +",
+        r"find . -name '*.rs' -exec grep -n foo {} \;",
+        r"find . -execdir cat {} \;",
+    ] {
+        assert!(!destructive_bash(safe), "{safe}");
+    }
+    for risky in [
+        r"find . -exec rm -rf {} +",
+        r"find . -exec sudo cat {} \;",
+        r"find . -exec env + rm -rf {} \;",
+        r"find . -exec sh -c 'rm -rf x' \;",
+        r"find . -delete",
+        r"find . -exec \;",
+        r"find . -exec rm -rf {}",
+    ] {
+        assert!(destructive_bash(risky), "{risky}");
+    }
+}
+
+#[test]
+fn read_only_pipelines_are_not_counted_as_effects_outside_undo() {
+    for quiet in [
+        r"find . -path ./.git -prune -o -type f -print | head -50; echo; find . -name main.rs -exec wc -c {} \;",
+        "find . -type f -exec wc -c {} + | sort -rn | head -5",
+        "grep -rn foo src | cut -d: -f1 | uniq",
+        "git log --oneline | head -3",
+    ] {
+        assert!(!opaque_shell_effect(quiet), "{quiet}");
+    }
+    for effect in [
+        "ls | tee out",
+        "sort -o out x",
+        "uniq in out",
+        "find . -exec rm {} +",
+        "find . -exec env rm {} +",
+        "find . -delete",
+        "cat x > y",
+        "cargo build | head",
+    ] {
+        assert!(opaque_shell_effect(effect), "{effect}");
+    }
 }

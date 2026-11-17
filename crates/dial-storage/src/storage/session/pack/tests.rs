@@ -383,3 +383,200 @@ fn unpacked_source_path_is_recorded_so_the_original_forks() {
         Resumed::Owned(_) => panic!("the stale source must fork after an unpack elsewhere"),
     }
 }
+
+#[test]
+fn orphan_companions_refuse_unpack_even_when_absent_from_archive() {
+    let src = env();
+    let session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+    let archive = src.project.path().join("orphan.zip");
+    pack_session(&src.layout, session.path().unwrap(), &archive).unwrap();
+    for kind in ["side", "stream", "workers"] {
+        let dst = env();
+        fs::create_dir_all(dst.layout.sessions_dir()).unwrap();
+        let target = dst
+            .layout
+            .sessions_dir()
+            .join(session.path().unwrap().file_name().unwrap());
+        let companion = match kind {
+            "stream" => crate::runtime::stream_journal::path(&target),
+            "workers" => {
+                let dir = subagent::transcript_dir(&dst.layout, session.id());
+                fs::create_dir_all(&dir).unwrap();
+                dir.join("job-1-1.jsonl")
+            }
+            _ => side_thread::path_for(&target),
+        };
+        fs::write(&companion, b"existing orphan").unwrap();
+        assert!(unpack_session(&dst.layout, &archive).is_err());
+        assert!(!target.exists());
+        assert_eq!(fs::read(companion).unwrap(), b"existing orphan");
+    }
+}
+
+#[test]
+fn worker_only_artifacts_travel_with_transcripts() {
+    let src = env();
+    let session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+    let store = ArtifactStore::new(&artifact_root(session.path().unwrap()).unwrap()).unwrap();
+    let uri = store.retain("worker-only payload").unwrap();
+    let transcripts = subagent::transcript_dir(&src.layout, session.id());
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("job-1-1.jsonl"),
+        format!("{}\n", json!({"content": uri})),
+    )
+    .unwrap();
+    let archive = src.project.path().join("worker.zip");
+    let packed = pack_session(&src.layout, session.path().unwrap(), &archive).unwrap();
+    assert_eq!(packed.artifacts, 1);
+    let dst = env();
+    let unpacked = unpack_session(&dst.layout, &archive).unwrap();
+    let imported = ArtifactStore::new(&artifact_root(&unpacked.session_path).unwrap()).unwrap();
+    assert_eq!(
+        fs::read(imported.blob_path(&uri).unwrap()).unwrap(),
+        b"worker-only payload"
+    );
+}
+
+#[test]
+fn ledger_failure_only_cleans_up_definitely_unpublished_unpack() {
+    for published in [false, true] {
+        let src = env();
+        let session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+        let archive = src.project.path().join("ledger.zip");
+        let source = session.path().unwrap().to_path_buf();
+        let transcripts = subagent::transcript_dir(&src.layout, session.id());
+        fs::create_dir_all(&transcripts).unwrap();
+        fs::write(transcripts.join("job-1-1.jsonl"), b"{}\n").unwrap();
+        pack_session(&src.layout, &source, &archive).unwrap();
+        let dst = env();
+        if !published {
+            crate::platform::atomic::private_dir(&dst.layout.user_dir).unwrap();
+            fs::create_dir(crate::config::paths::session_transfers_file(
+                &dst.layout.user_dir,
+            ))
+            .unwrap();
+        }
+        let error = unpack_with_record(
+            &dst.layout,
+            &archive,
+            Limits::default(),
+            |layout, id, from, to| {
+                transfers::record(layout, id, from, to)?;
+                anyhow::bail!("injected ledger directory sync failure");
+            },
+        )
+        .unwrap_err();
+        let target = dst.layout.sessions_dir().join(source.file_name().unwrap());
+        assert_eq!(target.exists(), published, "{error:#}");
+        assert!(source.exists());
+        if published {
+            assert!(format!("{error:#}").contains("no rollback claimed"));
+            assert_eq!(fs::read(target).unwrap(), fs::read(source).unwrap());
+        } else {
+            assert!(!subagent::transcript_dir(&dst.layout, session.id()).exists());
+            fs::remove_dir(crate::config::paths::session_transfers_file(
+                &dst.layout.user_dir,
+            ))
+            .unwrap();
+            assert_eq!(unpack_session(&dst.layout, &archive).unwrap().subagents, 1);
+        }
+    }
+}
+
+/// Remove a blob and all declarations of it, keeping the remaining manifest self-consistent.
+fn omit_archive_artifact(src: &Path, dst: &Path, omitted: &str) {
+    let member = format!(
+        "{ARTIFACT_PREFIX}{}",
+        crate::storage::artifact::artifact_id(omitted).unwrap()
+    );
+    let mut input = zip::ZipArchive::new(File::open(src).unwrap()).unwrap();
+    let mut entries = Vec::new();
+    for index in 0..input.len() {
+        let mut entry = input.by_index(index).unwrap();
+        let name = entry.name().unwrap().into_owned();
+        if name == member {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        if name == MANIFEST {
+            let mut manifest: Manifest = serde_json::from_slice(&bytes).unwrap();
+            manifest.members.retain(|entry| entry.name != member);
+            manifest.artifacts.retain(|uri| uri != omitted);
+            bytes = serde_json::to_vec(&manifest).unwrap();
+        }
+        entries.push((name, bytes, None));
+    }
+    write_zip(dst, &entries);
+}
+
+#[test]
+fn unpack_requires_direct_and_nested_artifacts_from_every_transcript_carrier() {
+    for carrier in ["session", "worker", "stream"] {
+        let src = env();
+        let mut session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+        let path = session.path().unwrap().to_owned();
+        let store = ArtifactStore::new(&artifact_root(&path).unwrap()).unwrap();
+        let (citation, dependencies) = evidence_chain(&store);
+        match carrier {
+            "session" => {
+                session
+                    .append(json!({"role":"user", "content":citation}))
+                    .unwrap();
+            }
+            "worker" => {
+                let dir = subagent::transcript_dir(&src.layout, session.id());
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("job-1-1.jsonl"),
+                    format!("{}\n", json!({"content":citation})),
+                )
+                .unwrap();
+            }
+            "stream" => {
+                let tree = crate::runtime::Tree::default();
+                tree.journal(crate::runtime::stream_journal::Journal::open(&path).unwrap());
+                let worker = tree.start("worker", "artifact dependency", None);
+                // Replay must join append frames before classifying the reference.
+                let (head, tail) = citation.split_at(citation.len() / 2);
+                worker.append(head);
+                worker.append(tail);
+            }
+            _ => unreachable!(),
+        }
+        let archive = src.project.path().join("complete.zip");
+        assert_eq!(
+            pack_session(&src.layout, &path, &archive)
+                .unwrap()
+                .artifacts,
+            4
+        );
+        let complete = env();
+        assert_eq!(
+            unpack_session(&complete.layout, &archive)
+                .unwrap()
+                .artifacts,
+            4
+        );
+        for omitted in [&citation, &dependencies[0]] {
+            let tampered = src.project.path().join("omitted.zip");
+            omit_archive_artifact(&archive, &tampered, omitted);
+            let dst = env();
+            // Existing destination cache entries must not conceal an incomplete portable archive.
+            let cache_root = artifact_root(&dst.layout.sessions_dir().join("check.jsonl")).unwrap();
+            let cache = ArtifactStore::new(&cache_root).unwrap();
+            store.transfer_to(&cache, omitted).unwrap();
+            let error = unpack_session(&dst.layout, &tampered).unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("missing required artifact"),
+                "{carrier}: {diagnostic}"
+            );
+            assert!(diagnostic.contains(omitted), "{carrier}: {diagnostic}");
+            assert_nothing_installed(&dst.layout);
+            assert!(!subagent::transcript_dir(&dst.layout, session.id()).exists());
+            assert!(!crate::config::paths::session_transfers_file(&dst.layout.user_dir).exists());
+        }
+    }
+}

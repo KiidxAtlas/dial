@@ -40,6 +40,9 @@ fn info() -> WelcomeInfo {
         approval: "ask".into(),
         sandbox: "dev".into(),
         approval_key: String::new(),
+        submit_key: "Enter".into(),
+        actions_key: "F1".into(),
+        dismiss_key: "Esc".into(),
         doctor_issues: 0,
         tour: false,
     }
@@ -281,6 +284,9 @@ fn long_and_hostile_fields_are_sanitized_and_ellipsized() {
         approval: String::new(),
         sandbox: String::new(),
         approval_key: String::new(),
+        submit_key: String::new(),
+        actions_key: String::new(),
+        dismiss_key: String::new(),
         doctor_issues: 0,
         tour: false,
     };

@@ -339,21 +339,23 @@ impl GitOverlay {
             (false, Area::Staged) => (true, true, "Unstaged"),
             (false, Area::Commit) => return,
         };
-        let Some(result) = self
-            .repo
-            .apply_lines(&shown.doc, hunk, &picks, reverse, cached)
-        else {
-            return self.flash("Selection contains no changes", true);
-        };
-        let plural = if picks.len() == 1 { "" } else { "s" };
-        match result {
-            Ok(()) => {
-                self.line_sel = None;
-                self.flash(format!("{verb} {} line{plural}", picks.len()), false);
-                self.sync();
+        let doc = shown.doc.clone();
+        if discard {
+            let signature = format!(
+                "{}:{:?}:{hunk}:{picks:?}:{doc:?}",
+                self.reads.generation, shown.change
+            );
+            if !self.confirm_patch(signature, "Press x again to discard the selected lines") {
+                return;
             }
-            Err(error) => self.flash(error, true),
         }
+        let plural = if picks.len() == 1 { "" } else { "s" };
+        let message = format!("{verb} {} line{plural}", picks.len());
+        self.start_mutation(move |repo| {
+            repo.apply_lines(&doc, hunk, &picks, reverse, cached)
+                .ok_or_else(|| "Selection contains no changes".to_owned())??;
+            Ok((message, false))
+        });
     }
 
     /// Hint-line entries for the line keys, shown in the diff. While lines are marked, Esc clears

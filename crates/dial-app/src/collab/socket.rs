@@ -238,6 +238,19 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// An in-memory connection handle for owner lifecycle tests; never starts a network worker.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (_, events) = sync_channel(EVENT_CAPACITY);
+        Self {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Queue::default()),
+                stop: AtomicBool::new(false),
+                open: AtomicBool::new(false),
+            }),
+            events,
+        }
+    }
     pub fn connect(opts: SocketOptions) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),

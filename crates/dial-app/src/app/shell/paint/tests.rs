@@ -94,7 +94,11 @@ fn a_command_report_on_the_home_screen_ends_the_home_so_it_is_visible() {
     let (_home, _project, _app, mut shell) = super::super::testkit::shell();
     shell.home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));
     // Background notices at launch keep the home: the user has not asked for anything yet.
-    shell.note("Workers", "restored");
+    shell.notify(
+        crate::ui::overlay::inbox::Category::General,
+        "Workers",
+        "restored",
+    );
     shell.paint(None).unwrap();
     assert!(shell.home.is_some());
 
@@ -406,4 +410,14 @@ fn shift_tab_never_cycles_into_full_auto() {
     assert_eq!(next_cycled_approval(Approval::Write), Approval::Readonly);
     assert_eq!(next_cycled_approval(Approval::Readonly), Approval::Ask);
     assert_eq!(next_cycled_approval(Approval::Auto), Approval::Ask);
+}
+
+#[test]
+fn shift_tab_notes_use_the_mode_names_and_say_how_to_return_to_full_auto() {
+    let left_auto = cycled_approval_note(Approval::Auto, Approval::Ask);
+    assert!(left_auto.starts_with("Ask first"), "{left_auto}");
+    assert!(left_auto.contains("/approval auto"), "{left_auto}");
+    let note = cycled_approval_note(Approval::Ask, Approval::Write);
+    assert_eq!(note, "Edit freely for this session");
+    assert!(!cycled_approval_note(Approval::Write, Approval::Readonly).contains("readonly"));
 }

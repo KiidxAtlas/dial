@@ -96,7 +96,7 @@ fn selection_keeps_clean_entries_cached_but_checks_dirty_pending_and_missing_bas
     let errors = EntryErrors::default();
     let mut dirty = HashSet::new();
     assert!(needs_watch_check(&e, &scheduler, &errors, &dirty, false));
-    scheduler.ran(&e, 0, Some([1; 32]));
+    scheduler.ran(&e, 0, Some([1; 32]), Some([1; 32]));
     assert!(!needs_watch_check(&e, &scheduler, &errors, &dirty, false));
     assert!(needs_watch_check(&e, &scheduler, &errors, &dirty, true));
     dirty.insert(e.id.clone());
@@ -107,10 +107,61 @@ fn selection_keeps_clean_entries_cached_but_checks_dirty_pending_and_missing_bas
         needs_watch_check(&e, &scheduler, &errors, &dirty, false),
         "debounce must recheck without events"
     );
-    scheduler.ran(&e, 2, None);
+    scheduler.ran(&e, 2, Some([1; 32]), None);
     assert!(
         needs_watch_check(&e, &scheduler, &errors, &dirty, false),
         "failed after-run baseline must be retried"
+    );
+}
+
+#[test]
+fn failing_watch_waits_for_error_retry_even_with_events_or_missing_baseline() {
+    let e = Entry {
+        id: "watch".into(),
+        prompt: "inspect".into(),
+        every_secs: None,
+        watch: vec!["*.rs".into()],
+        allow: vec![],
+        approval: "readonly".into(),
+        created: 0,
+    };
+    let scheduler = Scheduler::default();
+    let mut errors = EntryErrors::default();
+    let mut dirty = HashSet::new();
+    dirty.insert(e.id.clone());
+    // Fresh failure: missing baseline, dirty and everything-dirty must all wait for the retry window.
+    errors.current.insert(
+        e.id.clone(),
+        ("watch rejected: boom".into(), Instant::now()),
+    );
+    assert!(!needs_watch_check(&e, &scheduler, &errors, &dirty, true));
+    // Once the retry window has elapsed the entry is checked again.
+    let past = Instant::now().checked_sub(ERROR_RETRY).unwrap();
+    errors
+        .current
+        .insert(e.id.clone(), ("watch rejected: boom".into(), past));
+    assert!(needs_watch_check(&e, &scheduler, &errors, &dirty, false));
+}
+
+#[test]
+fn post_run_events_mark_the_entry_that_just_ran() {
+    let e = Entry {
+        id: "watch".into(),
+        prompt: "inspect".into(),
+        every_secs: None,
+        watch: vec!["*.rs".into()],
+        allow: vec![],
+        approval: "readonly".into(),
+        created: 0,
+    };
+    let globs = HashMap::from([(e.id.clone(), set(&["*.rs"]))]);
+    let mut dirty = HashSet::new();
+    mark_dirty(&globs, &[PathBuf::from("src/late.txt")], &mut dirty);
+    assert!(dirty.is_empty(), "non-matching paths mark nothing");
+    mark_dirty(&globs, &[PathBuf::from("src/late.rs")], &mut dirty);
+    assert!(
+        dirty.contains(&e.id),
+        "an edit that arrived after the snapshot is kept"
     );
 }
 

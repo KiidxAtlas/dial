@@ -18,6 +18,7 @@ Find the active keys, edit bindings and handle terminal-specific keyboard differ
 | Multiline input | `Shift-Enter` when the terminal supports the kitty keyboard protocol, otherwise `Ctrl-J` (the newline hint shows `Ctrl-J` when Shift+Enter would arrive as plain Enter) |
 | Queue a follow-up while busy | `Ctrl-Q`, or `Option+Enter` on macOS / `Alt+Enter` elsewhere (Windows Terminal keeps `Alt+Enter` for fullscreen) |
 | Expand/collapse tool results / show or hide tools | `Ctrl-O` / `Alt-O` or `F5` |
+| Inspect one retained tool call | `F10` Controls → Inspect tool evidence; bulk `Ctrl-O` is unchanged |
 | Worker hub / latest worker | `Alt-A` or `F6` / `Alt-Shift-A` or `F7` |
 | Next favorite model | `Alt-]` or `F8` |
 | Repaint the screen | `Ctrl-L` or `Alt-L` |
@@ -39,9 +40,17 @@ the command palette uses `Alt-K` and `F1` instead. `Ctrl-K` is cut-to-line-end o
 When an application shortcut takes a chord an editing action also uses (for example a custom
 `"app.model.select" = "Ctrl+K"`), `/hotkeys` and the shortcuts panel flag the editing chord as shadowed.
 
-Every Option/Alt shortcut also has a Control or function-key default, because macOS terminals type a
-symbol for Option+letter (Option+M types `µ`) unless Option sends Meta/Esc (iTerm2: Profiles → Keys →
-Left Option key → Esc+; Terminal.app: **Use Option as Meta key**). On macOS, **F2** opens the
+Option shortcuts work in macOS terminals whose Option key types characters (iTerm2's default
+"Option key sends: Normal", Terminal.app without **Use Option as Meta key**, the VS Code
+terminal). With a U.S. or ABC keyboard layout, Dial reads the character Option+key types back as
+that shortcut: Option+K arrives as `˚` and opens the command palette, and Option+M arrives as `µ`
+and opens the model selector. This only applies to keys bound to an Option chord. Other characters still type,
+and pasting `˚` or `µ` into the draft still inserts them. Other layouts type some of these
+characters with plain keys (`ß`, `å`, `ø`, `ç`), so there Dial leaves them as text. Set Option to
+send Meta/Esc+ (iTerm2: Profiles → Keys → Left Option key → Esc+; Terminal.app: **Use Option as
+Meta key**), or use the Control and function-key alternatives every default Option shortcut has.
+Option+E, I, N and U are accent keys that type nothing on their own, so Dial cannot see them in
+this mode. On macOS, **F2** opens the
 model selector and Option+M remains available; bind `Ctrl+K` yourself if you prefer it. Function keys on Mac keyboards may need
 `Fn` unless "Use F1, F2, etc. keys as standard function keys" is on. On Windows, Windows Terminal
 keeps `Alt+Enter` (fullscreen), `Ctrl+V` (its text paste) and `Ctrl+,` (its settings), so use `Ctrl+Q`,
@@ -56,6 +65,10 @@ search) opens the full key sheet. In the HTTP header editor `Ctrl+O` adds a row
 GNOME Terminal takes `F10`. A key you bind to an editing action is not shadowed by an application
 default on the same key. `/model` works on every platform, and the footer and `/hotkeys` show your
 active bindings, including custom overrides.
+The key sheet scrolls with arrows, PageUp/PageDown and Home/End while keeping its close hint visible.
+Peers keeps recipient selection separate from board scrolling: PageUp/PageDown reveals longer claims.
+In Activity, Ctrl+Shift+F11/F12 navigates inner tabs. Alt+PageUp/PageDown and Ctrl+Tab remain alternatives where the terminal forwards them.
+Models, Providers and Settings use Ctrl+B for scope outside text editors; Ctrl+S means Save in headers.
 Shortcut labels use **Option** on macOS and **Alt** elsewhere. **Ctrl** always means Control,
 not Command. Both `Alt` and `Option` are accepted in keybinding configuration on every platform;
 saved bindings retain the portable `Alt` spelling. `/hotkeys` shows the effective native labels.

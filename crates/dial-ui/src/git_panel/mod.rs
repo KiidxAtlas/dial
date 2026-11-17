@@ -4,11 +4,13 @@
 
 mod ai;
 mod git;
+mod jobs;
 mod watch;
 
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub(crate) use jobs::JobNotice;
 pub(crate) use watch::Watch;
 
 /// Unified-diff context lines for the panel's diffs (matches the diff view).
@@ -203,11 +205,10 @@ pub(super) fn hunk_patch(doc: &Doc, index: usize) -> Option<String> {
     Some(out)
 }
 
-/// A generated commit message and whether generation first staged everything.
+/// A generated commit message and validation feedback.
 pub(super) struct Generated {
     pub(super) text: String,
     pub(super) validation_error: Option<String>,
-    pub(super) staged_all: bool,
 }
 
 /// Outcome of one AI staging run.

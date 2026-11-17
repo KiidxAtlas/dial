@@ -128,6 +128,26 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// Apply real host frames to an in-memory guest for frontend routing tests.
+    #[cfg(test)]
+    pub(crate) fn fixture(frames: &[Value]) -> Self {
+        let mut guest = Self {
+            socket: Socket::detached(),
+            read_only: true,
+            welcomed: false,
+            ended: false,
+            hello: frame::hello("fixture"),
+            write_token: Some([7; WRITE_TOKEN_BYTES]),
+            write_challenge: None,
+            request_sequence: std::cell::Cell::new(0),
+            replica: Replica::default(),
+            projected: 0,
+        };
+        for frame in frames {
+            guest.on_frame(frame, &mut Vec::new());
+        }
+        guest
+    }
     /// Connect to the room named by `link`. `default_relay` is used only for bare links.
     pub fn join(default_relay: &str, link: &str, name: &str) -> Result<Self> {
         let parsed = parse_link(link, default_relay)?;
@@ -150,6 +170,11 @@ impl Guest {
             replica: Replica::default(),
             projected: 0,
         })
+    }
+
+    /// Whether the host has completed its admission handshake for this guest.
+    pub fn welcomed(&self) -> bool {
+        self.welcomed
     }
 
     pub fn is_read_only(&self) -> bool {

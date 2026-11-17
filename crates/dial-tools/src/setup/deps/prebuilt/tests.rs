@@ -59,6 +59,18 @@ fn llama_cpp_pins_each_platform_archive_with_its_layout() {
 }
 
 #[test]
+fn sd_cpp_pins_a_flat_archive_for_each_supported_platform() {
+    for platform in ["darwin-arm64", "linux-x64", "win32-x64"] {
+        let asset = SD_CPP.asset(platform).unwrap();
+        assert_eq!(asset.format, Format::FlatZip, "{platform}");
+        assert_eq!(asset.sha256.len(), 64, "{}", asset.url);
+        assert!(asset.url.starts_with(
+            "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1106-532d2c1/"
+        ));
+    }
+}
+
+#[test]
 fn symlinks_must_stay_inside_the_install_directory() {
     assert!(link_stays_inside(
         Path::new("bin/npm"),

@@ -447,11 +447,13 @@ fn capture_and_freshness_honor_both_sandbox_deny_read_policies() {
             deny_read: vec![path.clone()],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
         Policy::Strict {
             deny_read: vec![path],
             extra_write: vec![],
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let restricted = ws.clone().with_policy(policy);

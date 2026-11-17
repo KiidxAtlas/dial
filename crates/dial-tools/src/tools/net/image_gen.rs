@@ -8,9 +8,14 @@
 //! Per-model settings (`[image.models.*]`, edited by `/image settings`) apply to every request for
 //! the matching model; each image API receives only the settings it accepts (`supported`).
 //!
-//! Edits (`image`): MLX-Serve accepts base64 input on `images/generations`, OpenAI Images uses
-//! multipart `images/edits`, Responses gets `input_image`, and Gemini gets `inlineData`.
-//! Other routes refuse before any request. The source file is only read.
+//! Edits (`image`): MLX-Serve accepts base64 input on `images/generations`, OpenAI Images and
+//! Dial-launched stable-diffusion.cpp use multipart `images/edits`, Responses gets `input_image`,
+//! and Gemini gets `inlineData`. Other routes refuse before any request. The source file is only
+//! read.
+//!
+//! A downloaded image checkpoint assigned as the image model (a local path, not an endpoint) runs
+//! on stable-diffusion.cpp's `sd-server`, which Dial starts for the call and stops afterwards
+//! (`crate::llm::server::image`).
 //!
 //! Request validation, path resolution, destination preflight and mutation authority run before
 //! generation. Provider errors or a later filesystem race can still fail a paid request. Returned
@@ -45,6 +50,9 @@ const MAX_PROMPT_BYTES: usize = 4_000;
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 300;
+/// The most images one call writes. A model asked for one image may still return several; each
+/// is saved next to the requested output, and a larger batch is refused as unexpected.
+const MAX_IMAGES: usize = 8;
 const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// GPT Image 2.6 is the first OpenAI family with animated GIF output (Images API and the
 /// Responses image tool). Flare is the fast variant, used when no GIF-capable model was chosen.
@@ -88,6 +96,8 @@ pub fn auto_tools(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
     }
     match resolve(config) {
         Ok(_) => Ok(tools(config)),
+        // The account refused ChatGPT's hosted image tool: stop offering it instead of failing.
+        Err(error) if error.is::<selected::HostedImageRefused>() => Ok(Vec::new()),
         Err(error)
             if customized(&config.image)
                 || config.role_selection("image").is_some()
@@ -132,6 +142,7 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
             Wire::OpenAi => "OpenAI Images",
             Wire::Xai => "xAI Images",
             Wire::MlxServe => "MLX-Serve",
+            Wire::SdCpp => "stable-diffusion.cpp (started by Dial)",
             Wire::Responses => "Responses image tool",
             Wire::ChatCompletions => "Chat image output",
             Wire::Gemini => "Gemini native image",
@@ -150,7 +161,7 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
 /// Why `target` cannot edit an existing image, when it cannot.
 fn edit_unsupported(target: &Target) -> Option<String> {
     match target.wire {
-        Wire::MlxServe | Wire::Responses | Wire::Gemini => None,
+        Wire::MlxServe | Wire::SdCpp | Wire::Responses | Wire::Gemini => None,
         Wire::OpenAi if target.model.starts_with("dall-e-3") => Some(format!(
             "{} cannot edit images; use gpt-image-1 or dall-e-2",
             target.model
@@ -163,7 +174,7 @@ fn edit_unsupported(target: &Target) -> Option<String> {
         | Wire::ComfyUi
         | Wire::Fal
         | Wire::Replicate => Some(format!(
-            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve, Gemini or Responses image model",
+            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve, local checkpoint, Gemini or Responses image model",
             target.model
         )),
     }
@@ -173,6 +184,7 @@ fn edit_unsupported(target: &Target) -> Option<String> {
 fn supported(wire: Wire, model: &str) -> &'static [&'static str] {
     match wire {
         Wire::MlxServe => &["size", "steps", "seed", "strength", "loras", "cond_weights"],
+        Wire::SdCpp => &["size", "steps", "seed"],
         Wire::OpenAi if model.starts_with("dall-e") => &["size", "quality"],
         Wire::OpenAi | Wire::Responses => &["size", "quality", "background", "moderation"],
         Wire::Xai | Wire::ChatCompletions => &["size"],
@@ -249,6 +261,9 @@ enum Wire {
     Xai,
     /// Native MLX-Serve Images API, returning PNG only.
     MlxServe,
+    /// A local checkpoint served by a Dial-launched stable-diffusion.cpp `sd-server` (OpenAI
+    /// Images shape; steps and seed travel in its `<sd_cpp_extra_args>` prompt extension).
+    SdCpp,
     Responses,
     ChatCompletions,
     Gemini,
@@ -575,26 +590,56 @@ impl ImageGen {
                 let similarity = crate::tools::vision::search::prompt_similarity_line(
                     ctx.config,
                     args["prompt"].as_str().unwrap_or_default(),
-                    &written.path,
+                    &written.files[0].path,
                 );
+                let edited = written
+                    .source
+                    .as_ref()
+                    .map(|source| format!(", edited from {source}"))
+                    .unwrap_or_default();
+                let summary = match written.files.as_slice() {
+                    [only] => format!(
+                        "Wrote {} {} ({} bytes) from {} to {}{edited}.",
+                        written.format.name(),
+                        only.frames.map_or_else(
+                            || "image".to_owned(),
+                            |n| format!("animation, {n} frames,")
+                        ),
+                        only.bytes,
+                        written.model,
+                        only.relative,
+                    ),
+                    files => format!(
+                        "Wrote {} {} {} from {} (the model returned more than one){edited}: {}.",
+                        files.len(),
+                        written.format.name(),
+                        if files.iter().any(|file| file.frames.is_some()) {
+                            "animations"
+                        } else {
+                            "images"
+                        },
+                        written.model,
+                        files
+                            .iter()
+                            .map(|file| format!(
+                                "{} ({} bytes{})",
+                                file.relative,
+                                file.bytes,
+                                file.frames
+                                    .map(|n| format!(", {n} frames"))
+                                    .unwrap_or_default()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
                 ToolOutput::ok(format!(
-                    "Wrote {} {} ({} bytes) from {} to {}{}.{}",
-                    written.format.name(),
-                    written
-                        .frames
-                        .map_or_else(|| "image".to_owned(), |n| format!("animation, {n} frames,")),
-                    written.bytes,
-                    written.model,
-                    written.relative,
-                    written
-                        .source
-                        .map(|source| format!(", edited from {source}"))
-                        .unwrap_or_default(),
+                    "{summary}{}",
                     similarity
                         .map(|line| format!("\n{line}"))
                         .unwrap_or_default()
                 ))
-                .with_changes([written.path])
+                .with_changes(written.files.into_iter().map(|file| file.path))
             }
             Err(error) => ToolOutput::err(format!("{error:#}")),
         }
@@ -896,15 +941,43 @@ impl From<Format> for image::ImageFormat {
     }
 }
 
-struct Written {
+/// One image file `generate` published.
+struct WrittenFile {
     relative: String,
     path: PathBuf,
-    format: Format,
     bytes: u64,
-    model: String,
-    source: Option<String>,
     /// Frame count of an animated GIF.
     frames: Option<usize>,
+}
+
+/// Everything one call published: the requested output first, then any further images the model
+/// returned, in the provider's order.
+struct Written {
+    files: Vec<WrittenFile>,
+    format: Format,
+    model: String,
+    source: Option<String>,
+}
+
+/// Downloaded checkpoints run on stable-diffusion.cpp's `sd-server`. When none is installed, ask
+/// once and install the pinned, checksum-verified build into Dial's own folder (`/setup sd-cpp`).
+fn ensure_sd_server(ctx: &ToolContext, cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+    if crate::llm::local_format::sd_server().is_some() {
+        return Ok(());
+    }
+    let asked = ctx.confirm.is_some_and(|confirm| {
+        confirm("Local image models run on stable-diffusion.cpp, which is not installed. Install it now? Dial downloads a pinned, checksum-verified build into its own folder (no admin rights).")
+    });
+    ensure!(asked, "{}", crate::llm::server::image::MISSING_RUNTIME);
+    let layout = crate::config::paths::Layout::discover(ctx.workspace.root())
+        .context("finding Dial's folders to install stable-diffusion.cpp")?;
+    crate::setup::deps::run::install_and_save(&layout, "sd-cpp", cancel, &mut |_| {})?;
+    ensure!(
+        crate::llm::local_format::sd_server().is_some(),
+        "stable-diffusion.cpp was installed but its sd-server was not found; {}",
+        crate::llm::server::image::MISSING_RUNTIME
+    );
+    Ok(())
 }
 
 fn generate(
@@ -962,19 +1035,94 @@ fn generate(
             request.size = "auto";
         }
     }
+    // A local checkpoint runs on an sd-server started for this call; dropping it stops the server.
+    let _server = if target.wire == Wire::SdCpp {
+        ensure_sd_server(ctx, &cancel)?;
+        let server = crate::llm::server::image::ImageServer::start(
+            std::path::Path::new(&target.model),
+            ctx.config.image.timeout_secs,
+            Arc::clone(&cancel),
+        )?;
+        target.base_url = server.base_url().to_owned();
+        Some(server)
+    } else {
+        None
+    };
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("output has no parent directory"))?;
+        .ok_or_else(|| anyhow!("output has no parent directory"))?
+        .to_path_buf();
     // Stage in the destination directory before spending quota; RAII removes it on every error.
-    let mut file = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("preparing image destination {}", request.output))?;
+    let mut first = Some(
+        tempfile::NamedTempFile::new_in(&parent)
+            .with_context(|| format!("preparing image destination {}", request.output))?,
+    );
     let client = native::Client::new(&target, ctx.config, cancel);
     client.check()?;
-    let bytes = request_image(&target, ctx.config, &request, &client)
+    let images = request_image(&target, ctx.config, &request, &client)
         .map_err(|error| client.redact(error))?;
-    let native_format = Format::detect(&bytes)
+    ensure!(!images.is_empty(), "image API returned no image");
+    ensure!(
+        images.len() <= MAX_IMAGES,
+        "image API returned {} images; image_gen writes at most {MAX_IMAGES}",
+        images.len()
+    );
+    let extras = extra_outputs(ctx, request.output, &path, images.len() - 1)?;
+    if !extras.is_empty() {
+        let paths: Vec<PathBuf> = extras.iter().map(|(_, path)| path.clone()).collect();
+        ctx.authorize_mutation(TOOL, &paths, false)
+            .map_err(|error| anyhow!(error))?;
+    }
+    let destinations = std::iter::once((request.output.to_owned(), path)).chain(extras);
+    let mut staged = Vec::with_capacity(images.len());
+    for (bytes, (relative, path)) in images.iter().zip(destinations) {
+        let mut file = match first.take() {
+            Some(file) => file,
+            None => tempfile::NamedTempFile::new_in(&parent)
+                .with_context(|| format!("preparing image destination {relative}"))?,
+        };
+        let frames = encode_image(bytes, format, &mut file)
+            .with_context(|| format!("writing {relative}"))?;
+        let written_bytes = file.as_file().metadata()?.len();
+        ensure!(
+            written_bytes <= MAX_RESPONSE_BYTES,
+            "generated image output exceeds {} MiB",
+            MAX_RESPONSE_BYTES / (1024 * 1024)
+        );
+        staged.push((
+            file,
+            WrittenFile {
+                relative,
+                path,
+                bytes: written_bytes,
+                frames,
+            },
+        ));
+    }
+    client.check()?;
+    crate::tools::exec::execution::before_commit().map_err(|error| anyhow!(error))?;
+    let mut files = Vec::with_capacity(staged.len());
+    for (file, written) in staged {
+        file.persist_noclobber(&written.path)
+            .with_context(|| format!("publishing {} without overwriting", written.relative))?;
+        files.push(written);
+    }
+    Ok(Written {
+        files,
+        format,
+        model: target.model,
+        source: request.source.map(|source| source.relative),
+    })
+}
+
+/// Writes one returned image to `file` in the requested `format`; returns the GIF frame count.
+fn encode_image(
+    bytes: &[u8],
+    format: Format,
+    file: &mut tempfile::NamedTempFile,
+) -> Result<Option<usize>> {
+    let native_format = Format::detect(bytes)
         .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, WebP, or GIF"))?;
-    let mut frames = None;
     if format == Format::Gif || native_format == Format::Gif {
         // Animations are never synthesized from a still image, nor flattened into one.
         ensure!(
@@ -983,44 +1131,59 @@ fn generate(
             native_format.name(),
             format.name()
         );
-        frames = Some(gif_frames(&bytes)?);
-        file.write_all(&bytes)
-            .with_context(|| format!("writing {}", request.output))?;
-    } else if native_format == format {
-        decode_bounded(&bytes).context("decoding generated image")?;
-        file.write_all(&bytes)
-            .with_context(|| format!("writing {}", request.output))?;
-    } else {
-        let decoded = decode_bounded(&bytes).context("decoding generated image")?;
-        // JPEG cannot encode alpha; the caller chose that loss of transparency via the extension.
-        let decoded = if format == Format::Jpeg {
-            image::DynamicImage::ImageRgb8(decoded.into_rgb8())
-        } else {
-            decoded
-        };
-        decoded
-            .write_to(file.as_file_mut(), format.into())
-            .with_context(|| format!("converting generated image to {}", format.name()))?;
+        let frames = gif_frames(bytes)?;
+        file.write_all(bytes)?;
+        return Ok(Some(frames));
     }
-    let written_bytes = file.as_file().metadata()?.len();
-    ensure!(
-        written_bytes <= MAX_RESPONSE_BYTES,
-        "generated image output exceeds {} MiB",
-        MAX_RESPONSE_BYTES / (1024 * 1024)
-    );
-    client.check()?;
-    crate::tools::exec::execution::before_commit().map_err(|error| anyhow!(error))?;
-    file.persist_noclobber(&path)
-        .with_context(|| format!("publishing {} without overwriting", request.output))?;
-    Ok(Written {
-        relative: request.output.to_owned(),
-        path,
-        format,
-        bytes: written_bytes,
-        model: target.model,
-        source: request.source.map(|source| source.relative),
-        frames,
-    })
+    if native_format == format {
+        decode_bounded(bytes).context("decoding generated image")?;
+        file.write_all(bytes)?;
+        return Ok(None);
+    }
+    let decoded = decode_bounded(bytes).context("decoding generated image")?;
+    // JPEG cannot encode alpha; the caller chose that loss of transparency via the extension.
+    let decoded = if format == Format::Jpeg {
+        image::DynamicImage::ImageRgb8(decoded.into_rgb8())
+    } else {
+        decoded
+    };
+    decoded
+        .write_to(file.as_file_mut(), format.into())
+        .with_context(|| format!("converting generated image to {}", format.name()))?;
+    Ok(None)
+}
+
+/// Workspace-relative names for `count` further images beside `output`: `name-2.ext`,
+/// `name-3.ext` and so on, skipping names that already exist so nothing is overwritten.
+fn extra_outputs(
+    ctx: &ToolContext,
+    output: &str,
+    primary: &std::path::Path,
+    count: usize,
+) -> Result<Vec<(String, PathBuf)>> {
+    let split = output.rfind(['/', '\\']).map_or(0, |index| index + 1);
+    let (directory, name) = output.split_at(split);
+    let (stem, extension) = name
+        .rsplit_once('.')
+        .context("image_gen output has no extension")?;
+    let mut chosen = Vec::with_capacity(count);
+    let mut number = 2;
+    while chosen.len() < count {
+        ensure!(
+            number < 1000,
+            "no free file name for the extra images beside {output}"
+        );
+        let relative = format!("{directory}{stem}-{number}.{extension}");
+        number += 1;
+        let path = ctx
+            .workspace
+            .resolve(&relative)
+            .map_err(|error| anyhow!(error))?;
+        if !path.exists() && path != primary {
+            chosen.push((relative, path));
+        }
+    }
+    Ok(chosen)
 }
 
 fn request_body(target: &Target, request: &Request) -> Value {
@@ -1030,6 +1193,16 @@ fn request_body(target: &Target, request: &Request) -> Value {
         "n": 1,
     });
     match target.wire {
+        Wire::SdCpp => {
+            body["model"] = json!(crate::llm::server::image::REQUEST_MODEL);
+            body["prompt"] = json!(sd_cpp_prompt(target, request.prompt));
+            if request.size != "auto" {
+                body["size"] = json!(request.size);
+            }
+            if request.source.is_none() {
+                body["output_format"] = json!("png");
+            }
+        }
         Wire::OpenAi | Wire::MlxServe => {
             // MLX-Serve edits size the result from the source unless a size was chosen.
             if !(target.wire == Wire::MlxServe
@@ -1075,12 +1248,32 @@ fn request_body(target: &Target, request: &Request) -> Value {
     body
 }
 
+/// The prompt with configured steps and seed in stable-diffusion.cpp's prompt extension, which
+/// its OpenAI-compatible routes read and strip before generating.
+fn sd_cpp_prompt(target: &Target, prompt: &str) -> String {
+    let mut extra = serde_json::Map::new();
+    if let Some(steps) = target.settings.steps {
+        extra.insert("sample_params".into(), json!({ "sample_steps": steps }));
+    }
+    if let Some(seed) = target.settings.seed {
+        extra.insert("seed".into(), json!(seed));
+    }
+    if extra.is_empty() {
+        prompt.to_owned()
+    } else {
+        format!(
+            "{prompt} <sd_cpp_extra_args>{}</sd_cpp_extra_args>",
+            Value::Object(extra)
+        )
+    }
+}
+
 fn request_image(
     target: &Target,
     config: &Config,
     request: &Request,
     client: &native::Client<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     match target.wire {
         Wire::Gemini | Wire::Imagen => return google::request(client, target, request),
         Wire::BlackForestLabs | Wire::Fal | Wire::Replicate => {
@@ -1094,7 +1287,7 @@ fn request_image(
     }
     let base = target.base_url.trim_end_matches('/');
     let edit = match (target.wire, &request.source) {
-        (Wire::OpenAi, Some(source)) => Some(source),
+        (Wire::OpenAi | Wire::SdCpp, Some(source)) => Some(source),
         _ => None,
     };
     let path = match (target.wire, edit) {
@@ -1173,7 +1366,7 @@ fn multipart(boundary: &str, body: &Value, source: &Source) -> Vec<u8> {
     out
 }
 
-fn parse_response(status: u16, raw: &[u8]) -> Result<Vec<u8>> {
+fn parse_response(status: u16, raw: &[u8]) -> Result<Vec<Vec<u8>>> {
     let value: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
         let detail = value["error"]["message"]
@@ -1185,12 +1378,25 @@ fn parse_response(status: u16, raw: &[u8]) -> Result<Vec<u8>> {
             .unwrap_or_default();
         bail!("image API failed (HTTP {status}){detail}");
     }
-    let encoded = value["data"][0]["b64_json"]
-        .as_str()
+    let data = value["data"]
+        .as_array()
+        .filter(|data| !data.is_empty())
         .ok_or_else(|| anyhow!("image API response contained no b64_json image data"))?;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .context("image API returned invalid base64 image data")
+    ensure!(
+        data.len() <= MAX_IMAGES,
+        "image API returned {} images; image_gen writes at most {MAX_IMAGES}",
+        data.len()
+    );
+    data.iter()
+        .map(|item| {
+            let encoded = item["b64_json"]
+                .as_str()
+                .ok_or_else(|| anyhow!("image API response contained no b64_json image data"))?;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .context("image API returned invalid base64 image data")
+        })
+        .collect()
 }
 
 #[cfg(test)]

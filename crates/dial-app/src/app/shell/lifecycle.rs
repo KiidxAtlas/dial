@@ -174,11 +174,15 @@ impl Shell {
             frame_pacing: Default::default(),
         };
         for warning in warnings {
-            shell.note("Key bindings", &warning);
+            shell.notify(
+                crate::ui::overlay::inbox::Category::General,
+                "Key bindings",
+                &warning,
+            );
         }
         if let Some(error) = shell.themes.last_error() {
             let error = error.to_owned();
-            shell.note("Theme", &error);
+            shell.notify(crate::ui::overlay::inbox::Category::Error, "Theme", &error);
         }
         if let Some(error) = &app.store_error {
             shell.note("Learning", error);
@@ -216,14 +220,17 @@ impl Shell {
         {
             if let Some(message) = self.runtime_updates.poll(&app.layout.user_dir) {
                 self.runtime_updates.retain_report(message);
+                if let Some(message) = self.runtime_updates.notice() {
+                    self.inbox.push("Runtime updates", message);
+                }
                 files_changed = true;
             }
+            let previous_release = self.release_notice.notice().map(str::to_owned);
             files_changed |= self.release_notice.poll(&app.layout.user_dir);
-            if let Some(message) = self.release_notice.notice() {
+            if self.release_notice.notice() != previous_release.as_deref()
+                && let Some(message) = self.release_notice.notice()
+            {
                 self.inbox.push("Update available", message);
-            }
-            if let Some(message) = self.runtime_updates.notice() {
-                self.inbox.push("Runtime updates", message);
             }
         }
         self.files.request(&app.layout.project_root);
@@ -449,6 +456,9 @@ impl Shell {
                 approval: format!("{:?}", app.config.approval).to_lowercase(),
                 sandbox: format!("{:?}", app.config.sandbox.mode).to_lowercase(),
                 approval_key: self.keys.label(Action::ApprovalCycle),
+                submit_key: self.keys.label(Action::Submit),
+                actions_key: self.keys.label(Action::CommandPalette),
+                dismiss_key: self.keys.label(Action::Dismiss),
                 doctor_issues: usize::from(app.store_error.is_some())
                     + usize::from(self.themes.last_error().is_some())
                     + usize::from(selection.provider.is_empty()),
@@ -507,7 +517,11 @@ impl Shell {
         self.catalog.refresh(app);
         let themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, self.dark);
         if let Some(error) = themes.last_error() {
-            self.note("Theme", format!("{error}; keeping last good theme"));
+            self.notify(
+                crate::ui::overlay::inbox::Category::Error,
+                "Theme",
+                format!("{error}; keeping last good theme"),
+            );
         } else {
             self.themes = themes;
         }

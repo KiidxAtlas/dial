@@ -42,7 +42,7 @@ impl SettingsOverlay {
             self.scroll = 0;
             return OverlayEvent::None;
         }
-        if is_ctrl(key, 's') {
+        if is_ctrl(key, 'b') {
             self.scope = other_scope(self.scope);
             if self.changed_only {
                 self.cursor = 0;
@@ -453,7 +453,7 @@ impl SettingsOverlay {
     /// What the open browser or structured editor does, for the description area.
     pub(super) fn structured_help(&self) -> Option<String> {
         Some(match &self.mode {
-            Mode::Path { .. } => "Enter opens a folder or chooses the entry; type to filter, or type a path and press Enter. Ctrl+E types the value instead.".to_owned(),
+            Mode::Path { .. } => "Enter opens a folder or chooses the entry; type to filter. For a typed path, Enter checks/opens it; Enter again chooses a checked file. Ctrl+E types the value instead.".to_owned(),
             Mode::List { editor, .. } if editor.ordered() => "Space checks or unchecks; Shift+Up/Down reorders (earlier is preferred); the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
             Mode::List { .. } => "Space checks or unchecks; the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
             Mode::Entries { def, .. } => {

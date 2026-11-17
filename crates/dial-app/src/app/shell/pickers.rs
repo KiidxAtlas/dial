@@ -57,7 +57,7 @@ impl Shell {
         match choice {
             0 => Some(format!("open {id}")),
             1 => {
-                let text = self.side.command(&format!("open {id}"), None);
+                let text = crate::app::side::command(&mut self.side, &format!("open {id}"), None);
                 if text.starts_with("error:") {
                     self.note("BTW", text);
                     return None;

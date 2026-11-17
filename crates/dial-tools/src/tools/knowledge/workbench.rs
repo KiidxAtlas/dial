@@ -13,6 +13,33 @@ const MAX_NODES: usize = 64;
 const MAX_BYTES: usize = 1024 * 1024;
 const PREVIEW_BYTES: usize = 4096;
 
+/// The workbench request that inspects the retained log of one recorded check, by exact name.
+/// `summary` is the turn summary (`recorded_checks` with `name` and `evidence_ref`). Shared by
+/// `/evidence check` and `evidence` over RPC. Absent, ambiguous and log-less checks are refused:
+/// there is no fallback to other output.
+pub fn check_inspect_request(summary: &Value, name: &str) -> Result<Value> {
+    let matches: Vec<_> = summary["recorded_checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| check["name"].as_str() == Some(name))
+        .collect();
+    let [check] = matches.as_slice() else {
+        bail!(
+            "Exact check unavailable or name ambiguous. List the recorded checks; no latest-output fallback is used."
+        );
+    };
+    let reference = check["evidence_ref"]
+        .as_str()
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Exact retained log unavailable for this check; no latest-output fallback is used."
+            )
+        })?;
+    Ok(json!({"action":"inspect", "references":[reference]}))
+}
+
 /// The retired `workbench` contract, now the `evidence` `audit`, `lineage` and `correct` actions.
 /// `/evidence` uses the same [`run`].
 pub(crate) fn schema() -> Value {

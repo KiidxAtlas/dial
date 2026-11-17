@@ -4,12 +4,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+require('./capture.test.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname,'driver.cjs'),'utf8');
 function harness({realTimers = false} = {}) {
   const timers = new Set(), frames = [];
   let onLine;
   const stdout = { writableNeedDrain:false,writableLength:0,write(line,callback) { frames.push(JSON.parse(line));callback();return true; } };
-  const context = vm.createContext({ Buffer, setTimeout: realTimers ? setTimeout : (fn) => {timers.add(fn);return fn;},clearTimeout: realTimers ? clearTimeout : (fn) => {timers.delete(fn);},
+  const context = vm.createContext({ Buffer, URL, setTimeout: realTimers ? setTimeout : (fn) => {timers.add(fn);return fn;},clearTimeout: realTimers ? clearTimeout : (fn) => {timers.delete(fn);},
     require(name) { return name === 'node:readline' ? {createInterface(){return {on(event,callback){if(event === 'line') onLine=callback;}};}} : {chromium:{}}; },
     process:{env:{DIAL_PLAYWRIGHT:'external-operator-module'},stdout,stderr:{write(){}},on(){},stdin:{on(){}},exit(){}},
   });
@@ -396,4 +397,80 @@ test('implicit sole-tab observations exclude old failures even without a tab in 
   const result=h.frames.at(-1).result;
   assert.equal(result.completed,true);
   assert.deepEqual(result.observations.events.events.map(event=>event.text),['new']);
+});
+
+test('timed out page execution is quarantined before returning and cannot be reused', async () => {
+  const { runCode, runCall } = require('./run.cjs');
+  for (const execute of [options => runCode({...options, code:'await sleep(99999)'}), options => runCall({...options, chain:[{method:'evaluate',args:['new Promise(()=>{})']}]})]) {
+    let retired = false, evaluations = 0;
+    const page = {evaluate(){evaluations++; return new Promise(()=>{});}};
+    await assert.rejects(execute({page,timeoutMs:1000,onTimeout(){retired=true;}}), /timed out/);
+    assert.equal(retired,true);
+    await assert.rejects(runCode({page,timeoutMs:1000,code:'return 1'}), /quarantined/);
+    assert.equal(evaluations,1);
+  }
+});
+
+test('snapshot text and URL clipping preserve Unicode at the UTF-16 boundary', async () => {
+  const h = harness();
+  const text = 'a'.repeat(299)+'😀';
+  h.run(`globalThis.location={href:'a'.repeat(1999)+'😀'}; globalThis.NodeFilter={SHOW_ELEMENT:1};
+    globalThis.getComputedStyle=()=>({display:'block',visibility:'visible'});
+    globalThis.CSS={escape:value=>value};
+    globalThis.root={nodeType:1,id:'root',localName:'button',textContent:${JSON.stringify(text)},childNodes:[],getClientRects:()=>[{}],getAttribute:()=>null,hasAttribute:()=>false,closest:()=>null};
+    globalThis.document={createTreeWalker:()=>({nextNode:()=>null}),getElementById:()=>null};
+    globalThis.scope={locator:()=>({evaluate:(fn,arg)=>fn(root,arg)})};`);
+  const result = await h.run('snapshot(scope,{})');
+  for (const value of [result.nodes[0].name,result.url]) assert(!/[\uD800-\uDBFF]$/.test(value));
+});
+
+test('execution timeout retires owned contexts but never closes attached operator contexts',async()=>{
+  for (const attached of [false,true]) {
+    const h=harness();
+    h.run(`attached=${attached}; globalThis.closes=0; context={close:async()=>{closes++;}};`);
+    await h.run('quarantineContext()');
+    assert.equal(h.run('closes'),attached?0:1);
+    await assert.rejects(h.run("run({action:'initialize'})"),/quarantined/);
+    await assert.rejects(h.run("run({action:'tabs'})"),/quarantined/);
+  }
+});
+
+test('attached quarantine revokes existing WebSocket bridges and rejects delayed or new sockets',async()=>{
+  const h=harness();
+  h.run(`attached=true; wsEndpoints=['127.0.0.1:3000'];
+    globalThis.pageCloses=0; context={close(){pageCloses++;}};
+    globalThis.makeSocket=()=>{
+      const server={sent:[],closed:0,send(message){this.sent.push(message);},close(){this.closed++;return new Promise(()=>{});},onMessage(fn){this.message=fn;},onClose(fn){this.closedHandler=fn;}};
+      return {server,sent:[],closed:0,connections:0,url:()=> 'ws://127.0.0.1:3000/live',
+        connectToServer(){this.connections++;return server;},send(message){this.sent.push(message);},close(){this.closed++;return new Promise(()=>{});},
+        onMessage(fn){this.message=fn;},onClose(fn){this.closedHandler=fn;}};
+    };
+    globalThis.existing=makeSocket(); guardSocket(existing);`);
+  assert.equal(h.run('existing.connections'),1);
+  h.run("existing.message('approved client'); existing.server.message('approved server')");
+  assert.equal(h.run('existing.sent.length+existing.server.sent.length'),2);
+  await h.run('quarantineContext()');
+  assert.equal(h.run('pageCloses'),0);
+  assert.equal(h.run('existing.closed'),1);
+  assert.equal(h.run('existing.server.closed'),1);
+  h.run(`existing.message?.('late client message'); existing.server.message?.('late server message');
+    globalThis.delayed=makeSocket(); guardSocket(delayed);
+    wsEndpoints=['127.0.0.1:3000']; globalThis.fresh=makeSocket(); guardSocket(fresh);`);
+  for(const name of ['delayed','fresh']) {
+    assert.equal(h.run(`${name}.connections`),0);
+    assert.equal(h.run(`${name}.closed`),1);
+  }
+  assert.equal(h.run('existing.sent.length+existing.server.sent.length'),2);
+});
+
+test('accessibility target and duplicate-id descriptions preserve emoji boundaries',()=>{
+  const h=harness();
+  h.run(`globalThis.longTarget={tagName:'IMG',id:'a'.repeat(115)+'😀',hasAttribute:()=>false,getAttribute:()=>null};
+    globalThis.duplicate={id:'a'.repeat(79)+'😀'};
+    globalThis.document={documentElement:{tagName:'HTML',getAttribute:()=> 'en'},querySelector:()=>({}),
+      querySelectorAll(selector){return selector==='img'?[longTarget]:selector==='[id]'?[duplicate,duplicate]:[];}};`);
+  const result=h.run('accessibilityAudit()');
+  for(const finding of result.findings) for(const value of [finding.target,finding.detail]) {
+    assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value || ''));
+  }
 });

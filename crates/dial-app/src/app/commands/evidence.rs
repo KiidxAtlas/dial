@@ -25,7 +25,7 @@ pub(super) fn run(
             if args == "checks" {
                 shell.note("Recorded checks", check_list(summary));
             } else {
-                match check_request(summary, args[6..].trim()) {
+                match workbench::check_inspect_request(summary, args[6..].trim()) {
                     Ok(value) => match workbench::run(agent.workspace(), &value) {
                         Ok(output) => shell.note(
                             "Recorded check evidence",
@@ -125,29 +125,6 @@ pub(in crate::app) fn check_list(summary: &Value) -> String {
         ));
     }
     crate::storage::redact::redact_text(&lines.join("\n")).into_owned()
-}
-
-fn check_request(summary: &Value, name: &str) -> Result<Value> {
-    let matches: Vec<_> = summary["recorded_checks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|check| check["name"].as_str() == Some(name))
-        .collect();
-    let [check] = matches.as_slice() else {
-        bail!(
-            "Exact check unavailable or name ambiguous. Use /evidence checks; no latest-output fallback is used."
-        );
-    };
-    let reference = check["evidence_ref"]
-        .as_str()
-        .filter(|r| !r.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Exact retained log unavailable for this check; no latest-output fallback is used."
-            )
-        })?;
-    Ok(json!({"action":"inspect", "references":[reference]}))
 }
 
 #[cfg(test)]

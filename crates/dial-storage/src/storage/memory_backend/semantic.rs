@@ -6,7 +6,6 @@ use crate::config::memory_backend::{EmbeddingMode, MemoryBackendId, SemanticConf
 
 use super::semantic_store::{
     Fact, MAX_CONTENT_BYTES, MAX_SOURCE_BYTES, Saved, Store, estimate_tokens, fit_budget, fuse,
-    query_tokens,
 };
 use super::{
     Driver, FactRef, MemoryModelRunner, Operation, SaveInput, clean, files::PrivateDirectory, now,
@@ -28,8 +27,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+mod query_vectors;
 mod recall_cache;
 
+use self::query_vectors::QueryVectorCache;
 use self::recall_cache::{CacheStats, Key as RecallKey, RecallCache};
 
 const EMBED_CHUNK: usize = 16;
@@ -46,8 +47,6 @@ const TURNS_PER_PASS: usize = 4;
 const EXTRACT_OUTPUT_TOKENS: u32 = 1024;
 const MODEL_TIMEOUT_SECS: u64 = 120;
 const CONSOLIDATE_WINDOW: usize = 500;
-const MIN_DUPLICATE_TOKENS: usize = 3;
-const DUPLICATE_THRESHOLD: f64 = 0.8;
 const LAST_CONSOLIDATED: &str = "last_consolidated";
 const MAX_EMBED_RESPONSE: u64 = 8 * 1024 * 1024;
 const DEFAULT_SOURCE: &str = "dial-memory";
@@ -68,6 +67,11 @@ const MIN_QUERY_EMBED: Duration = Duration::from_millis(100);
 /// Turns text into vectors. Production uses an HTTP endpoint; tests inject fakes.
 pub trait Embedder: Send {
     fn model(&self) -> &str;
+    /// Identifies the endpoint and model vectors come from. Cached vectors are reused only on the
+    /// route that produced them.
+    fn route(&self) -> String {
+        self.model().to_owned()
+    }
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
     /// Embeds within `budget`, failing once it passes. An embedder that cannot bound a call
     /// uses its own timeout.
@@ -124,16 +128,24 @@ impl std::error::Error for Refused {}
 impl HttpEmbedder {
     /// Sends the request; when nothing listens at a local Ollama address this embedder may start,
     /// starts the shared server (or waits for one another Dial process is starting) and retries once.
+    /// `deadline` bounds the whole call, server start included; `None` lets the start and the
+    /// retry each use `timeout_secs`.
     fn send(
         &mut self,
         inputs: &[String],
         timeout_secs: u64,
         cancel: Option<Arc<AtomicBool>>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Vec<f32>>> {
         match self.attempt(inputs, timeout_secs, cancel.clone()) {
             Err(error) if error.downcast_ref::<Refused>().is_some() => {
-                match self.start_server(Duration::from_secs(timeout_secs)) {
-                    Ok(true) => self.attempt(inputs, timeout_secs, cancel),
+                let start_deadline =
+                    deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(timeout_secs));
+                match self.start_server(start_deadline, cancel.clone()) {
+                    Ok(true) => {
+                        let retry_secs = deadline.map_or(timeout_secs, whole_seconds_left);
+                        self.attempt(inputs, retry_secs, cancel)
+                    }
                     Ok(false) => Err(error),
                     Err(start) => Err(anyhow::anyhow!("{error}; {start:#}")),
                 }
@@ -143,8 +155,9 @@ impl HttpEmbedder {
     }
 
     /// `Ok(true)` once the server answers; `Ok(false)` when starting is off or paused after a
-    /// failure; an error when the start failed or the server is still coming up.
-    fn start_server(&mut self, wait: Duration) -> Result<bool> {
+    /// failure; an error when the start failed, was cancelled, or the server is still coming up.
+    /// A cancelled start is not a failed one, so it does not pause later starts.
+    fn start_server(&mut self, deadline: Instant, cancel: Option<Arc<AtomicBool>>) -> Result<bool> {
         use crate::llm::ollama::serve::{self, Ready};
         let Some(auto) = self.autostart.as_mut() else {
             return Ok(false);
@@ -152,12 +165,19 @@ impl HttpEmbedder {
         if auto.retry_at.is_some_and(|at| Instant::now() < at) {
             return Ok(false);
         }
-        match serve::ensure(&auto.user_dir, &auto.base_url, None, wait) {
+        match serve::ensure_until(
+            &auto.user_dir,
+            &auto.base_url,
+            None,
+            deadline,
+            cancel.as_deref(),
+        ) {
             Ok(Ready::Running | Ready::Started) => Ok(true),
             Ok(Ready::Starting) => anyhow::bail!(
                 "Dial is starting Ollama at {}; recall uses keywords until it answers",
                 auto.base_url
             ),
+            Err(error) if error.is::<serve::Cancelled>() => Err(error),
             Err(error) => {
                 auto.retry_at = Some(Instant::now() + AUTOSTART_RETRY);
                 Err(error.context("could not start Ollama for embeddings"))
@@ -239,17 +259,36 @@ impl Embedder for HttpEmbedder {
         &self.model
     }
 
+    /// The endpoint, model, and a digest of the credential and resolved headers, so a rotated key
+    /// or changed header never reuses vectors from the previous route. The digest keeps the
+    /// credential itself out of the route string.
+    fn route(&self) -> String {
+        let mut material = format!("{}\n", self.token.as_deref().unwrap_or(""));
+        if let Ok(resolved) = resolve_headers(&self.headers) {
+            for (name, value) in resolved.pairs() {
+                material.push_str(&format!("{name}\u{0}{value}\n"));
+            }
+        }
+        format!(
+            "{}\n{}\n{:x}",
+            self.url,
+            self.model,
+            Sha256::digest(material.as_bytes())
+        )
+    }
+
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.send(inputs, self.timeout_secs, None)
+        self.send(inputs, self.timeout_secs, None, None)
     }
 
     fn embed_within(&mut self, inputs: &[String], budget: Duration) -> Result<Vec<Vec<f32>>> {
         let budget = budget.min(Duration::from_secs(self.timeout_secs.max(1)));
+        let deadline = Instant::now() + budget;
         let cancel = Arc::new(AtomicBool::new(false));
-        let deadline = super::DeadlineGuard::start(budget, cancel.clone());
-        let timeout_secs = budget.as_secs() + u64::from(budget.subsec_nanos() > 0);
-        let result = self.send(inputs, timeout_secs.max(1), Some(cancel.clone()));
-        drop(deadline);
+        let guard = super::DeadlineGuard::start(budget, cancel.clone());
+        let timeout_secs = whole_seconds_left(deadline);
+        let result = self.send(inputs, timeout_secs, Some(cancel.clone()), Some(deadline));
+        drop(guard);
         result.map_err(|error| {
             if cancel.load(Ordering::SeqCst) {
                 anyhow::anyhow!(
@@ -261,6 +300,12 @@ impl Embedder for HttpEmbedder {
             }
         })
     }
+}
+
+/// Seconds until `deadline`, rounded up, never below one: a request timeout in whole seconds.
+fn whole_seconds_left(deadline: Instant) -> u64 {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (left.as_secs() + u64::from(left.subsec_nanos() > 0)).max(1)
 }
 
 fn is_local_url(url: &str) -> bool {
@@ -662,6 +707,8 @@ struct Semantic {
     project_cache: RecallCache,
     /// Cached user-bank recall results, valid only while the user store is unchanged.
     user_cache: RecallCache,
+    /// Query embeddings, reused for repeated queries on the same embedding route.
+    query_vectors: QueryVectorCache,
     /// The most recent search, for status output.
     last_recall: Option<LastRecall>,
 }
@@ -748,6 +795,7 @@ pub fn open(
         recall_note: None,
         project_cache: RecallCache::default(),
         user_cache: RecallCache::default(),
+        query_vectors: QueryVectorCache::default(),
         last_recall: None,
     }))
 }
@@ -779,6 +827,7 @@ struct LastRecall {
 const RECENCY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// A query vector and the embedding model that produced it.
+#[derive(Clone)]
 struct QueryVector {
     model: String,
     vector: Vec<f32>,
@@ -816,6 +865,32 @@ fn embed_query(
         },
         Err(error) => (None, Some(format!("{error:#}"))),
     }
+}
+
+/// The query's vector: from the cache when this route already embedded the same text, otherwise
+/// embedded (and cached on success). A cache hit makes no request, so it needs no budget.
+fn cached_query_vector(
+    cache: &mut QueryVectorCache,
+    embedder: Option<&mut (dyn Embedder + 'static)>,
+    query: &str,
+    budget: Option<Duration>,
+) -> (Option<QueryVector>, Option<String>) {
+    let Some(embedder) = embedder else {
+        return (None, None);
+    };
+    if query.trim().is_empty() {
+        return (None, None);
+    }
+    let route = embedder.route();
+    let now = Instant::now();
+    if let Some(vector) = cache.get(&route, query, now) {
+        return (Some(vector), None);
+    }
+    let (vector, error) = embed_query(Some(embedder), query, budget);
+    if let Some(vector) = &vector {
+        cache.put(&route, query, vector.clone(), now);
+    }
+    (vector, error)
 }
 
 fn cache_json(stats: &CacheStats) -> Value {
@@ -1106,53 +1181,39 @@ fn parse_extracted(text: &str) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Jaccard similarity of two token sets is at or above `DUPLICATE_THRESHOLD`.
-fn similar(a: &HashSet<String>, b: &HashSet<String>) -> bool {
-    let shared = a.intersection(b).count();
-    let union = a.len() + b.len() - shared;
-    union > 0 && shared as f64 / union as f64 >= DUPLICATE_THRESHOLD
-}
-
 /// A merge pass runs when the interval has elapsed since the last recorded pass (or never ran).
 fn consolidation_due(last: i64, at: i64, interval_secs: i64) -> bool {
     interval_secs > 0 && at.saturating_sub(last) >= interval_secs
 }
 
-/// Tokens that carry a number or version (any digit), including the single digits that
-/// `query_tokens` drops. Facts that differ in them state different values, not a duplicate.
-fn numeric_tokens(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|token| token.chars().any(|c| c.is_ascii_digit()))
-        .map(str::to_lowercase)
-        .collect()
+/// The text two facts are compared by when merging: whitespace runs collapse to one space and case
+/// is ignored. Punctuation, numbers, words and their order are kept, so any other difference
+/// (a word added, dropped, moved or negated) keeps both facts.
+fn exact_key(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
-/// Forgets the newer of each near-duplicate pair among the newest live facts. The older fact
-/// survives and keeps its id. Facts whose numbers differ ("limit is 1 rps" vs "limit is 2 rps")
-/// are never merged, so a correction is not discarded in favour of the stale value. Each forget
-/// is guarded by the revision that was read, so a fact changed by another writer is left alone
-/// and reported as an error for the next pass.
+/// Forgets the newer of each pair of facts that are exactly equal after [`exact_key`] normalization,
+/// among the newest live facts. The older fact survives and keeps its id. Near duplicates are never
+/// merged: a fact that adds, drops, moves or negates a word may state a different rule ("rarely
+/// require approval" is not "require approval"). Each forget is guarded by the revision that was
+/// read, so a fact changed by another writer is left alone and reported as an error for the next
+/// pass.
 pub fn merge_duplicates(store: &mut Store, at: i64) -> Result<usize> {
     let mut ids = store.recent(CONSOLIDATE_WINDOW)?;
     ids.sort_unstable();
-    let mut survivors: Vec<(HashSet<String>, HashSet<String>)> = Vec::new();
+    let mut kept: HashSet<String> = HashSet::new();
     let mut merged = Vec::new();
     for id in ids {
         let Some(fact) = store.fact(id)? else {
             continue;
         };
-        let tokens: HashSet<String> = query_tokens(&fact.content).into_iter().collect();
-        if tokens.len() < MIN_DUPLICATE_TOKENS {
-            continue;
-        }
-        let numbers = numeric_tokens(&fact.content);
-        if survivors
-            .iter()
-            .any(|(kept, kept_numbers)| *kept_numbers == numbers && similar(kept, &tokens))
-        {
+        if !kept.insert(exact_key(&fact.content)) {
             merged.push((fact.id, fact.revision));
-        } else {
-            survivors.push((tokens, numbers));
         }
     }
     for (id, revision) in &merged {
@@ -1309,7 +1370,12 @@ impl Driver for Semantic {
         let budget = op
             .deadline
             .map(|_| op.remaining(Duration::MAX).saturating_sub(KEYWORD_RESERVE));
-        let (vector, embedding_error) = embed_query(self.embedder.as_deref_mut(), query, budget);
+        let (vector, embedding_error) = cached_query_vector(
+            &mut self.query_vectors,
+            self.embedder.as_deref_mut(),
+            query,
+            budget,
+        );
         if self.embedder.is_some() && !query.trim().is_empty() {
             self.recall_note = embedding_error.clone();
         }

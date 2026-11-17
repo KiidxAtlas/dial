@@ -268,3 +268,85 @@ fn local_tool_turn_preserves_reasoning_and_prose_through_state_ui() {
         assert_eq!(server.requests().len(), 1);
     }
 }
+
+#[test]
+fn arguments_only_provider_retry_delivers_one_boundary_to_raw_and_reduced_surfaces() {
+    #[derive(Default)]
+    struct View {
+        arguments: usize,
+        retries: usize,
+    }
+    impl Ui for View {
+        fn tool_arguments_delta(&mut self, _: u64, _: &str, _: &str, _: &str) {
+            self.arguments += 1;
+        }
+        fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+            if event.kind == crate::agent::ui::ui_event::EventKind::Retry {
+                self.retries += 1;
+            }
+        }
+    }
+    for reduced in [false, true] {
+        let draft = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"draft","type":"function","function":{"name":"write","arguments":"{"}}]}}]});
+        let final_answer =
+            json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]});
+        let server = llm::fake::serve(vec![
+            // EOF before a finish marker discards the provider attempt, not an executed call.
+            llm::fake::Script::Sse(format!("data: {draft}\n\n")),
+            llm::fake::Script::Sse(format!("data: {final_answer}\n\ndata: [DONE]\n\n")),
+        ]);
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: server.url.clone(),
+                model: "test".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        backend.retry_backoff = Duration::ZERO;
+        let request = Chat {
+            messages: vec![json!({"role":"user","content":"write notes"})],
+            tools: vec![
+                json!({"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
+            ],
+            temperature: 0.0,
+            max_tokens: 128,
+            seed: None,
+        };
+        let mut view = View::default();
+        let mut run = |surface: &mut dyn Ui| {
+            chat_with_ui(
+                &mut backend,
+                None,
+                &request,
+                ChatOptions {
+                    timeout: 5,
+                    render_text: true,
+                    context_tokens: None,
+                    policy: None,
+                    recovery: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+                surface,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let reply = if reduced {
+            let mut state = crate::agent::ui::state_ui::StateUi::new(
+                &mut view,
+                crate::runtime::Tree::default(),
+                None,
+            );
+            run(&mut state)
+        } else {
+            run(&mut view)
+        };
+        assert_eq!(reply.text, "recovered");
+        assert!(reply.tool_calls.is_empty());
+        assert!(view.arguments > 0);
+        assert_eq!(view.retries, 1, "reduced={reduced}");
+        assert_eq!(server.requests().len(), 2);
+    }
+}

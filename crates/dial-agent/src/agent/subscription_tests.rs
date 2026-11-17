@@ -238,10 +238,19 @@ fn subscription_provider_recovers_disconnection_runs_real_tools_and_replays_resu
         llm::fake::header(&requests[0], "originator").as_deref(),
         Some("dial")
     );
-    assert_eq!(
-        llm::fake::header(&requests[0], "version").as_deref(),
-        Some("0.159.0")
-    );
+    // Version discovery can use a newer local Codex cache. The resolver's own tests
+    // check exact version selection; recovery must send a stable release on every request.
+    for request in &requests {
+        let version = llm::fake::header(request, "version").expect("missing Codex version header");
+        let parts: Vec<_> = version.split('.').collect();
+        assert!(
+            parts.len() == 3
+                && parts.iter().all(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                }),
+            "expected a stable Codex release, got {version:?}"
+        );
+    }
     assert_eq!(
         llm::fake::request_line(&requests[0]),
         "POST /codex/responses HTTP/1.1"

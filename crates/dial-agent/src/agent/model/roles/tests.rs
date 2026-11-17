@@ -357,3 +357,74 @@ side_models='reuse_main'
         });
     }
 }
+
+#[test]
+fn auxiliary_role_waits_cancellably_for_its_actual_provider_slot() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    struct QueuedUi {
+        cancel: Arc<AtomicBool>,
+        queued: bool,
+    }
+    impl Ui for QueuedUi {
+        fn notice(&mut self, text: &str) {
+            if text == crate::agent::model::provider_slots::QUEUED_NOTICE {
+                self.queued = true;
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    for mode in ["fallback", "assigned", "reuse_main"] {
+        let server = llm::fake::serve(vec![]);
+        let overlay = format!(
+            "provider='openai'\nmodel='fixture'\n[model_roles.small]\nprovider='openai'\nmodel='side'\nbase_url='{}/v1'\n",
+            server.url
+        );
+        let overlay = match mode {
+            "assigned" => overlay,
+            "reuse_main" => "provider='mlx'\nmodel='fixture'\n[model_roles.small]\nprovider='mlx'\nmodel='other'\n[assistance.local]\nside_models='reuse_main'\n".to_owned(),
+            _ => String::new(),
+        };
+        with_agent(&overlay, |agent| {
+            assert_eq!(agent.role_selection("small").is_some(), mode == "assigned");
+            let route = if mode == "assigned" {
+                agent.auth_config.for_role("small")
+            } else {
+                agent.auth_config.clone()
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let _held = crate::agent::model::provider_slots::acquire(&route, &cancel).unwrap();
+            let mut main = Backend::new(
+                ProviderKind::Endpoint {
+                    base_url: format!("{}/v1", server.url),
+                    model: "fixture".into(),
+                    api_key: None,
+                },
+                Default::default(),
+                5,
+            )
+            .with_session_id(agent.session().id());
+            let request = index_chat("Return text", "Decide", 64);
+            let mut ui = QueuedUi {
+                cancel: cancel.clone(),
+                queued: false,
+            };
+            let result = agent.bounded_role_chat_with_cancel(
+                &mut main,
+                "small",
+                llm::usage::Purpose::Judgment,
+                &request,
+                &mut ui,
+                (2, cancel),
+            );
+            assert!(
+                result.is_err(),
+                "request bypassed its occupied provider slot"
+            );
+            assert!(ui.queued, "{mode} did not wait for the actual route");
+        });
+        assert!(
+            server.requests().is_empty(),
+            "queued auxiliary request reached the provider"
+        );
+    }
+}

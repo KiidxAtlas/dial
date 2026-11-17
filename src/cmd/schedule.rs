@@ -26,7 +26,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &ScheduleCommand) -> Resul
             println!("added schedule {}", store.add(entry)?);
         }
         ScheduleCommand::List => {
-            let state = store.last_runs();
+            let state = store.last_runs()?;
             let entries = store.load()?;
             if entries.is_empty() {
                 println!("no schedules; add one with `dial schedule add`");

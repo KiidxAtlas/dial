@@ -137,6 +137,41 @@ pub struct UsageReport {
     pub metadata: BTreeMap<String, String>,
 }
 
+impl UsageReport {
+    /// The account's plan or tier for display (`Plus`, `Max 20x`), from whichever metadata key
+    /// the provider fills: `plan`, `planType` (ChatGPT) or `currentTierName` (Gemini).
+    pub fn plan(&self) -> Option<String> {
+        ["plan", "planType", "currentTierName"]
+            .iter()
+            .find_map(|key| self.metadata.get(*key))
+            .map(|raw| plan_label(raw))
+            .filter(|label| !label.is_empty())
+    }
+}
+
+/// A readable plan name from a provider identifier: `plus` → `Plus`, `claude_max` → `Max`,
+/// `max_20x` → `Max 20x`. A name that already has capitals or spaces is kept as sent.
+pub fn plan_label(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.chars().any(|ch| ch.is_uppercase() || ch == ' ') {
+        return raw.to_owned();
+    }
+    let raw = ["claude_", "chatgpt_"]
+        .iter()
+        .find_map(|prefix| raw.strip_prefix(prefix))
+        .unwrap_or(raw);
+    raw.split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Used fraction (0..1; >1 means overage) from whichever amount fields are populated.
 /// Precedence: explicit fraction > used/limit > percent-unit used > inverted remaining.
 pub fn resolve_used_fraction(limit: &UsageLimit) -> Option<f64> {

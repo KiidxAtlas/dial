@@ -23,7 +23,7 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (coding agent; usage)"
 );
-use crate::llm::chatgpt::{CLIENT_VERSION, ORIGINATOR};
+use crate::llm::chatgpt::{ORIGINATOR, client_version};
 const DAY_SECONDS: u64 = 86_400;
 const HOUR_SECONDS: u64 = 3_600;
 /// Plan windows reported on `rate_limit`, with their stable window keys.
@@ -106,6 +106,7 @@ pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<
 
 fn get_json(path: &str, token: &str, account_id: &str, cancel: &Arc<AtomicBool>) -> Result<Value> {
     let bearer = format!("Bearer {token}");
+    let version = client_version();
     let url = format!("{}{path}", chatgpt::BASE_URL);
     let response = util::request(
         "GET",
@@ -116,7 +117,7 @@ fn get_json(path: &str, token: &str, account_id: &str, cancel: &Arc<AtomicBool>)
             ("Accept", "application/json"),
             ("User-Agent", USER_AGENT),
             ("originator", ORIGINATOR),
-            ("version", CLIENT_VERSION),
+            ("version", version.as_str()),
         ],
         Body::Empty,
         cancel,
@@ -152,6 +153,7 @@ pub fn consume_reset_credit(
     }
     let (account_id, token) = chatgpt::account_access(user_dir, Arc::clone(cancel))?;
     let bearer = format!("Bearer {}", token.as_str());
+    let version = client_version();
     let url = format!(
         "{}/wham/rate-limit-reset-credits/consume",
         chatgpt::BASE_URL
@@ -170,7 +172,7 @@ pub fn consume_reset_credit(
             ("Accept", "application/json"),
             ("User-Agent", USER_AGENT),
             ("originator", ORIGINATOR),
-            ("version", CLIENT_VERSION),
+            ("version", version.as_str()),
         ],
         Body::Json(&payload),
         cancel,

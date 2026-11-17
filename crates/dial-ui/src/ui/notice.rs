@@ -3,7 +3,7 @@
 //!
 //! Line shapes, checked in order:
 //! - a body that is JSON is flattened to `key: value` rows (empty → "Nothing to show.");
-//! - `Blocked:` lines and "… is unavailable" notes are flagged as warnings;
+//! - urgency comes from producer metadata, never from words in the title or body;
 //! - two-column rows (`name  description`, two or more spaces apart) keep their column, and a
 //!   wrapped description hangs under the description column instead of returning to the margin;
 //! - `key: value` pairs, several per line joined by ` · `, show a muted key and a bright value;
@@ -32,7 +32,18 @@ const EMPTY: &str = "Nothing to show.";
 
 type Row = Vec<Span<'static>>;
 
+#[cfg(test)]
 pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
+    rows_with_severity(title, body, w, ctx, Severity::Info)
+}
+
+pub(super) fn rows_with_severity(
+    title: &str,
+    body: &str,
+    w: u16,
+    ctx: &TranscriptCtx,
+    severity: Severity,
+) -> Rows {
     if title == "Notice"
         && let Some(rows) = super::tool_cards::incoming_notice(body, w, ctx)
     {
@@ -41,7 +52,7 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     if title == "Notice"
         && let Some((title, body)) = open_work(body)
     {
-        return rows(title, &body, w, ctx);
+        return rows_with_severity(title, &body, w, ctx, severity);
     }
     if title == "Turn report" {
         let next = body.lines().find(|line| line.starts_with("Next: "));
@@ -69,7 +80,7 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
                 .filter(|line| !line.starts_with("Summary: "))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return rows("Turn details", &full, w, ctx);
+            return rows_with_severity("Turn details", &full, w, ctx, severity);
         }
     }
     let w = w as usize;
@@ -87,9 +98,7 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     } else {
         body
     };
-    if let Some(severity) = severity_of(title)
-        && w >= CARD_MIN
-    {
+    if severity != Severity::Info && w >= CARD_MIN {
         return severity_card(title, &body, severity, w, theme, section);
     }
     let mut rows = Vec::new();
@@ -108,16 +117,17 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     rows
 }
 
-/// How urgent a notice reads from its title: warnings and failures get a card, other notices
-/// (command results, reports) stay quiet labelled rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Severity {
+/// Producer-supplied urgency. Ordinary command results never infer urgency from prose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Severity {
+    #[default]
+    Info,
     Warning,
     Error,
 }
 
-/// The agent's end-of-turn open-work notice in plain words. Required steps and deliverables keep
-/// a warning card; when only optional follow-ups remain, a quiet row says nothing required is left.
+/// The legacy end-of-turn open-work notice in plain words. This formatter does not assign
+/// urgency; only producer metadata controls warning cards.
 fn open_work(body: &str) -> Option<(&'static str, String)> {
     let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
     let counts = first.strip_prefix("Outstanding work retained: ")?;
@@ -163,26 +173,6 @@ fn open_work(body: &str) -> Option<(&'static str, String)> {
     Some((title, text))
 }
 
-/// The severity a notice title asks for.
-fn severity_of(title: &str) -> Option<Severity> {
-    let t = title.to_ascii_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
-    if has(&["error", "failed", "failure", "blocked"]) {
-        Some(Severity::Error)
-    } else if has(&[
-        "warn",
-        "heads up",
-        "outstanding",
-        "attention",
-        "unfinished",
-        "unavailable",
-    ]) {
-        Some(Severity::Warning)
-    } else {
-        None
-    }
-}
-
 /// Narrowest width that draws a warning or failure notice as a card.
 const CARD_MIN: usize = 32;
 
@@ -197,6 +187,7 @@ fn severity_card(
     section: Section,
 ) -> Rows {
     let (tok, glyph) = match severity {
+        Severity::Info => (Tok::Muted, theme.sym(Sym::Dot)),
         Severity::Warning => (Tok::Warning, theme.sym(Sym::Warn)),
         Severity::Error => (Tok::Error, theme.sym(Sym::Cross2)),
     };
@@ -262,28 +253,7 @@ fn layout(
     let gap = |n: usize| Span::raw(" ".repeat(n));
     let muted = theme.fg(Tok::Muted);
 
-    if let Some(rest) = content.strip_prefix("Blocked:") {
-        let first = vec![
-            gap(pad),
-            Span::styled(
-                format!("{} Blocked", theme.sym(Sym::Warn)),
-                theme.fg(Tok::Warning).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ];
-        let hang = pad + text::width(theme.sym(Sym::Warn)) + 1;
-        return hang_wrap(first, inline(rest.trim(), muted, theme), hang, room);
-    }
-    let lower = content.to_ascii_lowercase();
-    if [" is unavailable", " are unavailable", "unavailable:"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        let glyph = format!("{} ", theme.sym(Sym::Warn));
-        let hang = pad + text::width(&glyph);
-        let first = vec![gap(pad), Span::styled(glyph, theme.fg(Tok::Warning))];
-        return hang_wrap(first, inline(content, muted, theme), hang, room);
-    }
+    // Body text is data, not a severity channel. Producers choose warning/error metadata.
     if let Some((left, spaces, right)) = columns(content) {
         let left_style = if is_command(left) || is_chord(left) {
             theme.fg(Tok::Accent)
@@ -332,9 +302,7 @@ fn columns(content: &str) -> Option<(&str, usize, &str)> {
 fn section_of(title: &str) -> Section {
     let t = title.to_ascii_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
-    if has(&["error", "blocked", "failed", "failure"]) {
-        Section::Primary
-    } else if has(&["memory", "learn", "understand"]) {
+    if has(&["memory", "learn", "understand"]) {
         Section::Learn
     } else if has(&["mcp", "extension", "provider", "connect", "collab"]) {
         Section::Connect
@@ -346,8 +314,6 @@ fn section_of(title: &str) -> Section {
         Section::Tools
     } else if has(&["loop"]) {
         Section::Loop
-    } else if has(&["warn"]) {
-        Section::Warn
     } else {
         Section::Dial
     }

@@ -683,6 +683,7 @@ fn upstream(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) ->
     let current = format!("{}\n{}", version_query.stdout, version_query.stderr);
     let repo = match recipe.id {
         "llama-cpp" => "ggml-org/llama.cpp",
+        "sd-cpp" => "leejet/stable-diffusion.cpp",
         "bun" => "oven-sh/bun",
         "uv" => "astral-sh/uv",
         "node" => "nodejs/node",

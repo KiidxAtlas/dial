@@ -109,7 +109,50 @@ impl Agent<'_> {
             .run_background_tool(name, &call.arguments, ui, None)
             .context("image_gen is not registered")?;
         ui.tool_result(name, &result);
+        // The same preview a model-called `image_gen` gets: every written image, in order.
+        if !result.is_error {
+            for path in self.written_images(&result, Some(output)) {
+                match self
+                    .workspace
+                    .resolve(path.to_string_lossy().as_ref())
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|absolute| {
+                        let relative = absolute
+                            .strip_prefix(self.workspace.root())
+                            .context("image resolves outside the project")?;
+                        crate::llm::images::attachment(self.workspace.root(), relative)
+                    }) {
+                    Ok(reference) => ui.image(&reference),
+                    Err(error) => ui.notice(&format!("Image preview unavailable: {error:#}")),
+                }
+            }
+        }
         Ok(result)
+    }
+
+    /// Workspace-relative files `image_gen` reported writing, in order; `requested` when the
+    /// output names none inside the workspace.
+    pub(in crate::agent) fn written_images(
+        &self,
+        output: &ToolOutput,
+        requested: Option<&str>,
+    ) -> Vec<std::path::PathBuf> {
+        let written: Vec<_> = output
+            .execution
+            .changed_paths
+            .iter()
+            .filter_map(|path| path.strip_prefix(self.workspace.root()).ok())
+            .filter(|path| crate::llm::images::is_image(path))
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        if written.is_empty() {
+            requested
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .collect()
+        } else {
+            written
+        }
     }
     /// Blocking I/O tools run off the controller thread so the inline UI can repaint and process input.
     pub(in crate::agent) fn run_background_tool(
@@ -592,9 +635,17 @@ impl Agent<'_> {
                                     event.kind == "background_progress",
                                 );
                             } else if event.kind == "output" {
-                                ui.tool_output(&event.name, &event.text);
+                                ui.tool_output_with_id(
+                                    &calls[position].id,
+                                    &event.name,
+                                    &event.text,
+                                );
                             } else if event.kind == "progress" {
-                                ui.tool_progress(&event.name, &event.text);
+                                ui.tool_progress_with_id(
+                                    &calls[position].id,
+                                    &event.name,
+                                    &event.text,
+                                );
                             } else if event.kind != "start" {
                                 // Job starts are already visible in the launching tool's card.
                                 ui.background_notice(&format!(
@@ -798,3 +849,6 @@ impl Agent<'_> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -71,3 +71,50 @@ fn recall_matches_query_words_not_only_the_exact_phrase() {
             .contains("parser")
     );
 }
+
+#[test]
+fn pending_deltas_remain_due_after_a_partial_consolidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let mut driver = open(&layout, &SharpshooterConfig::default()).unwrap();
+    let key = format!(
+        "{:x}",
+        Sha256::digest(layout.project_root.as_os_str().as_encoded_bytes())
+    );
+    let db = PrivateDirectory::open(&layout, "sharpshooter")
+        .unwrap()
+        .child(&key)
+        .unwrap()
+        .database("decisions.sqlite3")
+        .unwrap();
+    db.execute("INSERT INTO deltas(id,session,branch,revision,payload,created) VALUES('remaining','s','b','r','{}',1)", []).unwrap();
+    db.execute("UPDATE state SET last_consolidated=2 WHERE id=1", [])
+        .unwrap();
+    let op = Operation::for_test(authority("session"), scope(), None);
+    assert!(
+        driver.maintenance_due(&op).unwrap(),
+        "older unconsumed deltas must remain eligible"
+    );
+    db.execute("UPDATE state SET lease_until=?1 WHERE id=1", [now() + 3600])
+        .unwrap();
+    assert!(
+        !driver.maintenance_due(&op).unwrap(),
+        "an active consolidation lease must still exclude work"
+    );
+    db.execute(
+        "UPDATE state SET lease_until=0,last_consolidated=?1 WHERE id=1",
+        [now()],
+    )
+    .unwrap();
+    assert!(
+        !driver.maintenance_due(&op).unwrap(),
+        "the configured interval still applies"
+    );
+    db.execute("DELETE FROM deltas", []).unwrap();
+    db.execute("UPDATE state SET last_consolidated=0 WHERE id=1", [])
+        .unwrap();
+    assert!(
+        !driver.maintenance_due(&op).unwrap(),
+        "an empty queue is not due"
+    );
+}

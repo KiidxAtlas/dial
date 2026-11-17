@@ -6,6 +6,20 @@ Assistant prose freezes complete top-level markdown blocks and reparses only the
 
 Streaming content may spill stable rows to scrollback while keeping the live tail visible. Resizing replays committed transcript content at the new width; terminal frame diffing reuses unchanged rows. Ctrl+O expands or collapses tool evidence and repaints existing scrollback, including successful reads, searches and checks. Compact diffs honor `ui.tool_output_lines`; expanded cards reveal complete stored output and clipped targets. Worker cards use typed results and show a short finding when collapsed and the full report when expanded. Themes are embedded JSON palettes and selectable by name.
 
+F10 Controls → **Inspect tool evidence** lists retained calls and opens only the selected call in a
+searchable, scrollable report. It preserves the draft and collapsed transcript, including retired
+cards. Stale IDs show an unavailable result rather than selecting a different call. Ctrl+O remains
+the bulk expansion shortcut.
+
+Collapsed tool output lays out only the source lines needed for its visible window and one-row
+lookahead, from the end for failed output. Hidden source lines are counted without allocating their
+styled/wrapped rows. Long individual visible lines are bounded before wrapping, including numbered
+diff previews, with complete grapheme boundaries retained. Sanitization and hidden-line counting
+still scan stored output; this is not constant-time rendering. Expanded cards retain full evidence.
+
+Stats caches its filtered, wrapped report by selected tab, query and content width. Scrolling and
+unchanged draws reuse that layout; changing any of those inputs rebuilds it.
+
 Spill validation reuses the markdown cache's frozen prefix when its source cut, width and theme
 match, instead of reparsing that growing prefix for each spill. The timestamp and styled rows must
 still exactly match the current displayed head; other cuts retain the full-render validation path.
@@ -18,6 +32,12 @@ One input pump reads the terminal into a bounded queue independently of model re
 Frame pacing adapts between 40 and 200 ms using the preceding paint cost. Scrollback retirement is limited per frame to 32 blocks, 256 rows and a 4 ms between-block deadline; a single render is not preempted. A partially retired block retains one wrapping until its remaining rows have been handed off. Native-image blocks remain indivisible with their graphics separator. Live-tail rendering starts at the newest visible blocks instead of formatting the entire waiting history. `/debug performance` reports observed input, refresh and paint stalls; `/debug terminal` includes output backlog and retirement/reveal state.
 
 Streaming tool arguments are bounded observational previews, correlated by call ID and merged into the eventual tool card. Previewing arguments never authorizes or executes a tool. Parallel calls publish their individual results as they complete; provider conversation settlement retains the original call order.
+
+Desktop tool cards name the native operation and explicit window selector rather than printing
+script source or typed input in their header. Window enumeration shows a bounded app/title summary;
+captures show a screenshot count. Expanding the card still exposes the original retained evidence,
+and failures keep their actual error output. The adaptive default status line leaves account IDs
+out of the model chip; expanded status and explicitly selected presets retain account identity.
 
 Defaults collapse reasoning, omit per-turn statistics and leave the workspace-change rail off. The worker rail shows active workers only; completed results stay in their task cards and the worker panel. Cache accounting and routine decision advice stay out of the transcript; `/cost`, `/policy` and `/laya status` retain the details. Explicit saved display preferences continue to apply.
 

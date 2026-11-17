@@ -187,6 +187,39 @@ pub const LLAMA_CPP: Prebuilt = Prebuilt {
     ],
 };
 
+/// stable-diffusion.cpp `master-1106-532d2c1` (`sd-server`), from its GitHub release. Every archive
+/// holds the server and its shared libraries flat at the root (no symlinks); the digests are the
+/// release's asset digests. These are the CPU (Linux, Windows) and Metal (macOS arm64) builds;
+/// Vulkan, CUDA and ROCm builds from the same release can be used through `DIAL_SD_SERVER`.
+pub const SD_CPP: Prebuilt = Prebuilt {
+    version: "master-1106-532d2c1",
+    binary: if cfg!(windows) {
+        "sd-server.exe"
+    } else {
+        "sd-server"
+    },
+    assets: &[
+        Asset {
+            platform: "darwin-arm64",
+            url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1106-532d2c1/sd-master-532d2c1-bin-Darwin-macOS-26.7.2-arm64.zip",
+            sha256: "8146d6ffc75f8ff8f64b62a80fffee8fb714ab65e368e202084135fa07cc6f36",
+            format: Format::FlatZip,
+        },
+        Asset {
+            platform: "linux-x64",
+            url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1106-532d2c1/sd-master-532d2c1-bin-Linux-Ubuntu-26.04-x86_64.zip",
+            sha256: "0a02f7f51feb0691128f60cf6ff1c686ec23089561cfe7c3b72645f446646e13",
+            format: Format::FlatZip,
+        },
+        Asset {
+            platform: "win32-x64",
+            url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1106-532d2c1/sd-master-532d2c1-bin-win-cpu-x64.zip",
+            sha256: "abef332cfca7861cc567910e79bedb70bfb2920bb4eedac97fcbb6db477f1596",
+            format: Format::FlatZip,
+        },
+    ],
+};
+
 /// Downloads `asset` into `dest` (the install directory). The archive goes to a `.download` file
 /// beside `dest`, is checked against its pinned digest, unpacked into `<dest>.part`, and only then
 /// replaces `dest`. Any failure leaves no partial install behind.

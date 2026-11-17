@@ -456,6 +456,7 @@ fn macos_eval_runs_under_the_workspace_sandbox_with_the_fork_fence() {
                 deny_read: Vec::new(),
                 extra_write: Vec::new(),
                 allow_network: false,
+                serial_ports: false,
             })
         } else {
             workspace.without_sandbox()

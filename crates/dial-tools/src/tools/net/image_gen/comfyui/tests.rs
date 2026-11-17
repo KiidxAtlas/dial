@@ -1,5 +1,5 @@
 //! Loopback fixtures for ComfyUI: the configured workflow is submitted with only the prompt
-//! replaced, polled through history for the returned id, and its single output downloaded from
+//! replaced, polled through history for the returned id, and its outputs downloaded from
 //! `/view` without credentials. Refusals happen before any submission. No live service is used.
 use super::super::loopback::Server;
 use super::super::{Format, Source, Wire};
@@ -63,8 +63,19 @@ fn config(timeout_secs: u64) -> Config {
     config
 }
 
-/// Runs the ComfyUI adapter once against `target`, returning the outcome and the requests seen.
+/// Runs the ComfyUI adapter once against `target` and returns its single image.
 fn run(target: &Target, config: &Config, cancel: Arc<AtomicBool>, prompt: &str) -> Result<Vec<u8>> {
+    let mut images = run_all(target, config, cancel, prompt)?;
+    assert_eq!(images.len(), 1, "expected one image");
+    Ok(images.remove(0))
+}
+
+fn run_all(
+    target: &Target,
+    config: &Config,
+    cancel: Arc<AtomicBool>,
+    prompt: &str,
+) -> Result<Vec<Vec<u8>>> {
     let client = Client::new(target, config, cancel);
     super::request(&client, target, &prompt_request(prompt))
 }
@@ -483,7 +494,7 @@ fn history_errors_are_reported_and_nothing_is_downloaded() {
 }
 
 #[test]
-fn output_node_must_produce_exactly_one_well_formed_image() {
+fn output_node_must_produce_well_formed_images() {
     let cases: Vec<(&str, Value, &str)> = vec![
         ("no outputs for the node", json!({}), "produced no images"),
         (
@@ -491,14 +502,14 @@ fn output_node_must_produce_exactly_one_well_formed_image() {
             json!({"images": "a.png"}),
             "produced no images",
         ),
-        ("zero images", json!({"images": []}), "exactly one image"),
+        ("zero images", json!({"images": []}), "produced no images"),
         (
-            "two images",
+            "one good and one malformed image",
             json!({"images": [
                 {"filename": "a.png", "type": "output"},
-                {"filename": "b.png", "type": "output"}
+                {"type": "output"}
             ]}),
-            "exactly one image",
+            "no filename",
         ),
         (
             "missing filename",
@@ -540,6 +551,29 @@ fn output_node_must_produce_exactly_one_well_formed_image() {
             "{name} must not download: {seen:?}"
         );
     }
+}
+
+#[test]
+fn every_image_at_the_output_node_is_downloaded_in_order() {
+    let (base, server) = serve(vec![
+        json_reply(&json!({"prompt_id": "many-1"})),
+        json_reply(&json!({"many-1": {
+            "status": {"status_str": "success"},
+            "outputs": {"9": {"images": [
+                {"filename": "a.png", "type": "output"},
+                {"filename": "b.png", "type": "temp"}
+            ]}}
+        }})),
+        (200, PNG.to_vec()),
+        (200, b"second".to_vec()),
+    ]);
+    let target = comfy_target(&base, template());
+    let images = run_all(&target, &config(30), idle_flag(), "a fox").unwrap();
+    assert_eq!(images, vec![PNG.to_vec(), b"second".to_vec()]);
+    let seen = server.join().unwrap();
+    let views: Vec<_> = seen.iter().filter(|raw| is_view(raw)).collect();
+    assert_eq!(views.len(), 2);
+    assert!(views[0].contains("filename=a.png") && views[1].contains("filename=b.png"));
 }
 
 #[test]

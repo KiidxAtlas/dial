@@ -1,6 +1,6 @@
 use super::super::{
     DrawCtx,
-    settings::{Axis, arrows, filled, hint, hint_line, scroll_cell},
+    settings::{Axis, arrows, editor_spans, filled, hint, hint_line, scroll_cell},
 };
 use super::{
     GitOverlay,
@@ -26,6 +26,28 @@ impl GitOverlay {
 
     /// The Log tab: recent commits as a selectable list with the shared selection row, a scroll
     /// indicator when they overflow, guidance when there are none, and a key-hint footer.
+    /// A recovered outcome persists until input acknowledges it; a recovered pending write stays busy.
+    fn job_status_line(&self, theme: &Theme) -> Option<Line<'static>> {
+        if self.mutation.is_some() || self.ai_job.is_some() || self.generating.is_some() {
+            return Some(Line::from(" Git operation in progress…"));
+        }
+        if let Some(notice) = &self.repo_job
+            && (notice.running || self.show_repo_outcome)
+        {
+            let tok = if notice.error { Tok::Error } else { Tok::Text };
+            return Some(Line::from(Span::styled(
+                format!(" {}", text::one_line(&notice.message)),
+                theme.fg(tok),
+            )));
+        }
+        self.status.as_ref().and_then(|(message, error, at)| {
+            (at.elapsed() < STATUS_TTL).then(|| {
+                let tok = if *error { Tok::Error } else { Tok::Success };
+                Line::from(Span::styled(format!(" {message}"), theme.fg(tok)))
+            })
+        })
+    }
+
     pub(super) fn log_lines(&self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(width), usize::from(height));
         if w == 0 || h == 0 {
@@ -83,7 +105,10 @@ impl GitOverlay {
         hints.push(hint(ctx.keys, Action::SelectCancel, "close"));
         out.truncate(body_h);
         out.resize(body_h, Line::default());
-        out.push(hint_line(theme, &hints, w));
+        out.push(
+            self.job_status_line(theme)
+                .unwrap_or_else(|| hint_line(theme, &hints, w)),
+        );
         out
     }
 
@@ -158,12 +183,13 @@ impl GitOverlay {
             }
         }
 
-        let footer = match &self.status {
-            Some((message, error, at)) if at.elapsed() < STATUS_TTL => {
-                let tok = if *error { Tok::Error } else { Tok::Success };
-                Line::from(vec![Span::styled(format!(" {message}"), theme.fg(tok))])
-            }
-            _ => hint_line(theme, &self.hints(ctx), w),
+        let footer = if let Some(prompt) = &self.ai_prompt {
+            let mut spans = vec![Span::raw(" Stage what? ")];
+            spans.extend(editor_spans(theme, prompt, w.saturating_sub(13), false));
+            Line::from(spans)
+        } else {
+            self.job_status_line(theme)
+                .unwrap_or_else(|| hint_line(theme, &self.hints(ctx), w))
         };
         out.push(footer);
         out
@@ -681,7 +707,9 @@ impl GitOverlay {
             }
         }
 
-        if self.commit.is_none() && !self.changes.is_empty() {
+        if self.commit.is_none()
+            && (!self.changes.is_empty() || self.editing || !self.message.text.is_empty())
+        {
             lines.push(Vec::new());
             let title = if self.amend {
                 "Commit message · amend"
@@ -689,7 +717,7 @@ impl GitOverlay {
                 "Commit message"
             };
             lines.push(vec![Span::raw(" "), chrome::label(theme, title)]);
-            if self.message.is_empty() {
+            if self.message.text.is_empty() {
                 let placeholder = if self.editing {
                     "  ▌"
                 } else if self.changes.iter().any(|c| c.area == Area::Staged) {
@@ -697,15 +725,31 @@ impl GitOverlay {
                 } else {
                     "  stage with space, then c"
                 };
+                if self.editing {
+                    cursor_line = lines.len();
+                }
                 lines.push(vec![Span::styled(placeholder, muted)]);
             } else {
-                let count = self.message.split('\n').count();
-                for (i, line) in self.message.split('\n').enumerate() {
-                    let mut content = format!("  {line}");
-                    if self.editing && i + 1 == count {
-                        content.push('▌');
+                let mut offset = 0;
+                for line in self.message.text.split('\n') {
+                    if self.editing && (offset..=offset + line.len()).contains(&self.message.cursor)
+                    {
+                        let mut editor = crate::ui::editor::Editor::default();
+                        editor.set(line);
+                        editor.move_to(self.message.cursor - offset);
+                        let mut content = vec![Span::raw("  ")];
+                        content.extend(editor_spans(
+                            theme,
+                            &editor,
+                            width.saturating_sub(2),
+                            false,
+                        ));
+                        cursor_line = lines.len();
+                        lines.push(content);
+                    } else {
+                        lines.push(vec![Span::styled(format!("  {line}"), theme.fg(Tok::Text))]);
                     }
-                    lines.push(vec![Span::styled(content, theme.fg(Tok::Text))]);
+                    offset += line.len() + 1;
                 }
             }
             if self.editing {

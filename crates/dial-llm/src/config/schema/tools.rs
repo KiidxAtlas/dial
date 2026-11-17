@@ -62,6 +62,16 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         true
     ),
     field!(
+        "sandbox.serial_ports",
+        sandbox.serial_ports,
+        TO,
+        "Sandbox",
+        "Serial ports",
+        "Let sandboxed shell commands open USB serial adapters (macOS /dev/cu.usbserial*, /dev/cu.usbmodem*; Linux /dev/ttyUSB*, /dev/ttyACM*) so tools like arduino-cli, esptool and PlatformIO can flash boards and read serial output. Other devices stay closed. No effect when the sandbox is off or on Windows.",
+        Kind::Bool,
+        true
+    ),
+    field!(
         "shell.backend",
         shell.backend,
         TO,

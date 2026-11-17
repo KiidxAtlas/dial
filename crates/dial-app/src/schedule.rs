@@ -405,6 +405,39 @@ fn hash_files(mut files: Vec<(PathBuf, u64, u128, [u8; 32])>) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Reads a persisted state file. A missing file is a fresh start; any other read or parse failure
+/// is an error that names the file but not its contents (which can include prompts).
+fn read_state_file<T>(path: &Path, what: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {what} {}", path.display()));
+        }
+    };
+    match toml::from_str(&text) {
+        Ok(state) => Ok(state),
+        Err(error) => bail!(
+            "{what} {} is corrupt ({}); move it aside to reset the schedule history",
+            path.display(),
+            error.message()
+        ),
+    }
+}
+
+/// Match private atomic publication: Unix acknowledgments include the directory flush;
+/// Windows does not expose an unprivileged directory flush.
+fn sync_publication_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    crate::platform::fs::sync_file(&fs::File::open(dir)?)?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 pub struct Store {
     dir: PathBuf,
 }
@@ -519,10 +552,7 @@ impl Store {
         lock.lock()?;
         let mut entries = self.load()?;
         let value = change(&mut entries)?;
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        file.write_all(toml::to_string(&File { entries })?.as_bytes())?;
-        crate::platform::fs::sync_file(file.as_file())?;
-        file.persist(self.path()).map_err(|e| e.error)?;
+        self.write_atomic(self.path(), &toml::to_string(&File { entries })?)?;
         Ok(value)
     }
 
@@ -560,78 +590,125 @@ impl Store {
         })
     }
 
-    pub fn last_runs(&self) -> HashMap<String, u64> {
-        self.load_state()
+    pub fn last_runs(&self) -> Result<HashMap<String, u64>> {
+        Ok(self.load_runtime()?.last_run)
     }
-    fn load_state(&self) -> HashMap<String, u64> {
-        fs::read_to_string(self.state_path())
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+
+    /// Whether another process currently holds this project's scheduler lease.
+    /// A missing lease file means no scheduler has run; I/O failures are not reported as idle.
+    pub fn running(&self) -> Result<bool> {
+        let path = self.dir.join("schedule.lock");
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("opening scheduler lease"),
+        };
+        match file.try_lock().map_err(io::Error::from) {
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error).context("probing scheduler lease"),
+        }
     }
-    fn load_baselines(&self) -> HashMap<String, SavedBaseline> {
-        fs::read_to_string(self.baseline_path())
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+    fn runtime_path(&self) -> PathBuf {
+        self.dir.join("schedule-runtime.toml")
     }
-    fn load_scheduler(&self) -> Scheduler {
+    /// Reads the consolidated file. Until the first save, the legacy pair is read instead; a
+    /// damaged or unreadable file is an error, never an empty history.
+    fn load_runtime(&self) -> Result<RuntimeState> {
+        match fs::metadata(self.runtime_path()) {
+            Ok(_) => read_state_file(&self.runtime_path(), "schedule run state"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RuntimeState {
+                last_run: read_state_file(&self.state_path(), "schedule run state")?,
+                baselines: read_state_file(&self.baseline_path(), "schedule watch state")?,
+            }),
+            Err(error) => Err(error).context("inspecting schedule run state"),
+        }
+    }
+    /// Restores the scheduler from disk. A failure to read the run state is returned rather than
+    /// treated as "never run": an empty history would re-execute every interval schedule
+    /// and re-baseline every watch.
+    fn load_scheduler(&self) -> Result<Scheduler> {
+        let state = self.load_runtime()?;
         let mut scheduler = Scheduler {
-            last_run: self.load_state(),
+            last_run: state.last_run,
             ..Default::default()
         };
-        for (id, saved) in self.load_baselines() {
-            let fingerprint = match saved {
-                SavedBaseline::Legacy(fp) => fp,
+        for (id, saved) in state.baselines {
+            let watch = match saved {
+                SavedBaseline::Legacy(fingerprint) => Watch {
+                    baseline: Some(fingerprint),
+                    ..Default::default()
+                },
                 SavedBaseline::Bound {
                     fingerprint,
                     definition,
+                    pending,
+                    followup,
+                    review,
                 } => {
                     scheduler.definitions.insert(id.clone(), definition);
-                    fingerprint
+                    Watch {
+                        baseline: Some(fingerprint),
+                        pending: pending.map(|saved| (saved.fingerprint, saved.since)),
+                        followup,
+                        review,
+                    }
                 }
             };
-            scheduler.watches.insert(
-                id,
-                Watch {
-                    baseline: Some(fingerprint),
-                    pending: None,
-                },
-            );
+            scheduler.watches.insert(id, watch);
         }
-        scheduler
+        Ok(scheduler)
     }
     fn write_atomic(&self, path: PathBuf, text: &str) -> Result<()> {
+        self.write_atomic_with_sync(path, text, sync_publication_dir)
+    }
+
+    fn write_atomic_with_sync(
+        &self,
+        path: PathBuf,
+        text: &str,
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         file.write_all(text.as_bytes())?;
         crate::platform::fs::sync_file(file.as_file())?;
-        file.persist(path).map_err(|e| e.error)?;
+        file.persist(&path).map_err(|e| e.error)?;
+        sync(&self.dir).with_context(|| {
+            format!(
+                "{} published but directory durability uncertain",
+                path.display()
+            )
+        })?;
         Ok(())
     }
-    fn save_state(&self, scheduler: &Scheduler) {
-        let baselines: HashMap<String, SavedBaseline> = scheduler
-            .watches
-            .iter()
-            .filter_map(|(id, watch)| {
-                Some((
-                    id.clone(),
-                    SavedBaseline::Bound {
-                        fingerprint: watch.baseline?,
-                        definition: scheduler.definitions.get(id)?.clone(),
-                    },
-                ))
-            })
-            .collect();
-        let write = || -> Result<()> {
-            // A torn state file would make every interval schedule look overdue, so writes are atomic.
-            self.write_atomic(self.state_path(), &toml::to_string(&scheduler.last_run)?)?;
-            self.write_atomic(self.baseline_path(), &toml::to_string(&baselines)?)?;
-            Ok(())
+    /// Writes the consolidated run state atomically. Legacy files are left untouched and ignored
+    /// from now on: nothing is deleted automatically, and the consolidated file always wins.
+    fn save_state(&self, scheduler: &Scheduler) -> Result<()> {
+        // A torn file would make every interval schedule look overdue or re-baseline every watch.
+        let state = RuntimeState {
+            last_run: scheduler.last_run.clone(),
+            baselines: scheduler
+                .watches
+                .iter()
+                .filter_map(|(id, watch)| {
+                    Some((
+                        id.clone(),
+                        SavedBaseline::Bound {
+                            fingerprint: watch.baseline?,
+                            definition: scheduler.definitions.get(id)?.clone(),
+                            pending: watch
+                                .pending
+                                .map(|(fingerprint, since)| SavedPending { fingerprint, since }),
+                            followup: watch.followup,
+                            review: watch.review,
+                        },
+                    ))
+                })
+                .collect(),
         };
-        if let Err(error) = write() {
-            eprintln!("dial schedule: could not save run state: {error:#}");
-        }
+        self.write_atomic(self.runtime_path(), &toml::to_string(&state)?)?;
+        Ok(())
     }
 }
 
@@ -670,13 +747,44 @@ enum SavedBaseline {
     Bound {
         fingerprint: [u8; 32],
         definition: Entry,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<SavedPending>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        followup: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        review: bool,
     },
 }
 
+#[derive(Serialize, Deserialize)]
+struct SavedPending {
+    fingerprint: [u8; 32],
+    since: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The persisted run state. Both parts are written in one file so that a crash cannot keep a
+/// run's completion without its new watch baseline, or the reverse.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeState {
+    last_run: HashMap<String, u64>,
+    baselines: HashMap<String, SavedBaseline>,
+}
+
+/// Per-entry watch state. `baseline` is the last acknowledged content. It moves only when a run
+/// finishes or a missing baseline is first observed, never on a failed observation.
 #[derive(Default)]
 struct Watch {
     baseline: Option<[u8; 32]>,
     pending: Option<([u8; 32], u64)>,
+    /// The pending change came from a run that changed watched content; the next run is its follow-up.
+    followup: bool,
+    /// Durable pause after a follow-up changed content again. Only re-adding the schedule clears it.
+    review: bool,
 }
 
 /// Decides what is due. Time and file fingerprints are inputs so the policy is testable.
@@ -686,10 +794,19 @@ pub struct Scheduler {
     watches: HashMap<String, Watch>,
     definitions: HashMap<String, Entry>,
     start_retries: HashMap<String, (u64, u64)>,
+    /// Changed since the last successful save; no run may start until it is saved.
+    unsaved: bool,
 }
 
 impl Scheduler {
     fn reconcile(&mut self, fresh: &[Entry]) {
+        let definitions: HashMap<String, Entry> = fresh
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect();
+        // Only a real change to the persisted state dirties it; an unchanged reload must not.
+        let changed = self.definitions != definitions;
+        let (watches, runs) = (self.watches.len(), self.last_run.len());
         self.watches.retain(|id, _| {
             fresh.iter().any(|entry| {
                 entry.id == *id && self.definitions.get(id).is_none_or(|old| old == entry)
@@ -702,10 +819,8 @@ impl Scheduler {
                 entry.id == *id && self.definitions.get(id).is_none_or(|old| old == entry)
             })
         });
-        self.definitions = fresh
-            .iter()
-            .map(|entry| (entry.id.clone(), entry.clone()))
-            .collect();
+        self.unsaved |= changed || watches != self.watches.len() || runs != self.last_run.len();
+        self.definitions = definitions;
     }
 
     pub fn due(
@@ -718,6 +833,14 @@ impl Scheduler {
             .start_retries
             .get(&entry.id)
             .is_some_and(|(retry_at, _)| now < *retry_at)
+        {
+            return None;
+        }
+        // A paused watch stays paused through intervals and restarts until its schedule is re-added.
+        if self
+            .watches
+            .get(&entry.id)
+            .is_some_and(|watch| watch.review)
         {
             return None;
         }
@@ -739,10 +862,15 @@ impl Scheduler {
         let watch = self.watches.entry(entry.id.clone()).or_default();
         let Some(baseline) = watch.baseline else {
             watch.baseline = Some(fp);
+            self.unsaved = true;
             return None;
         };
         if fp == baseline {
-            watch.pending = None;
+            if watch.pending.is_some() || watch.followup {
+                watch.pending = None;
+                watch.followup = false;
+                self.unsaved = true;
+            }
             return None;
         }
         match watch.pending {
@@ -753,6 +881,7 @@ impl Scheduler {
             Some((seen, _)) if seen == fp => None,
             _ => {
                 watch.pending = Some((fp, now));
+                self.unsaved = true;
                 None
             }
         }
@@ -770,18 +899,94 @@ impl Scheduler {
             .insert(entry.id.clone(), (now.saturating_add(delay), delay));
     }
 
-    /// Record a finished run. The new fingerprint becomes the baseline, so the run's own edits do not retrigger it.
-    pub fn ran(&mut self, entry: &Entry, now: u64, fingerprint: Option<[u8; 32]>) {
+    /// Record a finished run and report whether it left the entry paused for review.
+    /// `pre` is the content the run started on: the acknowledged baseline. `post` is the content
+    /// afterwards, or None when it could not be observed. A difference is an edit made while the
+    /// run was active: it gets one coalesced follow-up run. A difference after a follow-up run
+    /// pauses the entry durably, because the scheduler must not chase its own writes indefinitely.
+    pub fn ran(
+        &mut self,
+        entry: &Entry,
+        now: u64,
+        pre: Option<[u8; 32]>,
+        post: Option<[u8; 32]>,
+    ) -> bool {
+        self.unsaved = true;
         self.start_retries.remove(&entry.id);
         self.last_run.insert(entry.id.clone(), now);
-        if !entry.watch.is_empty() {
-            self.watches.insert(
-                entry.id.clone(),
-                Watch {
-                    baseline: fingerprint,
-                    pending: None,
-                },
-            );
+        if entry.watch.is_empty() {
+            return false;
+        }
+        let Some(pre) = pre else {
+            return false;
+        };
+        let watch = self.watches.entry(entry.id.clone()).or_default();
+        let was_followup = watch.followup;
+        match post {
+            Some(post) if post == pre => {
+                watch.baseline = Some(post);
+                watch.pending = None;
+                watch.followup = false;
+                false
+            }
+            Some(_) if was_followup => {
+                watch.baseline = Some(pre);
+                watch.pending = None;
+                watch.followup = false;
+                watch.review = true;
+                true
+            }
+            Some(post) => {
+                watch.baseline = Some(pre);
+                watch.pending = Some((post, now));
+                watch.followup = true;
+                false
+            }
+            None if was_followup => {
+                // A follow-up whose result cannot be observed may have changed anything. Pause for
+                // review rather than retry; keep the last trustworthy baseline and the unresolved state.
+                watch.baseline.get_or_insert(pre);
+                watch.pending = None;
+                watch.review = true;
+                true
+            }
+            None => {
+                // Unknown content: keep the last trustworthy baseline and compare against it next time.
+                watch.baseline.get_or_insert(pre);
+                watch.pending = None;
+                watch.followup = true;
+                false
+            }
+        }
+    }
+}
+
+/// Saves run state when a change is unsaved. While it is unsaved no new run is launched (checked
+/// before every launch). That only limits further launches: a crash or disk failure can still lose
+/// a completion that was not yet durable. A failure is reported once per distinct message.
+fn checkpoint(
+    store: &Store,
+    scheduler: &mut Scheduler,
+    reported: &mut Option<String>,
+) -> Result<()> {
+    if !scheduler.unsaved {
+        return Ok(());
+    }
+    match store.save_state(scheduler) {
+        Ok(()) => {
+            scheduler.unsaved = false;
+            *reported = None;
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if reported.as_deref() != Some(message.as_str()) {
+                eprintln!(
+                    "dial schedule: run state not saved; new runs are paused until it is: {message}"
+                );
+                *reported = Some(message);
+            }
+            Err(error)
         }
     }
 }
@@ -1801,6 +2006,19 @@ impl EntryErrors {
     }
 }
 
+/// Changed paths mark every watch they match, including the entry that just ran.
+fn mark_dirty(
+    globs: &HashMap<String, globset::GlobSet>,
+    paths: &[PathBuf],
+    dirty: &mut HashSet<String>,
+) {
+    for (id, set) in globs {
+        if paths.iter().any(|path| set.is_match(path)) {
+            dirty.insert(id.clone());
+        }
+    }
+}
+
 fn needs_watch_check(
     entry: &Entry,
     scheduler: &Scheduler,
@@ -1808,14 +2026,27 @@ fn needs_watch_check(
     dirty: &HashSet<String>,
     everything_dirty: bool,
 ) -> bool {
-    !entry.watch.is_empty()
-        && (everything_dirty
-            || dirty.contains(&entry.id)
-            || scheduler
-                .watches
-                .get(&entry.id)
-                .is_none_or(|watch| watch.baseline.is_none() || watch.pending.is_some())
-            || errors.retry_due(&entry.id))
+    if entry.watch.is_empty() {
+        return false;
+    }
+    // A paused watch is not checked until its schedule is re-added.
+    if scheduler
+        .watches
+        .get(&entry.id)
+        .is_some_and(|watch| watch.review)
+    {
+        return false;
+    }
+    // A failing watch is retried on ERROR_RETRY only. Events, missing baselines and pending
+    // follow-ups must not re-hash it on every pass, which would bypass that backoff.
+    if errors.current.contains_key(&entry.id) {
+        return errors.retry_due(&entry.id);
+    }
+    everything_dirty
+        || dirty.contains(&entry.id)
+        || scheduler.watches.get(&entry.id).is_none_or(|watch| {
+            watch.baseline.is_none() || watch.pending.is_some() || watch.followup
+        })
 }
 
 /// The scheduler loop. Only one per project runs: a second instance fails fast on the lock.
@@ -1841,7 +2072,7 @@ pub fn run(
     })?;
     let exe = std::env::current_exe()?;
     let root = &layout.project_root;
-    let mut scheduler = store.load_scheduler();
+    let mut scheduler = store.load_scheduler()?;
     let events = if once {
         None
     } else {
@@ -1866,6 +2097,7 @@ pub fn run(
     let mut everything_dirty = true;
     let mut rescan_next = false;
     let mut first = true;
+    let mut save_reported: Option<String> = None;
     while !stop.load(Ordering::Acquire) {
         // Re-parse only when the file changed; a broken replacement keeps the last good set.
         let current_stamp = store.stamp();
@@ -1916,13 +2148,7 @@ pub fn run(
         }
         match events.as_ref().map(FsEvents::drain) {
             None | Some(Changes::Everything) => everything_dirty = true,
-            Some(Changes::Paths(paths)) => {
-                for (id, set) in &globs {
-                    if paths.iter().any(|path| set.is_match(path)) {
-                        dirty.insert(id.clone());
-                    }
-                }
-            }
+            Some(Changes::Paths(paths)) => mark_dirty(&globs, &paths, &mut dirty),
         }
         let mut checked: HashMap<String, Result<[u8; 32]>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
@@ -1988,6 +2214,23 @@ pub fn run(
             let Some(reason) = scheduler.due(entry, at, || before) else {
                 continue;
             };
+            // Launching is the one step a restart cannot undo: never start while state is unsaved.
+            if checkpoint(&store, &mut scheduler, &mut save_reported).is_err() {
+                break;
+            }
+            // The content the run starts on is the acknowledged baseline. An edit made while the run is
+            // active differs from it afterwards, so it is followed up even if it lands before the run ends.
+            let pre = if entry.watch.is_empty() {
+                None
+            } else {
+                match fingerprint(root, &entry.watch) {
+                    Ok(fp) => Some(fp),
+                    Err(error) => {
+                        errors.fail(&store, &entry.id, "watch rejected before run", &error);
+                        continue;
+                    }
+                }
+            };
             eprintln!("dial schedule: running {} ({reason:?})", entry.id);
             // A child may edit any watched file. Later entries need a fresh shared snapshot,
             // not results computed before this run (including when no watcher is available).
@@ -2018,52 +2261,62 @@ pub fn run(
                 }
                 Err(RunFailure::Active(error)) => {
                     // Do not launch another entry when process ownership or completion is uncertain.
-                    scheduler.ran(entry, now(), None);
-                    store.save_state(&scheduler);
+                    scheduler.ran(entry, now(), pre, None);
+                    let error = match checkpoint(&store, &mut scheduler, &mut save_reported) {
+                        Ok(()) => error,
+                        Err(save) => error.context(format!("run state not saved: {save:#}")),
+                    };
                     return Err(error)
                         .with_context(|| format!("schedule {} stopped; see its log", entry.id));
                 }
             }
-            if stop.load(Ordering::Acquire) {
-                scheduler.ran(entry, now(), None);
-                store.save_state(&scheduler);
-                break;
-            }
-            let after = if entry.watch.is_empty() {
-                Ok(None)
-            } else {
-                fingerprint(root, &entry.watch).map(Some)
-            };
             let finished = now();
-            match after {
-                Ok(after) => scheduler.ran(entry, finished, after),
-                Err(error) => {
-                    // No baseline: the next check re-baselines instead of re-running on stale state.
-                    scheduler.ran(entry, finished, None);
-                    errors.fail(
-                        &store,
-                        &entry.id,
-                        "watch coverage rejected after run",
-                        &error,
-                    );
+            let paused = if entry.watch.is_empty() {
+                scheduler.ran(entry, finished, None, None)
+            } else {
+                // An unobservable result is recorded as unknown; the last trustworthy baseline is kept.
+                let post = match fingerprint(root, &entry.watch) {
+                    Ok(post) => Some(post),
+                    Err(error) => {
+                        errors.fail(
+                            &store,
+                            &entry.id,
+                            "watch coverage rejected after run",
+                            &error,
+                        );
+                        None
+                    }
+                };
+                scheduler.ran(entry, finished, pre, post)
+            };
+            if paused {
+                eprintln!(
+                    "dial schedule: {} paused for review; watched content changed or could not be observed after a follow-up run",
+                    entry.id
+                );
+                let note = format!(
+                    "--- {finished} paused for review: watched content changed or could not be observed after a follow-up run; remove and re-add the schedule to resume\n"
+                );
+                if let Err(log_error) = append_log(&store.log_path(&entry.id), &note) {
+                    eprintln!("dial schedule: {} log unavailable: {log_error:#}", entry.id);
                 }
             }
-            // The run's own edits were folded into the new baseline; drop their queued events.
+            // Edits that arrive while a run is active may not be in its snapshot. Every matching
+            // watch, including this one, is marked so the next check compares content and keeps them.
+            // A run's own late notifications compare equal and do not start another run.
             match events.as_ref().map(FsEvents::drain) {
-                Some(Changes::Paths(paths)) => {
-                    for (id, set) in &globs {
-                        if id != &entry.id && paths.iter().any(|path| set.is_match(path)) {
-                            dirty.insert(id.clone());
-                        }
-                    }
-                }
+                Some(Changes::Paths(paths)) => mark_dirty(&globs, &paths, &mut dirty),
                 Some(Changes::Everything) => rescan_next = true,
                 None => {}
             }
-            store.save_state(&scheduler);
+            // A failed save is reported and blocks the next launch until a later save succeeds.
+            checkpoint(&store, &mut scheduler, &mut save_reported).ok();
         }
         everything_dirty = events.is_none() || std::mem::take(&mut rescan_next);
+        // Persist first-sight baselines and other changes made without a run.
+        let saved = checkpoint(&store, &mut scheduler, &mut save_reported);
         if once {
+            saved?;
             break;
         }
         // Wake for the next interval/debounce check, a filesystem event, or a schedules edit.

@@ -5,8 +5,10 @@ Find actions through the goal-first palette, slash completion and command help.
 [Terminal overview](terminal-interface.md) · [Documentation index](README.md)
 
 - **Action palette:** `Alt-K`, `F1` or `/palette` starts with a short list of goals: start or
-  continue work, review changes, manage ongoing work, configure Dial, or browse all actions.
-  Choose a goal to drill into relevant commands; return to the goal list before closing. Up to
+  continue work, review changes, manage ongoing work, configure Dial, browse all actions, or
+  **Search local** across Actions, Settings, Sessions and Help (`all:` remains supported).
+  The action list uses a compact scrolling panel with nearby hints; pickers and Plan/Progress retain
+  their full-height views. Choose a goal to drill into relevant commands; return to the goal list before closing. Up to
   three actions you ran from the palette this session (idle or during a turn) lead the goal list, marked *recent*. While
   nothing is typed, digits `1`–`9` run the matching visible row (pickers keep digits for filtering).
   Search is fuzzy; a phrase of two or more words that matches nothing that way ("undo the last
@@ -75,18 +77,42 @@ swallowed. Lists in Settings and Providers stop at their first and last rows rat
 - **`/git`** opens Status, Diff, Commit and Log tabs; `Tab`/`Shift-Tab` switch tabs and keep the
   commit draft. `/git tab status|diff|commit|log` opens a tab directly, `/git <revision>` still
   shows that revision (even one named `status`), and `/git commit run [flags]` runs `/commit`.
-- **`/activity`** opens Attention, Workers, Processes, Compute, Schedule and Queue tabs; Left/Right
-  or `Tab`/`Shift-Tab` switch them. `/workers`, `/processes`, `/compute`, `/schedule` and `/queue`
-  open their tab, and `/activity downloads` opens model downloads in the Models panel (it is not
-  one of the tabs). `Ctrl-Tab` reaches a panel's inner tabs; attached terminals keep normal `Tab` input.
+  Git mutations run in a single background job per panel with a persistent busy indicator; another
+  operation against the same repository is refused until it finishes, even after closing and reopening
+  the panel. Closing does not cancel an in-flight Git write. Workers are also bounded across repositories.
+  Reopening shows a still-running operation and its eventual completion or error, without retrying it.
+  Recovered outcomes stay visible until the next input. The latest outcome per repository is kept for
+  this process only (up to 32 repositories / 128 KiB of retained paths and text, 4 KiB per message;
+  oldest outcomes are evicted).
+  Failed commits retain the draft. Both the commit composer
+  and AI staging prompt support the shared editor bindings, cursor movement and paste. `Ctrl-G`
+  in the composer generates a message for explicitly staged changes only: it never stages files.
+  File discard requires a second deliberate `Delete`; hunk and marked-line discard require a
+  second deliberate `x`. Navigation or repository refresh cancels an armed discard.
+- **`/activity`** opens Attention, Workers, Processes, Downloads, Compute, Schedule and Queue tabs;
+  Left/Right or `Tab`/`Shift-Tab` switch them. `/workers`, `/processes`, `/compute`, `/schedule`
+  and `/queue` open their tab; `/activity downloads` embeds the existing Models download owner.
+  `Ctrl-Shift-F11`/`Ctrl-Shift-F12` reaches inner tabs; `Alt-PageUp`/`Alt-PageDown` and `Ctrl-Tab`
+  are alternatives where the terminal forwards them. Attached terminals keep their input.
+  Attention distinguishes loading, observed empty results and unavailable sources. Worker and
+  process entries open the exact selected owner, without starting, retrying or attaching work.
+  Back from an Attention drill-down restores its filter and selection; switching sibling Activity
+  tabs does not add extra Back steps.
+  Queue picker actions identify the original queued item, so a stale picker cannot edit its replacement.
 - **`/extensions`** browses MCP servers, skills, tool groups and hooks; `/extensions
   mcp|skills|tools|hooks` opens a tab and `/hooks` opens the Hooks tab.
 - **`/stats`** opens searchable Usage / cost, Tokens, Sessions and Tools tabs across sessions.
-  `/stats <range>` and `/stats --port <port>` behave as before; `/usage` (provider quotas) and
-  `/cost` (this runtime's accounting) stay separate.
-- **`/inbox`** lists this session's notifications; `Enter` reads a notice and marks it read, and
-  **Mark all read** (or `/inbox read-all`) clears the unread count. **`/doctor`** lists
-  local diagnostics and reviews a fix before applying it. **`/accounts`** lists saved logins
+  `/stats <range>` and `/stats --port <port>` behave as before; `/usage` (provider quotas, with
+  each account's plan or tier such as `Plus`, `Pro` or `Max 20x`) and
+  `/cost` (this runtime's accounting) stay separate. Quota summaries retain each bucket's name
+  alongside its window, plus unlimited and overage notes. Usage above 100% represents reported
+  overage and is not capped at 100%.
+- **`/inbox`** lists this session's notifications. **Mark all read** appears above entries; choose
+  **Show unread only** or use `/inbox unread` (`/inbox all` restores the full list).
+  `Enter` reads a notice and marks it read; `/inbox read-all` clears the unread count.
+  Repeats within one minute coalesce with an occurrence count and reopen read notices. At the
+  200-entry bound, read notices are removed first; unread eviction is explicitly counted, not silent.
+  **`/doctor`** lists local diagnostics and reviews a fix before applying it. **`/accounts`** lists saved logins
   without showing credentials. **`/set <key> [value] [--project]`** shows a setting and its source
   or saves a validated value.
 

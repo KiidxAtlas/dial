@@ -2,6 +2,7 @@ pub mod acp;
 pub mod app;
 pub mod benchmark;
 pub mod changelog;
+pub(crate) mod checks;
 pub mod cli;
 pub mod collab;
 pub mod release;
@@ -9,6 +10,7 @@ pub mod repl;
 pub(crate) mod rewind;
 pub mod rpc;
 pub mod schedule;
+pub(crate) mod side;
 
 pub(crate) use dial_agent::telemetry;
 pub(crate) use dial_agent::{

@@ -68,9 +68,21 @@ fn generated_text_round_trips_through_validation_flag() {
     let generated = Generated {
         text: "fix: x".to_owned(),
         validation_error: Some("bad scope".to_owned()),
-        staged_all: false,
     };
     assert_eq!(generated.text, "fix: x");
     assert_eq!(generated.validation_error.as_deref(), Some("bad scope"));
-    assert!(!generated.staged_all);
+}
+
+#[test]
+fn generation_without_staged_changes_never_changes_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::testkit::git(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("private.txt"), "not selected\n").unwrap();
+    let result = generate_in(dir.path(), &Config::default());
+    assert!(result.is_err());
+    let staged = run_checked(dir.path(), &["diff", "--cached", "--name-only"], false).unwrap();
+    assert!(
+        staged.is_empty(),
+        "message generation must never stage files"
+    );
 }

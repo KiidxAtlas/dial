@@ -18,6 +18,7 @@ in this table (see Dependency boundaries).
 
 | Layer | Crate | Modules and contents |
 |---|---|---|
+| 0 | `dial-protocol` | Plain-data wire vocabulary shared by engine and clients; depends on no other workspace crate |
 | 1 | `dial-build-info` | `build_info`: revision, dirty state and build epoch (`build.rs` emits them) |
 | 2 | `dial-core` | `platform`, `runtime` (shared result bodies, execution facts, cancellation, stream journal, schemas, arguments), `output`, `workspace_copy`; root helpers `hex`, `install_tls_provider`, `flush_stdout_on_exit` |
 | 3 | `dial-llm` | `config` (types, defaults, settings declarations, layered views, validation, paths), `llm` (provider clients, acquisition, streaming, tool-call repair), `url`; `build.rs` builds the Apple Foundation Models helper |
@@ -27,7 +28,7 @@ in this table (see Dependency boundaries).
 | 7 | `dial-agent` | `agent` (agent loop, grouped below), `learn`, `judgment`, `adaptive`, `steering`, `weights`, `reliability`, `telemetry`, `stats`, `extensions`, `commit`, `pack` |
 | 8 | `dial-ui` | `ui` (terminal interface: composer, transcript, overlays, themes), `git_panel`; bundled palettes live in `crates/dial-ui/themes/` |
 | 9 | `dial-app` | `app` (application wiring, with private slash-command handlers in `app/commands/`), `cli` (subcommands, flags, plain-text tables), `benchmark`, `repl`, `rpc`, `acp`, `schedule`, `changelog`, `collab` |
-| 10 | `dial-client` | Rust client for the `dial rpc` wire protocol (launch, negotiation, correlation, disconnect accounting); depends on no other workspace crate, so frontends couple only to the protocol |
+| 10 | `dial-client` | Rust client for the `dial rpc` wire protocol (launch, negotiation, correlation, disconnect accounting); depends only on `dial-protocol`, never on engine crates |
 
 The root `build.rs` only declares rerun inputs; per-crate build scripts own their own outputs.
 
@@ -104,12 +105,13 @@ tool contracts and self-contained domain prompts are linked there, not duplicate
 
 Enforced by `tests/integration/architecture.rs`.
 
-- **Crate layers.** `CRATE_LAYERS` lists the workspace crates lowest first (`dial-build-info`,
-  `dial-core`, `dial-llm`, `dial-storage`, `dial-tools`, `dial-computer`, `dial-agent`, `dial-ui`,
-  `dial-app`, `dial-client`). `crates_depend_only_on_lower_layers` requires every workspace-crate dependency of a
-  crate, including dev-dependencies, to appear earlier in that list. An unlisted crate is a
-  violation, so a new crate is placed in the order deliberately. `dial-client` sits last so no
-  engine crate can depend on it; it declares no workspace dependencies of its own.
+- **Crate layers.** `CRATE_LAYERS` lists the workspace crates lowest first (`dial-protocol`,
+  `dial-build-info`, `dial-core`, `dial-llm`, `dial-storage`, `dial-tools`, `dial-computer`,
+  `dial-agent`, `dial-ui`, `dial-app`, `dial-client`). `crates_depend_only_on_lower_layers`
+  requires every workspace-crate dependency of a crate, including dev-dependencies, to appear
+  earlier in that list. An unlisted crate is a violation, so a new crate is placed in the order
+  deliberately. `dial-client` sits last so no engine crate can depend on it; its only workspace
+  dependency is the shared `dial-protocol` vocabulary.
   `crate_manifests_are_checked_against_the_layer_order` tests that check against fixture manifests.
   `workspace_crates_and_layer_registry_agree` additionally rejects missing, duplicate or unregistered
   crates and crates not selected by `workspace.members`.
@@ -339,13 +341,13 @@ of each feature. The reviewed areas and resulting decisions are:
 | Model configuration, setup and settings surfaces | Route embedding-role changes through the canonical selection writer; preserve explicit overrides and open-choice settings. |
 | Benchmarks and worker isolation | Share source copying and exclusion policy outside benchmark ownership; keep private dependency materialization semantics separate. |
 | Terminal, print CLI, RPC and ACP | Keep adapters over shared events; add independent terminal I/O, bounded rendering, draft-safe dialogs and native transcript navigation without moving execution authority into presentation. |
-| Session persistence and runtime streams | Preserve writer leases; contention creates an independent sibling. Move/archive/delete associated side history and roll back failed destination publication without damaging the source. |
+| Session persistence and runtime streams | Preserve writer leases; native interactive contention creates an independent sibling, while ACP exact resume refuses contention. Move/archive/delete associated side history and distinguish definite publication failure from uncertain durability before rollback. |
 | Side conversations and worker controls | Freeze side context without borrowing the running agent; persist streamed prefixes. Keep worker editors and model revisions local, and restore only safely acknowledged starts. |
 | Steering, import and automatic improvement | Share mutation leases and admission checks rather than duplicating weaker promotion gates. |
 | Provider acquisition and optional learning | Retain acquisition ownership; centralize existing identity policy without changing its scope or running downloads/training. |
 | Background execution | Long `eval` cells and named shells hand off through the existing bash adopter into the `bg` table; handed-off cells refuse host callbacks and busy names/runtimes refuse new work. |
 | Media and remote reads | `read` keeps one dispatch path: hooks and approval run before vision questions; URL reads reuse the guarded web fetch client; archive formats share one admission walk with entry, size and decode limits. |
-| Portable sessions | Packing is versioned and hash-verified; unpack never overwrites and refuses traversal, links and newer schemas. A global transfer ledger makes a moved-away source fork. |
+| Portable sessions | Packing is versioned and hash-verified; unpack never overwrites and refuses traversal, links and newer schemas. A global transfer ledger makes native interactive resume of a moved-away source fork; exact ACP resume refuses it. |
 | Provider resilience | Cache-field refusals narrow a per-endpoint latch; cache warming runs on its own client and folds replay cost into session usage; OAuth accounts share one store and rotate like the API-key pool. |
 | Consultation and host integration | `seance` is a read-only worker over stored transcripts; RPC host tools and URI schemes are ordinary tools subject to approval and reset on session switch. |
 

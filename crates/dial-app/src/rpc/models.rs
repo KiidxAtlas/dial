@@ -264,5 +264,53 @@ pub(super) fn acp_options(config: &Config, user_dir: &Path, with_list: bool) -> 
     options
 }
 
+/// RPC `delete_local_model`: deletes a downloaded local model's folder (or, with `dry_run`, only
+/// reports what would be removed). `in_use` is every model the configuration and the session
+/// select; those are refused. Refusals are coded: an unknown model is `NotFound`, a selected one
+/// `Refused`, a malformed request `InvalidParams`, and a failed delete `Failed`.
+pub(super) fn delete_local(params: &Value, in_use: &[String]) -> anyhow::Result<Value> {
+    use super::coded;
+    use dial_protocol::ErrorCode;
+    if !params.is_object() {
+        return Err(coded(ErrorCode::InvalidParams, "params must be an object"));
+    }
+    let model = params["model"]
+        .as_str()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidParams,
+                "delete_local_model requires params.model (a local model path or label)",
+            )
+        })?;
+    let dry_run = match params.get("dry_run") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(coded(ErrorCode::InvalidParams, "dry_run must be a boolean"));
+        }
+    };
+    let removal = catalog::plan_local_model_removal(model)
+        .map_err(|error| coded(ErrorCode::NotFound, error))?;
+    if !dry_run {
+        catalog::remove_local_model(&removal.model, in_use).map_err(|error| {
+            let code = if error.downcast_ref::<catalog::ModelInUse>().is_some() {
+                ErrorCode::Refused
+            } else {
+                ErrorCode::Failed
+            };
+            coded(code, error)
+        })?;
+    }
+    Ok(json!({
+        "label": removal.label,
+        "model": removal.model,
+        "folder": removal.folder,
+        "bytes": removal.bytes,
+        "source": removal.source,
+        "deleted": !dry_run,
+    }))
+}
+
 #[cfg(test)]
 mod tests;

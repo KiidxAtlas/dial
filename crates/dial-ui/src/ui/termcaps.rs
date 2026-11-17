@@ -26,6 +26,12 @@ pub fn terminal_focused() -> bool {
     FOCUS.load(Ordering::SeqCst) == 1
 }
 
+/// The terminal reported that it lost focus: the user has looked away. Unlike
+/// [`terminal_focused`], an unknown state is not an absence here.
+pub fn terminal_reported_unfocused() -> bool {
+    FOCUS.load(Ordering::SeqCst) == 2
+}
+
 /// Background brightness from an OSC 11 reply (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB` ended by BEL or
 /// `ESC \`) anywhere in `bytes`: `Some(true)` for a dark background. Components may have 1–4 hex
 /// digits each, as XParseColor allows.

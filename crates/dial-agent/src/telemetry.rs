@@ -407,22 +407,79 @@ fn project_key(config: &Config) -> String {
         .unwrap_or_default()
 }
 
-/// Push buffered records out now (bounded by the export timeout).
+/// Longest a `flush` or `shutdown` waits for the worker to admit its barrier and acknowledge it.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(15);
+/// Back-off between admission attempts while the ingress queue is full.
+const CONTROL_RETRY: Duration = Duration::from_millis(5);
+
+/// Push buffered records out now (bounded by `CONTROL_DEADLINE`). Failure is reported on stderr;
+/// use [`try_flush`] to observe it.
 pub fn flush() {
-    let Some(tx) = hub_sender(false) else { return };
-    let (done, wait) = mpsc::channel();
-    if tx.try_send(Msg::Flush(done)).is_ok() {
-        let _ = wait.recv_timeout(Duration::from_secs(15));
+    if let Err(error) = try_flush() {
+        eprintln!("dial telemetry: {error:#}");
     }
+}
+
+/// Push buffered records out now, reporting a barrier that could not be admitted or acknowledged
+/// before the deadline. A full queue is waited on, not skipped, so the barrier is not silently lost.
+pub fn try_flush() -> Result<()> {
+    let Some(tx) = hub_sender(false) else {
+        return Ok(());
+    };
+    control(&tx, CONTROL_DEADLINE, "flush", Msg::Flush)
 }
 
 /// Flush and stop the background thread. Called once before the process exits.
 pub fn shutdown() {
+    if let Err(error) = try_shutdown() {
+        eprintln!("dial telemetry: {error:#}");
+    }
+}
+
+/// Flush and stop the background thread, reporting a stop that was not admitted or acknowledged.
+pub fn try_shutdown() -> Result<()> {
     let hub = HUB.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(hub) = hub {
-        let (done, wait) = mpsc::channel();
-        if hub.tx.try_send(Msg::Stop(done)).is_ok() {
-            let _ = wait.recv_timeout(Duration::from_secs(15));
+    let Some(hub) = hub else {
+        return Ok(());
+    };
+    control(&hub.tx, CONTROL_DEADLINE, "shutdown", Msg::Stop)
+}
+
+/// Delivers one control barrier and waits for its acknowledgement, all within `budget`. Control
+/// barriers may not be dropped like events, so a full queue is retried until the deadline; each
+/// failure is counted in [`LossCounters::control`] and returned.
+fn control(
+    tx: &mpsc::SyncSender<Msg>,
+    budget: Duration,
+    what: &str,
+    make: fn(mpsc::Sender<()>) -> Msg,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    let (done, wait) = mpsc::channel();
+    let mut msg = make(done);
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                CONTROL_LOSS.fetch_add(1, Ordering::Relaxed);
+                bail!("telemetry worker is not running; {what} was not delivered");
+            }
+            Err(mpsc::TrySendError::Full(back)) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    CONTROL_LOSS.fetch_add(1, Ordering::Relaxed);
+                    bail!("telemetry queue stayed full for {budget:?}; {what} was not delivered");
+                }
+                msg = back;
+                thread::sleep(CONTROL_RETRY.min(left));
+            }
+        }
+    }
+    match wait.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            CONTROL_LOSS.fetch_add(1, Ordering::Relaxed);
+            bail!("telemetry {what} was not acknowledged within {budget:?}");
         }
     }
 }
@@ -493,21 +550,37 @@ pub struct LossCounters {
     pub ingress: u64,
     pub export: u64,
     pub stats: u64,
+    /// Control barriers (flush/shutdown) that were not admitted or acknowledged in time.
+    pub control: u64,
 }
 static INGRESS_LOSS: AtomicU64 = AtomicU64::new(0);
 static EXPORT_LOSS: AtomicU64 = AtomicU64::new(0);
 static STATS_LOSS: AtomicU64 = AtomicU64::new(0);
+static CONTROL_LOSS: AtomicU64 = AtomicU64::new(0);
 pub fn loss_counters() -> LossCounters {
     LossCounters {
         ingress: INGRESS_LOSS.load(Ordering::Relaxed),
         export: EXPORT_LOSS.load(Ordering::Relaxed),
         stats: STATS_LOSS.load(Ordering::Relaxed),
+        control: CONTROL_LOSS.load(Ordering::Relaxed),
     }
 }
 fn enqueue(tx: &mpsc::SyncSender<Msg>, msg: Msg) {
     if tx.try_send(msg).is_err() {
         INGRESS_LOSS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Replaces the export target. Turns still open on the old target are closed as `interrupted`
+/// and flushed there before it is dropped, so their child spans keep a parent and the old
+/// endpoint receives the complete trace. A turn that continues on the new target starts a new
+/// trace there.
+fn reconfigure_exporter(exporter: &mut Option<Exporter>, otlp: Option<OtlpSettings>) {
+    if let Some(mut old) = exporter.take() {
+        old.close_open_turns();
+        old.flush();
+    }
+    *exporter = otlp.map(Exporter::new);
 }
 
 fn run(rx: mpsc::Receiver<Msg>) {
@@ -548,10 +621,7 @@ fn run(rx: mpsc::Receiver<Msg>) {
                     }
                 }
                 if exporter.as_ref().map(|e| &e.settings) != route.otlp.as_ref() {
-                    if let Some(old) = &mut exporter {
-                        old.flush();
-                    }
-                    exporter = route.otlp.clone().map(Exporter::new);
+                    reconfigure_exporter(&mut exporter, route.otlp.clone());
                 }
                 if let Some(e) = &mut exporter {
                     e.observe(&event);
@@ -1030,6 +1100,7 @@ impl Exporter {
                 ingress: 0,
                 export: 0,
                 stats: 0,
+                control: 0,
             },
             #[cfg(test)]
             last_error: None,
@@ -1309,7 +1380,8 @@ impl Exporter {
         }
     }
 
-    /// Turns still open at shutdown are closed as interrupted so their child spans keep a parent.
+    /// Turns still open at shutdown or export-target replacement are closed as interrupted so
+    /// their child spans keep a parent.
     fn close_open_turns(&mut self) {
         let now = SystemTime::now();
         let open: Vec<(String, u64)> = self
@@ -1450,6 +1522,7 @@ impl Exporter {
             ("ingress", losses.ingress, self.losses.ingress),
             ("export", losses.export, self.losses.export),
             ("stats", losses.stats, self.losses.stats),
+            ("control", losses.control, self.losses.control),
         ] {
             if now > before {
                 self.add(

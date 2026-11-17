@@ -66,8 +66,11 @@ idle time (`keep_alive`, five minutes by default).
 - **Limits.** Only the `embedding` role is started, never the explicit `embedding_base_url` /
   `embedding_model` override or a remote address. Ollama must already be installed and on `PATH`
   (or in `/opt/homebrew/bin` or `/usr/local/bin`); this path never installs it. A recall waits at
-  most its remaining time budget, so the first recall can still be keyword-only while the server
-  comes up. After a failed start Dial waits a minute before trying again. The server's output goes
+  most its remaining time budget, including the server start, so the first recall can still be
+  keyword-only while the server comes up. The wait is bounded by one absolute deadline: a recall
+  whose time has already run out takes no lock, records no lease and starts nothing, and a cancelled
+  or failed recall gives up its own lease so it does not keep the server running. A call can finish
+  up to 100 ms past its deadline, the length of one final readiness probe. After a failed start Dial waits a minute before trying again. The server's output goes
   to `serve.log` in the state directory.
 
 Set `memory.semantic.embedding_autostart = false` to manage the server yourself.
@@ -152,6 +155,24 @@ the message names the protocol. Choose a model served over one of the three form
 - Responses are rejected when a vector holds a non-number or a value outside the f32 range, when an
   index is not a non-negative integer below the input count or is repeated, when counts differ from
   the inputs, or when vectors differ in length.
+
+## Code-search embeddings
+
+`find` with `ranking: "embedding"` uses the configured embedding route, not only the model
+name, to identify cached vectors. Changing an endpoint cannot reuse another route's vectors.
+The shared cache evicts oldest entries incrementally within a 64 MiB accounting budget;
+oversized entries bypass it rather than clearing useful entries. This is a cache budget, not
+a bound on all process memory or a measured throughput improvement.
+Repeated searches rotate missing-window work independently of cache eviction, so an oversized
+scope does not permanently starve its later windows. Progress metadata is bounded to 128 recent
+route/scope snapshots; an evicted scope restarts its cursor. Coverage still reports vectors absent
+from the current call rather than promising that the entire scope fits in cache.
+
+Source collection uses bounded descriptor reads and rejects final-component symlinks and
+non-regular files. Existing workspace confinement still applies; this does not introduce
+descriptor-relative protection against ancestor replacement. Walker truncation is reported as
+incomplete coverage. Collection/hashing and ranking run outside the shared embedder lock;
+embedding requests remain serialized through that owner.
 
 ## Limits and gaps
 

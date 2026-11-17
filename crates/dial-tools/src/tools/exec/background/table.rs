@@ -42,6 +42,38 @@ const DRAIN_GRACE: Duration = Duration::from_millis(300);
 /// How long [`finish_reader`] waits for a stopped reader to report completion before detaching it.
 const JOIN_WAIT: Duration = Duration::from_millis(500);
 
+/// Bound the dense terminal emulator, including its alternate screen, independently of u16 axes.
+const MAX_TERMINAL_CELLS: u32 = 256 * 1024;
+
+fn validate_terminal_size(rows: u16, cols: u16) -> Result<(), String> {
+    if rows == 0 || cols == 0 || u32::from(rows) * u32::from(cols) > MAX_TERMINAL_CELLS {
+        return Err(format!(
+            "terminal size must have nonzero rows/cols and at most {MAX_TERMINAL_CELLS} cells"
+        ));
+    }
+    Ok(())
+}
+
+/// Actual OS output handles must use the platform's bounded read, not a blocking Windows Read.
+struct OutputPipe<R>(R);
+
+impl<R: Read + crate::platform::io::Pipe> Read for OutputPipe<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        crate::platform::io::read_nonblocking(&mut self.0, buffer)
+    }
+}
+
+fn spawn_pipe_reader<R: Read + crate::platform::io::Pipe + Send + 'static>(
+    pipe: R,
+    terminal: bool,
+    ring: Arc<Mutex<Ring>>,
+    spool: Option<ArtifactSpool>,
+    stop: Arc<AtomicBool>,
+) -> io::Result<JoinHandle<()>> {
+    crate::platform::io::set_nonblocking(&pipe)?;
+    spawn_reader(OutputPipe(pipe), terminal, ring, spool, stop)
+}
+
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -177,16 +209,46 @@ impl Ring {
         Some(text.trim_end_matches([' ', '\n']).to_owned())
     }
 
-    /// Cursor `(row, col)` on the rendered screen; `None` when this ring is not a terminal.
-    pub(super) fn screen_cursor(&self) -> Option<(u16, u16)> {
-        Some(self.screen.as_ref()?.screen().cursor_position())
-    }
-
-    /// Every row of the rendered screen, untrimmed, so the panel can place the cursor on blank rows.
-    pub(super) fn screen_rows(&self) -> Option<Vec<String>> {
+    /// Project the existing emulator without reparsing escape sequences in the frontend.
+    pub(super) fn terminal_view(&self) -> Option<crate::runtime::terminal::Screen> {
+        use crate::runtime::terminal::{Cell, Color, Screen};
         let screen = self.screen.as_ref()?.screen();
-        let (_, cols) = screen.size();
-        Some(screen.rows(0, cols).collect())
+        let color = |value| match value {
+            vt100::Color::Default => Color::Default,
+            vt100::Color::Idx(index) => Color::Indexed(index),
+            vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        };
+        let (rows, cols) = screen.size();
+        Some(Screen {
+            rows: (0..rows)
+                .map(|row| {
+                    (0..cols)
+                        .filter_map(|col| {
+                            let cell = screen.cell(row, col)?;
+                            Some(Cell {
+                                contents: cell.contents(),
+                                width: if cell.is_wide_continuation() {
+                                    0
+                                } else if cell.is_wide() {
+                                    2
+                                } else {
+                                    1
+                                },
+                                foreground: color(cell.fgcolor()),
+                                background: color(cell.bgcolor()),
+                                bold: cell.bold(),
+                                italic: cell.italic(),
+                                underline: cell.underline(),
+                                inverse: cell.inverse(),
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            cursor: (!screen.hide_cursor()).then(|| screen.cursor_position()),
+            bracketed_paste: screen.bracketed_paste(),
+            application_cursor: screen.application_cursor(),
+        })
     }
 
     /// Absolute offset of the oldest retained byte.
@@ -515,6 +577,9 @@ impl Proc {
             rows,
             cols,
         } = attachment;
+        if terminal {
+            validate_terminal_size(rows, cols)?;
+        }
         let spool = ws
             .artifacts()
             .map(|store| store.spool())
@@ -573,13 +638,11 @@ impl Proc {
             })?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(master, true, ring.clone(), spool, stop.clone())
+            let reader = spawn_pipe_reader(master, true, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting PTY output reader: {e}"))?;
             (group, reader, Some(Arc::new(input)))
         } else {
             let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
-            crate::platform::io::set_nonblocking(&reader)
-                .map_err(|e| format!("configuring output pipe: {e}"))?;
             let writer_err = writer
                 .try_clone()
                 .map_err(|e| format!("creating output pipe: {e}"))?;
@@ -598,7 +661,7 @@ impl Proc {
             })?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
+            let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting output reader: {e}"))?;
             (group, reader, input)
         };
@@ -639,7 +702,7 @@ impl Proc {
                 child,
                 terminated: false,
             };
-            let reader = spawn_reader(output, true, ring.clone(), spool, stop.clone())
+            let reader = spawn_pipe_reader(output, true, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting ConPTY output reader: {e}"))?;
             (group, reader, input)
         } else {
@@ -662,7 +725,7 @@ impl Proc {
             })?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
+            let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting output reader: {e}"))?;
             (group, reader, input)
         };
@@ -1143,10 +1206,8 @@ impl Table {
         ring.push(&captured);
         ring.total = captured_total;
         let ring = Arc::new(Mutex::new(ring));
-        crate::platform::io::set_nonblocking(&reader)
-            .map_err(|error| format!("configuring adopted output reader: {error}"))?;
         let stop = Arc::new(AtomicBool::new(false));
-        let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
+        let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())
             .map_err(|error| format!("starting adopted output reader: {error}"))?;
         let pid = group.id();
         wake::watch_exit(pid);
@@ -1369,6 +1430,7 @@ impl Table {
         rows: u16,
         cols: u16,
     ) -> Result<Option<PendingResize>, String> {
+        validate_terminal_size(rows, cols)?;
         self.refresh();
         let index = self
             .position(name)

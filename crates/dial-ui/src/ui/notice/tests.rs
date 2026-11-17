@@ -104,7 +104,7 @@ fn values_commands_and_blocked_lines_are_styled_by_meaning() {
             .style
             .fg
     };
-    assert_eq!(find("Blocked"), theme.fg(Tok::Warning).fg);
+    assert_eq!(find("Blocked"), theme.fg(Tok::Muted).fg);
     assert_eq!(find("30s"), theme.fg(Tok::Text).fg);
     assert_eq!(find("Request timeout"), theme.fg(Tok::Muted).fg);
     assert_eq!(find("true"), theme.fg(Tok::Success).fg);
@@ -232,16 +232,17 @@ fn turn_report_is_compact_until_tools_are_expanded() {
 fn warnings_and_failures_are_cards_in_their_severity_color() {
     let env = Env::new();
     let theme = &env.theme;
-    for (title, tok) in [
-        ("Outstanding work", Tok::Warning),
-        ("Heads up", Tok::Warning),
-        ("Check failed", Tok::Error),
+    for (severity, title, tok) in [
+        (Severity::Warning, "Outstanding work", Tok::Warning),
+        (Severity::Warning, "Heads up", Tok::Warning),
+        (Severity::Error, "Check failed", Tok::Error),
     ] {
-        let card = rows(
+        let card = rows_with_severity(
             title,
             "Blocked: credentials missing\nretry later",
             60,
             &env.ctx(),
+            severity,
         );
         let lines = plain(&card);
         assert!(lines[0].starts_with(theme.sym(Sym::BoxTl)) && lines[0].contains(title));
@@ -250,16 +251,26 @@ fn warnings_and_failures_are_cards_in_their_severity_color() {
         assert!(lines.iter().any(|l| l.contains("credentials missing")));
         assert_eq!(card[0].spans[0].style.fg, theme.fg(tok).fg, "{title}");
         // Narrow terminals keep the labelled rows.
-        let narrow = plain(&rows(title, "retry later", CARD_MIN as u16 - 1, &env.ctx()));
+        let narrow = plain(&rows_with_severity(
+            title,
+            "retry later",
+            CARD_MIN as u16 - 1,
+            &env.ctx(),
+            severity,
+        ));
         assert!(!narrow[0].starts_with(theme.sym(Sym::BoxTl)), "{narrow:?}");
     }
     // Ordinary command results stay quiet.
     let help = plain(&rows("Help", "/review  review changes", 60, &env.ctx()));
     assert!(!help[0].starts_with(theme.sym(Sym::BoxTl)), "{help:?}");
+    for title in ["Error settings", "Failure history", "Warnings disabled"] {
+        let quiet = plain(&rows(title, "No action needed", 60, &env.ctx()));
+        assert!(!quiet[0].starts_with(theme.sym(Sym::BoxTl)), "{quiet:?}");
+    }
 }
 
 #[test]
-fn open_work_notices_read_plainly_and_only_required_work_is_a_warning() {
+fn legacy_open_work_notices_read_plainly_without_guessing_severity() {
     let env = Env::new();
     let theme = &env.theme;
     let optional = plain(&rows(
@@ -283,7 +294,7 @@ fn open_work_notices_read_plainly_and_only_required_work_is_a_warning() {
         &env.ctx(),
     ));
     assert!(
-        required[0].starts_with(theme.sym(Sym::BoxTl)) && required[0].contains("Unfinished work"),
+        !required[0].starts_with(theme.sym(Sym::BoxTl)) && required[0].contains("UNFINISHED WORK"),
         "{required:?}"
     );
     assert!(

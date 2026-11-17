@@ -34,6 +34,19 @@ use crate::ui::theme::ThemeManager;
 use anyhow::Result;
 use crossterm::event::Event;
 
+/// History controls share their command translation across idle and busy panels.
+fn history_command(action: &str) -> Option<String> {
+    if let Some(id) = action.strip_prefix("history-open:") {
+        Some(format!("/search open {id}"))
+    } else {
+        match action {
+            "history-return" => Some("/search back".to_owned()),
+            "history-more" => Some("/search more".to_owned()),
+            _ => None,
+        }
+    }
+}
+
 impl Shell {
     /// Remember a command run from the palette so the next palette offers it first.
     fn remember_palette_command(&mut self, command: &str) {
@@ -103,13 +116,7 @@ impl Shell {
                 continue;
             }
             if let Some(action) = outcome.next.as_deref() {
-                let command = if let Some(id) = action.strip_prefix("history-open:") {
-                    Some(format!("/search open {id}"))
-                } else if action == "history-return" {
-                    Some("/search back".to_owned())
-                } else {
-                    None
-                };
+                let command = history_command(action);
                 if let Some(command) = command {
                     return Ok(match self.command(app, agent, &command)? {
                         Step::Done => carried,
@@ -129,7 +136,11 @@ impl Shell {
                         continue;
                     }
                     Err(error) => {
-                        self.note("Project peers", error);
+                        self.notify(
+                            crate::ui::overlay::inbox::Category::Error,
+                            "Project peers",
+                            error,
+                        );
                         return Ok(carried);
                     }
                 }
@@ -197,7 +208,11 @@ impl Shell {
         self.composer.set_busy_send(fresh.ui.busy_send);
         let themes = ThemeManager::new(&app.layout.user_dir, &fresh.ui, self.dark);
         if let Some(error) = themes.last_error() {
-            self.note("Theme", format!("{error}; keeping last good theme"));
+            self.notify(
+                crate::ui::overlay::inbox::Category::Error,
+                "Theme",
+                format!("{error}; keeping last good theme"),
+            );
         } else {
             self.themes = themes;
         }
@@ -209,8 +224,9 @@ impl Shell {
         };
         let activity_tab = match &which {
             Which::Subagents | Which::SubagentsActivity => Some(ActivityTab::Workers),
-            Which::Jobs => Some(ActivityTab::Processes),
+            Which::Jobs | Which::Job(_) => Some(ActivityTab::Processes),
             Which::Compute => Some(ActivityTab::Compute),
+            Which::ModelDownloads => Some(ActivityTab::Downloads),
             Which::Activity(tab) => Some(*tab),
             _ => None,
         };
@@ -252,10 +268,18 @@ impl Shell {
         let overlay = match which {
             Which::Activity(tab) => {
                 let spec = match tab {
-                    ActivityTab::Queue => queue_choices(&self.composer.queued_messages()),
+                    ActivityTab::Queue => queue_choices(&self.composer.queued_items()),
                     ActivityTab::Schedule => schedule_choices(),
                     ActivityTab::Attention => {
-                        crate::app::overlay::activity::attention_choices(&Default::default(), &[])
+                        let mut spec = crate::app::overlay::activity::attention_choices(
+                            &Default::default(),
+                            &[],
+                        );
+                        spec.summary =
+                            "Loading Attention sources… Missing snapshots are not an all-clear."
+                                .into();
+                        spec.empty_message = spec.summary.clone();
+                        spec
                     }
                     _ => return self.make_overlay(app, tab.destination()),
                 };
@@ -278,6 +302,30 @@ impl Shell {
             }
             Which::Controls => {
                 ActiveOverlay::Palette(PaletteOverlay::choice(self.controls_picker(&effective)))
+            }
+            Which::ToolEvidence => {
+                ActiveOverlay::Palette(PaletteOverlay::choice(self.tool_evidence_picker()))
+            }
+            Which::ToolEvidenceCall(id) => {
+                use crate::ui::{overlay::stats::StatsOverlay, text};
+                let tabs = match self.transcript.retained_tool(&id) {
+                    Some(tool) => {
+                        let mut tabs = vec![
+                            ("Output", text::sanitize(&tool.output)),
+                            ("Arguments", text::sanitize(&tool.input)),
+                            ("Call", text::sanitize(&format!("Call: {}\nTool: {}\nSummary: {}\nState: {}", tool.id, tool.name, tool.summary, tool.state.label()))),
+                        ];
+                        if let Some(progress) = &tool.progress {
+                            tabs.push(("Progress", text::sanitize(progress)));
+                        }
+                        tabs
+                    }
+                    None => vec![("Unavailable", "This tool call is no longer retained in the current conversation. Return to the tool list and select a current call.".into())],
+                };
+                ActiveOverlay::Stats(Box::new(StatsOverlay::new(tabs).with_title(
+                    "Tool evidence",
+                    "Read-only snapshot of one retained tool call. Output is the full retained result, not the collapsed preview. Tab switches output, arguments and call facts; / filters lines; Home/End jump. Esc returns without changing transcript expansion.",
+                )))
             }
             Which::Palette => ActiveOverlay::Palette(
                 PaletteOverlay::new(
@@ -353,8 +401,12 @@ impl Shell {
                 }
                 ActiveOverlay::Peers(Box::new(overlay))
             }
-            Which::Jobs => {
-                ActiveOverlay::Jobs(Box::new(crate::ui::overlay::jobs::JobsOverlay::new()))
+            Which::Jobs | Which::Job(_) => {
+                let mut panel = crate::ui::overlay::jobs::JobsOverlay::new();
+                if let Which::Job(name) = which {
+                    panel.select_when_available(name);
+                }
+                ActiveOverlay::Jobs(Box::new(panel))
             }
             Which::Git { root, revision } => {
                 use crate::ui::overlay::git::{GitOverlay, GitTab};
@@ -506,6 +558,9 @@ impl Shell {
                         .into_shared()
                     })
                     .clone();
+                downloads
+                    .borrow_mut()
+                    .set_in_use(crate::llm::catalog::models_in_use(&effective));
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
                         .with_project_name(
@@ -621,7 +676,8 @@ impl Shell {
             } else if let Some(destination) = outcome.next.as_deref().and_then(overlay_destination)
             {
                 // Editors with drop-flushed drafts must settle before constructing a sibling.
-                let retain = overlay.retains_navigation();
+                let retain =
+                    overlay.retains_navigation(outcome.next.as_deref().unwrap_or_default());
                 if retain {
                     // Keep navigation memory bounded even when a panel links back to itself.
                     if history.len() == 16 {
@@ -848,7 +904,11 @@ impl Shell {
         let previous = returning.then(|| state.history.pop()).flatten();
         let from_palette =
             matches!(&state.overlay, ActiveOverlay::Palette(p) if p.is_action_search());
-        if next_panel.is_some() && state.overlay.retains_navigation() {
+        if next_panel.is_some()
+            && state
+                .overlay
+                .retains_navigation(state.next.as_deref().unwrap_or_default())
+        {
             if state.history.len() == 16 {
                 state.history.remove(0);
             }
@@ -900,6 +960,8 @@ impl Shell {
                 self.remember_palette_command(command);
             }
             return Ok(self.route_busy_command(app, command.to_owned()));
+        } else if let Some(command) = state.next.as_deref().and_then(history_command) {
+            return Ok(self.route_busy_command(app, command));
         } else if let Some(id) = state
             .next
             .as_deref()

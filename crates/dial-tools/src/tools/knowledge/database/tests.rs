@@ -136,6 +136,7 @@ fn source_confinement_and_policy_are_preserved() {
         deny_read: vec![dir.path().join("sample.db")],
         extra_write: vec![],
         allow_network: false,
+        serial_ports: false,
     });
     assert!(call(&ws, "schema", None).is_err());
 }

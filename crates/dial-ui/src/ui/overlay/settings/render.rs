@@ -26,6 +26,58 @@ impl SettingsOverlay {
             return self.bulk_compose(usize::from(w), usize::from(h), ctx);
         }
         let (w, h) = (usize::from(w), usize::from(h));
+        if let Some(id) = &self.setup_armed {
+            if let Some((path, offer)) = self.setup_offers.iter().find(|(_, offer)| &offer.id == id)
+            {
+                let label = crate::config::schema::registry()
+                    .iter()
+                    .find(|def| def.path == path)
+                    .map_or(path.as_str(), |def| def.label);
+                let rows: Vec<_> = offer
+                    .preview
+                    .lines()
+                    .flat_map(|line| text::wrap_words(line, w.max(1)))
+                    .collect();
+                let body = h.saturating_sub(2);
+                self.setup_usable = w >= 20 && h >= 4;
+                self.page = body.max(1);
+                self.setup_scroll = self.setup_scroll.min(rows.len().saturating_sub(body));
+                let mut lines = vec![Line::from(fit(
+                    vec![Span::styled(
+                        format!(" Install {} · {label}", text::one_line(&offer.title)),
+                        ctx.theme.fg(Tok::Accent),
+                    )],
+                    w,
+                ))];
+                lines.extend(
+                    rows.into_iter()
+                        .skip(self.setup_scroll)
+                        .take(body)
+                        .map(Line::from),
+                );
+                lines.resize(h.saturating_sub(1), Line::default());
+                if h > 0 {
+                    lines.push(if self.setup_usable {
+                        super::super::providers::key_footer(
+                            ctx.theme,
+                            &[
+                                (ctx.keys.label(Action::SelectConfirm), "install".into()),
+                                ("Ctrl+L".into(), "install".into()),
+                                ("↑/↓".into(), "scroll".into()),
+                                (ctx.keys.label(Action::SelectCancel), "cancel".into()),
+                            ],
+                            w,
+                        )
+                    } else {
+                        Line::from("Enlarge to confirm; Esc cancels")
+                    });
+                }
+                return lines;
+            }
+            self.setup_armed = None;
+            self.setup_scroll = 0;
+            self.setup_usable = false;
+        }
         let theme = ctx.theme;
         let rows = self.visible();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
@@ -58,18 +110,45 @@ impl SettingsOverlay {
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(h);
         if show_tabs {
-            lines.push(self.tab_bar(theme, w));
+            let bar = self.tab_bar(theme, w);
+            let names: Vec<String> = self
+                .tab_counts()
+                .into_iter()
+                .map(|(name, count)| {
+                    if count == 0 {
+                        name.to_owned()
+                    } else {
+                        format!("{name} {count}")
+                    }
+                })
+                .collect();
+            let mut x = 0;
+            for span in &bar.spans {
+                let cells = text::width(&span.content);
+                if let Some(tab) = names.iter().position(|name| name == span.content.as_ref()) {
+                    self.tab_hits.row(x, lines.len(), cells, tab);
+                }
+                x += cells;
+            }
+            lines.push(bar);
         }
         if show_scope {
+            // The title already names where saves go and the Ctrl+B switch, so this row explains
+            // what the tab numbers are and how to list just those overrides.
+            let saved: usize = self.tab_counts().iter().map(|(_, count)| count).sum();
+            let legend = if saved == 0 {
+                " Nothing saved in this scope yet; tab numbers count saved overrides".to_owned()
+            } else {
+                format!(" {saved} saved in this scope · tab numbers count them")
+            };
             lines.push(Line::from(fit(
                 vec![Span::styled(
                     format!(
-                        " Editing: {} · Ctrl+S scope · Ctrl+O {}",
-                        self.editing_scope_label(),
+                        "{legend} · Ctrl+O {}",
                         if self.changed_only {
                             "all settings"
                         } else {
-                            "changed only"
+                            "only those"
                         }
                     ),
                     theme.fg(Tok::Accent),
@@ -218,17 +297,10 @@ impl SettingsOverlay {
                     items.push(Item::Hint(hint.clone()));
                 }
                 if let Some(offer) = self.setup_offers.get(def.path) {
-                    if self.setup_armed.as_deref() == Some(offer.id.as_str()) {
-                        items.extend(offer.preview.lines().map(|line| Item::Setup {
-                            line: line.to_owned(),
-                            chip: false,
-                        }));
-                    } else {
-                        items.push(Item::Setup {
-                            line: format!("Ctrl+L installs {}", offer.title),
-                            chip: true,
-                        });
-                    }
+                    items.push(Item::Setup {
+                        line: format!("Ctrl+L installs {}", offer.title),
+                        chip: true,
+                    });
                 }
             }
         }
@@ -315,6 +387,11 @@ impl SettingsOverlay {
         for y in 0..body_rows {
             let mut spans: Vec<Span<'static>> = Vec::new();
             let item = items.get(self.scroll + y);
+            if matches!(self.mode, Mode::Browse)
+                && let Some(Item::Row(index)) = item
+            {
+                self.hits.row(0, lines.len(), w, *index);
+            }
             let list_line = match item {
                 None if rows.is_empty() && y == 0 => {
                     let msg = if self.changed_only && self.search.is_empty() {
@@ -912,8 +989,7 @@ impl SettingsOverlay {
                         String::new()
                     },
                     hint(keys, Action::SectionNext, "sections"),
-                    "Ctrl+S scope".to_owned(),
-                    "Ctrl+O changed only".to_owned(),
+                    // Ctrl+B and Ctrl+O are named once, in the title and the scope row.
                     "Alt+Left back".to_owned(),
                     "Del clear override".to_owned(),
                     "Ctrl+Del review removals".to_owned(),

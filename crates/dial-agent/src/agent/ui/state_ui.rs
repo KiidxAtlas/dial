@@ -24,6 +24,13 @@ pub(in crate::agent) struct StateUi<'a> {
     parent: Option<String>,
     prose: Option<Body>,
     reasoning: Option<Body>,
+    // Every prose and reasoning body the current request started, open or already closed by a
+    // later delta. A discarded attempt interrupts all of them, not only the open one.
+    attempt_bodies: Vec<Body>,
+    attempt_arguments: bool,
+    // Foreground surfaces announce a discarded attempt; worker surfaces stay quiet so their
+    // retries never mark rows of the parent conversation as abandoned.
+    announce_retry: bool,
     inference: Option<Body>,
     // Keep the request identity through discard/cancellation until its worker actually finishes.
     timing_body: Option<Body>,
@@ -77,9 +84,17 @@ impl<'a> StateUi<'a> {
             request_timing: Default::default(),
             prose: None,
             reasoning: None,
+            attempt_bodies: Vec::new(),
+            attempt_arguments: false,
+            announce_retry: true,
             tools: Vec::new(),
             registry,
         }
+    }
+    /// Worker surfaces keep retry attempts local: the parent conversation is not told about them.
+    pub fn without_retry_notice(mut self) -> Self {
+        self.announce_retry = false;
+        self
     }
     fn close_prose(&mut self) {
         for body in [self.prose.take(), self.reasoning.take()]
@@ -110,6 +125,27 @@ impl<'a> StateUi<'a> {
             body,
             args: Value::Null,
         });
+    }
+    /// Routes streamed output or a progress snapshot to the row of its call. Calls without an id
+    /// (legacy and internal dispatch) fall back to the newest running row of that tool name.
+    fn route_tool_text(&mut self, call_id: Option<&str>, name: &str, text: &str, progress: bool) {
+        let tool = match call_id.filter(|id| !id.is_empty()) {
+            Some(id) => self
+                .tools
+                .iter()
+                .rev()
+                .find(|tool| tool.call_id.as_deref() == Some(id)),
+            None => self.tools.iter().rev().find(|tool| tool.name == name),
+        };
+        if let Some(tool) = tool {
+            if progress {
+                tool.body.tool_progress(text);
+            } else {
+                tool.body.append(text);
+            }
+            let body = tool.body.clone();
+            self.publish(|ui| ui.result_node(&body));
+        }
     }
     fn settle_tool(&mut self, name: &str, call_id: Option<&str>, output: &ToolOutput) {
         let position = match call_id {
@@ -172,6 +208,22 @@ impl<'a> StateUi<'a> {
             self.publish(|ui| ui.result_node(&body));
         }
     }
+    /// Interrupts every prose and reasoning body the failed attempt produced, including bodies that
+    /// a later delta already closed as completed. Returns whether any of them streamed text.
+    fn discard_attempt_output(&mut self) -> bool {
+        // The open prose and reasoning slots end with the attempt, so the next one starts fresh.
+        self.discard_partial_output();
+        let mut had_output = std::mem::take(&mut self.attempt_arguments);
+        for body in std::mem::take(&mut self.attempt_bodies) {
+            let node = body.snapshot();
+            had_output |= !node.result.text.is_empty();
+            if node.result.phase != Phase::Interrupted {
+                body.settle(node.result.text, node.result.data, Phase::Interrupted);
+                self.publish(|ui| ui.result_node(&body));
+            }
+        }
+        had_output
+    }
     pub fn finish(&mut self, interrupted: bool) {
         self.settle_inference(if interrupted {
             Phase::Interrupted
@@ -222,10 +274,14 @@ impl Ui for StateUi<'_> {
         if self.reasoning.is_some() {
             self.close_prose();
         }
-        let body = self
-            .prose
-            .get_or_insert_with(|| self.tree.start("assistant", "answer", self.parent.clone()))
-            .clone();
+        let body = if let Some(body) = &self.prose {
+            body.clone()
+        } else {
+            let body = self.tree.start("assistant", "answer", self.parent.clone());
+            self.attempt_bodies.push(body.clone());
+            self.prose = Some(body.clone());
+            body
+        };
         body.append(text);
         self.publish(|ui| {
             ui.result_node(&body);
@@ -237,13 +293,16 @@ impl Ui for StateUi<'_> {
         if self.prose.is_some() {
             self.close_prose();
         }
-        let body = self
-            .reasoning
-            .get_or_insert_with(|| {
-                self.tree
-                    .start("reasoning", "reasoning", self.parent.clone())
-            })
-            .clone();
+        let body = if let Some(body) = &self.reasoning {
+            body.clone()
+        } else {
+            let body = self
+                .tree
+                .start("reasoning", "reasoning", self.parent.clone());
+            self.attempt_bodies.push(body.clone());
+            self.reasoning = Some(body.clone());
+            body
+        };
         body.append(text);
         self.publish(|ui| {
             ui.result_node(&body);
@@ -306,12 +365,21 @@ impl Ui for StateUi<'_> {
         self.publish(|ui| ui.tool_presentation(call_id, view));
     }
     fn tool_output(&mut self, name: &str, text: &str) {
-        if let Some(tool) = self.tools.iter().rev().find(|tool| tool.name == name) {
-            tool.body.append(text);
-            let body = tool.body.clone();
-            self.publish(|ui| ui.result_node(&body));
-        }
+        self.route_tool_text(None, name, text, false);
         self.publish(|ui| ui.tool_output(name, text));
+    }
+    fn tool_output_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        self.route_tool_text(Some(call_id), name, text, false);
+        self.publish(|ui| ui.tool_output_with_id(call_id, name, text));
+    }
+    /// Progress is a replacement snapshot, so the body keeps only the latest one per call.
+    fn tool_progress(&mut self, name: &str, text: &str) {
+        self.route_tool_text(None, name, text, true);
+        self.publish(|ui| ui.tool_progress(name, text));
+    }
+    fn tool_progress_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        self.route_tool_text(Some(call_id), name, text, true);
+        self.publish(|ui| ui.tool_progress_with_id(call_id, name, text));
     }
     fn tool_result(&mut self, name: &str, output: &ToolOutput) {
         self.settle_tool(name, None, output);
@@ -320,6 +388,9 @@ impl Ui for StateUi<'_> {
     fn tool_result_with_id(&mut self, call_id: &str, name: &str, output: &ToolOutput) {
         self.settle_tool(name, Some(call_id), output);
         self.publish(|ui| ui.tool_result_with_id(call_id, name, output));
+    }
+    fn owns_attempt_boundary(&self) -> bool {
+        true
     }
     fn notice(&mut self, v: &str) {
         self.inner.notice(v)
@@ -361,6 +432,7 @@ impl Ui for StateUi<'_> {
         self.inner.model_progress(p)
     }
     fn tool_arguments_delta(&mut self, i: u64, id: &str, n: &str, d: &str) {
+        self.attempt_arguments = true;
         self.note_delta();
         self.inner.tool_arguments_delta(i, id, n, d)
     }
@@ -469,6 +541,8 @@ impl Ui for StateUi<'_> {
             // Each model request answers on its own: the previous reply is a finished message,
             // so the next one must not continue it mid-sentence.
             self.close_prose();
+            self.attempt_bodies.clear();
+            self.attempt_arguments = false;
             self.settle_inference(Phase::Completed);
             self.inference = Some(self.tree.start(
                 "inference",
@@ -477,9 +551,18 @@ impl Ui for StateUi<'_> {
             ));
             self.timing_body = self.inference.clone();
         }
-        // Backoff follows a failed attempt whose partial reply the provider discarded.
+        // Backoff follows a failed attempt: its whole reply is discarded, and a foreground surface
+        // gets one typed attempt boundary, emitted only when some of that reply streamed.
         if phase == RequestPhase::Backoff {
-            self.discard_partial_output();
+            let had_output = self.discard_attempt_output();
+            if had_output && self.announce_retry {
+                self.publish(|ui| {
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                        crate::agent::ui::ui_event::EventKind::Retry,
+                        "Provider retry: the partial answer from the failed attempt was discarded; the next attempt starts fresh.",
+                    ))
+                });
+            }
         }
         if let Some(clock) = &mut self.request_clock {
             clock.phase(phase, Instant::now());

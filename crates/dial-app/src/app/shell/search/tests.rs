@@ -18,7 +18,7 @@ fn hit(id: &str) -> SearchHit {
 
 /// A runner that records each query and answers at once with one hit named after it.
 fn recording(calls: Calls) -> Runner {
-    Arc::new(move |_, query| {
+    Arc::new(move |_, query, _| {
         calls.lock().unwrap().push(query.to_owned());
         Ok(vec![hit(query)])
     })
@@ -28,7 +28,7 @@ fn recording(calls: Calls) -> Runner {
 fn gated(calls: Calls) -> (SyncSender<()>, Runner) {
     let (gate_tx, gate_rx) = sync_channel::<()>(4);
     let gate_rx = Mutex::new(gate_rx);
-    let runner: Runner = Arc::new(move |_, query| {
+    let runner: Runner = Arc::new(move |_, query, _| {
         calls.lock().unwrap().push(query.to_owned());
         gate_rx.lock().unwrap().recv().unwrap();
         Ok(vec![hit(query)])
@@ -176,7 +176,7 @@ fn a_request_made_after_the_change_publishes_in_the_new_session() {
 fn a_disconnected_worker_is_reported_as_an_error_not_silence() {
     let (_home, _project, layout, _) = crate::app::tests::config();
     let runner: Runner =
-        Arc::new(|_, _| -> anyhow::Result<Vec<SearchHit>> { panic!("simulated worker crash") });
+        Arc::new(|_, _, _| -> anyhow::Result<Vec<SearchHit>> { panic!("simulated worker crash") });
     let mut search = Search::with_runner(runner);
 
     search.request(&layout, "a", "boom");
@@ -221,10 +221,10 @@ fn search_text_keeps_the_transcript_wording_and_surfaces_errors() {
 fn ready_results_are_discarded_by_new_requests_and_session_changes() {
     let (_home, _project, layout, _) = crate::app::tests::config();
     let mut search = Search::with_runner(recording(Default::default()));
-    search.ready = Some(("old".into(), vec![hit("old")]));
+    search.ready = Some(("old".into(), page(vec![hit("old")])));
     search.request(&layout, "session-a", "new");
     assert!(search.ready.is_none());
-    search.ready = Some(("new".into(), vec![hit("new")]));
+    search.ready = Some(("new".into(), page(vec![hit("new")])));
     search.invalidate();
     assert!(search.ready.is_none());
     search.settle(&layout, "session-a");
@@ -250,4 +250,78 @@ fn returning_to_origin_is_scoped_to_the_project() {
     search.remember_origin("original");
     search.sync(&other_project(&layout), "elsewhere");
     assert_eq!(search.origin(), None);
+}
+
+fn page(hits: Vec<SearchHit>) -> Page {
+    Page {
+        hits,
+        titles: Default::default(),
+        has_more: false,
+        limit: SEARCH_LIMIT,
+    }
+}
+
+#[test]
+fn expanding_window_uses_lookahead_and_preserves_context_invalidation() {
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let runner: Runner =
+        Arc::new(|_, _, limit| Ok((0..limit.min(75)).map(|i| hit(&i.to_string())).collect()));
+    let mut search = Search::with_runner(runner);
+    search.request(&layout, "session", "needle");
+    let first = search
+        .settle(&layout, "session")
+        .pop()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(first.hits.len(), 50);
+    assert!(first.has_more);
+    search.request_window(&layout, "session", "needle", 100);
+    let next = search
+        .settle(&layout, "session")
+        .pop()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(next.hits.len(), 75);
+    assert!(!next.has_more);
+    search.request_window(&layout, "session", "needle", 150);
+    search.invalidate();
+    assert!(search.settle(&layout, "session").is_empty());
+    assert!(search.window.is_none());
+}
+
+#[test]
+fn worker_hydrates_titles_before_publishing_results() {
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let mut session = Session::create(
+        &layout,
+        crate::storage::session::SessionMeta {
+            model: "fixture".into(),
+        },
+    )
+    .unwrap();
+    session
+        .append(serde_json::json!({"role":"user", "content":"A distinctive title"}))
+        .unwrap();
+    let id = session.id().to_owned();
+    let expected = Session::find_prefix(&layout, &id)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .title;
+    assert!(!expected.is_empty());
+    let hit_id = id.clone();
+    let mut search = Search::with_runner(Arc::new(move |_, _, _| {
+        Ok(vec![hit(&hit_id), hit(&hit_id)])
+    }));
+    search.request(&layout, "active", "needle");
+    let page = search
+        .settle(&layout, "active")
+        .pop()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(page.titles.len(), 1);
+    assert_eq!(page.titles.get(&id), Some(&expected));
 }

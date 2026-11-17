@@ -43,7 +43,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "model",
         MO,
         "Configuration",
-        "Model identity",
+        "Model name",
         "Raw model name. The Models panel offers model discovery and role assignment.",
         Kind::Text
     ),
@@ -51,7 +51,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "provider",
         MO,
         "Configuration",
-        "Provider identity",
+        "Provider",
         "Optional provider override; Delete inherits the provider. Use the Providers panel for setup.",
         Kind::Text
     ),

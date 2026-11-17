@@ -2,10 +2,11 @@
 //! and `/ssh`. Each reads or writes `service_tier`, `extended_context`, `model_presets`,
 //! `ssh_hosts` or the usage reporter, and persists through the shared settings path.
 
-use crate::agent::{Agent, plan_with_runner, related_tests_with_runner};
+use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
 use crate::config::settings_store::{self, Change, Scope};
 use crate::config::types::{Config, ModelPreset, SshHostConfig, VerificationCommand};
+use crate::config::working_modes::{TierPlan, fast_plan, set_value, slow_plan};
 use crate::llm::usage_report::{self, Outcome, UsageReport, resolve_used_fraction};
 use anyhow::{Result, anyhow, bail};
 use std::path::PathBuf;
@@ -251,152 +252,6 @@ pub(super) fn run_live(
         _ => return None,
     };
     Some(result)
-}
-
-/// Provider families whose `priority` tier Dial sends (`/fast`).
-const PRIORITY_PROVIDERS: &[&str] = &[
-    "openai",
-    "openai-codex",
-    "chatgpt",
-    "anthropic",
-    "google",
-    "gemini",
-    "google-vertex",
-];
-/// Provider families with OpenAI's `ultrafast` tier.
-const ULTRAFAST_PROVIDERS: &[&str] = &["openai", "openai-codex"];
-/// Provider families with the `flex` tier (`/slow`). Anthropic's low-priority lane is not supported.
-const FLEX_PROVIDERS: &[&str] = &["openai", "openai-codex", "chatgpt", "google", "gemini"];
-
-/// A `/fast` or `/slow` outcome: the note to show and the settings writes it needs.
-struct TierPlan {
-    note: String,
-    changes: Vec<Change>,
-}
-
-fn set_value(path: &str, value: toml::Value) -> Change {
-    Change::Set {
-        path: path.into(),
-        value,
-    }
-}
-
-fn tier_plan(note: impl Into<String>, changes: Vec<Change>) -> TierPlan {
-    TierPlan {
-        note: note.into(),
-        changes,
-    }
-}
-
-/// `/fast` owns `fast_mode` and the explicit `service_tier` fast values; it never touches `slow_mode`.
-fn fast_plan(config: &Config, provider: &str, args: &str) -> Result<TierPlan> {
-    let tier = config.service_tier.as_str();
-    let fast_tier = matches!(tier, "priority" | "ultrafast");
-    let fast_on = config.fast_mode || fast_tier;
-    let status = match tier {
-        "ultrafast" => "ultra",
-        _ if fast_on => "on",
-        _ => "off",
-    };
-    let target = match args.trim() {
-        "status" => return Ok(tier_plan(format!("Fast mode is {status}."), vec![])),
-        "" | "toggle" if fast_on => "off",
-        "" | "toggle" | "on" => "on",
-        "ultra" | "ultrafast" => "ultra",
-        "off" => "off",
-        other => bail!("Usage: /fast [on|ultra|off|status] (got {other:?})"),
-    };
-    match target {
-        "off" => {
-            let mut changes = Vec::new();
-            if config.fast_mode {
-                changes.push(set_value("fast_mode", toml::Value::Boolean(false)));
-            }
-            if fast_tier {
-                changes.push(set_value(
-                    "service_tier",
-                    toml::Value::String("none".into()),
-                ));
-            }
-            Ok(tier_plan("Fast mode disabled.", changes))
-        }
-        "on" => {
-            if !PRIORITY_PROVIDERS.contains(&provider) {
-                return Ok(tier_plan(
-                    "Fast mode is unavailable for the current model.",
-                    vec![],
-                ));
-            }
-            let mut changes = vec![set_value("fast_mode", toml::Value::Boolean(true))];
-            if tier != "none" {
-                changes.push(set_value(
-                    "service_tier",
-                    toml::Value::String("none".into()),
-                ));
-            }
-            Ok(tier_plan("Fast mode enabled.", changes))
-        }
-        _ => {
-            if !ULTRAFAST_PROVIDERS.contains(&provider) {
-                return Ok(tier_plan(
-                    "Ultrafast is unavailable for the current model.",
-                    vec![],
-                ));
-            }
-            Ok(tier_plan(
-                "Ultrafast mode enabled.",
-                vec![set_value(
-                    "service_tier",
-                    toml::Value::String("ultrafast".into()),
-                )],
-            ))
-        }
-    }
-}
-
-/// `/slow` owns `slow_mode` only; it never touches `fast_mode` or `service_tier`.
-fn slow_plan(config: &Config, provider: &str, args: &str) -> Result<TierPlan> {
-    let slow_on = config.slow_mode;
-    let arg = args.trim();
-    match arg {
-        "status" => Ok(tier_plan(
-            if slow_on {
-                "Slow mode is on (flex tier)."
-            } else {
-                "Slow mode is off."
-            },
-            vec![],
-        )),
-        "" | "toggle" | "on" | "off" => {
-            let enable = match arg {
-                "on" => true,
-                "off" => false,
-                _ => !slow_on,
-            };
-            if !enable {
-                let changes = if slow_on {
-                    vec![set_value("slow_mode", toml::Value::Boolean(false))]
-                } else {
-                    vec![]
-                };
-                return Ok(tier_plan("Slow mode off.", changes));
-            }
-            if !FLEX_PROVIDERS.contains(&provider) {
-                return Ok(tier_plan(
-                    format!(
-                        "Slow mode is unavailable for {provider}: Dial implements /slow as the flex tier \
-                         on OpenAI and Google models; Anthropic's subscription low-priority lane is not ported."
-                    ),
-                    vec![],
-                ));
-            }
-            Ok(tier_plan(
-                "Slow mode on: requests use the flex tier (lower cost, higher latency).",
-                vec![set_value("slow_mode", toml::Value::Boolean(true))],
-            ))
-        }
-        other => bail!("Usage: /slow [on|off|status] (got {other:?})"),
-    }
 }
 
 fn apply_tier_plan(
@@ -749,16 +604,34 @@ fn usage_text(outcomes: &[Outcome]) -> String {
 }
 
 fn report_text(report: &UsageReport) -> String {
-    let mut lines = vec![report.provider.clone()];
+    let mut lines = vec![match report.plan() {
+        Some(plan) => format!("{} · {plan}", report.provider),
+        None => report.provider.clone(),
+    }];
     for limit in &report.limits {
-        let window = limit
-            .window
-            .as_ref()
-            .map_or(limit.label.as_str(), |window| window.label.as_str());
+        let label = match &limit.window {
+            Some(window) if window.label != limit.label => {
+                format!("{} · {}", limit.label, window.label)
+            }
+            _ => limit.label.clone(),
+        };
         let used = resolve_used_fraction(limit)
             .map(|used| format!("{:.0}% used", used * 100.0))
-            .unwrap_or_else(|| "usage unknown".to_owned());
-        lines.push(format!("  {window}: {used}"));
+            .unwrap_or_else(|| {
+                if limit.notes.iter().any(|note| note == "Unlimited") {
+                    "Unlimited".to_owned()
+                } else {
+                    "usage unknown".to_owned()
+                }
+            });
+        lines.push(format!("  {label}: {used}"));
+        lines.extend(
+            limit
+                .notes
+                .iter()
+                .filter(|note| note.as_str() != used)
+                .map(|note| format!("    note: {note}")),
+        );
     }
     lines.extend(report.notes.iter().map(|note| format!("  note: {note}")));
     lines.join("\n")
@@ -849,26 +722,11 @@ fn checks(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &st
     match sub {
         "add" => {
             let (name, check) = parse_check_add(rest)?;
-            if app
-                .config
-                .verification
-                .commands
-                .iter()
-                .any(|c| c.name == name)
-            {
-                bail!("check {name} already exists; remove it first.");
-            }
-            let mut commands = project_checks(app)?;
-            commands.push(toml::Value::try_from(&check)?);
-            let step = shell.save(
-                app,
-                agent,
-                &[Change::Set {
-                    path: "verification.commands".into(),
-                    value: toml::Value::Array(commands),
-                }],
-                Scope::Project,
-            )?;
+            // The shared owner refuses a name the saved configuration already has and writes under
+            // the settings locks; `save_with` then applies the result as every settings save does.
+            let step = shell.save_with(app, agent, |app| {
+                app.save_project_checks(|layout| crate::checks::add_project(layout, &check))
+            })?;
             shell.note(TITLE, format!("Added check {name}."));
             Ok(step)
         }
@@ -877,39 +735,14 @@ fn checks(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &st
             if name.is_empty() {
                 bail!("Usage: /checks remove <name>");
             }
-            let mut commands = project_checks(app)?;
-            let before = commands.len();
-            commands.retain(|value| value.get("name").and_then(toml::Value::as_str) != Some(name));
-            if commands.len() == before {
-                bail!(
-                    "no check named {name} in the project config; checks from the user config must be removed from that file"
-                );
-            }
-            let step = shell.save(
-                app,
-                agent,
-                &[Change::Set {
-                    path: "verification.commands".into(),
-                    value: toml::Value::Array(commands),
-                }],
-                Scope::Project,
-            )?;
+            let step = shell.save_with(app, agent, |app| {
+                app.save_project_checks(|layout| crate::checks::remove_project(layout, name))
+            })?;
             shell.note(TITLE, format!("Removed check {name}."));
             Ok(step)
         }
         other => bail!("Unknown /checks subcommand: {other}. {CHECKS_USAGE}"),
     }
-}
-
-/// Existing project-level `verification.commands` entries, read raw so user-level entries are not copied down.
-fn project_checks(app: &App) -> Result<Vec<toml::Value>> {
-    let project = settings_store::load_layer(&app.layout, Scope::Project)?;
-    Ok(project
-        .get("verification")
-        .and_then(|value| value.get("commands"))
-        .and_then(toml::Value::as_array)
-        .cloned()
-        .unwrap_or_default())
 }
 
 /// `<name> [--ext rs,py] [--timeout secs] -- <command>`; the command runs through the shell.
@@ -947,38 +780,13 @@ fn parse_check_add(rest: &str) -> Result<(String, VerificationCommand)> {
             _ => bail!("{USAGE}"),
         }
     }
-    Ok((
-        name.to_owned(),
-        VerificationCommand {
-            name: name.to_owned(),
-            command: command.to_owned(),
-            file_extensions,
-            timeout_secs,
-        },
-    ))
+    let check = VerificationCommand::new(name, command, file_extensions, timeout_secs)?;
+    Ok((check.name.clone(), check))
 }
 
-/// Automatic checks for the uncommitted changes (the same planner that runs after each edit) plus
-/// configured commands.
+/// Automatic checks for the uncommitted changes plus configured commands.
 fn checks_list(config: &Config) -> String {
-    let root = &config.project_root;
-    let changed = changed_files(root);
-    let paths: Vec<PathBuf> = changed.iter().map(PathBuf::from).collect();
-    let python = if config.python.is_file() {
-        config.python.clone()
-    } else {
-        PathBuf::from("python3")
-    };
-    let mut automatic =
-        plan_with_runner(root, &python, &paths, &config.verification.python_command);
-    if config.assistance.enabled && config.assistance.selective_verification {
-        automatic.extend(related_tests_with_runner(
-            root,
-            &python,
-            &paths,
-            &config.verification.python_command,
-        ));
-    }
+    let crate::checks::Plan { changed, automatic } = crate::checks::plan(config);
     let mut lines = Vec::new();
     if !config.verification.enabled {
         lines.push("Automatic checks: off (verification is disabled in the config).".to_owned());
@@ -1017,23 +825,6 @@ fn checks_list(config: &Config) -> String {
         ));
     }
     lines.join("\n")
-}
-
-/// Paths with uncommitted changes in the project, as `git status` reports them. Empty outside Git.
-fn changed_files(root: &std::path::Path) -> Vec<String> {
-    let Ok(stdout) = crate::tools::vcs::git::run_checked(
-        root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-        false,
-    ) else {
-        return Vec::new();
-    };
-    stdout
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim().to_owned())
-        .filter(|path| !path.is_empty())
-        .collect()
 }
 
 /// Without `HOME` there is no `~/.ssh/config` to merge; list only Dial's configured hosts.

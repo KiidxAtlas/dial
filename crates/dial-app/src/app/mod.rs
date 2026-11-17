@@ -41,7 +41,7 @@ pub(crate) use commands::extensions_browser::{
     run_and_save as extensions_run_and_save, snapshot as extensions_snapshot,
 };
 /// Engine owners shared by slash commands and `dial rpc` methods.
-pub(crate) use commands::session::failed_prompt;
+pub(crate) use commands::session::{MoveOutcome, failed_prompt, move_session_checked};
 pub(crate) use commands::workspace::{add_workspace_dir, remove_workspace_dir};
 pub(crate) use display::config_key;
 pub(crate) use print_attachments::{PreparedTurn, prepare_attached_turn};

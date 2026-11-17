@@ -5,6 +5,7 @@ fn dev(allow_network: bool) -> Policy {
         deny_read: vec![PathBuf::from("/home/u/.ssh")],
         extra_write: vec![PathBuf::from("/home/u/.cargo")],
         allow_network,
+        serial_ports: false,
     }
 }
 
@@ -29,6 +30,7 @@ fn dev_with_network_keeps_low_integrity_and_other_policies_use_an_appcontainer()
         deny_read: Vec::new(),
         allow_network: true,
         extra_write: Vec::new(),
+        serial_ports: false,
     };
     assert!(matches!(backend(&strict), Backend::AppContainer(plan) if plan.network));
 }

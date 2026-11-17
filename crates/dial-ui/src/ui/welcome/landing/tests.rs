@@ -14,6 +14,9 @@ fn info() -> WelcomeInfo {
         sandbox: "dev".into(),
         setup_hint: "Ctrl+K to choose one".into(),
         tips: vec![("/".into(), "commands".into())],
+        submit_key: "Enter".into(),
+        actions_key: "F1".into(),
+        dismiss_key: "Esc".into(),
         ..Default::default()
     }
 }
@@ -93,7 +96,7 @@ fn resting_home_has_no_metadata_stack_and_offers_starters_where_room_allows() {
     let hint = text.find("Enter send").expect("key hint");
     assert!(hint < text.find(STARTERS[0]).unwrap(), "{text}");
     assert!(
-        !text.contains("browse"),
+        !text.contains("↓ suggestions"),
         "the list is already shown: {text}"
     );
     assert!(content_width(120) <= 56);
@@ -101,6 +104,37 @@ fn resting_home_has_no_metadata_stack_and_offers_starters_where_room_allows() {
         text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
         "the braille knob lockup fills a tall window: {text}"
     );
+}
+
+#[test]
+fn wide_menu_rows_center_at_the_menu_measure_and_the_input_keeps_its_place() {
+    let theme = Theme::dark();
+    let input = |rows: Vec<Line<'static>>| ComposerView {
+        rows,
+        cursor: (1, 2),
+    };
+    let menu = Line::from("m".repeat(menu_width(120) as usize));
+    let view = View {
+        wide_lead: 1,
+        ..View::default()
+    };
+    let wide = frame(
+        &info(),
+        120,
+        40,
+        &theme,
+        view,
+        input(vec![menu, Line::from("draft")]),
+        vec![],
+    );
+    let plain_rows = plain(&wide.rows);
+    let menu_row = plain_rows.iter().find(|r| r.contains("mmm")).unwrap();
+    assert!(text::width(menu_row) <= 120, "{menu_row}");
+    assert!(menu_width(120) > content_width(120));
+    let draft = plain_rows.iter().find(|r| r.contains("draft")).unwrap();
+    let inset = (120 - content_width(120) as usize) / 2;
+    assert_eq!(draft.find("draft"), Some(inset), "{draft}");
+    assert_eq!(wide.cursor.1 as usize, inset + 2);
 }
 
 #[test]
@@ -120,11 +154,11 @@ fn starters_yield_to_first_run_steps_and_short_windows() {
         text.contains("first steps") && !text.contains(STARTERS[0]),
         "{text}"
     );
-    // Short: the hint row alone, still offering to browse the list.
+    // Short: the hint row alone, still offering to browse the list it had to hide.
     let short = render(&info(), 16);
     assert!(!short.contains(STARTERS[0]), "{short}");
     assert!(
-        short.contains("Enter send") && short.contains("browse"),
+        short.contains("Enter send") && short.contains("↓ suggestions"),
         "{short}"
     );
 }
@@ -295,7 +329,7 @@ fn resizing_keeps_input_and_selected_actions_visible_without_overflow() {
             if width >= 38 {
                 let plain = plain(&view.rows).join("\n");
                 assert!(plain.contains(STARTERS[2]), "{width}x{height}: {plain}");
-                assert!(plain.contains("sandbox") && plain.contains("off"));
+                assert!(plain.contains("no sandbox"), "{width}x{height}: {plain}");
             }
         }
     }
@@ -455,4 +489,78 @@ fn the_home_names_the_approval_mode_and_the_key_that_changes_it() {
     // Without a bound key the hint row stays as it was.
     let text = draw(&info());
     assert!(!text.contains("mode:"), "{text}");
+    // Cycling never moves the centered row: every mode name takes the same width.
+    let position = |approval: &str| {
+        let mut info = with_key.clone();
+        info.approval = approval.into();
+        let text = draw(&info);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Enter send"))
+            .unwrap()
+            .to_owned();
+        line.find("Enter send").unwrap()
+    };
+    assert_eq!(position("ask"), position("write"));
+    assert_eq!(position("readonly"), position("auto"));
+}
+
+#[test]
+fn safety_warnings_name_the_risk_only_when_commands_run_unasked() {
+    assert!(safety_notice("auto", "off").unwrap().contains("no sandbox"));
+    assert!(
+        safety_notice("auto", "dev")
+            .unwrap()
+            .starts_with("Full auto")
+    );
+    assert!(
+        safety_notice("write", "off")
+            .unwrap()
+            .starts_with("No sandbox")
+    );
+    // Ask first and Read-only never run a command the user did not approve.
+    assert_eq!(safety_notice("ask", "off"), None);
+    assert_eq!(safety_notice("readonly", "off"), None);
+    assert_eq!(safety_notice("write", "dev"), None);
+}
+
+#[test]
+fn launch_hints_follow_remapped_and_unbound_actions() {
+    use crate::ui::keys::Action;
+    for bound in [true, false] {
+        let mut keys = Keymap::defaults();
+        for (action, chord) in [
+            (Action::Submit, "F10"),
+            (Action::CommandPalette, "F11"),
+            (Action::Dismiss, "F12"),
+        ] {
+            let chords = [chord];
+            keys.rebind(action, if bound { &chords } else { &[] })
+                .unwrap();
+        }
+        let mut info = info();
+        info.tour = true;
+        info.submit_key = keys.label(Action::Submit);
+        info.actions_key = keys.label(Action::CommandPalette);
+        info.dismiss_key = keys.label(Action::Dismiss);
+        let rendered = frame(
+            &info,
+            120,
+            40,
+            &Theme::dark(),
+            View::default(),
+            ComposerView {
+                rows: vec![Line::from("draft")],
+                cursor: (0, 0),
+            },
+            vec![],
+        );
+        let text = plain(&rendered.rows).join("\n");
+        for stale in ["Enter send", "F1 opens", "Esc dismisses"] {
+            assert!(!text.contains(stale), "{text}");
+        }
+        for hint in ["F10 send", "F11 opens actions", "F12 dismisses"] {
+            assert_eq!(text.contains(hint), bound, "{hint}: {text}");
+        }
+    }
 }

@@ -179,6 +179,28 @@ fn identity_and_profile_fields_extract() {
 }
 
 #[test]
+fn profile_names_the_claude_plan() {
+    let plan = |profile| profile_plan(&profile);
+    assert_eq!(
+        plan(json!({"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}})).as_deref(),
+        Some("Max 20x")
+    );
+    assert_eq!(
+        plan(json!({"organization":{"organization_type":"claude_pro","rate_limit_tier":"default_claude_ai"}})).as_deref(),
+        Some("Pro")
+    );
+    assert_eq!(
+        plan(json!({"account":{"has_claude_max":true,"has_claude_pro":false}})).as_deref(),
+        Some("Max")
+    );
+    assert_eq!(
+        plan(json!({"account":{"has_claude_pro":true}})).as_deref(),
+        Some("Pro")
+    );
+    assert_eq!(plan(json!({"uuid":"u-1"})), None);
+}
+
+#[test]
 fn fetch_without_credentials_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));

@@ -219,7 +219,7 @@ fn fenced_code_has_a_gutter_and_plain_language_label() {
     let rows = md("```rust\nlet x = 1;\n```", 20);
     let text = plain(&rows);
     let bar = theme().sym(Sym::CodeBar).to_owned();
-    assert_eq!(text, [format!("{bar} RUST"), format!("{bar} let x = 1;")]);
+    assert_eq!(text, [format!("{bar} rust"), format!("{bar} let x = 1;")]);
     assert!(
         rows.iter()
             .all(|l| l.spans.iter().all(|s| s.style.bg.is_none()))
@@ -589,7 +589,7 @@ fn ascii_mode_frames_diagrams_with_ascii_glyphs() {
 fn other_fences_keep_their_language_label_with_extra_info() {
     let text = plain(&md("```rust,ignore title\nlet x = 1;\n```", 30));
     let bar = theme().sym(Sym::CodeBar).to_owned();
-    assert_eq!(text[0], format!("{bar} RUST"));
+    assert_eq!(text[0], format!("{bar} rust"));
 }
 
 #[test]

@@ -14,10 +14,11 @@
 
 use crate::platform::{fs as platform_fs, process, procinfo::ProcId};
 use anyhow::{Context, Result, bail, ensure};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const LOCK_FILE: &str = "lock";
@@ -25,7 +26,15 @@ const SERVER_FILE: &str = "server.json";
 const LEASES: &str = "leases";
 /// Output of the server Dial started, for diagnosing a failed start.
 pub const LOG_FILE: &str = "serve.log";
+/// Interval between readiness probes while a started server comes up.
 const POLL: Duration = Duration::from_millis(200);
+/// Interval between attempts to take the state lock while another process holds it.
+const LOCK_POLL: Duration = Duration::from_millis(20);
+/// Longest a single readiness probe may take, so a probe never outlives the caller's deadline by much.
+const PROBE: Duration = Duration::from_secs(1);
+/// Shortest probe timeout. A probe that starts just before the deadline may run this long past it:
+/// the bound on how far an [`ensure_until`] call can overrun its deadline, besides the lock poll.
+pub const MIN_PROBE: Duration = Duration::from_millis(100);
 
 /// State directories this process holds a lease in, released by [`shutdown`].
 static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -40,6 +49,19 @@ pub enum Ready {
     /// A server Dial started is still coming up after the wait.
     Starting,
 }
+
+/// An Ollama start interrupted by its caller's cancellation. It is not a failed start: nothing is
+/// recorded as broken, so the next caller may try again at once.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the Ollama start was cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// The loopback `host:port` of an `http://` Ollama base URL, or `None` for any other address.
 /// Only a server on this machine is started.
@@ -71,7 +93,8 @@ pub fn state_dir(user_dir: &Path, host: &str, port: u16) -> PathBuf {
 
 /// What the lifecycle needs from the outside world; tests substitute it.
 pub(crate) trait Host {
-    fn reachable(&self) -> bool;
+    /// Whether the server answers within `timeout`.
+    fn reachable(&self, timeout: Duration) -> bool;
     /// Launches the server and returns its identity.
     fn spawn(&self, dir: &Path) -> Result<ProcId>;
 }
@@ -83,9 +106,9 @@ struct RealHost {
 }
 
 impl Host for RealHost {
-    fn reachable(&self) -> bool {
+    fn reachable(&self, timeout: Duration) -> bool {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(1)))
+            .timeout_global(Some(timeout))
             .http_status_as_error(false)
             .build()
             .into();
@@ -144,6 +167,23 @@ pub fn ensure(
     program: Option<&Path>,
     wait: Duration,
 ) -> Result<Ready> {
+    ensure_until(user_dir, base_url, program, Instant::now() + wait, None)
+}
+
+/// [`ensure`] bounded by an absolute `deadline` and an optional `cancel` flag. Every nested step
+/// (waiting for the state lock, probing, spawning, polling for readiness) honours both. A deadline
+/// that has passed before the state lock is taken returns [`Ready::Starting`] without taking the
+/// lock, recording a lease or spawning; a deadline passing later, while the server is still coming
+/// up, also returns `Starting`. A set `cancel` returns [`Cancelled`] at the next check, and a
+/// cancelled or failed call drops its own lease, so it does not keep the server up. The call can
+/// finish up to one readiness probe ([`MIN_PROBE`] at least) after `deadline`.
+pub fn ensure_until(
+    user_dir: &Path,
+    base_url: &str,
+    program: Option<&Path>,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Result<Ready> {
     let (host, port) = local_address(base_url)
         .with_context(|| format!("Dial starts Ollama only on this machine, not at {base_url}"))?;
     let dir = state_dir(user_dir, &host, port);
@@ -153,7 +193,7 @@ pub fn ensure(
         port,
         program: program.map(Path::to_path_buf),
     };
-    let ready = ensure_with(&dir, me, &host, wait)?;
+    let ready = ensure_with(&dir, me, &host, deadline, cancel)?;
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     if !held.contains(&dir) {
         held.push(dir);
@@ -173,15 +213,64 @@ pub fn shutdown() {
     }
 }
 
-fn lock(dir: &Path) -> Result<File> {
+fn open_lock(dir: &Path) -> Result<File> {
     fs::create_dir_all(dir.join(LEASES)).with_context(|| format!("creating {}", dir.display()))?;
-    let file = platform_fs::open_owner_only(
+    platform_fs::open_owner_only(
         OpenOptions::new().create(true).write(true),
         &dir.join(LOCK_FILE),
     )
-    .context("opening the Ollama server lock")?;
+    .context("opening the Ollama server lock")
+}
+
+/// Takes the state lock, waiting unboundedly. Used only where no caller deadline applies.
+fn lock(dir: &Path) -> Result<File> {
+    let file = open_lock(dir)?;
     file.lock().context("locking the Ollama server state")?;
     Ok(file)
+}
+
+/// Takes the state lock before `deadline`, or `Ok(None)` when another process still holds it
+/// then. A set `cancel` stops the wait with [`Cancelled`].
+fn lock_until(dir: &Path, deadline: Instant, cancel: Option<&AtomicBool>) -> Result<Option<File>> {
+    let mut file = None;
+    loop {
+        // Cancellation and the deadline are checked before every attempt, so neither a pre-set
+        // flag nor an expired deadline ever takes the lock.
+        check_cancel(cancel)?;
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let opened = match file.take() {
+            Some(opened) => opened,
+            None => open_lock(dir)?,
+        };
+        match opened.try_lock() {
+            Ok(()) => return Ok(Some(opened)),
+            Err(TryLockError::WouldBlock) => file = Some(opened),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("locking the Ollama server state");
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(LOCK_POLL.min(deadline - now));
+    }
+}
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(anyhow::Error::new(Cancelled));
+    }
+    Ok(())
+}
+
+/// How long one readiness probe may run before `deadline`.
+fn probe_timeout(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .clamp(MIN_PROBE, PROBE)
 }
 
 fn lease_path(dir: &Path, client: ProcId) -> PathBuf {
@@ -211,21 +300,47 @@ fn live_leases(dir: &Path) -> Result<Vec<ProcId>> {
     Ok(live)
 }
 
+/// The lifecycle behind [`ensure_until`]. The state lock covers only the decision and its records
+/// (lease, server record, at most one spawn); readiness is polled without it so other clients are
+/// never queued behind a slow start.
 pub(crate) fn ensure_with(
     dir: &Path,
     me: ProcId,
     host: &dyn Host,
-    wait: Duration,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Ready> {
-    let _lock = lock(dir)?;
+    let result = claim_and_wait(dir, me, host, deadline, cancel);
+    if result.is_err() {
+        // A caller that fails or is cancelled does not keep the server alive for itself.
+        let _ = fs::remove_file(lease_path(dir, me));
+    }
+    result
+}
+
+fn claim_and_wait(
+    dir: &Path,
+    me: ProcId,
+    host: &dyn Host,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Result<Ready> {
+    let Some(lock) = lock_until(dir, deadline, cancel)? else {
+        // Another process holds the state and may be starting the server, or the deadline passed
+        // first: either way this call does not wait past its deadline.
+        return Ok(Ready::Starting);
+    };
     fs::write(lease_path(dir, me), serde_json::to_vec(&me)?)
         .context("recording the Ollama server lease")?;
-    if host.reachable() {
+    if host.reachable(probe_timeout(deadline)) {
         return Ok(Ready::Running);
     }
+    check_cancel(cancel)?;
     let server = match read_server(dir).filter(ProcId::alive) {
         // Another Dial process started it and it is still coming up: wait for it, never spawn twice.
         Some(server) => server,
+        // A spawn is not started once the deadline has passed; the lease stays for a later call.
+        None if Instant::now() >= deadline => return Ok(Ready::Starting),
         None => {
             let server = host.spawn(dir)?;
             fs::write(dir.join(SERVER_FILE), serde_json::to_vec(&server)?)
@@ -233,9 +348,9 @@ pub(crate) fn ensure_with(
             server
         }
     };
-    let deadline = Instant::now() + wait;
+    drop(lock);
     loop {
-        if host.reachable() {
+        if host.reachable(probe_timeout(deadline)) {
             return Ok(Ready::Started);
         }
         ensure!(
@@ -243,10 +358,12 @@ pub(crate) fn ensure_with(
             "`ollama serve` exited during startup; see {}",
             dir.join(LOG_FILE).display()
         );
-        if Instant::now() >= deadline {
+        check_cancel(cancel)?;
+        let now = Instant::now();
+        if now >= deadline {
             return Ok(Ready::Starting);
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(POLL.min(deadline - now));
     }
 }
 

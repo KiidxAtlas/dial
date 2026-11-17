@@ -416,8 +416,8 @@ impl Drop for WorkerExit {
             return;
         }
         let value = json!({"id":self.id,"status":"failed","steps":0,"result":WORKER_LOST});
-        settle_result(&self.control.body, &value);
         self.team.retire(&self.id, "failed");
+        settle_result(&self.control.body, &value);
         self.control.finished.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Event::Done(self.id.clone(), value));
         crate::platform::wake::signal();
@@ -1486,10 +1486,11 @@ impl LiveTasks {
                             value["transcript_error"] = json!(format!("{error:#}"));
                         }
                 }
+                // Once terminal status is visible, new messages must be refused.
+                team.retire(&done_id, value["status"].as_str().unwrap_or("finished"));
                 settle_result(&control.body, &value);
                 drop(_lease);
                 exit.reported = true;
-                team.retire(&done_id, value["status"].as_str().unwrap_or("finished"));
                 control.finished.store(true, Ordering::SeqCst);
                 let _ = tx.send(Event::Done(done_id, value));
                 crate::platform::wake::signal();

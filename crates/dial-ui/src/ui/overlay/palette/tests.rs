@@ -812,6 +812,8 @@ fn todo_tabs_preserve_plan_selection_and_never_execute_progress() {
             OverlayEvent::None
         ));
         if palette.progress_tab {
+            draw_in(&mut palette, Rect::new(0, 0, 80, 24));
+            assert!(palette.list_bounds.is_none());
             assert!(
                 text_lines(&mut palette)
                     .iter()
@@ -847,4 +849,45 @@ fn palette_search_and_arguments_follow_remapped_editing_keys() {
     palette.handle(&Event::Paste("some args".into()), &keys);
     palette.handle(&plain(KeyCode::F(7)), &keys);
     assert_eq!(palette.arguments.as_ref().unwrap().1.text, "");
+}
+
+#[test]
+fn action_panel_keeps_controls_near_the_goals_on_tall_screens() {
+    for area in [Rect::new(0, 0, 100, 50), Rect::new(7, 5, 80, 40)] {
+        let mut palette = PaletteOverlay::new(entries(), false);
+        let buffer = draw_in(&mut palette, area);
+        let footer = (area.y..area.bottom())
+            .find(|&y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Esc")
+            })
+            .expect("visible controls");
+        assert!(footer < area.y + 18, "controls at {footer} in {area:?}");
+        let bounds = palette.list_bounds.unwrap();
+        assert_eq!(bounds.y, area.y + 3);
+        assert_eq!(bounds.height, 5);
+        assert!(matches!(
+            palette.click(bounds.x, bounds.y),
+            OverlayEvent::None
+        ));
+        assert_eq!(palette.view, View::Goal(0));
+    }
+}
+
+#[test]
+fn help_sheet_clears_the_underlying_action_hit_targets() {
+    let mut palette = PaletteOverlay::new(entries(), false);
+    let area = Rect::new(0, 0, 100, 40);
+    draw_in(&mut palette, area);
+    let bounds = palette.list_bounds.unwrap();
+    palette.handle(&plain(KeyCode::F(1)), &Keymap::defaults());
+    draw_in(&mut palette, area);
+    assert!(palette.list_bounds.is_none());
+    assert!(matches!(
+        palette.click(bounds.x, bounds.y),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.view, View::Goals);
 }

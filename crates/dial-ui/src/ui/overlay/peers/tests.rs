@@ -324,3 +324,32 @@ fn selection_scrolls_into_view_and_narrow_ascii_panels_stay_ascii() {
         "{screen}"
     );
 }
+
+#[test]
+fn page_scroll_reaches_all_claims_without_changing_recipient() {
+    let rig = Rig::new();
+    let mut view = board();
+    view.peers[0].claims = (0..40)
+        .map(|i| claim(&format!("claim-{i:02}"), false))
+        .collect();
+    let mut overlay = PeersOverlay::new(view);
+    let first = shown(&mut overlay, &rig, 40, 12);
+    for _ in 0..8 {
+        overlay.handle(&key(KeyCode::PageDown), &rig.keys);
+    }
+    let last = shown(&mut overlay, &rig, 40, 12);
+    assert_ne!(first, last);
+    assert_eq!(overlay.selected(), Some(PEER_A));
+    assert!(last.contains("bbbbbbbb"), "{last}");
+}
+
+#[test]
+fn mouse_selects_peer_without_composing() {
+    let rig = Rig::new();
+    let mut o = PeersOverlay::new(board());
+    let screen = shown(&mut o, &rig, 90, 24);
+    let (x, y) = super::super::settings::testkit::position(&screen, "bbbbbbbb");
+    assert!(matches!(o.click(x, y), OverlayEvent::None));
+    assert_eq!(o.selected(), Some(PEER_B));
+    assert!(o.compose.is_none());
+}

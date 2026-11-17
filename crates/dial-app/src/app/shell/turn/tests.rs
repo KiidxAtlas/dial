@@ -59,3 +59,20 @@ fn unsent_message_returns_to_the_composer_ahead_of_new_typing() {
     shell.restore_unsent("fix the bug", false);
     assert_eq!(shell.composer.draft(), "fix the bug\n\nand add a test");
 }
+
+#[test]
+fn a_finished_foreground_turn_does_not_leave_an_unread_inbox_notice() {
+    use crate::agent::TurnOutcome;
+    assert!(turn_shown_on_screen(TurnOutcome::Answered, false));
+    assert!(turn_shown_on_screen(TurnOutcome::Answered, true));
+    assert!(turn_shown_on_screen(TurnOutcome::Completed, false));
+    // Away from the terminal, completed work waits in the inbox for the return digest.
+    assert!(!turn_shown_on_screen(TurnOutcome::Completed, true));
+    for outcome in [
+        TurnOutcome::Failed,
+        TurnOutcome::NeedsInput,
+        TurnOutcome::Interrupted,
+    ] {
+        assert!(!turn_shown_on_screen(outcome, false), "{outcome:?}");
+    }
+}

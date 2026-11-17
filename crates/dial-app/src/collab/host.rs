@@ -150,6 +150,8 @@ fn publish_entries(
 }
 
 pub struct Host {
+    /// Public room identifier, used internally to bind a frontend's lifecycle to this instance.
+    room_id: String,
     socket: Socket,
     link: String,
     /// `None` for a read-only room: no link carries a write token, so no peer can be granted write.
@@ -218,6 +220,7 @@ impl Host {
             .map(|message| Arc::from(bounded_json(message)))
             .collect();
         Ok(Self {
+            room_id,
             socket,
             link,
             write_token,
@@ -231,6 +234,10 @@ impl Host {
         })
     }
 
+    pub(crate) fn room_id(&self) -> &str {
+        &self.room_id
+    }
+
     pub fn link(&self) -> &str {
         &self.link
     }
@@ -241,6 +248,14 @@ impl Host {
 
     pub fn guest_count(&self) -> usize {
         self.guests.len()
+    }
+
+    /// Admitted peer identities and write grants, excluding transport challenges and keys.
+    pub fn peers(&self) -> Vec<Value> {
+        self.guests
+            .iter()
+            .map(|(id, guest)| json!({"id": id, "name": guest.name, "writable": guest.writable}))
+            .collect()
     }
 
     /// Append messages archived since the last publish and broadcast them to every peer. A rewind
@@ -293,6 +308,18 @@ impl Host {
     /// Drain guest requests for the host agent, in arrival order.
     pub fn take_steering(&mut self) -> Vec<Steer> {
         std::mem::take(&mut self.steering)
+    }
+
+    /// Take one pending prompt without losing prompts behind it or consuming a pending abort.
+    pub(crate) fn take_prompt(&mut self) -> Option<String> {
+        let index = self
+            .steering
+            .iter()
+            .position(|action| matches!(action, Steer::Prompt(_)))?;
+        match self.steering.remove(index) {
+            Steer::Prompt(text) => Some(text),
+            Steer::Abort => unreachable!("selected a prompt"),
+        }
     }
 
     /// Drain queued guest aborts for the running turn. Prompts stay queued for the main loop.

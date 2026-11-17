@@ -215,6 +215,7 @@ sandbox.allow_network
 sandbox.extra_write
 sandbox.network_allow
 sandbox.network_deny
+sandbox.serial_ports
 shell.backend
 worktree.clean_source
 commit.cache_enabled

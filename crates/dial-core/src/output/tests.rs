@@ -161,3 +161,85 @@ fn only_a_closed_reader_counts_as_a_closed_stdout_panic() {
         "Broken pipe while talking to a child"
     ));
 }
+
+#[test]
+fn continuous_spooling_reuses_delivered_storage() {
+    // Drive the writer's chunk/ack boundary deterministically: keep a persistent backlog
+    // while delivering many times the disk budget, without timing a pipe reader.
+    let limit = READ_CHUNK * 3;
+    let pipe = Pipe {
+        state: Mutex::new(State::default()),
+        publication: Mutex::new(()),
+        wake: Condvar::new(),
+        idle: Condvar::new(),
+        memory_limit: 1,
+        spool_limit: limit,
+    };
+    pipe.enqueue(vec![0]).unwrap();
+    pipe.enqueue(vec![1; READ_CHUNK as usize]).unwrap();
+    pipe.enqueue(vec![2; READ_CHUNK as usize]).unwrap();
+    assert!(matches!(pipe.next_chunk(), Some(Chunk::Memory(bytes)) if bytes == [0]));
+    for expected in 1..=20u8 {
+        let Some(Chunk::Spool { file, start, end }) = pipe.next_chunk() else {
+            panic!("persistent backlog disappeared at chunk {expected}");
+        };
+        let mut bytes = vec![0; (end - start) as usize];
+        spool_read(&file, &mut bytes, start % limit).unwrap();
+        assert_eq!(bytes, vec![expected; READ_CHUNK as usize]);
+        pipe.lock().spool.as_mut().unwrap().read = end;
+        pipe.enqueue(vec![expected + 2; READ_CHUNK as usize])
+            .expect("delivered bytes must release spool capacity");
+        assert!(file.metadata().unwrap().len() <= limit);
+    }
+    assert!(pipe.lock().failure.is_none());
+}
+
+#[test]
+fn spool_wrap_preserves_in_flight_and_unread_bytes() {
+    let pipe = Pipe {
+        state: Mutex::new(State::default()),
+        publication: Mutex::new(()),
+        wake: Condvar::new(),
+        idle: Condvar::new(),
+        memory_limit: 1,
+        spool_limit: 8,
+    };
+    pipe.enqueue(b"a".to_vec()).unwrap();
+    pipe.enqueue(b"bcdefg".to_vec()).unwrap();
+    assert!(matches!(pipe.next_chunk(), Some(Chunk::Memory(_))));
+    let Some(Chunk::Spool { file, start, end }) = pipe.next_chunk() else {
+        panic!("expected first spool chunk");
+    };
+    // Fill remaining capacity while the writer holds an unacknowledged chunk.
+    pipe.enqueue(b"hi".to_vec()).unwrap();
+    let mut bytes = vec![0; (end - start) as usize];
+    spool_read(&file, &mut bytes, start).unwrap();
+    assert_eq!(bytes, b"bcdefg");
+    pipe.lock().spool.as_mut().unwrap().read = end;
+    pipe.enqueue(b"jklmn".to_vec()).unwrap();
+    let mut delivered = Vec::new();
+    while delivered.len() < 7 {
+        let Some(Chunk::Spool { file, start, end }) = pipe.next_chunk() else {
+            panic!("expected wrapped spool chunk");
+        };
+        let mut bytes = vec![0; (end - start) as usize];
+        spool_read(&file, &mut bytes, start % 8).unwrap();
+        delivered.extend(bytes);
+        pipe.lock().spool.as_mut().unwrap().read = end;
+    }
+    assert_eq!(delivered, b"hijklmn");
+    // Reuse space at an unaligned offset, splitting a single enqueue across the end.
+    pipe.enqueue(b"opqrst".to_vec()).unwrap();
+    let mut delivered = Vec::new();
+    while delivered.len() < 6 {
+        let Some(Chunk::Spool { file, start, end }) = pipe.next_chunk() else {
+            panic!("expected split-write spool chunk");
+        };
+        let mut bytes = vec![0; (end - start) as usize];
+        spool_read(&file, &mut bytes, start % 8).unwrap();
+        delivered.extend(bytes);
+        pipe.lock().spool.as_mut().unwrap().read = end;
+    }
+    assert_eq!(delivered, b"opqrst");
+    assert_eq!(file.metadata().unwrap().len(), 8);
+}

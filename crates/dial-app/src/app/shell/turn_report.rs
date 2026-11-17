@@ -359,7 +359,8 @@ fn obligations_missing(evidence: &Value) -> bool {
 }
 
 /// Observed wall-clock request timing; loading, prompt processing and retry backoff appear only
-/// when measured. Zero or missing values are omitted.
+/// when measured. Zero or missing values are omitted. It is labelled model time because it covers
+/// model requests only, not tool runs or time spent at prompts, so it never reads as the turn total.
 fn timing_line(latency: &Value) -> Option<String> {
     let positive = |key: &str| latency[key].as_u64().filter(|value| *value > 0);
     let phases: Vec<String> = [
@@ -379,7 +380,7 @@ fn timing_line(latency: &Value) -> Option<String> {
         .filter(|count| *count > 1)
         .map(|count| format!(" over {count} requests"))
         .unwrap_or_default();
-    Some(format!("Timing: {}{requests}", phases.join(", ")))
+    Some(format!("Model time: {}{requests}", phases.join(", ")))
 }
 
 fn duration(ms: u64) -> String {

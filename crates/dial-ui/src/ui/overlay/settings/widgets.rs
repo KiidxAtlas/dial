@@ -290,27 +290,23 @@ pub(in crate::ui::overlay) fn scope_caption(
     project: &str,
     max_cells: usize,
 ) -> String {
-    let full = format!(
-        "scope: {}{} · {} · Ctrl+S switch",
-        scope_name(scope),
-        if scope == Scope::Project {
-            format!(" ({project})")
-        } else {
-            String::new()
-        },
-        if scope == Scope::Global {
-            format!("project ({project})")
-        } else {
-            "global".into()
-        }
-    );
-    if crate::ui::text::width(&full) <= max_cells {
+    let destination = match scope {
+        Scope::Global => "All projects".to_owned(),
+        Scope::Project => format!("This project ({project})"),
+    };
+    let caption = format!("Save to: {destination}");
+    let alternative = match scope {
+        Scope::Global => format!("This project ({project})"),
+        Scope::Project => "All projects".to_owned(),
+    };
+    let full = format!("{caption} · Ctrl+B: {alternative}");
+    let compact = format!("{caption} · Ctrl+B");
+    if text::width(&full) <= max_cells {
         full
+    } else if text::width(&compact) <= max_cells {
+        compact
     } else {
-        crate::ui::text::clip(
-            &format!("scope: {} ({project})", scope_name(scope)),
-            max_cells,
-        )
+        text::clip(&caption, max_cells)
     }
 }
 
@@ -408,7 +404,8 @@ pub(in crate::ui::overlay) fn tab_strip(
     for (i, name) in names.iter().enumerate().skip(start) {
         let sep = if i > start { gap } else { 0 };
         let hidden = names.len() - i;
-        let more_label = format!("{mark}{hidden}");
+        // Spelled out: a bare `…2` reads like the override count other tabs carry.
+        let more_label = format!("+{hidden} more");
         let reserve = if i + 1 < names.len() {
             gap + text::width(&more_label)
         } else {
@@ -432,3 +429,6 @@ pub(in crate::ui::overlay) fn tab_strip(
     }
     Line::from(fit(spans, w))
 }
+
+#[cfg(test)]
+mod tests;

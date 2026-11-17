@@ -331,24 +331,6 @@ impl<'a> Agent<'a> {
                     backend.restore_cache_namespace(private_cache);
                     result
                 } else {
-                    let config = snapshot
-                        .role_config
-                        .as_ref()
-                        .unwrap_or(&snapshot.main_config);
-                    let _slot = crate::agent::model::provider_slots::acquire_checked(
-                        config,
-                        || -> Result<()> {
-                            if inference_cancel.load(Ordering::SeqCst) {
-                                return Err(llm::Interrupted.into());
-                            }
-                            ensure!(
-                                Instant::now() < summary_expires,
-                                "summary deadline expired while waiting for a provider slot"
-                            );
-                            Ok(())
-                        },
-                        || ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
-                    )?;
                     let remaining = summary_expires.saturating_duration_since(Instant::now());
                     ensure!(!remaining.is_zero(), "summary deadline expired");
                     self.bounded_role_chat_with_cancel(

@@ -11,6 +11,95 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+// Desktop calls may contain typed secrets or script source. Describe only the operation and
+// explicit window selector, never arbitrary call arguments or evaluated return objects.
+fn desktop_target(args: &Value) -> String {
+    match args["action"].as_str() {
+        Some("run") => "script".into(),
+        Some("call") => {
+            let Some(chain) = args["chain"].as_array() else {
+                return "call".into();
+            };
+            let mut parts = Vec::new();
+            for call in chain.iter().take(4) {
+                let Some(method) = call["method"].as_str() else {
+                    continue;
+                };
+                let mut part = desktop_fragment(method);
+                if method == "window" {
+                    let selector = &call["args"][0];
+                    if let Some(target) = selector
+                        .as_str()
+                        .or_else(|| selector["app"].as_str())
+                        .or_else(|| selector["title"].as_str())
+                    {
+                        part.push(' ');
+                        part.push_str(&desktop_fragment(target));
+                    }
+                }
+                parts.push(part);
+            }
+            if chain.len() > 4 {
+                parts.push(format!("+{} steps", chain.len() - 4));
+            }
+            if parts.is_empty() {
+                "call".into()
+            } else {
+                parts.join(" · ")
+            }
+        }
+        Some(action) => desktop_fragment(action),
+        None => "desktop operation".into(),
+    }
+}
+
+fn desktop_fragment(value: &str) -> String {
+    one_line(&crate::runtime::presentation::truncate(value, 160))
+}
+
+fn desktop_result(view: &mut Presentation, args: &Value, output: &ToolOutput) {
+    let Some(data) = &output.data else { return };
+    if let Some(shots) = data["screenshots"]
+        .as_array()
+        .filter(|shots| !shots.is_empty())
+    {
+        view.facts.push(plural(shots.len(), "screenshot"));
+        view.preview = Some("Screenshot available · expand for capture details".into());
+    }
+    // Only a direct windows() result has the window-list contract. A script can return any array.
+    let lists_windows = args["action"] == "call"
+        && args["chain"]
+            .as_array()
+            .and_then(|chain| chain.last())
+            .is_some_and(|call| call["method"] == "windows");
+    if lists_windows && let Some(windows) = data["value"].as_array() {
+        view.facts.push(plural(windows.len(), "window"));
+        let mut rows: Vec<String> = windows
+            .iter()
+            .take(3)
+            .map(|window| {
+                let app = window["app"].as_str().unwrap_or("Window");
+                let title = window["title"].as_str().unwrap_or_default();
+                if title.is_empty() {
+                    desktop_fragment(app)
+                } else {
+                    format!("{} · {}", desktop_fragment(app), desktop_fragment(title))
+                }
+            })
+            .collect();
+        if windows.len() > 3 {
+            rows.push(format!(
+                "{} more windows · expand for details",
+                windows.len() - 3
+            ));
+        }
+        view.preview = Some(if rows.is_empty() {
+            "No windows returned".into()
+        } else {
+            rows.join("\n")
+        });
+    }
+}
 /// Presenters for the file/shell and controller tools. Extension definitions can override both hooks.
 pub fn render_call(name: &str, args: &Value) -> Presentation {
     if name == "bash"
@@ -41,6 +130,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "web_search" => ("Web", Connect, Text),
         "github" => ("GitHub", Connect, Text),
         "browser" => ("Browse", Connect, Text),
+        "computer" => ("Desktop", Tools, Text),
         "lsp" => ("LSP", Tools, Text),
         "tool_search" | "tool_load" => ("Tools", Tools, Quiet),
         // Loading instructions is context, not work: one quiet line naming the skill.
@@ -52,6 +142,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
     };
     let field = |key: &str| args[key].as_str().unwrap_or_default();
     let target = match name {
+        "computer" => desktop_target(args),
         "task" => args["tasks"]
             .as_array()
             .map(|tasks| plural(tasks.len(), "worker"))
@@ -164,6 +255,7 @@ pub fn render_result(name: &str, args: &Value, output: &ToolOutput) -> Presentat
     }
     if !output.is_error {
         match name {
+            "computer" => desktop_result(&mut view, args, output),
             "read" => {
                 let n = output
                     .text

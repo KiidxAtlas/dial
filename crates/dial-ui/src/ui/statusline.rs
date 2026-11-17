@@ -604,7 +604,11 @@ impl Env<'_> {
                 }
                 let provider = text::one_line(&data.provider);
                 let provider = provider.trim();
-                let short = short_account(&short_model(model));
+                let short = if self.cfg.status == StatusPreset::Default && !data.status_expanded {
+                    without_account(&short_model(model))
+                } else {
+                    short_account(&short_model(model))
+                };
                 let label = if provider.is_empty() {
                     short
                 } else {
@@ -1014,6 +1018,17 @@ fn short_model(model: &str) -> String {
         return name.to_string_lossy().into_owned();
     }
     model.to_owned()
+}
+
+/// The adaptive default reserves identity details for expanded status; role annotations remain.
+fn without_account(label: &str) -> String {
+    let Some((head, rest)) = label.split_once(" [account ") else {
+        return label.to_owned();
+    };
+    let Some((_, tail)) = rest.split_once(']') else {
+        return label.to_owned();
+    };
+    format!("{head}{tail}")
 }
 
 /// Account ids are long opaque identifiers; the status bar keeps only their first 8 characters,

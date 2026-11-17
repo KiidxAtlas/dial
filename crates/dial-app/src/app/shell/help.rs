@@ -292,16 +292,25 @@ impl Shell {
     }
 
     pub(super) fn queue_command(&mut self, line: &str) {
+        let snapshot = self.composer.queued_items();
         let items = self.composer.queued_messages();
         if items.is_empty() {
             self.note("Queue", "No queued messages. While busy, submit a draft to choose between adding direction now and queuing for later; the follow-up shortcut queues directly.");
             return;
         }
         let words: Vec<_> = line.split_whitespace().collect();
-        let requested = words
+        let handle = words
             .get(2)
-            .and_then(|number| number.parse::<usize>().ok())
-            .and_then(|number| number.checked_sub(1));
+            .and_then(|word| word.strip_prefix('@'))
+            .and_then(|id| id.parse::<u64>().ok());
+        let requested = if let Some(id) = handle {
+            self.composer.queued_index(id)
+        } else {
+            words
+                .get(2)
+                .and_then(|number| number.parse::<usize>().ok())
+                .and_then(|number| number.checked_sub(1))
+        };
         let selected = if words.len() == 1 {
             let labels: Vec<_> = items
                 .iter()
@@ -342,6 +351,9 @@ impl Shell {
             }
             return;
         };
+        // Modal prompts can run callbacks. Revalidate the selected identity after every prompt,
+        // not just the position captured before it opened.
+        let selected_id = snapshot.get(index).map(|item| item.0);
         let action = if words.get(1) == Some(&"edit") {
             Some(0)
         } else if words.get(1) == Some(&"remove") {
@@ -354,6 +366,13 @@ impl Shell {
             )
         } else {
             None
+        };
+        let Some(index) = selected_id.and_then(|id| self.composer.queued_index(id)) else {
+            self.note(
+                "Queue",
+                "That queued message is no longer available. Queue unchanged; reopen /queue.",
+            );
+            return;
         };
         match action {
             Some(0) if self.composer.edit_queued(index) => self.note("Queue", "Message moved to the composer for editing. Your other queued messages are unchanged."),

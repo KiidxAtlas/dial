@@ -79,7 +79,13 @@ struct WriterState {
 }
 #[cfg(windows)]
 impl<W: std::io::Write + Send + 'static + std::os::windows::io::AsRawHandle> QueuedWriter<W> {
-    pub fn new(mut writer: W, capacity: usize) -> Self {
+    pub fn new(writer: W, capacity: usize) -> Self {
+        Self::with_notify(writer, capacity, || {})
+    }
+
+    /// Calls `notify` after delivery or failure changes readiness. The callback runs without
+    /// holding the queue lock, so consumers can safely recheck readiness before sleeping.
+    pub fn with_notify(mut writer: W, capacity: usize, notify: fn()) -> Self {
         let capacity = capacity.max(1);
         let state = std::sync::Arc::new((
             std::sync::Mutex::new(WriterState {
@@ -138,6 +144,8 @@ impl<W: std::io::Write + Send + 'static + std::os::windows::io::AsRawHandle> Que
                     current.closed = true;
                 }
                 ready.notify_all();
+                drop(current);
+                notify();
             }
         });
         Self {

@@ -189,8 +189,8 @@ fn a_single_question_has_no_counter_and_hints_only_working_keys() {
     let rows = dialog.rows(80, 30);
     assert_eq!(rows[0], "Question 2/2 · Scope");
     assert!(
-        rows.iter()
-            .any(|row| row.contains("← back") && row.contains("→ done")),
+        rows.iter().any(|row| row.contains("← back"))
+            && rows.iter().any(|row| row.contains("→ done")),
         "{rows:?}"
     );
 }
@@ -373,8 +373,11 @@ fn choice_navigation_and_hints_follow_the_keymap() {
     keys.rebind(Action::SelectDown, &["F5"]).unwrap();
     keys.rebind(Action::SelectConfirm, &["F6"]).unwrap();
     let mut dialog = Dialog::new(&multi, Path::new("/tmp")).with_keys(&keys);
-    let footer = dialog.rows(80, 30).last().unwrap().clone();
-    assert!(footer.starts_with("↑/F5 choose · F6 select"), "{footer}");
+    let footer = dialog.rows(80, 30).join("\n");
+    assert!(
+        footer.contains("↑/F5 choose") && footer.contains("F6 select"),
+        "{footer}"
+    );
     let start = dialog.cursor;
     dialog.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &keys);
     assert_eq!(dialog.cursor, start, "the unbound default does nothing");
@@ -412,4 +415,213 @@ fn a_timeout_after_the_user_chose_reports_nothing_extra() {
     dialog.deadline = Some(now);
     assert!(dialog.expired_at(now).is_some());
     assert!(dialog.timeout_notes().is_empty());
+}
+
+fn rendered(dialog: &Dialog<'_>, width: usize, height: usize) -> String {
+    framed(
+        dialog.rows(width, height),
+        width,
+        height,
+        &crate::ui::theme::Theme::dark(),
+    )
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+#[test]
+fn small_question_keeps_selection_and_confirm_cancel_controls() {
+    let request = request(1, None);
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::SelectConfirm, &["F6"]).unwrap();
+    keys.rebind(Action::SelectCancel, &["F7"]).unwrap();
+    let dialog = Dialog::new(&request, Path::new("/tmp")).with_keys(&keys);
+    for (width, height) in [(80, 6), (32, 6), (24, 7)] {
+        let view = rendered(&dialog, width, height);
+        assert!(view.contains("yes"), "{width}x{height}: {view}");
+        assert!(view.contains("F6 select"), "{width}x{height}: {view}");
+        assert!(view.contains("F7 cancel"), "{width}x{height}: {view}");
+    }
+}
+
+#[test]
+fn question_and_selected_details_are_reachable_without_changing_answers() {
+    let mut request = request(1, None);
+    request.questions[0].question = (0..15).map(|i| format!("question-line-{i}\n")).collect();
+    request.questions[0].options[0].description = Some("description-end".into());
+    request.questions[0].options[0].preview = Some("preview-end".into());
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::SelectPageDown, &["F8"]).unwrap();
+    keys.rebind(Action::SelectPageUp, &["F9"]).unwrap();
+    for width in [24, 60] {
+        let mut dialog = Dialog::new(&request, Path::new("/tmp")).with_keys(&keys);
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&rendered(&dialog, width, 6));
+            dialog.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE), &keys);
+        }
+        for expected in [
+            "question-line-0",
+            "question-line-7",
+            "question-line-14",
+            "description-end",
+            "preview-end",
+        ] {
+            assert!(seen.contains(expected), "missing {expected}: {seen}");
+        }
+        assert!(dialog.answers[0].selected_options.is_empty());
+        // Scrolling at the bottom must not accumulate an invisible overscroll debt.
+        let end = rendered(&dialog, width, 6);
+        dialog.key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &keys);
+        assert_ne!(rendered(&dialog, width, 6), end);
+        for _ in 0..40 {
+            dialog.key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &keys);
+        }
+        assert!(rendered(&dialog, width, 6).contains("question-line-0"));
+        dialog.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &keys);
+        assert!(rendered(&dialog, width, 6).contains("Other"));
+        assert!(dialog.answers[0].selected_options.is_empty());
+    }
+}
+
+#[test]
+fn small_text_and_attachment_views_keep_active_input_feedback_and_back() {
+    let request = request(1, None);
+    let keys = Keymap::defaults();
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    dialog.start_text(Field::Custom);
+    dialog.paste(&format!("{}cursor-tail", "long answer ".repeat(40)));
+    dialog.feedback = "Input too long".into();
+    for width in [32, 80] {
+        let view = rendered(&dialog, width, 8);
+        assert!(view.contains("cursor-tail│"), "{view}");
+        assert!(view.contains("Input too long"), "{view}");
+        assert!(view.contains("Esc back"), "{view}");
+        assert!(view.contains("Enter submit"), "{view}");
+    }
+    dialog.key(
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        &keys,
+    );
+    dialog.paste(&format!("{}image.png", "long-path/".repeat(30)));
+    dialog.feedback = "File not found".into();
+    let view = rendered(&dialog, 40, 8);
+    assert!(view.contains("image.png│"), "{view}");
+    assert!(view.contains("File not found"), "{view}");
+    assert!(view.contains("Enter attach"), "{view}");
+    assert!(view.contains("Esc back"), "{view}");
+}
+
+#[test]
+fn question_modes_obey_viewport_bounds_at_degenerate_sizes() {
+    let mut request = request(1, None);
+    request.questions[0].question = "Long question 界 ".repeat(40);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    for mode in 0..3 {
+        if mode == 1 {
+            dialog.start_text(Field::Note);
+            dialog.paste(&"input 界 │\n".repeat(30));
+        } else if mode == 2 {
+            dialog.key(
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                &keys,
+            );
+            dialog.paste(&"long/path/".repeat(40));
+        }
+        dialog.feedback = "Validation feedback".into();
+        for width in [0, 1, 7, 8, 24, 32, 80] {
+            for height in 0..=12 {
+                let rows = dialog.rows(width, height);
+                assert!(
+                    rows.len() <= height,
+                    "mode={mode}, {width}x{height}: {rows:?}"
+                );
+                let lines = framed(rows, width, height, &theme);
+                assert!(lines.len() <= height);
+                assert!(lines.iter().all(|line| text::line_width(line) <= width));
+            }
+        }
+    }
+}
+
+#[test]
+fn question_layout_regression_choices_and_footer_stay_put_across_options() {
+    let mut request = request(1, None);
+    request.questions[0].options[0].preview = Some("Long preview line\n".repeat(40));
+    request.questions[0].options.push(QuestionOption {
+        label: "Short option".into(),
+        description: None,
+        preview: None,
+    });
+    for (width, height) in [(32, 12), (80, 30)] {
+        let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+        let mut positions = Vec::new();
+        for cursor in 0..request.questions[0].options.len() + 4 {
+            dialog.cursor = cursor;
+            let rows = dialog.rows(width, height);
+            let first_choice = rows
+                .iter()
+                .position(|row| row.starts_with("> ") || row.starts_with("  "))
+                .unwrap();
+            positions.push((rows.len(), first_choice));
+        }
+        assert!(
+            positions.windows(2).all(|pair| pair[0] == pair[1]),
+            "{width}x{height}: {positions:?}"
+        );
+    }
+}
+
+#[test]
+fn question_layout_regression_custom_input_is_bounded_and_not_muted() {
+    let request = request(1, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    dialog.start_text(Field::Custom);
+    dialog.paste("My own answer");
+    let theme = crate::ui::theme::Theme::dark();
+    let lines = framed(dialog.rows(60, 14), 60, 14, &theme);
+    let view = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(view.contains("Your answer"), "{view}");
+    assert!(view.contains("┌") && view.contains("└"), "{view}");
+    let input = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains("My own answer"))
+        .unwrap();
+    assert_eq!(input.style.fg, theme.fg(crate::ui::theme::Tok::Text).fg);
+}
+
+#[test]
+fn input_boxes_keep_whitespace_and_support_ascii_borders() {
+    let request = request(1, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    dialog.start_text(Field::Note);
+    dialog.paste("  indented\nsecond line");
+    let theme = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let lines = framed(dialog.rows(40, 14), 40, 14, &theme);
+    let view = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(view.contains("+- Your note"), "{view}");
+    assert!(view.contains("|   indented"), "{view}");
+    assert!(!view.contains('┌') && !view.contains('└'), "{view}");
+    assert!(lines.iter().all(|line| text::line_width(line) == 40));
+}
+
+#[test]
+fn scroll_hint_accounts_for_space_reserved_by_choices() {
+    let mut request = request(1, None);
+    request.questions[0].options[0].preview = Some("detail\n".repeat(10));
+    let dialog = Dialog::new(&request, Path::new("/tmp"));
+    let view = rendered(&dialog, 70, 18);
+    assert!(view.contains("scroll details"), "{view}");
 }

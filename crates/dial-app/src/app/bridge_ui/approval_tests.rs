@@ -1,7 +1,7 @@
 use super::*;
 use agent::safety::approval::{ApprovalPreview, PolicyExplanation, PolicyReason};
 
-const HINT: &str = "n or Esc denies · Ctrl+C denies and stops the turn";
+const HINT: &str = "Ctrl+C denies and stops the turn";
 
 #[test]
 fn reusable_choices_lead_with_the_action_and_carry_lifetimes_in_labels() {

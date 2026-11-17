@@ -1117,6 +1117,7 @@ fn warm_embedding(
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
 pub mod fixtures;
+pub mod image;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests;

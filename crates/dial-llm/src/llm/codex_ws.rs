@@ -800,7 +800,7 @@ fn connect(
         .insert("originator", super::chatgpt::ORIGINATOR.parse()?);
     request
         .headers_mut()
-        .insert("version", super::chatgpt::CLIENT_VERSION.parse()?);
+        .insert("version", super::chatgpt::client_version().parse()?);
     request
         .headers_mut()
         .insert("x-session-id", session_id.parse()?);

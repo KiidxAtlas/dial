@@ -212,6 +212,17 @@ impl App {
         self.adopt_settings(changes, None)
     }
 
+    /// Project check-list edit through the shared owner (`checks::add_project` or `remove_project`,
+    /// atomic under the settings locks), then the same model adoption a settings save performs.
+    pub(crate) fn save_project_checks(
+        &self,
+        edit: impl FnOnce(&Layout) -> Result<Config>,
+    ) -> Result<()> {
+        let config = edit(&self.layout)?;
+        let applied = crate::checks::saved_change(&config)?;
+        self.adopt_settings(std::slice::from_ref(&applied), None)
+    }
+
     pub(crate) fn save_reviewed_model_settings(
         &self,
         review: &settings_store::ModelConfigReview,

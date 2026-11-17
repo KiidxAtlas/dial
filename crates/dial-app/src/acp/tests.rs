@@ -47,6 +47,55 @@ fn overlapping_same_name_calls_keep_their_own_results() {
 }
 
 #[test]
+fn interleaved_same_name_progress_replaces_each_calls_snapshot() {
+    let updates = session_updates(vec![
+        json!({"event":"tool_call","call_id":"a","name":"read","summary":"first"}),
+        json!({"event":"tool_call","call_id":"b","name":"read","summary":"second"}),
+        json!({"event":"tool_progress","call_id":"a","name":"read","text":"a: 1 of 3"}),
+        json!({"event":"tool_progress","call_id":"b","name":"read","text":"b: 1 of 2"}),
+        json!({"event":"tool_progress","call_id":"a","name":"read","text":"a: 2 of 3"}),
+        json!({"event":"tool_output","call_id":"b","name":"read","delta":"B-out\n"}),
+        json!({"event":"tool_progress","call_id":"b","name":"read","text":"b: 2 of 2"}),
+        json!({"event":"tool_result","call_id":"a","name":"read","text":"done a"}),
+    ]);
+    assert_eq!(updates.len(), 8);
+    let a = &updates[0]["toolCallId"];
+    let b = &updates[1]["toolCallId"];
+    assert_ne!(a, b);
+    // Each snapshot replaces the call's previous one; streamed output stays above it.
+    let expected = [
+        (2, a, "a: 1 of 3"),
+        (3, b, "b: 1 of 2"),
+        (4, a, "a: 2 of 3"),
+        (5, b, "B-out\nb: 1 of 2"),
+        (6, b, "B-out\nb: 2 of 2"),
+    ];
+    for (index, id, text) in expected {
+        assert_eq!(&updates[index]["toolCallId"], id, "update {index}");
+        assert_eq!(updates[index]["status"], "in_progress", "update {index}");
+        assert_eq!(
+            updates[index]["content"][0]["content"]["text"], text,
+            "update {index}"
+        );
+    }
+    assert_eq!(&updates[7]["toolCallId"], a);
+    assert_eq!(updates[7]["status"], "completed");
+}
+
+#[test]
+fn empty_call_ids_route_streamed_output_and_progress_by_name() {
+    let updates = session_updates(vec![
+        json!({"event":"tool_call","call_id":"","name":"bash","summary":"run"}),
+        json!({"event":"tool_output","call_id":"","name":"bash","delta":"legacy"}),
+        json!({"event":"tool_progress","call_id":"","name":"bash","text":"step"}),
+    ]);
+    assert_eq!(updates.len(), 3);
+    assert_eq!(updates[1]["toolCallId"], updates[0]["toolCallId"]);
+    assert_eq!(updates[1]["content"][0]["content"]["text"], "legacy");
+    assert_eq!(updates[2]["content"][0]["content"]["text"], "legacy\nstep");
+}
+
+#[test]
 fn approval_and_legacy_output_follow_the_call_and_session_lifetime() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

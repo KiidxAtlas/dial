@@ -276,7 +276,7 @@ fn schedule(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
         .map_or((args, ""), |(action, rest)| (action, rest.trim()));
     match action {
         "" | "list" => {
-            let state = store.last_runs();
+            let state = store.last_runs()?;
             let entries = store.load()?;
             let text = if entries.is_empty() {
                 format!("No schedules yet.\n{USAGE}")

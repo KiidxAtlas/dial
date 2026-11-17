@@ -14,6 +14,8 @@ pub(super) struct RetryState {
     pub oauth_retry: OAuthRetry,
     pub active_account: Option<String>,
     pub tried_accounts: BTreeSet<String>,
+    /// The ChatGPT sign-in was renewed once for this request after a plan or credential refusal.
+    pub chatgpt_renewed: bool,
 }
 
 pub(super) struct FailedAttempt<'a> {
@@ -258,6 +260,36 @@ impl Backend {
             );
             return Ok(());
         }
+        // ChatGPT access tokens record the plan they were issued for and are kept until near
+        // expiry, so after an upgrade the server keeps refusing with the old plan. Renew once per
+        // request: a rejected credential always retries with the new token; a quota or plan
+        // refusal retries only when the renewed token names a different plan.
+        if attempt < retry_policy.attempts(&class)
+            && !state.chatgpt_renewed
+            && matches!(
+                class,
+                llm::errors::ErrorClass::Auth | llm::errors::ErrorClass::QuotaExhausted { .. }
+            )
+            && let ProviderKind::ChatGpt { user_dir, .. } = &self.kind
+            && let Some(account) = state.active_account.as_deref()
+        {
+            state.chatgpt_renewed = true;
+            if let Some(renewal) = self.renew_chatgpt(user_dir, account, interrupt) {
+                if renewal.plan_changed() {
+                    on_notice(&format!(
+                        "ChatGPT plan changed to {}; renewed the sign-in and retrying",
+                        renewal.after.as_deref().unwrap_or("another plan")
+                    ));
+                    return Ok(());
+                }
+                if matches!(class, llm::errors::ErrorClass::Auth) {
+                    on_notice(
+                        "ChatGPT rejected the access token; renewed the sign-in and retrying",
+                    );
+                    return Ok(());
+                }
+            }
+        }
         if attempt < retry_policy.attempts(&class)
             && retry_policy.rotate_accounts
             && matches!(
@@ -391,6 +423,24 @@ impl Backend {
             ));
         }
         Ok(())
+    }
+    /// Renew the ChatGPT sign-in now; `None` when the renewal failed or is not permitted yet.
+    fn renew_chatgpt(
+        &self,
+        user_dir: &std::path::Path,
+        account: &str,
+        interrupt: &Arc<AtomicBool>,
+    ) -> Option<llm::chatgpt::Renewal> {
+        #[cfg(any(test, feature = "test-support"))]
+        let renewed = llm::chatgpt::renew_access_at(
+            user_dir,
+            Some(account),
+            Arc::clone(interrupt),
+            self.chatgpt_token_url.as_deref()?,
+        );
+        #[cfg(not(any(test, feature = "test-support")))]
+        let renewed = llm::chatgpt::renew_access(user_dir, Some(account), Arc::clone(interrupt));
+        renewed.ok().flatten()
     }
     fn failover_chatgpt_account(
         &mut self,

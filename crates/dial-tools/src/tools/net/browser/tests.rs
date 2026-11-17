@@ -645,6 +645,7 @@ fn chromium_approved_localhost_without_manual_allowlist() {
         deny_read: Vec::new(),
         extra_write: Vec::new(),
         allow_network: true,
+        serial_ports: false,
     };
     let sandbox = crate::tools::exec::sandbox::Sandbox::probe_policy(dir.path(), &policy);
     sandbox.available().unwrap();

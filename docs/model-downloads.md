@@ -49,16 +49,38 @@ Typing moves to the query, and Enter searches Hugging Face. Results receive list
 selects rather than repeating the search. Clearing the query restores offline suggestions while
 refreshing the live catalog. F5 refreshes installed models and retries catalog metadata.
 
-The **Images** shelf searches Hugging Face for repositories tagged **MLX** and **text-to-image**,
-not models guessed from names or vision-input capabilities. Browsing and searching only read
-metadata. Enter on a result explicitly starts the existing snapshot download flow to the **Hugging
-Face cache**; Esc cancels it. These weights require a compatible image server such as MLX-Serve:
-Dial's Python chat runner does not run them, and a Hub tag does not guarantee that the server supports
-that particular pack. Import/serve the checkpoint, then F5 rescan and select its endpoint in the
-separate **Images** group. This group also lists models already downloaded for MLX-Serve. Enter
-assigns the `image` role; Roles / `Ctrl+A` offer the same assignment. Image-only checkpoints are not
-assigned to `main`, `memory` or `embedding`. An unassigned `image` role follows the main model;
-this does not turn a chat-only model into an image-generation endpoint.
+The **Images** shelf searches Hugging Face for **Diffusers** repositories tagged **text-to-image**,
+the layouts Dial runs itself, not models guessed from names or vision-input capabilities. Browsing
+and searching only read metadata. Enter on a result lists its files and downloads only what
+stable-diffusion.cpp loads to the **Hugging Face cache**: `model_index.json`, each component's
+config and its half-precision (`fp16`) weights when offered, else its default weights. Duplicate
+single-file checkpoints, sample images and other precision variants are skipped. FLUX.2 repositories
+(such as FLUX.2 klein) are the exception: stable-diffusion.cpp cannot read their Diffusers
+`Flux2Transformer2DModel` transformer (it misdetects it as FLUX.1 and refuses its tensors), so Dial
+downloads the original single-file transformer at the repository root instead and loads it with the
+Diffusers VAE and Qwen3 text encoder. A FLUX.2 model downloaded before this change lacks that file;
+its first `image_gen` call is refused with a note to download it again from the Images shelf. Esc
+cancels a download.
+Dial runs a downloaded checkpoint itself on stable-diffusion.cpp's `sd-server`, on macOS, Linux
+and Windows: a single `.safetensors`/`.ckpt` file, a Diffusers UNet layout (SD 1.x/2.x/XL) or a
+Diffusers transformer layout (FLUX, SD3, Krea 2 and similar). Enter on it assigns the `image` role,
+and each `image_gen` call starts `sd-server` on loopback, loads the checkpoint and stops the server
+afterwards, so every call pays the model load. When no `sd-server` is installed, the first
+`image_gen` call asks to install one; yes installs the same pinned, checksum-verified release as
+`/setup sd-cpp` into Dial's `tools/sd-cpp` folder (macOS arm64, Linux x64, Windows x64).
+`DIAL_SD_SERVER` points Dial at another build, such as a Vulkan or CUDA release. Whether
+stable-diffusion.cpp supports a given architecture is known only once it loads; a load failure
+quotes the server's log.
+
+MLX-quantized packs (mflux 4/8-bit, MLX-Serve conversions) store packed integer weights that
+stable-diffusion.cpp cannot read. Enter on one, in the **Images** group or shelf, looks up the
+model the pack declares as its `base_model` on Hugging Face and asks whether to download that
+original (with its size); `y` downloads it as above, `n` or Esc downloads nothing. Gated originals
+are refused with the license and `hf auth login` steps. Serving a pack with MLX-Serve on Apple
+Silicon still works: F5 rescan and select its endpoint. Roles / `Ctrl+A` offer the same
+assignment. Image-only checkpoints are not assigned to `main`, `memory` or `embedding`. An
+unassigned `image` role follows the main model; this does not turn a chat-only model into an
+image-generation endpoint.
 
 | Key | Action |
 |---|---|
@@ -73,6 +95,24 @@ this does not turn a chat-only model into an image-generation endpoint.
 | Enter (curated embedding model) | Set it up as `/setup embeddings:<model> yes` does; see [model-embeddings.md](model-embeddings.md) |
 | Esc (Get models content) | Explicitly cancel a running download; otherwise close the picker, stop listing, or clear the query before returning to groups |
 | Left (or Ctrl+Left) | Move to the groups column; Up/Down there switch groups. Downloads keep running; Esc from groups closes Models without cancelling them |
+| Ctrl+D (installed model) | Ask to delete it from disk; Enter or `y` deletes, Esc or `n` keeps it. Also works on local rows of the other model lists |
+
+### Deleting local models
+
+Ctrl+D deletes a downloaded local model wherever `/models` lists it: in All, Favorites, Memory,
+Images and provider groups (any row backed by a file or folder on this machine, marked
+`Ctrl+D delete` in the footer) and on installed models in Get models. One confirmation shows the
+model, where it came from, how much space it frees and the folder that will be removed; Enter or
+`y` deletes, Esc or `n` keeps it. Afterwards the lists rescan, so the model disappears everywhere.
+
+Dial deletes only models its local discovery found, and only their own folder inside the store
+that holds them: the whole `models--owner--name` repository of the Hugging Face cache (snapshots
+share its blobs, so the repository is the unit), or the `publisher/model` folder of LM Studio's
+download folder or `~/.mlx-serve/models`. Models outside those stores, linked folders and the stores
+themselves are refused with the reason. A model the configuration selects, as the main model or
+for any role, is refused before the confirmation until another model is chosen, and deleting waits
+for a running download. Models served by Ollama or another server are managed by that server.
+Clients use the RPC method `delete_local_model` (`model`, optional `dry_run`).
 
 A download runs in the background. The status line shows the repository, the bytes fetched so far
 against the expected total, the elapsed time and the latest step. Get models and Activity → Downloads

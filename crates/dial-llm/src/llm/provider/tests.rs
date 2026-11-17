@@ -1235,6 +1235,68 @@ fn chatgpt_portable_failover_pins_backend_and_replays_next_request() {
     }
 }
 
+/// An access token for `oaiapp_test` on `plan`.
+fn plan_token(plan: &str) -> String {
+    use base64::Engine;
+    let encode = |value: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+    format!(
+        "{}.{}.sig",
+        encode("{}".into()),
+        encode(
+            json!({"https://api.openai.com/auth":{"chatgpt_account_id":"oaiapp_test","chatgpt_plan_type":plan}})
+                .to_string()
+        )
+    )
+}
+
+#[test]
+fn chatgpt_refusal_after_a_plan_upgrade_renews_the_sign_in_instead_of_failing() {
+    for (status, body) in [
+        (401, json!({"error":{"message":"rejected"}})),
+        (
+            429,
+            json!({"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::serve(vec![fake::json(status, &body), codex_rotation_success()]);
+        let upgraded = plan_token("plus");
+        let tokens = fake::serve(vec![fake::json(
+            200,
+            &json!({"access_token":upgraded,"refresh_token":"rotated","token_type":"Bearer","expires_in":3600}),
+        )]);
+        let mut remote = rotation_backend(dir.path(), &server.url);
+        remote.chatgpt_token_url = Some(tokens.url.clone());
+        let mut notices = Vec::new();
+        let reply = remote
+            .chat_with_control(
+                None,
+                &request(),
+                5,
+                None,
+                &mut |notice| notices.push(notice.to_owned()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert_eq!(reply.text, "rotated", "HTTP {status}");
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("ChatGPT plan changed to plus")),
+            "HTTP {status}: {notices:?}"
+        );
+        // The same account retries with the renewed token; nothing failed over or signed out.
+        assert_eq!(remote.account_id(), Some("oaiapp_test"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header(&requests[1], "authorization"),
+            Some(format!("Bearer {upgraded}"))
+        );
+        assert_eq!(tokens.requests().len(), 1);
+    }
+}
+
 #[test]
 fn chatgpt_failover_refuses_bound_cache_and_existing_native_history() {
     for binding in ["session", "cache", "native"] {

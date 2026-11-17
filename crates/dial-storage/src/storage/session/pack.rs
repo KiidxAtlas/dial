@@ -4,7 +4,8 @@
 //! and stream-journal companions, child transcripts, and every artifact blob the journal references,
 //! each named by its SHA-256. The member grammar is fixed: nothing outside it is admitted. Unpacking
 //! stages and verifies every member against the manifest before anything is installed, refuses to
-//! overwrite any existing file, and rolls back what it created if an install step fails.
+//! overwrite any existing file, and rolls back what it created on installation failures. A transfer
+//! ledger failure after possible publication retains the installed destination for recovery.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -153,16 +154,7 @@ fn pack_session_with(
 
     // Artifacts referenced by the journal, or by live stream nodes, travel with the session.
     let mut refs = HashSet::new();
-    let mut reader = BufReader::new(File::open(session_path)?);
-    let mut line = Vec::new();
-    while let Some(raw) = read_bounded_line(&mut reader, &mut line)? {
-        if raw.terminated
-            && !raw.oversized
-            && let Ok(value) = serde_json::from_slice::<Value>(&line)
-        {
-            collect_references(&value, &source_root, &mut refs);
-        }
-    }
+    collect_journal_references(session_path, &source_root, &mut refs)?;
     let stream = crate::runtime::stream_journal::path(session_path);
     for node in crate::runtime::stream_journal::recover(session_path)? {
         collect_references(&serde_json::to_value(node)?, &source_root, &mut refs);
@@ -176,6 +168,7 @@ fn pack_session_with(
 
     let transcripts = subagent::transcript_files(layout, &session_id)?;
     for path in &transcripts {
+        collect_journal_references(path, &source_root, &mut refs)?;
         let file = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -318,7 +311,30 @@ fn write_members(
     Ok(())
 }
 
+fn collect_journal_references(path: &Path, root: &Path, refs: &mut HashSet<String>) -> Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    while let Some(raw) = read_bounded_line(&mut reader, &mut line)? {
+        if raw.terminated
+            && !raw.oversized
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+        {
+            collect_references(&value, root, refs);
+        }
+    }
+    Ok(())
+}
+
 fn unpack_session_with(layout: &Layout, archive: &Path, limits: Limits) -> Result<UnpackReport> {
+    unpack_with_record(layout, archive, limits, transfers::record)
+}
+
+fn unpack_with_record(
+    layout: &Layout,
+    archive: &Path,
+    limits: Limits,
+    record: impl FnOnce(&Layout, &str, &Path, &Path) -> Result<()>,
+) -> Result<UnpackReport> {
     ensure!(
         is_regular(archive)?,
         "session archive {} is not a regular file",
@@ -338,14 +354,22 @@ fn unpack_session_with(layout: &Layout, archive: &Path, limits: Limits) -> Resul
             .context("parsing archive manifest")?;
     verify_manifest(&manifest, &staged)?;
 
+    verify_journal(&manifest, &staged[SESSION_MEMBER].path)?;
+    verify_artifact_dependencies(&mut staged, staging.path())?;
     let session_staged = &staged[SESSION_MEMBER];
-    verify_journal(&manifest, &session_staged.path)?;
 
     let sessions_dir = layout.sessions_dir();
     crate::platform::atomic::private_dir(&sessions_dir)?;
     let dst = sessions_dir.join(&manifest.session_file);
 
     // Every destination is checked before the first write, so a conflict installs nothing.
+    super::relocate::ensure_side_thread_free(&dst)?;
+    let stream = crate::runtime::stream_journal::path(&dst);
+    ensure!(
+        !exists(&stream)?,
+        "stream journal destination exists: {}",
+        stream.display()
+    );
     let mut plan: Vec<(PathBuf, PathBuf)> = vec![(session_staged.path.clone(), dst.clone())];
     if let Some(side) = staged.get(SIDE_MEMBER) {
         plan.push((side.path.clone(), side_thread::path_for(&dst)));
@@ -357,10 +381,14 @@ fn unpack_session_with(layout: &Layout, archive: &Path, limits: Limits) -> Resul
         ));
     }
     let transcript_dir = subagent::transcript_dir(layout, &manifest.session_id);
+    ensure!(
+        !exists(&transcript_dir)?,
+        "child transcript destination exists: {}",
+        transcript_dir.display()
+    );
     let mut subagents = 0usize;
     for (name, file) in &staged {
         if let Some(leaf) = name.strip_prefix(SUBAGENT_PREFIX) {
-            crate::platform::atomic::private_dir(&transcript_dir)?;
             plan.push((file.path.clone(), transcript_dir.join(leaf)));
             subagents += 1;
         }
@@ -380,7 +408,17 @@ fn unpack_session_with(layout: &Layout, archive: &Path, limits: Limits) -> Resul
         .collect::<Result<_>>()?;
 
     let mut created = Vec::new();
+    let mut created_transcripts = false;
     let installed = (|| -> Result<()> {
+        if subagents > 0 {
+            crate::platform::atomic::private_dir(
+                transcript_dir
+                    .parent()
+                    .context("transcript directory has no parent")?,
+            )?;
+            platform_fs::create_dir_owner_only(&fs::DirBuilder::new(), &transcript_dir)?;
+            created_transcripts = true;
+        }
         for (src, target) in &plan {
             install_file(src, target, &mut created)?;
         }
@@ -393,15 +431,34 @@ fn unpack_session_with(layout: &Layout, archive: &Path, limits: Limits) -> Resul
                 store.import_blob(&format!("artifact://{id}"), &member.path)?;
             }
         }
-        transfers::record(layout, &manifest.session_id, &manifest.source_path, &dst)
-            .context("recording the unpacked session in the transfer ledger")?;
         Ok(())
     })();
     if let Err(error) = installed {
         for path in created.iter().rev() {
             let _ = fs::remove_file(path);
         }
+        if created_transcripts {
+            let _ = fs::remove_dir(&transcript_dir);
+        }
         return Err(error);
+    }
+
+    if let Err(error) = record(layout, &manifest.session_id, &manifest.source_path, &dst) {
+        if transfers::definitely_unpublished(&error) {
+            for path in created.iter().rev() {
+                let _ = fs::remove_file(path);
+            }
+            if created_transcripts {
+                let _ = fs::remove_dir(&transcript_dir);
+            }
+            return Err(
+                error.context("recording unpacked session failed before ledger publication")
+            );
+        }
+        return Err(error.context(format!(
+            "transfer ledger publication uncertain; unpacked destination {} retained; no rollback claimed",
+            dst.display()
+        )));
     }
 
     Ok(UnpackReport {
@@ -538,6 +595,59 @@ fn verify_manifest(manifest: &Manifest, staged: &HashMap<String, Staged>) -> Res
         listed == members,
         "archive artifact list does not match its artifact members"
     );
+    Ok(())
+}
+
+/// Validate portability against the archive alone, never against the destination's artifact cache.
+/// Arrange verified staged files for the existing authenticated resolver and stream replay, without
+/// copying blobs or interpreting ordinary artifacts. All paths remain inside temporary staging.
+fn verify_artifact_dependencies(
+    staged: &mut HashMap<String, Staged>,
+    staging: &Path,
+) -> Result<()> {
+    let root = staging.join("artifact-dependencies");
+    let store = ArtifactStore::new(&root)?;
+    for (name, file) in staged.iter_mut() {
+        if let Some(id) = name.strip_prefix(ARTIFACT_PREFIX) {
+            ensure!(
+                file.sha256 == id,
+                "archive artifact {id} has corrupt content"
+            );
+            let path = root.join(id);
+            fs::rename(&file.path, &path)?;
+            file.path = path;
+        }
+    }
+
+    let journal = staged[SESSION_MEMBER].path.clone();
+    let mut references = HashSet::new();
+    collect_journal_references(&journal, &root, &mut references)?;
+    for (name, file) in staged.iter() {
+        if name.starts_with(SUBAGENT_PREFIX) {
+            collect_journal_references(&file.path, &root, &mut references)?;
+        }
+    }
+    if let Some(stream) = staged.get_mut(STREAM_MEMBER) {
+        // Replay joins split append deltas before the existing collector classifies references.
+        let path = crate::runtime::stream_journal::path(&journal);
+        fs::rename(&stream.path, &path)?;
+        stream.path = path;
+        for node in crate::runtime::stream_journal::recover(&journal)? {
+            collect_references(&serde_json::to_value(node)?, &root, &mut references);
+        }
+    }
+    store
+        .expand_evidence_references(&mut references)
+        .context("validating archive artifact dependencies")?;
+    let mut references: Vec<_> = references.into_iter().collect();
+    references.sort();
+    for uri in references {
+        let id = crate::storage::artifact::artifact_id(&uri).map_err(anyhow::Error::msg)?;
+        ensure!(
+            staged.contains_key(&format!("{ARTIFACT_PREFIX}{id}")),
+            "session archive is missing required artifact {uri}; repack the complete source session"
+        );
+    }
     Ok(())
 }
 

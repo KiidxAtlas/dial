@@ -14,16 +14,25 @@ and notification rows under one heading; they stay in their own categories too, 
 copy edits the same setting. Type to search labels, descriptions, paths and goal-oriented synonyms
 across categories. An exact path or label ranks first, whole-word matches rank above scattered
 letters, weak scattered matches are dropped, and each result names its category at the right edge.
-Tab counts show saved overrides, not running tasks.
+Tab counts show saved overrides in the edited scope, not running tasks; the row under the tabs says so and
+**Ctrl-O** lists only those overrides. Tabs that do not fit are summarized as `+N more`.
 [Settings layout](configuration.md#settings-layout) describes
 the categories; Safety groups approval, sandbox, isolation, folders and rules, while Connections
 groups provider and tool-server configuration. Approval and sandboxing remain independent controls.
 
 `Enter` toggles a two-state switch or opens an editor. Auto settings offer explicit **Auto / On / Off**
 choices. Choices save only when confirmed; `Esc` cancels. The permanent scope line identifies the
-named project or all-project destination; `Ctrl-S` switches it. Success is acknowledged only after
+named project or all-project destination; `Ctrl-B` switches it outside text editors. Success is acknowledged only after
 the controller saves. `Delete` removes one override, revealing its inherited value rather than
 resetting unrelated settings. Details explain effective source, precedence and restart requirements.
+
+Path-valued editors browse directories and validate typed paths on background workers, keeping
+typing and cancellation responsive even on slow mounts. A listing reads at most 2,000 raw entries;
+its partial-list warning stays visible while filtering, which searches only those loaded entries.
+Type a full path to reach omitted entries. Typed directories open when checked; typed files show
+**Path checked; Enter chooses it** and require a second Enter to select. Editing the path cancels
+the old validation result. Native Windows separators are accepted on Windows, and symlink/`..`
+traversal follows the operating system rather than lexical path simplification.
 
 `Ctrl-O` shows **Changed only** across categories for the chosen scope. `Ctrl-Delete` reviews the
 exact visible saved leaf overrides and their masked fallback values before removing them together.
@@ -31,6 +40,22 @@ Nothing is removed until the rendered confirmation is accepted. Changed scope/va
 configuration and incomplete embedding pairs require a new review; hidden partner settings are
 never silently added. A failed review stays open with an error. Very short terminals cannot confirm
 an unreadable review.
+
+Missing-dependency offers use `Ctrl-L` to open a focused install-plan review. The setting and
+dependency name stay above the wrapped plan; `Up`/`Down`, `PageUp`/`PageDown` and `Home`/`End`
+scroll commands, downloads and destinations without changing the selected setting. `Enter` or
+`Ctrl-L` confirms the displayed plan once; `Esc` returns without installing. Confirmation is
+disabled until the review has been rendered at a usable size. Installation still runs through
+the existing background setup owner.
+
+Provider API-key and Add provider forms keep the active input and confirm/cancel keys pinned on
+short terminals. Their help, validation errors, complete endpoint and wizard step details wrap;
+`PageUp`/`PageDown` scroll this secondary copy without saving or changing the input. Editing or
+validating returns to the start so a new error is visible. Arrow keys and `Home`/`End` retain their
+text-editor meanings; `F1` shows the key sheet. Keys stay masked throughout inspection.
+Provider reset, key removal and sign-out confirmations wrap their consequences and support the
+review navigation keys, with confirm/cancel kept below the review. Enlarge an unusably small review
+before confirming.
 
 While you search, the category tabs are not offered and `Tab` does nothing; `Esc` clears the search first.
 
@@ -101,6 +126,9 @@ offered, and reserved MCP switches are explicitly labeled as having no current r
 
 `F10` (rebindable as `app.status.focus`) or `/controls` opens the keyboard-accessible session control
 doorway. The compact composer strip reports planning, approval, **main** reasoning and assistance.
+Controls offers only the planning change that applies (**Start planning** or **Leave planning**; both
+while the state is unknown), shows context use as `12k of 200k tokens (6%)`, and lists the read-only
+Stop and Undo explanations after the controls.
 Unknown active facts remain unknown; saved defaults waiting for the safe turn boundary are not
 labelled active. Opening controls preserves the composer draft. Linked model, provider, Safety and
 context settings keep their existing validation and approval owners.
@@ -212,4 +240,4 @@ To create a theme, put a JSON file such as
 `~/.dial/themes/custom.json` there; it may extend a built-in (`dark`, `light`, `mono`, `gruvbox`,
 `nord`, or `paper`) and overrides reload live. `NO_COLOR` forces monochrome output.
 
-`Ctrl-S` changes global/project storage scope in the model, provider and settings panels.
+`Ctrl-B` changes global/project storage scope in the model, provider and settings panels outside text editors; `Ctrl-S` remains Save in the headers editor.

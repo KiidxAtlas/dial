@@ -142,8 +142,8 @@ fn recorded_timing_lists_measured_phases() {
     });
     let text = render(&summary, &latency).expect("edits produce a report");
     assert_eq!(
-        line(&text, "Timing:"),
-        "Timing: wait 1.5 s, generation 2.5 s over 2 requests"
+        line(&text, "Model time:"),
+        "Model time: wait 1.5 s, generation 2.5 s over 2 requests"
     );
 }
 
@@ -160,8 +160,8 @@ fn loading_retry_and_prompt_phases_appear_only_when_measured() {
     });
     let text = render(&summary, &latency).expect("failures produce a report");
     assert_eq!(
-        line(&text, "Timing:"),
-        "Timing: wait 120 ms, loading 800 ms, prompt processing 300 ms, retry backoff 4.0 s"
+        line(&text, "Model time:"),
+        "Model time: wait 120 ms, loading 800 ms, prompt processing 300 ms, retry backoff 4.0 s"
     );
 }
 
@@ -180,7 +180,7 @@ fn missing_null_or_zero_timing_adds_no_line() {
     let wrong_types = json!({"generation_ms": "fast", "response_wait_ms": -5});
     for latency in [no_timing(), json!({}), all_zero, with_nulls, wrong_types] {
         let text = render(&summary, &latency).expect("edits produce a report");
-        assert!(!text.contains("Timing:"), "{latency}: {text}");
+        assert!(!text.contains("Model time:"), "{latency}: {text}");
         assert!(text.contains("Changed: a.rs"), "{text}");
     }
 }
@@ -415,14 +415,14 @@ fn measured_latency_refresh_keeps_a_single_handoff_with_next_action_last() {
         !initial
             .handoff
             .iter()
-            .any(|line| line.starts_with("Timing:"))
+            .any(|line| line.starts_with("Model time:"))
     );
     let refreshed = super::outcome(&summary, &json!({"requests":2,"generation_ms":1500}));
     assert_eq!(
         refreshed
             .handoff
             .iter()
-            .filter(|line| line.starts_with("Timing:"))
+            .filter(|line| line.starts_with("Model time:"))
             .count(),
         1
     );

@@ -979,6 +979,7 @@ fn dev_sandbox_confines_background_writes() {
         deny_read: Vec::new(),
         extra_write: Vec::new(),
         allow_network: false,
+        serial_ports: false,
     };
     let sandbox = Sandbox::probe_policy(dir.path(), &policy);
     if let Err(reason) = sandbox.available() {

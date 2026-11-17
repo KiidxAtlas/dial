@@ -175,19 +175,31 @@ pub fn detect(path: &Path) -> Option<LocalFormat> {
 /// at `tools/llama-cpp` as `setup::deps::install_dir` lays it out), else `PATH` or a common
 /// package-manager location.
 pub fn llama_server() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("DIAL_LLAMA_SERVER").filter(|v| !v.is_empty()) {
+    find_server("DIAL_LLAMA_SERVER", "llama-cpp", "llama-server")
+}
+
+/// stable-diffusion.cpp's `sd-server`, which serves downloaded image checkpoints:
+/// `DIAL_SD_SERVER`, else Dial's own install (`/setup sd-cpp`, at `tools/sd-cpp`), else `PATH` or a
+/// common package-manager location.
+pub fn sd_server() -> Option<PathBuf> {
+    find_server("DIAL_SD_SERVER", "sd-cpp", "sd-server")
+}
+
+/// A server program: the explicit `variable`, Dial's install under `tools/<install>`, then `PATH`.
+fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(explicit));
     }
     let name = if cfg!(windows) {
-        "llama-server.exe"
+        format!("{program}.exe")
     } else {
-        "llama-server"
+        program.to_owned()
     };
     let user_dir = crate::config::types::default_user_dir();
     if !user_dir.as_os_str().is_empty() {
         let managed = crate::config::paths::tools_dir(&user_dir)
-            .join("llama-cpp")
-            .join(name);
+            .join(install)
+            .join(&name);
         if managed.is_file() {
             return Some(managed);
         }
@@ -197,7 +209,7 @@ pub fn llama_server() -> Option<PathBuf> {
         .unwrap_or_default();
     dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
     dirs.into_iter()
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
         .find(|candidate| candidate.is_file())
 }
 

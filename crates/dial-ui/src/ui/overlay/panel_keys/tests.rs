@@ -80,7 +80,7 @@ fn a_long_footer_keeps_the_action_the_finder_the_sheet_and_the_way_out() {
         "F7 tune",
         "Shift+F2 filter",
         "type to search",
-        "Ctrl+S scope",
+        "Ctrl+B scope",
         "Esc close",
     ]);
     assert_eq!(
@@ -103,4 +103,58 @@ fn a_long_footer_keeps_the_action_the_finder_the_sheet_and_the_way_out() {
     let capped = capped_footer(plain, "F1 keys");
     assert_eq!(capped[1], "↑↓ move");
     assert_eq!(capped.len(), FOOTER_HINTS);
+}
+
+#[test]
+fn key_rows_fit_narrow_panels_without_losing_their_text() {
+    let theme = Theme::dark();
+    let lines = plain(&sheet(
+        &theme,
+        &[SheetGroup {
+            title: "Actions",
+            rows: vec![(
+                "Ctrl+PageDown".into(),
+                "move to the next section safely".into(),
+            )],
+        }],
+        "",
+        "Esc",
+        12,
+    ));
+    assert!(
+        lines.iter().all(|line| text::width(line) <= 12),
+        "{lines:?}"
+    );
+    assert!(lines.join(" ").contains("safely"));
+}
+
+#[test]
+fn help_scrolls_to_last_note_with_back_pinned_even_on_short_panels() {
+    let theme = Theme::dark();
+    let mut panel = PanelKeys::default();
+    panel.handle_key(&event(KeyCode::F(1)), false);
+    let content = || {
+        sheet(
+            &theme,
+            &[SheetGroup {
+                title: "Keys",
+                rows: vec![("Enter".into(), "apply".into())],
+            }],
+            "first note\nlast note",
+            "Esc",
+            20,
+        )
+    };
+    let first = plain(&panel.viewport(content(), 20, 3, &theme));
+    assert!(first.last().unwrap().contains("Esc"));
+    panel.handle_key(&event(KeyCode::End), false);
+    let last = plain(&panel.viewport(content(), 20, 3, &theme));
+    assert!(
+        last.iter().any(|line| line.contains("last note")),
+        "{last:?}"
+    );
+    assert!(last.last().unwrap().contains("Esc"));
+    let tiny = plain(&panel.viewport(content(), 20, 1, &theme));
+    assert_eq!(tiny.len(), 1);
+    assert!(tiny[0].contains("Esc"));
 }

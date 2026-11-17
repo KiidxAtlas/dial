@@ -5,7 +5,10 @@ Image input/vision is not evidence that a model can generate images. Known image
 `model_profiles.<name>.capabilities.image_generation` declarations identify the generation transport.
 ChatGPT plan models are also listed: their catalog omits the hosted image tool, so assigning one is
 an approved attempt through the Responses hosted tool with your subscription, even while main uses
-another provider; an explicit `disabled` declaration still refuses it.
+another provider; an explicit `disabled` declaration still refuses it. Some ChatGPT accounts (free
+plans, for example) do not offer the hosted tool and answer `Tool choice 'image_generation' not
+found`. Dial then reports that the account lacks the tool and stops offering `image_gen` for that
+account until it restarts; assign an image role or configure an image provider to generate images.
 Provider credentials and model access are still required. A catalog entry is not a live generation test.
 Direct Gemini API image models (`gemini-2.5-flash-image`, `gemini-3-pro-image`, `gemini-3.1-flash-image`,
 `gemini-3.1-flash-lite-image`, `nano-banana-pro-preview`, `gemini-nano-banana-2.1` and their
@@ -27,6 +30,25 @@ Explicit image-route errors remain visible, and `image.auto = false` still disab
 offering (an explicit `integrations = ["image_gen"]` entry enables it separately). All generation
 continues to require approval.
 
+### When a model returns several images
+
+Dial asks for one image, but some models return more (several hosted image calls in one
+Responses turn, several Gemini parts, a ComfyUI batch, a multi-image fal or Replicate result).
+Each one is saved: the first to the requested `output`, the rest beside it as `name-2.ext`,
+`name-3.ext` and so on. Names that already exist are skipped, and no file is ever overwritten.
+Every image is converted to the requested format, and the tool result lists each file. One call
+writes at most eight images. A larger batch, or any unfinished, filtered or malformed image in
+the response, refuses the whole result and writes nothing.
+
+### Seeing the result
+
+Every image `image_gen` writes, whether the model called it or you ran `/image`, is previewed in the
+chat. Terminals with a graphics protocol (kitty, Ghostty, iTerm2) show the real image; others
+show a block-character thumbnail. The preview's `Image · <path> · <width>x<height>` header names
+the file. In terminals with hyperlink support it is a clickable link that opens the image in your
+default viewer (iTerm2 included: image links carry no line number, so they skip the text editor).
+Inside tmux, or in terminals without hyperlinks, the path stays plain text.
+
 To build a page or screen on generated art (generate, inspect, build the UI, confirm with a browser
 screenshot, remix), import the versioned `art-to-ui` example skill with
 `dial skills import ./examples/skills/art-to-ui`; see [skills](skills.md#import-and-maintain-the-examples).
@@ -45,6 +67,15 @@ screenshot, remix), import the versioned `art-to-ui` example skill with
 | `comfyui` | Explicit ComfyUI API-format workflow | No |
 | `fal` | fal model endpoint and queue | No |
 | `replicate` | Replicate prediction | No |
+
+A downloaded image checkpoint assigned to the `image` role (a local path rather than an endpoint)
+needs no declaration: `image_gen` starts stable-diffusion.cpp's `sd-server` on loopback for the
+call, sends the OpenAI Images request, and stops the server afterwards. Edits upload the source to
+its `images/edits` route. Configured `steps` and `seed` travel in sd-server's
+`<sd_cpp_extra_args>` prompt extension, and `image.timeout_secs` bounds the model load and then the
+generation. When no `sd-server` is installed, the call asks to install one (as `/setup sd-cpp` does)
+and fails with that hint if declined or unattended; `DIAL_SD_SERVER` selects another build.
+MLX-quantized packs are refused before any server starts. See [model downloads](model-downloads.md).
 
 Edit support in this table is what **Dial's adapter** accepts, not a statement that other APIs or
 workflows cannot edit images. Unsupported edits fail before submission. Nothing is uploaded merely
@@ -145,10 +176,10 @@ The **Workflow** row in `/image settings` edits a TOML inline table with these t
 
 - `workflow`: the full exported node-ID → node-object graph (not the UI-format `nodes`/`links` file).
 - `prompt_node`: the string node ID containing the positive prompt's string `inputs.text`.
-- `output_node`: the string node ID whose completed output contains exactly one image.
+- `output_node`: the string node ID whose completed output holds the generated image(s).
 
 Keep checkpoint names, negative prompts, dimensions, sampling, seeds, LoRAs and batch size in the
-workflow itself. Use batch size one. Dial changes only the configured prompt node; it does not guess
+workflow itself. A batch larger than one writes each image (at most eight; see above). Dial changes only the configured prompt node; it does not guess
 node IDs, rewrite the graph, install missing models/nodes, or upload source images. Omit the tool's
 `size` argument or set it to `auto`; an explicit pixel size is refused. ComfyUI may execute arbitrary
 installed custom nodes or paid API nodes in a configured workflow, so review the graph before using it.

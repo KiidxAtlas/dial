@@ -40,6 +40,62 @@ fn request_settings_change(
         .map(|changes| format!("{changes} · /policy for details"))
 }
 
+/// Compose question and shell-owned ancillary rows within the final panel viewport.
+fn question_panel(
+    dialog: &crate::ui::questions::Dialog<'_>,
+    width: usize,
+    height: usize,
+    draft_note: Option<&str>,
+    focus: crate::app::shell::prompts::Focus,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<Line<'static>> {
+    use crate::app::shell::prompts::Focus;
+    // Six panel rows preserve the question's selected answer/input and essential keys.
+    // Shell hints consume only the remaining rows, not a fixed four-row draft allowance.
+    // When the draft owns input, retain its focus/return hint even below that baseline.
+    let mut ancillary_room = height.saturating_sub(6);
+    if draft_note.is_some() && focus == Focus::Draft && height >= 5 {
+        ancillary_room = ancillary_room.max(1);
+    }
+    let attention_rows = usize::from(
+        ancillary_room > 0
+            && !(ancillary_room == 1 && draft_note.is_some() && focus == Focus::Draft),
+    );
+    let inner_width = if width >= 8 { width - 4 } else { width };
+    let mut draft_rows = draft_note.map_or_else(Vec::new, |note| {
+        note.lines().take(4).map(text::sanitize).collect::<Vec<_>>()
+    });
+    let draft_room = ancillary_room.saturating_sub(attention_rows);
+    let compact = draft_rows.len() > draft_room
+        || draft_rows
+            .first()
+            .is_some_and(|header| text::width(header) > inner_width);
+    if compact && let Some(header) = draft_rows.first_mut() {
+        *header = match focus {
+            Focus::Choices => "Draft · Tab: edit",
+            Focus::Draft => "Draft · Tab: choices",
+        }
+        .into();
+    }
+    draft_rows.truncate(draft_room);
+    let mut body = dialog.rows(
+        width,
+        height.saturating_sub(attention_rows + draft_rows.len()),
+    );
+    if attention_rows > 0 {
+        body.insert(
+            1.min(body.len()),
+            text::ellipsize(ATTENTION_HINT, inner_width, theme.ascii()),
+        );
+    }
+    body.extend(
+        draft_rows
+            .into_iter()
+            .map(|line| text::ellipsize(&line, inner_width, theme.ascii())),
+    );
+    crate::ui::questions::framed(body, width, height, theme)
+}
+
 struct ApprovalPrompt {
     body: String,
     options: Vec<(&'static str, char, Decision)>,
@@ -47,10 +103,11 @@ struct ApprovalPrompt {
     scope: Option<String>,
 }
 
-/// How to stop the turn as well: shown under the action; the panel footer names Esc as deny.
+/// How to stop the turn as well. The choices list `n  Deny` and the panel footer names Esc as deny,
+/// so this line only adds what neither says.
 fn deny_hint(keys: &crate::ui::keys::Keymap) -> String {
     format!(
-        "n or Esc denies · {} denies and stops the turn",
+        "{} denies and stops the turn",
         keys.label(Action::Interrupt)
     )
 }
@@ -83,7 +140,7 @@ fn approval_prompt(
         ));
     }
     if let Some(reason) = &preview.unavailable_reason {
-        body.push_str(&format!("\n\nOne-time approval only: {reason}"));
+        body.push_str(&format!("\n\nNot reusable: {reason}"));
     }
     body.push_str(&format!("\n\n{hint}"));
     let mut options = vec![("Allow once", 'y', Decision::Allow)];
@@ -201,6 +258,23 @@ impl Bridge<'_> {
             self.show_stopping(None);
         } else {
             self.repaint(true);
+        }
+    }
+
+    /// The card for `call_id` reads as waiting for approval rather than running.
+    fn hold_for_approval(&mut self, call_id: &str, waiting: bool) {
+        self.shell
+            .transcript
+            .tool_awaiting_approval(call_id, waiting);
+    }
+
+    /// Time spent at the prompt is not run time: the call's clock (card, status line and the
+    /// elapsed reported with its result) starts again once the user has answered.
+    fn release_from_approval(&mut self, call_id: &str, waited: Duration) {
+        self.hold_for_approval(call_id, false);
+        if let Some((_, _, started)) = self.pending.iter_mut().find(|(id, _, _)| id == call_id) {
+            *started = started.checked_add(waited).unwrap_or_else(Instant::now);
+            self.shell.status.tool_started = Some(*started);
         }
     }
 
@@ -456,10 +530,35 @@ impl Ui for Bridge<'_> {
         self.repaint(false);
     }
 
+    fn tool_output_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        // Calls are keyed by id: two running calls of one tool each keep their own card.
+        if let Some((id, _, _)) = self
+            .pending
+            .iter()
+            .rev()
+            .find(|(id, tool, _)| id == call_id && tool == name)
+        {
+            self.shell.transcript.tool_delta(id, text);
+        }
+        self.repaint(false);
+    }
+
     fn tool_progress(&mut self, name: &str, text: &str) {
         // Progress names its tool, not its call: it belongs to the newest pending call of that tool,
         // the same call `tool_output` streams into.
         if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, tool, _)| tool == name) {
+            self.shell.transcript.tool_progress(id, text);
+        }
+        self.repaint(false);
+    }
+
+    fn tool_progress_with_id(&mut self, call_id: &str, name: &str, text: &str) {
+        if let Some((id, _, _)) = self
+            .pending
+            .iter()
+            .rev()
+            .find(|(id, tool, _)| id == call_id && tool == name)
+        {
             self.shell.transcript.tool_progress(id, text);
         }
         self.repaint(false);
@@ -471,7 +570,11 @@ impl Ui for Bridge<'_> {
     }
 
     fn background_notice(&mut self, message: &str) {
-        self.shell.note("Background", message);
+        self.shell.notify(
+            crate::ui::overlay::inbox::Category::General,
+            "Background",
+            message,
+        );
         self.repaint(true);
     }
 
@@ -705,7 +808,11 @@ impl Ui for Bridge<'_> {
             self.repaint(true);
             return;
         }
-        self.shell.note("Notice", message);
+        self.shell.notify(
+            crate::ui::overlay::inbox::Category::General,
+            "Notice",
+            message,
+        );
         self.repaint(true);
     }
 
@@ -936,7 +1043,7 @@ impl Ui for Bridge<'_> {
 
     fn approve_call_with_preview(
         &mut self,
-        _call_id: &str,
+        call_id: &str,
         tool: &str,
         summary: &str,
         preview: &agent::safety::approval::ApprovalPreview,
@@ -951,6 +1058,8 @@ impl Ui for Bridge<'_> {
             .iter()
             .map(|(label, key, _)| (*label, *key))
             .collect();
+        self.hold_for_approval(call_id, true);
+        let asked = Instant::now();
         let decision = loop {
             let decision = self
                 .shell
@@ -971,6 +1080,7 @@ impl Ui for Bridge<'_> {
                 break Decision::Deny;
             }
         };
+        self.release_from_approval(call_id, asked.elapsed());
         self.settle_prompt(was_stopping);
         decision
     }
@@ -1059,26 +1169,12 @@ impl Ui for Bridge<'_> {
             }
             let (width, height) = self.shell.term.size();
             let draft_note = self.shell.draft_note(focus);
-            let draft_height = if draft_note.is_some() { 4 } else { 0 };
-            let inner_width = usize::from(width).saturating_sub(4);
-            let mut body = dialog.rows(
-                inner_width,
-                usize::from(height).saturating_sub(6 + draft_height),
-            );
-            body.insert(1.min(body.len()), ATTENTION_HINT.into());
-            if let Some(note) = draft_note {
-                body.extend(note.lines().take(draft_height).map(|line| {
-                    crate::ui::text::ellipsize(
-                        &crate::ui::text::sanitize(line),
-                        inner_width,
-                        self.shell.themes.current().ascii(),
-                    )
-                }));
-            }
-            let rows = crate::ui::questions::framed(
-                body,
+            let rows = question_panel(
+                &dialog,
                 usize::from(width),
                 usize::from(height).saturating_sub(1),
+                draft_note.as_deref(),
+                focus,
                 self.shell.themes.current(),
             );
             if self.shell.paint(Some(rows)).is_err() {
@@ -1103,7 +1199,7 @@ impl Ui for Bridge<'_> {
                     if attention_key(&key) {
                         dialog.pause_timeout(Instant::now());
                         let pending = dialog
-                            .rows(inner_width, usize::from(height).saturating_sub(5))
+                            .rows(usize::from(width), usize::from(height).saturating_sub(1))
                             .join("\n");
                         let exit =
                             self.shell
@@ -1219,3 +1315,6 @@ mod request_settings_tests;
 
 #[cfg(test)]
 mod approval_tests;
+
+#[cfg(test)]
+mod question_tests;

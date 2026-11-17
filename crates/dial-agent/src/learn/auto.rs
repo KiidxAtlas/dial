@@ -81,20 +81,26 @@ pub fn compute_lock_cancellable(
 
 /// Persistent operator stop: checked between cases and inside training subprocess polling.
 pub fn check_stop(config: &Config) -> Result<()> {
+    super::compute::check_cancelled()?;
     ensure!(
         !config.state_dir.join("improvement.stop").try_exists()?,
         "improvement stopped by operator"
     );
     // A running background job also stops when today's compute budget is spent.
     if super::compute::background_active() {
-        check_compute_budget(config, super::compute::lease_elapsed_secs())?;
+        let at = super::resources::now();
+        let elapsed = super::compute::lease_elapsed_today_secs_at(at);
+        check_compute_budget_at(config, elapsed, at)?;
     }
     Ok(())
 }
 
-/// Also used by request watchers, which cannot read the owning thread's lease clock.
-pub(super) fn check_compute_budget(config: &Config, elapsed_secs: u64) -> Result<()> {
-    let used = super::resources::used_today_checked(&config.user_dir)?.saturating_add(elapsed_secs);
+pub(super) fn check_compute_budget_at(config: &Config, elapsed_secs: u64, at: u64) -> Result<()> {
+    if config.improve.daily_compute_minutes == 0 {
+        return Ok(());
+    }
+    let used =
+        super::resources::used_at_checked(&config.user_dir, at)?.saturating_add(elapsed_secs);
     if super::resources::budget_left(&config.improve, used) == Some(0) {
         return Err(BudgetReached.into());
     }

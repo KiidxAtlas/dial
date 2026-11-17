@@ -33,14 +33,17 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CALLBACK_PORT: u16 = 1455;
-/// Shared Codex compatibility version for model listing, inference, compaction and usage.
-pub(super) const CLIENT_VERSION: &str = "0.159.0";
+mod client_version;
+/// The Codex compatibility version for model listing, inference, compaction and usage.
+pub(super) use client_version::current as client_version;
 pub(super) const ORIGINATOR: &str = "dial";
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const MAX_JSON: u64 = 256 * 1024;
 // Account catalogs include model instructions and can be much larger than OAuth responses.
 const MAX_CATALOG_JSON: u64 = 8 * 1024 * 1024;
 const FILE: &str = "chatgpt-accounts.json";
+/// Model discovery renews an access token issued longer ago than this (seconds).
+const DISCOVERY_RENEW_AGE: u64 = 600;
 
 /// Credential file protected independently from other subscription-store data.
 pub fn credential_path(dir: &std::path::Path) -> std::path::PathBuf {
@@ -189,14 +192,20 @@ pub fn accounts(dir: &Path) -> Result<Vec<AccountInfo>> {
         .iter()
         .map(|(id, account)| AccountInfo {
             client_id: id.clone(),
-            label: format!(
-                "{} ({id})",
-                if account.email.is_empty() {
+            label: {
+                let name = if account.email.is_empty() {
                     "ChatGPT account"
                 } else {
                     &account.email
+                };
+                // The plan the stored access token was issued for; renewal keeps it current.
+                match account.tokens.as_ref().and_then(plan_of) {
+                    Some(plan) => {
+                        format!("{name} · {} ({id})", super::usage_report::plan_label(&plan))
+                    }
+                    None => format!("{name} ({id})"),
                 }
-            ),
+            },
             active: state.active.as_ref() == Some(id),
             signed_in: account.tokens.is_some() && account.client_id == CLIENT_ID,
         })
@@ -824,14 +833,96 @@ fn account_token_at(
     scoped_account_token_at(dir, None, cancel, url)
 }
 
+/// When a stored access token is exchanged for a new one.
+#[derive(Clone, Copy)]
+enum Renew {
+    /// Only within a minute of expiry (every dispatch).
+    Expiring,
+    /// Also when it was issued at least this many seconds ago (model discovery).
+    OlderThan(u64),
+    /// Whenever the provider permits (a plan-gated refusal).
+    Now,
+}
+
+/// A forced token renewal and the ChatGPT plan the old and new access tokens name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renewal {
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+impl Renewal {
+    /// The account's plan changed (an upgrade or downgrade) since the old token was issued.
+    pub fn plan_changed(&self) -> bool {
+        self.after.is_some() && self.before != self.after
+    }
+}
+
+/// The ChatGPT plan (`chatgpt_plan_type`) an access token, else its identity token, was issued for.
+fn plan_of(tokens: &Tokens) -> Option<String> {
+    [tokens.access_token.as_str(), tokens.id_token.as_str()]
+        .into_iter()
+        .filter_map(|token| codex_claims(token).ok())
+        .find_map(|claims| {
+            claims[JWT_AUTH_CLAIM]["chatgpt_plan_type"]
+                .as_str()
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+/// Exchange the account's refresh token now, so a plan bought since sign-in reaches the access
+/// token: the access token records the plan it was issued for, and an unexpired one is otherwise
+/// kept for days. `None` when the provider does not permit a renewal yet (`earliest_refresh_at`).
+pub fn renew_access(
+    dir: &Path,
+    account_id: Option<&str>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<Renewal>> {
+    renew_at(dir, account_id, cancel, TOKEN_URL, Renew::Now)
+}
+
+/// [`renew_access`] against a fake token endpoint.
+#[cfg(any(test, feature = "test-support"))]
+pub fn renew_access_at(
+    dir: &Path,
+    account_id: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    token_url: &str,
+) -> Result<Option<Renewal>> {
+    renew_at(dir, account_id, cancel, token_url, Renew::Now)
+}
+
 fn scoped_account_token_at(
     dir: &Path,
     selected: Option<&str>,
     cancel: Arc<AtomicBool>,
     url: &str,
 ) -> Result<(String, SecretToken)> {
-    cancelled(&cancel)?;
     let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
+    token_locked(dir, selected, cancel, url, Renew::Expiring).map(|(id, token, _)| (id, token))
+}
+
+fn renew_at(
+    dir: &Path,
+    selected: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    url: &str,
+    renew: Renew,
+) -> Result<Option<Renewal>> {
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
+    token_locked(dir, selected, cancel, url, renew).map(|(_, _, renewal)| renewal)
+}
+
+/// Caller holds the credential lock.
+fn token_locked(
+    dir: &Path,
+    selected: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    url: &str,
+    renew: Renew,
+) -> Result<(String, SecretToken, Option<Renewal>)> {
+    cancelled(&cancel)?;
     let mut state = load(dir)?;
     let id = selected
         .map(str::to_owned)
@@ -879,7 +970,17 @@ fn scoped_account_token_at(
         previous.expires_at > now() || previous.earliest_refresh_at <= now(),
         "ChatGPT token expired before renewal is available; sign in again from /providers"
     );
-    if previous.expires_at <= now() + 60 && previous.earliest_refresh_at <= now() {
+    let due = match renew {
+        Renew::Expiring => false,
+        Renew::Now => true,
+        // ChatGPT access tokens carry `iat`; one without it is left to expire normally.
+        Renew::OlderThan(age) => codex_claims(&previous.access_token)
+            .ok()
+            .and_then(|claims| claims["iat"].as_u64())
+            .is_some_and(|issued| now().saturating_sub(issued) >= age),
+    };
+    let mut renewal = None;
+    if (due || previous.expires_at <= now() + 60) && previous.earliest_refresh_at <= now() {
         let response = token_request(
             url,
             &[
@@ -896,6 +997,10 @@ fn scoped_account_token_at(
             refreshed_id == id && refreshed_subject == account.subject,
             "ChatGPT refresh returned a different workspace; sign in again from /providers"
         );
+        renewal = Some(Renewal {
+            before: plan_of(previous),
+            after: plan_of(&replacement),
+        });
         account.tokens = Some(replacement);
         save(dir, &state)?;
     }
@@ -906,14 +1011,20 @@ fn scoped_account_token_at(
         account_id == id,
         "ChatGPT refresh returned a different workspace; sign in again from /providers"
     );
-    Ok((account_id, SecretToken::new(tokens.access_token.clone())))
+    Ok((
+        account_id,
+        SecretToken::new(tokens.access_token.clone()),
+        renewal,
+    ))
 }
+/// Signs one account out and forgets it: the registration, its tokens and its cached model list.
+/// Remote revocation is attempted first; a failure there still removes the local entry.
 pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String> {
     let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut state = load(dir)?;
     let account = state
         .accounts
-        .get_mut(id)
+        .get(id)
         .ok_or_else(|| anyhow::anyhow!("ChatGPT account registration no longer exists"))?;
     let revoked = if let Some(tokens) = &account.tokens {
         (|| -> Result<()> {
@@ -947,18 +1058,45 @@ pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String>
     } else {
         true
     };
-    account.tokens = None;
+    state.accounts.remove(id);
     if state.active.as_deref() == Some(id) {
         state.active = None;
     }
     save(dir, &state)?;
-    Ok(if revoked { "Signed out of ChatGPT; account registration retained for later sign-in." } else { "Signed out locally. Remote revocation was not confirmed; disconnect Dial in ChatGPT Settings if needed." }.into())
+    forget_cached_catalogs(dir, Some(id))?;
+    Ok(if revoked { "Signed out of ChatGPT and removed the account from Dial." } else { "Removed the ChatGPT account from Dial. Remote revocation was not confirmed; disconnect Dial in ChatGPT Settings if needed." }.into())
 }
 
-/// Forget all local account registrations and tokens without a network request.
+/// Drops cached model lists for one account, or for every account when `id` is `None`. The file
+/// is rewritten rather than deleted so a legacy copy is not migrated back in.
+fn forget_cached_catalogs(dir: &Path, id: Option<&str>) -> Result<()> {
+    let path = crate::config::paths::chatgpt_model_catalog_file(dir);
+    let _lock = locked_cancellable(&path, &AtomicBool::new(false))?;
+    let Some(bytes) = crate::platform::atomic::read_private(&path)? else {
+        return Ok(());
+    };
+    let mut catalogs: BTreeMap<String, Value> = match id {
+        // An unreadable cache holds nothing worth keeping once every account is forgotten.
+        None => BTreeMap::new(),
+        Some(_) => serde_json::from_slice(&bytes).map_err(|_| {
+            anyhow::anyhow!("ChatGPT model metadata cache is invalid; rescan from /models")
+        })?,
+    };
+    if let Some(id) = id
+        && catalogs.remove(id).is_none()
+    {
+        return Ok(());
+    }
+    write_private(&path, &serde_json::to_vec(&catalogs)?)
+}
+
+/// Forget all local account registrations, tokens and cached model lists without a network request.
 pub fn forget_accounts(dir: &Path) -> Result<()> {
-    let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
-    save(dir, &State::default())
+    {
+        let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
+        save(dir, &State::default())?;
+    }
+    forget_cached_catalogs(dir, None)
 }
 fn codex_request(
     account_id: &str,
@@ -972,7 +1110,7 @@ fn codex_request(
         .header("chatgpt-account-id", account_id)
         .header("OpenAI-Beta", "responses=experimental")
         .header("originator", ORIGINATOR)
-        .header("version", CLIENT_VERSION)
+        .header("version", client_version())
         .header("Accept", "application/json")
         .call()
         .map_err(|_| anyhow::anyhow!("OpenAI Codex model discovery unavailable"))
@@ -986,17 +1124,30 @@ pub fn discover(
 ) {
     let label = "ChatGPT subscription";
     let outcome = (|| -> Result<(String, Vec<super::catalog::ModelEntry>)> {
+        // Discovery (startup, F5, /providers) renews a token older than ten minutes, so a plan
+        // bought since sign-in lists its models without signing in again. A failed renewal keeps
+        // the stored token; the normal access below reports any real sign-in problem.
+        let _ = renew_at(
+            dir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            TOKEN_URL,
+            Renew::OlderThan(DISCOVERY_RENEW_AGE),
+        );
         let (id, token) = account_token_at(dir, Arc::new(AtomicBool::new(false)), TOKEN_URL)?;
+        // The backend lists (and serves) newer models only to a recent enough client version.
+        let supplemental = codex_model_metadata();
+        let version =
+            client_version::refresh(dir, supplemental.as_ref(), client_version::REGISTRY_URL);
         let urls = [
-            format!("{BASE_URL}/codex/models?client_version={CLIENT_VERSION}"),
-            format!("{BASE_URL}/models?client_version={CLIENT_VERSION}"),
+            format!("{BASE_URL}/codex/models?client_version={version}"),
+            format!("{BASE_URL}/models?client_version={version}"),
         ];
         let mut response = urls
             .iter()
             .find_map(|url| codex_request(&id, &token, url, 5).ok())
             .ok_or_else(|| anyhow::anyhow!("OpenAI Codex model discovery failed"))?;
         let value = limited_json(&mut response, MAX_CATALOG_JSON, "model catalog")?;
-        let supplemental = codex_model_metadata();
         let catalog = build_catalog(&value, supplemental.as_ref())?;
         save_catalog(dir, &id, &catalog)?;
         let models = catalog.models;

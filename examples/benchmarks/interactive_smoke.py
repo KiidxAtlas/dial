@@ -1099,7 +1099,7 @@ def main():
             # Alt+M selects a model on every platform; Ctrl+K does only on macOS (elsewhere it
             # cuts to line end), so it would leave the Linux picker closed.
             terminal.key("M-m")
-            terminal.wait("scope: global")
+            terminal.wait("Save to: All projects", history=False)
             terminal.capture("picker")
             terminal.run("resize-window", "-t", "smoke", "-x", "72", "-y", "22")
             time.sleep(0.3)
@@ -1244,7 +1244,7 @@ def main():
             # A populated real picker acknowledges that Dial consumed discovery;
             # do not infer completion from an elapsed sleep or HTTP response alone.
             terminal.key("M-m")
-            terminal.wait("scope: global")
+            terminal.wait("Save to: All projects", history=False)
             terminal.wait("mock-next", history=False)
             terminal.key("Escape")
             assert model(home) == "mock-main", "cancelled switch must not apply after discovery"

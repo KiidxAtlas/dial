@@ -1,9 +1,9 @@
 use super::cache::selection_cache_key;
 use super::credentials::env_token;
 use super::local_models::{
-    lmstudio_gguf_models, lmstudio_gguf_models_where, lmstudio_mlx_models,
-    lmstudio_mlx_models_where, local_models, local_models_where, model_card_kind_in,
-    resolve_local_model_in,
+    annotate_image_checkpoints, lmstudio_gguf_models, lmstudio_gguf_models_where,
+    lmstudio_mlx_models, lmstudio_mlx_models_where, local_models, local_models_where,
+    model_card_kind_in, resolve_local_model_in,
 };
 use super::local_servers::{
     annotate_lmstudio, declared_kind, kind_from_declared, ollama_show, parse_lmstudio,
@@ -2193,6 +2193,45 @@ fn krea_root_transformer_layout_is_an_image_not_chat() {
     assert_eq!(local_model_metadata(dir.path()).kind, ModelKind::Image);
 }
 
+#[test]
+fn image_checkpoints_are_available_when_stable_diffusion_cpp_can_load_them() {
+    let runnable = tempfile::tempdir().unwrap();
+    for part in ["transformer", "vae", "text_encoder"] {
+        fs::create_dir_all(runnable.path().join(part)).unwrap();
+        fs::write(runnable.path().join(part).join("model.safetensors"), b"w").unwrap();
+    }
+    let quantized = tempfile::tempdir().unwrap();
+    fs::write(
+        quantized.path().join("config.json"),
+        r#"{"quantization":{"bits":4,"method":"mflux"}}"#,
+    )
+    .unwrap();
+    let entry = |path: &Path| ModelEntry {
+        selection: ModelSelection {
+            provider: "mlx".into(),
+            model: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        label: "image".into(),
+        source: "Hugging Face cache (MLX)".into(),
+        available: false,
+        metadata: ModelMetadata {
+            kind: ModelKind::Image,
+            ..ModelMetadata::default()
+        },
+    };
+    let mut models = vec![entry(runnable.path()), entry(quantized.path())];
+    annotate_image_checkpoints(&mut models);
+    assert!(models[0].available, "{}", models[0].source);
+    assert!(models[0].source.contains("stable-diffusion.cpp"));
+    assert!(!models[1].available);
+    assert!(
+        models[1].source.contains("not runnable: MLX-quantized"),
+        "{}",
+        models[1].source
+    );
+}
+
 /// Direct provider discovery: an exact documented id is annotated only when the live row declares
 /// no image output, and the row's own value (including `Disabled`) always wins.
 #[test]
@@ -2743,4 +2782,70 @@ fn reset_provider_stays_unconfigured_despite_saved_selections() {
                 .any(|entry| entry.selection.provider == id)
         );
     }
+}
+
+/// A model served by MLX-Serve that declares `image` is listed as an available image-role
+/// candidate, and the saved listing is what `image_gen` later reads for the role's transport.
+#[test]
+fn served_mlx_serve_image_model_is_selectable_for_the_image_role() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let url = routed(vec![(
+        "/v1/models",
+        serde_json::json!({"data":[
+            {"id":"mlx-community/flux2-klein-9b-4bit","owned_by":"mlx-serve","capabilities":["image"]},
+            {"id":"mlx-community/chat-4bit","owned_by":"mlx-serve","capabilities":["chat"]}
+        ]})
+        .to_string(),
+    )]);
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let mut configured: BTreeMap<_, _> = LOCAL_SERVERS
+        .iter()
+        .map(|&(id, ..)| id)
+        .chain(KNOWN.iter().map(|row| row.0))
+        .chain(["chatgpt", "apple"])
+        .map(|id| {
+            (
+                id.to_owned(),
+                ProviderSpec {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    configured.insert(
+        "mlx-serve".into(),
+        ProviderSpec {
+            label: "MLX-Serve".into(),
+            base_url: url.clone(),
+            ..Default::default()
+        },
+    );
+    let found = discover(&layout, &configured, &[]);
+    let served: Vec<_> = found
+        .models
+        .iter()
+        .filter(|entry| entry.selection.provider == "mlx-serve")
+        .collect();
+    let image = served
+        .iter()
+        .find(|entry| entry.selection.model == "mlx-community/flux2-klein-9b-4bit")
+        .expect("served image model listed");
+    assert!(image.available, "a served image model can be selected");
+    assert!(image.accepts_image_role());
+    assert!(!image.supports_chat(), "never offered as a chat model");
+    assert_eq!(image.selection.base_url.as_deref(), Some(url.as_str()));
+    let chat = served
+        .iter()
+        .find(|entry| entry.selection.model == "mlx-community/chat-4bit")
+        .unwrap();
+    assert!(!chat.accepts_image_role(), "chat models stay out of Images");
+
+    // Assigning the entry to the image role stores its selection; image_gen reads the saved listing.
+    assert_eq!(
+        model_metadata(&layout, &image.selection).image_generation,
+        Some(ImageGenerationApi::MlxServe)
+    );
 }

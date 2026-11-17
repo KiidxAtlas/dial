@@ -38,6 +38,7 @@ fn compiler_preview_reports_type_failure_and_preserves_project() {
             deny_read: vec![],
             extra_write: toolchains,
             allow_network: false,
+            serial_ports: false,
         },
     );
     let output = run(

@@ -41,7 +41,7 @@ packets say that index coverage is partial, so an owner that is not found may be
 | `memory.semantic.recall_limit` | 8 | Most facts per query, 1–50. |
 | `memory.semantic.token_budget` | 1500 | Recall text budget in tokens, 64–16000. |
 | `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts between turns with the `memory` role, or with the `small` role when `memory` is unassigned. It pauses while neither role is assigned (it never falls back to the main model); recall and the `memory` tool's `retain` action keep working. `/memory status` names the role in use. Malformed model output drops the turn; an unreachable model keeps it queued. A failing extraction does not block duplicate merging. |
-| `memory.semantic.consolidate_interval_minutes` | 60 | How often near-duplicate facts are merged (token-overlap ≥ 0.8; the newer copy is forgotten). Facts whose numbers differ are never merged. `0` disables consolidation. Range 0–10080. |
+| `memory.semantic.consolidate_interval_minutes` | 60 | How often duplicate facts are merged. Two facts merge only when they are exactly equal after case and whitespace are normalized (`Use pnpm` and `use  pnpm` merge). Punctuation, numbers, word order and every word are compared exactly, so near duplicates (a word added, dropped, moved or negated, such as "rarely require approval" vs "require approval") are kept. The newer copy of a merged pair is forgotten. `0` disables consolidation. Range 0–10080. |
 
 Privacy: with no endpoint configured, nothing leaves the machine. With an endpoint, fact content and recall queries are sent to that service for embedding. Embedding requests send only the URL, model and bearer key; custom provider headers and `allow_insecure` are not applied to them. Facts are re-embedded only when their content changes or after `/memory rebuild`. Recalled facts are advisory, untrusted text.
 Auto-retain sends the text of each queued turn to the model assigned to the `memory` role, or to the `small` role when `memory` is unassigned.
@@ -57,7 +57,7 @@ full lexical/embedding search. Rejected facts are not marked shown and can attac
 request. Provenance/codebase automatic context similarly abstains on incidental overlap and admits
 unchanged individual records only once while they remain in the visible branch.
 
-Semantic recall ranks each bank with reciprocal rank fusion over up to three voices: lexical (FTS5 BM25), embedding similarity when an embedding is available, and recency. The recency voice runs only for temporal queries and orders the facts updated in the last seven days, newest first. A query is temporal when it contains one of these whole words or phrases (matched case-insensitively, on word boundaries): "yesterday", "today", "recent", "recently", "last", "latest", "ago", "before", "this week", "this month". Substrings do not count, so "blast radius" or "diagonal" are not temporal. Recall results are cached per bank, keyed by query, limit, token budget and query vector, for at most 300 seconds and 32 entries. Any write to the memory database (retain, update, forget, consolidation, or a write from another connection) invalidates the bank's cache. Temporal recalls and recalls that degraded because embedding failed are not cached. Relation or graph ranking is not part of this backend: Dial's semantic store has no entity or triple storage.
+Semantic recall ranks each bank with reciprocal rank fusion over up to three voices: lexical (FTS5 BM25), embedding similarity when an embedding is available, and recency. The recency voice runs only for temporal queries and orders the facts updated in the last seven days, newest first. A query is temporal when it contains one of these whole words or phrases (matched case-insensitively, on word boundaries): "yesterday", "today", "recent", "recently", "last", "latest", "ago", "before", "this week", "this month". Substrings do not count, so "blast radius" or "diagonal" are not temporal. Query embeddings are cached before any embedding request: a repeated query on the same embedding route makes no new request, for at most 300 seconds and 64 queries. The route is the endpoint, the model, and a digest of the credential and resolved custom headers, so a rotated key or changed header drops the cached vectors; the digest keeps the credential out of memory strings. Failed embeddings are not cached. Recall results are cached per bank, keyed by query, limit, token budget and query vector, for at most 300 seconds and 32 entries. Any write to the memory database (retain, update, forget, consolidation, or a write from another connection) invalidates the bank's cache. Temporal recalls and recalls that degraded because embedding failed are not cached. Relation or graph ranking is not part of this backend: Dial's semantic store has no entity or triple storage.
 
 `/debug memory` reports the active backend, fact counts, embedding and auto-retain state, each bank's recall cache hits, misses and entries, the most recent recall (mode, item count, and whether each bank was a cache hit, miss, bypass, or skipped), and the backend's read-only diagnose report.
 
@@ -96,6 +96,13 @@ Local background operations check that compute budget while running, not just be
 Training requests a cooperative checkpoint/pause on budget exhaustion and uses the existing bounded
 termination path if the worker does not settle. Exhaustion ends the cycle rather than retrying as
 ordinary foreground preemption; recorded usage and active lease time both count toward the limit.
+Usage is settled against UTC calendar days; a lease crossing midnight charges only its current-day
+portion to the current daily limit, rather than moving the whole lease into the new day. The ledger
+retains the existing single-day accounting policy, not a historical usage archive.
+Same-day clock corrections preserve monotonic compute. A zero local budget bypasses budget-ledger
+reads but not cancellation or operator pause. Failed settlement retains debt in this process and
+blocks new admission until persistence recovers; that debt is not crash-durable, and an ambiguous
+publication may conservatively be charged again rather than silently undercounted.
 
 Repository-derived practice tasks are sourced from local git history and tests when available; generated curriculum tasks remain a separate source. Evaluation snapshots stay isolated from training trajectories. Manually registered repository tasks remain available for curated cases.
 
@@ -160,6 +167,10 @@ Backend-specific controls are exposed in `/settings`. External backends require 
 operator provisioning; missing dependencies produce an inactive/error status, never a lexical
 fallback advertised as semantic recall. Model overrides changing provider discard the previous
 provider's endpoint, credentials and custom headers.
+
+Sharpshooter maintenance treats every remaining queued delta as pending work, including deltas
+older than the last partial consolidation. The configured interval and active consolidation lease
+still prevent overlapping or too-frequent passes; a successful partial pass does not strand its tail.
 
 `/memory` routes to the selected backend. Hindsight supports `status`, `search`, `save`,
 `enqueue`, `stats`, `diagnose` and backend-specific commands; unsupported operations fail

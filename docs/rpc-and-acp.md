@@ -97,10 +97,19 @@ MCP sign-in uses the same events: `mcp_login` (`server`) runs `/mcp login` for a
 Session administration, models and settings (native `dial rpc` only for the `session_admin` and `settings` groups). These controller methods answer while a turn runs:
 
 - `list_sessions` (`offset`, `limit` 1–500 default 50, `include_empty`): this project's sessions in picker order, pinned first then latest activity. Each entry has `session_id`, `title`, `started`, `updated`, `messages`, `user_messages`, `model`, `parent_id`, `first_message`, `last_message`, `last_answer`, `pinned`, `current` and `open_elsewhere`. The page has `offset`, `total` and `next_offset`. Sessions without a user request are omitted unless `include_empty` is true; the current session is always listed. Over ACP, `session/list` keeps its own ACP shape.
+- `search_sessions` (`query`, optional `limit` 1–1,000 default 50): read-only full-text history
+  search through the same local index as `/search`. The nonblank query is capped at 4,096 UTF-8
+  bytes after trimming. Returns `{query, limit, hits, has_more}`; hits contain `session_id`,
+  `entry_id`, `role`, `snippet`, bounded `preview`, `when` and best-effort `title` (empty when
+  unavailable). Increase `limit` to expand the ranked window; refine the query beyond 1,000.
+  Each request queries current history, not a stable snapshot. Runs on a bounded connection-owned
+  read job while turns continue; saturation returns `busy`, malformed inputs `invalid_params`,
+  and index failures `failed`. Search never opens or rewinds a conversation; use `resume` to open one.
 - `pin_session` (`session_id`, `pinned`): idempotent; `changed` reports whether anything changed.
 - `delete_session` (`session_id`): removes another session of this project together with its pin. The active session and journals held by another writer are refused.
 - `fork_session` (optional `session_id`, default the active session): an actor method like `resume`, refused while a turn runs. It forks the session into a new one and switches to it, running the same branch and switch hooks as `/fork`. Returns `session_id`, `forked_from` and `plan_mode`.
 - `list_models` (optional `provider`): every model `set_model` accepts without a network round trip. That covers the main, current, role, favorite and profile models, the bundled catalog of the providers they and `[providers]` name, downloaded local models, and the saved `/models` listings of those providers. Models whose metadata declares a non-chat kind (embedding, rerank, image, audio) are left out. Each row has `provider`, `model_id`, `label`, `sources`, `current` and `thinking_levels`, plus catalog or local metadata when known (`context_window`, `max_output_tokens`, `vision`, `reasoning`, `default_thinking`, `pricing`, `kind`). Live provider listings are not queried.
+- `delete_local_model` (`model`, optional `dry_run`): deletes a downloaded local model as Ctrl+D in `/models` → Get models does. `model` is a local model path or label that local discovery lists (Hugging Face cache, LM Studio, MLX-Serve); its whole folder in that store is removed. Replies `{label, model, folder, bytes, source, deleted}`; `dry_run: true` only reports. An unknown or out-of-store model is `not_found`, one the saved configuration or the session selects is `refused`, and a failed delete is `failed`.
 - `settings_schema`: the settings reference (`dial config reference`): each setting's `path`, `label`, `description`, `kind`, `constraints`, `default` and `restart`.
 - `get_settings` (optional `key`): every effective setting as `{key, value, redacted}`, or `{key, value}` for one key. Credentials are redacted.
 - `set_setting` (`key`, non-null `value`, `scope` `global` or `project`, default `global`) and `reset_setting` (`key`, `scope`) use the same validation and locked write as `dial config set`/`reset`. They change the saved files only (`restart_required`): the running engine keeps its configuration until `apply_settings`. Values are never echoed.
@@ -130,9 +139,77 @@ Workspace directories (native `dial rpc` only, `workspace` group): `list_dirs` (
 
 Background jobs (native `dial rpc` only, `jobs` group; controller methods, answer during a turn): `list_jobs` returns the session's `bg` jobs, each `{name, command, status, running, stop_requested, terminal}`. `stop_job` (`name`) stops one and returns `{name, stopped}`; an unknown job is `not_found`. Attaching to a job's terminal stays terminal-only.
 
+Usage (native `dial rpc` only, `usage` group; controller method, answers during a turn): `usage` returns `{providers: [{provider, plan, report, error}]}` for every signed-in provider with a usage endpoint, as `/usage` shows. `plan` is the account's readable plan or tier (`Plus`, `Pro`, `Max 20x`, a Copilot or Z.AI plan, a Gemini tier) or `null` when the provider does not report one; `report` is the provider's limits, notes and metadata. One provider's failure is its `error`; the others still report. Spending a saved reset (`/usage reset`) stays terminal-only.
+
+Checks, evidence, policy, skills and reliability (native `dial rpc` only; ACP does not serve them). Checks: `list_checks` (read) returns what `/checks` shows: `{enabled, changed_files, automatic, configured}`; the automatic plan comes from the uncommitted changes, and an empty or non-repository tree reports none. `add_check {name, command, file_extensions?, timeout_secs?, confirm: true}` and `remove_check {name, confirm: true}` (write) edit the project check list as `/checks add` and `/checks remove` do; a check is a shell command that runs after edits, so both need `confirm: true`, and the change applies on `apply_settings`. Evidence: `evidence` (read) answers `checks` (the checks recorded at turn completion), `check {name}` (the retained log of one recorded check by exact name), `inspect {reference}` and `lineage {references}`; it writes nothing. `evidence_correct {reference, correction}` (write) appends a human correction, which is also added to the conversation as unverified evidence data. `evidence_compare {reference, other}` (write, because it stores a new investigation record) runs the semantic comparison; unlike `/evidence compare`, its result is not added to the conversation, so the agent sees it only when the client sends it as a message. Evidence text is redacted as `/evidence` shows it; redaction covers the patterns the storage redactor knows (for example bearer authorization headers), not every secret format. Policy and reliability: `policy` (`/policy`) and `reliability` (`/reliability`) are reads of the adaptive request policy and the tool reliability report for this session. Skills: `list_skills {action?: list|sources|installed|search, query?}` (read) answers the `/skills` views with the owner's text; `search` fetches each configured registry index over the network, so it is the one read that leaves the machine, and its query is limited to eight words and 200 bytes. `skill_action {action, name?, spec?, path?, scope?: project|user, dry_run?, update?, confirm?}` (write) runs one `/skills` change on a worker thread, one at a time: `enable` runs at once, `disable`, `install`, `update`, `remove` and a non-dry-run `import` need `confirm: true`, and a second change while one runs is refused `busy`. Typed fields become owner arguments; no shell line is parsed. Refusals use the coded errors above (`invalid_params` for a malformed or unconfirmed request, `conflict` for a duplicate check, `not_found` for an unknown check, `busy` for a concurrent skill change).
+
+Check edits judge duplicates and missing names against the saved files, under the settings locks, not the session's snapshot. `add_check` for a name the user or project file already defines is `conflict`, and `remove_check` for a name the project file lacks is `not_found`. A removed name can be added again before `apply_settings`, and a repeated add never writes a second entry. `list_checks.changed_files` reads Git's NUL-delimited status, so paths with spaces, non-ASCII names or `->` text are reported verbatim.
+
 Schema (`schema` group, controller method): `get_schema` returns this protocol's JSON Schema, the same document as `docs/rpc-schema.json`, so a client in any language can generate request and event types from the engine it is connected to.
 
 Command parity: `get_available_commands` gives every discoverable slash command an `rpc` field saying where a client finds it: `{surface: "method", method}` (call that method), `{surface: "client", reason}` (presentation the client renders itself, such as themes, key bindings or the activity panel) or `{surface: "terminal", reason}` (only the terminal serves it today; the reason names the alternative when there is one). Custom and skill commands are `{surface: "method", method: "send"}`. A test fails when a new command is added without a classification.
+
+### Native workflow operations
+
+These operations are advertised only by native RPC, not ACP. Check `ready.methods`; use the
+published JSON Schema for exact tagged variants. Actor mutations return `busy` during a main
+turn rather than silently queueing a session change behind it.
+
+- **Modes:** `get_modes` inspects state; `set_mode` controls vibe, skillful, plan, prewalk,
+  advisor, external thinking and plan-yolo through their existing session owners. Drafter,
+  fast/ultra/slow and extended-context preferences use the same settings plans as the terminal
+  and adopt through a validated rebuild. Drafter is project-scoped; fast/slow and extended
+  context retain the terminal's global scope. Unsupported provider tiers are refused.
+- **Goals:** `goal {action: get|set|guided|pause|resume|drop|budget, ...}` uses the existing
+  coordinator. Actions that return a continuation run through the ordinary turn lifecycle,
+  with cancellation and compute admission; they are not completion shortcuts.
+- **Side conversations:** `side_thread` supports `list`, `ask`, `open`, `answer` and `cancel`.
+  During a main turn, asking uses its frozen pre-turn context, not half-written history.
+  `side_state` events report persisted streaming prefixes and structured exchange outcomes.
+  Configurations requiring Dial's foreground compute admission refuse side inference over RPC
+  rather than borrowing or reacquiring an actor lease. Externally managed endpoint routes remain
+  subject to the existing lease-exemption policy; this is not a blanket loopback restriction.
+  `side_promote {thread_id}` creates a sibling conversation without switching the main session.
+  Switching, rewinding, compaction and relocation invalidate old snapshots. Clipboard handling
+  remains the client's job. Handoff uses `compact {method:"handoff", require_method:true,
+  instructions?:"..."}` through the existing compaction owner.
+- **Session maintenance:** `archive {view: projects|sessions|prompts, ...}` returns structured
+  history. `pack_session {path?}` refuses overwriting an existing archive. `label_session
+  {label}` labels the active leaf (empty clears it). `branch_session {turns, confirm:true}`
+  rewinds conversation only, never restores files. `move_session {path, confirm:true}` validates
+  the destination before relocation and replies only after rebuilding with the destination
+  layout/configuration; controller queries then use that same destination.
+- **Schedules:** `list_schedules`, `add_schedule`, `remove_schedule` and `schedule_status`
+  reuse the persisted scheduler store and lease. Add/remove require explicit `confirm:true`;
+  confirmation does not grant write permissions. Schedules remain read-only unless the request
+  specifies allowed capabilities. Status probes the existing lease; it does not start a daemon.
+- **Learning:** `research_status` reports stored versions, metrics, admission evidence and the
+  session's actual version/steering state. `research_action` evaluates a pending candidate or
+  promotes an evaluated steering vector with explicit confirmation and the existing admission
+  gates. Responses distinguish unchanged evaluation, next-turn adoption when improvement is
+  enabled, stored admission while improvement is disabled, and steering's next-model-load
+  activation when enabled. No request silently enables improvement or steering.
+- **Collaboration:** `collaboration_start {confirm:true,read_only?:bool}` hosts the current
+  conversation using the existing encrypted room owner; read-only is the default.
+  `collaboration_invite {confirm:true}` deliberately returns a secret bearer link; clients must
+  not log or expose it. Status and events never include that link. `collaboration_stop` tears
+  down the hosted room. Hosting ends on disconnect or conversation replacement.
+  `collaboration_status`, `collaboration_join {link,name?,confirm:true}` and
+  `collaboration_leave` also use the room owner. Joining means admission is pending, not that
+  the guest can write. Guest prompts and aborts retain host admission checks and never fall back
+  to local inference. Relay service administration remains outside this API.
+
+`recovery_snapshot` returns a combined idle transcript and live-state snapshot with an event
+sequence fence. It refuses active workers and oversized histories rather than certifying a
+racing or truncated recovery. Process preceding messages before applying it. `state.live`
+contains only pending approvals, question and todo with their fence; it cannot certify transcript
+recovery. See [client recovery](client-contracts.md#rust-client).
+
+`steer` accepts input only for an active turn, not merely a busy actor, and any supplied session ID
+must match that turn. Admission closes when the turn settles. Unconsumed queued input is discarded
+with a `notice` of `kind: "steering_discarded"` and `count`; it never leaks into the next turn. Send
+that input again explicitly if still wanted. Session activation clears prior live state and reseeds
+the activated session's todos. Unchanged side-conversation polls reuse their current projection.
 
 ### One process per session
 
@@ -150,21 +227,23 @@ Every plain-RPC event (not replies, not ACP frames) carries `seq`, `session_id` 
 
 Tool cards: after `tool_call`, the engine emits `tool_card` (`call_id`, `label`, `target`, `tone`, `body`, `facts`, optional `preview`), the same card the terminal renders. It can be sent again for the same `call_id` as the call progresses; the latest card replaces the earlier one. `tool_result` adds `status` (`ok`, `error`, `blocked`, `skipped`, `timeout`, `aborted`), `effects` (`none`, `known`, `unknown`) and `changed_paths` (absolute paths). Render these fields instead of parsing `summary` or `text`.
 
-When a client stops reading stdout, the engine queues frames (in memory, then spooled to disk) rather than dropping them. The client receives them in order once it reads again.
+Tool output and progress: `tool_output` (`call_id`, `name`, `delta`) streams text into the row of the call named by `call_id`; `call_id` is empty when the dispatch had no id, and clients then fall back to `name`. `tool_progress` (`call_id`, `name`, `text`) carries the latest live status snapshot of one running call and replaces the previous one. ACP maps both to `tool_call_update` on the same tool call: progress shows after the streamed output and never erases it. Stream-json print output carries `call_id` on `tool_output` when the dispatch had one. A retry that discards a failed attempt's streamed answer emits a typed `notice` with `kind` `retry` and `lane` `context`, after the partial answer is marked interrupted. Worker retries do not emit it.
+
+When a client stops reading stdout, the engine queues frames (in memory, then spooled to disk) rather than dropping them. The client receives them in order once it reads again. The private spool is capped at 1 GiB of outstanding bytes; delivered space is reused even when traffic keeps the queue continuously nonempty. The same bound limits the spool file's physical size. Exhausting the outstanding-byte budget fails the connection rather than silently dropping frames.
 
 ### Ready frame
 
 The first event on every connection is `ready`. Besides `protocol_version` (the version this connection speaks: `1` until the client negotiates otherwise), `session_id`, `model`, `tools`, `image_input` and `question_input`, it carries what a client needs to negotiate and size its requests:
 
 - `supported_protocol_versions`: array of versions the server serves (currently `[1, 2]`). Refuse to continue when none is one you implement.
-- `methods`: request methods this transport accepts. `capabilities`: the capability groups those methods belong to (`prompt`, `query`, `plan_mode`, `sessions`, `session_admin`, `maintenance`, `context_seed`, `tasks`, `steering`, `abort`, `approvals`, `questions`, `live_voice`, `model`, `export`, `host_tools`, `host_uris`, `auth`, `settings`, `checkpoints`, `extensions`, `schema`, `session_control`, `workspace`, `jobs`, `shutdown`). Over ACP the `questions`, `live_voice`, `host_tools`, `host_uris`, `auth`, `session_admin`, `settings`, `checkpoints`, `extensions`, `schema`, `session_control`, `workspace` and `jobs` groups are absent. The method table, capability groups and error codes are defined once in the `dial-protocol` crate, which the engine and `dial-client` share.
+- `methods`: request methods this transport accepts. `capabilities`: the capability groups those methods belong to (`prompt`, `query`, `plan_mode`, `sessions`, `session_admin`, `maintenance`, `context_seed`, `tasks`, `steering`, `abort`, `approvals`, `questions`, `live_voice`, `model`, `export`, `host_tools`, `host_uris`, `auth`, `settings`, `checkpoints`, `extensions`, `schema`, `session_control`, `workspace`, `jobs`, `usage`, `benchmarks`, `checks`, `evidence`, `diagnostics`, `skills`, `shutdown`). Over ACP the `questions`, `live_voice`, `host_tools`, `host_uris`, `auth`, `session_admin`, `settings`, `checkpoints`, `extensions`, `schema`, `session_control`, `workspace`, `jobs`, `usage`, `benchmarks`, `checks`, `evidence`, `diagnostics` and `skills` groups are absent. The method table, capability groups and error codes are defined once in the `dial-protocol` crate, which the engine and `dial-client` share.
 - `limits`: `max_request_bytes` (1 MiB for RPC, 8 MiB for ACP; a longer line is drained and answered with an error), `max_pending_steering` (8), `max_seed_messages` (200), `max_seed_message_bytes` (1 MiB), `max_memory_command_bytes` (8192), `messages_page_default` (50), `messages_page_max` (500) and `tool_result_event_bytes` (24 KiB; `tool_result` event text is clipped, the model-visible result is not).
 
 `hello` also takes `interactive` (boolean, default false; native `dial rpc` only, echoed in the reply). A GUI where a person answers sets it to true: the engine may then ask for things it otherwise refuses over RPC, such as the directory-access grant the model requests to work outside the workspace (sent as an ordinary `approval` event). Scripts leave it false and keep the non-interactive behaviour. `dial-client`'s `Launch::interactive` sets it.
 
 Protocol negotiation (`hello`, `params.protocol_version`): send one `hello` as the first request to move the connection to the highest version you speak. The response carries the negotiated `protocol_version` and `supported_protocol_versions`. A client that never sends `hello` stays on version 1 and sees exactly the v1 frames. Version 2 changes one thing: failed requests carry a stable `error.code` next to `error.message`. Codes are:
 
-- `busy`: another operation owns the session (a turn or maintenance is running, the session is closing) or the steering queue is full. Retry after the current operation settles.
+- `busy`: another operation owns the session (a turn or maintenance is running, the session is closing) or the steering queue is full. Admin reads (`list_sessions`, `list_models`, `settings_schema`, `get_settings`, `list_extensions`, `list_checks`, `list_skills`, `get_schema`) and the `usage` poll run as connection-scoped read jobs, at most four in flight at once; a read past that bound is refused with `busy` at once rather than queued. When the connection ends, new reads are refused, cancellable reads (`usage`) receive the connection's cancel token, and answers not yet delivered are dropped; non-cancellable reads finish on their own under their owner's limits. Retry after the current operation settles.
 - `invalid_params`: the request is malformed or a value is out of range (missing `text`, `approval_id` or `protocol_version`, an unknown approval `decision`, an invalid history cursor, an unparsable question payload or answer, a built-in command name sent as a prompt).
 - `not_pending`: the targeted turn, approval or question is not, or no longer, pending (`steer` with no active turn, a stale or already answered `approval_id`, a mismatched, unacknowledged, expired or replayed question). Drop the stale card rather than retrying.
 - `not_found`: the named session, setting, checkpoint turn or file does not exist.
@@ -214,9 +293,10 @@ RPC `tool_timing` events also carry `call_id`, alongside `name` and `seconds`. C
 the same tool publish their own timing and result as each finishes; clients should correlate by
 call ID rather than attach a duration to the most recently displayed tool name.
 
-Resuming a session whose writer lease is held creates an independent sibling rather than taking
-over the live owner. RPC resume results identify the source with `forked_from`; the returned session
-ID is the sibling's ID. Integrity errors and non-contention I/O errors still fail instead of forking.
+Native RPC resume of a held writer lease creates an independent sibling and returns `forked_from`.
+ACP `session/load` and `session/resume` require the exact requested identity: contention or a
+moved-away source is refused without creating a sibling or changing the active session. Integrity
+and non-contention I/O errors also fail rather than forking.
 
 A prompt response maps the authoritative outcome. Completed turns return a plain `stopReason` of
 `end_turn`; interrupted turns return `cancelled`; a turn that used its whole step budget returns

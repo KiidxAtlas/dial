@@ -134,3 +134,34 @@ fn acp_options_omit_the_list_unless_asked() {
             .is_none()
     );
 }
+
+fn delete_code(params: Value) -> dial_protocol::ErrorCode {
+    delete_local(&params, &[])
+        .unwrap_err()
+        .downcast_ref::<super::super::RequestError>()
+        .expect("coded refusal")
+        .code
+}
+
+#[test]
+fn delete_local_model_refuses_malformed_requests_and_unknown_models_without_deleting() {
+    use dial_protocol::ErrorCode;
+    assert_eq!(delete_code(json!(null)), ErrorCode::InvalidParams);
+    assert_eq!(delete_code(json!({})), ErrorCode::InvalidParams);
+    assert_eq!(
+        delete_code(json!({"model": "  "})),
+        ErrorCode::InvalidParams
+    );
+    assert_eq!(
+        delete_code(json!({"model": "x", "dry_run": "yes"})),
+        ErrorCode::InvalidParams
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("model");
+    std::fs::create_dir_all(&outside).unwrap();
+    assert_eq!(
+        delete_code(json!({"model": outside.to_string_lossy(), "dry_run": true})),
+        ErrorCode::NotFound
+    );
+    assert!(outside.is_dir());
+}

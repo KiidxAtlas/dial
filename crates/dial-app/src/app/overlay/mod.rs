@@ -33,11 +33,14 @@ pub(super) struct ImproveWatch {
 pub(super) enum Which {
     Palette,
     Controls,
+    ToolEvidence,
+    ToolEvidenceCall(String),
     Choice(Box<ChoiceSpec>),
     Activity(activity::ActivityTab),
     Compute,
     Improve,
     Jobs,
+    Job(String),
     Subagents,
     ModelDownloads,
     ModelMemory,
@@ -90,6 +93,19 @@ fn subagent_viewer_destination(action: &str) -> Option<Which> {
 
 /// Overlay navigation uses the same destinations while idle and during work.
 pub(super) fn overlay_destination(action: &str) -> Option<Which> {
+    // These choice-list values are internal navigation, not terminal slash commands.
+    let evidence = action
+        .strip_prefix("command:/open:tool-evidence")
+        .or_else(|| action.strip_prefix("open:tool-evidence"));
+    if let Some(rest) = evidence {
+        return if rest.is_empty() {
+            Some(Which::ToolEvidence)
+        } else {
+            rest.strip_prefix(':')
+                .and_then(|id| serde_json::from_str::<String>(id).ok())
+                .map(Which::ToolEvidenceCall)
+        };
+    }
     if let Some(path) = action.strip_prefix("open:settings:") {
         return crate::config::schema::registry()
             .iter()
@@ -106,6 +122,9 @@ pub(super) fn overlay_destination(action: &str) -> Option<Which> {
         return serde_json::from_str(selection)
             .ok()
             .map(Which::SelectedModelSettings);
+    }
+    if let Some(name) = action.strip_prefix("open:process:") {
+        return serde_json::from_str(name).ok().map(Which::Job);
     }
     if let Some(tab) = action
         .strip_prefix("open:activity:")
@@ -188,8 +207,9 @@ pub(super) enum ActiveOverlay {
 }
 
 impl ActiveOverlay {
-    /// Retain browser state, not live worker editors whose drop flushes a shared draft.
-    pub(super) fn retains_navigation(&self) -> bool {
+    /// Retain browser drill-down state, not sibling Activity tabs or live worker editors
+    /// whose drop flushes a shared draft.
+    pub(super) fn retains_navigation(&self, action: &str) -> bool {
         matches!(
             self,
             Self::Settings(_)
@@ -197,7 +217,8 @@ impl ActiveOverlay {
                 | Self::Providers(_)
                 | Self::Palette(_)
                 | Self::Shortcuts(_)
-        )
+        ) || matches!(self, Self::Activity(activity) if activity.tab == activity::ActivityTab::Attention)
+            && !action.starts_with("open:activity:")
     }
 
     /// The panel's name for the terminal title, matching the name its border shows.
@@ -208,7 +229,7 @@ impl ActiveOverlay {
             Self::Compute(_) => "Compute & background work",
             Self::Improve(_) => "Improve",
             Self::Extensions(_) => "Extensions",
-            Self::Stats(_) => "Stats",
+            Self::Stats(panel) => panel.title(),
             Self::Settings(_) => "Settings",
             Self::ModelSettings(_) => "Model settings",
             Self::BackupModels(_) => "Backup models",
@@ -305,6 +326,12 @@ impl ActiveOverlay {
                 return match self {
                     Self::Palette(o) => o.click(mouse.column, mouse.row),
                     Self::Jobs(o) => o.click(mouse.row),
+                    Self::Settings(o) => o.click(mouse.column, mouse.row),
+                    Self::Models(o) => o.click(mouse.column, mouse.row),
+                    Self::Providers(o) => o.click(mouse.column, mouse.row),
+                    Self::Compute(o) => o.click(mouse.column, mouse.row),
+                    Self::Stats(o) => o.click(mouse.column, mouse.row),
+                    Self::Peers(o) => o.click(mouse.column, mouse.row),
                     Self::Subagents(o) => {
                         o.click(mouse.column, mouse.row, std::time::Instant::now())
                     }

@@ -236,6 +236,27 @@ fn collect_argvs(
         }
         return complete;
     }
+    if name == "find" {
+        // `-exec`/`-execdir`/`-ok`/`-okdir` run their operands as a program until `;` or `+`; expose each one
+        // so `find -exec rm -rf {} +` is judged like `rm -rf` and `find -exec wc -c {} +` like `wc -c`.
+        let mut k = 0;
+        while k < rest.len() {
+            if matches!(rest[k].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                let start = k + 1;
+                // `+` ends the payload only right after `{}`; elsewhere it is an ordinary operand.
+                let Some(len) = rest[start..].iter().enumerate().position(|(n, w)| {
+                    w == ";" || (w == "+" && n > 0 && rest[start + n - 1] == "{}")
+                }) else {
+                    return false;
+                };
+                if len == 0 || !collect_argvs(&rest[start..start + len], out, depth + 1, true) {
+                    return false;
+                }
+                k = start + len;
+            }
+            k += 1;
+        }
+    }
     true
 }
 
@@ -364,15 +385,53 @@ pub(in crate::agent) fn safe_review_batch(command: &str) -> bool {
     })
 }
 
-/// Effect tracking only: a `;`, `&&` or newline batch whose every segment passes `safe_bash` or is
-/// a history inspection runs only inspections. The shared lexer supplies quote-aware boundaries;
-/// malformed input is unsafe. Approval never uses this batch exemption.
+/// Effect tracking only: a `;`, `&&` or newline batch whose every segment is a pipeline of read-only
+/// stages ([`read_only_stage`]) runs only inspections. The shared lexer supplies quote-aware
+/// boundaries; malformed input is unsafe. Approval never uses this batch exemption.
 pub(in crate::agent) fn read_only_inspection_batch(command: &str) -> bool {
     top_level_segments(command).is_some_and(|segments| {
-        segments
-            .iter()
-            .all(|s| safe_bash(s) || history_inspection(s))
+        segments.iter().all(|segment| {
+            pipe_stages(segment)
+                .is_some_and(|stages| stages.iter().all(|stage| read_only_stage(stage)))
+        })
     })
+}
+
+/// Effect tracking only: one pipeline stage that reads or filters text and writes no file. Plain
+/// inspections, history reads, the common line filters, and `find` whose `-exec` payloads are
+/// themselves read-only. Redirection and expansion never parse here, so they always count.
+fn read_only_stage(stage: &str) -> bool {
+    if safe_bash(stage) || history_inspection(stage) {
+        return true;
+    }
+    let Some(words) = shell_words(stage) else {
+        return false;
+    };
+    let args = &words[1..];
+    let short_flag =
+        |a: &String, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    match words[0].as_str() {
+        "sort" => !args
+            .iter()
+            .any(|a| short_flag(a, 'o') || a.starts_with("--output")),
+        "cut" | "tr" | "nl" | "rev" | "tac" | "column" => true,
+        // A second operand is uniq's output file.
+        "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
+        "find" => {
+            let mut payloads = Vec::new();
+            !args.iter().any(|a| {
+                matches!(a.as_str(), "-delete" | "-ok" | "-okdir" | "-fls")
+                    || a.starts_with("-fprint")
+            }) && collect_argvs(&words, &mut payloads, 0, false)
+                && payloads.iter().skip(1).all(|argv| {
+                    matches!(
+                        argv[0].as_str(),
+                        "wc" | "cat" | "head" | "tail" | "stat" | "file" | "grep" | "ls" | "echo"
+                    )
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Effect tracking only: `git log`, `show`, `rev-parse`, `ls-files`, `blame`, `shortlog` or
@@ -1364,9 +1423,8 @@ pub fn destructive_bash(command: &str) -> bool {
                     .windows(2)
                     .any(|w| w[0] == "checkout" && (w[1] == "--" || w[1] == "."))
             }
-            "find" => args
-                .iter()
-                .any(|a| a == "-delete" || a == "-exec" || a == "-execdir"),
+            // `-exec` payloads were exposed as their own argvs by `shell_argvs` and are judged there.
+            "find" => args.iter().any(|a| a == "-delete"),
             "curl" | "wget" => args
                 .iter()
                 .any(|a| a == "-o" || a == "-O" || a.starts_with("--output")),
@@ -1403,23 +1461,37 @@ pub struct ApprovalPreview {
 }
 
 /// What `/undo` covers for this call. Checkpoints hold file edits made through the editing tools;
-/// this function cannot see `shell.undo_snapshot`, so shell coverage is stated conditionally.
+/// this function cannot see `shell.undo_snapshot`, so shell coverage is stated conditionally. The
+/// command's risk is stated once, by [`bash_prompt_reason`], not repeated here.
 fn undo_coverage(call: &ToolCall) -> String {
-    const SHELL: &str = "/undo restores files a shell command changed only when shell.undo_snapshot is on; effects outside the project are never restored.";
     let tool = crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0;
     match tool.as_str() {
         "write" | "edit" | "ast_edit" => {
             "Checkpointed: /undo restores the previous file contents.".into()
         }
-        "bash"
-            if call.arguments["command"]
-                .as_str()
-                .is_some_and(destructive_bash) =>
-        {
-            format!("Destructive or privileged command. {SHELL}")
-        }
-        "bash" => SHELL.into(),
+        "bash" => "/undo restores shell changes only when shell.undo_snapshot is on, and never outside the project.".into(),
         _ => "No checkpoint: /undo does not revert anything this call changes.".into(),
+    }
+}
+
+/// Whether the classifier could read every program in `command`. Pipes, `;`, `&&`, redirection and
+/// `$` expansion are not parsed; such commands ask rather than guess, which is not the same as
+/// being destructive.
+fn bash_parsed(command: &str) -> bool {
+    let (argvs, complete) = shell_argvs(command);
+    complete && !argvs.is_empty() && !download_to_interpreter(command)
+}
+
+/// The one sentence an approval prompt gives for why a shell command asks.
+fn bash_prompt_reason(command: &str, approval: Approval) -> &'static str {
+    if !bash_parsed(command) {
+        "Compound command (pipes, `;`, `&&`, redirection or `$` expansion): these always ask."
+    } else if destructive_bash(command) {
+        "Destructive or privileged command."
+    } else if approval == Approval::Write {
+        "Not auto-approved in this mode."
+    } else {
+        "Ask first: every shell command that is not a read-only inspection asks."
     }
 }
 
@@ -1447,7 +1519,11 @@ fn approval_grant(call: &ToolCall) -> ApprovalGrant {
                 .as_str()
                 .ok_or("No reusable matcher is available for this command shape.")?;
             if destructive_bash(command) {
-                return Err("Destructive or privileged shell commands are approved one at a time.");
+                return Err(if bash_parsed(command) {
+                    "Destructive or privileged commands ask every time."
+                } else {
+                    "Compound commands, expansions and redirections ask every time."
+                });
             }
             let words = shell_words(command).ok_or(
                 "Compound commands, expansions and redirections cannot create reusable permissions.",
@@ -1700,12 +1776,11 @@ fn authorize_inner(
             Ok(false)
         }
         Approval::Ask | Approval::Write => {
-            let summary = if call.name == "bash" && approval == Approval::Write {
-                format!("{summary}\nDestructive or privileged shell command; approval required.")
-            } else if call.name == "bash" {
-                format!("{summary}\nShell command requires approval (not classified as read-only).")
-            } else {
-                summary.to_owned()
+            let summary = match call.arguments["command"].as_str() {
+                Some(command) if call.name == "bash" => {
+                    format!("{summary}\n{}", bash_prompt_reason(command, approval))
+                }
+                _ => summary.to_owned(),
             };
             explain(ui, call, PolicyReason::PromptRequired);
             // The prompt itself says approval is required; the summary stays the action alone.

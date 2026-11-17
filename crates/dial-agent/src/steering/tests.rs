@@ -408,7 +408,7 @@ fn missing_vector_explains_path_and_recovery_without_creating_it() {
     assert!(!path.exists());
 }
 #[test]
-fn admission_is_model_scoped_and_content_change_restarts_profile() {
+fn preflight_accepts_model_aliases_and_content_change_restarts_profile() {
     let root = tempfile::tempdir().unwrap();
     let config = AppConfig {
         model: "test".into(),
@@ -424,7 +424,17 @@ fn admission_is_model_scoped_and_content_change_restarts_profile() {
     let mut item = candidate();
     write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
     let first = specification(&config, "test").unwrap().unwrap();
-    assert!(specification(&config, "another").is_err());
+    // This is preflight, not weight admission. The provider sees a resolved snapshot path;
+    // Python validates the canonical model and adapter fingerprints before installing hooks.
+    let snapshot = root.path().join("models/snapshots/test");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let resolved = specification(&config, snapshot.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first, resolved,
+        "a model alias must preserve the runtime profile identity"
+    );
     item["evaluation"]["baseline_passes"] = json!(3);
     write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
     assert_ne!(first, specification(&config, "test").unwrap().unwrap());

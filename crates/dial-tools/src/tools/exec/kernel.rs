@@ -796,19 +796,19 @@ pub(crate) fn lock_session<'a>(
     }
 }
 
-fn serial_operation<'a>(
-    workspace: &'a Workspace,
+fn serial_operation(
+    workspace: &Workspace,
     end: &Deadline,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
-) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+) -> Result<crate::tools::SerialOperation, String> {
     workspace.serial_operation_checked(|| check_operation(end, interrupt, cancel))
 }
 
 /// Runs one controller callback with the workspace serial guard released; the guard is reacquired
 /// before returning. The driver stays paused until the reply is sent.
 fn dispatch_guarded<'a>(
-    serial: &mut Option<std::sync::MutexGuard<'a, ()>>,
+    serial: &mut Option<Arc<crate::tools::SerialOperation>>,
     scope: &CellScope<'a>,
     dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     callback: ToolCallback,
@@ -841,7 +841,9 @@ fn dispatch_guarded<'a>(
         return Err("native callback ended with uncertain effects; namespace discarded".into());
     }
     check_operation(end, interrupt, cancel)?;
-    *serial = Some(serial_operation(workspace, end, interrupt, cancel)?);
+    *serial = Some(Arc::new(serial_operation(
+        workspace, end, interrupt, cancel,
+    )?));
     Ok(output)
 }
 
@@ -894,6 +896,7 @@ impl Handoff<'_> {
         &self,
         end: &Arc<Deadline>,
         display: Arc<preludes::DisplayBuffer>,
+        serial: Arc<crate::tools::SerialOperation>,
     ) -> Result<String, String> {
         let (end, session, busy, pid) = (
             end.clone(),
@@ -905,7 +908,7 @@ impl Handoff<'_> {
             command: self.label.clone(),
             network: false,
             work: Box::new(move |cancel: Arc<AtomicBool>| {
-                detached_cell(&session, &pid, &busy, &end, &cancel, &display)
+                detached_cell(&session, &pid, &busy, &end, &cancel, &display, serial)
             }),
         };
         let name = (self.adopt)(AdoptedJob::Cell(job))?;
@@ -960,15 +963,12 @@ fn native_cell_once(
     yield_now: &dyn Fn() -> bool,
 ) -> Result<Option<Value>, String> {
     let end: &Deadline = scope.end;
-    let (workspace, interrupt, cancel) = (scope.workspace, scope.interrupt, scope.cancel);
-    // Native code may write directly. Never run it concurrently with another workspace transaction.
-    // The outer agent MUST NOT hold its own serial guard for supports_tool_dispatch() tools.
-    let mut serial = Some(serial_operation(workspace, end, interrupt, cancel)?);
+    let (interrupt, cancel) = (scope.interrupt, scope.cancel);
+    let serial = &mut process.operation;
     let check = || check_operation(end, interrupt, cancel);
     let callback = |request: &Value| {
         check_operation(end, interrupt, cancel)?;
-        let mut call =
-            |callback: ToolCallback| dispatch_guarded(&mut serial, scope, dispatch, callback);
+        let mut call = |callback: ToolCallback| dispatch_guarded(serial, scope, dispatch, callback);
         if let Some(reply) = preludes::bridge_reply(request, display, &mut call) {
             return reply;
         }
@@ -992,7 +992,7 @@ fn native_cell_once(
             _ => return Err("unsupported code-mode callback".into()),
         };
         // Controller callbacks execute their own Workspace transaction, approvals and observers.
-        let output = dispatch_guarded(&mut serial, scope, dispatch, callback)?;
+        let output = dispatch_guarded(serial, scope, dispatch, callback)?;
         Ok(
             json!({"text":output.text,"data":output.data,"is_error":output.is_error,
             "status":crate::runtime::execution::ToolStatus::from_output(&output).as_str(),
@@ -1001,10 +1001,17 @@ fn native_cell_once(
         )
     };
     match code {
-        Some(code) => {
-            process.request_yieldable(json!({"code":code}), None, check, yield_now, 128, callback)
-        }
-        None => process.resume_yieldable(None, check, yield_now, 128, callback),
+        Some(code) => process.transport.request_yieldable(
+            json!({"code":code}),
+            None,
+            check,
+            yield_now,
+            128,
+            callback,
+        ),
+        None => process
+            .transport
+            .resume_yieldable(None, check, yield_now, 128, callback),
     }
 }
 
@@ -1020,6 +1027,14 @@ pub(crate) fn native_cell(
     handoff: &Handoff<'_>,
     started: &AtomicBool,
 ) -> Result<CellOutcome, String> {
+    // Hold one transferable lease from the first request until completion or background
+    // settlement. Yielding the protocol does not pause native code in the interpreter.
+    process.operation = Some(Arc::new(serial_operation(
+        scope.workspace,
+        scope.end,
+        scope.interrupt,
+        scope.cancel,
+    )?));
     let never = || false;
     if !process.ready {
         native_cell_once(
@@ -1063,7 +1078,11 @@ pub(crate) fn native_cell(
     let mut value =
         match native_cell_once(process, scope, Some(code), &display, dispatch, &yield_now)? {
             Some(value) => value,
-            None => match handoff.move_to_background(scope.end, display.clone()) {
+            None => match handoff.move_to_background(
+                scope.end,
+                display.clone(),
+                process.operation.as_ref().unwrap().clone(),
+            ) {
                 Ok(name) => return Ok(CellOutcome::Moved(name)),
                 Err(error) => {
                     notice = Some(format!(
@@ -1089,6 +1108,7 @@ pub(crate) fn native_cell(
             object.insert("stdout".into(), Value::String(combined));
         }
     }
+    process.operation.take();
     Ok(CellOutcome::Value(value))
 }
 
@@ -1101,6 +1121,7 @@ fn detached_cell(
     end: &Deadline,
     cancel: &AtomicBool,
     display: &preludes::DisplayBuffer,
+    _serial: Arc<crate::tools::SerialOperation>,
 ) -> String {
     let interrupt = AtomicBool::new(false);
     let callback_wait = AtomicBool::new(false);
@@ -1130,6 +1151,7 @@ fn detached_cell(
         Err(error) => (code_output(Err(error)).text, false),
     };
     if keep {
+        process.operation.take();
         *session.lock() = Some(process);
     }
     *busy.lock() = None;
@@ -1139,6 +1161,8 @@ fn detached_cell(
 /// Tool-owned prelude state wraps the neutral transport; browser processes do not install preludes.
 pub(crate) struct NativeProcess {
     transport: crate::runtime::json_transport::JsonProcess,
+    // Declared after transport: on failure the child is terminated before exclusion is released.
+    operation: Option<Arc<crate::tools::SerialOperation>>,
     pub(crate) prelude_language: Option<preludes::PreludeLanguage>,
     prelude_generation: u64,
     /// The interpreter answered a request, so it is running under its launch confinement.
@@ -1148,6 +1172,7 @@ impl NativeProcess {
     pub(crate) fn start(command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
         Ok(Self {
             transport: crate::runtime::json_transport::JsonProcess::start(command, pid)?,
+            operation: None,
             prelude_language: None,
             prelude_generation: 0,
             ready: false,

@@ -288,7 +288,23 @@ file copy, not `git worktree`, so it works with dirty trees and non-git projects
 **Schedules.** `dial schedule add "prompt" --every 30m --watch 'src/**/*.rs' [--allow read,edit | -y]`,
 `list`, `remove <id>`, `log <id>` and `run [--once]` (a foreground scheduler, one per project; keep it in
 tmux or launchd). Runs are ordinary `dial -p` children, read-only unless `--allow`/`-y` was given at add
-time, one at a time. Watch triggers wait for edits to settle and ignore the run's own changes.
+time, one at a time. Watch triggers wait for edits to settle. A run starts on the watched content it sees
+at launch; that content is the acknowledged baseline. Any change to the watched files between launch and the
+end of the run is kept as a pending change, whether the run wrote it or an editor did: the two cannot be told
+apart, so an edit made while the run is active is never absorbed silently. The pending change gets exactly one
+coalesced follow-up run after the usual settle delay. If that follow-up changes the watched files again, the
+schedule is paused for review: neither intervals nor watch triggers start it, and the pause survives restarts.
+Re-adding the schedule (`remove` then `add`, which creates a new definition) is the acknowledgment that clears
+it. A run that keeps editing its own watched files therefore runs at most twice per burst, then pauses.
+Schedule run state (last-run times and watch baselines) is one file, `schedule-runtime.toml`, in the
+project's private state directory, written atomically so the two parts never diverge. While it is absent, a
+legacy `schedule-state.toml` + `schedule-watch.toml` pair is read. Once the new file exists the legacy pair is
+ignored and never deleted by dial; remove those two files by hand when you no longer need them. The file is
+read strictly: a missing file starts fresh, but a corrupt or unreadable file stops `dial schedule run` with an
+error naming the file rather than re-running every interval schedule. Move the named file aside to reset history.
+Definition and checkpoint publication flush the file and, on Unix, synchronize its parent directory
+before acknowledging success. A post-publication sync error reports uncertain durability: the new
+file may already be visible, so inspect it rather than assuming the write never happened.
 The interactive `/schedule add` accepts the same repeated or comma-separated `--allow` values
 and reports the resulting access policy when saving. `/schedule run` runs due entries once in a
 background job; `dial schedule run` remains the persistent foreground scheduler unless `--once`
@@ -297,6 +313,13 @@ is supplied. Neither confirmation nor a named allow list grants approval to unli
 Failed child starts preserve the pending watch trigger and interval timestamp; retries use a
 separate exponential backoff from 2 seconds up to 60 seconds. Filesystem notifications are bounded
 and coalesced; overflow or incomplete watcher coverage requests a conservative full rescan.
+If run state cannot be saved, no new run starts until a save succeeds: the scheduler retries at the end of
+each pass and reports the error once, and `dial schedule run --once` returns it. This only stops further
+launches; a crash or disk failure can still lose a completion that was not yet durable. A watch whose post-run
+fingerprint cannot be computed keeps its last trustworthy baseline and is compared against it next time; if
+that run was a follow-up, the entry pauses for review instead. Nothing is silently re-baselined. A watch whose
+fingerprint fails is retried every 30 seconds, and events,
+pending follow-ups or a missing baseline do not re-hash it sooner.
 Directory create/remove and rename notifications also request a full rescan: a directory path
 need not match a watched file glob, and some backends emit no descendant notifications.
 Watch fingerprints include file content, so same-size edits with restored mtimes are detected.

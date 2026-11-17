@@ -295,11 +295,9 @@ fn histogram_buckets_follow_explicit_bounds() {
     assert_eq!(hist.max, 11.0);
 }
 
-#[test]
-fn flush_posts_json_to_the_signal_path() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
+/// Accepts one connection, answers 200, and returns the request line and body.
+fn capture_one_post(listener: std::net::TcpListener) -> thread::JoinHandle<(String, Vec<u8>)> {
+    thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
@@ -321,7 +319,11 @@ fn flush_posts_json_to_the_signal_path() {
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
             .unwrap();
         (line, body)
-    });
+    })
+}
+
+/// Traces-only config pointed at a local listener, so one request is exactly one export.
+fn traces_only(port: u16) -> OtlpSettings {
     let config = TelemetryConfig {
         enabled: true,
         endpoint: Some(format!("http://127.0.0.1:{port}")),
@@ -329,7 +331,15 @@ fn flush_posts_json_to_the_signal_path() {
         logs: false,
         ..Default::default()
     };
-    let mut exporter = Exporter::new(OtlpSettings::resolve_with(&config, |_| None).unwrap());
+    OtlpSettings::resolve_with(&config, |_| None).unwrap()
+}
+
+#[test]
+fn flush_posts_json_to_the_signal_path() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = capture_one_post(listener);
+    let mut exporter = Exporter::new(traces_only(port));
     exporter.observe(&request_event("s2", true));
     exporter.flush();
     let (line, body) = server.join().unwrap();
@@ -340,6 +350,65 @@ fn flush_posts_json_to_the_signal_path() {
         2
     );
     assert!(exporter.last_error.is_none());
+}
+
+fn span_attribute(span: &Value, key: &str) -> Value {
+    span["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attribute| attribute["key"] == key)
+        .map(|attribute| attribute["value"]["stringValue"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn replacing_the_export_target_closes_open_turns_on_the_old_target() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = capture_one_post(listener);
+    let token = "Bearer secret-token-042";
+    let mut old = traces_only(port);
+    old.headers.push(("authorization".into(), token.into()));
+    let route = |otlp| Route { stats: None, otlp };
+    let (tx, rx) = mpsc::sync_channel(8);
+    let hub = thread::spawn(move || run(rx));
+    // A request opens the turn on the old target; the reconfigured route must not orphan it.
+    tx.send(Msg::Event(
+        Box::new(route(Some(old))),
+        request_event("reconfigured", false),
+    ))
+    .unwrap();
+    tx.send(Msg::Event(
+        Box::new(route(None)),
+        request_event("disabled", false),
+    ))
+    .unwrap();
+    let (done, wait) = mpsc::channel();
+    tx.send(Msg::Stop(done)).unwrap();
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    hub.join().unwrap();
+    let (_, body) = server.join().unwrap();
+    let text = String::from_utf8(body.clone()).unwrap();
+    assert!(
+        !text.contains("secret-token"),
+        "header value leaked into export"
+    );
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let turn = spans
+        .iter()
+        .find(|span| span["name"] == "invoke_agent dial")
+        .expect("open turn is exported as the old target is retired");
+    assert_eq!(span_attribute(turn, "dial.agent.outcome"), "interrupted");
+    let chat = spans
+        .iter()
+        .find(|span| span["name"] == "chat test-model")
+        .expect("chat span is exported");
+    assert_eq!(chat["traceId"], turn["traceId"]);
+    assert_eq!(chat["parentSpanId"], turn["spanId"]);
 }
 
 fn execution_event(execution: &crate::runtime::execution::Execution) -> Event {
@@ -542,4 +611,60 @@ fn interrupted_requests_are_not_recorded_as_fatal_provider_failures() {
     assert_eq!(failure_finish_reason(&interrupted), "error:interrupted");
     let fatal = anyhow::anyhow!("unexpected provider reply");
     assert_eq!(failure_finish_reason(&fatal), "error:fatal");
+}
+
+#[test]
+fn control_barrier_waits_for_a_saturated_queue_to_drain() {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let route = Route {
+        stats: None,
+        otlp: None,
+    };
+    tx.send(Msg::Event(
+        Box::new(route),
+        request_event("saturating", false),
+    ))
+    .unwrap();
+    // The worker starts only after the queue is provably full, so the barrier must wait for room.
+    let worker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        run(rx)
+    });
+    control(&tx, Duration::from_secs(10), "flush", Msg::Flush).unwrap();
+    control(&tx, Duration::from_secs(10), "shutdown", Msg::Stop).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn control_barrier_failures_are_reported_and_counted() {
+    let budget = Duration::from_millis(50);
+    let route = || Route {
+        stats: None,
+        otlp: None,
+    };
+    let before = loss_counters().control;
+
+    // Queue stays full because nothing drains it.
+    let (full_tx, _full_rx) = mpsc::sync_channel(1);
+    full_tx
+        .send(Msg::Event(Box::new(route()), request_event("full", false)))
+        .unwrap();
+    assert!(control(&full_tx, budget, "flush", Msg::Flush).is_err());
+    assert!(loss_counters().control > before);
+
+    // Worker has gone away entirely.
+    let (gone_tx, gone_rx) = mpsc::sync_channel(1);
+    drop(gone_rx);
+    assert!(control(&gone_tx, budget, "shutdown", Msg::Stop).is_err());
+    assert!(loss_counters().control >= before + 2);
+
+    // Barrier is admitted but never acknowledged: the caller gets the deadline, not a hang.
+    let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+    let silent = thread::spawn(move || {
+        let _held = ack_rx.recv();
+        thread::sleep(Duration::from_millis(300));
+    });
+    assert!(control(&ack_tx, budget, "flush", Msg::Flush).is_err());
+    assert!(loss_counters().control >= before + 3);
+    silent.join().unwrap();
 }

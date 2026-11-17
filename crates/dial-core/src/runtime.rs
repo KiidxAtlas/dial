@@ -13,6 +13,7 @@ pub mod schema;
 pub mod stream_journal;
 pub mod structural;
 pub mod template;
+pub mod terminal;
 pub mod tool_output;
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,9 @@ fn now_ms() -> u64 {
 
 /// Worker shards expose only this UTF-8 tail; complete answers live in result/artifact records.
 pub(super) const WORKER_TAIL_LIMIT: usize = 16 * 1024;
+
+/// Live status snapshot kept for a running tool call; the TUI card shows the same bounded line.
+const PROGRESS_TAIL_LIMIT: usize = 16 * 1024;
 
 /// Live text a running tool body retains. Interfaces stream tool output through their own bounded
 /// buffers and the settled result replaces this text, so the body keeps a prefix-stable head
@@ -250,6 +254,25 @@ impl Body {
             }
             data["phase"] = serde_json::json!(phase);
             data["steps"] = serde_json::json!(steps);
+            data["updated_ms"] = serde_json::json!(now_ms());
+            true
+        });
+    }
+    /// Replace the running tool's live status snapshot. Each call keeps only its latest snapshot,
+    /// bounded like the TUI card's progress line, so repeated progress never grows the body.
+    pub fn tool_progress(&self, text: &str) {
+        self.update(|node| {
+            if node.result.phase != Phase::Running {
+                return false;
+            }
+            let data = node
+                .result
+                .data
+                .get_or_insert_with(|| serde_json::json!({}));
+            if !data.is_object() {
+                *data = serde_json::json!({});
+            }
+            data["progress"] = serde_json::json!(tail(text, PROGRESS_TAIL_LIMIT));
             data["updated_ms"] = serde_json::json!(now_ms());
             true
         });

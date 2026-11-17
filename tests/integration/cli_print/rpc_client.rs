@@ -2,7 +2,7 @@
 //! approvals, coded errors, disconnect accounting and reconnect-by-resume), with the local
 //! scripted provider and no real accounts.
 use super::*;
-use dial_client::{Client, ClientError, Decision, Effect, Launch, Message};
+use dial_client::{Client, ClientError, Decision, Effect, HandoffPoll, Launch, Message};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -302,7 +302,21 @@ fn saved_settings_apply_by_restarting_into_the_same_session() {
         .set_setting("harness.max_steps", json!(7), false, WAIT)
         .unwrap();
     assert_eq!(saved["restart_required"], true);
-    let mut client = client.restart_and_resume(&launch, WAIT).unwrap();
+    let mut restarted = client.restart_and_resume(&launch, WAIT).unwrap();
+    // The old engine wrote nothing after its last reply, so its handoff holds only its end marker.
+    let mut old = Vec::new();
+    loop {
+        match restarted.handoff.poll(WAIT) {
+            HandoffPoll::Message(message) => old.push(message),
+            HandoffPoll::Finished => break,
+            HandoffPoll::TimedOut => panic!("the old engine never ended: {old:?}"),
+        }
+    }
+    assert!(
+        matches!(old.as_slice(), [Message::Disconnected { outstanding }] if outstanding.is_empty()),
+        "{old:?}"
+    );
+    let mut client = restarted.client;
     assert_eq!(client.state(WAIT).unwrap()["session_id"], session.as_str());
     assert_eq!(
         client

@@ -460,6 +460,60 @@ pub fn fuzzy(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
     Some((score, positions))
 }
 
+/// Whether every word of `query` starts a word of `text` (case-insensitive): `them` and `ui the`
+/// do for "ui.theme", `hm` does not. Prose is long enough to contain almost any scattered letters,
+/// so a description counts as a match only on a word piece like this.
+pub fn word_prefix(query: &str, text: &str) -> bool {
+    let text = text.to_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut any = false;
+    for needle in query.split_whitespace() {
+        let needle = needle.to_lowercase();
+        let needle = needle.trim_matches(|c: char| !c.is_alphanumeric());
+        if needle.is_empty() {
+            continue;
+        }
+        any = true;
+        // A needle with inner punctuation (`ui.the`) is matched against the whole text instead.
+        let found = if needle.contains(|c: char| !c.is_alphanumeric()) {
+            text.contains(needle)
+        } else {
+            words.iter().any(|word| word.starts_with(needle))
+        };
+        if !found {
+            return false;
+        }
+    }
+    any
+}
+
+/// [`fuzzy`] over prose (descriptions, combined metadata): only when [`word_prefix`] holds, so
+/// `theme` never matches a description that merely contains t, h, e, m and e in order.
+pub fn fuzzy_prose(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
+    if query.trim().is_empty() {
+        return fuzzy(query, text);
+    }
+    word_prefix(query, text)
+        .then(|| fuzzy(query, text))
+        .flatten()
+}
+
+/// [`fuzzy`] over a short name, rejecting letters picked from across the name: the hits must lie
+/// within half again the query's length (plus one), unless the query starts a word of the name.
+/// `st` and `sndbx` still find "settings" and "sandbox"; `se` no longer finds "shake".
+pub fn fuzzy_compact(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
+    let (score, hits) = fuzzy(query, text)?;
+    let n = query.chars().count();
+    let compact = hits
+        .first()
+        .zip(hits.last())
+        .is_none_or(|(first, last)| last - first < n + n / 2 + 1);
+    (compact || word_prefix(query, text)).then_some((score, hits))
+}
+
 #[cfg(test)]
 mod tests;
 

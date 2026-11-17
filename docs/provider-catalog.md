@@ -106,7 +106,7 @@ Reset also removes Dial's saved URL-scoped API keys for the connection and its p
 sign-ins; these credentials are shared across projects (and a URL-scoped key may be used
 by another provider at that URL). Pending sign-in for that provider is cancelled. A failure
 to clear credentials is reported, not presented as a successful complete reset. Resetting
-ChatGPT forgets local account registrations/tokens; it does not claim remote revocation.
+ChatGPT forgets local account registrations, tokens and cached model lists; it does not claim remote revocation.
 Environment variables, external server processes, installed software, downloaded weights,
 and session history are not deleted. The provider remains available for **Set up provider**.
 For a custom endpoint with no setup URL, use **Edit configuration / endpoint** to enter one.
@@ -382,8 +382,13 @@ role. Eligible plan access and shared limits are controlled by your account; the
 not an entitlement check, and your first completed inference request verifies access. Manage Dial's
 permission and limits in [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
 
-The provider menu lets you choose a saved workspace, sign in again, or sign out. Dial refreshes
-rotating tokens under a cross-process lock. Sign-in continues if you close the provider panel; use
+The provider menu lets you choose a saved workspace, sign in again, or sign out. Signing out tries to
+revoke the sign-in remotely, then removes the account and its cached model list from Dial; use
+**Continue with ChatGPT (add account)** to add it back. Dial refreshes
+rotating tokens under a cross-process lock. A plan change (for example an upgrade) needs no new
+sign-in: model discovery (startup, **F5**, `/providers`) renews an access token older than ten
+minutes, and a request the account refuses (HTTP 401 or a usage/plan limit) renews the sign-in
+once and retries when the renewed token names a different plan. Sign-in continues if you close the provider panel; use
 **Cancel pending sign-in** in its menu to stop it. OAuth credentials are stored in owner-private,
 atomic `chatgpt-accounts.json` storage under Dial's user directory (plaintext, not an OS keychain),
 separately from API keys and editable project files. Requests use the ChatGPT Codex Responses
@@ -431,6 +436,13 @@ Dial combines the account model list with visible models in a recent local Codex
 cache, when present, so newly released models can appear before the account list catches up.
 Those additions are labeled **Codex catalog**; their first completed request verifies account access.
 Dial reads model metadata only from Codex and uses its own OAuth credentials for every request.
+
+The ChatGPT backend lists and serves newer models only to a recent enough Codex client, so Dial
+reports the newest of the Codex release it was built against, the latest published `@openai/codex`
+release and the `client_version` in a recent local Codex model cache. Model discovery checks the
+npm registry at most once a day and caches the answer in Dial's private cache directory; a failed
+check keeps the previous answer.
+
 For ChatGPT models, `/reasoning` shows the current and supported levels. Use `/reasoning high`,
 `/reasoning max`, or another advertised level to change it; `/thinking high` is an alias. Choices
 persist per model in this project's settings and are sent through the Responses reasoning field.

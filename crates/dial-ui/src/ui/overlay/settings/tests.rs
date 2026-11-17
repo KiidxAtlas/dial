@@ -2,6 +2,61 @@ use super::testkit::*;
 use super::*;
 use std::cell::RefCell;
 #[test]
+fn setup_plan_is_a_scrollable_review_not_setting_navigation() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.set_setup_offers(BTreeMap::from([(
+        "voice.tts.backend".into(),
+        SetupOffer {
+            id: "piper".into(),
+            title: "Piper".into(),
+            preview: format!(
+                "PLAN_START\nRuns: {} COMMAND_END\nDestination: {} DESTINATION_END\nPLAN_END",
+                "command-argument ".repeat(20),
+                "/long/destination".repeat(12)
+            ),
+        },
+    )]));
+    goto(&mut o, &rig.keys, "voice.tts.backend");
+    send(&mut o, &rig.keys, ctrl('l'));
+    assert!(
+        matches!(send(&mut o, &rig.keys, ctrl('l')), OverlayEvent::None),
+        "an unrendered review cannot install"
+    );
+    let selected = path_at_cursor(&o).to_owned();
+    let mut seen = draw(&mut o, &rig, 80, 12);
+    assert!(seen.contains("PLAN_START"), "{seen}");
+    for _ in 0..50 {
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Down)),
+            OverlayEvent::None
+        ));
+        seen.push_str(&draw(&mut o, &rig, 80, 12));
+        assert_eq!(path_at_cursor(&o), selected);
+    }
+    for marker in ["COMMAND_END", "DESTINATION_END", "PLAN_END"] {
+        assert!(seen.contains(marker), "missing {marker}: {seen}");
+    }
+    assert!(
+        matches!(send(&mut o, &rig.keys, ctrl('l')), OverlayEvent::SetupDep { id } if id == "piper")
+    );
+    assert!(matches!(
+        send(&mut o, &rig.keys, ctrl('l')),
+        OverlayEvent::None
+    ));
+    draw(&mut o, &rig, 12, 3);
+    for event in [key(KeyCode::Enter), ctrl('l')] {
+        assert!(matches!(send(&mut o, &rig.keys, event), OverlayEvent::None));
+        assert!(o.setup_armed.is_some());
+    }
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(o.setup_armed.is_none());
+}
+
+#[test]
 fn settings_includes_learning_preferences_and_learning_view_remains_a_subset() {
     let mut all = overlay().coding_only();
     for path in [
@@ -358,7 +413,8 @@ fn renders_title_tabs_sections_rows_and_footer() {
         "Powerline thin",
         "Search: ",
         "Esc close",
-        "Ctrl+S scope",
+        "Ctrl+B",
+        "tab numbers count",
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in\n{screen}");
     }
@@ -802,7 +858,7 @@ fn delete_unsets_in_the_active_scope_only() {
         OverlayEvent::None
     ));
     assert!(draw(&mut o, &rig, 120, 30).contains("Set in the global scope"));
-    send(&mut o, &rig.keys, ctrl('s'));
+    send(&mut o, &rig.keys, ctrl('b'));
     match send(&mut o, &rig.keys, key(KeyCode::Delete)) {
         OverlayEvent::Unset { path, scope } => {
             assert_eq!((path.as_str(), scope), ("ui.tips", Scope::Global))
@@ -993,14 +1049,14 @@ fn search_never_changes_scope_and_ctrl_s_preserves_the_query() {
     send_all(&mut o, &rig.keys, typed("status"));
     assert_eq!(o.search, "status", "every letter belongs to search");
     assert_eq!(o.scope, Scope::Global);
-    send(&mut o, &rig.keys, ctrl('s'));
+    send(&mut o, &rig.keys, ctrl('b'));
     assert_eq!(o.scope, Scope::Project);
     assert_eq!(o.search, "status");
     assert!(draw(&mut o, &rig, 100, 24).contains("Save to: This project"));
     goto(&mut o, &rig.keys, "ui.tips");
     let (_, _, scope) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(scope, Scope::Project, "later events carry the new scope");
-    send(&mut o, &rig.keys, ctrl('s'));
+    send(&mut o, &rig.keys, ctrl('b'));
     assert_eq!(o.scope, Scope::Global);
 }
 
@@ -1738,11 +1794,11 @@ fn narrow_title_sheds_the_scope_label_without_touching_the_title() {
         let top = shown.lines().next().unwrap();
         assert!(top.starts_with(" Settings "), "width {w}: {top}");
         if w >= 60 {
-            assert!(top.contains("Ctrl+S"), "width {w}: {top}");
+            assert!(top.contains("Ctrl+B"), "width {w}: {top}");
         }
     }
     // Switching scope is acknowledged in the body, where every width can see it.
-    send(&mut o, &rig.keys, ctrl('s'));
+    send(&mut o, &rig.keys, ctrl('b'));
     assert!(draw(&mut o, &rig, 38, 16).contains("this project"));
 }
 
@@ -2071,6 +2127,21 @@ fn path_settings_open_a_browser_and_save_only_the_chosen_entry() {
         matches!(o.mode, Mode::Path { .. }),
         "Enter browses instead of typing"
     );
+    let wait_for_path = |o: &mut SettingsOverlay| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let Mode::Path { browser, .. } = &mut o.mode else {
+                panic!("expected path browser")
+            };
+            browser.poll();
+            if !browser.is_loading() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    wait_for_path(&mut o);
     let screen = draw(&mut o, &rig, 120, 40);
     assert!(screen.contains("python3"), "{screen}");
     assert!(matches!(
@@ -2080,6 +2151,7 @@ fn path_settings_open_a_browser_and_save_only_the_chosen_entry() {
     assert!(matches!(o.mode, Mode::Browse), "Esc writes nothing");
 
     send(&mut o, &rig.keys, key(KeyCode::Enter));
+    wait_for_path(&mut o);
     send_all(&mut o, &rig.keys, typed("python3"));
     let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
     assert_eq!(path, "python");
@@ -2461,4 +2533,70 @@ fn every_declared_blank_meaning_is_a_short_phrase() {
         }
     }
     assert!(found >= 10, "{found}");
+}
+
+#[test]
+fn scope_switch_is_not_the_save_shortcut() {
+    let keys = Keymap::defaults();
+    let mut o = overlay();
+    o.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    assert!(o.scope == Scope::Global);
+    o.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    assert!(o.scope == Scope::Project);
+}
+
+#[test]
+fn mouse_selects_setting_without_changing_its_value() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let shown = screen(&render(100, 32, |f| o.draw(f, &ctx)));
+    let target = o
+        .visible()
+        .iter()
+        .enumerate()
+        .find_map(|(i, row)| {
+            if let Row::Setting(index) = row {
+                let label = crate::config::schema::registry()[*index].label;
+                if i != o.cursor && shown.contains(label) {
+                    return Some((i, label));
+                }
+            }
+            None
+        })
+        .expect("another visible setting");
+    let (x, y) = position(&shown, target.1);
+    assert!(matches!(o.click(x, y), OverlayEvent::None));
+    assert_eq!(o.cursor, target.0);
+    assert!(matches!(o.mode, Mode::Browse));
+    assert!(o.pending.is_empty());
+}
+
+#[test]
+fn mouse_switches_visible_category_tabs() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let shown = screen(&render(120, 32, |f| o.draw(f, &ctx)));
+    let name = o.tabs[1].0;
+    let (x, y) = position(&shown, name);
+    o.click(x, y);
+    assert_eq!(o.tab, 1);
+    assert_eq!(o.cursor, 0);
 }

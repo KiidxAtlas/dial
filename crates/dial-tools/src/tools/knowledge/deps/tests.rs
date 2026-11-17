@@ -11,6 +11,7 @@ fn dev(ws: Workspace, deny_read: Vec<PathBuf>) -> Workspace {
         deny_read,
         extra_write: Vec::new(),
         allow_network: false,
+        serial_ports: false,
     })
 }
 
@@ -149,11 +150,13 @@ fn caches_outside_the_workspace_follow_the_sandbox_read_policy() {
             deny_read: vec![home.path().to_path_buf()],
             allow_network: false,
             extra_write: Vec::new(),
+            serial_ports: false,
         },
         Policy::Dev {
             deny_read: vec![home.path().to_path_buf()],
             extra_write: Vec::new(),
             allow_network: false,
+            serial_ports: false,
         },
     ] {
         let denied = Workspace::new(project.path()).unwrap().with_policy(policy);

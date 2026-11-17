@@ -649,3 +649,60 @@ fn tree_mode_is_titled_session_forks_and_long_lists_show_a_scroll_thumb() {
         "{shown}"
     );
 }
+
+#[test]
+fn help_fits_compact_terminals_and_every_shortcut_is_reachable() {
+    for (cols, height) in [(40, 10), (80, 12)] {
+        let mut picker = Picker::new(vec![session("one", "Old", 1)], vec![], "", "Old", false);
+        let theme = Theme::dark();
+        picker.handle(&key(KeyCode::F(1), KeyModifiers::NONE), height);
+        let first = picker.rows(cols, height, &theme);
+        assert!(
+            first.len() <= height,
+            "{cols}x{height}: {} rows",
+            first.len()
+        );
+        let mut seen = text_of(&first);
+        for _ in 0..100 {
+            picker.handle(&key(KeyCode::Down, KeyModifiers::NONE), height);
+            let rows = picker.rows(cols, height, &theme);
+            assert!(rows.len() <= height);
+            seen.push_str(&text_of(&rows));
+        }
+        for shortcut in [
+            "Enter", "Ctrl+B", "Ctrl+R", "Ctrl+F", "Ctrl+D", "Ctrl+G", "Ctrl+A", "Ctrl+T", "Ctrl+U",
+        ] {
+            assert!(
+                seen.contains(shortcut),
+                "{cols}x{height}: missing {shortcut}"
+            );
+        }
+        picker.handle(&key(KeyCode::Home, KeyModifiers::NONE), height);
+        assert_eq!(text_of(&picker.rows(cols, height, &theme)), text_of(&first));
+        picker.handle(&key(KeyCode::Esc, KeyModifiers::NONE), height);
+        assert_eq!(picker.query(), "Old");
+        assert_eq!(picker.selected_id(), Some("one"));
+    }
+}
+
+#[test]
+fn wide_details_leave_turns_to_the_pane_and_enter_on_the_current_session_returns() {
+    let picker = Picker::new(
+        vec![session("one", "Work", 1), session("two", "Other", 1)],
+        vec![],
+        "one",
+        "",
+        false,
+    );
+    let wide = text_of(&picker.rows(160, 40, &Theme::dark()));
+    assert!(!wide.contains("You  Fix callback"), "{wide}");
+    assert!(wide.contains("Enter return to it"), "{wide}");
+    let narrow = text_of(&picker.rows(70, 40, &Theme::dark()));
+    assert!(narrow.contains("You  Fix callback"), "{narrow}");
+
+    let elsewhere =
+        Picker::new(vec![session("two", "Other", 1)], vec![], "one", "", false).scope(true, 1);
+    let shown = text_of(&elsewhere.rows(70, 40, &Theme::dark()));
+    assert!(shown.contains("Resume · all projects"), "{shown}");
+    assert!(shown.contains("Enter resume"), "{shown}");
+}

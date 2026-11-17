@@ -21,6 +21,27 @@ function send(value) {
 const callbacks = new Map();
 let callbackId = 0, browser, context, nextTab = 1, operationId = 0, operationDeadline = null, pendingBytes = 0, activeHttp = 0;
 let attached = false, tracing = false, wsEndpoints = [];
+let contextQuarantined = false;
+const socketBridges = new Set();
+function closeSocket(socket, reason) {
+  try { Promise.resolve(socket.close({code:1008,reason})).catch(() => {}); } catch (_) {}
+}
+function retireSocketBridge(bridge) {
+  if (bridge.closed) return;
+  bridge.closed = true;
+  socketBridges.delete(bridge);
+  closeSocket(bridge.socket, 'Browser socket bridge retired');
+  closeSocket(bridge.server, 'Browser socket bridge retired');
+}
+function quarantineContext() {
+  contextQuarantined = true;
+  wsEndpoints = [];
+  for (const bridge of socketBridges) retireSocketBridge(bridge);
+  cancelPending('browser context quarantined after execution timeout');
+  // Never close operator-owned contexts/pages: quarantine the entire adapter instead. The
+  // operator must terminate any surviving page code and restart this session explicitly.
+  if (!attached) return context.close().catch(() => {});
+}
 const httpQueue = [];
 let queuedHttpBytes = 0;
 let activeRoutes = 0;
@@ -160,11 +181,26 @@ function requestCallback(fields) {
 // Only exact loopback endpoints approved by the Rust policy connect; everything else is closed.
 // Used for context-wide routing (launched browsers) and per-page routing (attached browsers).
 function guardSocket(socket) {
+  if (contextQuarantined) { closeSocket(socket, 'Browser context quarantined'); return; }
   let url;
-  try { url = new URL(socket.url()); } catch { socket.close({ code:1008, reason:'WebSocket endpoint is not approved for this browser session' }); return; }
+  try { url = new URL(socket.url()); } catch { closeSocket(socket, 'WebSocket endpoint is not approved for this browser session'); return; }
   const port = url.port || (url.protocol === 'wss:' ? '443' : '80');
-  if (wsEndpoints.includes(`${url.hostname}:${port}`)) socket.connectToServer();
-  else socket.close({ code:1008, reason:'WebSocket endpoint is not approved for this browser session' });
+  if (!wsEndpoints.includes(`${url.hostname}:${port}`)) {
+    closeSocket(socket, 'WebSocket endpoint is not approved for this browser session'); return;
+  }
+  const server = socket.connectToServer();
+  const bridge = {socket,server,closed:false};
+  socketBridges.add(bridge);
+  // Explicit forwarding revokes authority synchronously, even while asynchronous socket closes
+  // are still in flight. Only Dial's routed bridge is retired, never an operator page/context.
+  const forward = destination => message => {
+    if (contextQuarantined || bridge.closed) return;
+    try { destination.send(message); } catch (_) { retireSocketBridge(bridge); }
+  };
+  socket.onMessage(forward(server));
+  server.onMessage(forward(socket));
+  socket.onClose(() => retireSocketBridge(bridge));
+  server.onClose(() => retireSocketBridge(bridge));
 }
 function register(page) {
   for (const [id, tab] of tabs) if (tab.page === page) return id;
@@ -179,7 +215,10 @@ function register(page) {
   page.on('requestfailed', request => record(tab, 'network', { time:Date.now(), operation_id:operationId, kind:'failed', url:clip(request.url()), error:clip(request.failure()?.errorText || '') }));
   page.on('framenavigated', frame => { if (frame === page.mainFrame()) record(tab, 'navigation', { time:Date.now(), operation_id:operationId, kind:'navigated', url:clip(frame.url()) }); });
   page.on('load', () => record(tab, 'navigation', { time:Date.now(), operation_id:operationId, kind:'load', url:clip(page.url()) }));
-  page.on('close', () => tabs.delete(id));
+  page.on('close', () => {
+    tabs.delete(id);
+    if (tab.recording) captureModule.discardRecording(tab).catch(() => {});
+  });
   page.on('dialog', dialog => {
     const policy = tab.dialogPolicy || {mode:'dismiss'};
     if (policy.once) tab.dialogPolicy = null;
@@ -232,6 +271,9 @@ function register(page) {
     });
     await session.send('Network.setCacheDisabled',{cacheDisabled:true});
     await session.send('Fetch.enable',{patterns:[{urlPattern:'*',requestStage:'Request'}]});
+    // Existing attached documents missed the init script; buffered observers recover what the
+    // browser retains. Future documents install before page scripts run via context.addInitScript.
+    await page.evaluate(captureModule.installVitals);
   });
   tab.ready.catch(error=>record(tab,'console',{type:'bridge-initialize-error',text:clip(error.message)}));
   return id;
@@ -259,6 +301,7 @@ async function initialize(request) {
       await context.routeWebSocket('**/*', guardSocket);
     }
     await context.addInitScript(webmcpModule.installHook, webmcpModule.KEY);
+    await context.addInitScript(captureModule.installVitals, {documentStart:true});
     // Attached browsers already own pages; register them so tabs/tab-less actions see them.
     for (const page of context.pages()) { try { register(page); } catch (_) {} }
     context.on('page', page => { try { register(page); } catch (_) {} });
@@ -318,7 +361,8 @@ async function snapshot(scope,request) {
   return scope.locator(request.selector || 'body').evaluate((root,maxNodes)=>{
     const nodes=[], walker=document.createTreeWalker(root,NodeFilter.SHOW_ELEMENT);
     let element=root, visited=0, chars=0, truncated=false;
-    const trim=value=>String(value || '').replace(/\s+/g,' ').trim().slice(0,300);
+    const cut=(value,limit)=>{const text=String(value).slice(0,limit);return /[\uD800-\uDBFF]$/.test(text)?text.slice(0,-1):text;};
+    const trim=value=>cut(String(value || '').replace(/\s+/g,' ').trim(),300);
     const selectorFor=node=>{
       const parts=[];
       while (node && node.nodeType===1 && parts.length<12) {
@@ -359,7 +403,7 @@ async function snapshot(scope,request) {
       }
       element=walker.nextNode();
     }
-    return {source:'dom-semantic',url:location.href.slice(0,2000),nodes,truncated,visited_elements:Math.min(visited,5000),limits:{nodes:maxNodes,characters:20000,visited_elements:5000}};
+    return {source:'dom-semantic',url:cut(location.href,2000),nodes,truncated,visited_elements:Math.min(visited,5000),limits:{nodes:maxNodes,characters:20000,visited_elements:5000}};
   },maxNodes);
 }
 async function transferDownload(tab,scope,request) {
@@ -466,6 +510,7 @@ async function observeResult(request, result, cursors) {
   return result;
 }
 async function run(request) {
+  if (contextQuarantined) throw new Error('browser context quarantined after execution timeout; restart the browser session (attached pages may still be executing; stop them in the operator browser)');
   wsEndpoints = Array.isArray(request.websocket_endpoints) ? request.websocket_endpoints.map(String) : wsEndpoints;
   if (request.action === 'initialize') return initialize(request);
   if (!context) throw new Error('browser is not initialized');
@@ -665,8 +710,8 @@ async function run(request) {
       // null: no history entry in that direction, or a same-document navigation without a response.
       return {tab:request.tab,action:request.action,url:clip(page.url()),title:clip(await page.title()),status:response?.status() ?? null};
     }
-    case 'run': return runModule.runCode({page, code: request.code, timeoutMs: request.timeoutMs});
-    case 'call': return runModule.runCall({page, chain: request.chain, timeoutMs: request.timeoutMs});
+    case 'run': return runModule.runCode({page, code: request.code, timeoutMs: request.timeoutMs, onTimeout:quarantineContext});
+    case 'call': return runModule.runCall({page, chain: request.chain, timeoutMs: request.timeoutMs, onTimeout:quarantineContext});
     case 'close': await page.close(); return {closed:request.tab};
     case 'aria': {
       if (typeof scope.locator('body').ariaSnapshot !== 'function') throw new Error('aria snapshots require Playwright >=1.49');
@@ -702,7 +747,8 @@ function artifactsDir() {
 function accessibilityAudit() {
   const findings = [];
   const describe = el => (el.tagName || '').toLowerCase() + (el.id ? '#' + el.id : '');
-  const add = (rule, el, detail) => { if (findings.length < 200) findings.push({ rule, target: el ? describe(el).slice(0, 120) : null, detail }); };
+  const cut = (value, limit) => { const text = String(value).slice(0, limit); return /[\uD800-\uDBFF]$/.test(text) ? text.slice(0, -1) : text; };
+  const add = (rule, el, detail) => { if (findings.length < 200) findings.push({ rule, target: el ? cut(describe(el), 120) : null, detail }); };
   const text = el => (el.textContent || '').trim();
   const named = el => !!((el.getAttribute('aria-label') || '').trim() || el.getAttribute('aria-labelledby') || (el.getAttribute('title') || '').trim());
   const labelled = el => named(el) || (!!el.id && !!document.querySelector('label[for="' + CSS.escape(el.id) + '"]')) || !!el.closest('label');
@@ -724,7 +770,7 @@ function accessibilityAudit() {
   }
   const ids = new Map();
   for (const el of document.querySelectorAll('[id]')) ids.set(el.id, (ids.get(el.id) || 0) + 1);
-  for (const [id, count] of ids) if (count > 1) add('duplicate-id', null, 'id "' + id.slice(0, 80) + '" appears ' + count + ' times');
+  for (const [id, count] of ids) if (count > 1) add('duplicate-id', null, 'id "' + cut(id, 80) + '" appears ' + count + ' times');
   let previous = 0;
   for (const heading of document.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
     const level = Number(heading.tagName.slice(1));

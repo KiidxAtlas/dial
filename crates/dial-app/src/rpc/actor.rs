@@ -68,6 +68,11 @@ enum Exit {
         next: Box<Config>,
         reconnect: bool,
     },
+    /// The journal and live workspace moved; rebuild against the destination project settings.
+    Moved {
+        id: Value,
+        next: Box<Config>,
+    },
 }
 
 /// What `apply_settings` decided: apply in place, or rebuild the agent with `next`.
@@ -101,10 +106,13 @@ pub(super) struct Actor {
     pub worker_disconnected: Arc<AtomicBool>,
     pub worker_query_cache: Arc<Mutex<QueryProjection>>,
     pub worker_live: Arc<Mutex<LiveState>>,
-    pub queue: Arc<Mutex<Vec<String>>>,
+    pub queue: Arc<Mutex<Steering>>,
     pub worker_fs: Arc<client_fs::ClientFsCalls>,
     /// The controller's copy of the configuration, replaced after a rebuild.
     pub admin_config: Arc<std::sync::RwLock<Config>>,
+    /// Published with the rebuilt configuration when the active project changes.
+    pub admin_layout: Arc<std::sync::RwLock<Layout>>,
+    pub sides: Arc<side_control::SideControl>,
 }
 
 /// A panic invalidates the actor's mutable state: reply once, emit fatal, then stop.
@@ -133,6 +141,28 @@ fn run_boundary(
     outcome
 }
 
+/// Keep the serving checkpoint and live version reader on the same learning store. Disabled
+/// improvement must not create a store (or consult a previously pinned checkpoint).
+fn serving_setup(config: &Config) -> Result<(Option<crate::storage::store::Store>, Config)> {
+    let store = config
+        .improve
+        .enabled
+        .then(|| {
+            crate::storage::store::Store::open(
+                &config.state_dir,
+                &config.model,
+                &config.use_case,
+                &config.harness,
+            )
+        })
+        .transpose()?;
+    let mut serving = config.clone();
+    if let Some(store) = &store {
+        crate::learn::improve::apply_pinned_model(&mut serving, store)?;
+    }
+    Ok((store, serving))
+}
+
 impl Actor {
     pub(super) fn run(self) -> Result<()> {
         let Self {
@@ -140,7 +170,7 @@ impl Actor {
             config,
             overlay,
             acp,
-            launch,
+            mut launch,
             rx,
             approval_rx,
             question_rx,
@@ -160,10 +190,13 @@ impl Actor {
             queue,
             worker_fs,
             admin_config,
+            admin_layout,
+            sides,
         } = self;
         run_boundary(
             |in_flight| -> Result<()> {
                 let mut config = config;
+                let mut layout = layout;
                 let mut rx = Some(rx);
                 let mut ui = Some(RpcUi {
                     out: worker_out.clone(),
@@ -188,7 +221,8 @@ impl Actor {
                 let mut handoff = None;
                 let mut reply: Option<(Value, Value)> = None;
                 loop {
-                    let backend = make_backend(&config)?;
+                    let (store, serving) = serving_setup(&config)?;
+                    let backend = make_backend(&serving)?;
                     let image_input = backend.accepts_image_input();
                     let session = if acp || handoff.is_some() {
                         Session::ephemeral()
@@ -206,7 +240,7 @@ impl Actor {
                         layout.clone(),
                         session,
                         None,
-                        None,
+                        store.as_ref(),
                         flag.clone(),
                     )?;
                     agent.set_launch(launch.clone())?;
@@ -267,10 +301,26 @@ impl Actor {
                             }
                         }
                     }
+                    // Rebuilds can retain a foreground lease across a project/model change.
+                    // Publish its new attribution before exposing the rebuilt session.
+                    if compute.is_some() {
+                        let effective = agent.effective_config();
+                        crate::learn::compute::register(
+                            &layout.user_dir,
+                            "session",
+                            &layout.project_root,
+                            &effective.state_dir,
+                            &effective.model,
+                        )?;
+                    }
                     query_snapshot(
                         &agent,
                         &mut worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()),
                     );
+                    if !acp {
+                        collaboration::hosting::sync(agent.session());
+                        sides.bind(&agent, None)?;
+                    }
                     if fresh {
                         worker_out.emit(ready_frame(
                             agent.session().id(),
@@ -281,7 +331,14 @@ impl Actor {
                         ));
                         worker_out.attribute(agent.session().id(), Value::Null);
                     }
-                    *admin_config.write().unwrap_or_else(|p| p.into_inner()) = config.clone();
+                    {
+                        let mut published_config =
+                            admin_config.write().unwrap_or_else(|p| p.into_inner());
+                        let mut published_layout =
+                            admin_layout.write().unwrap_or_else(|p| p.into_inner());
+                        *published_config = config.clone();
+                        *published_layout = layout.clone();
+                    }
                     let _ = control_tx.send((
                         agent.live_task_control(),
                         agent.background_compaction_control(),
@@ -291,6 +348,7 @@ impl Actor {
                         result["tools"] = json!(agent.tool_names());
                         result["model"] = json!(agent.effective_config().model);
                         result["image_input"] = json!(agent.accepts_image_input());
+                        result["state"] = workflows::modes(&agent);
                         *in_flight = None;
                         active.store(false, Ordering::SeqCst);
                         worker_out.result(&id, Ok(result));
@@ -298,6 +356,8 @@ impl Actor {
                     }
                     // Tracks the message count the published projection was built from.
                     let projected_messages = agent.session().message_count();
+                    let steering_cleanup =
+                        SteeringCleanup::new(ui.as_ref().context("RPC UI already taken")?);
                     let mut runtime = ActorRuntime {
                         layout: &layout,
                         config: &config,
@@ -318,19 +378,24 @@ impl Actor {
                         compute: compute.take(),
                         projected_messages,
                         projected_at: std::time::Instant::now(),
+                        recovery_reply: None,
+                        steering_cleanup,
                         parked: std::collections::HashMap::new(),
                         current: !acp,
+                        sides: sides.clone(),
                     };
-                    let (id, next, reconnect) = match runtime.run(in_flight)? {
+                    let (id, next, reconnect, moved) = match runtime.run(in_flight)? {
                         Exit::Closed => return Ok(()),
                         Exit::Rebuild {
                             id,
                             next,
                             reconnect,
-                        } => (id, next, reconnect),
+                        } => (id, next, reconnect, false),
+                        Exit::Moved { id, next } => (id, next, true, true),
                     };
                     // Parked sessions are saved on disk; `resume` reopens them under the rebuilt agent.
                     let (mut agent, kept_ui, kept_rx, kept_compute) = runtime.into_parts();
+                    let destination = moved.then(|| agent.layout().cloned()).flatten();
                     let host_tools = worker_host.reset();
                     agent.unregister_host_tools(&host_tools);
                     worker_uris.reset();
@@ -343,6 +408,7 @@ impl Actor {
                     let accounting = agent.runtime_accounting();
                     let selection = agent.effective_config().selection();
                     let model = (selection != config.selection()).then_some(selection);
+                    launch = agent.modes().launch.clone();
                     let session = std::mem::replace(agent.session_mut(), Session::ephemeral());
                     handoff = Some((
                         session,
@@ -359,6 +425,9 @@ impl Actor {
                         model,
                     ));
                     drop(agent);
+                    if let Some(destination) = destination {
+                        layout = destination;
+                    }
                     // MCP servers survive when their configuration is unchanged (`prefetch`),
                     // unless the client asked to reconnect them (after an MCP sign-in).
                     if let Some(connecting) = mcp.filter(|_| !reconnect) {
@@ -368,7 +437,11 @@ impl Actor {
                     config = *next;
                     reply = Some((
                         id,
-                        json!({"applied":"rebuild","rebuilt":true,"reconnected":reconnect,"host_tools_reset":!host_tools.is_empty()}),
+                        if moved {
+                            json!({"session_id":handoff.as_ref().map(|state| state.0.id()),"path":layout.project_root,"moved":true,"rebuilt":true,"host_tools_reset":!host_tools.is_empty()})
+                        } else {
+                            json!({"applied":"rebuild","rebuilt":true,"reconnected":reconnect,"host_tools_reset":!host_tools.is_empty()})
+                        },
                     ));
                     rx = Some(kept_rx);
                     ui = Some(kept_ui);
@@ -388,7 +461,45 @@ impl Actor {
 /// Shortest gap between projection rebuilds driven only by runtime (worker) changes.
 const PROJECTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Admission must close before task/session destructors run, including during unwinding.
+/// Normal settlement uses this same owner; dropping it again is idempotent.
+struct SteeringCleanup {
+    steering: Arc<Mutex<Steering>>,
+    out: Sender,
+}
+
+impl SteeringCleanup {
+    fn new(ui: &RpcUi) -> Self {
+        Self {
+            steering: ui.steering.clone(),
+            out: ui.out.clone(),
+        }
+    }
+
+    fn settle(&self) {
+        let discarded = self
+            .steering
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .end();
+        if discarded > 0 && !self.out.unavailable() {
+            self.out.emit(json!({"event":"notice","kind":"steering_discarded","count":discarded,
+                "message":format!("Turn ended before {discarded} queued steering messages were consumed; resend them for the next turn.")}));
+        }
+    }
+}
+
+impl Drop for SteeringCleanup {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 struct ActorRuntime<'a> {
+    // Release an abandoned stdout fence before agent/task teardown can wait on output.
+    recovery_reply: Option<ReservedReply>,
+    // This owner closes steering before any agent, task or parked-session teardown.
+    steering_cleanup: SteeringCleanup,
     // Fields drop in declaration order: parked sessions and UI before the agent, then its
     // compute lease, matching the former run-local cleanup order on errors and panics.
     parked: std::collections::HashMap<String, ParkedSession>,
@@ -413,6 +524,7 @@ struct ActorRuntime<'a> {
     /// When the query projection was last rebuilt.
     projected_at: std::time::Instant,
     current: bool,
+    sides: Arc<side_control::SideControl>,
 }
 
 impl<'a> ActorRuntime<'a> {
@@ -427,12 +539,14 @@ impl<'a> ActorRuntime<'a> {
     ) {
         let Self {
             parked,
+            steering_cleanup,
             ui,
             agent,
             compute,
             rx,
             ..
         } = self;
+        drop(steering_cleanup);
         drop(parked);
         (agent, ui, rx, compute)
     }
@@ -466,6 +580,9 @@ impl ActorRuntime<'_> {
             *in_flight = Some(id.clone());
             self.worker_out
                 .attribute(self.agent.session().id(), id.clone());
+            if !self.acp {
+                self.sides.suspend()?;
+            }
             // A rebuild replies once the new agent exists (`Actor::run`), not here.
             let result = match request["method"].as_str().unwrap_or_default() {
                 "apply_settings" => match self.settings_change(&request["params"]) {
@@ -477,6 +594,26 @@ impl ActorRuntime<'_> {
                         });
                     }
                     Ok(SettingsChange::Live(result)) => Ok(result),
+                    Err(error) => Err(error),
+                },
+                "set_mode" => match self.mode_change(&request["params"]) {
+                    Ok(SettingsChange::Rebuild(next, reconnect)) => {
+                        return Ok(Exit::Rebuild {
+                            id,
+                            next,
+                            reconnect,
+                        });
+                    }
+                    Ok(SettingsChange::Live(result)) => Ok(result),
+                    Err(error) => Err(error),
+                },
+                "move_session" => match self.move_session(&request["params"]) {
+                    Ok(next) => {
+                        return Ok(Exit::Moved {
+                            id,
+                            next: Box::new(next),
+                        });
+                    }
                     Err(error) => Err(error),
                 },
                 _ => self.handle_request(&request),
@@ -531,8 +668,97 @@ impl ActorRuntime<'_> {
         Ok(SettingsChange::Rebuild(Box::new(next), reconnect))
     }
 
+    /// Publish persistent mode preferences only after admission and validation, then use the
+    /// ordinary settings rebuild so projections, side snapshots and controls advance together.
+    fn mode_change(&mut self, params: &Value) -> Result<SettingsChange> {
+        if self.acp {
+            return Err(super::unknown_method());
+        }
+        if workflows::mode_settings(self.agent.effective_config(), params)?.is_none() {
+            return workflows::set_mode(&mut self.agent, params).map(SettingsChange::Live);
+        }
+        if self
+            .agent
+            .live_task_control()
+            .list()
+            .iter()
+            .any(|(_, running)| *running)
+        {
+            return Err(coded(
+                ErrorCode::Busy,
+                "workers are running; change settings after they finish or cancel them",
+            ));
+        }
+        let mut saved = crate::config::settings_store::load_config(self.layout, self.overlay)
+            .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
+        // Session model switches do not change saved preferences, but tier eligibility follows
+        // the model actually receiving requests, just as in the terminal.
+        saved.provider = Some(self.agent.effective_config().selection().provider);
+        let (scope, changes) = workflows::mode_settings(&saved, params)?
+            .context("persistent mode plan disappeared")?;
+        let preview = crate::config::settings_store::preview_config(
+            self.layout,
+            scope,
+            &changes,
+            self.overlay,
+        )
+        .map_err(|error| coded(ErrorCode::InvalidParams, error))?
+        .for_coding();
+        preview
+            .require_model()
+            .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
+        crate::config::settings_store::save_config_checked(
+            self.layout,
+            scope,
+            &changes,
+            self.overlay,
+            |config| {
+                let config = config.clone().for_coding();
+                // A global layer may intentionally leave model selection to the project or CLI.
+                if config.model.trim().is_empty() {
+                    return Ok(());
+                }
+                make_backend(&config).map(|_| ())
+            },
+        )
+        .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
+        match self.settings_change(&json!({}))? {
+            SettingsChange::Live(mut result) => {
+                result["state"] = workflows::modes(&self.agent);
+                Ok(SettingsChange::Live(result))
+            }
+            rebuild => Ok(rebuild),
+        }
+    }
+
+    /// Validate a project move before the relocation owner can publish the destination journal.
+    fn move_session(&mut self, params: &Value) -> Result<Config> {
+        if self.acp {
+            return Err(unknown_method());
+        }
+        if self
+            .agent
+            .live_task_control()
+            .list()
+            .iter()
+            .any(|(_, running)| *running)
+        {
+            return Err(coded(
+                ErrorCode::Busy,
+                "workers are running; move after they finish or cancel them",
+            ));
+        }
+        self.sides.prepare_move()?;
+        maintenance::move_session(&mut self.agent, self.overlay, params)
+    }
+
     /// Publish the post-request state and reply only after cancellation and close cleanup.
     fn settle_request(&mut self, request: &Value, id: &Value, result: Result<Value>) {
+        self.steering_cleanup.settle();
+        let recovery_reply = self.recovery_reply.take();
+        if !self.acp {
+            collaboration::hosting::sync(self.agent.session());
+        }
         if self.acp && self.current && self.flag.load(Ordering::SeqCst) {
             stop_owned_tasks(&mut self.agent, &mut self.ui);
             let tools = self.agent.fresh_session_tools();
@@ -541,6 +767,7 @@ impl ActorRuntime<'_> {
         if request["method"] == "close_session" {
             self.worker_closing.store(false, Ordering::SeqCst);
         }
+        self.refresh_sides();
         query_snapshot(
             &self.agent,
             &mut self
@@ -551,12 +778,42 @@ impl ActorRuntime<'_> {
         if !self.worker_closing.load(Ordering::SeqCst) {
             self.active.store(false, Ordering::SeqCst);
         }
-        self.worker_out.result(id, result);
+        if request["_collaboration"] == true {
+            match result {
+                Ok(result) => {
+                    self.worker_out.emit(
+                        json!({"event":"collaboration_turn","outcome":"completed","result":result}),
+                    );
+                }
+                Err(error) => {
+                    let code = error
+                        .downcast_ref::<RequestError>()
+                        .map_or(ErrorCode::Failed, |error| error.code)
+                        .as_str();
+                    self.worker_out.emit(json!({"event":"collaboration_turn","outcome":"failed","error":{"code":code,"message":format!("{error:#}")}}));
+                }
+            }
+        } else if let Some(reply) = recovery_reply {
+            reply.complete(id, result);
+        } else {
+            self.worker_out.result(id, result);
+        }
+    }
+
+    /// Refresh after every request, including failed/partially applied mutations. This covers
+    /// session activation, rewind and compaction without maintaining a parallel method allowlist.
+    fn refresh_sides(&mut self) {
+        if !self.acp
+            && let Err(error) = self.sides.bind(&self.agent, None)
+        {
+            self.ui
+                .notice(&format!("Side context unavailable: {error:#}"));
+        }
     }
 
     fn idle_tick(&mut self) -> Result<()> {
         self.agent.pump_subagents(&mut self.ui);
-        if self.current {
+        if self.current && !crate::collab::room::is_guest() {
             let queued = self.worker_prompt_queued.load(Ordering::SeqCst);
             let foreground =
                 self.config.compute_locks && self.agent.foreground_idle_pending(queued)?;
@@ -607,6 +864,7 @@ impl ActorRuntime<'_> {
             self.ui.projection_dirty = false;
             self.projected_at = std::time::Instant::now();
             self.projected_messages = messages;
+            self.refresh_sides();
             query_snapshot(
                 &self.agent,
                 &mut self
@@ -648,6 +906,16 @@ impl ActorRuntime<'_> {
     fn handle_request(&mut self, request: &Value) -> Result<Value> {
         let params = &request["params"];
         let method = request["method"].as_str().unwrap_or("");
+        if !self.acp
+            && method == "goal"
+            && crate::collab::room::is_guest()
+            && matches!(params["action"].as_str(), Some("set" | "guided" | "resume"))
+        {
+            return Err(coded(
+                ErrorCode::Refused,
+                "leave the collaboration guest session before starting a local goal",
+            ));
+        }
         if self.acp
             && !matches!(
                 method,
@@ -668,8 +936,13 @@ impl ActorRuntime<'_> {
             if !self.current || self.agent.session().id() != wanted {
                 self.activate_parked(wanted)?;
             }
-            self.worker_out
-                .emit(json!({"event":"active_session","session_id":self.agent.session().id()}));
+            self.publish_activation();
+        }
+        if !self.acp
+            && matches!(method, "send" | "retry" | "live_listen")
+            && let Some(result) = collaboration::prompt(method, params)
+        {
+            return result;
         }
         let memory_compute = request["method"] == "memory"
             && self.config.memory_uses_local_compute()
@@ -681,14 +954,23 @@ impl ActorRuntime<'_> {
                     .next(),
                 None | Some("status" | "queue")
             );
+        let goal_compute = method == "goal" && workflows::goal_has_prompt(&self.agent, params)?;
         if self.compute.is_none()
             && self.config.compute_locks
             && (memory_compute
                 || (self.config.requires_compute_lock()
-                    && matches!(
-                        request["method"].as_str(),
-                        Some("send" | "retry" | "live_listen" | "compact" | "task_start")
-                    )))
+                    && (goal_compute
+                        || matches!(
+                            request["method"].as_str(),
+                            Some(
+                                "send"
+                                    | "retry"
+                                    | "live_listen"
+                                    | "compact"
+                                    | "task_start"
+                                    | "branch_session"
+                            )
+                        ))))
         {
             self.compute = crate::learn::auto::compute_lock_cancellable(self.layout, || {
                 self.flag.load(Ordering::SeqCst) || self.worker_out.unavailable()
@@ -702,9 +984,89 @@ impl ActorRuntime<'_> {
                 &self.config.model,
             )?;
         }
+        if matches!(method, "send" | "retry" | "live_listen") || goal_compute {
+            self.ui
+                .steering
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .begin(
+                    self.agent.session().id(),
+                    request.get("id").cloned().unwrap_or(Value::Null),
+                );
+        }
         let mut result = match method {
+            "get_modes" => Ok(workflows::modes(&self.agent)),
+            "recovery_snapshot" => {
+                if self
+                    .agent
+                    .live_task_control()
+                    .list()
+                    .iter()
+                    .any(|(_, running)| *running)
+                {
+                    return Err(coded(
+                        ErrorCode::Busy,
+                        "wait for workers before recovering a consistent conversation",
+                    ));
+                }
+                let output = self.worker_out.mapping()?;
+                let mut snapshot = output
+                    .envelope
+                    .live
+                    .snapshot(Some(self.agent.session().id()), output.envelope.seq);
+                snapshot["messages"] = json!(self.agent.session().messages());
+                snapshot["busy"] = json!(false);
+                snapshot["todo"] = json!(self.agent.todo().snapshot());
+                self.recovery_reply = Some(self.worker_out.reserve_reply(&output)?);
+                drop(output);
+                live_snapshot::bounded(snapshot, live_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES)
+            }
+            "set_mode" => workflows::set_mode(&mut self.agent, params),
+            "goal" => {
+                let (state, prompt) = workflows::goal(&mut self.agent, params)?;
+                if let Some(text) = prompt {
+                    self.turn_prompt(&Value::Null, text, None, None)
+                } else {
+                    Ok(state)
+                }
+            }
+            "side_promote" => self.sides.promote(&self.agent, self.layout, params),
+            "archive" => maintenance::archive(self.layout, params),
+            "pack_session" => maintenance::pack(&self.agent, params),
+            "branch_session" => {
+                maintenance::branch(self.config, &self.flag, &mut self.agent, params)
+            }
+            "label_session" => maintenance::label(&mut self.agent, params),
+            "list_schedules" => maintenance::schedule_list(self.layout, params),
+            "add_schedule" => maintenance::schedule_add(self.layout, params),
+            "remove_schedule" => maintenance::schedule_remove(self.layout, params),
+            "schedule_status" => maintenance::schedule_status(self.layout, params),
+            "research_status" => research::inspect(&self.agent),
+            "research_action" => self.research_action(params),
+            "collaboration_join" => self.collaboration_join(params),
+            "collaboration_start" => {
+                if self
+                    .agent
+                    .live_task_control()
+                    .list()
+                    .iter()
+                    .any(|(_, running)| *running)
+                {
+                    return Err(coded(
+                        ErrorCode::Busy,
+                        "wait for local child workers before sharing this session",
+                    ));
+                }
+                collaboration::hosting::start(
+                    self.agent.effective_config(),
+                    self.layout,
+                    self.agent.session(),
+                    params,
+                    &self.flag,
+                )
+            }
             "send" | "live_listen" => self.send(request, params),
-            "retry" => self.retry(request),
+            "retry" => self.retry(),
             "state" => Ok(state_projection(&self.agent)),
             "plan" => {
                 self.agent.set_plan_mode(
@@ -838,6 +1200,11 @@ impl ActorRuntime<'_> {
             "list_checkpoints" => Ok(checkpoints::list(self.agent.checkpoints())),
             "checkpoint_files" => checkpoints::files(self.agent.checkpoints(), params),
             "checkpoint_diff" => checkpoints::diff(self.agent.checkpoints(), params),
+            "evidence" => diagnostics::evidence(&self.agent, params),
+            "evidence_correct" => diagnostics::evidence_correct(&mut self.agent, params),
+            "evidence_compare" => diagnostics::evidence_compare(&self.agent, params),
+            "policy" => Ok(diagnostics::policy(&self.agent)),
+            "reliability" => Ok(diagnostics::reliability(&self.agent)),
             "restore_checkpoint_files" => checkpoints::restore(self.agent.checkpoints(), params),
             "undo" => {
                 let turns = checkpoints::undo_turns(params)?;
@@ -903,17 +1270,119 @@ impl ActorRuntime<'_> {
         Ok(result)
     }
 
-    /// `retry`: rewind the unanswered prompt and send it again, as `/retry` does.
-    fn retry(&mut self, request: &Value) -> Result<Value> {
+    /// Maintenance temporarily owns exclusive compute; no foreground lease may survive into it.
+    fn research_action(&mut self, params: &Value) -> Result<Value> {
+        let config = self.agent.effective_config().clone();
+        research::validate(&config, params)?;
+        if self
+            .agent
+            .live_task_control()
+            .list()
+            .iter()
+            .any(|(_, running)| *running)
+        {
+            return Err(coded(
+                ErrorCode::Busy,
+                "wait for child workers before running research admission",
+            ));
+        }
+        self.agent.cancel_background_compaction();
+        self.agent.release_idle_models();
+        let had_compute = self.release_foreground_compute()?;
+        let mut result = research::action(&config, params, self.flag.clone(), &mut |text| {
+            self.worker_out
+                .emit(json!({"event":"research_progress","phase":"evaluation","text":text}));
+        });
+        // Cancelled/disconnected requests leave the foreground lease absent. The normal next
+        // turn reacquires it; reacquiring with a cancelled flag here could trap transport cleanup.
+        if had_compute && !self.flag.load(Ordering::SeqCst) && !self.worker_out.unavailable() {
+            let restored = crate::learn::auto::compute_lock_cancellable(self.layout, || {
+                self.flag.load(Ordering::SeqCst) || self.worker_out.unavailable()
+            })
+            .and_then(|lock| {
+                if lock.is_some() {
+                    crate::learn::compute::register(
+                        &self.layout.user_dir,
+                        "session",
+                        &self.layout.project_root,
+                        &config.state_dir,
+                        &config.model,
+                    )?;
+                }
+                Ok(lock)
+            });
+            match restored {
+                Ok(lock) => self.compute = lock,
+                Err(error) => match &mut result {
+                    Ok(value) => value["foreground_compute_error"] = json!(format!("{error:#}")),
+                    Err(work) => {
+                        return Err(anyhow::anyhow!(
+                            "{work:#}; foreground compute restore also failed: {error:#}"
+                        ));
+                    }
+                },
+            }
+        }
+        if let Ok(value) = &mut result {
+            value["foreground_compute_restored"] = json!(self.compute.is_some());
+            value["activation"] = json!(match params["action"].as_str() {
+                Some("evaluate") if value["admission"]["passed"] != true => "unchanged",
+                Some("evaluate") if config.improve.enabled => "next_turn",
+                Some("evaluate") => "stored_only",
+                _ => "next_model_load_if_enabled",
+            });
+        }
+        result
+    }
+
+    fn release_foreground_compute(&mut self) -> Result<bool> {
+        let Some(lock) = self.compute.take() else {
+            return Ok(false);
+        };
+        crate::learn::compute::clear_owner(&self.layout.user_dir);
+        std::fs::File::unlock(&lock)?;
+        Ok(true)
+    }
+
+    fn collaboration_join(&mut self, params: &Value) -> Result<Value> {
+        if self
+            .agent
+            .live_task_control()
+            .list()
+            .iter()
+            .any(|(_, running)| *running)
+        {
+            return Err(coded(
+                ErrorCode::Busy,
+                "wait for local child workers before joining a remote host",
+            ));
+        }
+        let result = collaboration::join(self.agent.effective_config(), params, &self.flag)?;
+        self.agent.cancel_background_compaction();
+        self.agent.release_idle_models();
+        self.release_foreground_compute()?;
+        Ok(result)
+    }
+
+    /// `retry`: guest admission has already run before this point. Rewind and replay the
+    /// recorded text, whose frontend command expansion happened on the original send.
+    fn retry(&mut self) -> Result<Value> {
         let text = crate::app::failed_prompt(&self.agent.session().messages())
             .map_err(|reason| coded(ErrorCode::InvalidParams, reason))?;
         self.agent.cancel_background_compaction();
         crate::rewind::rewind(self.config, &self.flag, &mut self.agent, 1)
             .map_err(|error| coded(ErrorCode::InvalidParams, format!("rewind: {error:#}")))?;
-        self.send(request, &json!({"text":text}))
+        // As before, retry is text-only: request-supplied images are not newly attached.
+        self.turn_prompt(&Value::Null, text, None, None)
     }
 
     fn send(&mut self, request: &Value, params: &Value) -> Result<Value> {
+        if !self.acp
+            && let Some(result) =
+                collaboration::prompt(request["method"].as_str().unwrap_or("send"), params)
+        {
+            return result;
+        }
         let mut attached = None;
         let (spoken, transcript) = if request["method"] == "live_listen" {
             let session = live_state(&self.worker_live)
@@ -935,6 +1404,18 @@ impl ActorRuntime<'_> {
             }
             (text, None)
         };
+        self.turn_prompt(params, spoken, transcript, attached)
+    }
+
+    /// Shared turn lifecycle after client-only slash expansion and attachments are resolved.
+    /// Engine-generated goal continuations enter here literally, never as frontend commands.
+    fn turn_prompt(
+        &mut self,
+        params: &Value,
+        spoken: String,
+        transcript: Option<String>,
+        attached: Option<crate::app::PreparedTurn>,
+    ) -> Result<Value> {
         let started = Instant::now();
         let prompt = {
             let mut state = live_state(&self.worker_live);
@@ -945,6 +1426,9 @@ impl ActorRuntime<'_> {
                 .map(|session| session.prompt_for(&spoken))
         };
         let text = prompt.unwrap_or(spoken);
+        if !self.acp {
+            self.sides.bind(&self.agent, Some(&text))?;
+        }
         let turn = if self.acp {
             self.agent.turn_prepared_preserving_interrupt(
                 &text,
@@ -1108,6 +1592,12 @@ impl ActorRuntime<'_> {
         Ok(json!({"schemes": schemes}))
     }
 
+    fn publish_activation(&mut self) {
+        self.worker_out
+            .emit(json!({"event":"active_session","session_id":self.agent.session().id()}));
+        self.ui.todo(self.agent.todo());
+    }
+
     fn new_session(&mut self) -> Result<Value> {
         self.agent
             .gate_session_change("session_before_switch", json!({"reason":"new"}))
@@ -1119,9 +1609,9 @@ impl ActorRuntime<'_> {
             },
         )?;
         let workspace = self.agent.prepare_session_workspace(&session)?;
+        stop_owned_tasks(&mut self.agent, &mut self.ui);
         drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         if self.acp {
-            stop_owned_tasks(&mut self.agent, &mut self.ui);
             let next = ParkedSession::fresh(&self.agent, session);
             activate_session(
                 &mut self.agent,
@@ -1136,6 +1626,7 @@ impl ActorRuntime<'_> {
             self.agent.swap_session_prepared(session, workspace);
             self.agent.set_plan_mode(false);
         }
+        self.publish_activation();
         Ok(json!({"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode()}))
     }
 
@@ -1241,13 +1732,10 @@ impl ActorRuntime<'_> {
                                 "session id not found in launched project",
                             )
                         })?;
-                    let (session, source) = match Session::open_or_fork(self.layout, &info.path)? {
-                        crate::storage::session::Resumed::Owned(session) => (session, None),
-                        crate::storage::session::Resumed::Forked { source_id, session } => {
-                            (session, Some(source_id))
-                        }
-                    };
-                    forked_from = source;
+                    // ACP load returns the requested identity, not a replacement id. Never
+                    // create a hidden sibling when another connection owns this journal.
+                    let session = Session::open_exact(self.layout, &info.path)
+                        .map_err(|error| coded(ErrorCode::Refused, error))?;
                     let workspace = self.agent.prepare_session_workspace(&session)?;
                     (ParkedSession::fresh(&self.agent, session), workspace)
                 };
@@ -1262,9 +1750,8 @@ impl ActorRuntime<'_> {
                 );
                 self.current = true;
             }
+            self.publish_activation();
             if params["_replay"] == true {
-                self.worker_out
-                    .emit(json!({"event":"active_session","session_id":self.agent.session().id()}));
                 for message in self.agent.session().messages() {
                     if self.flag.load(Ordering::SeqCst)
                         || self.worker_out.failed.load(Ordering::SeqCst)
@@ -1309,6 +1796,7 @@ impl ActorRuntime<'_> {
                 drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
                 self.agent.swap_session_prepared(session, workspace);
                 self.agent.set_plan_mode(false);
+                self.publish_activation();
             }
             Ok(json!({"session_id":self.agent.session().id(),"forked_from":forked_from}))
         }
@@ -1362,6 +1850,7 @@ impl ActorRuntime<'_> {
         );
         self.agent.set_plan_mode(false);
         self.current = true;
+        self.publish_activation();
         Ok(json!({"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode()}))
     }
 
@@ -1407,6 +1896,7 @@ impl ActorRuntime<'_> {
         drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         self.agent.swap_session_prepared(session, workspace);
         self.agent.set_plan_mode(false);
+        self.publish_activation();
         Ok(
             json!({"session_id":self.agent.session().id(),"forked_from":wanted,"plan_mode":self.agent.plan_mode()}),
         )
@@ -1460,3 +1950,6 @@ impl ActorRuntime<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod research_tests;

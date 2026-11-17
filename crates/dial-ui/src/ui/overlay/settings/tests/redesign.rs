@@ -21,7 +21,7 @@ fn changed_filter_spans_categories_and_folded_rows_without_searching_values() {
     o.search.clear();
     let shown = draw(&mut o, &rig, 130, 30);
     assert!(!shown.contains("never-show-this-secret"), "{shown}");
-    send(&mut o, &rig.keys, ctrl('s'));
+    send(&mut o, &rig.keys, ctrl('b'));
     assert!(shows(&o, "ui.motion"));
     assert!(!shows(&o, "ui.tips"));
     send(&mut o, &rig.keys, key(KeyCode::Delete));

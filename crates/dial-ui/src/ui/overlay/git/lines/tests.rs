@@ -110,6 +110,7 @@ fn selection_stages_only_the_marked_line() {
     assert!(overlay.line_key(&mark, Some('m')));
     let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
     assert!(overlay.line_key(&space, Some(' ')));
+    overlay.wait_mutation();
 
     assert_eq!(
         git(root, &["show", ":f.txt"]),

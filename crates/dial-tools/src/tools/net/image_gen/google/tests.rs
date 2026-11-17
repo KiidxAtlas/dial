@@ -71,46 +71,50 @@ fn gemini_body_sends_source_as_inline_data() {
 }
 
 #[test]
-fn gemini_image_returns_the_only_image_and_skips_thoughts() {
+fn gemini_images_returns_the_image_and_skips_thoughts() {
     let response = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
         {"thought": true, "inlineData": {"mimeType": "image/png", "data": encoded(b"draft")}},
         {"text": "here it is"},
         {"inlineData": {"mimeType": "image/png", "data": encoded(b"final")}}
     ]}}]});
-    assert_eq!(gemini_image(&response).unwrap(), b"final");
+    assert_eq!(gemini_images(&response).unwrap(), [b"final".to_vec()]);
 }
 
 #[test]
 fn gemini_image_reports_refusals_and_missing_images() {
     let finish =
         |reason: &str| json!({"candidates": [{"finishReason": reason, "content": {"parts": []}}]});
-    let safety = gemini_image(&finish("SAFETY")).unwrap_err().to_string();
+    let safety = gemini_images(&finish("SAFETY")).unwrap_err().to_string();
     assert!(safety.contains("SAFETY"), "{safety}");
-    let no_image = gemini_image(&finish("NO_IMAGE")).unwrap_err().to_string();
+    let no_image = gemini_images(&finish("NO_IMAGE")).unwrap_err().to_string();
     assert!(no_image.contains("NO_IMAGE"), "{no_image}");
-    let stopped = gemini_image(&finish("MAX_TOKENS")).unwrap_err().to_string();
+    let stopped = gemini_images(&finish("MAX_TOKENS"))
+        .unwrap_err()
+        .to_string();
     assert!(stopped.contains("MAX_TOKENS"), "{stopped}");
     let text_only =
         json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "no"}]}}]});
-    assert!(gemini_image(&text_only).is_err());
+    assert!(gemini_images(&text_only).is_err());
     let blocked = json!({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}});
     assert!(
-        gemini_image(&blocked)
+        gemini_images(&blocked)
             .unwrap_err()
             .to_string()
             .contains("PROHIBITED_CONTENT")
     );
-    assert!(gemini_image(&json!({})).is_err());
+    assert!(gemini_images(&json!({})).is_err());
 }
 
 #[test]
-fn gemini_image_rejects_multiple_images() {
+fn gemini_images_returns_every_image_in_order() {
     let response = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
         {"inlineData": {"mimeType": "image/png", "data": encoded(b"a")}},
         {"inlineData": {"mimeType": "image/png", "data": encoded(b"b")}}
     ]}}]});
-    let error = gemini_image(&response).unwrap_err().to_string();
-    assert!(error.contains("2 images"), "{error}");
+    assert_eq!(
+        gemini_images(&response).unwrap(),
+        [b"a".to_vec(), b"b".to_vec()]
+    );
 }
 
 #[test]
@@ -162,29 +166,32 @@ fn imagen_rejects_source_images_before_any_request() {
 }
 
 #[test]
-fn imagen_image_returns_the_single_prediction() {
+fn imagen_images_returns_every_prediction_in_order() {
     let response =
         json!({"predictions": [{"bytesBase64Encoded": encoded(b"png"), "mimeType": "image/png"}]});
-    assert_eq!(imagen_image(&response).unwrap(), b"png");
-}
-
-#[test]
-fn imagen_image_reports_empty_filtered_and_multiple_predictions() {
-    assert!(imagen_image(&json!({"predictions": []})).is_err());
-    assert!(imagen_image(&json!({})).is_err());
-    let filtered = json!({"predictions": [{"raiFilteredReason": "PROHIBITED"}]});
-    let error = imagen_image(&filtered).unwrap_err().to_string();
-    assert!(error.contains("PROHIBITED"), "{error}");
+    assert_eq!(imagen_images(&response).unwrap(), [b"png".to_vec()]);
     let many = json!({"predictions": [
         {"bytesBase64Encoded": encoded(b"a")},
         {"bytesBase64Encoded": encoded(b"b")}
     ]});
-    assert!(
-        imagen_image(&many)
-            .unwrap_err()
-            .to_string()
-            .contains("2 images")
+    assert_eq!(
+        imagen_images(&many).unwrap(),
+        [b"a".to_vec(), b"b".to_vec()]
     );
+}
+
+#[test]
+fn imagen_images_reports_empty_and_filtered_predictions() {
+    assert!(imagen_images(&json!({"predictions": []})).is_err());
+    assert!(imagen_images(&json!({})).is_err());
+    let filtered = json!({"predictions": [{"raiFilteredReason": "PROHIBITED"}]});
+    let error = imagen_images(&filtered).unwrap_err().to_string();
+    assert!(error.contains("PROHIBITED"), "{error}");
+    let partly = json!({"predictions": [
+        {"bytesBase64Encoded": encoded(b"a")},
+        {"raiFilteredReason": "PROHIBITED"}
+    ]});
+    assert!(imagen_images(&partly).is_err());
 }
 
 #[test]

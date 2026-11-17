@@ -1551,6 +1551,7 @@ fn focused_python_checks_avoid_an_interpreter_hidden_by_the_shell_sandbox() {
                 deny_read: Vec::new(),
                 extra_write: Vec::new(),
                 allow_network: false,
+                serial_ports: false,
             });
     assert_eq!(agent.check_python(), python, "visible interpreter is kept");
     agent.workspace = agent

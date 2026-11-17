@@ -975,7 +975,8 @@ impl<'a> ChildTurn<'a> {
             children.journal.borrow().session.runtime(),
             None,
             env.ext.clone(),
-        );
+        )
+        .without_retry_notice();
         // Workers share the main loop's host-default policy, using the route actually bound
         // above rather than the launch route after an owner-requested model switch.
         let config = self

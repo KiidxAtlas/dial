@@ -834,8 +834,15 @@ fn rpc_keeps_conversation_state_and_approval_does_not_bypass_policy() {
         "approve",
         json!({"approval_id":"approval-1","decision":"allow"}),
     );
-    let future = rpc.next();
-    assert_eq!(future["id"], 90);
+    // Restored side-state notifications may arrive before the first response. They must not
+    // obscure the first request's coded refusal or consume an approval decision.
+    let future = loop {
+        let frame = rpc.next();
+        if frame.get("event").is_none() {
+            break frame;
+        }
+    };
+    assert_eq!(future["id"], 90, "unexpected frame: {future}");
     assert!(
         future["error"]["message"]
             .as_str()

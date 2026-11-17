@@ -39,6 +39,7 @@ mod validate;
 pub mod vision;
 pub mod voice;
 pub mod weights;
+pub mod working_modes;
 
 use crate::config::{
     paths::Layout,

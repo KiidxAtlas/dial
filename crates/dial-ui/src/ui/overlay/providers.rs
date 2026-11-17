@@ -4,7 +4,9 @@
 //! API keys are typed into a masked field backed by [`Secret`]; the text is never drawn, never in
 //! `Debug` output, and is moved into the single `SaveCredential` event (or wiped) the moment the
 //! field is confirmed or abandoned. Whether a key is saved is asked of the controller through the
-//! `has_key` callback, so the display always reflects the real credential store.
+//! `has_key` callback. Each answer is kept until the credential store can have changed (a
+//! controller reply, a configuration change or a rescan), so drawing never reads the store per row
+//! and per frame.
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -248,6 +250,7 @@ pub struct EnvCredential {
 
 pub struct ProviderOverlay {
     panel_keys: super::panel_keys::PanelKeys,
+    hits: super::panel_keys::RowHits,
     chatgpt_pending: bool,
     chatgpt_accounts: Vec<crate::llm::chatgpt::AccountInfo>,
     anthropic_signed_in: bool,
@@ -255,12 +258,18 @@ pub struct ProviderOverlay {
     discovery: Option<Discovery>,
     configured: BTreeMap<String, ProviderSpec>,
     has_key: Box<dyn Fn(&str) -> bool>,
+    /// `has_key` answers by base URL; see [`Self::forget_saved_keys`].
+    saved_keys: std::cell::RefCell<BTreeMap<String, bool>>,
     scope: Scope,
     project_name: String,
     cursor: usize,
     scroll: usize,
     page: usize,
     mode: Mode,
+    confirm_scroll: usize,
+    confirm_usable: bool,
+    form_scroll: usize,
+    form_page: usize,
     message: Option<(String, bool)>,
     /// A credential save awaits the controller's verdict; shown neutral until `set_status` answers.
     saving: bool,
@@ -320,6 +329,7 @@ impl ProviderOverlay {
     ) -> Self {
         ProviderOverlay {
             panel_keys: Default::default(),
+            hits: Default::default(),
             chatgpt_pending: false,
             chatgpt_accounts: Vec::new(),
             anthropic_signed_in: false,
@@ -327,12 +337,17 @@ impl ProviderOverlay {
             discovery,
             configured,
             has_key,
+            saved_keys: Default::default(),
             scope,
             project_name: "this project".into(),
             cursor: 0,
             scroll: 0,
             page: 8,
             mode: Mode::List,
+            confirm_scroll: 0,
+            confirm_usable: true,
+            form_scroll: 0,
+            form_page: 1,
             message: None,
             saving: false,
             credential_sources: BTreeMap::new(),
@@ -361,6 +376,11 @@ impl ProviderOverlay {
     }
     pub fn set_configured(&mut self, configured: BTreeMap<String, ProviderSpec>) {
         self.configured = configured;
+        self.forget_saved_keys();
+    }
+    /// Drop remembered `has_key` answers so the next frame reads the credential store again.
+    fn forget_saved_keys(&mut self) {
+        self.saved_keys.get_mut().clear();
     }
     /// Where each provider's key comes from, keyed by base URL. The caller
     /// resolves the saved key and the environment variable; this overlay only describes them.
@@ -371,6 +391,7 @@ impl ProviderOverlay {
     pub fn set_discovery(&mut self, d: Discovery) {
         let anchor = self.entries().get(self.cursor).map(|e| e.id.clone());
         self.discovery = Some(d);
+        self.forget_saved_keys();
         let entries = self.entries();
         self.cursor = anchor
             .and_then(|id| entries.iter().position(|e| e.id == id))
@@ -472,10 +493,15 @@ impl ProviderOverlay {
     }
 
     fn key_saved(&self, entry: &Entry) -> bool {
-        entry
-            .base_url
-            .as_deref()
-            .is_some_and(|url| (self.has_key)(url))
+        let Some(url) = entry.base_url.as_deref() else {
+            return false;
+        };
+        if let Some(saved) = self.saved_keys.borrow().get(url) {
+            return *saved;
+        }
+        let saved = (self.has_key)(url);
+        self.saved_keys.borrow_mut().insert(url.to_owned(), saved);
+        saved
     }
 
     // ---- input ----------------------------------------------------------------------------
@@ -486,6 +512,27 @@ impl ProviderOverlay {
             .handle_key(event, !matches!(self.mode, Mode::List))
         {
             return OverlayEvent::None;
+        }
+        // Page only the explanatory copy. Arrows, Home and End still belong to the editor.
+        if matches!(self.mode, Mode::Key { .. } | Mode::Wizard(_)) {
+            if let Event::Key(key) = event
+                && pressed(key)
+            {
+                if keys.matches(Action::SelectPageDown, key) {
+                    self.form_scroll = self.form_scroll.saturating_add(self.form_page);
+                    return OverlayEvent::None;
+                }
+                if keys.matches(Action::SelectPageUp, key) {
+                    self.form_scroll = self.form_scroll.saturating_sub(self.form_page);
+                    return OverlayEvent::None;
+                }
+                self.form_scroll = 0;
+            }
+            if matches!(event, Event::Paste(_)) {
+                self.form_scroll = 0;
+            }
+        } else {
+            self.form_scroll = 0;
         }
         match event {
             Event::Key(key) if pressed(key) => self.key(key, keys),
@@ -533,6 +580,8 @@ impl ProviderOverlay {
     pub fn set_status(&mut self, message: String, is_error: bool) {
         self.message = Some((message, !is_error));
         self.saving = false;
+        // The controller replies after applying a save or removal.
+        self.forget_saved_keys();
     }
 
     fn list_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
@@ -540,7 +589,7 @@ impl ProviderOverlay {
         self.saving = false;
         let count = self.row_count();
         let last = count - 1;
-        if is_ctrl(key, 's') {
+        if is_ctrl(key, 'b') {
             self.scope = other_scope(self.scope);
             return OverlayEvent::None;
         }
@@ -1126,7 +1175,24 @@ impl ProviderOverlay {
         let Mode::Confirm(entry, removal) = &self.mode else {
             return OverlayEvent::None;
         };
+        if keys.matches(Action::SelectDown, key) {
+            self.confirm_scroll = self.confirm_scroll.saturating_add(1);
+        } else if keys.matches(Action::SelectUp, key) {
+            self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
+        } else if keys.matches(Action::SelectPageDown, key) {
+            self.confirm_scroll = self.confirm_scroll.saturating_add(self.page);
+        } else if keys.matches(Action::SelectPageUp, key) {
+            self.confirm_scroll = self.confirm_scroll.saturating_sub(self.page);
+        } else if key.code == KeyCode::Home {
+            self.confirm_scroll = 0;
+        } else if key.code == KeyCode::End {
+            self.confirm_scroll = usize::MAX;
+        }
         if keys.matches(Action::SelectConfirm, key) {
+            if !self.confirm_usable {
+                return OverlayEvent::None;
+            }
+            self.confirm_scroll = 0;
             let (id, base_url, removal) = (entry.id.clone(), entry.base_url.clone(), *removal);
             self.mode = Mode::List;
             return match removal {
@@ -1145,6 +1211,7 @@ impl ProviderOverlay {
             };
         }
         if keys.matches(Action::SelectCancel, key) {
+            self.confirm_scroll = 0;
             self.mode = Mode::List;
         }
         OverlayEvent::None
@@ -1179,11 +1246,7 @@ impl ProviderOverlay {
                 "  Dial stops using the subscription login; a saved API key is kept.".to_owned(),
             ),
         };
-        vec![
-            Line::default(),
-            Line::from(fit(vec![Span::styled(main, theme.fg(Tok::Warning))], w)),
-            Line::from(fit(vec![Span::styled(note, theme.fg(Tok::Muted))], w)),
-        ]
+        Self::wrapped_copy(theme, vec![(main, Tok::Warning), (note, Tok::Muted)], w)
     }
 
     fn wizard_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
@@ -1260,8 +1323,26 @@ impl ProviderOverlay {
 
     // ---- drawing --------------------------------------------------------------------------
 
+    /// A click selects a provider; Enter remains the explicit action.
+    pub fn click(&mut self, x: u16, y: u16) -> OverlayEvent {
+        if !self.panel_keys.open()
+            && matches!(self.mode, Mode::List)
+            && let Some(index) = self.hits.hit(x, y)
+        {
+            self.cursor = index;
+        }
+        OverlayEvent::None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(frame, ctx, "Providers", "a adds a provider · k sets an API key · x or Delete removes (asks first) · Enter opens the provider menu.\nCtrl+S switches save scope.", false, false) {
+        self.hits.begin(frame.area());
+        self.panel_keys.set_footer(
+            self.footer(ctx.keys)
+                .into_iter()
+                .map(|(key, label)| format!("{key} {label}"))
+                .collect(),
+        );
+        if self.panel_keys.draw(frame, ctx, "Providers", "a adds a provider · k sets an API key · x or Delete removes (asks first) · Enter opens the provider menu.\nCtrl+B switches save scope.\nIn API-key and Add provider forms, PageUp/PageDown scroll all help, validation errors and endpoint details while the input stays pinned. Home/End and arrows retain editor navigation. Editing or validating returns to the start of the copy.", false, false) {
             return;
         }
         let extra = super::settings::scope_caption(
@@ -1287,6 +1368,73 @@ impl ProviderOverlay {
     fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(w), usize::from(h));
         let theme = ctx.theme;
+        // Forms and reviews own their body: list details and empty status rows must not hide input.
+        if matches!(
+            self.mode,
+            Mode::Key { .. } | Mode::Wizard(_) | Mode::Confirm(..)
+        ) {
+            let body_rows = h.saturating_sub(1);
+            let mut body = match &self.mode {
+                Mode::Key {
+                    entry,
+                    secret,
+                    error,
+                } => self.key_body(theme, entry, secret, error.as_deref(), w),
+                Mode::Wizard(wizard) => self.wizard_body(theme, wizard, w),
+                Mode::Confirm(entry, removal) => self.confirm_body(theme, entry, *removal, w),
+                _ => unreachable!(),
+            };
+            // Forms begin with a compact heading and active input. Only secondary copy scrolls.
+            let mut pinned = Vec::new();
+            if !matches!(self.mode, Mode::Confirm(..)) {
+                let details = body.split_off(2.min(body.len()));
+                pinned = body;
+                pinned.truncate(body_rows);
+                body = details;
+                if body_rows >= 4 && body.len() > body_rows.saturating_sub(pinned.len()) {
+                    pinned.push(chrome::hint_line(
+                        theme,
+                        &[(
+                            &pair_label(ctx.keys, Action::SelectPageUp, Action::SelectPageDown),
+                            "details",
+                        )],
+                        w,
+                    ));
+                }
+            }
+            let detail_rows = body_rows.saturating_sub(pinned.len());
+            let review = matches!(self.mode, Mode::Confirm(..));
+            let start = if review {
+                self.confirm_usable = w >= 20 && h >= 3;
+                self.page = body_rows.max(1);
+                self.confirm_scroll = self
+                    .confirm_scroll
+                    .min(body.len().saturating_sub(body_rows));
+                self.confirm_scroll
+            } else {
+                self.form_page = detail_rows.max(1);
+                self.form_scroll = self.form_scroll.min(body.len().saturating_sub(detail_rows));
+                self.form_scroll
+            };
+            let mut out = pinned;
+            out.extend(body.into_iter().skip(start).take(detail_rows));
+            out.resize(body_rows, Line::default());
+            if h > 0 {
+                if review && !self.confirm_usable {
+                    out.push(Line::from("Enlarge to confirm; Esc cancels"));
+                } else {
+                    let mut footer = self.footer(ctx.keys);
+                    if review {
+                        footer.insert(1, ("↑/↓".into(), "scroll".into()));
+                    }
+                    if !review {
+                        footer.insert(1, ("F1".into(), "keys".into()));
+                    }
+                    out.push(key_footer(theme, &footer, w));
+                }
+            }
+            return out;
+        }
         let body_min = h.min(3);
         let mut spare = h - body_min;
         let mut grant = || {
@@ -1370,6 +1518,12 @@ impl ProviderOverlay {
             out.extend(
                 (0..=extra_detail).map(|index| details.get(index).cloned().unwrap_or_default()),
             );
+        }
+        if matches!(self.mode, Mode::List) {
+            for y in 0..body_rows.min((entries.len() + 1).saturating_sub(self.scroll)) {
+                self.hits
+                    .row(0, usize::from(show_header) + y, w, self.scroll + y);
+            }
         }
         if show_footer {
             out.push(key_footer(theme, &self.footer(ctx.keys), w));
@@ -1675,26 +1829,12 @@ impl ProviderOverlay {
         } else {
             "•".repeat(dots)
         };
+        let title = format!("API key for {}", text::one_line(&entry.label));
         let mut lines = vec![
-            Line::default(),
             Line::from(fit(
-                vec![Span::styled(
-                    format!("  API key for {}", text::one_line(&entry.label)),
-                    theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
-                )],
+                vec![Span::styled(title.clone(), theme.fg(Tok::Accent))],
                 w,
             )),
-            Line::from(fit(
-                vec![Span::styled(
-                    format!(
-                        "  stored for {}",
-                        text::one_line(entry.base_url.as_deref().unwrap_or(""))
-                    ),
-                    theme.fg(Tok::Muted),
-                )],
-                w,
-            )),
-            Line::default(),
             Line::from(fit(
                 vec![
                     Span::styled(
@@ -1702,102 +1842,104 @@ impl ProviderOverlay {
                         theme.fg(Tok::Accent),
                     ),
                     Span::styled(shown, theme.fg(Tok::Text)),
-                    Span::styled(
-                        " ".to_owned(),
-                        theme.fg(Tok::Text).add_modifier(Modifier::REVERSED),
-                    ),
+                    Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
                 ],
                 w,
             )),
-            Line::from(fit(
-                vec![Span::styled(
-                    format!(
-                        "  {dots} characters; the key is hidden and is not kept after you press Enter"
-                    ),
-                    theme.fg(Tok::Dim),
-                )],
-                w,
-            )),
         ];
+        let mut copy = Vec::new();
         if let Some(error) = error {
-            lines.push(Line::from(fit(
-                vec![Span::styled(
-                    format!("  {} {error}", theme.sym(Sym::Cross2)),
-                    theme.fg(Tok::Error),
-                )],
-                w,
-            )));
+            copy.push((
+                format!("{} {}", theme.sym(Sym::Cross2), text::one_line(error)),
+                Tok::Error,
+            ));
         }
+        copy.extend([
+            (title, Tok::Text),
+            (
+                format!(
+                    "stored for {}",
+                    text::one_line(entry.base_url.as_deref().unwrap_or(""))
+                ),
+                Tok::Muted,
+            ),
+            (
+                format!(
+                    "{dots} characters; the key is hidden and is not kept after you press Enter"
+                ),
+                Tok::Dim,
+            ),
+        ]);
+        lines.extend(Self::wrapped_copy(theme, copy, w));
         lines
     }
 
     fn wizard_body(&self, theme: &Theme, wizard: &Wizard, w: usize) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::default()];
-        for (i, step) in STEPS.iter().enumerate() {
-            let done = i < wizard.step;
-            let active = i == wizard.step;
-            let mark = if done {
-                theme.sym(Sym::Check)
-            } else if active {
-                theme.sym(Sym::Pointer)
-            } else {
-                " "
-            };
-            let tok = if active {
-                Tok::Accent
-            } else if done {
-                Tok::Success
-            } else {
-                Tok::Dim
-            };
-            let mut spans = vec![Span::styled(
-                format!("  {mark} {}", step.title()),
-                theme.fg(tok).add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-            )];
-            if done {
-                let value = if wizard.values[i].is_empty() {
-                    "(none)".to_owned()
-                } else {
-                    text::one_line(&wizard.values[i])
-                };
-                spans.push(Span::styled(format!("  {value}"), theme.fg(Tok::Muted)));
-            }
-            if active {
-                let mut input = vec![Span::styled("    [".to_owned(), theme.fg(Tok::Muted))];
-                input.extend(editor_spans(
-                    theme,
-                    &wizard.editor,
-                    w.saturating_sub(7),
-                    false,
-                ));
-                input.push(Span::styled("]".to_owned(), theme.fg(Tok::Muted)));
-                lines.push(Line::from(fit(spans, w)));
-                lines.push(Line::from(fit(input, w)));
-                lines.push(Line::from(fit(
-                    vec![Span::styled(
-                        format!("    {}", step.help()),
-                        theme.fg(Tok::Dim),
-                    )],
-                    w,
-                )));
-                if let Some(error) = &wizard.error {
-                    lines.push(Line::from(fit(
-                        vec![Span::styled(
-                            format!("    {} {error}", theme.sym(Sym::Cross2)),
-                            theme.fg(Tok::Error),
-                        )],
-                        w,
-                    )));
-                }
-            } else {
-                lines.push(Line::from(fit(spans, w)));
-            }
+        let mut input = vec![Span::styled("  [", theme.fg(Tok::Muted))];
+        input.extend(editor_spans(
+            theme,
+            &wizard.editor,
+            w.saturating_sub(5),
+            false,
+        ));
+        input.push(Span::styled("]", theme.fg(Tok::Muted)));
+        let mut lines = vec![
+            Line::from(fit(
+                vec![Span::styled(
+                    format!(
+                        "{}/{} · {}",
+                        wizard.step + 1,
+                        STEPS.len(),
+                        wizard.current().title()
+                    ),
+                    theme.fg(Tok::Accent),
+                )],
+                w,
+            )),
+            Line::from(fit(input, w)),
+        ];
+        let mut copy = Vec::new();
+        if let Some(error) = &wizard.error {
+            copy.push((
+                format!("{} {}", theme.sym(Sym::Cross2), text::one_line(error)),
+                Tok::Error,
+            ));
         }
+        copy.push((wizard.current().title().to_owned(), Tok::Accent));
+        copy.push((wizard.current().help().to_owned(), Tok::Dim));
+        for (i, step) in STEPS.iter().enumerate() {
+            if i == wizard.step {
+                continue;
+            }
+            let row = if i < wizard.step {
+                format!(
+                    "{} {}: {}",
+                    theme.sym(Sym::Check),
+                    step.title(),
+                    if wizard.values[i].is_empty() {
+                        "(none)".into()
+                    } else {
+                        text::one_line(&wizard.values[i])
+                    }
+                )
+            } else {
+                step.title().to_owned()
+            };
+            copy.push((row, Tok::Muted));
+        }
+        lines.extend(Self::wrapped_copy(theme, copy, w));
         lines
+    }
+
+    /// Shared word-aware copy layout for forms and provider removal reviews.
+    fn wrapped_copy(theme: &Theme, copy: Vec<(String, Tok)>, w: usize) -> Vec<Line<'static>> {
+        copy.into_iter()
+            .flat_map(|(row, tone)| {
+                text::wrap_words(&row, w.max(1))
+                    .into_iter()
+                    .map(move |line| Line::styled(line, theme.fg(tone)))
+            })
+            .collect()
     }
 
     fn detail(&self, theme: &Theme, entries: &[Entry]) -> Vec<Span<'static>> {
@@ -1849,7 +1991,7 @@ impl ProviderOverlay {
                 ("k".to_owned(), "key".to_owned()),
                 ("x".to_owned(), "remove".to_owned()),
                 ("F5".to_owned(), "rescan".to_owned()),
-                ("Ctrl+S".to_owned(), "scope".to_owned()),
+                ("Ctrl+B".to_owned(), "scope".to_owned()),
                 hint(Action::SelectCancel, "close"),
             ],
             Mode::Menu(_) => vec![

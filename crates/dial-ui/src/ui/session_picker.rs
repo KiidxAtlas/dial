@@ -82,7 +82,7 @@ pub struct Picker {
     /// List movement, confirm and cancel follow the user's keymap.
     keys: Keymap,
     /// F1 shows the key sheet instead of the list.
-    help: bool,
+    help: super::overlay::panel_keys::PanelKeys,
 }
 
 impl Picker {
@@ -130,7 +130,7 @@ impl Picker {
             found: Vec::new(),
             searchable,
             keys: Keymap::defaults(),
-            help: false,
+            help: Default::default(),
         };
         if !tree {
             picker.order_pins_first();
@@ -330,19 +330,12 @@ impl Picker {
     }
 
     pub fn handle(&mut self, event: &Event, height: usize) -> Action {
+        if self.help.handle_key(event, true) {
+            return Action::None;
+        }
         let page = self.page_size(height);
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                // F1 toggles the key sheet; while it shows, Esc or Enter closes it too.
-                if key.code == KeyCode::F(1)
-                    || (self.help && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
-                {
-                    self.help = !self.help;
-                    return Action::None;
-                }
-                if self.help {
-                    return Action::None;
-                }
                 if self.rename.is_some() {
                     return self.handle_rename(key);
                 }
@@ -526,7 +519,7 @@ impl Picker {
     }
 
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme) -> Rows {
-        if self.help && height >= 5 && cols >= 12 {
+        if self.help.open() && height >= 5 && cols >= 12 {
             let groups = [crate::ui::overlay::panel_keys::SheetGroup {
                 title: "Keys",
                 rows: vec![
@@ -555,6 +548,12 @@ impl Picker {
                 "",
                 "F1/Esc",
                 cols.saturating_sub(4),
+            );
+            let sheet = self.help.viewport(
+                sheet,
+                cols.saturating_sub(4),
+                height.saturating_sub(2),
+                theme,
             );
             return chrome::framed_lines(
                 theme,
@@ -774,28 +773,31 @@ impl Picker {
             if let Some((note, tok)) = state {
                 body.push(line(note.into(), tok));
             }
-            body.push(line(
-                format!(
-                    "You  {}",
-                    if s.last_message.trim().is_empty() {
-                        "No prompt yet"
-                    } else {
-                        &s.last_message
-                    }
-                ),
-                Tok::Text,
-            ));
-            body.push(line(
-                format!(
-                    "Dial {}",
-                    if s.last_answer.trim().is_empty() {
-                        "No answer recorded"
-                    } else {
-                        &s.last_answer
-                    }
-                ),
-                Tok::Muted,
-            ));
+            // The preview pane beside a wide list shows these turns already.
+            if !wide {
+                body.push(line(
+                    format!(
+                        "You  {}",
+                        if s.last_message.trim().is_empty() {
+                            "No prompt yet"
+                        } else {
+                            &s.last_message
+                        }
+                    ),
+                    Tok::Text,
+                ));
+                body.push(line(
+                    format!(
+                        "Dial {}",
+                        if s.last_answer.trim().is_empty() {
+                            "No answer recorded"
+                        } else {
+                            &s.last_answer
+                        }
+                    ),
+                    Tok::Muted,
+                ));
+            }
         }
         if let Some(notice) = &self.notice {
             body.push(line(notice.clone(), Tok::Warning));
@@ -847,7 +849,15 @@ impl Picker {
             ));
         } else {
             let arrows = if theme.ascii() { "Up/Down" } else { "↑↓" };
-            let mut primary = vec![(arrows, "move"), ("Enter", "resume")];
+            // Enter on the session already open just returns to it; say so rather than "resume".
+            let here = self
+                .found
+                .get(self.selected)
+                .is_some_and(|&index| self.sessions[index].id == self.current);
+            let mut primary = vec![
+                (arrows, "move"),
+                ("Enter", if here { "return to it" } else { "resume" }),
+            ];
             if loaded < self.total {
                 primary.push(("Ctrl+A", "load all"));
             }
@@ -899,14 +909,13 @@ impl Picker {
         } else {
             format!("{} found", self.found.len())
         };
-        chrome::framed_lines(
-            theme,
-            chrome::Section::Dial,
-            if self.tree { "Session forks" } else { "Resume" },
-            &extra,
-            rows,
-            cols,
-        )
+        // Across projects the title says so, also when the scope row has no room or nothing is listed.
+        let title = match (self.tree, self.all_projects) {
+            (true, _) => "Session forks",
+            (false, true) => "Resume · all projects",
+            (false, false) => "Resume",
+        };
+        chrome::framed_lines(theme, chrome::Section::Dial, title, &extra, rows, cols)
     }
 
     /// One session row (and its preview line outside compact layouts).

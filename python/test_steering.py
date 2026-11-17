@@ -79,6 +79,35 @@ class Contracts(unittest.TestCase):
             before=s.identity(root);(root/'config.json').write_text('{"hidden_size":3}')
             self.assertNotEqual(before,s.identity(root))
 
+    def test_binding_uses_canonical_weights_and_adapter_not_display_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);model=root/'model';adapter=root/'adapter';other=root/'other'
+            for directory in (model,adapter,other):
+                directory.mkdir();(directory/'config.json').write_text('{"hidden_size":2}')
+            alias=root/'alias';alias.symlink_to(model,target_is_directory=True)
+            item=bundle();item.update(model_name='org/download-id',model=s.identity(model),adapter=s.identity(adapter))
+            s.bind(item,alias,adapter)
+            for weights,adapt in ((other,adapter),(model,None),(model,other)):
+                with self.subTest(weights=weights,adapter=adapt), self.assertRaisesRegex(ValueError,'fingerprint changed'):
+                    s.bind(item,weights,adapt)
+
+    def test_runtime_rejects_wrong_weight_or_adapter_fingerprints_before_any_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);model=root/'model';adapter=root/'adapter';other=root/'other'
+            for directory in (model,adapter,other):
+                directory.mkdir();(directory/'config.json').write_text('{"hidden_size":2}')
+            item=bundle();item.update(model_name='org/download-id',model=s.identity(model),adapter=s.identity(adapter))
+            item['id']=s.digest(s.payload(item));item['evaluation']['artifact']=item['id']
+            path=root/'vector.json';s.atomic_json(path,item)
+            specification=dict(path=str(path),strength=.5,id=item['id'])
+            for weights,adapt in ((other,adapter),(model,None),(model,other)):
+                with self.subTest(weights=weights,adapter=adapt), patch.object(s,'layer_list') as layers, patch.object(s,'hook') as hook:
+                    s.apply_server_vector(object(),weights,adapt,specification,'mlx-lm')
+                    self.assertEqual(s.STATUS['state'],'bypassed')
+                    self.assertEqual(s.STATUS['uses'],0)
+                    self.assertIn('fingerprint changed',s.STATUS['reason'])
+                    layers.assert_not_called();hook.assert_not_called()
+
     def test_corrupt_or_finished_checkpoint_restarts_and_valid_checkpoint_resumes(self):
         with tempfile.TemporaryDirectory() as tmp:
             request={'progress':str(Path(tmp)/'progress.json')};initial={'phase':'extracting','completed':0,'total':8,'sum':None}

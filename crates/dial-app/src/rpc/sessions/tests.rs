@@ -150,3 +150,66 @@ fn administration_refusals_carry_codes_a_client_can_branch_on() {
         "invalid_params"
     );
 }
+
+#[test]
+fn search_returns_bounded_hydrated_windows_without_changing_journals() {
+    let (_project, _home, layout) = layout();
+    let id = conversation(&layout, "needle title");
+    conversation(&layout, "another needle");
+    let info = Session::find_prefix(&layout, &id).unwrap().pop().unwrap();
+    let before = std::fs::read(&info.path).unwrap();
+    let first = search(&layout, &json!({"query":" needle ","limit":1})).unwrap();
+    assert_eq!(first["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(first["has_more"], true);
+    let all = search(&layout, &json!({"query":"needle","limit":1000})).unwrap();
+    assert_eq!(all["has_more"], false);
+    let hits = all["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    let hit = hits.iter().find(|hit| hit["session_id"] == id).unwrap();
+    assert_eq!(hit["title"], info.title);
+    assert!(!hit["entry_id"].as_str().unwrap().is_empty());
+    assert!(hit["preview"].as_str().unwrap().contains("needle"));
+    assert_eq!(std::fs::read(&info.path).unwrap(), before);
+    let (_other, _home, other) = self::layout();
+    assert!(
+        search(&other, &json!({"query":"needle"})).unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn search_refuses_invalid_parameters_with_codes() {
+    let (_project, _home, layout) = layout();
+    for params in [
+        Value::Null,
+        json!({}),
+        json!({"query":" "}),
+        json!({"query":"x".repeat(4097)}),
+        json!({"query":42}),
+        json!({"query":"x","limit":0}),
+        json!({"query":"x","limit":1001}),
+        json!({"query":"x","limit":1.5}),
+        json!({"query":"x","limit":-1}),
+        json!({"query":"x","limit":null}),
+        json!({"query":"x","offset":2}),
+    ] {
+        assert_eq!(
+            code(search(&layout, &params).unwrap_err()),
+            "invalid_params",
+            "{params}"
+        );
+    }
+}
+
+#[test]
+fn search_index_failures_are_coded() {
+    let (_project, _home, layout) = layout();
+    conversation(&layout, "needle");
+    std::fs::write(layout.state_dir.join("sessions.sqlite3"), b"not sqlite").unwrap();
+    assert_eq!(
+        code(search(&layout, &json!({"query":"needle"})).unwrap_err()),
+        "failed"
+    );
+}

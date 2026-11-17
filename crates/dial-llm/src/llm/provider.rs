@@ -337,6 +337,10 @@ pub struct RequestControls {
 pub struct Backend {
     #[cfg(any(test, feature = "test-support"))]
     pub chatgpt_url: Option<String>,
+    /// The ChatGPT token endpoint for a renewal after a refusal. Test builds renew only when this is
+    /// set, so no test contacts the real one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub chatgpt_token_url: Option<String>,
     kind: ProviderKind,
     python: PathBuf,
     startup_timeout_secs: u64,
@@ -437,6 +441,8 @@ impl Backend {
         Backend {
             #[cfg(any(test, feature = "test-support"))]
             chatgpt_url: None,
+            #[cfg(any(test, feature = "test-support"))]
+            chatgpt_token_url: None,
             kind,
             python,
             startup_timeout_secs,
@@ -1962,6 +1968,7 @@ impl Backend {
             oauth_retry: recovery::OAuthRetry::NotRequested,
             active_account: self.account_id.clone(),
             tried_accounts: self.account_id.iter().cloned().collect(),
+            chatgpt_renewed: false,
         };
         let request_id = if self.protocol == Some(ApiProtocol::FactoryDroid) {
             Some(llm::factory_droid::new_request_id()?)

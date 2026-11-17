@@ -42,6 +42,31 @@ struct ActiveTool {
     pending: bool,
     /// Approval that created this placeholder; cleared when a call card adopts it, removed when decided.
     approval: Option<String>,
+    /// Latest live status snapshot; replaced by each tool_progress event for this call.
+    progress: String,
+}
+
+/// The active tool row a streamed event belongs to. An absent or empty call id is the legacy form
+/// and routes by name, so it never matches a row by an empty id.
+fn tool_position(tools: &[ActiveTool], event: &Value, name: &str) -> Option<usize> {
+    match event["call_id"].as_str().filter(|id| !id.is_empty()) {
+        Some(id) => tools
+            .iter()
+            .rposition(|tool| tool.call_id.as_deref() == Some(id)),
+        None => tools.iter().rposition(|tool| tool.name == name),
+    }
+}
+
+/// What the ACP card shows: streamed output, then the latest progress snapshot, if any.
+fn live_text(tool: &ActiveTool) -> String {
+    let mut text = tool.output.clone();
+    if !tool.progress.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&tool.progress);
+    }
+    text
 }
 pub(crate) struct Adapter {
     layout: Layout,
@@ -981,6 +1006,7 @@ impl Adapter {
                             output: String::new(),
                             pending: true,
                             approval: Some(approval.into()),
+                            progress: String::new(),
                         });
                         approval.into()
                     }
@@ -1027,34 +1053,34 @@ impl Adapter {
                         output: String::new(),
                         pending: false,
                         approval: None,
+                        progress: String::new(),
                     });
                     id
                 };
                 json!({"sessionUpdate":"tool_call","toolCallId":id,"title":event["summary"],"kind":tool_kind(name),"status":"in_progress","rawInput":{"tool":name,"summary":event["summary"]}})
             }
-            "tool_result" | "tool_output" => {
+            "tool_result" | "tool_output" | "tool_progress" => {
                 let name = event["name"].as_str().unwrap_or("tool");
-                let position =
-                    self.tools
-                        .iter()
-                        .rposition(|tool| match event["call_id"].as_str() {
-                            Some(id) => tool.call_id.as_deref() == Some(id),
-                            None => tool.name == name,
-                        });
-                let Some(position) = position else {
+                let Some(position) = tool_position(&self.tools, &event, name) else {
                     return Vec::new();
                 };
                 let id = self.tools[position].id.clone();
-                let partial = event["event"] == "tool_output";
-                let text = if partial {
-                    let text = &mut self.tools[position].output;
+                let partial = event["event"] != "tool_result";
+                let text = if event["event"] == "tool_output" {
+                    let tool = &mut self.tools[position];
                     if let Some(delta) = event["delta"].as_str() {
-                        text.push_str(delta);
+                        tool.output.push_str(delta);
                     }
-                    if text.len() > 24 * 1024 {
-                        *text = crate::agent::safety::guard::clip_middle(text, 24 * 1024);
+                    if tool.output.len() > 24 * 1024 {
+                        tool.output =
+                            crate::agent::safety::guard::clip_middle(&tool.output, 24 * 1024);
                     }
-                    text.clone()
+                    live_text(tool)
+                } else if event["event"] == "tool_progress" {
+                    // A snapshot replaces the previous one for this call; streamed output stays.
+                    let tool = &mut self.tools[position];
+                    tool.progress = event["text"].as_str().unwrap_or("").to_owned();
+                    live_text(tool)
                 } else {
                     event["text"].as_str().unwrap_or("").to_owned()
                 };

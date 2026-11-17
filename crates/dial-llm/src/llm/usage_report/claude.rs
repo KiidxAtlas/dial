@@ -60,6 +60,9 @@ pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<
             identity.account_id = identity.account_id.or(from_profile.account_id);
             identity.email = identity.email.or(from_profile.email);
             identity.org_id = from_profile.org_id;
+            if let Some(plan) = profile_plan(&profile) {
+                report.metadata.insert("plan".to_owned(), plan);
+            }
         }
         Ok(None) => {}
         Err(error) => notes.push(format!("Claude profile unavailable: {error}")),
@@ -912,6 +915,40 @@ fn profile_identity(value: &Value) -> Identity {
         email: first_string(value, &["email", "account.email"]),
         org_id: first_string(value, &["organization.uuid", "organization_uuid"])
             .filter(|id| valid_org_id(id)),
+    }
+}
+
+/// The Claude plan the profile names: the rate-limit tier when it gives the Max multiplier
+/// (`default_claude_max_20x` → `Max 20x`), else the organization type (`claude_pro` → `Pro`),
+/// else the account's `has_claude_max`/`has_claude_pro` flags.
+fn profile_plan(profile: &Value) -> Option<String> {
+    let tier = first_string(
+        profile,
+        &["organization.rate_limit_tier", "rate_limit_tier"],
+    );
+    if let Some(tier) = tier.as_deref()
+        && let Some(at) = tier.find("max_")
+    {
+        return Some(super::plan_label(&tier[at..]));
+    }
+    if let Some(kind) = first_string(
+        profile,
+        &["organization.organization_type", "organization_type"],
+    ) {
+        return Some(super::plan_label(&kind));
+    }
+    let flag = |path: &str| {
+        path.split('.')
+            .try_fold(profile, |current, key| current.get(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    if flag("account.has_claude_max") {
+        Some("Max".to_owned())
+    } else if flag("account.has_claude_pro") {
+        Some("Pro".to_owned())
+    } else {
+        None
     }
 }
 

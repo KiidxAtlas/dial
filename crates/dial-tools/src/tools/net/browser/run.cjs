@@ -13,6 +13,7 @@ const MIN_TIMEOUT_MS = 1000;
 const MAX_TIMEOUT_MS = 3600000;
 const SELECTOR_STATES = ['visible', 'hidden', 'attached', 'detached'];
 const SELECT_VALUES_MAX = 32;
+const quarantinedPages = new WeakSet();
 
 // Runs in the page realm. Self-contained: Playwright serializes it with Function.prototype.toString.
 // kind 'run'  -> `source` is a function body evaluated as an async function with assert/sleep bindings.
@@ -52,23 +53,30 @@ function requireTimeout(timeoutMs) {
 
 function requirePage(page) {
   if (!page || typeof page.evaluate !== 'function') throw new TypeError('a Playwright page is required');
+  if (quarantinedPages.has(page)) throw new Error('Browser page is quarantined after an execution timeout; restart the browser session');
 }
 
-function withTimeout(work, timeoutMs, label) {
+function withTimeout(work, timeoutMs, label, page, onTimeout) {
   let timer;
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      // Poison synchronously, before exposing the timeout to the next queued request. Closing a
+      // renderer may hang too, so retirement is best-effort and never delays the deadline.
+      quarantinedPages.add(page);
+      try { Promise.resolve(onTimeout?.()).catch(() => {}); } catch (_) {}
+      reject(new Error(`${label} timed out after ${timeoutMs}ms; browser context quarantined, restart required`));
+    }, timeoutMs);
   });
   return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
 }
 
-// Note: page.evaluate cannot be cancelled. On timeout the caller gets the error at once; a synchronous
-// infinite loop in the page keeps the page busy until it is closed.
-async function runCode({ page, code, timeoutMs }) {
+// page.evaluate cannot be cancelled: quarantine before returning, and let the owner retire its
+// context without closing an operator-owned attached browser.
+async function runCode({ page, code, timeoutMs, onTimeout }) {
   requirePage(page);
   if (typeof code !== 'string' || code.trim().length === 0) throw new TypeError('run requires non-empty code');
   const ms = requireTimeout(timeoutMs);
-  return withTimeout(page.evaluate(PAGE_EXEC, { kind: 'run', source: code, limit: RUN_VALUE_PREVIEW_CHARS }), ms, 'Browser code execution');
+  return withTimeout(page.evaluate(PAGE_EXEC, { kind: 'run', source: code, limit: RUN_VALUE_PREVIEW_CHARS }), ms, 'Browser code execution', page, onTimeout);
 }
 
 function expectArgs(name, args, min, max) {
@@ -194,7 +202,7 @@ function validateChain(chain) {
 }
 
 // Runs steps sequentially. Resolves to { value: [result of each step, in order] }.
-async function runCall({ page, chain, timeoutMs }) {
+async function runCall({ page, chain, timeoutMs, onTimeout }) {
   requirePage(page);
   const steps = validateChain(chain);
   const ms = requireTimeout(timeoutMs);
@@ -203,13 +211,13 @@ async function runCall({ page, chain, timeoutMs }) {
   const work = (async () => {
     const results = [];
     for (const step of steps) {
-      if (aborted) throw new Error('Browser call was aborted by its timeout');
+      if (aborted || quarantinedPages.has(page)) throw new Error('Browser call was aborted by its timeout');
       results.push(await HELPERS[step.method](page, step.args, ms));
     }
     return { value: results };
   })();
   try {
-    return await withTimeout(work, ms, 'Browser call');
+    return await withTimeout(work, ms, 'Browser call', page, onTimeout);
   } catch (error) {
     aborted = true;
     throw error;

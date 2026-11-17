@@ -327,10 +327,15 @@ impl Shell {
                 } else {
                     cols
                 };
-                let view = if home.is_some() {
-                    composer.home_view(input_width, &cctx)
+                // On the home the command menu may be wider than the narrow launch input.
+                let (view, wide_lead) = if home.is_some() {
+                    composer.home_view_wide(
+                        input_width,
+                        crate::ui::welcome::menu_width(cols),
+                        &cctx,
+                    )
                 } else {
-                    composer.view(input_width, &cctx)
+                    (composer.view(input_width, &cctx), 0)
                 };
                 let spinner = (status.phase == Phase::Working).then(|| theme.spinner(status.tick));
                 let cap = (rows as usize / 3).min(10);
@@ -427,7 +432,13 @@ impl Shell {
                 bottom.extend(attention);
                 bottom.extend(plan);
                 if let Some(home) = home {
-                    let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
+                    let frame = home.frame(
+                        cols,
+                        rows.saturating_sub(1),
+                        theme,
+                        (view, wide_lead),
+                        bottom,
+                    );
                     (frame.rows, Some(frame.cursor))
                 } else {
                     let above = bottom.len() as u16;
@@ -495,7 +506,11 @@ impl Shell {
         let hub_key = self.keys.label(Action::SubagentsHub);
         let open_key = self.keys.label(Action::SubagentsRecent);
         for line in self.workers.take_notices_with(&hub_key, &open_key) {
-            self.note("Workers", line);
+            self.notify(
+                crate::ui::overlay::inbox::Category::General,
+                "Workers",
+                line,
+            );
         }
     }
 
@@ -562,14 +577,31 @@ impl Shell {
     /// Shift+Tab: cycles ask → write → readonly → ask and reports the new mode. Full auto is never
     /// one stray keypress away: it is chosen explicitly (`/approval`), and the cycle leaves it for ask.
     pub(super) fn cycle_approval(&mut self, agent: &mut Agent<'_>) {
-        let next = next_cycled_approval(agent.approval());
+        let previous = agent.approval();
+        let next = next_cycled_approval(previous);
         agent.set_approval(next);
         let mode = format!("{next:?}").to_lowercase();
         // The home names the mode the first request will run in, so it follows the cycle.
         if let Some(home) = &mut self.home {
             home.info.approval.clone_from(&mode);
         }
-        self.note("Approval", mode);
+        self.note("Approval", cycled_approval_note(previous, next));
+    }
+}
+
+/// What the transcript says after Shift+Tab: the mode's own name (as the status line shows it), and,
+/// when the cycle has just left Full auto, how to get back, since the cycle never returns to it.
+pub(super) fn cycled_approval_note(previous: Approval, next: Approval) -> String {
+    let name = |mode: Approval| {
+        crate::ui::status::approval_label(&format!("{mode:?}").to_lowercase()).to_owned()
+    };
+    if previous == Approval::Auto {
+        format!(
+            "{} for this session. Shift+Tab cycles Ask first, Edit freely and Read-only; /approval auto returns to Full auto.",
+            name(next)
+        )
+    } else {
+        format!("{} for this session", name(next))
     }
 }
 

@@ -15,6 +15,8 @@ use ratatui::{
 
 pub struct StatsOverlay {
     tabs: Vec<(&'static str, String)>,
+    title: &'static str,
+    help: &'static str,
     active: usize,
     /// First visible wrapped row of the report.
     scroll: usize,
@@ -25,12 +27,23 @@ pub struct StatsOverlay {
     total: usize,
     page: usize,
     panel_keys: panel_keys::PanelKeys,
+    report: Option<Report>,
+    hits: panel_keys::RowHits,
+}
+
+struct Report {
+    tab: usize,
+    query: String,
+    width: usize,
+    rows: Vec<String>,
 }
 
 impl StatsOverlay {
     pub fn new(tabs: Vec<(&'static str, String)>) -> Self {
         Self {
             tabs,
+            title: "Stats",
+            help: "Home/End jump to the top or bottom of the report.\nReports are a cross-session database snapshot, not live provider quotas. /usage shows quotas; /cost shows the current runtime session.",
             active: 0,
             scroll: 0,
             query: String::new(),
@@ -38,17 +51,50 @@ impl StatsOverlay {
             total: 0,
             page: 10,
             panel_keys: panel_keys::PanelKeys::default(),
+            report: None,
+            hits: Default::default(),
         }
     }
 
-    fn lines(&self) -> Vec<&str> {
-        let Some((_, text)) = self.tabs.get(self.active) else {
-            return Vec::new();
-        };
-        let needle = self.query.to_lowercase();
-        text.lines()
-            .filter(|line| needle.is_empty() || line.to_lowercase().contains(&needle))
-            .collect()
+    /// Reuse the read-only, searchable report surface for other retained evidence.
+    pub fn with_title(mut self, title: &'static str, help: &'static str) -> Self {
+        self.title = title;
+        self.help = help;
+        self
+    }
+
+    pub fn title(&self) -> &'static str {
+        self.title
+    }
+
+    fn report(&mut self, width: usize) -> &[String] {
+        let valid = self.report.as_ref().is_some_and(|report| {
+            report.tab == self.active && report.query == self.query && report.width == width
+        });
+        if !valid {
+            let needle = self.query.to_lowercase();
+            let rows = self
+                .tabs
+                .get(self.active)
+                .into_iter()
+                .flat_map(|(_, report)| report.lines())
+                .filter(|line| needle.is_empty() || line.to_lowercase().contains(&needle))
+                .flat_map(|line| {
+                    if line.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        text::wrap_words(line, width)
+                    }
+                })
+                .collect();
+            self.report = Some(Report {
+                tab: self.active,
+                query: self.query.clone(),
+                width,
+                rows,
+            });
+        }
+        &self.report.as_ref().expect("report initialized").rows
     }
 
     fn max_scroll(&self) -> usize {
@@ -113,15 +159,24 @@ impl StatsOverlay {
         OverlayEvent::None
     }
 
+    /// Select a visible report tab; hidden tabs and padding are not targets.
+    pub fn click(&mut self, x: u16, y: u16) -> OverlayEvent {
+        if !self.panel_keys.open()
+            && let Some(index) = self.hits.hit(x, y)
+        {
+            self.active = index;
+            self.scroll = 0;
+            self.searching = false;
+        }
+        OverlayEvent::None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(
-            frame,
-            ctx,
-            "Stats",
-            "Home/End jump to the top or bottom of the report.\nReports are a cross-session database snapshot, not live provider quotas. /usage shows quotas; /cost shows the current runtime session.",
-            true,
-            true,
-        ) {
+        self.hits.begin(frame.area());
+        if self
+            .panel_keys
+            .draw(frame, ctx, self.title, self.help, true, true)
+        {
             return;
         }
         let extra = self
@@ -129,9 +184,14 @@ impl StatsOverlay {
             .get(self.active)
             .map(|_| format!("{}/{}", self.active + 1, self.tabs.len()))
             .unwrap_or_default();
-        panel(frame, ctx.theme, Section::Dial, "Stats", &extra, |w, h| {
-            self.rows(usize::from(w), usize::from(h), ctx)
-        });
+        panel(
+            frame,
+            ctx.theme,
+            Section::Dial,
+            self.title,
+            &extra,
+            |w, h| self.rows(usize::from(w), usize::from(h), ctx),
+        );
     }
 
     /// Tab strip, the search line while one is typed, the wrapped report with a scroll indicator,
@@ -143,6 +203,14 @@ impl StatsOverlay {
             tab_strip(theme, &names, self.active, true, w),
             Line::default(),
         ];
+        let mut x = 0;
+        for span in &out[0].spans {
+            let cells = text::width(&span.content);
+            if let Some(index) = names.iter().position(|name| *name == span.content.as_ref()) {
+                self.hits.row(x, 0, cells, index);
+            }
+            x += cells;
+        }
         if self.searching || !self.query.is_empty() {
             let mut spans = vec![
                 Span::styled(" Search  ", theme.fg(Tok::Accent)),
@@ -159,21 +227,11 @@ impl StatsOverlay {
             out.push(Line::from(spans));
         }
         let text_w = w.saturating_sub(3).max(1);
-        let report: Vec<String> = self
-            .lines()
-            .into_iter()
-            .flat_map(|line| {
-                if line.is_empty() {
-                    vec![String::new()]
-                } else {
-                    text::wrap_words(line, text_w)
-                }
-            })
-            .collect();
+        self.total = self.report(text_w).len();
         let body_h = h.saturating_sub(out.len() + 1);
-        self.total = report.len();
         self.page = body_h.max(1);
         self.scroll = self.scroll.min(self.max_scroll());
+        let report = &self.report.as_ref().expect("report initialized").rows;
         if report.is_empty() {
             let message = if self.query.is_empty() {
                 "Nothing recorded for this report yet."
