@@ -201,7 +201,7 @@ fn call_records_keep_names_and_digests_but_never_raw_values_or_error_text() {
     for secret in ["TOKEN-SECRET-123", "creds-dir/token.txt", "denied writing"] {
         assert!(
             !serialized.contains(secret),
-            "{secret} leaked into the trace"
+            "trace contains a value that should have been redacted"
         );
     }
 }

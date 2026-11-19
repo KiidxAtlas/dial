@@ -2670,7 +2670,7 @@ fn ctrl_d_is_offered_on_downloaded_local_models_in_the_model_lists() {
     assert!(matches!(send(&mut o, &rig, ctrl('d')), OverlayEvent::None));
     assert!(o.deletion.is_none());
     let (message, ok) = o.message.clone().unwrap();
-    assert!(!ok && message.starts_with("Cannot delete:"), "{message}");
+    assert!(!ok && message.starts_with("Cannot delete:"));
 
     let mut remote = overlay();
     remote.type_text("llama3");
@@ -2723,10 +2723,7 @@ fn a_delete_shows_what_it_removes_and_needs_an_explicit_confirmation() {
     ));
     assert!(o.deletion.is_none());
     let (message, ok) = o.message.clone().unwrap();
-    assert!(
-        !ok && message.starts_with("Did not delete org/local:"),
-        "{message}"
-    );
+    assert!(!ok && message.starts_with("Did not delete org/local:"));
 }
 
 #[test]

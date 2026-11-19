@@ -407,8 +407,7 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
         let single = callback(agent, "functions.read_file", json!({"filePath":"a.txt"}));
         assert!(
             !single.is_error && single.text.contains("alpha"),
-            "{}",
-            single.text
+            "read alias must return the fixture content"
         );
         let mut batch = |agent: &mut Agent<'_>, calls: Value| {
             callback(agent, BATCH_CALLBACK, json!({"calls":calls}))

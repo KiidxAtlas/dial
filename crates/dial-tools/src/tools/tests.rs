@@ -331,8 +331,11 @@ fn dev_sandbox_denies_present_credential_files_and_token_directories() {
         ".npmrc",
         ".config/gh",
     ] {
-        assert!(denied.contains(&home.join(path)), "{path}: {denied:?}");
+        assert!(
+            denied.contains(&home.join(path)),
+            "missing fixture denial: {path}"
+        );
     }
     // Absent credential files are not listed (Linux cannot mask them inside a writable home).
-    assert!(!denied.contains(&home.join(".pypirc")), "{denied:?}");
+    assert!(!denied.contains(&home.join(".pypirc")));
 }

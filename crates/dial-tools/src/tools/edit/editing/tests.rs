@@ -382,7 +382,11 @@ fn hashline_default_accepts_every_edit_method_without_extra_tools() {
         .with_edit_mode(EditMode::Hashline);
     let path = dir.path().join("sample.txt");
     fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
-    ws.store().record_all(&path, "alpha\nbeta\ngamma\n");
+    let read = execute(&ws, "read", &json!({"path":"sample.txt"}), 20);
+    assert!(
+        !read.is_error,
+        "fixture read must witness the canonical edit path"
+    );
 
     let offered_schema = schema(EditMode::Hashline);
 
