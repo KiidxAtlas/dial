@@ -981,7 +981,7 @@ fn find_match_in_spool(
     Some(Ok(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn find_match(
     ring: &Mutex<Ring>,
     terminal: bool,

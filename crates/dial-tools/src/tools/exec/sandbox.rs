@@ -107,15 +107,21 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 /// Execution-owner-only launch restrictions, separate from filesystem trust policy.
+#[cfg(not(windows))]
 #[derive(Clone, Copy, Default)]
 pub(super) struct CommandMode<'a> {
     /// Only a verified, freshly extracted CPython installation; never a caller-provided path.
     pub bundle: Option<&'a crate::setup::deps::bundled_python::Runtime>,
-    #[cfg(not(windows))]
     pub owned_terminal: Option<i32>,
-    #[cfg(not(windows))]
     pub fork_fence: bool,
 }
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct WindowsCommandMode {}
+
+#[cfg(windows)]
+pub(super) type CommandMode<'a> = WindowsCommandMode;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";

@@ -305,15 +305,19 @@ pub(crate) fn resolve_operator_executable(
         if label == "kernel.python" && program == crate::config::tools::kernel::DEFAULT_PYTHON {
             names.push("python");
         }
-        let mut search_dirs: Vec<PathBuf> =
+        let search_dirs: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
         #[cfg(not(windows))]
-        for fallback in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-            let dir = PathBuf::from(fallback);
-            if !search_dirs.contains(&dir) {
-                search_dirs.push(dir);
+        let search_dirs = {
+            let mut dirs = search_dirs;
+            for fallback in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+                let dir = PathBuf::from(fallback);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
             }
-        }
+            dirs
+        };
         names.into_iter().find_map(|name| {
             search_dirs
                 .iter()

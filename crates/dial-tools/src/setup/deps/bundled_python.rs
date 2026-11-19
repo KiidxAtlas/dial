@@ -28,7 +28,8 @@ pub fn version() -> Option<&'static str> {
 
 #[derive(Debug)]
 pub struct Runtime {
-    tree: tempfile::TempDir,
+    // Own the extracted tree until the interpreter is no longer needed.
+    _tree: tempfile::TempDir,
     executable: PathBuf,
 }
 
@@ -36,8 +37,9 @@ impl Runtime {
     pub fn executable(&self) -> &Path {
         &self.executable
     }
+    #[cfg(not(windows))]
     pub(crate) fn root(&self) -> &Path {
-        self.tree.path()
+        self._tree.path()
     }
 }
 
@@ -109,7 +111,10 @@ fn extract(parent: &Path, gz: &[u8], size: u64) -> Result<Runtime> {
         executable.is_file() && crate::platform::fs::is_executable(&executable),
         "missing CPython executable"
     );
-    Ok(Runtime { tree, executable })
+    Ok(Runtime {
+        _tree: tree,
+        executable,
+    })
 }
 
 #[cfg(test)]
