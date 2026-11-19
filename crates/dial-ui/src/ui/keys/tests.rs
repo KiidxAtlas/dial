@@ -33,8 +33,12 @@ fn primary_shortcuts_preserve_alternates_and_avoid_panel_and_editor_collisions()
         }
     }
     // Both primaries must work without Option settings or Windows Terminal reserved chords.
-    // Status has an Option primary but a function-key fallback for those terminals.
-    for (action, expected) in [(Action::WorkTab, "Ctrl+X"), (Action::StatusExpand, "Alt+S")] {
+    let status = if cfg!(target_os = "macos") {
+        "F11"
+    } else {
+        "Alt+S"
+    };
+    for (action, expected) in [(Action::WorkTab, "Ctrl+X"), (Action::StatusExpand, status)] {
         let primary = map.chords(action)[0];
         assert_eq!(primary, Chord::parse(expected).unwrap());
         for other in Action::ALL
@@ -86,6 +90,34 @@ fn primary_shortcuts_preserve_alternates_and_avoid_panel_and_editor_collisions()
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(custom.label(Action::WorkTab), "Ctrl+F");
     assert_eq!(custom.label(Action::Interrupt), "Esc");
+}
+
+#[test]
+fn application_hints_prefer_keys_the_platform_forwards() {
+    for (macos, windows) in [(true, false), (false, true), (false, false)] {
+        for action in Action::ALL {
+            let defaults = action.defaults_for(macos, windows);
+            for chord in defaults {
+                assert!(Chord::parse(chord).is_ok(), "{chord}");
+            }
+            if macos && action.context() == 0 && defaults.iter().any(|c| c.starts_with('F')) {
+                assert!(!defaults[0].starts_with("Alt+"), "{}", action.id());
+            }
+        }
+        assert_eq!(
+            Action::CommandPalette.defaults_for(macos, windows)[0],
+            if macos { "F1" } else { "Alt+K" }
+        );
+        assert_eq!(
+            Action::Settings.defaults_for(macos, windows)[0],
+            if windows { "Ctrl+4" } else { "Ctrl+," }
+        );
+    }
+}
+
+#[test]
+fn shortcut_recording_never_saves_a_command_key_as_plain_text() {
+    assert!(Chord::from_key(&key(KeyCode::Char('k'), KeyModifiers::SUPER)).is_none());
 }
 
 #[test]
@@ -547,7 +579,10 @@ fn hotkeys_table_reflects_remaps_and_unbound_actions() {
     let find = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
     assert_eq!(find("app.history.search").keys, "unbound");
     assert!(find("app.model.select").customized && find("app.model.select").keys == "Ctrl+K");
-    assert_eq!(find("app.settings").keys, "Ctrl+, / Ctrl+4");
+    assert_eq!(
+        find("app.settings").keys,
+        Action::Settings.defaults().join(" / ")
+    );
     assert!(!find("app.settings").customized);
     assert_eq!(find("tui.select.up").group, "Navigation");
 }

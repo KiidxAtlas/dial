@@ -158,7 +158,7 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         TO,
         "Editing",
         "Edit mode",
-        "Default edit grammar: exact/fuzzy replacement, snapshot hashline, apply-patch, structured hunks or sloppy source matching. Exact profile, process and CLI pins take precedence.",
+        "Preferred grammar shown for the edit tool (default: hashline). Other supported grammars are still accepted. Model, process and CLI pins can override this preference.",
         Kind::Enum(EDIT_MODE),
     ),
     field!(
@@ -490,6 +490,15 @@ pub(super) static INTEGRATIONS: &[SettingDef] = &[
         "Bounded review for changed-file thresholds, sensitive prefixes, uncheckpointed effects or artifact work lacking observed declared requirements. Unset enabled uses a privacy-permitted coach, or one in-context self-review if unavailable; true explicitly requests coach review, false disables. Findings are advisory, not execution authority or proof.",
         Kind::Table,
     ),
+    field!(
+        "verification.quality_review",
+        verification.quality_review,
+        TO,
+        "Verification",
+        "Review work quality before finishing",
+        "Once per request that changed files, hold back the first finished answer and ask the agent to review its own work with its tools: render and inspect visual changes through a fresh screenshot, reread changed code and run relevant checks, fix material problems, then report. Costs at least one extra model request; skipped in plan mode, hermetic runs and past a deadline or cost cap. The review is the model's judgment, not proof; completion gates still apply.",
+        Kind::Bool,
+    ),
     def!(
         "lsp.rust-analyzer.program",
         TO,
@@ -601,7 +610,7 @@ pub(super) static EVAL: &[SettingDef] = &[
         TO,
         "Verification",
         "Automatic registered helpers",
-        "Rerun explicitly model-registered acceptance helpers once after settled mutation batches through normal shell approval. Helper outcomes remain separate from configured/task acceptance. Disable for an ablation.",
+        "Opt in to rerunning model-registered acceptance helpers after each settled edit batch. By default they run on registration and remain available for verification without interrupting each edit batch.",
         Kind::Bool
     ),
     field!(

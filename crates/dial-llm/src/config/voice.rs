@@ -159,6 +159,8 @@ pub struct SttConfig {
     /// Hugging Face repo or local directory of an MLX Whisper model.
     pub mlx_whisper_model: String,
     pub capture: CaptureChoice,
+    /// Microphone for native capture, by name as the system lists it; empty uses the default.
+    pub input_device: String,
     /// Recorder command writing raw signed 16-bit little-endian 16 kHz mono PCM to stdout.
     pub capture_command: Vec<String>,
     /// Hard stop for one push-to-talk recording.
@@ -185,6 +187,7 @@ impl Default for SttConfig {
             mlx_whisper_program: "mlx_whisper".into(),
             mlx_whisper_model: "mlx-community/whisper-large-v3-turbo".into(),
             capture: CaptureChoice::Auto,
+            input_device: String::new(),
             capture_command: Vec::new(),
             max_recording_secs: 120,
             end_silence_ms: 600,

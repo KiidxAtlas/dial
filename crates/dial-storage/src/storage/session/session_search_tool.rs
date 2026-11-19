@@ -5,7 +5,7 @@ use super::*;
 pub fn schema() -> Value {
     json!({"type": "function", "function": {
         "name": "session_search",
-        "description": "Full-text search over this project's earlier conversations (user and assistant messages, tool names, short tool results). Use it to recall what was decided or done in a previous session. Returns the best matching snippets with session id and time.",
+        "description": "Full-text search over this project's earlier conversations (user and assistant messages, tool names, short tool results). Use it to find what was said or done in a previous session. Returns the best matching snippets with session id and time. Saved facts and preferences: `memory`; code change history: `history` source=changes.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -77,11 +77,45 @@ pub fn call_owned(layout: Option<&Layout>, session: &Session, args: &Value) -> T
             })
             .transpose()?;
         if history {
-            ensure!(
-                query.is_empty(),
-                "raw history uses query:\"\"; use ordinary search separately"
-            );
-            Ok(Some(session.context_history(after, limit, all_branches)?))
+            if query.is_empty() {
+                Ok(Some(session.context_history(after, limit, all_branches)?))
+            } else {
+                let terms: Vec<String> = query
+                    .split_whitespace()
+                    .map(|t| t.to_ascii_lowercase())
+                    .collect();
+                let mut cursor = after.map(str::to_owned);
+                let mut matched = Vec::new();
+                let mut last_page = None;
+                let mut scanned_pages = 0usize;
+                while matched.len() < limit && scanned_pages < 8 {
+                    let page = session.context_history(cursor.as_deref(), 64, all_branches)?;
+                    scanned_pages += 1;
+                    if let Some(entries) = page["entries"].as_array() {
+                        for entry in entries {
+                            let hay = entry.to_string().to_ascii_lowercase();
+                            if terms.iter().all(|term| hay.contains(term)) {
+                                matched.push(entry.clone());
+                                if matched.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let next = page["next_entry_id"].as_str().map(str::to_owned);
+                    let complete = page["complete"].as_bool().unwrap_or(true);
+                    last_page = Some(page);
+                    if complete || next.is_none() {
+                        break;
+                    }
+                    cursor = next;
+                }
+                let mut out = last_page.unwrap_or_else(|| json!({}));
+                out["query"] = json!(query);
+                out["filtered"] = json!(true);
+                out["entries"] = Value::Array(matched);
+                Ok(Some(out))
+            }
         } else {
             ensure!(
                 after.is_none() && !object.contains_key("all_branches"),

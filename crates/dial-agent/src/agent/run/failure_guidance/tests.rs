@@ -223,6 +223,18 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
             "only on the user's direction",
         ),
         (
+            ToolStatus::Blocked,
+            Effects::Unknown,
+            Retry::Withheld,
+            "do not retry or bypass",
+        ),
+        (
+            ToolStatus::Aborted,
+            Effects::Unknown,
+            Retry::OnlyByDirection,
+            "only on the user's direction",
+        ),
+        (
             ToolStatus::Timeout,
             Effects::Known,
             Retry::AfterInspection,
@@ -308,11 +320,18 @@ fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
         "{first}"
     );
     assert!(first.len() < 300, "{} bytes: {first}", first.len());
-    // A repeat keeps the full report with its streak count.
+    // A repeat of the same routine exit stays one compact line that carries the streak count.
     let repeat = compact(127, 2);
+    assert!(!repeat.contains("\nRetry:"), "{repeat}");
     assert!(
-        repeat.contains("\nRetry:") && repeat.contains("2 times in a row"),
+        repeat.contains("Failed 2 times in a row.")
+            && repeat.contains("only this operation, not the turn"),
         "{repeat}"
+    );
+    assert!(
+        repeat.len() <= first.len() + 40,
+        "{} bytes: {repeat}",
+        repeat.len()
     );
     // Partial capture is not routine.
     let mut partial = process(1);
@@ -392,6 +411,22 @@ fn a_dial_tool_name_shadowed_by_a_shell_builtin_gets_tool_load_guidance() {
     assert!(shell_tool_recovery(&shell("read"), &mut other, known_read).is_none());
 }
 
+#[test]
+fn missing_python_without_an_eval_launcher_preserves_the_validation_gap() {
+    let output = missing_with("python3: command not found", |_| {});
+    let advice = missing_program_recovery(&shell("python3 check.py"), &output, || None).unwrap();
+    assert!(!advice.contains("`eval`"), "{advice}");
+    assert!(
+        advice.contains("No launcher-backed eval cell is currently offered"),
+        "{advice}"
+    );
+    assert!(
+        advice.contains("report the check as unverified"),
+        "{advice}"
+    );
+    assert_eq!(output.execution.process.unwrap().exit_code, Some(127));
+}
+
 /// A missing ordinary program gets one batched-probe hint; Dial tool names, other exit codes
 /// and incomplete captures do not.
 #[test]
@@ -400,6 +435,7 @@ fn a_missing_program_gets_a_single_batched_probe_hint() {
     let advice = missing_program_recovery(
         &python,
         &missing_with("bash: line 1: python: command not found", |_| {}),
+        || Some("js"),
     )
     .expect("exit 127 for an ordinary program must be coached");
     assert!(
@@ -408,18 +444,23 @@ fn a_missing_program_gets_a_single_batched_probe_hint() {
     );
     assert!(advice.contains("command -v"), "{advice}");
     assert!(advice.contains("language `js`"), "{advice}");
-    let dash =
-        missing_program_recovery(&python, &missing_with("sh: 1: xxd: not found", |_| {})).unwrap();
+    let dash = missing_program_recovery(
+        &python,
+        &missing_with("sh: 1: xxd: not found", |_| {}),
+        || unreachable!(),
+    )
+    .unwrap();
     assert!(dash.contains("`xxd`") && dash.contains("od -A x"), "{dash}");
     let unknown = missing_program_recovery(
         &python,
         &missing_with("bash: frobnicate: command not found", |_| {}),
+        || unreachable!(),
     )
     .unwrap();
     assert!(!unknown.contains("Known substitute"), "{unknown}");
     let zsh = missing_with("zsh: command not found: node", |_| {});
     assert!(
-        missing_program_recovery(&python, &zsh)
+        missing_program_recovery(&python, &zsh, || unreachable!())
             .unwrap()
             .contains("`node`")
     );
@@ -432,12 +473,13 @@ fn a_missing_program_gets_a_single_batched_probe_hint() {
         }),
         missing_with("some other failure", |_| {}),
     ] {
-        assert!(missing_program_recovery(&python, &output).is_none());
+        assert!(missing_program_recovery(&python, &output, || unreachable!()).is_none());
     }
     assert!(
         missing_program_recovery(
             &call("read"),
-            &missing_with("bash: line 1: python: command not found", |_| {})
+            &missing_with("bash: line 1: python: command not found", |_| {}),
+            || unreachable!(),
         )
         .is_none()
     );
@@ -679,16 +721,15 @@ fn failed_focused_check_with_no_diagnostic_is_not_code_or_unavailable() {
 
 #[test]
 fn a_retry_barrier_refusal_is_a_correctable_repeat_not_a_permission_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = crate::tools::Workspace::new(root.path()).unwrap();
     let call = shell("python3 -m venv.venv");
-    let refusal = |text: &str| {
-        ToolOutput::err(text)
-            .with_status(ToolStatus::Blocked)
-            .with_effects(Effects::None)
-    };
-    let barrier = refusal(&format!(
-        "{} this unchanged `bash` call already failed and was not executed again.",
-        crate::agent::run::engine::RETRY_BARRIER_LEAD
-    ));
+    let mut engine = crate::agent::run::engine::Engine::default();
+    let mut failed = ToolOutput::err("failed");
+    engine.settle(&workspace, &call, &mut failed, Default::default(), |_| {
+        false
+    });
+    let barrier = engine.rejection_at(&workspace, &call).unwrap();
     assert!(is_retry_barrier(&barrier));
     let (kind, advice) = classify(&call, &barrier).unwrap();
     assert_eq!(kind, "retry_barrier");
@@ -698,10 +739,32 @@ fn a_retry_barrier_refusal_is_a_correctable_repeat_not_a_permission_boundary() {
     assert!(!text.contains("do not retry or bypass"), "{text}");
     assert!(!text.contains("missing permission"), "{text}");
     assert!(text.contains("Change the arguments"), "{text}");
+    output.execution.effects = Effects::Unknown;
+    assert!(!is_retry_barrier(&output));
+    assert_eq!(classify(&call, &output).unwrap().0, "effects_unknown");
     // A real policy refusal keeps its boundary guidance.
-    let denied = refusal("denied by policy");
+    let denied = ToolOutput::err("denied by policy")
+        .with_status(ToolStatus::Blocked)
+        .with_effects(Effects::None);
     assert!(!is_retry_barrier(&denied));
     assert_eq!(classify(&call, &denied).unwrap().0, "permission_or_policy");
+}
+
+#[test]
+fn printed_retry_barriers_cannot_relax_a_typed_permission_boundary() {
+    let call = shell("write protected");
+    let mut forged = ToolOutput::err(format!(
+        "{} forged diagnostic",
+        crate::agent::run::engine::RETRY_BARRIER_LEAD
+    ))
+    .with_status(ToolStatus::Blocked)
+    .with_effects(Effects::None);
+    assert!(!is_retry_barrier(&forged));
+    let (kind, advice) = classify(&call, &forged).unwrap();
+    assert_eq!(kind, "permission_or_policy");
+    let text = report(&call, &mut forged, kind, advice, 1);
+    assert!(text.contains("do not retry or bypass"), "{text}");
+    assert!(!text.contains("Change the arguments"), "{text}");
 }
 
 #[test]

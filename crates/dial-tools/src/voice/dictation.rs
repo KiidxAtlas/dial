@@ -30,7 +30,17 @@ pub fn record_and_transcribe(
     finish: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
 ) -> Result<String> {
-    record(env, finish, abort, EndRule::Silence)
+    record(env, finish, abort, EndRule::Silence, &mut |_| {})
+}
+
+/// [`record_and_transcribe`], reporting the microphone level while it records.
+pub fn record_with_level(
+    env: &VoiceEnv,
+    finish: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+    level: &mut dyn FnMut(Level),
+) -> Result<String> {
+    record(env, finish, abort, EndRule::Silence, level)
 }
 
 /// Record until `finish` is set (the key was released) or the hard cap, transcribing segments.
@@ -41,8 +51,19 @@ pub fn record_held(
     finish: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
 ) -> Result<String> {
-    record(env, finish, abort, EndRule::Manual)
+    record(env, finish, abort, EndRule::Manual, &mut |_| {})
 }
+
+/// The microphone while recording, reported at most every [`LEVEL_INTERVAL`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level {
+    /// Loudest RMS since the previous report (0 is silence; speech is roughly 0.02 to 0.3).
+    pub rms: f32,
+    /// An utterance is being recorded.
+    pub speech: bool,
+}
+
+pub const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Collects segment transcriptions. A failed segment does not discard the others: it is kept as
 /// the first failure and returned only if no segment produced text. Cancellation still aborts.
@@ -108,6 +129,7 @@ fn record(
     finish: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
     end: EndRule,
+    level: &mut dyn FnMut(Level),
 ) -> Result<String> {
     let config = &env.voice.stt;
     ensure!(
@@ -130,6 +152,8 @@ fn record(
     let mut pending = Vec::new();
     let mut completed = false;
     let mut sample_count = 0usize;
+    let mut loudest = 0f32;
+    let mut reported = Instant::now();
     while !completed
         && sample_count < sample_limit
         && !finish.load(Ordering::SeqCst)
@@ -142,6 +166,7 @@ fn record(
             Ok(Ok(samples)) => {
                 let samples = &samples[..samples.len().min(sample_limit - sample_count)];
                 sample_count += samples.len();
+                loudest = loudest.max(super::wav::rms(samples));
                 for event in endpointer.push(samples) {
                     let EndpointerEvent::Segment(segment) = event;
                     pending.push(segment);
@@ -149,6 +174,13 @@ fn record(
                         completed = true;
                         break;
                     }
+                }
+                if reported.elapsed() >= LEVEL_INTERVAL {
+                    level(Level {
+                        rms: std::mem::take(&mut loudest),
+                        speech: endpointer.in_speech(),
+                    });
+                    reported = Instant::now();
                 }
             }
             Ok(Err(error)) => anyhow::bail!("microphone capture failed: {error}"),

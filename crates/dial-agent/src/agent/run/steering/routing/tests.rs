@@ -1,5 +1,18 @@
 use super::*;
-use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_agent as with_fixture_agent;
+
+/// Most fixtures here classify on the default route, whose provider slot (`local:<model>`, one
+/// request at a time) is shared by the whole test process. The classifier never waits for that
+/// slot, so two of these tests overlapping made one report a busy provider and skip its request.
+static DEFAULT_ROUTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The shared agent fixture, one routing test at a time.
+fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    let _serial = DEFAULT_ROUTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_fixture_agent(overlay, f)
+}
 
 #[derive(Default)]
 struct Input {

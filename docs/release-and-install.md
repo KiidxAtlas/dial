@@ -24,15 +24,26 @@
   use the transitive, hashed `scripts/requirements-ci.lock`. The Nix input is pinned to an immutable
   revision, but still needs a genuine resolver-generated `flake.lock` and native Nix acceptance.
 
+### Windows publisher signing
+
+CI candidates remain unsigned. On release tags the protected `windows-signing` environment
+signs each candidate's `dial.exe` before the final ZIP checksums and Ed25519 manifest.
+Restrict that GitHub environment to `v*` tags and configure required reviewers. On the Entra
+release app add a GitHub federated credential for this repository and that environment;
+assign **Artifact Signing Certificate Profile Signer** on `rootatlas` / `dial-desktop`.
+Set environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+`AZURE_SIGNING_ENDPOINT` (the signing account's regional HTTPS endpoint) and
+`AZURE_SIGNING_PUBLISHER` (the exact certificate common name). No client secret is needed.
+
 ### Bundled execution runtime and installed-feature gate
 
-Release binaries embed a compressed, target-specific Node runtime alongside the existing
-embedded shell and utilities. The executable remains the installation/update unit: no sibling
-runtime directory needs to survive an installer or self-update. Default `eval.node` and
-`browser.node` (`node`), and the computer worker, prefer this payload. Explicit executable
-overrides remain operator-owned; Python, browser packages/Chromium and project toolchains are
-not bundled by this change. A bundled runtime is extracted into Dial's private cache and its
-length and SHA-256 are checked before reuse. Corruption is an error, not a PATH fallback.
+Release binaries embed target-specific Node and CPython runtimes alongside the shell and utilities.
+The executable remains the installation/update unit. Default `eval.node`, `browser.node`, and the
+computer worker prefer bundled Node. Python Eval uses bundled CPython when no project environment or
+explicit interpreter override is selected. The stdlib is included, not third-party project packages,
+Chromium or other toolchains. Node is extracted to Dial’s private cache and verified on reuse.
+CPython is extracted to a fresh private directory held for the interpreter’s lifetime. A broken
+payload is an error, not a reason to silently switch interpreters.
 
 `runtimes/node/manifest.json` pins Node's version, target archive and SHA-256. Release builds
 run `scripts/prepare-node.py --target <triple> --output <directory>` and set
@@ -43,6 +54,16 @@ To refresh the pin, review upstream checksum inputs and license, update every ta
 then rerun payload tests and native installed-artifact checks. ARM64 musl uses the explicitly
 pinned Node unofficial-builds artifact; other targets use nodejs.org artifacts. Musl Node needs
 the system `libstdc++` and `libgcc` packages, which the Alpine release gate installs explicitly.
+
+`runtimes/python/manifest.json` pins each CPython archive. Run `scripts/prepare-python.py --target
+<triple> --output <directory>` (optionally `--archive <local-file>` for an offline build), then set
+`DIAL_BUNDLED_PYTHON_DIR` to the prepared directory for Cargo. Preparation checks the upstream
+checksum; Cargo checks the target, size and uncompressed SHA-256 before embedding the payload.
+`dial __installed-smoke --require-bundled-python` runs a Python Eval cell that reads a saved regex,
+compares Python's exact positive and negative results, and checks the interpreter version. For an
+offline Harbor checkout build, prefetch the pinned archive to `target/python-archives/<triple>.tar.gz`;
+the checkout build wrapper verifies it before Cargo runs. The task image needs no shell Python.
+Cross-compilation alone does not prove that the installed interpreter runs.
 
 The internal `dial __installed-smoke --require-bundled-node` probe verifies the runtime version,
 starts the real computer worker, exchanges ping/pong messages and requires a bounded close
@@ -120,6 +141,14 @@ version, pass a tag such as `v0.2.2`: `curl -fsSL https://dial.rootatlas.dev/ins
 `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
 `dial update` (or `/update` inside the interactive terminal, followed by `/restart`) updates Dial the way it was installed. For installer copies it checks the GitHub latest release (or `dial update --version 0.1.1`, `/update 0.1.1`). If you already run that release it says so and stops; an explicit `--version` always installs, so it can also reinstall or downgrade. It verifies the same signed manifest and asset digest, stages the candidate on the install filesystem, and checks its `--version`. On Unix it holds a lock file (`.dial-update.lock`) in the install directory so concurrent updates cannot interleave, preserves a digest-verified copy of the current binary as the rollback point, renames the candidate over the active name (never removing that name first, so an interruption leaves a complete old or new executable), fsyncs the directory, and re-checks `--version`. If the post-install check fails, the rollback copy is renamed back; if that also fails, the error reports both failures and the rollback copy is kept at `<name>.dial.bak` for manual recovery. Windows uses a deferred PowerShell swap after the running process exits, with its own rollback.
+
+`dial update --check` only reports: whether a newer release exists, and how `dial update` would install it. It changes nothing. `dial update --check --json` prints one JSON object for frontends (Dial Desktop runs it to offer engine updates):
+
+```json
+{"current":"0.3.10","latest":"0.3.11","update_available":true,"installation":"installer","method":"release","can_update":true,"update_command":"dial update","error":null}
+```
+
+`installation` is `installer`, `homebrew`, `cargo` or `nix`; `method` is `release`, `package_manager`, `checkout` or `manual`. When `can_update` is false, `update_command` says what to do instead. If GitHub cannot be reached, `latest` is `null`, `update_available` is false, `error` says why, and the command still exits 0 so the reply always parses. Fields are only ever added. `--check` cannot be combined with `--version`.
 
 Other installations are updated by their owners, which `dial update` runs for you:
 

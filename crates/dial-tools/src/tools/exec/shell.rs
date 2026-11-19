@@ -153,14 +153,15 @@ const BASH_LINE_SLACK: usize = 512;
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
 /// Adoption hint when `bg` is offered: the job's result comes from one `bg wait`.
-pub const BG_OFFERED_HINT: &str = " `bg wait` returns its output; no polling.";
+pub const BG_OFFERED_HINT: &str =
+    " Do independent work first. When blocked, `bg wait` returns its output; no polling.";
 /// Adoption hint when `bg` is loadable but not offered. The agent replaces it with
 /// [`BG_OFFERED_HINT`] when it loads `bg` for the next request itself.
 pub const BG_LOAD_HINT: &str = " Load the Dial `bg` tool with `tool_search` names:[\"bg\"] to wait for or stop it; no polling.";
 
 /// Helper languages the session prompt reports, each with the program names that provide it.
 const SHELL_INTERPRETERS: &[(&str, &[&str])] = &[
-    ("python3", &["python3", "python"]),
+    ("python3", &["python3"]),
     ("node", &["node", "bun", "deno"]),
     ("perl", &["perl"]),
     ("ruby", &["ruby"]),
@@ -173,17 +174,30 @@ const SHELL_INTERPRETERS: &[(&str, &[&str])] = &[
 /// Which helper languages the shell's `PATH` provides, for the session prompt. Models otherwise
 /// write a whole Python or Node helper before discovering the image has neither; the bash
 /// missing-program notice arrives only after that output has been generated and paid for.
-pub fn interpreter_guidance() -> String {
-    interpreter_guidance_for(std::env::var_os("PATH").as_deref())
+pub fn interpreter_guidance(ws: &Workspace) -> String {
+    let path = std::env::var_os("PATH");
+    #[cfg(not(windows))]
+    let path = if !ws.unsandboxed && matches!(ws.policy, None | Some(Policy::Strict { .. })) {
+        Some(bash_path_for(ws).into())
+    } else {
+        path
+    };
+    interpreter_guidance_for(ws, path.as_deref())
 }
 
-fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
+fn interpreter_guidance_for(ws: &Workspace, path: Option<&std::ffi::OsStr>) -> String {
     let dirs: Vec<PathBuf> = path
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
+        .map(|dir| ws.root().join(dir))
         .collect();
-    let found = |program: &str| dirs.iter().any(|dir| dir.join(program).is_file());
+    let found = |program: &str| {
+        dirs.iter().any(|dir| {
+            crate::platform::fs::executable_candidate(&dir.join(program))
+                .is_some_and(|p| !ws.sandbox_hides(&p))
+        })
+    };
     let (mut available, mut missing) = (Vec::new(), Vec::new());
     for (language, programs) in SHELL_INTERPRETERS {
         match programs.iter().copied().find(|program| found(program)) {
@@ -192,6 +206,17 @@ fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
             None => missing.push(*language),
         }
     }
+    // A bare `python` is not evidence of Python 3 (it may be Python 2 or a different interpreter),
+    // so it is advertised as an unverified launcher and never as `python3`.
+    let bare_python = !found("python3") && found("python");
+    if bare_python {
+        available.push("python (unverified version; no python3 launcher)".to_owned());
+    }
+    let validation = if missing.contains(&"python3") {
+        " No python3 launcher resolves on the shell PATH. For Python-specific behavior, use Python Eval if offered; a different engine is only partial evidence."
+    } else {
+        " Use the resolved command for helpers; lookup does not test runtime compatibility."
+    };
     let available = if available.is_empty() {
         "none".to_owned()
     } else {
@@ -202,9 +227,7 @@ fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
     } else {
         format!("; not found: {}", missing.join(", "))
     };
-    format!(
-        "- Shell PATH languages: {available}{missing}. Write helper scripts only in a language listed as available.\n"
-    )
+    format!("- Shell PATH languages: {available}{missing}.{validation}\n")
 }
 
 /// Entries directly in `dir`, or `None` when it is unreadable or too large to compare.
@@ -744,20 +767,26 @@ pub(in crate::tools) fn discard_unspawned_script(spawn: &std::process::Command) 
     crate::embedded_shell::discard_script(spawn.get_args());
 }
 
-/// The sandboxed bash's PATH on Unix: Homebrew or /usr/local, the Command Line Tools, then the system bins.
+/// The strict sandboxed bash's PATH on Unix: exactly the trusted package bin directories that exist
+/// and are not hidden (Homebrew `/opt/homebrew/bin`, `/usr/local/bin`), the Command Line Tools,
+/// then the system bins. The operator's inherited `PATH` is never extended into the sandbox.
 #[cfg(not(windows))]
-fn bash_path() -> String {
-    let mut paths = Vec::new();
-    if Path::new("/opt/homebrew/bin").is_dir() {
-        paths.push("/opt/homebrew/bin");
-    } else if Path::new("/usr/local/bin").is_dir() {
-        paths.push("/usr/local/bin");
+fn bash_path_for(ws: &Workspace) -> String {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for candidate in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let path = Path::new(candidate);
+        if path.is_dir() && !ws.sandbox_hides(path) {
+            paths.push(path.to_path_buf());
+        }
     }
     if Path::new(CLT_DIR).is_dir() {
-        paths.push("/Library/Developer/CommandLineTools/usr/bin");
+        paths.push(PathBuf::from("/Library/Developer/CommandLineTools/usr/bin"));
     }
-    paths.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"]);
-    paths.join(":")
+    paths.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+    std::env::join_paths(paths)
+        .ok()
+        .and_then(|joined| joined.into_string().ok())
+        .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into())
 }
 
 /// Recognize only simple, conventional preview commands. This is a routing diagnostic, never an
@@ -817,6 +846,32 @@ fn effective_timeout(requested: Option<u64>, cap: u64) -> u64 {
         Some(requested) if cap == 0 => requested,
         Some(requested) => requested.min(cap),
     }
+}
+
+/// The opt-in silence limit for one foreground command. Absent keeps the wall-time contract. It is
+/// a watchdog, not a longer deadline: it must be 1..=the command's wall timeout, and it never
+/// applies to background, named-session or PTY commands.
+fn idle_timeout_secs(
+    args: &Value,
+    asynchronous: bool,
+    named_session: bool,
+    wall_secs: u64,
+) -> Result<Option<Duration>, String> {
+    let Some(idle) = opt_u64(args, "idle_timeout")? else {
+        return Ok(None);
+    };
+    if idle == 0 {
+        return Err("idle_timeout needs at least 1 second".into());
+    }
+    if asynchronous || named_session {
+        return Err("idle_timeout is foreground-only; background and named-session commands keep the wall-time contract".into());
+    }
+    if wall_secs != 0 && idle > wall_secs {
+        return Err(format!(
+            "idle_timeout ({idle}s) cannot exceed the command timeout ({wall_secs}s)"
+        ));
+    }
+    Ok(Some(Duration::from_secs(idle)))
 }
 
 /// Explicit command-result semantics, never inferred from diagnostic text. Acceptance checks
@@ -1007,7 +1062,7 @@ pub(super) fn bash_tool_pty(
     args: &Value,
     start: impl FnOnce(&Value) -> ToolOutput,
 ) -> Result<ToolOutput, String> {
-    for field in ["session", "timeout"] {
+    for field in ["session", "timeout", "idle_timeout"] {
         if args.get(field).is_some_and(|value| !value.is_null()) {
             return Err(format!(
                 "bash pty=true does not accept {field}; it starts a managed bg terminal immediately, controlled with bg input, output, wait, resize or kill"
@@ -1040,7 +1095,7 @@ pub(super) fn bash_tool_pty(
                 .process_outcome()
                 .is_some_and(|process| process.exit_code.is_some() || process.signal.is_some())
             {
-                output.text.push_str("\nPTY started as a managed bg job; this is not command completion. Use bg input, output, wait, resize or kill with the returned job name. Continue independent work or use a bounded bg wait.");
+                output.text.push_str("\nPTY running; this is not command completion. Use the job name for bg input, output, wait, resize or kill. Do independent work first.");
             }
         }
         Ok(output)
@@ -1124,12 +1179,17 @@ fn run_bash(
     }
     let requested_timeout = opt_u64(args, "timeout")?;
     let timeout_secs = effective_timeout(requested_timeout, timeout_secs);
+    let idle_timeout = idle_timeout_secs(args, asynchronous, session.is_some(), timeout_secs)?;
 
     if cancel.load(Ordering::Acquire) {
         return Ok(ToolOutput::err("[cancelled before command started]\n"));
     }
     // Background requests need a child process, so they take the child-host path below.
-    if !asynchronous && session.is_none() && runner_for(ws)? == Runner::InProcess {
+    if !asynchronous
+        && session.is_none()
+        && idle_timeout.is_none()
+        && runner_for(ws)? == Runner::InProcess
+    {
         return inprocess::run(
             ws,
             &command,
@@ -1153,6 +1213,7 @@ fn run_bash(
         None,
         exchange.as_ref().map(|exchange| exchange.path()),
         false,
+        None,
     )?;
     let spawned = (|| {
         let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
@@ -1180,18 +1241,20 @@ fn run_bash(
 
     let timeout = Duration::from_secs(timeout_secs);
     let started = Instant::now();
+    let mut last_output = started;
     let mut capture = Capture::new();
     let mut artifact_error = None;
     let mut capture_error = None;
     let mut eof = false;
     let mut timed_out = false;
+    let mut idle_killed = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
     let requested = requested_timeout
         .filter(|secs| *secs > 0)
         .map(|_| timeout)
         .filter(|timeout| !timeout.is_zero());
-    let mut adopt_after = if explicit_exit_codes {
+    let mut adopt_after = if explicit_exit_codes || idle_timeout.is_some() {
         None
     } else {
         adoption_deadline(auto_background, requested)
@@ -1275,6 +1338,7 @@ fn run_bash(
             break;
         }
         if !eof {
+            let before = capture.total;
             match drain_pipe(
                 &mut reader,
                 &mut capture,
@@ -1282,7 +1346,12 @@ fn run_bash(
                 &mut artifact_error,
                 on_output,
             ) {
-                Ok(closed) => eof = closed,
+                Ok(closed) => {
+                    eof = closed;
+                    if capture.total != before {
+                        last_output = Instant::now();
+                    }
+                }
                 Err(error) => {
                     capture_error = Some(format!("reading command output: {error}"));
                     break;
@@ -1297,6 +1366,13 @@ fn run_bash(
         }
         if timeout_kills(timeout, started.elapsed(), adopt_after) {
             timed_out = true;
+            break;
+        }
+        // Opt-in silence limit: only output (not elapsed wall time) resets it, and the wall deadline
+        // above still bounds the command. A quiet command shorter than the limit is never touched.
+        if idle_timeout.is_some_and(|idle| last_output.elapsed() >= idle) {
+            timed_out = true;
+            idle_killed = true;
             break;
         }
         // Block until output arrives, the leader exits, a cancel is signalled, or a deadline
@@ -1341,6 +1417,12 @@ fn run_bash(
         && !cancelled;
     if cancelled {
         text.push_str("[cancelled; process group killed]\n");
+    } else if idle_killed {
+        text.push_str(&format!(
+            "[no output for {}s; process group killed by idle_timeout]\n",
+            idle_timeout.map_or(0, |idle| idle.as_secs())
+        ));
+        text.push_str("[idle_timeout only stops a command that is silent for its whole limit; for long quiet work use bg, or raise idle_timeout]\n");
     } else if timed_out {
         text.push_str(&format!(
             "[timed out after {timeout_secs}s; process group killed]\n"
@@ -1486,8 +1568,9 @@ pub(super) fn shell_command_fenced(
     ws: &Workspace,
     script: &str,
     cwd: &Path,
+    bundle: Option<&crate::setup::deps::bundled_python::Runtime>,
 ) -> Result<std::process::Command, String> {
-    shell_command_with_state(ws, script, cwd, None, None, true)
+    shell_command_with_state(ws, script, cwd, None, None, true, bundle)
 }
 
 /// Which program runs a `bash` command.
@@ -1754,7 +1837,7 @@ pub(in crate::tools) fn shell_command_mode(
     cwd: &Path,
     owned_terminal: Option<i32>,
 ) -> Result<std::process::Command, String> {
-    shell_command_with_state(ws, script, cwd, owned_terminal, None, false)
+    shell_command_with_state(ws, script, cwd, owned_terminal, None, false, None)
 }
 
 /// Command that runs `script` in `ws`'s root through the workspace's configured shell backend (the
@@ -1771,10 +1854,11 @@ fn shell_command_with_state(
     owned_terminal: Option<i32>,
     state: Option<&Path>,
     fork_fence: bool,
+    bundle: Option<&crate::setup::deps::bundled_python::Runtime>,
 ) -> Result<std::process::Command, String> {
     let runner = runner_for(ws)?;
     #[cfg(windows)]
-    let _ = fork_fence;
+    let _ = (fork_fence, bundle);
     // Background jobs and tool helpers need a child process; they run the same shell in a child
     // host (only reachable with the sandbox off, which `runner_for` verified).
     let runner = if runner == Runner::InProcess {
@@ -1928,6 +2012,7 @@ fn shell_command_with_state(
                 super::sandbox::CommandMode {
                     owned_terminal,
                     fork_fence,
+                    bundle,
                 },
             );
             spawn = match built {
@@ -1940,7 +2025,7 @@ fn shell_command_with_state(
             if strict {
                 spawn
                     .env_clear()
-                    .env("PATH", bash_path())
+                    .env("PATH", bash_path_for(ws))
                     .env("HOME", root)
                     .env("TMPDIR", &scratch_str)
                     .env("PWD", cwd_str)

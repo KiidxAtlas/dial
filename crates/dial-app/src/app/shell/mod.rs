@@ -64,6 +64,7 @@ pub(in crate::app) mod turn;
 pub(in crate::app) mod turn_report;
 pub(in crate::app) mod voice;
 pub(in crate::app) mod wait;
+mod worker_replies;
 
 impl Shell {
     pub(in crate::app) fn command_context(
@@ -183,10 +184,10 @@ pub(super) struct Shell {
     /// The session's title (its name, else its first message), appended to the terminal title so
     /// each tab says what it is working on. Empty until the session has one.
     pub(super) tab_scope: String,
-    /// What the terminal tab shows between turns (done, failed, waiting); cleared by a key press.
+    /// Settled turn outcome shown between turns; cleared by a key press.
     pub(super) term_activity: crate::ui::term_state::Activity,
     /// A modal question or approval is on screen and waits for the user.
-    pub(in crate::app) awaiting_user: bool,
+    pub(in crate::app) awaiting_user: Option<crate::ui::term_state::Prompt>,
     /// Draft-review consent for this shell only; never persisted or shared with tool approvals.
     accept_all_turn_drafts: bool,
     pub(super) turn_output_tokens: u64,

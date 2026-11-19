@@ -203,13 +203,11 @@ impl std::fmt::Display for TerminalFailure {
 }
 impl std::error::Error for TerminalFailure {}
 
-pub(super) fn advances_reply(data: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<Value>(data) else {
-        return false;
-    };
+pub(super) fn advances_reply_event(event: &Value) -> bool {
     match event["type"].as_str() {
         Some(
             "response.output_text.delta"
+            | "response.refusal.delta"
             | "response.reasoning_summary_text.delta"
             | "response.function_call_arguments.delta",
         ) => event["delta"].as_str().is_some_and(|s| !s.is_empty()),
@@ -509,8 +507,10 @@ fn request_inner(
             function["type"] = json!("function");
             function["strict"] = json!(false);
             if profile.is_some_and(|p| p.capabilities.strict_tools)
-                && let Some(parameters) =
-                    crate::llm::reliability::strict_parameters(&function["parameters"])
+                && let Some(parameters) = crate::llm::reliability::strict_tool_parameters(
+                    function["name"].as_str().unwrap_or_default(),
+                    &function["parameters"],
+                )
             {
                 function["parameters"] = parameters;
                 function["strict"] = json!(true);
@@ -612,8 +612,7 @@ fn completed(response: &Value) -> Result<Reply> {
     );
     reply_from_output(response, false)
 }
-/// Builds the reply from a response's output items. `partial` admits the in-progress message of a
-/// response that stopped at its token limit; unfinished tool calls always fail.
+/// `partial` keeps token-limited message text, but never releases or replays that turn's calls.
 fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
     let items = response["output"]
         .as_array()
@@ -623,6 +622,16 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
         ..Default::default()
     };
     let mut ids = std::collections::HashSet::new();
+    // A refusal applies to the whole reply, independent of where calls occur in output order.
+    let refused = items.iter().any(|item| {
+        item["type"] == "message"
+            && item["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "refusal"))
+    });
+    if refused {
+        reply.finish_reason = "refusal".into();
+    }
     for item in items {
         match item["type"].as_str() {
             Some("message") => {
@@ -645,6 +654,7 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
                     }
                 }
             }
+            Some("function_call") if partial || refused => continue,
             Some("function_call") => {
                 ensure!(
                     reply.tool_calls.len() < 128,
@@ -733,18 +743,27 @@ pub(super) struct Accumulator {
     calls: BTreeMap<u64, (String, String)>,
     added: std::collections::HashSet<u64>,
     finished: BTreeMap<u64, Value>,
+    unfinished_call: bool,
     result: Option<Reply>,
     image_generation: bool,
 }
 impl Accumulator {
-    pub(super) fn feed(
+    #[cfg(test)]
+    fn feed(
         &mut self,
         data: &str,
         on_text: &mut dyn FnMut(&str) -> bool,
         on_event: &mut dyn FnMut(&StreamEvent) -> bool,
     ) -> Result<bool> {
-        let event: Value = serde_json::from_str(data)
-            .map_err(|_| anyhow::anyhow!("invalid Responses stream event"))?;
+        self.feed_event(&serde_json::from_str(data)?, on_text, on_event)
+    }
+
+    pub(super) fn feed_event(
+        &mut self,
+        event: &Value,
+        on_text: &mut dyn FnMut(&str) -> bool,
+        on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+    ) -> Result<bool> {
         let usage = &event["response"]["usage"];
         super::usage::capture(super::usage::Snapshot {
             input: usage["input_tokens"].as_u64(),
@@ -800,17 +819,22 @@ impl Accumulator {
                     "duplicate finished Responses output item"
                 );
                 let item = &event["item"];
+                // A done envelope can precede max_output_tokens. Keep incomplete calls for
+                // terminal validation, but never announce them as complete to the caller.
                 if item["type"] == "function_call" {
-                    let arguments = item["arguments"]
-                        .as_str()
-                        .context("Responses finished call has invalid arguments")?;
-                    if !on_event(&StreamEvent::ToolCallComplete {
-                        index,
-                        id: item["call_id"].as_str().unwrap_or_default().to_owned(),
-                        name: tool_name(item)?,
-                        arguments: arguments.to_owned(),
-                    }) {
-                        return Err(Interrupted.into());
+                    if let Some(arguments) = item["arguments"].as_str()
+                        && item.get("status").is_none_or(|s| s == "completed")
+                    {
+                        if !on_event(&StreamEvent::ToolCallComplete {
+                            index,
+                            id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                            name: tool_name(item)?,
+                            arguments: arguments.to_owned(),
+                        }) {
+                            return Err(Interrupted.into());
+                        }
+                    } else {
+                        self.unfinished_call = true;
                     }
                 }
             }
@@ -834,6 +858,10 @@ impl Accumulator {
                 }
             }
             Some("response.completed") => {
+                ensure!(
+                    !self.unfinished_call,
+                    "Responses completed with an unfinished function call; no tool calls were executed"
+                );
                 let mut response = event["response"].clone();
                 // Subscription routing may put complete output only in output_item.done, with an
                 // empty terminal output array. Retain those items, but release them only after
@@ -874,13 +902,13 @@ impl Accumulator {
                     self.result = Some(reply);
                     return Ok(true);
                 }
-                return Err(TerminalFailure::from_event(kind, &event, reason).into());
+                return Err(TerminalFailure::from_event(kind, event, reason).into());
             }
             Some(_) => {}
             None => bail!("Responses stream event has no type"),
         }
         // Output items have no content callback of their own. The agent's silence watchdog must
-        // see the same lifecycle progress the transport's idle clock does (`advances_reply`).
+        // see the same lifecycle progress the transport's idle clock does.
         if matches!(
             event["type"].as_str(),
             Some("response.output_item.added" | "response.output_item.done")
@@ -891,17 +919,13 @@ impl Accumulator {
         Ok(false)
     }
 
-    /// A response that stopped at its token limit keeps its completed output as a `length` reply.
-    /// Any tool call makes it a terminal failure: a truncated turn never executes tools.
+    /// Recover text and usage from a token-limited reply, without executing or replaying tools.
     fn truncated_reply(&self, response: &Value) -> Result<Reply> {
         let mut response = response.clone();
         if response["output"].as_array().is_some_and(Vec::is_empty) && !self.finished.is_empty() {
             response["output"] = json!(self.finished.values().collect::<Vec<_>>());
         }
         let mut reply = reply_from_output(&response, true)?;
-        // Calls cut off by the output limit never run; `length` lets the agent raise the output
-        // budget and retry, as on the other transports.
-        reply.tool_calls.clear();
         reply.finish_reason = "length".into();
         Ok(reply)
     }
@@ -1331,12 +1355,16 @@ fn stream_body_inner(
         response.body_mut().as_reader(),
         super::MAX_STREAM_BYTES,
         if image_generation { super::MAX_STREAM_BYTES } else { super::stream::MAX_LINE_BYTES },
-        patience,
-        |data| advances_reply(data) || (image_generation && serde_json::from_str::<Value>(data).ok()
-            .and_then(|v| v["type"].as_str().map(|s| s.starts_with("response.image_generation_call."))) == Some(true)),
+        patience.clone(),
+        |_| false,
         |data| {
-            accumulator.feed(
-                data,
+            let event: Value = serde_json::from_str(data)
+                .map_err(|_| anyhow::anyhow!("invalid Responses stream event"))?;
+            if advances_reply_event(&event) || (image_generation && event["type"].as_str().is_some_and(|kind| kind.starts_with("response.image_generation_call."))) {
+                patience.mark_event();
+            }
+            accumulator.feed_event(
+                &event,
                 &mut |s| on_text.as_deref_mut().is_none_or(|cb| cb(s)),
                 on_event,
             )
@@ -1552,13 +1580,12 @@ pub(super) fn compact(
             super::stream::MAX_LINE_BYTES,
             patience,
             |data, name| {
-                advances_reply(data)
-                    || matches!(
-                        name,
-                        Some("response.output_item.done" | "response.completed" | "response.done")
-                    )
-                    || serde_json::from_str::<Value>(data)
-                        .is_ok_and(|event| event["type"] == "response.done")
+                matches!(
+                    name,
+                    Some("response.output_item.done" | "response.completed" | "response.done")
+                ) || serde_json::from_str::<Value>(data).is_ok_and(|event| {
+                    advances_reply_event(&event) || event["type"] == "response.done"
+                })
             },
             |data, name| {
                 if data.trim() == "[DONE]" {

@@ -585,15 +585,6 @@ pub(super) static APPEARANCE: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
-        "ui.status_transparent",
-        ui.status_transparent,
-        AP,
-        "Status Line",
-        "Transparent background",
-        "Use the terminal background instead of a tinted status line.",
-        Kind::Bool,
-    ),
-    field!(
         "ui.welcome",
         ui.welcome,
         AP,

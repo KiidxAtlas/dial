@@ -100,6 +100,74 @@ fn desktop_result(view: &mut Presentation, args: &Value, output: &ToolOutput) {
         });
     }
 }
+/// What a `verify` call checks: its named targets, the repro or acceptance it registers, or the
+/// completion gate's own selection.
+fn verify_target(args: &Value) -> String {
+    if args["plan"].as_bool() == Some(true) {
+        return "plan".into();
+    }
+    for (key, kind) in [("repro", "repro"), ("acceptance", "acceptance")] {
+        if let Some(name) = args[key]["name"].as_str().filter(|n| !n.is_empty()) {
+            return format!("{kind}: {}", one_line(name));
+        }
+    }
+    match args["targets"].as_array().map(Vec::as_slice) {
+        // `failed` is the keyword for rerunning the checks that failed, not a target named so.
+        Some([only]) if only.as_str() == Some("failed") => "rerun failed checks".into(),
+        Some(targets) if !targets.is_empty() => targets
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map_or_else(|| one_line(&t.to_string()), one_line)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "selected checks".into(),
+    }
+}
+/// The words a client shows for one `verify` result status (`CheckStatus` in snake case).
+fn verify_status(status: &str) -> &str {
+    match status {
+        "passed" => "passed",
+        "code_failed" => "failed",
+        "failed_unknown_cause" => "failed, cause unknown",
+        "environment_unavailable" => "environment unavailable",
+        "permission_denied" => "permission denied",
+        "timed_out" => "timed out",
+        "cancelled" => "cancelled",
+        "unverified" => "unverified",
+        other => other,
+    }
+}
+
+/// Counts on the card and one `status · name` row per check, from the structured result. A
+/// reused pass says so; the full diagnostics stay in the result text.
+fn verify_result(view: &mut Presentation, output: &ToolOutput) {
+    let Some(data) = &output.data else { return };
+    let count = |key: &str| data["counts"][key].as_u64().unwrap_or(0);
+    let Some(results) = data["results"].as_array().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    view.facts.push(format!("{} passed", count("passed")));
+    if count("failed") > 0 {
+        view.facts.push(format!("{} failed", count("failed")));
+    }
+    let rows: Vec<String> = results
+        .iter()
+        .map(|result| {
+            let status = verify_status(result["status"].as_str().unwrap_or("unverified"));
+            let reused = if result["reused"] == true {
+                ", reused"
+            } else {
+                ""
+            };
+            let name = one_line(result["name"].as_str().unwrap_or("check"));
+            format!("{status}{reused} · {name}")
+        })
+        .collect();
+    view.preview = Some(rows.join("\n"));
+}
+
 /// Presenters for the file/shell and controller tools. Extension definitions can override both hooks.
 pub fn render_call(name: &str, args: &Value) -> Presentation {
     if name == "bash"
@@ -137,6 +205,9 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "skill" => ("Skill", Tools, Quiet),
         // Notes between agents; the terminal draws a sent note as a quoted IRC line.
         "message" => ("IRC", Connect, Text),
+        // Controller calls whose arguments are structured, not a path or command.
+        "verify" => ("Verify", Tools, Text),
+        "finish" => ("Finish", Tools, Quiet),
         _ if name.starts_with("mcp__") => ("MCP", Connect, Text),
         _ => (name, Tools, Text),
     };
@@ -168,6 +239,8 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
                 format!("{name} · {file}")
             }
         }
+        "verify" => verify_target(args),
+        "finish" => one_line(field("outcome")),
         // The question the user is asked, not the call's JSON.
         "ask" => {
             let questions = args["questions"].as_array().map_or(&[][..], Vec::as_slice);
@@ -252,6 +325,9 @@ pub fn render_result(name: &str, args: &Value, output: &ToolOutput) -> Presentat
         if let Some(jobs) = jobs {
             view.target = plural(jobs.len(), "worker");
         }
+    }
+    if name == "verify" {
+        verify_result(&mut view, output);
     }
     if !output.is_error {
         match name {

@@ -146,9 +146,7 @@ enum WaitFor {
     PtyStartup,
 }
 
-const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. Jobs end with the session; `wait` blocks until `until` matches or the job exits; \
-output past 32 KiB stays in artifacts. Example: {\"action\":\"start\",\"name\":\"web\",\"command\":\"npm run dev\"}, \
-then {\"action\":\"wait\",\"name\":\"web\",\"until\":\"listening\"}.";
+const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. Jobs end with the session; `wait` blocks until `until` matches or the job exits; output past 32 KiB stays in artifacts.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).
@@ -582,7 +580,13 @@ impl Background {
             if matched.is_none()
                 && let Some(pattern) = &until
             {
-                matched = match find_match(&snap.ring, snap.terminal, pattern, &mut scanned) {
+                matched = match find_match_with_store(
+                    &snap.ring,
+                    snap.terminal,
+                    pattern,
+                    &mut scanned,
+                    ws.artifacts(),
+                ) {
                     Ok(matched) => matched,
                     Err(error) => {
                         return Ok(snap.with_launch(
@@ -873,19 +877,132 @@ fn plain_terminal(raw: &str) -> String {
 /// A wait owns its observation cursor independently of display and notification readers.
 /// Keep a bounded contiguous raw prefix so split UTF-8/terminal escapes and arbitrary regex
 /// anchors retain their semantics. Never silently turn an overrun into "not matched yet".
+const MAX_SPOOL_SCAN: u64 = 16 * 1024 * 1024;
+const SPOOL_OVERLAP: usize = 8 * 1024;
+const SPOOL_CHUNK: usize = 64 * 1024;
+
 #[derive(Default)]
 struct ReadinessScan {
     cursor: u64,
     raw: Vec<u8>,
     observed: bool,
+    spooled: bool,
 }
 
+fn extract_match_line(raw_bytes: &[u8], terminal: bool, pattern: &Regex) -> Option<String> {
+    let raw = String::from_utf8_lossy(raw_bytes);
+    let text = if terminal {
+        std::borrow::Cow::Owned(plain_terminal(&raw))
+    } else {
+        raw
+    };
+    let found = pattern.find(&text)?;
+    let start = text[..found.start()].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[found.end()..]
+        .find('\n')
+        .map_or(text.len(), |i| found.end() + i);
+    Some(text[start..end].chars().take(MAX_MATCH_LINE).collect())
+}
+
+fn open_spool_file(
+    ring: &Mutex<Ring>,
+    store: Option<&crate::storage::artifact::ArtifactStore>,
+) -> Option<(std::fs::File, u64)> {
+    let (spool_path, artifact, elided, total) = {
+        let r = lock(ring);
+        (
+            r.spool_path.clone(),
+            r.artifact.clone(),
+            r.elided_bytes,
+            r.total,
+        )
+    };
+    if elided != 0 {
+        return None;
+    }
+    if let Some(path) = spool_path
+        && let Ok(file) = std::fs::File::open(&path)
+    {
+        return Some((file, total));
+    }
+    if let (Some(uri), Some(store)) = (artifact, store)
+        && let Ok(file) = store.open(&uri)
+    {
+        return Some((file, total));
+    }
+    None
+}
+
+fn find_match_in_spool(
+    ring: &Mutex<Ring>,
+    terminal: bool,
+    pattern: &Regex,
+    scanned: &mut ReadinessScan,
+    store: Option<&crate::storage::artifact::ArtifactStore>,
+) -> Option<Result<Option<String>, String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut file, total) = open_spool_file(ring, store)?;
+    if scanned.observed && scanned.cursor >= total {
+        return Some(Ok(None));
+    }
+    if scanned.cursor >= MAX_SPOOL_SCAN {
+        return Some(Err(format!(
+            "readiness observation exceeded {MAX_SPOOL_SCAN} bytes in saved output; narrow the startup output or use a port readiness check"
+        )));
+    }
+    if file.seek(SeekFrom::Start(scanned.cursor)).is_err() {
+        return None;
+    }
+    // Keep only a bounded overlap tail from previously scanned bytes so memory stays bounded.
+    if scanned.raw.len() > SPOOL_OVERLAP {
+        let drop_len = scanned.raw.len() - SPOOL_OVERLAP;
+        scanned.raw.drain(..drop_len);
+    }
+    scanned.spooled = true;
+    scanned.observed = true;
+    let mut chunk = vec![0u8; SPOOL_CHUNK];
+    while scanned.cursor < total && scanned.cursor < MAX_SPOOL_SCAN {
+        let remaining = (MAX_SPOOL_SCAN - scanned.cursor).min(chunk.len() as u64) as usize;
+        let read = match file.read(&mut chunk[..remaining]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        scanned.cursor += read as u64;
+        scanned.raw.extend_from_slice(&chunk[..read]);
+        if let Some(found) = extract_match_line(&scanned.raw, terminal, pattern) {
+            return Some(Ok(Some(found)));
+        }
+        if scanned.raw.len() > SPOOL_OVERLAP {
+            let drop_len = scanned.raw.len() - SPOOL_OVERLAP;
+            scanned.raw.drain(..drop_len);
+        }
+    }
+    Some(Ok(None))
+}
+
+#[cfg(all(test, unix))]
 fn find_match(
     ring: &Mutex<Ring>,
     terminal: bool,
     pattern: &Regex,
     scanned: &mut ReadinessScan,
 ) -> Result<Option<String>, String> {
+    find_match_with_store(ring, terminal, pattern, scanned, None)
+}
+
+fn find_match_with_store(
+    ring: &Mutex<Ring>,
+    terminal: bool,
+    pattern: &Regex,
+    scanned: &mut ReadinessScan,
+    store: Option<&crate::storage::artifact::ArtifactStore>,
+) -> Result<Option<String>, String> {
+    if scanned.spooled
+        && let Some(res) = find_match_in_spool(ring, terminal, pattern, scanned, store)
+    {
+        return res;
+    }
     let (bytes, lost) = {
         let ring = lock(ring);
         if scanned.observed && scanned.cursor == ring.total {
@@ -896,12 +1013,15 @@ fn find_match(
             table::MAX_BUFFER.saturating_sub(scanned.raw.len()) + 1,
         )
     };
-    if lost != 0 {
-        return Err(format!(
-            "readiness output overrun ({lost} bytes missed); inspect the saved output or use an earlier wait"
-        ));
-    }
-    if scanned.raw.len() + bytes.len() > table::MAX_BUFFER {
+    if lost != 0 || scanned.raw.len() + bytes.len() > table::MAX_BUFFER {
+        if let Some(res) = find_match_in_spool(ring, terminal, pattern, scanned, store) {
+            return res;
+        }
+        if lost != 0 {
+            return Err(format!(
+                "readiness output overrun ({lost} bytes missed); inspect the saved output or use an earlier wait"
+            ));
+        }
         return Err(format!(
             "readiness observation exceeded {} bytes; narrow the startup output or use a port readiness check",
             table::MAX_BUFFER
@@ -910,22 +1030,7 @@ fn find_match(
     scanned.cursor += bytes.len() as u64;
     scanned.raw.extend_from_slice(&bytes);
     scanned.observed = true;
-    let raw = String::from_utf8_lossy(&scanned.raw);
-    let text = if terminal {
-        std::borrow::Cow::Owned(plain_terminal(&raw))
-    } else {
-        raw
-    };
-    let Some(found) = pattern.find(&text) else {
-        return Ok(None);
-    };
-    let start = text[..found.start()].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[found.end()..]
-        .find('\n')
-        .map_or(text.len(), |i| found.end() + i);
-    Ok(Some(
-        text[start..end].chars().take(MAX_MATCH_LINE).collect(),
-    ))
+    Ok(extract_match_line(&scanned.raw, terminal, pattern))
 }
 
 /// The last `n` lines of `text`, trailing newline included.

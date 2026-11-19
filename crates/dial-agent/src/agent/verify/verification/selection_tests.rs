@@ -248,7 +248,7 @@ fn related_checks_follow_project_metadata_and_source_layout() {
             .command
             .contains("-m pytest -q 'tests/test_config.py'")
     );
-    assert_eq!(checks[2].command, "go test './app'");
+    assert_eq!(checks[2].command, "go test -count=1 './app'");
     assert!(
         checks[3].command.contains("vitest")
             && checks[3].command.contains("run")
@@ -324,7 +324,7 @@ fn related_metadata_is_shared_within_selection_but_refreshed_between_calls() {
     let checks = select();
     assert_eq!(checks.len(), 3);
     assert_eq!(checks[0].name, "related vitest test: src/second.test.ts");
-    assert_eq!(checks[1].command, "go test './app'");
+    assert_eq!(checks[1].command, "go test -count=1 './app'");
     assert_eq!(checks[2].name, "related vitest test: src/first.test.ts");
     assert!(checks[0].command.contains(" run 'src/second.test.ts'"));
 
@@ -335,11 +335,11 @@ fn related_metadata_is_shared_within_selection_but_refreshed_between_calls() {
     assert_eq!(checks.len(), 3);
     assert_eq!(checks[0].name, "related jest test: src/second.test.ts");
     assert_eq!(checks[1].name, "related jest test: src/first.test.ts");
-    assert_eq!(checks[2].command, "go test './other'");
+    assert_eq!(checks[2].command, "go test -count=1 './other'");
     assert!(
         checks[0]
             .command
-            .contains(" --runInBand 'src/second.test.ts'")
+            .contains(" --runInBand --runTestsByPath 'src/second.test.ts'")
     );
 
     let jest = if cfg!(windows) { "jest.cmd" } else { "jest" };
@@ -411,4 +411,76 @@ fn empty_suites_are_not_behavioral_evidence() {
     assert!(zero_tests(
         "ok  \texample/tested\t0.01s [no tests to run]\n?   \texample/helper\t[no test files]\n"
     ));
+}
+
+#[test]
+fn changed_javascript_test_files_are_selected_directly_and_jest_paths_are_literal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    fs::create_dir_all(path.join("src/__tests__")).unwrap();
+    fs::create_dir_all(path.join("node_modules/.bin")).unwrap();
+    fs::write(path.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+    let executable = if cfg!(windows) { "jest.cmd" } else { "jest" };
+    fs::write(path.join("node_modules/.bin").join(executable), "").unwrap();
+    for file in ["src/ui.test.ts", "src/__tests__/helper.ts", "src/ui.ts"] {
+        fs::write(path.join(file), "").unwrap();
+    }
+    let checks = related_tests(
+        path,
+        Path::new("python3"),
+        &[
+            "src/ui.test.ts".into(),
+            "src/__tests__/helper.ts".into(),
+            "src/ui.ts".into(),
+        ],
+    );
+    assert_eq!(checks.len(), 2, "{checks:?}");
+    assert!(
+        checks[0]
+            .command
+            .ends_with("--runInBand --runTestsByPath 'src/ui.test.ts'"),
+        "{checks:?}"
+    );
+    assert!(
+        checks[1]
+            .command
+            .ends_with("--runInBand --runTestsByPath 'src/__tests__/helper.ts'"),
+        "{checks:?}"
+    );
+}
+
+#[test]
+fn nested_go_modules_run_the_owning_package_without_cached_results() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("services/api/calc")).unwrap();
+    fs::write(
+        root.path().join("services/api/go.mod"),
+        "module example.com/api\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("services/api/calc/value_test.go"),
+        "package calc\n",
+    )
+    .unwrap();
+    let checks = related_tests(
+        root.path(),
+        Path::new("python3"),
+        &["services/api/calc/value.go".into()],
+    );
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(
+        checks[0].command,
+        "cd 'services/api' && go test -count=1 './calc'"
+    );
+    fs::write(root.path().join("go.mod"), "module example.com/root\n").unwrap();
+    assert_eq!(
+        related_tests(
+            root.path(),
+            Path::new("python3"),
+            &["services/api/calc/value.go".into()]
+        ),
+        checks,
+        "the outer module must not override the nearest module"
+    );
 }

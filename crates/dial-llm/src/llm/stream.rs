@@ -56,6 +56,11 @@ pub(super) fn normalized_finish_reason(reason: &str) -> Result<String> {
         other => Ok(other.into()),
     }
 }
+/// Chat Completions can send a dedicated refusal field followed by an ordinary `stop`.
+pub(super) fn chat_finish_reason(reason: Option<&str>, refused: bool) -> Result<String> {
+    let reason = normalized_finish_reason(reason.unwrap_or_default())?;
+    Ok(if refused { "refusal".into() } else { reason })
+}
 
 /// Providers choose whether an idle timeout is safe to retry.
 #[derive(Debug)]
@@ -383,6 +388,7 @@ struct PartialCall {
 #[derive(Default)]
 pub(super) struct Accumulator {
     text: String,
+    refused: bool,
     calls: BTreeMap<u64, PartialCall>,
     /// Server `index` values that a different call id reused, mapped to the slot that call got.
     reused_indexes: BTreeMap<u64, u64>,
@@ -586,15 +592,36 @@ impl Accumulator {
                 Some(Value::String(_) | Value::Null) | None => {}
                 Some(_) => bail!("chat stream content delta is not a string"),
             }
+            if let Some(piece) = delta["refusal"].as_str().filter(|s| !s.is_empty()) {
+                self.refused = true;
+                progress_seen = true;
+                self.text.push_str(piece);
+                if !on_text(piece) {
+                    return Err(Interrupted.into());
+                }
+            }
             if let Some(calls) = delta.get("tool_calls") {
                 match calls {
                     Value::Array(calls) => {
                         progress_seen |= !calls.is_empty();
                         for call in calls {
-                            self.add_tool_delta(call)?;
-                            let (index, slot) = self.slot(call)?;
-                            if let Some(piece) =
-                                call.pointer("/function/arguments").and_then(Value::as_str)
+                            let (index, slot) = self.add_tool_delta(call)?;
+                            let args = call.pointer("/function/arguments");
+                            let piece = match args {
+                                Some(Value::String(piece)) => Some(piece.as_str()),
+                                Some(Value::Object(_)) => Some(slot.arguments.as_str()),
+                                // Some servers announce the name, omitting arguments until later.
+                                None | Some(Value::Null)
+                                    if call
+                                        .pointer("/function/name")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty()) =>
+                                {
+                                    Some("")
+                                }
+                                _ => None,
+                            };
+                            if let Some(piece) = piece
                                 && !on_event(&super::StreamEvent::ToolArguments {
                                     index,
                                     id: slot.id.clone(),
@@ -697,19 +724,19 @@ impl Accumulator {
         Ok((key, self.calls.entry(key).or_default()))
     }
 
-    fn add_tool_delta(&mut self, delta: &Value) -> Result<()> {
+    fn add_tool_delta(&mut self, delta: &Value) -> Result<(u64, &mut PartialCall)> {
         ensure!(
             delta.is_object(),
             "chat stream tool call delta is not an object"
         );
-        let (_, slot) = self.slot(delta)?;
+        let (index, slot) = self.slot(delta)?;
         if let Some(id) = delta.get("id").and_then(Value::as_str)
             && slot.id.is_empty()
         {
             slot.id = id.to_string();
         }
         let Some(function) = delta.get("function") else {
-            return Ok(());
+            return Ok((index, slot));
         };
         if let Some(name) = function.get("name").and_then(Value::as_str) {
             // Names normally arrive once; tolerate pieces, ignore exact repeats.
@@ -727,7 +754,7 @@ impl Accumulator {
             }
             _ => {}
         }
-        Ok(())
+        Ok((index, slot))
     }
 
     /// The finished reply. A stream that ended without a `finish_reason` or
@@ -743,7 +770,7 @@ impl Accumulator {
             )
             .into());
         }
-        let finish_reason = normalized_finish_reason(self.finish_reason.as_deref().unwrap_or(""))?;
+        let finish_reason = chat_finish_reason(self.finish_reason.as_deref(), self.refused)?;
         let calls: Vec<Value> = self
             .calls
             .into_values()
@@ -756,7 +783,11 @@ impl Accumulator {
             .collect();
         Ok(Reply {
             text: self.text,
-            tool_calls: parse_tool_calls(&calls)?,
+            tool_calls: if matches!(finish_reason.as_str(), "refusal" | "content_filter") {
+                Vec::new()
+            } else {
+                parse_tool_calls(&calls)?
+            },
             finish_reason,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,

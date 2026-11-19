@@ -84,7 +84,10 @@ without reading or refreshing sign-in credentials. `oauth` uses only the provide
 missing, unreadable, expired or rejected sign-in credentials never fall back to API-key billing.
 Quota exhaustion does not automatically switch methods. API-key selection does not make an
 OAuth-only provider endpoint accept API keys; the endpoint must support the chosen route.
-OpenAI API-key usage remains `openai`, and ChatGPT subscription usage remains `chatgpt`.
+OpenAI API-key usage remains `openai`, and ChatGPT subscription usage remains `chatgpt`. The
+`openai` provider speaks the Responses API (`/v1/responses`), so reasoning models keep their
+encrypted reasoning between tool calls and Responses-only models (`-codex`, `-pro`) are reachable.
+An explicit `protocol = "chat-completions"` on the endpoint still selects chat completions.
 OpenRouter browser sign-in creates an API key rather than a second subscription credential.
 
 For compatibility, omitted `auth` (or `auth = "auto"`) preserves legacy credential selection:

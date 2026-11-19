@@ -271,3 +271,156 @@ fn plan_text_caps_deliverables_while_structured_requirement_keeps_all() {
         json!(deliverables)
     );
 }
+
+fn eval_check(runtime: &str, passed: bool, digest: &str) -> Value {
+    json!({"runtime":runtime,"name":"unit","passed":passed,"source":{"path":"artifact.txt","sha256":digest}})
+}
+
+fn eval_reply(checks: Value) -> ToolOutput {
+    ToolOutput::structured(json!({"checks":checks}))
+        .with_observation(crate::runtime::execution::ObservationKind::Wait, true)
+}
+
+#[test]
+fn artifact_local_checks_track_bytes_not_turn_revision_and_never_credit_requirements() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("artifact.txt");
+    let mut config = config();
+    config.verification.requirements.insert(
+        "contract".into(),
+        VerificationRequirement {
+            checks: vec!["unit".into()],
+            ..Default::default()
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    let args = json!({"action":"eval","code":"..."});
+    let sha = |s: &str| format!("{:x}", Sha256::digest(s.as_bytes()));
+    std::fs::write(&path, "one").unwrap();
+    let mut out = eval_reply(json!([
+        eval_check("node", false, &sha("one")),
+        eval_check("quickjs", true, &sha("one"))
+    ]));
+    out.is_error = true; // An exception after a callback doesn't erase it.
+    agent.step_checks.eval_checks.observe(&args, &out);
+    std::fs::write(root.path().join("unrelated.txt"), "other").unwrap();
+    agent.step_checks.mutations += 1;
+    let plan = agent.verify_tool(&json!({"plan":true}), &mut NullUi);
+    let local = &plan.data.as_ref().unwrap()["artifact_local_checks"];
+    let receipts = local["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|r| r["freshness"] == "current"));
+    assert_eq!(receipts[0]["runtime"], "node");
+    assert_eq!(receipts[0]["passed"], false);
+    assert_eq!(receipts[1]["runtime"], "quickjs");
+    assert_eq!(receipts[1]["passed"], true);
+    assert!(plan.text.contains("source current"));
+    let completion = agent.completion_evidence(TurnOutcome::Completed);
+    assert_eq!(completion["artifact_local_checks"], *local);
+    assert_eq!(completion["checks"]["passing_checks"], 0);
+    assert_eq!(completion["requirements"]["observed"], 0);
+    assert_eq!(completion["verification_coverage"], "not_observed");
+
+    std::fs::write(&path, "two").unwrap(); // Same size, no new controller revision.
+    agent.step_checks.eval_checks.observe(
+        &args,
+        &eval_reply(json!([eval_check("node", true, &sha("two"))])),
+    );
+    let changed = agent.completion_evidence(TurnOutcome::Completed);
+    let receipts = changed["artifact_local_checks"]["receipts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(receipts[0]["freshness"], "stale");
+    assert_eq!(receipts[0]["passed"], false);
+    assert_eq!(receipts[2]["freshness"], "current");
+    assert_eq!(receipts[2]["source"]["sha256"], sha("two"));
+    std::fs::remove_file(&path).unwrap();
+    for protected in [false, true] {
+        if protected {
+            // Matching bytes reappear, but the receipt cannot reopen private storage.
+            std::fs::write(&path, "one").unwrap();
+            agent.workspace = agent
+                .workspace
+                .clone()
+                .with_protected_paths(std::slice::from_ref(&path));
+        }
+        let unavailable = agent.verify_tool(&json!({"plan":true}), &mut NullUi);
+        let data = unavailable.data.unwrap();
+        assert!(
+            data["artifact_local_checks"]["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["freshness"] == "unavailable")
+        );
+    }
+}
+
+#[test]
+fn artifact_local_checks_reject_invalid_unbound_and_unfinished_receipts() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config();
+    let mut agent = hermetic_agent(&config, root.path());
+    let history = &mut agent.step_checks.eval_checks;
+    let args = json!({"code":"..."});
+    let good = eval_check("python", true, &"0".repeat(64));
+    let mut unbound = good.clone();
+    unbound.as_object_mut().unwrap().remove("source");
+    let mut rows = vec![unbound];
+    for (pointer, value) in [
+        ("/runtime", json!("js")),
+        ("/passed", json!("yes")),
+        ("/name", json!("")),
+        ("/source/sha256", json!("bogus")),
+        ("/source/path", json!("../outside")),
+        ("/source/path", json!("/unapproved")),
+    ] {
+        let mut row = good.clone();
+        *row.pointer_mut(pointer).unwrap() = value;
+        rows.push(row);
+    }
+    assert_eq!(history.observe(&args, &eval_reply(json!(rows))), (1, 0)); // Only the unbound callback.
+    let valid_reply = eval_reply(json!([good]));
+    history.observe(&json!({"action":"status"}), &valid_reply);
+    history.observe(
+        &args,
+        &valid_reply
+            .clone()
+            .with_observation(crate::runtime::execution::ObservationKind::Wait, false),
+    );
+    let returned = ToolOutput::structured(json!({"value":valid_reply.data.unwrap()}))
+        .with_observation(crate::runtime::execution::ObservationKind::Wait, true);
+    history.observe(&args, &returned);
+    assert_eq!(history.snapshot(&agent.workspace), Value::Null);
+}
+
+#[test]
+fn artifact_local_checks_bound_turn_history_and_disclose_omitted_observations() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config();
+    let mut agent = hermetic_agent(&config, root.path());
+    let rows: Vec<_> = (0..100)
+        .map(|i| {
+            let mut row = eval_check("python", i < 99, &"0".repeat(64));
+            row["name"] = json!(format!("case {i}"));
+            row
+        })
+        .collect();
+    agent
+        .step_checks
+        .eval_checks
+        .observe(&json!({"code":"..."}), &eval_reply(json!(rows)));
+    let report = agent.verify_tool(&json!({"plan":true}), &mut NullUi);
+    let data = report.data.unwrap();
+    let history = &data["artifact_local_checks"];
+    let retained = history["receipts"].as_array().unwrap();
+    assert!(retained.len() < 100);
+    assert_eq!(
+        retained.len() as u64 + history["omitted"].as_u64().unwrap(),
+        100
+    );
+    assert_eq!(retained.last().unwrap()["name"], "case 99");
+    assert!(report.text.contains("case 99 — failed"));
+}

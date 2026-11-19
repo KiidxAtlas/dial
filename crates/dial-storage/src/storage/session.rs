@@ -819,6 +819,17 @@ impl Session {
         }
     }
 
+    /// Whether `flush_runtime` would do durable work or report a broken journal. Checked without
+    /// flushing, so an idle no-op publication does not count a runtime flush it did not perform.
+    fn runtime_flush_needed(&self) -> bool {
+        self.runtime.check_persistence().is_err()
+            || self.runtime.has_unpersisted()
+            || self
+                .runtime
+                .stream_writer()
+                .is_some_and(|journal| journal.needs_reclamation())
+    }
+
     /// Appends the `dial_state` record; returns whether its patch was empty (state already equal).
     fn publish_control_state(&mut self, state: Value) -> Result<bool> {
         let state = self.with_history_generation_floor(state);
@@ -839,9 +850,12 @@ impl Session {
                 }
                 equal = patch.is_empty();
                 if equal {
-                    // Runtime changes still cross the persistence boundary; identical control
-                    // data does not create a new context node or invalidate memory authority.
-                    self.flush_runtime()?;
+                    // Identical control data creates no context node or memory event. Runtime
+                    // changes still cross the persistence boundary, so flush only when something
+                    // is waiting; an idle runtime makes this publication a pure no-op.
+                    if self.runtime_flush_needed() {
+                        self.flush_runtime()?;
+                    }
                     return Ok(true);
                 }
                 message["patch"] = Value::Object(patch);

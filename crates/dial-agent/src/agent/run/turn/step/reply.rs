@@ -113,13 +113,7 @@ impl Agent<'_> {
         }
         // A provider refusal is not an answer and retrying the same request repeats it: stop with
         // the provider's category instead of entering empty-reply or completion recovery.
-        if let Some(crate::llm::ProviderStop::Refusal { category }) = reply.provider_stop() {
-            let reason = match category {
-                Some(category) => {
-                    format!("The provider declined this request (category: {category}).")
-                }
-                None => "The provider declined this request.".to_owned(),
-            };
+        if let Some(reason) = reply.refusal_message() {
             return self
                 .stop_turn(ui, reason, sent.step + 1)
                 .map(crate::agent::run::engine::Tick::Finished)
@@ -167,6 +161,7 @@ impl Agent<'_> {
             requested_tokens,
             window: self.context_window(),
             prompt_tokens: self.last_prompt_tokens,
+            model_max_output: backend.stated_output_limit(),
         };
         if let Some(truncation) = crate::agent::run::reply_triage::truncation(
             engine,
@@ -581,6 +576,10 @@ impl Agent<'_> {
                     crate::agent::run::guidance::Priority::Review,
                     crate::agent::verify::completion::CAPABILITY_SEARCH_REMINDER,
                 ));
+                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
+            }
+            if let Some(message) = self.quality_review(ui)? {
+                turn.pending_nudges.push(message);
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
             if let Some(message) = self.coach_completion(

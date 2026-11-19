@@ -188,6 +188,8 @@ test-embedded-host:
 
 test-packaging:
 	$(PYTHON) scripts/test-packaging.py
+	$(PYTHON) scripts/test-prepare-node.py
+	$(PYTHON) scripts/test-prepare-python.py
 	$(PYTHON) scripts/check-packaging.py
 
 test-release-policy:

@@ -224,6 +224,11 @@ fn exchange_in(
                 }
             }
         }
+        // The Connect end-stream envelope commits the reply even if the HTTP peer stays open.
+        // All frames in this read were validated; finish() still rejects a partial trailing frame.
+        if state.ended {
+            break;
+        }
     }
     frames.finish()?;
     if !state.ended {

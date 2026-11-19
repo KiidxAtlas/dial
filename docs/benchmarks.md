@@ -162,6 +162,22 @@ The records include:
   Incomplete totals stay null. Request latency coverage must reconcile within **each trial**:
   extra traces in one trial cannot cancel missing traces in another. Overlapping request/tool sums
   are not wall-clock controller overhead. Provider, Harbor and verifier retries remain separate.
+- Official passes / scored attempts and unscored count, followed by requests and elapsed time for
+  **passing attempts only**. Compare these per matching task; a fast failure is not a speedup.
+  On a single reconciled Dial journal, `observed_repeat_checks` counts marked checks rerunning a
+  matching foreground command (or registered helper) since the last observed file change. It is
+  not a count of unnecessary checks. `requests_from_first_mismatch_to_artifact_write` measures
+  request distance from the first observed mismatch to the last later write matching a declared
+  check path exactly. A shell mismatch needs a completed failing check with expected/actual output;
+  a registered code failure without a recorded path cannot identify the repaired artifact.
+  Only official passes contribute to aggregate repair distance. Missing links, unmarked exploratory
+  output and incompatible traces are not evidence of zero repair cost.
+
+For an artifact comparison, freeze both binaries, task sources, verifier, image and effort. Include
+a normal-runtime control, a missing-runtime task and a semantic disagreement case. The pilot fixture
+`examples/benchmarks/harbor-fixtures/unicode-word-groups/` uses the existing ARM64 Python image:
+Python's Unicode `\w+` splits `e\u0301x` into two matches, while Unicode-mode Perl keeps one. The
+official verifier evaluates the requested Python semantics independently of the agent's helper.
 
 For the existing pilot, regenerate a **separate** supplemental report without agent execution:
 
@@ -270,19 +286,19 @@ reliability estimate. Token and request totals are shown only when every pooled 
 
 ## Using an existing subscription sign-in
 
-Add `--share-auth` to explicitly let benchmark inference use the original subscription authentication
-store, for example:
-
-```sh
-dial benchmark examples/benchmarks/efficiency.toml --share-auth --report efficiency-report.json
-```
+Benchmark inference uses your existing subscription sign-ins (ChatGPT, Claude) by default, so
+`dial benchmark examples/benchmarks/efficiency.toml --report efficiency-report.json` works with the
+account you already use in Dial.
 
 Configuration, sessions, fixtures and caches still use disposable benchmark homes. ChatGPT/Claude
 subscription credentials are never copied: provider requests use the original store and its existing
 refresh locks. The shared directory remains protected from agent tools and sandboxed commands.
-Without this flag, subscription sign-ins remain unavailable to benchmark children, even if an ambient
-`DIAL_SUBSCRIPTION_AUTH_HOME` override exists. API-key credentials retain their existing behavior.
 Sharing authentication permits real model requests and can consume subscription quota.
+
+Add `--isolated-auth` to keep subscription sign-ins out of the run, even if an ambient
+`DIAL_SUBSCRIPTION_AUTH_HOME` override exists; only API-key credentials and local models then
+work. `--share-auth`, from when sharing was opt-in, is still accepted and changes nothing.
+API-key credentials behave the same either way.
 
 ## Measuring efficiency
 
@@ -325,6 +341,13 @@ per-turn report with its send ordinal. A bounded error-recovery state read is se
 are not cumulative totals. The runtime records first tool-result/known workspace-change-result
 latency and exact parent/worker inspection overlap, not semantic reuse or wasted work. A useful
 action's latency, missing counters and unavailable reports remain unknown rather than inferred.
+
+`projection_bytes.interventions` counts explicit controller events: `steering_message_journaled`
+once per persisted steering message, and `turn_interrupted` once per explicitly interrupted turn.
+These are observations, not a count of user corrections or evidence that assistance was necessary;
+deadlines, live acknowledgements and repeated polls do not create extra interventions.
+Scheduling `work_us` is an inclusive sum, not wall time or speedup; missing, invalid or mismatched
+per-call observations make it `null`, including when worker observations are combined.
 
 For evidence-led quality work, use `dial benchmark examples/benchmarks/quality.toml --report benchmarks/quality.json`.
 Its billing fixtures cover locating production code among archival decoys,
@@ -447,6 +470,10 @@ attempts, and observed tokens. Unavailable trials stay in the denominator; unkno
 null. Latency ratios use only tasks passing every trial in both configurations. Exit status 1
 means an observed per-task correctness-frequency regression against the named baseline, not a
 statistical significance claim. Existing summary files are never overwritten.
+Per-task `elapsed_ms_per_success` and `observed_tokens_per_success` amortize every attempt,
+including failed attempts, over independently checked successes. With no checked success they
+remain `null`; incomplete usage also leaves tokens per success unknown. Tool-effectiveness
+comparisons with only metric/manual-review cases report correctness nonregression as unknown.
 
 Lifecycle metric checks read each send's `efficiency.turns[].report.projection_bytes` counters
 and sum them across the case. Recovery snapshots are not additional turns. A missing counter,
@@ -787,6 +814,17 @@ completed cases per second. Unavailable measurements stay null. Recommendations 
 correctness floor and per-case regression limits; reports never apply settings, activate adapters or
 start training. Scripted-provider smoke results verify this plumbing, not real-model quality.
 
+`[machine] case_inactivity_secs` is an opt-in silence bound, separate from `case_timeout_secs`.
+It defaults to `0` (off). When set (1–600, and no longer than a positive `case_timeout_secs`), a case
+fails once that many seconds pass without meaningful progress: a request dispatch (so the first
+response is bounded too), new assistant or reasoning text, tool activity, a usage report, or a
+`model_progress` report whose counts changed. Identical repeated progress reports do not reset it,
+and neither do notices. Its failure reads `benchmark RPC inactive: no meaningful progress for N s`
+and keeps the metrics and in-flight counts observed so far. Use it for local servers, which the
+remote silence watchdog does not limit. A tool that runs silently longer than the bound counts as
+silence, so set the bound above your longest silent step or leave it off. The report records the
+bound only when it is set. Tests use scripted children; no live model result is implied.
+
 Each `[[configurations]]` entry may override assistance features for that run only. Unset keys keep the
 user's config value; set keys are written into the child's isolated config and recorded under `settings.assistance`.
 
@@ -996,6 +1034,10 @@ Diagnostics recorded per run:
   when every turn reported each field; additive numeric leaves add, strings and first-result latencies
   stay per turn, and absent dynamic-map labels count as zero. Otherwise that field is `null` (unknown),
   never zero. Failed trials are unknown.
+  Explicit null or invalid numeric counters also make their containing field unknown; metadata
+  and per-turn first-result latencies are excluded rather than summed. Dial token observations
+  with unreported or partial attempts remain lower bounds, not complete token totals, while
+  independently known request/tool counts remain measurable.
   Request phases are policy labels, not error counts: a recovery phase can persist across later
   successful shell observations. `recovery_attempts` counts separately instrumented recovery paths;
   an empty map does not establish that no tool failed. Use `failed_tool_results` and individual
@@ -1007,6 +1049,7 @@ Diagnostics recorded per run:
   measures provider-neutral serialization/hash preparation, excluding journal publication and model
   inference; it overlaps request preparation and must not be added to turn wall time. Full historical
   messages are remeasured after hooks, so this does not assume unchanged content or provider cache hits.
+- A case that times out or stalls keeps what the harness observed. Once a send was issued without a runtime ledger read, token usage is `token_usage_incomplete`, not zero. A request still in flight reports its last `model_progress` counts as `inflight_progress`; these are a live observation, never added to usage totals. The failure detail names the last child event and how long ago it arrived. The wall deadline (`case_timeout_secs`) is unchanged; see the inactivity bound below.
 - A non-zero exit records the exit code, the stderr log path (`stderr_log`) and a bounded excerpt
   (`stderr_tail`, last 800 characters) after best-effort redaction of token-like values. Excerpts are
   not a guarantee against leaking secrets: the raw logs are unredacted private artifacts. The progress
@@ -1201,10 +1244,21 @@ target directory rather than `$TMPDIR`, so an interrupted run keeps its evidence
 `compare.py` reports correctness regressions before speed. A score is a measurement only for the
 recorded model, machine and build (`execution_build`); compare runs with the same profile.
 
+For a timed case, the runner passes the remaining seconds to the RPC child as `--max-time`
+at launch. This gives the agent its usual one-time wrap-up reminder on the next eligible
+request after 80% of that turn's available time has elapsed. Follow-up turns share the same
+deadline; they do not receive a fresh case budget. The runner still enforces its own hard
+cutoff, and an unlimited case (`case_timeout_secs = 0`) sets no child time limit.
+
 When a case misses its whole-case deadline, the failure detail names the elapsed time of every
 completed RPC phase (`ready`, `seed_context#N`, `compact#N`, `send#N`) and how long the pending
 request had been waiting, for example
 `case elapsed 180.0 s; completed: ready 3.0 s, send#1 40.0 s, compact#2 57.0 s; pending for 80.0 s`.
+When the child reports a freshly executed passing check during a `send`, `metrics.post_check_timings`
+records that send's ID and milliseconds from receipt of the **last** such event to the RPC reply
+(`end: reply`) or to loss of the reply, including a deadline (`end: rpc_error`). The latter is
+only the observed wait. An omitted send means no attributed pass was observed, not zero wait.
+This is not the independent grader, a completion signal, or a reason to skip remaining work.
 
 Offline checks: `cd examples/benchmarks && python3 -m unittest test_local_tasks` verifies that each
 starting state fails, each reference fix passes, mutable-test weakening cannot hide the original
@@ -1215,6 +1269,45 @@ available); offline fixture checks do not establish better local-model task succ
 
 The scripted `offline_compare.py` harness is a transport and wrapper regression tool. Its tool
 scripts are not a model benchmark and its results must not be reported as model quality.
+
+### Experimental settings ledger
+
+Every `experimental.*` setting stays behind its flag until a headline comparison shows it helps
+(see [design philosophy](design-philosophy.md)). This ledger records each one's shipped default
+and its measurement status, so flags cannot pile up unreviewed. A test
+(`config::schema::tests::experimental_ledger_lists_every_experimental_setting`) fails when a
+setting is added or removed without updating this table.
+
+No headline baseline is recorded yet, so every status is **unmeasured**. To give a verdict, run
+`make bench-headline` twice on the same model, profile and build, changing only that one setting,
+and compare with `BASELINE=`. Correctness regressions decide before tokens or time. Then:
+**promote** (make it the default and move it out of `experimental`), **keep** (with the
+measured reason), or **remove**. Record the run files next to the verdict.
+
+| Setting | Default | Status |
+| --- | --- | --- |
+| `experimental.adaptive_output_effort` | `false` | unmeasured |
+| `experimental.background_check_slots` | `1` | unmeasured; needs `background_checks` |
+| `experimental.background_checks` | `false` | unmeasured |
+| `experimental.batch_approvals` | `false` | unmeasured; interactive-only, not exercised by unattended runs |
+| `experimental.changed_line_coverage` | `false` | unmeasured |
+| `experimental.check_predictions` | `false` | unmeasured |
+| `experimental.context_overlap_dedup` | `false` | unmeasured |
+| `experimental.dependency_dispatch` | `true` | unmeasured against `false`; shipped on |
+| `experimental.edit_bisection_runs` | `0` | unmeasured |
+| `experimental.fault_witness` | `false` | unmeasured |
+| `experimental.mutation_runs` | `0` | unmeasured |
+| `experimental.outcome_gradient_rounds` | `0` | unmeasured |
+| `experimental.profile_matching` | `false` | unmeasured; needs configured profiles |
+| `experimental.reasoning_strategy` | `default` | unmeasured, one comparison per preset |
+| `experimental.repro_first` | `advise` | unmeasured against `off`; shipped as advice |
+| `experimental.streaming_dispatch` | `true` | unmeasured against `false`; shipped on |
+| `experimental.tool_speculation` | `false` | unmeasured |
+| `experimental.turn_drafter_diagrams` | `false` | unmeasured; needs `turn_optimizer` |
+| `experimental.turn_optimizer` | `false` | unmeasured; interactive drafts need acceptance |
+| `experimental.verification_receipts` | `false` | unmeasured |
+| `experimental.video_analysis` | `false` | unmeasured; adds a tool, so the tool pause applies |
+| `experimental.work_packet_contracts` | `false` | unmeasured |
 
 ## Recorded runs
 

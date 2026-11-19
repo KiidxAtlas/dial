@@ -289,32 +289,84 @@ fn repeated_narration_warns_periodically_despite_different_calls_and_whitespace(
 fn a_length_stop_first_asks_for_a_bigger_budget_that_fits_the_context() {
     let r = reply("", vec![]);
     assert_eq!(
-        recover_from_length(4096, 32768, 2000, &r, 0),
+        recover_from_length(4096, 32768, 2000, None, &r, 0),
         LengthAction::Retry { max_tokens: 8192 }
     );
     assert_eq!(
-        recover_from_length(8192, 32768, 2000, &r, 0),
+        recover_from_length(8192, 32768, 2000, None, &r, 0),
         LengthAction::Retry { max_tokens: 16384 }
     );
     // Never more than the window can spare after the prompt.
     assert_eq!(
-        recover_from_length(8192, 32768, 20000, &r, 0),
+        recover_from_length(8192, 32768, 20000, None, &r, 0),
         LengthAction::Retry { max_tokens: 11744 }
     );
+    // Without a stated model maximum, the conservative default ceiling applies.
     assert_eq!(
-        recover_from_length(20000, 65536, 100, &r, 0),
+        recover_from_length(20000, 65536, 100, None, &r, 0),
         LengthAction::Retry { max_tokens: 32768 }
     );
 }
 
 #[test]
+fn a_stated_model_output_maximum_replaces_the_default_ceiling() {
+    let r = reply("", vec![]);
+    // A larger stated maximum lets one call grow past the unstated default.
+    assert_eq!(
+        recover_from_length(32768, 400_000, 1000, Some(128_000), &r, 0),
+        LengthAction::Retry { max_tokens: 65536 }
+    );
+    assert_eq!(
+        recover_from_length(65536, 400_000, 1000, Some(128_000), &r, 0),
+        LengthAction::Retry {
+            max_tokens: 128_000
+        }
+    );
+    // A smaller stated maximum is never exceeded.
+    assert_eq!(
+        recover_from_length(4096, 200_000, 1000, Some(8192), &r, 0),
+        LengthAction::Retry { max_tokens: 8192 }
+    );
+    assert!(matches!(
+        recover_from_length(8192, 200_000, 1000, Some(8192), &r, 0),
+        LengthAction::Nudge { .. }
+    ));
+}
+
+#[test]
+fn a_cut_off_call_is_told_the_limit_and_why_it_cannot_grow() {
+    let cut = reply("", vec![call("write", json!({}))]);
+    let message = |current, window, model_max| match recover_from_length(
+        current, window, 1000, model_max, &cut, 0,
+    ) {
+        LengthAction::Nudge {
+            partial: None,
+            message,
+        } => message,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        message(128_000, 400_000, Some(128_000)),
+        "Your last tool call was cut off at the 128000-token output limit, the most this model allows; nothing ran."
+    );
+    assert!(
+        message(32768, 400_000, None)
+            .contains("the most Dial requests when the model states no output maximum")
+    );
+    assert!(
+        message(8192, 8192, Some(128_000))
+            .contains("the most the remaining context window leaves room for")
+    );
+}
+
+#[test]
 fn without_room_to_grow_the_model_is_nudged_then_escalated_never_ended() {
-    let spent = recover_from_length(8192, 8192, 6000, &reply("", vec![]), 0);
+    let spent = recover_from_length(8192, 8192, 6000, None, &reply("", vec![]), 0);
     assert!(
         matches!(&spent, LengthAction::Nudge { partial: None, message } if message.contains("Think less") && !message.contains("Escalation")),
         "{spent:?}"
     );
-    let partial = recover_from_length(8192, 8192, 6000, &reply("The answer is", vec![]), 0);
+    let partial = recover_from_length(8192, 8192, 6000, None, &reply("The answer is", vec![]), 0);
     assert!(
         matches!(&partial, LengthAction::Nudge { partial: Some(p), .. } if p == "The answer is"),
         "{partial:?}"
@@ -323,19 +375,31 @@ fn without_room_to_grow_the_model_is_nudged_then_escalated_never_ended() {
         8192,
         8192,
         6000,
+        None,
         &reply("", vec![call("write", json!({}))]),
         1,
     );
     assert!(
-        matches!(&cut_call, LengthAction::Nudge { partial: None, message } if message.contains("smaller calls")),
+        matches!(&cut_call, LengthAction::Nudge { partial: None, message }
+            if message.contains("nothing ran")
+                && !message.contains("edit")
+                && !message.contains("parts")),
         "{cut_call:?}"
     );
-    match recover_from_length(8192, 8192, 6000, &reply("", vec![]), MAX_LENGTH_NUDGES) {
+    match recover_from_length(
+        8192,
+        8192,
+        6000,
+        None,
+        &reply("", vec![]),
+        MAX_LENGTH_NUDGES,
+    ) {
         LengthAction::Nudge { message, .. } => {
             assert!(
                 message.contains("Escalation")
                     && message.contains("8192 tokens")
                     && message.contains("Think less")
+                    && !message.contains("parts")
             )
         }
         other => panic!("{other:?}"),
@@ -715,6 +779,11 @@ fn a_long_run_of_single_lookups_is_told_each_streak_interval_to_batch() {
         assert!(pace.round(&lookup).is_none(), "round {round}");
     }
     assert!(pace.round(&lookup).unwrap().contains("one response"));
+    // The route may narrow between finishing a round and preparing its follow-up.
+    assert!(pace.lookup_advice(true, false).is_none());
+    let single = pace.lookup_advice(true, true).unwrap();
+    assert!(single.contains(crate::agent::prompts::recovery::KNOWN_READ_TARGETS));
+    assert!(!single.contains(crate::agent::prompts::recovery::KNOWN_LOOKUPS));
     // An ignored nudge repeats after another interval rather than going silent.
     for _ in 1..SERIAL_WARN {
         assert!(pace.round(&lookup).is_none());
@@ -733,6 +802,32 @@ fn a_long_run_of_single_lookups_is_told_each_streak_interval_to_batch() {
         assert!(pace.round(&lookup).is_none());
     }
     assert!(pace.round(&lookup).is_some());
+    // Count requested evidence targets, not wrapper calls. Different slices of the
+    // same file are real independent targets; repeating a selector is not batching.
+    for (tool, args, expect_advice) in [
+        ("read", json!({"paths":["a", "b"]}), false),
+        ("read", json!({"paths":["a:1-5", "a:20-30"]}), false),
+        ("read", json!({"paths":["a"]}), true),
+        ("read", json!({"paths":["a", "a"]}), true),
+        (
+            "grep",
+            json!({"path":"src; tests", "pattern":"Widget"}),
+            false,
+        ),
+        (
+            "glob",
+            json!({"pattern":"*.rs", "cursor":"previous-page"}),
+            false,
+        ),
+    ] {
+        let mut pace = PaceGuard::default();
+        for _ in 1..SERIAL_WARN {
+            assert!(pace.round(&lookup).is_none());
+        }
+        let advice = pace.round(&[call(tool, args.clone())]);
+        assert_eq!(advice.is_some(), expect_advice, "{tool} {args}");
+        assert!(pace.round(&lookup).is_none());
+    }
     let write = [call("edit", json!({}))];
     for _ in 0..SERIAL_WARN * 2 {
         assert!(pace.round(&write).is_none());
@@ -800,4 +895,59 @@ fn unverified_churn_withholds_large_rewrites_but_preserves_focused_repairs() {
     );
     guard.observe(&[], true);
     assert!(guard.rewrite_rejection("encoder.c", 10000).is_none());
+}
+
+#[test]
+fn repeated_failed_edits_to_one_file_add_pressure_without_withholding_writes() {
+    let mut guard = EditChurnGuard::default();
+    for _ in 1..EDIT_CHURN_WARN {
+        guard.observe_failed("src/lib.rs");
+    }
+    assert!(!guard.has_pressure(), "below the warning count");
+    guard.observe_failed("src/lib.rs");
+    assert!(guard.has_pressure(), "a repeated failed attempt is thrash");
+    assert!(
+        guard.rewrite_rejection("src/lib.rs", 10000).is_none(),
+        "failed attempts never withhold a write"
+    );
+    guard.observe(&[], true);
+    assert!(
+        !guard.has_pressure(),
+        "a passing check releases failed attempts"
+    );
+}
+
+#[test]
+fn eval_cells_of_one_shape_without_progress_repeat_the_advisory_per_streak() {
+    let cell = |language: &str, code: &str| json!({"language": language, "code": code});
+    // Spacing and literal values vary; the shape does not. Each third cell is one advisory.
+    let mut guard = EvalChurnGuard::default();
+    let advice: Vec<bool> = [
+        cell("py", "print(1)"),
+        cell("py", "print( 2 )  "),
+        cell("py", "print(\n3)"),
+        cell("py", "print(4)"),
+        cell("py", "print(5)"),
+        cell("py", "print(6)"),
+    ]
+    .iter()
+    .map(|args| guard.observe(args, false).is_some())
+    .collect();
+    assert_eq!(advice, [false, false, true, false, false, true]);
+    // A passing check is progress and resets the streak.
+    assert!(guard.observe(&cell("py", "print(7)"), true).is_none());
+    assert!(guard.observe(&cell("py", "print(8)"), false).is_none());
+    // A different language or shape is a different attempt.
+    let mut other = EvalChurnGuard::default();
+    other.observe(&cell("py", "x = 1"), false);
+    assert!(other.observe(&cell("js", "x = 1"), false).is_none());
+    other.observe(&cell("js", "x = 1"), false);
+    assert!(other.observe(&cell("js", "y = 1"), false).is_none());
+    // Cells without code text are not evidence of repetition.
+    assert!(guard.observe(&json!({"action": "status"}), false).is_none());
+    let mut committed = EvalChurnGuard::default();
+    committed.observe(&cell("py", "run()"), false);
+    committed.observe(&cell("py", "run()"), false);
+    committed.clear();
+    assert!(committed.observe(&cell("py", "run()"), false).is_none());
 }

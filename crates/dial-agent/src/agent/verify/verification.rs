@@ -139,7 +139,7 @@ pub(in crate::agent) fn classify_with_artifacts(
     if incomplete || process.exit_code.is_none() || process.exit_code == Some(0) {
         return CheckStatus::Unverified;
     }
-    if code_failure_diagnostic(&text) {
+    if code_failure_line(&text).is_some() {
         CheckStatus::CodeFailed
     } else {
         CheckStatus::FailedUnknownCause
@@ -149,7 +149,7 @@ pub(in crate::agent) fn classify_with_artifacts(
 /// Diagnostic recognition is shared with output clipping, but a useful line to retain is not
 /// necessarily a code diagnosis (for example `error: network unavailable` or a warning location).
 /// Require affirmative compiler, assertion, application exception or native test-runner evidence.
-fn code_failure_diagnostic(output: &str) -> bool {
+pub(super) fn code_failure_line(output: &str) -> Option<usize> {
     use regex::Regex;
     use std::sync::LazyLock;
 
@@ -166,7 +166,7 @@ fn code_failure_diagnostic(output: &str) -> bool {
         ))
         .expect("code diagnostic pattern is valid")
     });
-    output.lines().any(|line| {
+    output.lines().position(|line| {
         (crate::tools::code::diagnostics::is_diagnostic(line) && CODE_DIAGNOSTIC.is_match(line))
             // These runner/compiler forms are not part of the clipping recognizer.
             || line.contains("assertion failed")
@@ -196,7 +196,7 @@ fn go_compiler_diagnostic(line: &str) -> bool {
 /// Presentation is not exhaustive evidence. Recover complete retained bytes through the bounded
 /// artifact API, never a display link or payload-supplied fact. Oversized/unavailable evidence
 /// remains unverified rather than earning a pass or triggering speculative code repair.
-fn classification_text<'a>(
+pub(super) fn classification_text<'a>(
     output: &'a crate::runtime::tool_output::ToolOutput,
     artifacts: Option<&crate::storage::artifact::ArtifactStore>,
 ) -> Option<std::borrow::Cow<'a, str>> {
@@ -394,9 +394,10 @@ pub(in crate::agent) fn zero_tests(output: &str) -> bool {
     {
         return true;
     }
-    let testless = output
-        .lines()
-        .any(|line| line.trim().ends_with("[no test files]"));
+    let testless = output.lines().any(|line| {
+        let line = line.trim();
+        line.ends_with("[no test files]") || line.ends_with("[no tests to run]")
+    });
     if testless {
         let executed = output.lines().any(|line| {
             let line = line.trim();
@@ -514,7 +515,8 @@ pub(in crate::agent) fn environment_problem(
         || check.name.starts_with("related Rust tests:"))
         && check.command.starts_with("cargo ");
     let go = check.name.starts_with("related Go package tests:")
-        && check.command.starts_with("go test ");
+        && (check.command.starts_with("go test ")
+            || (check.command.starts_with("cd ") && check.command.contains(" && go test ")));
     let javascript = (check.name.starts_with("related vitest test:")
         && check.command.contains("node_modules/.bin/vitest"))
         || (check.name.starts_with("related jest test:")
@@ -827,6 +829,8 @@ struct RustTarget {
 
 struct RustPackage {
     dir: PathBuf,
+    /// A workspace-root manifest otherwise selects its default members, not this package.
+    workspace_package: Option<String>,
     targets: Vec<RustTarget>,
 }
 
@@ -987,16 +991,25 @@ fn load_package(root: &Path, dir: &Path) -> Option<RustPackage> {
     }
     Some(RustPackage {
         dir: dir.to_path_buf(),
+        workspace_package: manifest.contains_key("workspace").then_some(name),
         targets,
     })
 }
 
 /// The nearest manifest at or above the file's directory must be a readable package.
-fn owning_package(root: &Path, file: &Path) -> Result<RustPackage, &'static str> {
+fn owning_package<'a>(
+    root: &Path,
+    file: &Path,
+    packages: &'a mut HashMap<PathBuf, Option<RustPackage>>,
+) -> Result<&'a RustPackage, &'static str> {
     let mut dir = file.parent().map(normalize).unwrap_or_default();
     loop {
         if root.join(&dir).join("Cargo.toml").is_file() {
-            return load_package(root, &dir).ok_or("manifest is unreadable or not a package");
+            return packages
+                .entry(dir)
+                .or_insert_with_key(|dir| load_package(root, dir))
+                .as_ref()
+                .ok_or("manifest is unreadable or not a package");
         }
         if dir.as_os_str().is_empty() {
             return Err("no owning Cargo package");
@@ -1077,7 +1090,11 @@ fn declares_root_module(root: &Path, file: &Path, module: &str) -> bool {
 }
 
 /// Maps a changed Rust path to one focused `cargo test`, or to an explicit gap.
-fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
+fn rust_selection(
+    root: &Path,
+    changed: &Path,
+    packages: &mut HashMap<PathBuf, Option<RustPackage>>,
+) -> RustSelection {
     if changed.is_absolute()
         || changed.components().any(|part| {
             !matches!(
@@ -1095,7 +1112,7 @@ fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
     if removed_from(root, &file) {
         return RustSelection::Gap("deleted or renamed away; no test target to run".into());
     }
-    let package = match owning_package(root, &file) {
+    let package = match owning_package(root, &file, packages) {
         Ok(package) => package,
         Err(reason) => return RustSelection::Gap(reason.into()),
     };
@@ -1112,20 +1129,20 @@ fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
 
     if let Some(target) = package.targets.iter().find(|target| target.root == file) {
         if target.kind == RustKind::Test {
-            return RustSelection::Check(cargo_check(&package, target, None));
+            return RustSelection::Check(cargo_check(package, target, None));
         }
         if declares_tests_module(&source) {
-            return RustSelection::Check(cargo_check(&package, target, Some("tests::".into())));
+            return RustSelection::Check(cargo_check(package, target, Some("tests::".into())));
         }
         if has_test_attribute(&source) {
-            return RustSelection::Check(cargo_check(&package, target, None));
+            return RustSelection::Check(cargo_check(package, target, None));
         }
         return RustSelection::Gap("crate root declares no tests of its own".into());
     }
 
     // Files under `src/bin` belong to a registered binary only, never to the library's tree.
     let bin_dir = package.dir.join("src/bin");
-    let Some((target, module_dir)) = owning_target(root, &package, &file)
+    let Some((target, module_dir)) = owning_target(root, package, &file)
         .filter(|(_, dir)| !file.starts_with(&bin_dir) || dir.starts_with(&bin_dir))
     else {
         return RustSelection::Gap("not inside any registered target's source tree".into());
@@ -1162,7 +1179,7 @@ fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
             }
         },
     };
-    RustSelection::Check(cargo_check(&package, target, filter))
+    RustSelection::Check(cargo_check(package, target, filter))
 }
 
 fn cargo_check(package: &RustPackage, target: &RustTarget, filter: Option<String>) -> FocusedCheck {
@@ -1194,10 +1211,15 @@ fn cargo_check(package: &RustPackage, target: &RustTarget, filter: Option<String
         .as_deref()
         .map(|text| format!(" {text}"))
         .unwrap_or_default();
+    let package_arg = package
+        .workspace_package
+        .as_deref()
+        .map(|name| format!(" --package {}", shell_quote(name)))
+        .unwrap_or_default();
     FocusedCheck {
         name: format!("related Rust tests: {label} {plain}{filter_name}"),
         command: format!(
-            "cargo test --offline --manifest-path {} {quoted}{filter_arg} --quiet -j1",
+            "cargo test --offline --manifest-path {}{package_arg} {quoted}{filter_arg} --quiet -j1",
             shell_quote(&package.dir.join("Cargo.toml").to_string_lossy())
         ),
         timeout_secs: 0,
@@ -1264,6 +1286,40 @@ fn has_go_package_tests(root: &Path, dir: &Path) -> bool {
     })
 }
 
+/// The nearest Go module owns a package, even when the workspace has no root module.
+fn go_test_command(root: &Path, path: &Path) -> Option<(String, String)> {
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let mut owner = directory;
+    while !root.join(owner).join("go.mod").is_file() {
+        owner = owner.parent()?;
+    }
+    let relative = directory.strip_prefix(owner).ok()?;
+    let package = if relative.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        format!("./{}", relative.to_string_lossy())
+    };
+    // Observe a new execution, not a prior Go test-cache entry.
+    let command = format!("go test -count=1 {}", shell_quote(&package));
+    Some(if owner.as_os_str().is_empty() {
+        (package, command)
+    } else {
+        (
+            format!("{}: {package}", owner.display()),
+            format!("cd {} && {command}", shell_quote(&owner.to_string_lossy())),
+        )
+    })
+}
+
+fn javascript_test_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".test.") || name.contains(".spec."))
+        || path
+            .components()
+            .any(|part| part.as_os_str() == "__tests__")
+}
+
 fn javascript_test_runner(root: &Path) -> Option<(&'static str, String)> {
     let package_path = root.join("package.json");
     if std::fs::metadata(&package_path).ok()?.len() > 1024 * 1024 {
@@ -1297,25 +1353,32 @@ fn javascript_test_command(
     changed: &Path,
     (runner, invocation): &(&str, String),
 ) -> Option<FocusedCheck> {
-    let stem = changed.file_stem()?.to_str()?;
-    if !stem
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return None;
-    }
-    let parent = changed.parent().unwrap_or(Path::new(""));
-    let tests_dir = parent.join("__tests__");
-    let extensions = ["js", "jsx", "ts", "tsx", "mjs", "cjs"];
-    let mut test = None;
-    for suffix in ["test", "spec"] {
-        for extension in extensions {
-            for candidate in [
-                parent.join(format!("{stem}.{suffix}.{extension}")),
-                tests_dir.join(format!("{stem}.{suffix}.{extension}")),
-            ] {
-                if root.join(&candidate).is_file() {
-                    test = Some(candidate);
+    let test = if javascript_test_path(changed) {
+        changed.to_path_buf()
+    } else {
+        let stem = changed.file_stem()?.to_str()?;
+        if !stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        let parent = changed.parent().unwrap_or(Path::new(""));
+        let tests_dir = parent.join("__tests__");
+        let extensions = ["js", "jsx", "ts", "tsx", "mjs", "cjs"];
+        let mut test = None;
+        for suffix in ["test", "spec"] {
+            for extension in extensions {
+                for candidate in [
+                    parent.join(format!("{stem}.{suffix}.{extension}")),
+                    tests_dir.join(format!("{stem}.{suffix}.{extension}")),
+                ] {
+                    if root.join(&candidate).is_file() {
+                        test = Some(candidate);
+                        break;
+                    }
+                }
+                if test.is_some() {
                     break;
                 }
             }
@@ -1323,16 +1386,13 @@ fn javascript_test_command(
                 break;
             }
         }
-        if test.is_some() {
-            break;
-        }
-    }
-    let test = test?;
+        test?
+    };
     let mut command = format!("{invocation} ");
     if *runner == "vitest" {
         command.push_str("run ");
     } else {
-        command.push_str("--runInBand ");
+        command.push_str("--runInBand --runTestsByPath ");
     }
     command.push_str(&shell_quote(&test.to_string_lossy()));
     Some(FocusedCheck {
@@ -1406,13 +1466,13 @@ fn related_test_plan_with_metadata(
 ) -> RelatedTestPlan {
     let mut selected = Vec::new();
     let mut gaps = Vec::new();
-    let go_project = root.join("go.mod").is_file();
     // Invocation-local metadata only: later edits must be visible on the next selection pass.
     let mut javascript_runner = None;
     let mut go_packages = HashMap::new();
+    let mut rust_packages = HashMap::new();
     for path in changed.iter().take(RELATED_TEST_PATH_LIMIT) {
         if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            match rust_selection(root, path) {
+            match rust_selection(root, path, &mut rust_packages) {
                 RustSelection::Check(check) => selected.push(check),
                 RustSelection::Gap(reason) => gaps.push(rust_gap(path, &reason)),
                 RustSelection::Static => {}
@@ -1437,6 +1497,10 @@ fn related_test_plan_with_metadata(
         if !stem
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && !matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+            )
         {
             continue;
         }
@@ -1467,20 +1531,16 @@ fn related_test_plan_with_metadata(
                     });
                 }
             }
-            Some("go") if go_project => {
+            Some("go") => {
                 let directory = path.parent().unwrap_or(Path::new(""));
                 if *go_packages
                     .entry(directory)
                     .or_insert_with(|| go_has_tests(directory))
+                    && let Some((package, command)) = go_test_command(root, path)
                 {
-                    let package = if directory.as_os_str().is_empty() {
-                        ".".to_owned()
-                    } else {
-                        format!("./{}", directory.to_string_lossy())
-                    };
                     selected.push(FocusedCheck {
                         name: format!("related Go package tests: {package}"),
-                        command: format!("go test {}", shell_quote(&package)),
+                        command,
                         timeout_secs: 0,
                     });
                 }

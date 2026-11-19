@@ -15,6 +15,7 @@ fn trace(complete: bool, invoked: &[(&str, u64)]) -> ToolTrace {
             .iter()
             .map(|(name, count)| ((*name).to_owned(), *count))
             .collect(),
+        ..Default::default()
     }
 }
 

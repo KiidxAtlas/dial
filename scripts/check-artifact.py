@@ -15,6 +15,7 @@ PE_MACHINES = {"x86_64": 0x8664, "aarch64": 0xAA64}
 PT_INTERP = 3
 PE32_PLUS_MAGIC = 0x20B
 NODE_MANIFEST = Path(__file__).resolve().parent.parent / "runtimes" / "node" / "manifest.json"
+PYTHON_MANIFEST = NODE_MANIFEST.parents[1] / "python" / "manifest.json"
 SMOKE_REQUIRED_CHECKS = ("bundled-node", "node-version", "computer-worker")
 # Poison values: a probe that consults the host's Node through these must fail, not borrow it.
 POISON_NODE_OPTIONS = "--dial-poison-node-options-must-not-be-read"
@@ -219,6 +220,18 @@ def installed_smoke(executable, root, expected_version):
     return reports[-1]
 
 
+def installed_python(executable, workspace, env):
+    result = subprocess.run([str(executable), "__installed-smoke", "--require-bundled-python"],
+                            cwd=workspace, env=dict(env, PATH="", PYTHONHOME="/invalid", PYTHONPATH="/invalid"),
+                            capture_output=True, text=True, timeout=180)
+    if result.returncode:
+        raise RuntimeError(f"bundled Python probe failed (exit {result.returncode}): {result.stderr[-2048:]}")
+    version = json.loads(PYTHON_MANIFEST.read_text(encoding="utf-8"))["version"]
+    report = json.loads(result.stdout)
+    if report != {"schema_version": 1, "python_version": version, "checks": ["bundled-python"]}:
+        raise RuntimeError(f"installed probe did not prove the pinned CPython {version}: {report!r}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dial", type=Path, required=True)
@@ -227,9 +240,10 @@ def main():
                         help="verify only the --target binary format without executing the artifact")
     parser.add_argument("--require-bundled-node", action="store_true",
                         help="also run __installed-smoke; fail unless the packaged Node payload and computer worker are proven")
+    parser.add_argument("--require-bundled-python", action="store_true", help="require isolated packaged CPython and stdlib")
     args = parser.parse_args()
-    if args.format_only and args.require_bundled_node:
-        parser.error("--require-bundled-node cannot be combined with --format-only")
+    if args.format_only and (args.require_bundled_node or args.require_bundled_python):
+        parser.error("bundled runtime probes cannot be combined with --format-only")
     executable = args.dial.resolve(strict=True)
     checks = []
     if args.target:
@@ -309,6 +323,9 @@ def main():
         if args.require_bundled_node:
             report = installed_smoke(executable, root, expected_node_version())
             checks.append("installed-smoke")
+        if args.require_bundled_python:
+            installed_python(executable, workspace, env)
+            checks.append("bundled-python")
         print(json.dumps({"schema_version": 1, "executable": str(executable),
                           "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
                           "checks": [*checks, "entry", "metadata", "completions", "shell-host", "shell-state", "annotation"],

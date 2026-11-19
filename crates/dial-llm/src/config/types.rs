@@ -62,6 +62,10 @@ pub struct Config {
     /// `assistance.local.edit_mode` still wins; this only lets Dial say so once. Never serialized.
     #[serde(skip)]
     pub edit_mode_explicit: bool,
+    /// Runtime only: the merged layers set `[assistance.local] edit_mode`. Only then does it override an
+    /// explicit `[edit] mode` on a local route; otherwise the local default yields. Never serialized.
+    #[serde(skip)]
+    pub local_edit_mode_explicit: bool,
     /// Runtime provenance for schema settings; never persisted.
     #[serde(skip)]
     pub setting_sources: BTreeMap<String, &'static str>,
@@ -243,6 +247,7 @@ impl Default for Config {
             provider_cache_namespace: None,
             harness_temperature_pinned: false,
             edit_mode_explicit: false,
+            local_edit_mode_explicit: false,
             setting_sources: BTreeMap::new(),
             keys: toml::Table::new(),
             python: PathBuf::new(),

@@ -633,49 +633,63 @@ fn rewrite_child_call(
 fn child_code_batch(
     context: &CallContext<'_, '_, '_>,
     parent: &llm::ToolCall,
-    calls: &[ToolCall],
+    calls: impl ExactSizeIterator<Item = Result<ToolCall, String>>,
     steps: u32,
-    serial: &mut dyn FnMut(&ToolCall) -> ToolOutput,
+    serial: &mut dyn FnMut(ToolCall) -> ToolOutput,
 ) -> Vec<ToolOutput> {
     let env = context.env;
-    let ToolSurface { schemas, names, .. } = context.surface;
+    let provenance = context.surface.provenance;
     let hooks_free = ["pre_tool_use", "post_tool_use"]
         .iter()
         .all(|event| !crate::agent::safety::hooks::wanted(&env.config.hooks, event));
     let shareable = |entry: &ToolCall| {
         env.config.eval.parallel_batches
             && hooks_free
-            && entry.name != crate::tools::exec::eval::BATCH_CALLBACK
-            && names.contains(&entry.name)
-            && !matches!(entry.name.as_str(), "task" | "finish" | "exit_plan")
+            && provenance == approval::CallProvenance::Structured
             && approval::parallel_read(env.ext, &entry.name, &entry.arguments)
-            && call_form_error(entry, schemas, names).is_none()
-            && context
-                .approver
-                .borrow_mut()
-                .authorize_with_cancel(entry, &summarize(entry), false, env.interrupt)
-                .is_ok()
-            && gate_intercept(context.callback_gate, env.workspace.root(), entry).is_none()
     };
-    let mut outputs = Vec::with_capacity(calls.len());
-    let mut index = 0;
-    while index < calls.len() {
-        let group = calls[index..]
-            .iter()
-            .take_while(|entry| shareable(entry))
-            .count();
-        // A lone read inside a mixed batch keeps the ordinary serial callback path.
-        if group > 1 || group == calls.len() {
-            outputs.extend(child_shared_reads(
-                context,
-                parent,
-                &calls[index..index + group],
-                steps,
-            ));
-            index += group;
-        } else {
-            outputs.push(serial(&calls[index]));
-            index += 1;
+    let count = calls.len();
+    let mut outputs = Vec::with_capacity(count);
+    let mut pending = calls.peekable();
+    while pending.peek().is_some() {
+        let mut reads = Vec::new();
+        let mut next = None;
+        for entry in pending.by_ref() {
+            match entry {
+                Ok(call) if shareable(&call) => {
+                    if let Some(reason) =
+                        gate_intercept(context.callback_gate, env.workspace.root(), &call)
+                    {
+                        next = Some(Err(reason));
+                        break;
+                    }
+                    if let Err(denial) = context.approver.borrow_mut().authorize_with_cancel(
+                        &call,
+                        &summarize(&call),
+                        false,
+                        env.interrupt,
+                    ) {
+                        next = Some(Err(denial.message().into()));
+                        break;
+                    }
+                    reads.push(call);
+                }
+                other => {
+                    next = Some(other);
+                    break;
+                }
+            }
+        }
+        if reads.len() == 1 && count > 1 {
+            outputs.push(serial(reads.pop().unwrap()));
+        } else if !reads.is_empty() {
+            outputs.extend(child_shared_reads(context, parent, &reads, steps));
+        }
+        if let Some(entry) = next {
+            outputs.push(match entry {
+                Ok(call) => serial(call),
+                Err(reason) => refuse(reason),
+            });
         }
     }
     outputs
@@ -827,23 +841,47 @@ fn execute_child_call(
             }
             gate_blocked(callback_gate).map(ToolOutput::err)
         };
-        let mut nested_call = |name: String, arguments: Value| -> ToolOutput {
-            if env
-                .ext
-                .get(&name)
-                .is_some_and(|tool| tool.supports_tool_dispatch())
-                || matches!(name.as_str(), "finish" | "exit_plan")
-            {
-                return ToolOutput::err(
-                    "recursive code-mode and turn-control callbacks are not available",
-                );
+        let callback_names: Vec<_> = names
+            .iter()
+            .filter(|name| {
+                !matches!(name.as_str(), "task" | "finish" | "exit_plan")
+                    && !env
+                        .ext
+                        .get(name)
+                        .is_some_and(|tool| tool.supports_tool_dispatch())
+            })
+            .cloned()
+            .collect();
+        let prepare = |mut entry: ToolCall| -> Result<ToolCall, String> {
+            if let Some(refusal) = blocked() {
+                return Err(refusal.text);
             }
-            let nested = llm::ToolCall {
-                id: String::new(),
-                name,
-                arguments,
-                malformed_arguments: false,
-            };
+            if entry.name == crate::tools::exec::eval::BATCH_CALLBACK {
+                return Err("tool.batch entries cannot nest tool.batch".into());
+            }
+            entry.name =
+                crate::agent::run::tool_compat::canonical_name(&entry.name, &callback_names)
+                    .into_owned();
+            if !callback_names.contains(&entry.name) {
+                return Err(format!(
+                    "tool {:?} is not available in this code-mode scope",
+                    entry.name
+                ));
+            }
+            crate::agent::run::dispatch::prepare_callback_arguments(
+                &mut entry,
+                schemas,
+                &callback_names,
+                env.workspace,
+                true,
+            )?;
+            Ok(entry)
+        };
+        let mut nested_call = |mut nested: ToolCall| -> ToolOutput {
+            if let Some(refusal) = blocked() {
+                return refusal;
+            }
+            nested.id.clear(); // A callback is not a real accepted native turn-control call.
             let context = rerank.as_mut().map(|context| RerankContext {
                 backend: &mut *context.backend,
                 adapter: context.adapter,
@@ -913,13 +951,9 @@ fn execute_child_call(
                         schemas
                             .iter()
                             .filter(|schema| {
-                                schema["function"]["name"].as_str().is_some_and(|name| {
-                                    !matches!(name, "task" | "finish" | "exit_plan")
-                                        && !env
-                                            .ext
-                                            .get(name)
-                                            .is_some_and(|tool| tool.supports_tool_dispatch())
-                                })
+                                schema["function"]["name"]
+                                    .as_str()
+                                    .is_some_and(|name| callback_names.iter().any(|n| n == name))
                             })
                             .cloned()
                             .collect(),
@@ -940,18 +974,25 @@ fn execute_child_call(
                     if callbacks > CODE_CALLBACK_LIMIT {
                         return ToolOutput::err("code-mode callback limit exceeded (128 per cell)");
                     }
-                    let outputs = child_code_batch(context, call, &calls, steps, &mut |entry| {
-                        if entry.name == crate::tools::exec::eval::BATCH_CALLBACK {
-                            return ToolOutput::err("tool.batch entries cannot nest tool.batch");
-                        }
-                        blocked().unwrap_or_else(|| {
-                            nested_call(entry.name.clone(), entry.arguments.clone())
-                        })
-                    });
+                    let outputs = child_code_batch(
+                        context,
+                        call,
+                        calls.into_iter().map(prepare),
+                        steps,
+                        &mut nested_call,
+                    );
                     crate::agent::run::dispatch::code_batch_output(outputs)
                 }
                 crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
-                    nested_call(name, arguments)
+                    match prepare(ToolCall {
+                        id: String::new(),
+                        name,
+                        arguments,
+                        malformed_arguments: false,
+                    }) {
+                        Ok(nested) => nested_call(nested),
+                        Err(reason) => refuse(reason),
+                    }
                 }
             }
         };

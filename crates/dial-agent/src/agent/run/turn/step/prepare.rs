@@ -19,12 +19,22 @@ impl Agent<'_> {
         let backend = &mut **backend;
         let schemas = &mut **schemas;
         let ui = &mut **ui;
-        for note in turn.settle_delivered(|mark| {
+        if let Some(delivered) = turn.settle_delivered(|mark| {
             self.session
                 .weigh_from(mark, |message| usize::from(message["role"] == "assistant"))
         }) {
-            if crate::agent::run::search_frontier::EmptySearches::is_advice(&note) {
-                self.step_checks.empty_searches.delivered_advice(&note);
+            if self
+                .step_checks
+                .repair_brief
+                .take_if(|brief| brief.selected)
+                .is_some()
+            {
+                self.efficiency_metrics.recovery("local_repair_brief");
+            }
+            for note in delivered {
+                if crate::agent::run::search_frontier::EmptySearches::is_advice(&note) {
+                    self.step_checks.empty_searches.delivered_advice(&note);
+                }
             }
         }
         // `schemas` is the turn's full offer. A request narrows its own copy (planning gate,
@@ -101,6 +111,12 @@ impl Agent<'_> {
             && offer.iter().any(|s| s["function"]["name"] == "todo");
         // Harness notes for this request start here; they are coalesced into one message below.
         let notes_start = messages.len();
+        let repair_note = self
+            .local_repair_note(request_control["current_instruction"].as_str())
+            .filter(|_| backend.local_inference());
+        if let Some(note) = &repair_note {
+            messages.push(note.clone());
+        }
         if planning_required {
             if !turn.planning_notice {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Plan, "Plan required: create a todo plan to resume tools. The next request offers only todo."));
@@ -211,6 +227,18 @@ impl Agent<'_> {
         // observation run receives the advisory note and keeps its tools.
         let research_forced = self.lean_completion_route();
         let research_step = research_forced && engine.research_required();
+        if !planning_required
+            && !research_step
+            && !turn.names.is_empty()
+            && let Some(advice) = turn
+                .pace
+                .lookup_advice(single_call, turn.names.iter().any(|name| name == "read"))
+        {
+            messages.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Loop,
+                advice,
+            ));
+        }
         if let Some(note) = engine.research_prompt(research_forced) {
             messages.push(note);
         }
@@ -218,7 +246,13 @@ impl Agent<'_> {
         // notes and gates are unaffected. A previous request that was discarded before any reply
         // delivered nothing.
         turn.emissions.retract();
-        crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut turn.emissions);
+        let dropped =
+            crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut turn.emissions);
+        if let Some(brief) = &mut self.step_checks.repair_brief {
+            brief.selected = repair_note
+                .as_ref()
+                .is_some_and(|note| !dropped.contains(note));
+        }
         if discovery_advice.as_ref().is_some_and(|advice| {
             !messages.iter().any(|message| {
                 message["content"]

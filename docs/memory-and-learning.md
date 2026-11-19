@@ -182,7 +182,10 @@ only delivery of the winning user message consumes it. Setup has a five-second d
 Authenticated branch replacement invalidates stale work. Authentic archived user/assistant
 messages feed background retention; generated compaction prefixes do not become source evidence.
 Persistent actors service memory maintenance while idle; local inference follows their compute
-lease. Foreground calls stop competing maintenance rather than waiting indefinitely.
+lease. Foreground calls stop competing maintenance rather than waiting indefinitely. An idle pass
+starts at most every 30 seconds. Each pass that fails doubles that wait, up to 30 minutes; a pass
+that finishes, or a new turn, restores it. A pass stopped for foreground work does not count as a
+failure. The session's runtime record of a pass that did not finish carries the reason.
 
 Compaction recall is separate from first-prompt recall: Hindsight queries authentic archived
 user/assistant context with a five-second deadline, even when automatic prompt recall is disabled.

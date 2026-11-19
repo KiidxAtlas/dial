@@ -90,6 +90,60 @@ fn glob_and_grep_do_not_follow_symlinks() {
 }
 
 #[test]
+fn absolute_search_patterns_bind_to_the_named_readable_root_and_scope() {
+    let (_dir, ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let extra = extra.path().canonicalize().unwrap();
+    let ws = ws
+        .with_read_only_roots(std::slice::from_ref(&extra))
+        .unwrap();
+    for root in [ws.root(), &extra] {
+        fs::create_dir(root.join("nested")).unwrap();
+        for path in ["match.py", "nested/match.py"] {
+            fs::write(root.join(path), "def needle():\n    pass\n").unwrap();
+        }
+    }
+    let outside = tempfile::tempdir().unwrap();
+    for tool in ["glob", "grep"] {
+        let args = |pattern: &Path| match tool {
+            "glob" => json!({"pattern":pattern}),
+            _ => json!({"glob":pattern, "pattern":"needle"}),
+        };
+        for root in [ws.root(), extra.as_path()] {
+            let target = root.join("match.py");
+            let mut query = args(&target);
+            let expected = ws.rel(&target);
+            let results = |args: &Value| {
+                let out = run(&ws, tool, args.clone());
+                assert!(!out.is_error, "{tool}: {}", out.text);
+                body(&out.text)
+            };
+            let row = if tool == "glob" {
+                expected
+            } else {
+                format!("{expected}:1:def needle():")
+            };
+            assert_eq!(results(&query).trim(), row);
+            query["path"] = json!(format!("{};{}", ws.root().display(), extra.display()));
+            assert_eq!(results(&query).trim(), row);
+            query["path"] = json!(root.join("nested"));
+            assert_eq!(results(&query).trim(), "no matches");
+            let traversal = format!(
+                "{}{sep}nested{sep}..{sep}*.py",
+                root.display(),
+                sep = std::path::MAIN_SEPARATOR
+            );
+            assert!(run(&ws, tool, args(Path::new(&traversal))).is_error);
+            let metadata = root.join(".git");
+            fs::create_dir_all(&metadata).unwrap();
+            query["path"] = json!(metadata);
+            assert!(run(&ws, tool, query).is_error);
+        }
+        assert!(run(&ws, tool, args(&outside.path().join("*.py"))).is_error);
+    }
+}
+
+#[test]
 fn glob_patterns_sort_and_cap() {
     let (dir, ws) = workspace();
     for path in [
@@ -880,17 +934,18 @@ fn capped_lines_pages_suggest_files_mode_and_default_output_is_unchanged() {
 
 #[test]
 fn many_double_star_segments_match_in_bounded_time() {
-    let glob = Glob::new("**/*/**/*/**/*/**/*/**/*/**/*/**/x").unwrap();
+    let (_dir, ws) = workspace();
+    let glob = Glob::new(&ws, "**/*/**/*/**/*/**/*/**/*/**/*/**/x").unwrap();
     let deep = vec!["d"; 60].join("/") + "/y";
     let started = std::time::Instant::now();
     assert!(!glob.matches(&deep));
     assert!(glob.matches(&(vec!["d"; 60].join("/") + "/x")));
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     // Semantics: `**` takes zero or more whole segments, `*` exactly one.
-    let glob = Glob::new("src/**/*.rs").unwrap();
+    let glob = Glob::new(&ws, "src/**/*.rs").unwrap();
     assert!(glob.matches("src/a.rs") && glob.matches("src/a/b/c.rs"));
     assert!(!glob.matches("src") && !glob.matches("lib/a.rs"));
-    let glob = Glob::new("a/*/b").unwrap();
+    let glob = Glob::new(&ws, "a/*/b").unwrap();
     assert!(glob.matches("a/x/b") && !glob.matches("a/b") && !glob.matches("a/x/y/b"));
 }
 
@@ -999,6 +1054,19 @@ fn search_state(mode: OutputMode, max_matches: usize) -> GrepState {
     }
 }
 
+fn run_batch(state: &mut GrepState, ws: &Workspace, paths: &mut Vec<PathBuf>, workers: usize) {
+    with_prober(
+        ws,
+        workers,
+        state.matcher.clone(),
+        state.multiline,
+        state.mode,
+        |prepare| {
+            state.search_batch(ws, paths, &mut Vec::new(), prepare);
+        },
+    );
+}
+
 #[test]
 fn anchored_grep_prunes_unrelated_subtrees_on_complete_and_capped_pages() {
     let (dir, ws) = workspace();
@@ -1071,7 +1139,7 @@ fn parallel_search_reserves_actual_reads_before_dispatch() {
     for mode in [OutputMode::Lines, OutputMode::Files, OutputMode::Count] {
         let mut state = search_state(mode, 1000);
         let mut paths = vec![path.clone(); PARALLEL_BATCH];
-        state.search_batch(&ws, &mut paths, &mut Vec::new(), 8);
+        run_batch(&mut state, &ws, &mut paths, 8);
         assert_eq!(state.read_bytes, MAX_GREP_BYTES);
         assert_eq!(state.bytes, MAX_GREP_BYTES);
         assert_eq!(state.scanned as u64, MAX_GREP_BYTES / MAX_GREP_FILE);
@@ -1090,7 +1158,7 @@ fn early_page_stop_reads_only_one_bounded_microbatch() {
     }
     for mode in [OutputMode::Lines, OutputMode::Files] {
         let mut state = search_state(mode, 1);
-        state.search_batch(&ws, &mut paths.clone(), &mut Vec::new(), 8);
+        run_batch(&mut state, &ws, &mut paths.clone(), 8);
         assert_eq!(state.read_bytes, PREFETCH_FILES as u64 * 7);
         assert_eq!(state.bytes, 14);
         assert_eq!(state.next, Some((paths[1].clone(), 0)));
@@ -1183,7 +1251,7 @@ fn retrieval_measurement_matrix() {
             // Isolate the content kernel's real counters from directory/witness I/O.
             let mut state = search_state(OutputMode::Lines, max_matches);
             let start = if resumed { 7 } else { 0 };
-            state.search_batch(&ws, &mut paths[start..].to_vec(), &mut Vec::new(), workers);
+            run_batch(&mut state, &ws, &mut paths[start..].to_vec(), workers);
             assert_eq!(state.read_bytes % source.len() as u64, 0);
             let reads = state.read_bytes / source.len() as u64;
             assert!(state.read_bytes <= MAX_GREP_BYTES);
@@ -1388,6 +1456,13 @@ fn glob_preview_restoration_honors_multiple_scopes() {
         ),
         vec!["a/calc.py"]
     );
+    #[cfg(unix)]
+    {
+        let replaced = dir.path().join("a/calc.py");
+        fs::remove_file(&replaced).unwrap();
+        symlink(dir.path().join("b/calc.py"), replaced).unwrap();
+        assert_eq!(glob_source_targets(&ws, &args, &text), vec!["b/calc.py"]);
+    }
 }
 
 #[test]

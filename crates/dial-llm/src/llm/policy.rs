@@ -72,6 +72,9 @@ pub fn image_edge() -> u32 {
 pub struct ResolvedModel {
     pub context_window: u32,
     pub max_output_tokens: u32,
+    /// The output maximum an operator profile, live metadata or exact catalog record states;
+    /// `None` when `max_output_tokens` is only the context-derived fallback.
+    pub stated_max_output_tokens: Option<u32>,
     pub vision: Option<bool>,
     pub tools: Option<bool>,
 }
@@ -90,16 +93,18 @@ impl ResolvedModel {
             .or_else(|| exact.as_ref().and_then(|model| model.context_window))
             .filter(|window| *window > 0)
             .unwrap_or(context_fallback.max(1));
-        let max_output_tokens = profile
+        let stated_max_output_tokens = profile
             .and_then(|profile| profile.max_tokens)
             .filter(|limit| *limit > 0)
             .or(metadata.max_output_tokens)
             .or_else(|| exact.as_ref().and_then(|model| model.max_output_tokens))
-            .filter(|limit| *limit > 0)
-            .unwrap_or_else(|| (context_window / 8).clamp(1024, 8192));
+            .filter(|limit| *limit > 0);
+        let max_output_tokens =
+            stated_max_output_tokens.unwrap_or_else(|| (context_window / 8).clamp(1024, 8192));
         Self {
             context_window,
             max_output_tokens,
+            stated_max_output_tokens,
             vision: profile
                 .and_then(|profile| profile.capabilities.vision)
                 .or(metadata.vision)
@@ -118,3 +123,6 @@ impl ResolvedModel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -77,6 +77,8 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "evidence" => Method("evidence"),
         "policy" => Method("policy"),
         "reliability" => Method("reliability"),
+        "code-history" => Method("code_history"),
+        "stats" => Method("stats"),
         "skills" => Method("list_skills"),
         "archive" => Method("archive"),
         "pack" => Method("pack_session"),
@@ -102,15 +104,15 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "doctor" | "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
         "update" => Terminal("installs a new binary; use `dial update`"),
         "providers" => Terminal("provider setup wizard; use set_setting and login"),
-        "commit" | "git" | "wt" | "changes" | "code-history" => Terminal(GIT),
+        "commit" | "git" | "wt" | "changes" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
         "relay" | "peers" => Terminal(COLLAB),
         "compute" | "review" | "seance" | "tree" | "profile" | "permissions" | "todo"
         | "understanding" | "accounts" | "share" | "dump" | "trace" | "security" | "graphify"
-        | "image" | "modelpreset" | "ssh" | "stats" | "changelog" | "loop" | "fresh" | "shake"
-        | "tan" | "debug" | "rule" | "plan-review" | "contract" | "cleanse" | "gc"
-        | "anonymize" | "images" | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
+        | "image" | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan"
+        | "debug" | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize"
+        | "images" | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
         _ => return None,
     })
 }

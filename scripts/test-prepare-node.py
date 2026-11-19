@@ -13,6 +13,8 @@ import warnings
 import zipfile
 from pathlib import Path
 
+import runtime_payload
+
 
 def load_preparer():
     # Hyphenated script (like scripts/test-packaging.py), so load it by path.
@@ -245,10 +247,9 @@ class PrepareNodeTest(unittest.TestCase):
             return FakeResponse(b"x" * 4096)
 
         destination = self.root / "dl.bin"
-        with unittest.mock.patch.object(prepare_node, "DOWNLOAD_LIMIT", 1000), \
-                unittest.mock.patch.object(prepare_node.urllib.request, "urlopen", side_effect=fake_urlopen):
+        with unittest.mock.patch.object(runtime_payload.urllib.request, "urlopen", side_effect=fake_urlopen):
             with self.assertRaisesRegex(prepare_node.PrepareError, "download limit"):
-                prepare_node.download("https://nodejs.org/dist/x.tar.gz", destination)
+                runtime_payload.download("https://nodejs.org/dist/x.tar.gz", destination, limit=1000)
 
     def test_download_uses_timeout(self):
         seen = {}
@@ -266,7 +267,7 @@ class PrepareNodeTest(unittest.TestCase):
             seen["timeout"] = timeout
             return Empty(b"")
 
-        with unittest.mock.patch.object(prepare_node.urllib.request, "urlopen", side_effect=fake_urlopen):
+        with unittest.mock.patch.object(runtime_payload.urllib.request, "urlopen", side_effect=fake_urlopen):
             prepare_node.download("https://nodejs.org/dist/x.tar.gz", self.root / "e.bin")
         self.assertGreater(seen["timeout"], 0)
 

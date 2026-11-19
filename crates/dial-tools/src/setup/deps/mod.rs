@@ -5,6 +5,7 @@
 //! planning are pure over an [`Env`], so tests can fake the package managers on `PATH`.
 
 pub mod bundled_node;
+pub mod bundled_python;
 pub mod plan;
 pub mod prebuilt;
 pub mod run;

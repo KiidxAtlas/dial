@@ -320,3 +320,30 @@ fn string_encoded_object_and_array_fields_are_decoded_only_where_the_schema_want
     super::decode_encoded_containers(&mut mismatched, &schema);
     assert_eq!(mismatched, json!({"repro": "[1]", "targets": "not json"}));
 }
+
+/// The edit tool's selected grammar is guidance: under an explicit strict-tools profile it keeps its
+/// authored schema, while other eligible tools still get strict generation.
+#[test]
+fn strict_tools_keep_the_edit_guidance_tool_unpromoted() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+        "additionalProperties": false
+    });
+    let mut profile = ModelProfile::minimal("lm-studio", "test-model");
+    profile.capabilities.strict_tools = true;
+    let mut body = json!({
+        "model": "m",
+        "messages": [],
+        "tools": [
+            {"type": "function", "function": {"name": "edit", "description": "e", "parameters": schema.clone()}},
+            {"type": "function", "function": {"name": "write_notes", "description": "w", "parameters": schema.clone()}}
+        ]
+    });
+    profile.apply_openai(&mut body);
+
+    assert!(body.pointer("/tools/0/function/strict").is_none());
+    assert_eq!(body.pointer("/tools/0/function/parameters"), Some(&schema));
+    assert_eq!(body.pointer("/tools/1/function/strict"), Some(&json!(true)));
+}

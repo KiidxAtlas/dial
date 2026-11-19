@@ -266,7 +266,9 @@ impl Edits {
     }
     fn refused(&mut self, tool: &str, file: &str, content: &str) -> Option<String> {
         let call = self.edit_call(tool, file, content);
-        self.engine.rejection_at(&self.workspace, &call)
+        self.engine
+            .rejection_at(&self.workspace, &call)
+            .map(|output| output.text)
     }
     fn neutral_progress(&mut self) {
         // A successful read and a resolved todo used to clear recovery state.
@@ -2182,12 +2184,12 @@ fn failed_python_check_keeps_the_compiler_diagnostic_without_recursive_notices()
     let diagnostic = "File \"dungeon_game.py\", line 25\n    print(\"\n          ^\nSyntaxError: unterminated string literal";
     edits.settle(&check, vec![], ToolOutput::err(diagnostic));
     let first = edits.engine.rejection_at(&edits.workspace, &check).unwrap();
-    assert!(first.contains(diagnostic), "{first}");
-    assert!(!first.contains("<dial-notice"), "{first}");
-    edits.settle(&check, vec![], ToolOutput::err(first.clone()));
+    assert!(first.text.contains(diagnostic), "{first:?}");
+    assert!(!first.text.contains("<dial-notice"), "{first:?}");
+    edits.settle(&check, vec![], first.clone());
     let second = edits.engine.rejection_at(&edits.workspace, &check).unwrap();
     assert_eq!(
-        second, first,
+        second.text, first.text,
         "refusals must not replace executed diagnostics"
     );
 }

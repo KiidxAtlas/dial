@@ -273,6 +273,72 @@ fn torn_final_row_recovers_the_complete_prefix() {
 }
 
 #[test]
+fn reopening_discards_a_complete_json_frame_without_its_commit_newline() {
+    let root = tempfile::tempdir().unwrap();
+    let session = root.path().join("session.jsonl");
+    let journal = Journal::open(&session).unwrap();
+    let tree = crate::runtime::Tree::default();
+    tree.journal(journal.clone());
+    let body = tree.start("tool", "write", None);
+    body.append("durable prefix");
+    let expected = body.snapshot();
+    drop(body);
+    drop(tree);
+    drop(journal);
+    let stream = path(&session);
+    let prefix = std::fs::read(&stream).unwrap();
+    let mut uncommitted = expected.clone();
+    uncommitted.result.text = "uncommitted completion".into();
+    uncommitted.result.phase = crate::runtime::Phase::Completed;
+    uncommitted.result.revision += 1;
+    let mut bytes = prefix.clone();
+    bytes.extend(
+        serde_json::to_vec(&Frame::Snapshot {
+            schema_version: 1,
+            node: Box::new(uncommitted),
+        })
+        .unwrap(),
+    );
+    std::fs::write(&stream, &bytes).unwrap();
+    assert_eq!(recover(&session).unwrap(), vec![expected.clone()]);
+    let reopened = Journal::open(&session).unwrap();
+    assert_eq!(std::fs::read(&stream).unwrap(), prefix);
+    assert!(reopened.snapshot(&expected));
+    reopened.check().unwrap();
+    assert_eq!(recover(&session).unwrap(), vec![expected]);
+}
+
+#[test]
+fn malformed_interior_frames_are_preserved_and_refused_for_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let session = root.path().join("session.jsonl");
+    let journal = Journal::open(&session).unwrap();
+    let tree = crate::runtime::Tree::default();
+    tree.journal(journal.clone());
+    let body = tree.start("tool", "write", None);
+    body.append("retained");
+    let expected = body.snapshot();
+    drop(body);
+    drop(tree);
+    drop(journal);
+    let stream = path(&session);
+    let mut bytes = std::fs::read(&stream).unwrap();
+    bytes.extend_from_slice(b"{\"kind\":\"snapshot\",\"node\":\n");
+    std::fs::write(&stream, &bytes).unwrap();
+    let (nodes, complete) = scan(&session).unwrap();
+    assert_eq!(nodes, vec![expected]);
+    assert!(
+        !complete,
+        "corrupt frames cannot certify a complete history"
+    );
+    assert!(copy(&session, &root.path().join("copy.jsonl")).is_err());
+    let reopened = Journal::open(&session).unwrap();
+    reopened.checkpoint(&BTreeMap::new()).unwrap();
+    reopened.check().unwrap();
+    assert_eq!(std::fs::read(&stream).unwrap(), bytes);
+}
+
+#[test]
 fn retry_never_adopts_replaced_truncated_or_owner_removed_journals() {
     for case in ["replaced", "truncated", "removed"] {
         let root = tempfile::tempdir().unwrap();

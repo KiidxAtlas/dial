@@ -4667,3 +4667,26 @@ fn responses_narrow_with_allowed_tools_only_on_the_openai_api() {
     assert_eq!(names, ["todo"]);
     assert!(plain.get("tool_choice").is_none());
 }
+
+#[test]
+fn strict_tools_keep_the_edit_guidance_tool_unpromoted() {
+    let schema = json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false});
+    let req = Chat {
+        messages: vec![json!({"role":"user","content":"hi"})],
+        tools: vec![
+            json!({"type":"function","function":{"name":"edit","description":"e","parameters":schema.clone()}}),
+            json!({"type":"function","function":{"name":"write_notes","description":"w","parameters":schema.clone()}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let mut profile = llm::profiles::ModelProfile::minimal("anthropic", "claude-test");
+    profile.capabilities.strict_tools = true;
+    let body = anthropic_request_body("claude-test", &req, false, Some(&profile)).unwrap();
+    assert_eq!(body["tools"][0]["name"], "edit");
+    assert!(body["tools"][0].get("strict").is_none());
+    assert_eq!(body["tools"][0]["input_schema"], schema);
+    assert_eq!(body["tools"][1]["name"], "write_notes");
+    assert_eq!(body["tools"][1]["strict"], true);
+}

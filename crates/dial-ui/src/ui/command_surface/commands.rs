@@ -1237,12 +1237,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         during_turn: DuringTurn::Now,
-        subcommands: &["list", "save", "switch", "delete"],
+        subcommands: &[
+            "list", "new", "update", "rename", "delete", "apply", "preview", "save", "switch",
+            "capture",
+        ],
         help_order: Some(47),
         ..CommandSpec::new(
             "modelpreset",
-            "[list|save <name>|switch <name>|delete <name>]",
-            "manage model presets: list, save, switch, delete",
+            "[list|new <name>|update <name>|rename <old> <new>|delete <name>|apply <name>]",
+            "manage model presets (roles + thinking): list, new, update, rename, delete, apply",
             Category::Model,
             Surface::Group,
         )

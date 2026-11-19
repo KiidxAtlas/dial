@@ -42,7 +42,7 @@ mod recovery;
 
 pub const MAX_INPUT: usize = 256 * 1024;
 pub const MAX_FILE: u64 = 4 * 1024 * 1024;
-const MAX_DIFF_LINES: usize = 5000;
+const MAX_DIFF_LINES: usize = 12_000;
 const MAX_DIFF_D: usize = 1000;
 const SNAPSHOTS_PER_FILE: usize = 6;
 const MAX_FILES: usize = 256;
@@ -1967,6 +1967,7 @@ fn resolve_anchor(job: &mut Job, anchor: &Anchor) -> Result<Resolved, String> {
             }
         }
         Anchor::Tail => {
+            // An EOF anchor refers to the final row, not just to the snapshot tag.
             if len > 0 {
                 job.check_seen(len, len)?;
             }
@@ -2175,8 +2176,18 @@ fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
 fn reread_hint(job: &Job) -> String {
     let fresh = tag_of(&job.cur_lf);
     let lines = job.cur.len().max(1);
+    let (lo, hi) = if lines > 200 && !job.required.is_empty() {
+        let min_line = job.required.iter().map(|&(a, _)| a).min().unwrap_or(1);
+        let max_line = job.required.iter().map(|&(_, b)| b).max().unwrap_or(lines);
+        (
+            min_line.saturating_sub(20).max(1),
+            max_line.saturating_add(20).min(lines),
+        )
+    } else {
+        (1, lines)
+    };
     format!(
-        "Current content is [{rel}#{fresh}] ({lines} lines): read `{rel}:1-{lines}` and then retry against [{rel}#{fresh}].",
+        "Current content is [{rel}#{fresh}] ({lines} lines): read `{rel}:{lo}-{hi}` and then retry against [{rel}#{fresh}].",
         rel = job.rel,
     )
 }
@@ -2965,7 +2976,11 @@ fn read_impl(
     let len = lines.len();
     let spans = plan_spans(sel, offset, limit, len);
 
-    let row_limit = budget.saturating_sub(READ_FOOTER_RESERVE);
+    let row_limit = if budget <= READ_FOOTER_RESERVE {
+        budget.saturating_sub(128).max(64)
+    } else {
+        budget.saturating_sub(READ_FOOTER_RESERVE)
+    };
     let mut out = String::new();
     let mut shown: Vec<(usize, usize)> = Vec::new();
     let mut witnessed = Vec::new();

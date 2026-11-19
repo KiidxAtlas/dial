@@ -29,6 +29,31 @@ fn computer_call_read_only_classification() {
 }
 
 #[test]
+fn capture_alias_uses_screenshot_validation_policy_and_rendering() {
+    for root in [None, Some("window"), Some("display"), Some("ref")] {
+        let chain = |method| {
+            let mut steps = Vec::new();
+            if let Some(root) = root {
+                steps.push(json!({"method": root, "args": ["7"]}));
+            }
+            steps.push(json!({"method": method, "args": [{"silent": true}]}));
+            serde_json::from_value::<Vec<ComputerCallStep>>(json!(steps)).unwrap()
+        };
+        let alias = chain("capture");
+        let canonical = chain("screenshot");
+        assert_eq!(
+            is_read_only_computer_call(&alias),
+            is_read_only_computer_call(&canonical)
+        );
+        assert_eq!(
+            render_computer_call(&alias),
+            render_computer_call(&canonical)
+        );
+        assert_eq!(validate_chain(&alias).is_ok(), root != Some("ref"));
+    }
+}
+
+#[test]
 fn computer_call_rejects_invalid_chains() {
     assert!(validate_chain(&[]).is_err());
     assert!(validate_chain(&[step("nope", vec![])]).is_err());

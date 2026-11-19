@@ -303,7 +303,7 @@ pub(super) fn post_keyboard(pid: pid_t, event: &CGEvent) -> CoreResult<()> {
     });
     if !foreground {
         return Err(DesktopError::input_failed(
-            "background keyboard input is unavailable: macOS exposes no supported event-authentication ABI; use takeover mode to focus the target window, then retry",
+            "background keyboard input is unavailable: macOS exposes no supported event-authentication ABI; pass {takeover: true} (or acquire computer.control) to briefly focus the target window, or use AX setValue() for text fields",
         ));
     }
     // Use the public API only for the foreground target. Never read CGEvent's private layout

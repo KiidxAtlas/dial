@@ -131,7 +131,10 @@ fn linux_eval_sandbox_refusal_never_executes_code_even_when_platform_is_supporte
             &mut |_| unreachable!(),
             &AtomicBool::new(false),
         );
-        let error = result.err().expect("unavailable sandbox admitted code");
+        let error = result
+            .err()
+            .expect("unavailable sandbox admitted code")
+            .to_string();
         assert!(
             error.contains("forced unavailable") || error.contains("process-fork containment"),
             "{error}"

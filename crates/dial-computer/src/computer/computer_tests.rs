@@ -325,6 +325,35 @@ fn computer_run_code_that_is_a_function_is_called_with_the_fn_scope() {
     assert_eq!(result.value["returnValue"], 42, "the session stays usable");
 }
 
+#[test]
+#[ignore = "requires a visible test window and OS capture permission"]
+fn listed_window_live_screenshot() {
+    let app = std::env::var("DIAL_TEST_CAPTURE_APP").expect("name the intended test app");
+    assert!(!app.trim().is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_str().unwrap();
+    let session = ComputerSession::new(cwd.to_owned());
+    let action = parse_action(&json!({
+        "action": "run", "read_only": true, "args": [app],
+        "fn": "async ({desktop}, app) => {
+            const windows = (await desktop.windows({app})).filter(w => w.app === app);
+            if (windows.length !== 1) throw Error(`expected one ${app} window, found ${windows.length}`);
+            return await windows[0].capture({silent: true});
+        }"
+    }))
+    .unwrap();
+    let output = session
+        .execute(action, cwd, false, None, None, &AbortSignal::new())
+        .unwrap();
+    let shot = &output.value["returnValue"];
+    let path = shot["path"].as_str().unwrap();
+    let (width, height) = image::image_dimensions(path).unwrap();
+    assert!(width > 0 && height > 0);
+    assert_eq!(shot["width"], width);
+    assert_eq!(shot["height"], height);
+    println!("Window screenshot: {path}");
+}
+
 #[cfg(unix)]
 mod worker {
     use super::*;
@@ -425,6 +454,7 @@ mod worker {
                                     .expect("fixture must contain the requested window")
                             }
                         }
+                        Some("capture") => json!({"name": "Error", "message": "capture refused"}),
                         Some("capabilities") => json!({"backend": "fake"}),
                         Some("axQuery") => json!([
                             {"ref": "e1", "role": "textfield", "title": "Message"},
@@ -644,6 +674,7 @@ mod worker {
                 assert!(message.contains(kind), "{message}");
             }
             assert!(message.contains("screenshot"), "{message}");
+            assert!(!message.contains("capture"), "{message}");
             assert!(message.contains("focus"), "{message}");
         }
     }

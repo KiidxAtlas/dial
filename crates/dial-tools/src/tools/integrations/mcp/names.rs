@@ -18,6 +18,20 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
+fn namespace(server: &str) -> String {
+    format!("mcp__{}__", sanitize(server))
+}
+
+/// Prefix guaranteed to survive *every* name allocation, even with a hash and a decimal
+/// collision counter. Overlapping prefixes must settle together before the registry allocates
+/// names; disjoint prefixes cannot affect one another's released identities.
+pub(super) fn namespace_prefix(server: &str) -> String {
+    truncate(
+        &namespace(server),
+        MAX_NAME - "_ffffff_18446744073709551615".len(),
+    )
+}
+
 /// Hands out unique names. A name that no other tool sanitises or truncates to stays as it is; a
 /// colliding one gets a suffix derived from its own server and tool name (`_` and six hex digits of
 /// their SHA-256), so it does not depend on which server registered first and no remote tool
@@ -30,7 +44,7 @@ pub struct Namer {
 impl Namer {
     pub fn name(&mut self, server: &str, tool: &str) -> String {
         let base = truncate(
-            &format!("mcp__{}__{}", sanitize(server), sanitize(tool)),
+            &format!("{}{}", namespace(server), sanitize(tool)),
             MAX_NAME,
         );
         if self.taken.insert(base.clone()) {

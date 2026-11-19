@@ -755,27 +755,21 @@ fn context_ruler_is_six_cells_and_human_units_are_floored() {
 }
 
 #[test]
-fn the_status_line_paints_no_background_with_or_without_transparency() {
-    let theme = Theme::dark();
-    for transparent in [false, true] {
-        let line = border_line(
-            &UiConfig {
-                status_transparent: transparent,
-                ..UiConfig::default()
-            },
-            &data(),
-            &theme,
-            100,
-            Style::default(),
-            "╭",
-            "╮",
-        );
-        assert!(
-            line.spans.iter().all(|s| s.style.bg.is_none()),
-            "{:?}",
-            line.spans
-        );
-    }
+fn the_status_line_paints_no_background() {
+    let line = border_line(
+        &UiConfig::default(),
+        &data(),
+        &Theme::dark(),
+        100,
+        Style::default(),
+        "╭",
+        "╮",
+    );
+    assert!(
+        line.spans.iter().all(|s| s.style.bg.is_none()),
+        "{:?}",
+        line.spans
+    );
 }
 
 #[test]

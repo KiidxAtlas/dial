@@ -457,7 +457,9 @@ PATH. Config names are the last segment of the listing name (`io.github.acme/not
 
 Configured servers start connecting while Dial opens, in parallel with the session and the first
 agent, each within its own startup budget. The first model request does not wait for servers still
-connecting. They join at the first request of a later turn, so MCP adoption does not itself change the system prompt or cached prefix mid-turn.
+connecting. Each ready server joins at a turn's first request independently of slower servers;
+servers whose sanitized or shortened tool-name prefixes can collide join together so names stay
+stable across runs. Passive arrivals never change the system prompt or cached prefix mid-turn.
 Meanwhile each request carries a transient notice naming them as still connecting, outside the cached system prompt. `tool_search`, `mcp_servers` and loading a tool not yet
 registered wait for them. Exiting before they connect cancels the connection and stops their
 processes.

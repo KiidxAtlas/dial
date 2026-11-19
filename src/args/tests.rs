@@ -316,6 +316,29 @@ fn dev_commands_parse_under_dev_and_at_the_hidden_top_level() {
         }))
     ));
 
+    // Benchmarks use existing subscription sign-ins unless told not to; `--share-auth` stays
+    // accepted for scripts written when sharing was opt-in.
+    let isolated = |args: &[&str]| match Cli::try_parse_from(args)
+        .unwrap()
+        .command
+        .map(Command::normalized)
+    {
+        Some(Command::Developer(DevCommand::Benchmark { isolated_auth, .. })) => isolated_auth,
+        _ => panic!("not a benchmark: {args:?}"),
+    };
+    assert!(!isolated(&["dial", "bench", "suite.toml"]));
+    assert!(!isolated(&["dial", "bench", "suite.toml", "--share-auth"]));
+    assert!(isolated(&[
+        "dial",
+        "bench",
+        "suite.toml",
+        "--isolated-auth"
+    ]));
+    assert!(
+        Cli::try_parse_from(["dial", "bench", "s.toml", "--share-auth", "--isolated-auth"])
+            .is_err()
+    );
+
     let mut root = command();
     let visible: Vec<&str> = root
         .get_subcommands()

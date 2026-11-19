@@ -9,7 +9,7 @@ Find the active keys, edit bindings and handle terminal-specific keyboard differ
 | Search commands and actions | `Alt-K` or `F1`, `/help` |
 | Model selector / roles | `F2` on macOS (`Alt-M` elsewhere; both work everywhere) / `Alt-R` or `F3`, `/model` |
 | Provider setup | `Alt-P` or `F4`, `/providers` |
-| Settings | `Ctrl-,` (`Ctrl-4` fallback), `/settings` |
+| Settings | `Ctrl-4` on Windows; `Ctrl-,` elsewhere. Both are bound by default. `/settings` |
 | Edit keyboard shortcuts | `/hotkeys`, or `/settings` → Setup → Keyboard shortcuts |
 | Previous/next prompt | `Up` / `Down` or `Ctrl-P` / `Ctrl-N`; steps through queued messages first, then history, and preserves the unsent draft |
 | Search prompt history | `Ctrl-R` |
@@ -33,6 +33,7 @@ Find the active keys, edit bindings and handle terminal-specific keyboard differ
 | Focus session controls | `F10` |
 | Edit the draft in `$VISUAL`/`$EDITOR` | `Ctrl-G` |
 | Rate the last turn good / bad | `Alt-Up` / `Alt-Down` |
+| Run a numbered action on the latest recap | `Shift+F1`…`Shift+F9` on macOS; `Alt+1`…`Alt+9` elsewhere. Either set works with an empty, idle composer. |
 
 Hints and footers show only the primary shortcut; `/hotkeys` lists every bound alternative.
 `Ctrl-P` and `Ctrl-N` move the selection in every list and browse prompt history in the composer, so
@@ -48,11 +49,11 @@ and opens the model selector. This only applies to keys bound to an Option chord
 and pasting `˚` or `µ` into the draft still inserts them. Other layouts type some of these
 characters with plain keys (`ß`, `å`, `ø`, `ç`), so there Dial leaves them as text. Set Option to
 send Meta/Esc+ (iTerm2: Profiles → Keys → Left Option key → Esc+; Terminal.app: **Use Option as
-Meta key**), or use the Control and function-key alternatives every default Option shortcut has.
+Meta key**), use the alternative shown in `/hotkeys`, or bind a key your terminal forwards.
 Option+E, I, N and U are accent keys that type nothing on their own, so Dial cannot see them in
-this mode. On macOS, **F2** opens the
-model selector and Option+M remains available; bind `Ctrl+K` yourself if you prefer it. Function keys on Mac keyboards may need
-`Fn` unless "Use F1, F2, etc. keys as standard function keys" is on. On Windows, Windows Terminal
+this mode. If `Option+1` types a plain `1`, Dial cannot distinguish it from typing `1`: use the
+recap card's `Shift+F1` instead. On macOS, application shortcuts with both an Option and a function-key binding
+show the function key first. Mac keyboards may need `Fn` unless “Use F1, F2, etc. keys as standard function keys” is on. On Windows, Windows Terminal
 keeps `Alt+Enter` (fullscreen), `Ctrl+V` (its text paste) and `Ctrl+,` (its settings), so use `Ctrl+Q`,
 `Alt+V` and `Ctrl+4` there; `Ctrl+G` opens the draft through `pwsh`, falling back to Windows PowerShell.
 Panel keys (such as `Shift+F2` and `Shift+F3` in `/models`) are panel-local. A panel never gives a global

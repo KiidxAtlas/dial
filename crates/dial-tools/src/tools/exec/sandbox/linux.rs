@@ -295,7 +295,7 @@ pub(super) fn command_mode(
     policy: &Policy,
     program: &str,
     args: &[&str],
-    mode: super::CommandMode,
+    mode: super::CommandMode<'_>,
     proxy: Option<&super::netproxy::Endpoint>,
 ) -> Result<Command, String> {
     if !Path::new(BWRAP).is_file() {
@@ -308,6 +308,18 @@ pub(super) fn command_mode(
     }
     check_windows_interop()?;
     let mut mounts = Mounts::new(workspace, policy)?;
+    if let Some(bundle) = mode.bundle {
+        let root = bundle.root();
+        if mounts
+            .denied
+            .iter()
+            .chain(&mounts.write)
+            .any(|path| overlaps(root, path))
+        {
+            return Err("bundled Python overlaps a denied or writable mount".into());
+        }
+        mounts.read.push((root.to_owned(), root.to_owned()));
+    }
     mounts.grant_program(program)?;
     // Filtered network: a private namespace whose only way out is the proxy socket, reached
     // through the Dial binary re-executed as a loopback bridge in front of the command.

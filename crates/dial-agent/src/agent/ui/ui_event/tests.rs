@@ -39,3 +39,27 @@ fn work_wait_is_optional_typed_metadata_not_a_success_verdict() {
     assert_eq!(encoded["background_wait"]["reason"], "interrupted");
     assert!(encoded["background_wait"].get("success").is_none());
 }
+
+#[test]
+fn detail_is_optional_and_tagged_by_type() {
+    let plain = serde_json::to_value(UiEvent::new(EventKind::Model, "model changed")).unwrap();
+    assert!(plain.get("detail").is_none());
+    let switch = UiEvent::new(EventKind::Model, "fallback").with_detail(EventDetail::ModelSwitch {
+        from: Some("anthropic/opus".into()),
+        to: "openai/gpt".into(),
+        reason: SwitchReason::Fallback,
+    });
+    let encoded = serde_json::to_value(switch).unwrap();
+    assert_eq!(encoded["detail"]["type"], "model_switch");
+    assert_eq!(encoded["detail"]["from"], "anthropic/opus");
+    assert_eq!(encoded["detail"]["to"], "openai/gpt");
+    assert_eq!(encoded["detail"]["reason"], "fallback");
+    let review =
+        UiEvent::new(EventKind::Coach, "Advisor warning: x").with_detail(EventDetail::Review {
+            severity: "warning".into(),
+            note: "x".into(),
+        });
+    let encoded = serde_json::to_value(review).unwrap();
+    assert_eq!(encoded["detail"]["type"], "review");
+    assert_eq!(encoded["detail"]["severity"], "warning");
+}

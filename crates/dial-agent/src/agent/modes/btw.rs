@@ -81,7 +81,7 @@ impl SideSnapshot {
     /// exchanges of the same side thread, replayed before the new question.
     pub fn request(&self, prior: &[(String, String)], question: &str) -> Result<SideRequest> {
         let question = question.trim();
-        ensure!(!question.is_empty(), "usage: /btw <question>");
+        ensure!(!question.is_empty(), "Usage: /btw <question>");
         let mut chat = self.chat.clone();
         // The snapshot may be captured while the main agent is dispatching a tool batch.
         // Close only the copied transcript's pending calls so the side provider sees a valid

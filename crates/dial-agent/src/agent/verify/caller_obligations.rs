@@ -73,15 +73,17 @@ const COMMON_NAMES: &[&str] = &[
 pub(in crate::agent) fn changed_signatures(versions: &[TurnVersion]) -> Vec<(String, String)> {
     let mut changed = Vec::new();
     for version in versions {
-        let (Some(before), Some(after)) = (&version.before, &version.after) else {
+        let Some(before) = &version.before else {
             continue;
         };
-        if !version.in_project || before == after {
+        if !version.in_project || version.before == version.after {
             continue;
         }
         let path = Path::new(&version.path);
-        let (Ok(before), Ok(after)) = (std::str::from_utf8(before), std::str::from_utf8(after))
-        else {
+        let (Ok(before), Ok(after)) = (
+            std::str::from_utf8(before),
+            std::str::from_utf8(version.after.as_deref().unwrap_or_default()),
+        ) else {
             continue;
         };
         let (Some(before), Some(after)) = (

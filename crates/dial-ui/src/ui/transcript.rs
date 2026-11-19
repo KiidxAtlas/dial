@@ -59,9 +59,29 @@ pub struct TurnOutcome {
     pub status: String,
     pub changed_files: usize,
     pub open_tasks: usize,
+    /// Compact projection of the recorded changes and checks, absent for a plain answer.
+    pub receipt: Option<TurnReceipt>,
     /// Bounded, recorded handoff details projected by the application report owner.
     /// Empty for plain completed answers; these are information, never replay instructions.
     pub handoff: Vec<String>,
+}
+
+/// Bounded display labels from the completion record, not reconstructed tool intentions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnReceipt {
+    pub paths: Vec<String>,
+    pub check: ReceiptCheck,
+    pub check_label: String,
+    pub check_target: Option<String>,
+}
+
+/// Severity of the retained checks; a stale failure remains a failure, never a success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptCheck {
+    Passed,
+    Failed,
+    Stale,
+    Unverified,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +212,8 @@ const REVEAL_EASE: f64 = 0.12;
 const REVEAL_MAX_STEP: f64 = 0.25;
 /// What a card held at the approval prompt says instead of output.
 const APPROVAL_WAIT: &str = "waiting for your approval";
+/// The fact a call approved at the prompt carries once it runs.
+const APPROVED: &str = "approved";
 
 struct Block {
     kind: Kind,
@@ -212,6 +234,10 @@ struct Block {
     started: Option<Instant>,
     /// The call is held at the approval prompt: it shows that, not a running clock.
     awaiting_approval: bool,
+    /// The user approved this call at the prompt; the settled card says so on its facts edge.
+    approved: bool,
+    /// Context-lane events of this kind folded into this one, newest text kept (`×N` mark).
+    repeats: u32,
     /// The reasoning toggle's key label, named by a collapsed reasoning block's hint.
     thinking_key: Option<Arc<str>>,
 }
@@ -247,6 +273,8 @@ impl Block {
             breaks_run: false,
             started: None,
             awaiting_approval: false,
+            approved: false,
+            repeats: 0,
             thinking_key: None,
         }
     }
@@ -399,6 +427,16 @@ impl Block {
             // Work rows put their own status glyph in the shared icon gutter.
             Kind::Tool(_) => Arc::new(self.tool_view().map_or_else(Vec::new, |view| {
                 let w = w.min(WORK_MAX_W);
+                let view =
+                    if self.approved && !self.awaiting_approval && view.state != ToolState::Blocked
+                    {
+                        // A receipt of the decision: approved at the prompt, not by a standing rule.
+                        let mut view = view.into_owned();
+                        view.presentation.facts.push(APPROVED.to_owned());
+                        std::borrow::Cow::Owned(view)
+                    } else {
+                        view
+                    };
                 if self.awaiting_approval {
                     // Nothing runs until the user answers, so the card neither spins nor counts.
                     let mut view = view.into_owned();
@@ -422,12 +460,26 @@ impl Block {
             } => Arc::new(super::notice::rows_with_severity(
                 title, text, w, ctx, *severity,
             )),
-            Kind::Event(event) => Arc::new(super::lanes::rows(event, w.min(WORK_MAX_W), ctx)),
+            Kind::Event(event) => {
+                let w = w.min(WORK_MAX_W);
+                let mut rows = super::lanes::rows(event, w, ctx);
+                if self.repeats > 0
+                    && let Some(first) = rows.first_mut()
+                {
+                    let mark = format!(" ×{}", self.repeats + 1);
+                    if text::line_width(first) + text::width(&mark) <= usize::from(w) {
+                        first.spans.push(Span::styled(mark, ctx.theme.fg(Tok::Dim)));
+                    }
+                }
+                Arc::new(rows)
+            }
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
             Kind::Stats(s, recap) => {
                 let w = w.min(WORK_MAX_W);
-                Arc::new(recap::card(s, recap, w, ctx).unwrap_or_else(|| stats_rows(s, w, ctx)))
+                Arc::new(
+                    recap::card(s, recap, w, ctx).unwrap_or_else(|| stats_rows(s, recap, w, ctx)),
+                )
             }
         };
         if self.timestamp.is_some() {
@@ -917,6 +969,16 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
             ],
             style,
         );
+        let hint = error_hint::classify(body);
+        if let Some((kind, _)) = hint {
+            card.head.push(Span::styled(
+                format!(" {} {kind}", theme.sym(Sym::Dot)),
+                theme.fg(Tok::Muted),
+            ));
+        }
+        if let Some((_, step)) = hint {
+            card.foot = vec![Span::styled(step, theme.fg(Tok::Dim))];
+        }
         let inner = w - super::tool_cards::frame::CHROME_W;
         card.sections.push((
             None,
@@ -995,7 +1057,7 @@ fn outcome_mark(status: &str, theme: &Theme) -> (Tok, String, &'static str) {
 
 /// The turn's closing line: how it ended (its mark in the icon gutter), what it changed, how long
 /// it took and what it cost, with the follow-up commands at the right edge when files changed.
-fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
+fn stats_rows(s: &TurnStats, recap: &recap::Recap, w: u16, ctx: &TranscriptCtx) -> Rows {
     let timing = ctx.ui.show_turn_stats;
     if w == 0 || (!timing && s.outcome.is_none()) {
         return Vec::new();
@@ -1086,16 +1148,14 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     let mut rows = vec![fitted(left, w, theme)];
     if let Some(outcome) = &s.outcome {
-        for detail in outcome.handoff.iter().take(11) {
-            let detail = text::one_line(detail);
-            rows.push(fitted(
-                vec![
-                    Span::raw(in_gutter("")),
-                    Span::styled(detail, theme.fg(Tok::Muted)),
-                ],
-                w,
-                theme,
-            ));
+        rows.extend(recap::receipt_rows(outcome, recap, w, ctx));
+        if !outcome.handoff.is_empty() {
+            let indent = in_gutter("");
+            let inner = w.saturating_sub(text::width(&indent)).max(1);
+            for mut detail in recap::handoff_rows(outcome, inner, ctx) {
+                detail.spans.insert(0, Span::raw(indent.clone()));
+                rows.push(fitted(detail.spans, w, theme));
+            }
         }
     }
     rows
@@ -1675,6 +1735,10 @@ impl Transcript {
             return;
         };
         let block = &mut self.blocks[index];
+        // Released while still live: the user allowed it (a denial settles the card as denied).
+        if block.awaiting_approval && !waiting {
+            block.approved = true;
+        }
         block.awaiting_approval = waiting;
         block.started = (!waiting).then(Instant::now);
         self.invalidate_tail();
@@ -1781,6 +1845,21 @@ impl Transcript {
             })
         {
             tool.presentation = view.clone();
+        }
+    }
+
+    /// Apply the engine's view of a settled call after [`Self::tool_end_with`], which rebuilt
+    /// the card from the result text alone. The engine's view also saw the structured result
+    /// (verify counts, chosen answers, window lists), so it replaces the text-built one, unless
+    /// it says nothing beyond the call itself (no facts and no preview), which would only drop
+    /// what the text showed, such as an exit code.
+    pub fn tool_result_view(
+        &mut self,
+        id: &str,
+        view: &crate::runtime::presentation::Presentation,
+    ) {
+        if !view.target.is_empty() && (!view.facts.is_empty() || view.preview.is_some()) {
+            self.tool_presentation(id, view);
         }
     }
 
@@ -2024,6 +2103,30 @@ impl Transcript {
         if self.blocks.last().is_some_and(|block| matches!(&block.kind, Kind::Event(previous) if previous.kind == event.kind && previous.text == event.text)) {
             return; // Presentation only: the execution journal keeps the original events.
         }
+        // A run of quiet events of one kind (several skills loaded, tools enabled one by one)
+        // reads as one row with a count; the newest wording stands for the run.
+        let quiet = |e: &crate::agent::ui::ui_event::UiEvent| {
+            use crate::agent::ui::ui_event::EventKind;
+            e.detail.is_none()
+                && e.tokens.is_none()
+                && matches!(
+                    e.kind,
+                    EventKind::Skill | EventKind::Tools | EventKind::Learning
+                )
+        };
+        if quiet(event)
+            && self.blocks.len() > self.cursor
+            && let Some(block) = self.blocks.last_mut()
+            && let Kind::Event(previous) = &mut block.kind
+            && previous.kind == event.kind
+            && quiet(previous)
+        {
+            *previous = event.clone();
+            block.repeats += 1;
+            block.revision.set(block.revision.get().saturating_add(1));
+            self.invalidate_tail();
+            return;
+        }
         self.push(Kind::Event(event.clone()), false);
     }
 
@@ -2226,13 +2329,27 @@ impl Transcript {
         Vec::new()
     }
 
-    /// The follow-up for a pressed Alt+digit, when the latest recap offers that many actions.
+    /// The follow-up for a pressed recap shortcut with default bindings.
     pub fn recap_action_for(&self, key: &crossterm::event::KeyEvent) -> Option<RecapAction> {
-        self.recap_actions()
-            .into_iter()
-            .enumerate()
-            .find(|(i, _)| recap_action_chord(*i).is_some_and(|chord| chord.matches(key)))
-            .map(|(_, action)| action)
+        self.recap_action_with_keys(key, &crate::ui::keys::Keymap::defaults())
+    }
+
+    /// A panel-local shortcut must not take a key the user bound to another action.
+    pub fn recap_action_with_keys(
+        &self,
+        key: &crossterm::event::KeyEvent,
+        keys: &crate::ui::keys::Keymap,
+    ) -> Option<RecapAction> {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return None;
+        }
+        let index = (0..9).find(|&i| {
+            recap::action_chords(i).is_some_and(|chords| keys.matches_chords(&chords, key))
+        })?;
+        if !keys.actions_for(key).is_empty() {
+            return None;
+        }
+        self.recap_actions().into_iter().nth(index)
     }
 
     /// Finalize every streaming block; a tool that never reported back is shown as interrupted.
@@ -2843,6 +2960,7 @@ impl Replay {
     }
 }
 
+mod error_hint;
 mod recap;
 pub use recap::{RecapAction, RecapRun, action_chord as recap_action_chord};
 

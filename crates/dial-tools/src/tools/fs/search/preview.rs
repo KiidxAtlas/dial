@@ -60,33 +60,29 @@ pub(super) fn render(
     out
 }
 
-/// Rehydration only admits preview paths inside the original local search scope and glob.
-pub(super) fn source_targets(ws: &Workspace, args: &serde_json::Value, text: &str) -> Vec<String> {
-    if args["preview"] != true || super::OutputMode::parse(args) != Ok(super::OutputMode::Lines) {
-        return Vec::new();
-    }
-    let Ok(roots) = super::scopes(ws, args) else {
-        return Vec::new();
-    };
-    let Ok(glob) = crate::tools::opt_str(args, "glob")
-        .and_then(|pattern| pattern.map(super::Glob::new).transpose())
-    else {
+/// Only restore preview paths that execution could match in the original search scope and glob.
+pub(super) fn source_targets(
+    ws: &Workspace,
+    args: &serde_json::Value,
+    glob: Option<&super::Glob>,
+    text: &str,
+) -> Vec<String> {
+    let Ok(scopes) = super::resolve_scopes(ws, args, glob) else {
         return Vec::new();
     };
     navigation::source_paths(ws, text)
         .into_iter()
         .filter(|path| {
             ws.resolve_read(path).is_ok_and(|resolved| {
-                roots.iter().any(|root| resolved.starts_with(root))
-                    && glob.as_ref().is_none_or(|glob| {
-                        let root = ws.root_containing(&resolved).unwrap_or(ws.root());
-                        glob.matches(
-                            &resolved
-                                .strip_prefix(root)
-                                .unwrap_or(&resolved)
-                                .to_string_lossy(),
-                        )
-                    })
+                // The walker emits canonical spellings, never a symlink. A retained header
+                // must not grant witnesses to a replacement target reached through an alias.
+                if ws.rel(&resolved) != *path {
+                    return false;
+                }
+                scopes.roots.iter().any(|scope| {
+                    resolved.starts_with(scope)
+                        && glob.is_none_or(|g| g.matches_path(&resolved, g.pattern_root(ws, scope)))
+                })
             })
         })
         .collect()

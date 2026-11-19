@@ -172,6 +172,20 @@ call names that member, so it never covers the other readers or local Git. Watch
 fresh one-shot approval through `bg`. Recorded calls from older sessions are projected onto
 the successor when a session resumes.
 
+**Recall: which tool answers "what do we already know?"** Each recall store keeps its own
+tool, because their contracts differ: `session_search` is the compaction and new-context
+recovery path and is required by name there; `memory` writes; `evidence` runs experiments.
+Their descriptions name each other, and automatic task routing offers the matching one:
+
+| Question | Tool |
+| --- | --- |
+| What did we decide or agree on? What are my preferences or this project's conventions? | `memory` (`store=codebase` for saved project understanding) |
+| What was said or done in an earlier conversation? Exact raw transcript detail | `session_search` (`history: true` for raw entries) |
+| Which change introduced this? What happened in past sessions' archive? | `history` (`source=changes`, `source=sessions`) |
+| Which sources support this claim? Experiment results | `evidence` |
+
+Routing only offers a schema. It grants no permission and never answers from a store.
+
 **Tools** (file edits confined to the project; shell access follows the chosen sandbox)
 - The default core is stable across ordinary requests. Hosted routes get 25 KiB of schemas;
   lean and local routes keep 12 KiB, and lean local routes also cap the count at eight. Core
@@ -246,6 +260,7 @@ the successor when a session resumes.
   - `path:sym=NAME` (also `NAME,OTHER` or a qualified `Parent.name`) reads just the named declarations, together with the doc comments and attributes directly above them, as anchored rows that can be edited. The match comes from the same tree-sitter declarations as `:outline`. A name matching several small declarations returns all of them (at most 3, 400 lines); anything else lists the candidates with their line ranges.
   - `path:outline=NAME` returns the outline followed by those declarations.
   - `dir:outline` lists the top-level declarations of every parsed source file under a directory, within the read budget.
+  - A successful `read` that returns 300 or more lines of one file `:outline` can parse ends with a one-line `[hint]` naming that file's `:outline` and `:sym=NAME` selectors, so the next lookup can start smaller. Reads that already use `:sym=` or `:outline=`, and file types without a parser, get no hint. The hint never changes the rows returned.
   - `budget` (1024–49152 bytes) lowers the output cap of one read; the footer still names the next range.
   - Multi-path reads plan fair shares before reading, reserving space for later targets instead
     of letting the first large text file consume the whole reply. Each clipped text target keeps
@@ -702,10 +717,16 @@ enabled = false
 enabled = false
 ```
 
+The mode selects the instructions and argument schema shown for the single `edit` tool, not a
+restriction on what Dial accepts. For example, `dial --edit-mode replace` advertises string
+replacement, but a Hashline patch using the header from a source read still works. The same
+choice is available per model under **Edit style**; neither choice adds tools to the prompt.
+
 Process/CLI pins take precedence over an explicit model-profile `edit_mode`, a learned harness pin,
 model selector rules, the applicable local-assistance default, and the global mode, in that order.
-Unpinned local routes default to `replace`; hosted routes default to the global `hashline` mode.
-`assistance.local.edit_mode = "inherit"` makes local routes follow the global mode instead. When a
+Local routes default to `hashline`, the same as hosted routes. An explicit `[edit] mode` still applies
+on a local route unless `assistance.local.edit_mode` is set explicitly, which then replaces it.
+`assistance.local.edit_mode = "inherit"` makes local routes follow `[edit] mode` instead. When a
 local route replaces an explicitly configured `[edit] mode` (and no pin decides), Dial says so once
 per session, naming both modes and the `inherit` switch.
 Selector matching is case-insensitive; the longest matching substring wins, with deterministic
@@ -788,11 +809,20 @@ without inserting transient messages into the conversation or rewriting its cach
 Investigation checkpoints still require real todos; tools withheld by a checkpoint are explained
 as temporarily gated, and invalid todo calls receive a valid argument shape.
 
+Tool definitions advertise only canonical names. Outside strict evaluation, Dial can repair an
+unambiguous identifier spelling before validation: a tool name, a field of a closed record, or
+a string enum value. This is not fuzzy execution: ambiguous matches and conflicting fields
+are not resolved by guessing. Free-form text (including source code, commands and filenames)
+is not spell-corrected. Normal scope, approval, sandbox and edit-witness requirements still apply.
+
 Tolerated argument forms, each equivalent to the canonical call: an object- or array-typed
 field sent as a JSON string holding that container (`"repro": "{\"name\": …}"`) is decoded before
 validation, while string-typed fields are never decoded; `verify` with `targets: []` is the
-omitted selection; and an absolute `glob` pattern under the workspace root is the same pattern
-relative to it (patterns elsewhere are still refused).
+omitted selection. Local `glob` patterns and `grep` file filters may be absolute under a readable
+workspace root. An absolute pattern stays anchored there: `/project/main.rs` matches only that
+file, while the bare relative pattern `main.rs` also matches nested files. An explicit search
+scope still narrows the results. File reads and witnessed edits accept either a project-relative
+path or an authorized absolute path; changing the spelling grants no new access.
 
 ```sh
 dial reliability status

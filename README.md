@@ -2,7 +2,7 @@
 
 # dial
 
-**A coding agent that can undo every edit, shows evidence before it says "done", and can confine
+**A coding agent that checkpoints file edits, shows evidence before it says "done", and can confine
 commands to an OS sandbox. It works with your own models or anyone else's.**
 
 [![CI](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml/badge.svg)](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml)
@@ -28,8 +28,8 @@ On first launch Dial asks which model to use. Then you tell it what you want.
   runs commands, PowerShell included, at Low integrity so they can write only the project. If the
   sandbox is missing, commands are refused rather than run unprotected. A git guard stops subagents from running
   `reset --hard`, `clean -f` and similar commands that would throw away your uncommitted work.
-- **Every edit can be undone.** Dial saves a file's original contents before changing it.
-  `/undo`, `/rollback` and `/review-file` keep or revert changes, even after a restart.
+- **Review before undoing.** `/review files` lets you inspect checkpointed edits and keep or revert
+  individual files. `/undo files` restores a checkpoint without rewinding the conversation, even after a restart.
 - **Evidence, not "done".** After making changes, Dial runs the relevant tests and shows you the
   commands and results before it reports the work as finished.
 - **Any model, including fully local.** MLX on Apple Silicon, GGUF through llama.cpp, LM Studio,
@@ -75,8 +75,8 @@ Inside Dial:
 | ----------------------- | ---------------------------- |
 | `/providers`, `/models` | Sign in and pick a model     |
 | `/settings`             | Configure everything         |
-| `Ctrl-P`                | Search every command         |
-| `/review-file`          | Review, keep or undo changes |
+| `Alt-K` or `F1`         | Search actions and commands  |
+| `/review files`         | Review, keep or undo changes |
 | `/help`                 | Commands and shortcuts       |
 
 The approval mode sets how much Dial does without asking: `ask`, `write`, `auto` or

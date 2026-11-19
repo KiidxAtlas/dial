@@ -263,6 +263,7 @@ pub(in crate::app) fn overlay_input(
     mut event: Event,
 ) -> bool {
     if matches!(&event, Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release && key.code == crossterm::event::KeyCode::Left && key.modifiers == crossterm::event::KeyModifiers::ALT)
+        && !matches!(overlay.content_mut(), ActiveOverlay::BackupModels(panel) if panel.editing_chain())
     {
         env.next = Some("navigate:back".into());
         return true;

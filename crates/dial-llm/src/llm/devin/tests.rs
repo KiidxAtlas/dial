@@ -551,6 +551,15 @@ fn paced_exchange(base: &str, idle_limit: Duration) -> (Result<Reply>, std::time
 }
 
 #[test]
+fn completed_devin_reply_does_not_wait_for_server_eof() {
+    let frames = vec![text_frame("done"), frame(FLAG_END_STREAM, b"{}").unwrap()];
+    let (base, server) = serve_paced(frames, Duration::ZERO, Some(Duration::from_secs(2)));
+    let (result, _) = paced_exchange(&base, Duration::from_millis(200));
+    server.join().unwrap();
+    assert_eq!(result.unwrap().text, "done");
+}
+
+#[test]
 fn a_reply_that_keeps_producing_frames_outlives_the_idle_limit() {
     // 14 frames 150 ms apart: longer than the 1.5 s first-event budget and 1 s idle limit.
     // Leave scheduler headroom for real socket I/O on busy CI runners. The separate

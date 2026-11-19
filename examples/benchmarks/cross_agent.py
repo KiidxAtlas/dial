@@ -15,6 +15,7 @@ import concurrent.futures
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import signal
@@ -39,7 +40,8 @@ MEASUREMENT_FIELDS = (*TOKEN_FIELDS, "requests", "tool_calls", "tool_errors", "d
 # Inclusive costs nest inside `duration_ms` and are never summed as wall time.
 EFFICIENCY_FIELDS = ("duration_ms", "inference_latency", "storage_io", "projection_bytes")
 # Count maps keyed by dynamic labels: a label absent from one turn means a zero count.
-DYNAMIC_MAPS = frozenset({"requests_by_phase", "prefix_invalidations", "recovery_attempts", "backend_operations"})
+DYNAMIC_MAPS = frozenset({"requests_by_phase", "prefix_invalidations", "recovery_attempts", "backend_operations",
+                          "interventions", "read_reuse"})
 # First-result timestamps are observations relative to each turn's start, not additive counters.
 PER_TURN_FIELDS = frozenset({"first_tool_result_ms", "first_workspace_change_result_ms"})
 PROJECTION_COUNTERS = ("requests", "requests_before_first_workspace_change_result", "stable_message_bytes",
@@ -202,21 +204,27 @@ def parse_efficiency(result):
 
 
 def _is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value)))
 
 
 def numeric_tree(value):
-    """Additive numeric leaves only. Strings, bools, nulls and per-turn first-result latencies are
-    kept per turn, never summed."""
+    """Additive numeric leaves only. Explicit missing/invalid counters remain unknown;
+    metadata and per-turn first-result latencies are never summed."""
     if isinstance(value, dict):
         out = {}
         for key, child in value.items():
             if key in PER_TURN_FIELDS:
                 continue
             part = numeric_tree(child)
+            if part is UNKNOWN:
+                return UNKNOWN
             if part is not SKIP:
                 out[key] = part
         return out
+    if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)
+                         and (not _is_number(value) or value < 0)):
+        return UNKNOWN
     return value if _is_number(value) else SKIP
 
 
@@ -307,6 +315,11 @@ def parse_dial_json(stdout):
     for call in calls:
         count_tool(usage, call.get("name") or "?")
     usage["tool_errors"] = sum(1 for call in calls if call.get("is_error"))
+    # Failed/retried streams can leave positive token lower bounds without complete usage.
+    # Retain those raw observations, but never present them as complete trial totals.
+    if any(total.get(field, 0) for field in ("unreported_attempts", "partial_reported_attempts")):
+        usage["usage_complete"] = False
+        usage["known_fields"] = [field for field in MEASUREMENT_FIELDS if field not in TOKEN_FIELDS]
     by_model = (((result.get("usage") or {}).get("total") or {}).get("by_model")) or {}
     usage["models"] = sorted(by_model)
     # Kept beside the usage record so `add_usage` never mixes it into token totals.

@@ -413,11 +413,17 @@ impl Ui for StateUi<'_> {
     fn image(&mut self, v: &Value) {
         self.inner.image(v)
     }
+    fn generated_image(&mut self, v: &Value) {
+        self.inner.generated_image(v)
+    }
     fn request_policy(&mut self, v: &Value) {
         self.inner.request_policy(v)
     }
     fn efficiency(&mut self, report: &Value) {
         self.inner.efficiency(report)
+    }
+    fn check_passed(&mut self) {
+        self.inner.check_passed();
     }
     fn laya_activity(&mut self, status: &str, message: &str) {
         self.inner.laya_activity(status, message)

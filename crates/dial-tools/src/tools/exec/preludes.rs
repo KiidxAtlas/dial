@@ -47,6 +47,24 @@ pub enum PreludeLanguage {
     Python,
 }
 
+/// Controller-selected launcher for this persistent namespace, independent of cell output.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EvalBackend {
+    Node,
+    QuickJs,
+    Python,
+}
+
+impl EvalBackend {
+    pub(crate) fn language(self) -> PreludeLanguage {
+        match self {
+            Self::Node | Self::QuickJs => PreludeLanguage::Js,
+            Self::Python => PreludeLanguage::Python,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum PreludeMode {
     Portable,
@@ -151,6 +169,8 @@ pub(crate) fn invoke(
 /// Answers the `prelude` and `display` bridge callbacks; `None` for any other callback kind.
 pub(crate) fn bridge_reply(
     request: &Value,
+    backend: Option<EvalBackend>,
+    workspace: Option<&crate::tools::Workspace>,
     display: &DisplayBuffer,
     dispatch: &mut dyn FnMut(ToolCallback) -> Result<ToolOutput, String>,
 ) -> Option<Result<Value, String>> {
@@ -167,10 +187,30 @@ pub(crate) fn bridge_reply(
             let Some(passed) = request["passed"].as_bool() else {
                 return Some(Err("check condition must be a boolean".into()));
             };
-            display
-                .checks
-                .lock()
-                .push(json!({"name":name,"passed":passed}));
+            let Some(backend) = backend else {
+                return Some(Err("check requires a live Eval backend".into()));
+            };
+            let mut check = json!({"name":name,"passed":passed,"runtime":backend});
+            if let Some(source) = request.get("source") {
+                if name.trim().is_empty() || name.chars().any(char::is_control) {
+                    return Some(Err("source-bound check names must contain visible text and no control characters".into()));
+                }
+                match super::eval::checks::confirm_source(
+                    source,
+                    workspace,
+                    &mut PreludeCall { dispatch },
+                ) {
+                    Ok(source) => check["source"] = source,
+                    Err(error) => {
+                        // A caught negative assertion still failed, even if its source was stale.
+                        if !passed {
+                            display.checks.lock().push(check);
+                        }
+                        return Some(Err(error));
+                    }
+                }
+            }
+            display.checks.lock().push(check);
             Some(Ok(json!({"text":name,"data":null,"is_error":!passed})))
         }
         "prelude" => {

@@ -449,6 +449,105 @@ fn completed_stream_yields_tools_and_partial_stream_never_does() {
     assert_eq!(body["store"], false);
 }
 #[test]
+fn token_limit_discards_unfinished_calls_before_parsing_or_replay() {
+    let message = json!({"type":"message","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"Partial answer"}]});
+    let partial = json!({"type":"function_call","status":"incomplete","arguments":"{\"path\":"});
+    let mut output = response(vec![message, call(), partial]);
+    output["status"] = json!("incomplete");
+    output["incomplete_details"] = json!({"reason":"max_output_tokens"});
+    let mut acc = Accumulator::default();
+    let terminal = json!({"type":"response.incomplete","response":output});
+    assert!(
+        acc.feed(&terminal.to_string(), &mut |_| true, &mut |_| true)
+            .unwrap()
+    );
+    let reply = acc.finish().unwrap();
+    assert_eq!(reply.finish_reason, "length");
+    assert_eq!(reply.text, "Partial answer");
+    assert_eq!(reply.completion_tokens, Some(12));
+    assert!(reply.tool_calls.is_empty());
+    assert!(
+        reply
+            .provider_content
+            .iter()
+            .all(|item| item["item"]["type"] != "function_call")
+    );
+}
+
+#[test]
+fn completed_refusal_is_not_an_answer_or_a_replayable_call() {
+    let refusal = json!({"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Cannot assist."}]});
+    for items in [
+        vec![refusal.clone()],
+        vec![call(), refusal.clone()],
+        vec![refusal, call()],
+    ] {
+        let reply = completed(&response(items)).unwrap();
+        assert!(reply.refusal_message().is_some());
+        assert_eq!(reply.text, "Cannot assist.");
+        assert!(reply.tool_calls.is_empty());
+        assert!(
+            reply
+                .provider_content
+                .iter()
+                .all(|p| p["item"]["type"] != "function_call")
+        );
+    }
+}
+
+#[test]
+fn token_limit_after_argumentless_done_waits_for_terminal_status() {
+    let mut item = call();
+    item.as_object_mut().unwrap().remove("arguments");
+    for truncated in [true, false] {
+        let mut acc = Accumulator::default();
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let event = json!({"type":kind,"output_index":0,"item":item});
+            assert!(
+                !acc.feed_event(&event, &mut |_| true, &mut |e| {
+                    assert!(!matches!(e, StreamEvent::ToolCallComplete { .. }));
+                    true
+                })
+                .unwrap()
+            );
+        }
+        if truncated {
+            let mut output = response(vec![]);
+            output["status"] = json!("incomplete");
+            output["incomplete_details"] = json!({"reason":"max_output_tokens"});
+            assert!(
+                acc.feed_event(
+                    &json!({"type":"response.incomplete","response":output}),
+                    &mut |_| true,
+                    &mut |_| true
+                )
+                .unwrap()
+            );
+            let reply = acc.finish().unwrap();
+            assert_eq!(reply.finish_reason, "length");
+            assert_eq!(reply.completion_tokens, Some(12));
+            assert!(reply.tool_calls.is_empty() && reply.provider_content.is_empty());
+        } else {
+            let terminal = json!({"type":"response.completed","response":response(vec![call()])});
+            assert!(
+                acc.feed_event(&terminal, &mut |_| true, &mut |_| true)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn nonempty_refusal_deltas_are_reply_progress() {
+    assert!(advances_reply_event(
+        &json!({"type":"response.refusal.delta","delta":"I cannot"})
+    ));
+    assert!(!advances_reply_event(
+        &json!({"type":"response.refusal.delta","delta":""})
+    ));
+}
+
+#[test]
 fn late_usage_limit_failures_and_incomplete_responses_do_not_release_calls() {
     for terminal in [
         json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"secret prompt"}}}),
@@ -1121,4 +1220,23 @@ fn a_rejected_reasoning_effort_is_named_and_not_retried() {
         .unwrap_err();
     assert_eq!(classify(&err), ErrorClass::Fatal);
     assert!(!err.to_string().contains("/effort"), "{err}");
+}
+
+#[test]
+fn strict_tools_keep_the_edit_guidance_tool_unpromoted() {
+    let schema = json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false});
+    let mut chat = chat();
+    chat.tools = vec![
+        json!({"type":"function","function":{"name":"edit","description":"e","parameters":schema.clone()}}),
+        json!({"type":"function","function":{"name":"write_notes","description":"w","parameters":schema.clone()}}),
+    ];
+    let mut profile = crate::llm::profiles::ModelProfile::minimal("openai", "gpt-test");
+    profile.capabilities.strict_tools = true;
+    let body = request("gpt-test", &chat, Some(&profile)).unwrap();
+    let tools = &body["tools"][0]["tools"];
+    assert_eq!(tools[0]["name"], "edit");
+    assert_eq!(tools[0]["strict"], false);
+    assert_eq!(tools[0]["parameters"], schema);
+    assert_eq!(tools[1]["name"], "write_notes");
+    assert_eq!(tools[1]["strict"], true);
 }

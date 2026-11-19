@@ -73,7 +73,7 @@ impl Shell {
         }
     }
     /// The value picker a bare command opens in the TUI: `/approval`, `/effort`, `/profile`,
-    /// `/theme`, `/queue` and `/permissions remove`. `None` keeps the command's text output.
+    /// `/theme` and `/permissions remove`. `None` lets normal command routing continue.
     pub(super) fn picker(
         &self,
         app: &App,
@@ -208,39 +208,6 @@ impl Shell {
                     items,
                     ("Filter themes:", format!("Colors and glyphs; now {active}")),
                 ))
-            }
-            ("queue", "") => {
-                let items: Vec<ChoiceItem> = self
-                    .composer
-                    .queued_messages()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (message, follow_up))| ChoiceItem {
-                        value: (index + 1).to_string(),
-                        label: format!("{}. {}", index + 1, crate::ui::text::one_line(&message)),
-                        detail: if follow_up {
-                            "follow-up for after the turn"
-                        } else {
-                            "steering the current turn"
-                        }
-                        .to_owned(),
-                        current: false,
-                    })
-                    .collect();
-                let count = items.len();
-                (!items.is_empty()).then(|| {
-                    picker(
-                        "Queued messages",
-                        "queue",
-                        "edit",
-                        Some("remove"),
-                        items,
-                        (
-                            "Filter messages:",
-                            format!("{count} waiting to send; Enter edits, Delete removes",),
-                        ),
-                    )
-                })
             }
             ("permissions", "remove") => {
                 let items: Vec<ChoiceItem> = agent

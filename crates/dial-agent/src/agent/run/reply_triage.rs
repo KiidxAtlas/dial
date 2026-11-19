@@ -20,6 +20,8 @@ pub(in crate::agent) struct LengthFacts {
     pub requested_tokens: u32,
     pub window: u32,
     pub prompt_tokens: u64,
+    /// The model's stated output maximum; `None` when no profile, metadata or catalog states one.
+    pub model_max_output: Option<u32>,
 }
 
 /// How to recover from a reply cut off at the output limit. Where each message goes (history,
@@ -70,6 +72,7 @@ pub(in crate::agent) fn truncation(
             facts.requested_tokens,
             facts.window,
             facts.prompt_tokens,
+            facts.model_max_output,
             reply,
         ) {
             LengthAction::Retry { max_tokens } => Truncation::Raise(max_tokens),

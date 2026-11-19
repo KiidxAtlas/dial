@@ -326,7 +326,7 @@ pub(in crate::tools) fn footer(
         parts.push(format!(
             "output truncated at the byte budget after line {last} of {len}"
         ));
-    } else if !sel.raw && (sel.selects_lines() || shown != [(1, len)]) {
+    } else if !sel.raw && !shown.is_empty() && (sel.selects_lines() || shown != [(1, len)]) {
         parts.push(format!("lines {} of {len}", describe_spans(shown)));
     }
     if let Some(next) = next {

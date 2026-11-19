@@ -805,6 +805,90 @@ fn verified_artifact_completion_adds_no_self_review_to_either_surface() {
 }
 
 #[test]
+fn quality_review_asks_once_before_either_completion_surface_delivers() {
+    for explicit in [false, true] {
+        for enabled in [false, true] {
+            let final_reply = |summary: &str| {
+                if explicit {
+                    response(
+                        "",
+                        Some(("finish", json!({"outcome":"completed","summary":summary}))),
+                    )
+                } else {
+                    response(summary, None)
+                }
+            };
+            let mut scripts = vec![
+                response(
+                    "",
+                    Some((
+                        "write",
+                        json!({"path":"result.txt","content":"delivered\n"}),
+                    )),
+                ),
+                llm::fake::json(200, &json!({"total_slots":1})),
+                final_reply("Created result.txt."),
+            ];
+            if enabled {
+                scripts.push(final_reply("Reviewed result.txt; no changes needed."));
+            }
+            let server = llm::fake::serve(scripts);
+            let overlay = format!(
+                "[compaction]\nenabled=false\n[verification]\nquality_review={enabled}\n[verification.review]\nenabled=false\n"
+            );
+            let mut ui = NoticeUi::default();
+            crate::agent::run::tool_exposure::default_offer_tests::with_agent(&overlay, |agent| {
+                connect(agent, &server.url);
+                let report = agent
+                    .turn("Create result.txt containing delivered", &mut ui)
+                    .unwrap();
+                assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+                if enabled {
+                    assert!(
+                        report.text.contains("Reviewed result.txt"),
+                        "{}",
+                        report.text
+                    );
+                }
+            });
+            let requests = completion_requests(&server);
+            let label = format!("explicit={explicit}, enabled={enabled}");
+            assert_eq!(requests.len(), 2 + usize::from(enabled), "{label}");
+            let asked = requests
+                .iter()
+                .filter(|request| request.to_string().contains("[Dial quality review]"))
+                .count();
+            assert_eq!(asked, usize::from(enabled), "{label}");
+            if enabled {
+                let last = requests.last().unwrap().to_string();
+                assert!(last.contains("Changed files: result.txt"), "{label}");
+                assert!(
+                    ui.0.iter()
+                        .any(|notice| notice.starts_with("Quality review is on")),
+                    "{label}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quality_review_skips_answers_that_changed_nothing() {
+    let server = llm::fake::serve(vec![response("The answer is 4.", None)]);
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[compaction]\nenabled=false\n[verification]\nquality_review=true\n",
+        |agent| {
+            connect(agent, &server.url);
+            let report = agent.turn("What is 2 + 2?", &mut NullUi).unwrap();
+            assert!(report.text.contains("The answer is 4."), "{}", report.text);
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].to_string().contains("[Dial quality review]"));
+}
+
+#[test]
 fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() {
     let server = llm::fake::serve(vec![
         response(

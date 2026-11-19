@@ -129,6 +129,7 @@ fn hero(info: &WelcomeInfo, width: usize, budget: usize, theme: &Theme, view: &V
     } else {
         None
     };
+    let has_art = art.is_some();
     let mut rows: Rows = match art {
         Some(art) => art
             .into_iter()
@@ -143,10 +144,14 @@ fn hero(info: &WelcomeInfo, width: usize, budget: usize, theme: &Theme, view: &V
             theme,
         )],
     };
-    // The tagline sits under the mark when the window can spare the row and its whole width.
+    // The tagline sits under the mark when the window can spare the row and its whole width, with
+    // a blank row of air between solid pixel art and text when there is room for that too.
     let line = tagline(info, theme, sweep);
     let line_w: usize = line.iter().map(|s| text::width(&s.content)).sum();
     if budget >= rows.len() + 2 && line_w <= width {
+        if has_art && budget >= rows.len() + 3 {
+            rows.push(Line::default());
+        }
         rows.push(centered(line, width, theme));
     }
     rows.push(Line::default());

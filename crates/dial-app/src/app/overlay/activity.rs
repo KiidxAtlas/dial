@@ -420,13 +420,27 @@ pub(in crate::app) fn queue_choices(items: &[(u64, String, bool)]) -> ChoiceSpec
         command: "queue".into(),
         verb: "edit",
         remove: Some("remove"),
-        summary: "Enter edits one message; Delete twice removes only that message. An existing composer draft is kept. Queue changes made elsewhere appear when reopened.".into(),
-        items: items.iter().enumerate().map(|(index, (id, message, follow_up))| ChoiceItem {
-            value: format!("@{id}"),
-            label: format!("{} {}", index + 1, if *follow_up { "follow-up" } else { "steering" }),
-            detail: crate::ui::text::one_line(message),
-            current: false,
-        }).collect(),
+        prompt: "Filter messages:".into(),
+        summary: if items.is_empty() {
+            "No queued messages. During a turn, choose After this turn to queue a follow-up."
+        } else {
+            "Enter edits; Delete twice removes. Reopen to see queue changes."
+        }
+        .into(),
+        items: items
+            .iter()
+            .enumerate()
+            .map(|(index, (id, message, follow_up))| ChoiceItem {
+                value: format!("@{id}"),
+                label: format!(
+                    "{} {}",
+                    index + 1,
+                    if *follow_up { "follow-up" } else { "steering" }
+                ),
+                detail: crate::ui::text::one_line(message),
+                current: false,
+            })
+            .collect(),
         ..Default::default()
     }
 }

@@ -339,6 +339,33 @@ fn mismatched_tasks_and_unbounded_work_are_rejected() {
             .is_err()
     );
     policy.case_timeout_secs = 1;
+    // The inactivity bound is opt-in and may not outlast the wall deadline it refines.
+    policy.case_inactivity_secs = 2;
+    assert!(
+        policy
+            .validate(&suite, std::slice::from_ref(&configuration))
+            .is_err()
+    );
+    policy.case_inactivity_secs = 1;
+    assert!(
+        policy
+            .validate(&suite, std::slice::from_ref(&configuration))
+            .is_ok()
+    );
+    policy.case_timeout_secs = 0;
+    policy.case_inactivity_secs = 601;
+    assert!(
+        policy
+            .validate(&suite, std::slice::from_ref(&configuration))
+            .is_err()
+    );
+    policy.case_inactivity_secs = 600;
+    assert!(
+        policy
+            .validate(&suite, std::slice::from_ref(&configuration))
+            .is_ok()
+    );
+    policy.case_inactivity_secs = 0;
     policy.minimum_correctness = f64::NAN;
     assert!(policy.validate(&suite, &[configuration]).is_err());
 }

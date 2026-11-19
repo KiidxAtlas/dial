@@ -40,14 +40,11 @@ impl Shell {
         args: &str,
     ) -> Result<Step> {
         let args = args.trim();
-        if args == "results" {
-            return match self.take_search_panel(agent.layout().unwrap_or(&app.layout)) {
+        if args.is_empty() || args == "results" {
+            return match self.search_panel(agent.layout().unwrap_or(&app.layout)) {
                 Some(panel) => self.open(app, agent, Which::HistorySearch(panel)),
                 None => {
-                    self.note(
-                        "Search",
-                        "No ready results. Use /search <query> and wait for the search to finish.",
-                    );
+                    self.note_search_unavailable();
                     Ok(Step::Done)
                 }
             };
@@ -77,15 +74,7 @@ impl Shell {
             }
             return Ok(Step::Done);
         }
-        if args.is_empty() {
-            self.note(
-                "Search",
-                "Usage: /search <query> | /search results | /search more | /search open <id> | /search back",
-            );
-        } else {
-            self.start_search(agent.layout().unwrap_or(&app.layout), args);
-            self.note("Search", "Searching past messages…");
-        }
+        self.start_search(agent.layout().unwrap_or(&app.layout), args);
         Ok(Step::Done)
     }
 

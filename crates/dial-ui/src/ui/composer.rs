@@ -450,7 +450,7 @@ impl Composer {
 
     /// What Enter does with a draft while busy. With the chooser, a route picked earlier this
     /// session is named, since the chooser opens on it and Enter twice repeats it.
-    fn busy_send_hint(&self) -> String {
+    pub fn busy_send_hint(&self) -> String {
         match self.busy_send {
             BusySend::Choose => match self.last_draft_choice {
                 Some(last) => format!("choose route (last: {})", last.short()),

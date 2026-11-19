@@ -1145,6 +1145,65 @@ fn a_registry_does_not_wait_for_servers_still_connecting_and_adopts_them_once_re
 }
 
 #[test]
+fn ready_servers_publish_before_a_stall_without_reassigning_tool_names() {
+    use crate::tools::integrations::ext::Registry;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, open) = gated(&dir);
+    let gate = config.mcp.remove("gated").unwrap();
+    config.mcp.insert("a b".into(), gate);
+    config.mcp.insert("a.b".into(), fake_config("", 30));
+    config.mcp.insert("z".into(), fake_config("many-tools", 30));
+    let connecting = Connecting::spawn(&config).unwrap();
+    let mut registry = Registry::new();
+    registry.attach_mcp(&config, Startup::Connecting(connecting.clone()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fast_tool = "mcp__z__tool-0";
+    while !registry.contains(fast_tool) {
+        assert!(
+            Instant::now() < deadline,
+            "the independent server waited for the gate"
+        );
+        registry.adopt_mcp(false);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let fast = registry.get(fast_tool).unwrap().clone();
+    assert_eq!(registry.take_notices().len(), 1, "bounded catalog notice");
+    assert!(!registry.contains("mcp__a_b__echo"));
+    assert_eq!(
+        registry.mcp_connecting(),
+        Some(vec!["a b".into(), "a.b".into()])
+    );
+    std::fs::write(open, "").unwrap();
+    until_finished(&connecting);
+    let Startup::Ready(rebuilt) = registry.mcp_handoff().unwrap().startup() else {
+        panic!("a handoff that finished between turns should be ready");
+    };
+    assert!(
+        rebuilt.notices.is_empty(),
+        "handoff repeated the fast server's startup notice"
+    );
+    assert!(
+        !registry.contains("mcp__a_b__echo"),
+        "background completion is not publication"
+    );
+    assert!(registry.adopt_mcp(false));
+    assert!(Arc::ptr_eq(&fast, registry.get(fast_tool).unwrap()));
+    assert_eq!(
+        registry.get("mcp__a_b__echo").unwrap().lifecycle_channel(),
+        Some("a b")
+    );
+    for tool in tools_of(connecting.wait()) {
+        assert_eq!(
+            registry.get(tool.name()).unwrap().lifecycle_channel(),
+            tool.lifecycle_channel(),
+            "{}",
+            tool.name()
+        );
+    }
+    assert!(registry.mcp_connecting().is_none());
+}
+
+#[test]
 fn an_explicit_need_waits_for_servers_still_connecting() {
     use crate::tools::integrations::ext::Registry;
     let dir = tempfile::tempdir().unwrap();

@@ -240,7 +240,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
     use crate::llm::profiles::ModelProfile;
 
     for (route, settings, process, expected) in [
-        ("local", "", None, "replace"),
+        ("local", "", None, "hashline"),
         ("hosted", "", None, "hashline"),
         (
             "local",
@@ -288,7 +288,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
             ModelProfile {
                 provider: config.provider.clone().unwrap(),
                 model: config.model.clone(),
-                edit_mode: Some(EditMode::Hashline),
+                edit_mode: Some(EditMode::Replace),
                 ..Default::default()
             },
         );
@@ -299,7 +299,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
         );
         assert_eq!(
             config.active_model_profile().unwrap().edit_mode,
-            Some(EditMode::Hashline)
+            Some(EditMode::Replace)
         );
     }
 }
@@ -978,7 +978,7 @@ fn queue_picker_handles_do_not_remove_a_shifted_or_replacement_message() {
         .restore_pending_messages(vec!["consumed".into(), "keep".into()]);
     let id = shell.composer.queued_items()[0].0;
     assert_eq!(shell.composer.take_follow_up().as_deref(), Some("consumed"));
-    shell.queue_command(&format!("/queue remove @{id}"));
+    shell.queue_command(&format!("remove @{id}"));
     assert_eq!(
         shell.composer.queued_messages(),
         vec![("keep".into(), false)]
@@ -986,7 +986,7 @@ fn queue_picker_handles_do_not_remove_a_shifted_or_replacement_message() {
     shell
         .composer
         .restore_pending_messages(vec!["consumed".into()]);
-    shell.queue_command(&format!("/queue edit @{id}"));
+    shell.queue_command(&format!("edit @{id}"));
     assert_eq!(shell.composer.draft(), "");
     assert_eq!(shell.composer.queued_messages().len(), 2);
 }

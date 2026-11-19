@@ -210,7 +210,7 @@ fn working_setup_capture_roundtrips_without_models_secrets_or_paths() {
     assert!(preset.vision.is_none());
     assert!(preset.laya_checkpoint.is_none());
     let loaded: ModelPreset = toml::from_str(&encoded).unwrap();
-    let changes = preset_changes(&config, &loaded).unwrap();
+    let changes = presets::apply_changes(&config, &loaded).unwrap();
     let (_home, _project, layout, _) = crate::app::tests::config();
     let before = settings_store::load_layer(&layout, Scope::Global).unwrap();
     let future =
@@ -243,18 +243,18 @@ fn setup_rejects_unsafe_unknown_nested_and_colliding_keys() {
     }
     let mut preset = ModelPreset::default();
     preset.setup.insert("endpoint.headers".into(), true.into());
-    assert!(preset_changes(&Config::default(), &preset).is_err());
+    assert!(presets::apply_changes(&Config::default(), &preset).is_err());
 }
 
 #[test]
 fn legacy_model_presets_keep_the_same_change_plan_and_redact_review_auth() {
     let preset: ModelPreset =
         toml::from_str("laya_checkpoint = '/local/checkpoint'\n[roles]").unwrap();
-    let changes = preset_changes(&Config::default(), &preset).unwrap();
+    let changes = presets::apply_changes(&Config::default(), &preset).unwrap();
     assert_eq!(written(&changes), ["model_roles", "laya.checkpoint"]);
     let empty: ModelPreset = toml::from_str("").unwrap();
     assert_eq!(
-        written(&preset_changes(&Config::default(), &empty).unwrap()),
+        written(&presets::apply_changes(&Config::default(), &empty).unwrap()),
         ["model_roles"]
     );
     let review = changes_preview(&[Change::Set {

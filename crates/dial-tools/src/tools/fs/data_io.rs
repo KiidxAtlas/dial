@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const MAX_BYTES: usize = 1024 * 1024;
+pub(in crate::tools) const MAX_BYTES: usize = 1024 * 1024;
 /// Lines one ranged text read returns at most (also bounded by [`MAX_BYTES`]).
 const MAX_LINES: u64 = 100_000;
 /// Maximum consumed input per ranged page, including skipped lines. The read-data path has

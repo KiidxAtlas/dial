@@ -87,13 +87,14 @@ impl<'de> Deserialize<'de> for LeanLocal {
 }
 
 /// `assistance.local.edit_mode`: the edit grammar for local routes when nothing pins one. `inherit`
-/// follows `[edit] mode`; any edit mode name selects that grammar.
+/// follows `[edit] mode`; any edit mode name selects that grammar. Unset, local routes use Hashline
+/// unless `[edit] mode` is set explicitly, which then wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalEditMode(pub Option<EditMode>);
 
 impl Default for LocalEditMode {
     fn default() -> Self {
-        Self(Some(EditMode::Replace))
+        Self(Some(EditMode::Hashline))
     }
 }
 

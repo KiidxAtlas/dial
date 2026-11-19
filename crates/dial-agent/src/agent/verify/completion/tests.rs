@@ -92,11 +92,15 @@ fn optional_progress_does_not_force_bookkeeping_rounds() {
 
 #[test]
 fn only_executed_runtime_checks_count_and_a_caught_failure_remains_visible() {
+    use crate::runtime::execution::ObservationKind;
+    let mut checks = crate::agent::verify::eval_checks::History::default();
+    let args = json!({"code":"..."});
     let prose = ToolOutput::ok("assert(true); checks: passed".into());
-    assert!(eval_checks(&prose).next().is_none());
+    assert_eq!(checks.observe(&args, &prose), (0, 0));
     let output = ToolOutput::structured(json!({"checks":[{"name":"tiny round trip","passed":true},
-        {"name":"saved output","passed":false},{"name":"not an outcome"}]}));
-    assert_eq!(eval_checks(&output).collect::<Vec<_>>(), [true, false]);
+        {"name":"saved output","passed":false},{"name":"not an outcome"}]}))
+    .with_observation(ObservationKind::Wait, true);
+    assert_eq!(checks.observe(&args, &output), (1, 1));
 }
 
 #[test]

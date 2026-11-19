@@ -27,7 +27,7 @@ The main session returns to its primary model once the fallback's cooldown (the 
 `/model backups` opens an offline draft editor for this same retry policy. Choose cached chat
 models, saved favorites/profiles or role references; type on the model-choice row to filter,
 use Left/Right to browse, and Enter to append. On the ordered-backups row, Ctrl+Left/Right
-selects an entry, Alt+Left/Right reorders it, and Ctrl+Delete removes it. Direct comma-separated
+selects an entry, Shift+Left/Right (or Alt+Left/Right) reorders it, and Ctrl+Delete removes it. Direct comma-separated
 selectors remain available for endpoints/models that are not cached. On the key row, Enter
 loads the existing chain for `default`, a helper role, `provider/model`, or `provider/*`.
 

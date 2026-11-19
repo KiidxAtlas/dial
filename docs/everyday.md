@@ -19,28 +19,38 @@ request dismisses it permanently. Its marker is kept in Dial's private user stat
 
 While Dial works, type a correction or another request. Follow the input's busy choices to
 steer the current work or queue the request. Be explicit about scope: “Stop after the tests;
-don't commit.” Use **Esc** to interrupt when you need to stop rather than adjust the work.
+don't commit.” To stop the current answer, press **Ctrl+C** at the empty composer. With a panel
+open or a draft in the composer, the first press closes the panel or clears the draft instead.
 
 ## Review
 
-After edits, the compact turn report summarizes changed files, check state (passed, failed, stale
-or unverified), unfinished tasks and effects outside `/undo`. **Ctrl+O** expands the report along with tool details.
-The muted next-step line suggests useful actions; plain answers do not add one.
+After an edit, read the compact turn report before accepting the patch. It names changed paths
+and shows whether the recorded checks passed, failed, or no longer cover the latest edit.
+Unverified means Dial has no verdict it can rely on. **Ctrl+O** expands the evidence and tool
+output. Unfinished tasks and effects outside `/undo` remain visible; plain answers stay quiet.
 
-Use `/review` for a review of your changes. Read failures and stale-check notices before treating
-work as done. A current check is not necessarily a passing check; inspect the expanded report
-for the recorded results. Dial does not claim shell or extension effects are checkpoint-reversible.
+Use `/review uncommitted` for an AI review or `/review files` to inspect checkpointed changes
+yourself. Read failures and stale-check notices before treating work as done. A current check is
+not necessarily a passing check; inspect the expanded report for the recorded results.
 
 ## Undo
 
-Use `/undo` to revert checkpointed edits. Read the report's reversibility warning: shell commands
-and extensions can have effects outside checkpoints. Undo is not a general rollback of every
-external action. To have `/undo` also restore project files that shell commands change, turn on
+Choose what you want to keep before restoring anything:
+
+- **Keep the conversation:** `/undo files` restores files from the most recent checkpoint.
+- **Rewind the conversation too:** `/undo` restores checkpointed edits and rewinds the turn.
+- **Decide file by file:** `/review files` lets you inspect the changes before choosing.
+
+Shell commands and extensions can have effects outside checkpoints. For example, neither form of
+undo stops a service. To capture project files changed by shell commands, see
 [`shell.undo_snapshot`](shell.md#undo-for-shell-changes).
 
 ## Resume
 
-Use `/resume` to find a previous conversation, or pick one from the home screen's recent list.
+If you remember the conversation title, use `/sessions` or pick it from the home screen. If you
+remember a phrase instead, use `/search <words>`, then `/search` to inspect the matching messages.
+Press **Enter** on a match to resume its conversation, or **Esc** to keep working here. After
+opening a hit, `/search back` returns to the conversation you started from.
 After an interruption or failure, send a new message to continue with the saved session and
 its unfinished tasks. Tell Dial what to retry or change rather than starting over unnecessarily.
 

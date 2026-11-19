@@ -171,13 +171,16 @@ impl Supervised {
         crate::platform::process::exited(&self.child)
     }
 
-    pub(super) fn stop(&mut self) {
+    pub(super) fn stop(&mut self) -> Option<std::process::ExitStatus> {
         if !self.stopped {
+            let prior = self.child.try_wait().ok().flatten();
             let _ = crate::platform::process::kill_group(self.child.id());
-            let _ = self.child.wait();
+            let waited = self.child.wait().ok();
             crate::platform::process::forget_group(self.child.id());
             self.stopped = true;
+            return prior.or(waited);
         }
+        None
     }
 }
 

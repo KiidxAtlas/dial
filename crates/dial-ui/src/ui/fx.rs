@@ -59,6 +59,18 @@ fn rgb(color: Option<Color>) -> Option<(u8, u8, u8)> {
     }
 }
 
+/// `a` blended toward `b` by `t` (`0.0..=1.0`) when both are truecolor; otherwise `a` unchanged,
+/// so indexed and mono themes keep their own solid color.
+pub fn blend(a: Color, b: Color, t: f32) -> Color {
+    match (rgb(Some(a)), rgb(Some(b))) {
+        (Some(a), Some(b)) => {
+            let (r, g, b) = mix(a, b, t);
+            Color::Rgb(r, g, b)
+        }
+        _ => a,
+    }
+}
+
 /// The theme's three brand stops as truecolor, or `None` when any of them is not truecolor.
 fn stops(theme: &Theme) -> Option<[(u8, u8, u8); 3]> {
     Some([

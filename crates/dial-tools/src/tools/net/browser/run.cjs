@@ -39,7 +39,193 @@ const PAGE_EXEC = async ({ kind, source, limit }) => {
       if (!condition) throw new Error(message === undefined ? 'Assertion failed' : String(message));
     };
     const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(Number(ms) || 0, 60000))));
-    return encode(await new AsyncFunction('assert', 'sleep', source)(assert, sleep));
+    const isElVisible = el => {
+      if (!el || !el.isConnected) return false;
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 || rect.height > 0;
+    };
+    const fireInputEvents = el => {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const setElementValue = (el, value) => {
+      const text = String(value ?? '');
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, text);
+        else el.value = text;
+        fireInputEvents(el);
+      } else if (el.isContentEditable) {
+        el.textContent = text;
+        fireInputEvents(el);
+      } else {
+        el.value = text;
+        fireInputEvents(el);
+      }
+    };
+    const queryAll = (finder) => (typeof finder === 'function' ? finder() : Array.from(document.querySelectorAll(finder)));
+    const makeLocator = (finder, index = null) => {
+      const resolveAll = () => queryAll(finder);
+      const resolveOne = () => {
+        const all = resolveAll();
+        return index === null ? (all[0] || null) : (all[index] || null);
+      };
+      const requireOne = () => {
+        const el = resolveOne();
+        if (!el) throw new Error(`Locator matched no elements: ${typeof finder === 'string' ? finder : 'custom locator'}`);
+        return el;
+      };
+      return {
+        first: () => makeLocator(finder, 0),
+        last: () => makeLocator(() => { const a = resolveAll(); return a.length ? [a[a.length - 1]] : []; }, 0),
+        nth: i => makeLocator(finder, i),
+        count: async () => resolveAll().length,
+        all: async () => resolveAll().map((_, i) => makeLocator(finder, i)),
+        elementHandle: async () => resolveOne(),
+        textContent: async () => resolveOne()?.textContent ?? null,
+        innerText: async () => resolveOne()?.innerText ?? '',
+        innerHTML: async () => resolveOne()?.innerHTML ?? '',
+        inputValue: async () => String(requireOne().value ?? ''),
+        getAttribute: async name => resolveOne()?.getAttribute(name) ?? null,
+        isVisible: async () => isElVisible(resolveOne()),
+        isHidden: async () => !isElVisible(resolveOne()),
+        isChecked: async () => Boolean(requireOne().checked),
+        isEnabled: async () => !requireOne().disabled,
+        isDisabled: async () => Boolean(requireOne().disabled),
+        click: async () => { const el = requireOne(); el.scrollIntoView?.({ block: 'center', inline: 'center' }); el.click(); },
+        focus: async () => { requireOne().focus(); },
+        fill: async value => { const el = requireOne(); el.focus?.(); setElementValue(el, value); },
+        type: async value => { const el = requireOne(); el.focus?.(); setElementValue(el, (el.value ?? '') + String(value ?? '')); },
+        check: async () => { const el = requireOne(); if (!el.checked) el.click(); },
+        uncheck: async () => { const el = requireOne(); if (el.checked) el.click(); },
+        selectOption: async value => {
+          const el = requireOne();
+          const wanted = Array.isArray(value) ? value.map(String) : [String(value)];
+          for (const opt of Array.from(el.options || [])) {
+            opt.selected = wanted.includes(opt.value) || wanted.includes(opt.textContent?.trim());
+          }
+          fireInputEvents(el);
+        },
+        boundingBox: async () => {
+          const el = resolveOne();
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        },
+        waitFor: async (opts = {}) => {
+          const state = opts?.state ?? 'visible';
+          const deadline = Date.now() + Math.min(Math.max(Number(opts?.timeout ?? 5000), 50), 30000);
+          for (;;) {
+            const el = resolveOne();
+            const ok = state === 'attached' ? Boolean(el)
+              : state === 'detached' ? !el
+              : state === 'hidden' ? !isElVisible(el)
+              : isElVisible(el);
+            if (ok) return;
+            if (Date.now() >= deadline) throw new Error(`Timed out waiting for locator state "${state}"`);
+            await sleep(50);
+          }
+        },
+        evaluate: async (fn, arg) => fn(requireOne(), arg),
+        evaluateAll: async (fn, arg) => fn(resolveAll(), arg),
+        allTextContents: async () => resolveAll().map(el => el.textContent ?? ''),
+        allInnerTexts: async () => resolveAll().map(el => el.innerText ?? ''),
+      };
+    };
+    const hostOnly = method => () => {
+      throw new Error(`page.${method}() is a host-side browser action and cannot run inside the page realm; use browser action="call" or action="${method}" instead`);
+    };
+    const dispatchKey = (key, type) => {
+      const target = document.activeElement || document.body || document.documentElement;
+      target.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true }));
+    };
+    const page = {
+      url: () => window.location.href,
+      title: async () => document.title,
+      content: async () => document.documentElement?.outerHTML ?? '',
+      evaluate: async (fn, ...args) => (typeof fn === 'function' ? fn(...args) : (0, eval)(fn)),
+      waitForTimeout: sleep,
+      waitForSelector: async (selector, opts) => {
+        const loc = makeLocator(selector);
+        await loc.waitFor(opts);
+        return document.querySelector(selector);
+      },
+      waitForFunction: async (fn, arg, opts = {}) => {
+        const deadline = Date.now() + Math.min(Math.max(Number(opts?.timeout ?? 5000), 50), 30000);
+        for (;;) {
+          const val = typeof fn === 'function' ? await fn(arg) : await (0, eval)(fn);
+          if (val) return val;
+          if (Date.now() >= deadline) throw new Error('Timed out waiting for function condition');
+          await sleep(50);
+        }
+      },
+      $: async selector => document.querySelector(selector),
+      $$: async selector => Array.from(document.querySelectorAll(selector)),
+      $eval: async (selector, fn, arg) => makeLocator(selector).evaluate(fn, arg),
+      $$eval: async (selector, fn, arg) => makeLocator(selector).evaluateAll(fn, arg),
+      locator: selector => makeLocator(selector),
+      getByTestId: id => makeLocator(`[data-testid="${CSS.escape(String(id))}"]`),
+      getByPlaceholder: text => makeLocator(() => Array.from(document.querySelectorAll('[placeholder]')).filter(el => (el.getAttribute('placeholder') || '').includes(String(text)))),
+      getByText: (text, opts = {}) => makeLocator(() => {
+        const exact = Boolean(opts?.exact);
+        const wanted = String(text);
+        return Array.from(document.querySelectorAll('*')).filter(el => {
+          if (el.children.length > 0 && Array.from(el.children).some(c => (c.textContent || '').includes(wanted))) return false;
+          const content = (el.textContent || '').trim();
+          return exact ? content === wanted : content.includes(wanted);
+        });
+      }),
+      getByRole: (role, opts = {}) => makeLocator(() => {
+        const r = String(role).toLowerCase();
+        const tagMap = { button: 'button,[role="button"],input[type="button"],input[type="submit"]', link: 'a[href],[role="link"]', textbox: 'input:not([type]),input[type="text"],input[type="search"],input[type="email"],textarea,[role="textbox"]', heading: 'h1,h2,h3,h4,h5,h6,[role="heading"]', checkbox: 'input[type="checkbox"],[role="checkbox"]' };
+        const selector = tagMap[r] || `[role="${CSS.escape(r)}"]`;
+        let els = Array.from(document.querySelectorAll(selector));
+        if (opts?.name !== undefined) {
+          const matcher = opts.name instanceof RegExp ? s => opts.name.test(s) : s => s.toLowerCase().includes(String(opts.name).toLowerCase());
+          els = els.filter(el => matcher((el.getAttribute('aria-label') || el.textContent || el.value || '').trim()));
+        }
+        return els;
+      }),
+      getByLabel: text => makeLocator(() => {
+        const wanted = String(text).toLowerCase();
+        const results = [];
+        for (const label of Array.from(document.querySelectorAll('label'))) {
+          if (!(label.textContent || '').toLowerCase().includes(wanted)) continue;
+          const forId = label.getAttribute('for');
+          const control = forId ? document.getElementById(forId) : label.querySelector('input,textarea,select');
+          if (control) results.push(control);
+        }
+        return results;
+      }),
+      textContent: selector => makeLocator(selector).textContent(),
+      innerText: selector => makeLocator(selector).innerText(),
+      innerHTML: selector => makeLocator(selector).innerHTML(),
+      getAttribute: (selector, name) => makeLocator(selector).getAttribute(name),
+      isVisible: selector => makeLocator(selector).isVisible(),
+      click: selector => makeLocator(selector).click(),
+      fill: (selector, value) => makeLocator(selector).fill(value),
+      type: (selector, value) => makeLocator(selector).type(value),
+      focus: selector => makeLocator(selector).focus(),
+      check: selector => makeLocator(selector).check(),
+      uncheck: selector => makeLocator(selector).uncheck(),
+      selectOption: (selector, value) => makeLocator(selector).selectOption(value),
+      keyboard: {
+        press: async key => { dispatchKey(key, 'keydown'); dispatchKey(key, 'keypress'); dispatchKey(key, 'keyup'); },
+        down: async key => { dispatchKey(key, 'keydown'); },
+        up: async key => { dispatchKey(key, 'keyup'); },
+        type: async text => { for (const ch of String(text ?? '')) { dispatchKey(ch, 'keydown'); dispatchKey(ch, 'keypress'); dispatchKey(ch, 'keyup'); } },
+      },
+      goto: hostOnly('goto'),
+      reload: hostOnly('reload'),
+      goBack: hostOnly('back'),
+      goForward: hostOnly('forward'),
+      screenshot: hostOnly('screenshot'),
+      route: hostOnly('route'),
+    };
+    return encode(await new AsyncFunction('assert', 'sleep', 'page', source)(assert, sleep, page));
   }
   return encode(await (0, eval)(source));
 };

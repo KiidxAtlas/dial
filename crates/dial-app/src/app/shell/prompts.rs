@@ -15,6 +15,7 @@ use crate::app::shell::{Shell, TICK};
 use crate::ui::composer::ComposerEvent;
 use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
+use crate::ui::term_state::Prompt;
 use crate::ui::text;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -311,21 +312,23 @@ impl Shell {
         options: &[(&str, char)],
         selected: usize,
     ) -> Option<usize> {
-        self.ask_with_selection(title, body, options, None, selected)
+        self.ask_with_selection(Prompt::Question, title, body, options, None, selected)
     }
 
     pub(in crate::app) fn ask_with_cancel(
         &mut self,
+        prompt: Prompt,
         title: &str,
         body: &str,
         options: &[(&str, char)],
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<usize> {
-        self.ask_with_selection(title, body, options, cancel, 0)
+        self.ask_with_selection(prompt, title, body, options, cancel, 0)
     }
 
     fn ask_with_selection(
         &mut self,
+        prompt: Prompt,
         title: &str,
         body: &str,
         options: &[(&str, char)],
@@ -343,7 +346,7 @@ impl Shell {
             return None;
         }
         // The terminal tab shows that Dial waits for an answer while the panel is up.
-        let was_waiting = std::mem::replace(&mut self.awaiting_user, true);
+        let was_waiting = self.awaiting_user.replace(prompt);
         let answer = self.ask_loop(title, body, options, cancel, selected);
         self.awaiting_user = was_waiting;
         answer

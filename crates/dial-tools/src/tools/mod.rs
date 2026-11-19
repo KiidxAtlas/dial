@@ -51,6 +51,7 @@ pub use exec::sandbox;
 pub use fs::delta::{CoveredRun, DeltaPlan};
 pub use fs::documents;
 pub use fs::files::NativeReadSelection;
+pub use fs::outline::available as outline_available;
 pub use integrations::ext;
 pub use knowledge::{codebase, provenance};
 pub mod vcs;
@@ -1005,13 +1006,50 @@ impl Workspace {
         self.resolve_literal(&expanded, false)
     }
 
+    fn expand_path_prefixes<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
+        if (input == "~" || input.starts_with("~/"))
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            let home = PathBuf::from(home);
+            let rest = input.strip_prefix("~/").unwrap_or("");
+            let joined = if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
+            return std::borrow::Cow::Owned(joined.to_string_lossy().into_owned());
+        }
+        for prefix in ["$TMPDIR", "${TMPDIR}"] {
+            if input == prefix || input.starts_with(&format!("{prefix}/")) {
+                let rest = input
+                    .strip_prefix(prefix)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                let scratch = self.root.join(crate::workspace_copy::SCRATCH_DIR);
+                let base = if scratch.exists() {
+                    scratch
+                } else if let Some(env_tmp) = std::env::var_os("TMPDIR") {
+                    PathBuf::from(env_tmp)
+                } else {
+                    scratch
+                };
+                let joined = if rest.is_empty() {
+                    base
+                } else {
+                    base.join(rest)
+                };
+                return std::borrow::Cow::Owned(joined.to_string_lossy().into_owned());
+            }
+        }
+        std::borrow::Cow::Borrowed(input)
+    }
+
     fn resolve_literal(&self, input: &str, read_only: bool) -> io::Result<PathBuf> {
         if input.contains('\0') {
             return Err(io::Error::other("path contains a NUL byte"));
         }
-        let path = Path::new(input);
-        // An explicit sensitive root may be nested beneath the primary workspace.
-        // Resolve it from that most-specific root, not through a protected ancestor.
+        let expanded = self.expand_path_prefixes(input);
+        let path = Path::new(expanded.as_ref());
         if !path.is_absolute() && !self.sensitive_roots.is_empty() {
             let absolute = Self::canonical_prefix(&self.root.join(path));
             if self.sensitive_access(&absolute) {
@@ -1049,8 +1087,18 @@ impl Workspace {
                         .find(|dir| dir.join(".git").exists())
                         .or_else(|| path.parent())
                         .unwrap_or(path);
+                    let dep_hint = if path.to_string_lossy().contains("/.cargo/registry/")
+                        || path.to_string_lossy().contains("/.cargo/git/")
+                        || path.to_string_lossy().contains("/.rustup/toolchains/")
+                        || path.to_string_lossy().contains("/site-packages/")
+                        || path.to_string_lossy().contains("/pkg/mod/")
+                    {
+                        " For dependency source code, use the `dep_source` tool (discoverable via `tool_search`) instead."
+                    } else {
+                        ""
+                    };
                     io::Error::new(io::ErrorKind::PermissionDenied, format!(
-                        "path {input:?} is outside the workspace; call `ask` action=directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.",
+                        "path {input:?} is outside the workspace; call `ask` action=directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.{dep_hint}",
                         project.display()
                     ))
                 })?
@@ -1431,9 +1479,9 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. On Windows sandbox.mode=dev uses Low integrity (project-confined writes); strict or allow_network=false uses an AppContainer (confined reads; no network); off uses your privileges. Save reusable scripts instead of resending them."
+                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. On Windows sandbox.mode=dev uses Low integrity (project-confined writes); strict or allow_network=false uses an AppContainer (confined reads; no network); off uses your privileges."
             } else {
-                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. Sandbox may confine writes and network; use $TMPDIR for temporary files. Save reusable scripts instead of resending them."
+                "bash: execute `command` with the configured shell (default embedded Bash; bundled utilities precede PATH). `cwd` selects the directory. Captures merged stdout/stderr with head/tail and raw exit status. Default foreground: wait until exit or timeout; use background only for services or work you will run beside, pty for terminal input. Sandbox may confine writes and network; use $TMPDIR for temporary files."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
@@ -1444,6 +1492,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported variables across commands with the same session name."},
                 "pty": {"type": "boolean", "description": "Start as a terminal `bg` job (default false). Incompatible with session and timeout."},
                 "timeout": {"type": "integer", "minimum": 1, "description": "Seconds to wait before the command is killed (or moved to `bg` when `shell.auto_background_secs` is enabled and shorter)."},
+                "idle_timeout": {"type": "integer", "minimum": 1, "description": "Opt-in: kill after this many seconds with no output (at most timeout). Not with background, pty or session."},
                 "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers)."},
                 "trace": {"type": "boolean", "description": "Run this foreground command under strace -f on Linux and append a summary of programs executed, failed exits, missing paths, permission denials, network activity and files written."},
             }),
@@ -1451,6 +1500,15 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         ),
         _ => return None,
     })
+}
+
+/// Argument names a built-in tool accepts beyond what its offered schema declares. The per-call
+/// trace allowlists these with the schema's own properties; unknown names never qualify.
+pub fn accepted_argument_names(tool: &str) -> Vec<&'static str> {
+    match tool {
+        "edit" => edit::editing::accepted_argument_names(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn schemas(names: &[&str], mode: EditMode) -> Result<Vec<Value>> {
@@ -1557,9 +1615,10 @@ fn read_streaming(
 
 /// Preview uses the same complete payload preparation but never repairs or writes.
 pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
-    if let Err(error) = edit::editing::validate_shape(ws.edit_mode, args) {
-        return ToolOutput::err(error);
-    }
+    let effective = match edit::editing::validate_effective_shape(ws.edit_mode, args) {
+        Ok(mode) => mode,
+        Err(error) => return ToolOutput::err(error),
+    };
     let mut preview = ws.clone();
     preview.native_edits = Arc::new(edit::edit_native::store::EditStore::default());
     preview.edits = Arc::new(Mutex::new(ws.store().clone()));
@@ -1568,7 +1627,7 @@ pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
         preview_no_change: Some(&no_change),
         ..Default::default()
     };
-    let result = if ws.edit_mode == EditMode::Hashline {
+    let result = if effective == EditMode::Hashline {
         edit::hashline::input_arg(args)
             .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
@@ -1586,11 +1645,13 @@ pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
     output.data = Some(json!({"edit_preview":{"no_change":no_change.get()}}));
     output
 }
-/// Preview of a partially streamed edit: an incomplete apply_patch envelope is not an error.
+/// Preview of a partially streamed edit: an incomplete apply_patch envelope is
+/// accepted instead of failing the preview.
 pub fn preview_edit_streaming(ws: &Workspace, args: &Value) -> ToolOutput {
-    if let Err(error) = edit::editing::validate_shape(ws.edit_mode, args) {
-        return ToolOutput::err(error);
-    }
+    let effective = match edit::editing::validate_effective_shape(ws.edit_mode, args) {
+        Ok(mode) => mode,
+        Err(error) => return ToolOutput::err(error),
+    };
     let mut preview = ws.clone();
     preview.native_edits = Arc::new(edit::edit_native::store::EditStore::default());
     preview.edits = Arc::new(Mutex::new(ws.store().clone()));
@@ -1599,7 +1660,7 @@ pub fn preview_edit_streaming(ws: &Workspace, args: &Value) -> ToolOutput {
         preview_no_change: Some(&no_change),
         ..Default::default()
     };
-    let result = if ws.edit_mode == EditMode::Hashline {
+    let result = if effective == EditMode::Hashline {
         edit::hashline::input_arg(args)
             .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
@@ -1784,7 +1845,8 @@ fn edit_for_workspace(
         preview_no_change: None,
         refuse_syntax_errors,
     };
-    if workspace.edit_mode == EditMode::Hashline {
+    let effective = edit::editing::effective_mode(workspace.edit_mode, args);
+    if effective == EditMode::Hashline {
         return edit::hashline::input_arg(args)
             .and_then(|input| edit::hashline::edit_output_with(workspace, input, true, &execution))
             .unwrap_or_else(|error| {

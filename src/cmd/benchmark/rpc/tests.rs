@@ -48,14 +48,160 @@ fn diagnostics_are_bounded_and_drained() {
     assert_eq!(*captured.lock().unwrap(), vec![b'x'; MAX_DIAGNOSTIC_BYTES]);
 }
 
+// Observe the real child launch without starting Dial or a model. Closing stdout after
+// recording argv deliberately stops the benchmark at the ready handshake.
+#[cfg(unix)]
+#[test]
+fn rpc_child_inherits_only_a_bounded_case_deadline() {
+    use clap::Parser as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("rpc-child");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DIAL_HOME/args\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for limit in [180, 0] {
+        let home = tempfile::tempdir().unwrap();
+        let error = run_configured(
+            &child,
+            home.path(),
+            &BenchmarkCase::default(),
+            dir.path(),
+            CaseLimits {
+                wall_secs: limit,
+                inactivity_secs: 0,
+            },
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("benchmark RPC closed"),
+            "{error:#}"
+        );
+        let args = std::fs::read_to_string(home.path().join("args")).unwrap();
+        let cli =
+            crate::args::Cli::try_parse_from(std::iter::once("dial").chain(args.lines())).unwrap();
+        match limit {
+            0 => assert!(cli.model_flags.max_time.is_none()),
+            _ => assert!(
+                cli.model_flags
+                    .max_time
+                    .is_some_and(|s| s > 0.0 && s <= limit as f64),
+                "missing or invalid child time budget: {args}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn live_progress_is_kept_beside_usage_and_cleared_by_usage() {
+    let mut metrics = RunMetrics::default();
+    observe(
+        &mut metrics,
+        &json!({"event":"model_progress","progress":{"phase":"generating","output_tokens":17,"prompt_tokens":40,"estimated":true,"tokens_per_second":3.5}}),
+    );
+    assert_eq!(
+        metrics
+            .inflight_progress
+            .as_ref()
+            .and_then(|p| p.output_tokens),
+        Some(17)
+    );
+    assert_eq!((metrics.prompt_tokens, metrics.output_tokens), (0, 0));
+    assert!(!metrics.token_usage_observed && !metrics.token_usage_incomplete);
+    assert_eq!(
+        metrics.last_child_event.as_ref().map(|e| e.kind.as_str()),
+        Some("model_progress")
+    );
+    observe(
+        &mut metrics,
+        &json!({"event":"usage","prompt_tokens":40,"output_tokens":17}),
+    );
+    assert_eq!(metrics.inflight_progress, None);
+    assert_eq!((metrics.prompt_tokens, metrics.output_tokens), (40, 17));
+}
+
+// A child that is ready, accepts one send, reports live generation and then stalls silently.
+// The deadline must keep the live counts and must not present unread usage as zero.
+#[cfg(unix)]
+#[test]
+fn timeout_during_generation_keeps_live_counts_without_claiming_zero_usage() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("rpc-child");
+    std::fs::write(
+        &child,
+        r#"#!/bin/sh
+printf '%s\n' '{"event":"ready"}'
+read -r _request
+printf '%s\n' '{"event":"model_progress","progress":{"phase":"generating","output_tokens":17}}'
+sleep 30
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let error = run_configured(
+        &child,
+        home.path(),
+        &BenchmarkCase::default(),
+        dir.path(),
+        CaseLimits {
+            wall_secs: 1,
+            inactivity_secs: 0,
+        },
+        None,
+        None,
+    )
+    .unwrap_err();
+    let AgentFailure { metrics, detail } = error
+        .downcast::<AgentFailure>()
+        .expect("a timed-out case keeps its observed metrics");
+    assert!(metrics.agent_error && !metrics.agent_succeeded);
+    assert!(!metrics.token_usage_observed);
+    assert!(
+        metrics.token_usage_incomplete,
+        "a send with no ledger read is unknown usage, not zero"
+    );
+    assert_eq!(
+        metrics
+            .inflight_progress
+            .as_ref()
+            .and_then(|p| p.output_tokens),
+        Some(17)
+    );
+    assert!(detail.contains("timed out"), "{detail}");
+    assert!(detail.contains("send"), "{detail}");
+    assert!(
+        detail.contains("last child event model_progress") && detail.contains("in flight"),
+        "{detail}"
+    );
+}
+
 #[test]
 fn closed_rpc_is_not_misreported_as_timeout() {
     let (tx, rx) = mpsc::channel();
     drop(tx);
-    let error = receive(&rx, Some(Instant::now() + Duration::from_secs(1))).unwrap_err();
+    let error = receive(
+        &rx,
+        Guard::wall(Some(Instant::now() + Duration::from_secs(1))),
+        &RunMetrics::default(),
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "benchmark RPC closed");
     let (_tx, rx) = mpsc::channel();
-    let error = receive(&rx, Some(Instant::now())).unwrap_err();
+    let error = receive(
+        &rx,
+        Guard::wall(Some(Instant::now())),
+        &RunMetrics::default(),
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "benchmark RPC timed out");
 }
 
@@ -64,7 +210,12 @@ fn expired_receive_rejects_buffered_events_and_replies() {
     for event in [json!({"event":"ready"}), json!({"id":4,"result":{}})] {
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(event)).unwrap();
-        let error = receive(&rx, Some(Instant::now())).unwrap_err();
+        let error = receive(
+            &rx,
+            Guard::wall(Some(Instant::now())),
+            &RunMetrics::default(),
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "benchmark RPC timed out");
     }
 }
@@ -79,7 +230,7 @@ fn request_failures_identify_the_pending_operation_without_logging_params() {
         4,
         "compact",
         json!({"private_context":"not-for-diagnostics"}),
-        Some(Instant::now()),
+        Guard::wall(Some(Instant::now())),
         &mut RunMetrics::default(),
     )
     .unwrap_err();
@@ -107,6 +258,69 @@ fn deadline_failures_attribute_time_to_completed_and_pending_phases() {
         phases.summary(started, started + Duration::from_secs(180)),
         "case elapsed 180.0 s; completed: ready 3.0 s, send#1 40.0 s, compact#2 57.0 s; \
          pending for 80.0 s"
+    );
+}
+
+#[test]
+fn timing_survives_a_lost_reply_and_only_counts_passes_from_this_send() {
+    let mut metrics = RunMetrics::default();
+    for (id, method, events) in [
+        (
+            1,
+            "send",
+            vec![
+                json!({"event":"tool_result","is_error":false}),
+                json!({"event":"check_passed","request_id":2}),
+                json!({"id":1,"result":{}}),
+            ],
+        ),
+        (
+            2,
+            "send",
+            vec![
+                json!({"event":"check_passed","request_id":2}),
+                json!({"event":"check_passed","request_id":2}),
+                json!({"id":2,"result":{}}),
+            ],
+        ),
+        (
+            3,
+            "send",
+            vec![json!({"event":"check_passed","request_id":3})],
+        ),
+        (
+            4,
+            "state",
+            vec![
+                json!({"event":"check_passed","request_id":4}),
+                json!({"id":4,"result":{}}),
+            ],
+        ),
+    ] {
+        let (tx, rx) = mpsc::channel();
+        for event in events {
+            tx.send(Ok(event)).unwrap();
+        }
+        drop(tx);
+        let result = request(
+            &mut Vec::new(),
+            &rx,
+            id,
+            method,
+            json!({}),
+            Guard::wall(None),
+            &mut metrics,
+        );
+        assert_eq!(result.is_err(), id == 3);
+    }
+    let observed: Vec<_> = metrics
+        .post_check_timings
+        .iter()
+        .map(|t| (t.send_id, t.end))
+        .collect();
+    assert_eq!(
+        observed,
+        [(2, PostCheckEnd::Reply), (3, PostCheckEnd::RpcError)]
     );
 }
 
@@ -429,4 +643,134 @@ fn worker_counters_sum_only_when_every_worker_reports_them() {
         });
         assert_eq!(actual, expected, "{name}");
     }
+}
+
+// Scripted children for the inactivity guard. Each speaks just enough RPC for one send, state and
+// shutdown; the first send's reply is the only one that differs between them.
+#[cfg(unix)]
+const SILENT_CHILD: &str = r#"#!/bin/sh
+printf '%s\n' '{"event":"ready"}'
+read -r _request
+sleep 30
+"#;
+#[cfg(unix)]
+const HEARTBEAT_CHILD: &str = r#"#!/bin/sh
+printf '%s\n' '{"event":"ready"}'
+read -r _request
+i=0
+while [ $i -lt 150 ]; do
+  printf '%s\n' '{"event":"model_progress","progress":{"phase":"generating","output_tokens":5}}'
+  sleep 0.2
+  i=$((i+1))
+done
+"#;
+#[cfg(unix)]
+const PROGRESSING_CHILD: &str = r#"#!/bin/sh
+printf '%s\n' '{"event":"ready"}'
+read -r _request
+i=0
+while [ $i -lt 10 ]; do
+  sleep 0.2
+  printf '%s\n' "{\"event\":\"model_progress\",\"progress\":{\"phase\":\"generating\",\"output_tokens\":$i}}"
+  i=$((i+1))
+done
+printf '%s\n' '{"id":1,"result":{"text":"done","interrupted":false,"metrics":{"turns_completed":1}}}'
+read -r _request
+printf '%s\n' '{"id":2,"result":{}}'
+read -r _request
+printf '%s\n' '{"id":3,"result":{}}'
+"#;
+
+/// The inactivity bound is opt-in, separate from the wall deadline, and restarts only on meaningful
+/// progress. Failures keep the metrics observed before the bound fired.
+#[cfg(unix)]
+#[test]
+fn inactivity_guard_is_opt_in_and_resets_only_on_meaningful_progress() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // (child script, wall s, inactivity s, expected failure needle or None for success,
+    //  output tokens preserved from in-flight progress)
+    type Row = (&'static str, u64, u64, Option<&'static str>, Option<u64>);
+    let cases: [Row; 4] = [
+        (
+            SILENT_CHILD,
+            0,
+            1,
+            Some("inactive: no meaningful progress for 1 s"),
+            None,
+        ),
+        // Identical progress reports do not reset the window, so the bound still fires.
+        (HEARTBEAT_CHILD, 0, 1, Some("inactive"), Some(5)),
+        // Advancing progress keeps a 2 s generation alive under a 1 s bound.
+        (PROGRESSING_CHILD, 0, 1, None, None),
+        // Without the opt-in, silence ends at the wall deadline and never as an inactivity failure.
+        (SILENT_CHILD, 1, 0, Some("timed out"), None),
+    ];
+    for (script, wall, inactivity, expected, preserved) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("rpc-child");
+        std::fs::write(&child, script).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let outcome = run_configured(
+            &child,
+            home.path(),
+            &BenchmarkCase::default(),
+            dir.path(),
+            CaseLimits {
+                wall_secs: wall,
+                inactivity_secs: inactivity,
+            },
+            None,
+            None,
+        );
+        match (outcome, expected) {
+            (Ok(metrics), None) => {
+                assert!(metrics.agent_succeeded && !metrics.agent_error);
+                assert_eq!(metrics.turns_completed, 1);
+            }
+            (Err(error), Some(needle)) => {
+                let AgentFailure { metrics, detail } = error
+                    .downcast::<AgentFailure>()
+                    .expect("a bounded case keeps its observed metrics");
+                assert!(detail.contains(needle), "{detail}");
+                assert!(metrics.agent_error && !metrics.agent_succeeded);
+                assert!(!metrics.token_usage_observed && metrics.token_usage_incomplete);
+                assert_eq!(
+                    metrics
+                        .inflight_progress
+                        .as_ref()
+                        .and_then(|p| p.output_tokens),
+                    preserved
+                );
+                assert_eq!(
+                    detail.contains("in flight"),
+                    preserved.is_some(),
+                    "{detail}"
+                );
+            }
+            (outcome, expected) => panic!(
+                "expected {expected:?}, got {:?}",
+                outcome.map(|metrics| metrics.agent_succeeded)
+            ),
+        }
+    }
+}
+
+#[test]
+fn inactivity_limit_cannot_exceed_the_wall_deadline() {
+    let error = run_configured(
+        Path::new("unused"),
+        Path::new("unused"),
+        &BenchmarkCase::default(),
+        Path::new("unused"),
+        CaseLimits {
+            wall_secs: 10,
+            inactivity_secs: 11,
+        },
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("inactivity limit"), "{error}");
 }

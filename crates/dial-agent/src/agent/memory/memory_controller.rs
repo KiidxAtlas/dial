@@ -545,9 +545,11 @@ pub(in crate::agent) struct Worker {
     memory: std::sync::Arc<crate::storage::memory_backend::MemoryRuntime>,
     frozen: crate::config::types::Config,
     body: Option<crate::runtime::Body>,
+    /// The owner asked this pass to stop for foreground work; its error is then not a failure.
+    yielded: bool,
 }
 impl Worker {
-    fn settle(&mut self, phase: crate::runtime::Phase) {
+    fn settle(&mut self, phase: crate::runtime::Phase, text: String) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Account(_, id, usage, accepted, tx) => {
@@ -570,17 +572,36 @@ impl Worker {
         let (total, turn) = self.scope.snapshot();
         if let Some(body) = self.body.take() {
             body.settle(
-                "Selected memory maintenance settled".into(),
+                text,
                 Some(json!({"usage_total":total,"usage_turn":turn})),
                 phase,
             );
         }
     }
 }
+/// Journal text of a pass that ended without a failure to report.
+const SETTLED: &str = "Selected memory maintenance settled";
+/// Wait between maintenance passes while each one finishes.
+const PASS_INTERVAL: Duration = Duration::from_secs(30);
+/// Longest wait between passes after repeated failures.
+const MAX_PASS_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// How a maintenance pass ended, for pacing the next one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PassEnd {
+    Completed,
+    /// Stopped for foreground work; says nothing about whether the pass can succeed.
+    Yielded,
+    Failed,
+}
+
 #[derive(Default)]
 pub(in crate::agent) struct Controller {
     worker: Option<Worker>,
     last_start: Option<Instant>,
+    /// Passes that failed in a row. An idle session otherwise repeats a pass that cannot succeed
+    /// every `PASS_INTERVAL`, journaling one record each time.
+    failed_passes: u32,
     pub(in crate::agent) capture: Option<crate::agent::memory::memory_capture::Capture>,
     pub(in crate::agent) active_capture: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(in crate::agent) compaction_advice:
@@ -589,6 +610,24 @@ pub(in crate::agent) struct Controller {
 impl Controller {
     pub(in crate::agent) fn has_worker(&self) -> bool {
         self.worker.is_some()
+    }
+    /// Wait before the next pass: `PASS_INTERVAL`, doubled for each pass that failed in a row, up
+    /// to `MAX_PASS_INTERVAL`.
+    fn pass_interval(&self) -> Duration {
+        PASS_INTERVAL
+            .saturating_mul(1 << self.failed_passes.min(16))
+            .min(MAX_PASS_INTERVAL)
+    }
+    fn pass_due(&self) -> bool {
+        self.last_start
+            .is_none_or(|last| last.elapsed() >= self.pass_interval())
+    }
+    fn pass_ended(&mut self, end: PassEnd) {
+        match end {
+            PassEnd::Completed => self.failed_passes = 0,
+            PassEnd::Yielded => {}
+            PassEnd::Failed => self.failed_passes = self.failed_passes.saturating_add(1),
+        }
     }
 }
 impl Drop for Controller {
@@ -601,7 +640,7 @@ impl Drop for Controller {
         }
         if let Some(worker) = &mut self.worker {
             worker.memory.cancel();
-            worker.settle(crate::runtime::Phase::Interrupted);
+            worker.settle(crate::runtime::Phase::Interrupted, SETTLED.into());
         }
     }
 }
@@ -630,10 +669,7 @@ impl Agent<'_> {
             return Ok(true);
         }
         Ok(self.memory_runtime.is_some()
-            && self
-                .memory_controller
-                .last_start
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+            && self.memory_controller.pass_due()
             && self.auth_config.memory_uses_local_compute())
     }
     fn retire_capture_for_clear(&mut self) {
@@ -656,7 +692,7 @@ impl Agent<'_> {
                     "view" => &[Scope::Project, Scope::Global],
                     "view project" => &[Scope::Project],
                     "view global" => &[Scope::Global],
-                    _ => anyhow::bail!("usage: /memory view [project|global]"),
+                    _ => anyhow::bail!("Usage: /memory view [project|global]"),
                 };
                 let mut banks = Vec::new();
                 for scope in scopes {
@@ -697,7 +733,7 @@ impl Agent<'_> {
                 let scope = match input {
                     "clear" | "clear project" => Scope::Project,
                     "clear global" => Scope::Global,
-                    _ => anyhow::bail!("usage: /memory clear [project|global]"),
+                    _ => anyhow::bail!("Usage: /memory clear [project|global]"),
                 };
                 let call = memory_call(
                     "forget",
@@ -937,21 +973,28 @@ impl Agent<'_> {
         let Some(memory) = self.memory_runtime.clone() else {
             return;
         };
-        if busy || self.memory_controller.capture.is_some() || !ui.maintenance_ready() {
+        let yielding = busy || self.memory_controller.capture.is_some() || !ui.maintenance_ready();
+        if yielding {
             memory.stop_maintenance();
         }
         let mut controller = std::mem::take(&mut self.memory_controller);
+        if busy {
+            // A turn changes what there is to maintain: the next idle pass is not a repeat.
+            controller.failed_passes = 0;
+        }
         if busy && let Some(capture) = controller.capture.take() {
             capture.retire();
         }
         if let Some(mut worker) = controller.worker.take() {
+            worker.yielded |= yielding;
             let mut done = false;
             loop {
                 let event = match worker.events.try_recv() {
                     Ok(event) => event,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        worker.settle(crate::runtime::Phase::Failed);
+                        worker.settle(crate::runtime::Phase::Failed, SETTLED.into());
+                        controller.pass_ended(PassEnd::Failed);
                         done = true;
                         break;
                     }
@@ -990,18 +1033,31 @@ impl Agent<'_> {
                     Event::Write(op, targets, tx) => {
                         let _ = tx.send(runner.authorize_managed_write(&op, &targets));
                     }
-                    Event::Done(result) => {
-                        let phase = if result.is_ok() {
-                            crate::runtime::Phase::Completed
+                    Event::Done(Ok(())) => {
+                        controller.pass_ended(PassEnd::Completed);
+                        worker.settle(crate::runtime::Phase::Completed, SETTLED.into());
+                        done = true;
+                        break;
+                    }
+                    Event::Done(Err(error)) => {
+                        let yielded = worker.yielded
+                            || self.interrupt.load(std::sync::atomic::Ordering::SeqCst)
+                            || self.maintenance_has_live_work();
+                        controller.pass_ended(if yielded {
+                            PassEnd::Yielded
                         } else {
-                            crate::runtime::Phase::Interrupted
-                        };
-                        if let Err(error) = result {
-                            ui.diagnostic(&format!(
-                                "Selected memory maintenance did not finish: {error:#}"
-                            ));
-                        }
-                        worker.settle(phase);
+                            PassEnd::Failed
+                        });
+                        // The journal keeps the reason: a diagnostic is hidden on most surfaces.
+                        let text = format!(
+                            "Selected memory maintenance did not finish: {}",
+                            memory_backend::redact(&format!("{error:#}"))
+                        );
+                        ui.diagnostic(&format!(
+                            "{text}; next pass in {} s at the earliest",
+                            controller.pass_interval().as_secs()
+                        ));
+                        worker.settle(crate::runtime::Phase::Interrupted, text);
                         done = true;
                         break;
                     }
@@ -1026,9 +1082,7 @@ impl Agent<'_> {
             && self.approval != crate::config::types::Approval::Readonly
             && ui.maintenance_ready()
             && !self.maintenance_has_live_work()
-            && controller
-                .last_start
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+            && controller.pass_due()
         {
             let authority = memory_authority(&self.session, 0);
             memory.bind(authority.clone());
@@ -1075,6 +1129,7 @@ impl Agent<'_> {
                         memory: owned_memory,
                         frozen,
                         body: Some(body),
+                        yielded: false,
                     });
                 }
                 Err(error) => ui.diagnostic(&format!("Cannot start memory maintenance: {error}")),
@@ -1101,7 +1156,7 @@ impl Agent<'_> {
             if Instant::now() >= deadline {
                 if let Some(mut worker) = self.memory_controller.worker.take() {
                     worker.memory.cancel();
-                    worker.settle(crate::runtime::Phase::Interrupted);
+                    worker.settle(crate::runtime::Phase::Interrupted, SETTLED.into());
                 }
                 return;
             }
@@ -1113,10 +1168,13 @@ impl Agent<'_> {
             if self.memory_controller.last_start != started {
                 if let Some(mut worker) = self.memory_controller.worker.take() {
                     worker.memory.cancel();
-                    worker.settle(crate::runtime::Phase::Interrupted);
+                    worker.settle(crate::runtime::Phase::Interrupted, SETTLED.into());
                 }
                 return;
             }
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

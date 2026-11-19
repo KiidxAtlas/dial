@@ -290,6 +290,38 @@ impl Session {
         Ok(found)
     }
 
+    /// Best-effort display titles for a search page. Walk the project catalogue once and
+    /// summarize only exact filename matches. A missing journal never hides a search hit.
+    pub fn search_titles(layout: &Layout, hits: &[SearchHit]) -> HashMap<String, String> {
+        if hits.is_empty() {
+            return HashMap::new();
+        }
+        let wanted: HashSet<_> = hits.iter().map(|hit| hit.session_id.as_str()).collect();
+        let paths = session_files(&layout.sessions_dir()).unwrap_or_default();
+        let candidates = paths
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(file_id)
+                    .is_some_and(|id| wanted.contains(id))
+            })
+            .collect();
+        let mut titles = HashMap::new();
+        for info in Self::list_paths(candidates, usize::MAX).unwrap_or_default() {
+            if info
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(file_id)
+                == Some(info.id.as_str())
+            {
+                titles.entry(info.id).or_insert(info.title);
+            }
+        }
+        titles
+    }
+
     /// Summaries of `paths` in order, up to `limit`; unreadable journals are skipped. Unchanged
     /// journals come from the listing index instead of being parsed again.
     fn list_paths(paths: Vec<PathBuf>, limit: usize) -> Result<Vec<SessionInfo>> {

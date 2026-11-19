@@ -10,7 +10,7 @@
 use super::model_download::Step;
 pub use super::model_download::{DownloadFailure, ModelDownloads, SharedModelDownloads};
 use super::{
-    DrawCtx, OverlayEvent,
+    DrawCtx, OverlayEvent, PresetAction,
     settings::{
         filled, fit, highlighted, hint, hint_line, is_ctrl, match_style, other_scope, pair_label,
         panel, pressed, scope_name, scroll_cell, typed_char,
@@ -19,8 +19,12 @@ use super::{
 use crate::{
     config::paths::Layout,
     config::settings_store::Scope,
-    llm::catalog::{Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus},
-    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label},
+    llm::catalog::{
+        Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus, documented_thinking_levels,
+    },
+    llm::model_config::{
+        ModelPreset, ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label,
+    },
     setup::embeddings,
     stats::{ModelUsage, local_models::Settings},
     ui::{
@@ -198,6 +202,37 @@ struct Chooser {
     cursor: usize,
 }
 
+/// Choosing a thinking level for a role's model: right after picking the model (`assign`), or
+/// `t` on a Roles row to change only the level.
+struct ThinkingPick {
+    role: String,
+    /// `Some`: confirming assigns this model with the chosen level; `None`: only the level changes.
+    assign: Option<ModelSelection>,
+    name: String,
+    /// `default` first, then the model's documented levels (and `auto` for main).
+    levels: Vec<&'static str>,
+    cursor: usize,
+}
+
+/// An inline prompt on the Roles tab's preset rows.
+enum PresetPrompt {
+    /// Typing a name for a new preset, or a new name for `rename`.
+    Name {
+        rename: Option<String>,
+        text: String,
+    },
+    /// Waiting for y/Enter to delete the named preset.
+    Delete(String),
+}
+
+/// One row of the Roles tab: a role, the "save as preset" row heading the presets, or a preset.
+#[derive(Clone, Copy)]
+enum RoleRow<'a> {
+    Role(&'static str),
+    NewPreset,
+    Preset(&'a str, &'a ModelPreset),
+}
+
 struct AssignmentReview {
     transaction: crate::config::settings_store::ModelConfigReview,
     event: Option<OverlayEvent>,
@@ -249,6 +284,10 @@ pub struct ModelOverlay {
     /// Picking a model for this role (started from the Roles view).
     target_role: Option<String>,
     chooser: Option<Chooser>,
+    thinking: Option<ThinkingPick>,
+    /// Saved model presets, listed under the roles on the Roles tab.
+    presets: Vec<(String, ModelPreset)>,
+    preset_prompt: Option<PresetPrompt>,
     review: Option<AssignmentReview>,
     /// A downloaded local model Ctrl+D asked to delete, waiting for confirmation.
     deletion: Option<LocalRemoval>,
@@ -927,6 +966,9 @@ impl ModelOverlay {
             target_role: None,
             project_name: "this project".into(),
             chooser: None,
+            thinking: None,
+            presets: Vec::new(),
+            preset_prompt: None,
             review: None,
             deletion: None,
             deletion_scroll: 0,
@@ -1260,6 +1302,8 @@ impl ModelOverlay {
             || self.deletion.is_some()
             || self.headers_editor.is_some()
             || self.chooser.is_some()
+            || self.thinking.is_some()
+            || self.preset_prompt.is_some()
         {
             return false;
         }
@@ -1372,6 +1416,291 @@ impl ModelOverlay {
                         .position(|(entry, _)| same_model(&entry.selection, &a))
                 })
                 .unwrap_or_else(|| self.cursor.min(rows.len().saturating_sub(1)));
+        }
+    }
+
+    /// The saved model presets the Roles tab lists under the roles.
+    pub fn set_presets(&mut self, presets: &BTreeMap<String, ModelPreset>) {
+        self.presets = presets
+            .iter()
+            .map(|(name, preset)| (name.clone(), preset.clone()))
+            .collect();
+        if self.group == Group::Roles {
+            self.cursor = self.cursor.min(self.role_rows_len().saturating_sub(1));
+        }
+    }
+
+    /// Roles tab rows: every visible role, the "save as preset" row, then each preset.
+    fn role_rows_len(&self) -> usize {
+        self.visible_roles().len() + 1 + self.presets.len()
+    }
+
+    fn role_row(&self, index: usize) -> RoleRow<'_> {
+        let roles = self.visible_roles();
+        match index.checked_sub(roles.len()) {
+            None => RoleRow::Role(roles[index].0),
+            Some(0) => RoleRow::NewPreset,
+            Some(at) => self
+                .presets
+                .get(at - 1)
+                .map_or(RoleRow::NewPreset, |(name, preset)| {
+                    RoleRow::Preset(name, preset)
+                }),
+        }
+    }
+
+    /// The Roles tab row under the cursor.
+    fn current_role_row(&self) -> RoleRow<'_> {
+        self.role_row(self.cursor.min(self.role_rows_len() - 1))
+    }
+
+    /// Whether `preset` holds exactly the models and thinking levels the roles use now.
+    fn preset_is_active(&self, preset: &ModelPreset) -> bool {
+        let same = |a: Option<&ModelSelection>, b: Option<&ModelSelection>| match (a, b) {
+            (Some(a), Some(b)) => same_model(a, b) && a.thinking == b.thinking,
+            (None, None) => true,
+            _ => false,
+        };
+        preset.main.is_some()
+            && same(preset.main.as_ref(), self.role_selection("main"))
+            && self
+                .visible_roles()
+                .iter()
+                .filter(|(role, _)| *role != "main")
+                .all(|(role, _)| same(preset.roles.get(*role), self.role_selection(role)))
+    }
+
+    /// Thinking levels to offer for `selection` in `role`: empty when the catalog documents none.
+    fn thinking_levels(role: &str, selection: &ModelSelection) -> Vec<&'static str> {
+        let main = role == "main";
+        let mut levels = documented_thinking_levels(&selection.provider, &selection.model, !main);
+        if levels.is_empty() {
+            return levels;
+        }
+        levels.insert(0, "default");
+        if main {
+            levels.push("auto");
+        }
+        levels
+    }
+
+    /// Assign `selection` to `role`, first asking for its thinking level when the model has levels.
+    fn assign_with_thinking(
+        &mut self,
+        role: String,
+        mut selection: ModelSelection,
+        name: String,
+    ) -> OverlayEvent {
+        let levels = Self::thinking_levels(&role, &selection);
+        if levels.is_empty() {
+            selection.thinking = None;
+            return OverlayEvent::AssignModel {
+                role,
+                selection,
+                scope: self.scope,
+            };
+        }
+        // Re-picking the current model starts at its current level.
+        let current = self
+            .role_selection(&role)
+            .filter(|assigned| same_model(assigned, &selection))
+            .and_then(|assigned| assigned.thinking.clone());
+        let cursor = current
+            .and_then(|level| levels.iter().position(|l| *l == level))
+            .unwrap_or(0);
+        selection.thinking = None;
+        self.thinking = Some(ThinkingPick {
+            role,
+            assign: Some(selection),
+            name,
+            levels,
+            cursor,
+        });
+        OverlayEvent::None
+    }
+
+    /// `t` on a role row: change only the thinking level of the role's model.
+    fn open_thinking(&mut self, role: &'static str) {
+        let Some(selection) = self
+            .role_selection(role)
+            .filter(|_| {
+                role == "main"
+                    || self
+                        .roles
+                        .iter()
+                        .any(|s| s.role == role && s.source == RoleSource::Assigned)
+            })
+            .cloned()
+        else {
+            self.set_status(
+                format!(
+                    "{} follows another model: press Enter to pick its own model first",
+                    role_label(role)
+                ),
+                true,
+            );
+            return;
+        };
+        let levels = Self::thinking_levels(role, &selection);
+        if levels.is_empty() {
+            self.set_status(
+                format!(
+                    "Dial knows no thinking levels for {}; /effort lists them once a profile declares them",
+                    selection.display_name()
+                ),
+                true,
+            );
+            return;
+        }
+        let cursor = selection
+            .thinking
+            .as_deref()
+            .and_then(|level| levels.iter().position(|l| *l == level))
+            .unwrap_or(0);
+        self.thinking = Some(ThinkingPick {
+            role: role.to_owned(),
+            assign: None,
+            name: selection.display_name(),
+            levels,
+            cursor,
+        });
+    }
+
+    fn thinking_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        let Some(pick) = &mut self.thinking else {
+            return OverlayEvent::None;
+        };
+        let last = pick.levels.len() - 1;
+        if keys.matches(Action::SelectCancel, key) {
+            let assigning = pick.assign.is_some();
+            self.thinking = None;
+            if assigning {
+                self.set_status("Cancelled; the role keeps its model.".into(), false);
+            }
+        } else if keys.matches(Action::SelectUp, key) {
+            pick.cursor = if pick.cursor == 0 {
+                last
+            } else {
+                pick.cursor - 1
+            };
+        } else if keys.matches(Action::SelectDown, key) {
+            pick.cursor = if pick.cursor >= last {
+                0
+            } else {
+                pick.cursor + 1
+            };
+        } else if keys.matches(Action::SelectConfirm, key) {
+            let pick = self.thinking.take().expect("thinking pick is open");
+            let level = pick.levels[pick.cursor];
+            return match pick.assign {
+                Some(mut selection) => {
+                    selection.thinking = (level != "default").then(|| level.to_owned());
+                    OverlayEvent::AssignModel {
+                        role: pick.role,
+                        selection,
+                        scope: self.scope,
+                    }
+                }
+                None => OverlayEvent::SetThinking {
+                    role: pick.role,
+                    level: level.to_owned(),
+                    scope: self.scope,
+                },
+            };
+        }
+        OverlayEvent::None
+    }
+
+    /// Keys the Roles tab handles itself: `t` on a role row; Enter, `n`, `e`, `r` and `x` on preset rows.
+    fn roles_key(&mut self, key: &KeyEvent, keys: &Keymap) -> Option<OverlayEvent> {
+        let confirm = keys.matches(Action::SelectConfirm, key);
+        let delete = key.code == KeyCode::Delete;
+        let typed = typed_char(key);
+        match self.current_role_row() {
+            RoleRow::Role(role) if typed == Some('t') => {
+                self.open_thinking(role);
+                Some(OverlayEvent::None)
+            }
+            // `n` names a new preset from any Roles row, so it never starts a model search here.
+            RoleRow::Role(_) | RoleRow::NewPreset if confirm || typed == Some('n') => {
+                if confirm && matches!(self.current_role_row(), RoleRow::Role(_)) {
+                    return None;
+                }
+                self.preset_prompt = Some(PresetPrompt::Name {
+                    rename: None,
+                    text: String::new(),
+                });
+                Some(OverlayEvent::None)
+            }
+            RoleRow::Role(_) | RoleRow::NewPreset => None,
+            RoleRow::Preset(name, _) => {
+                let name = name.to_owned();
+                let event = if confirm {
+                    OverlayEvent::Preset(PresetAction::Apply(name))
+                } else if typed == Some('n') {
+                    self.preset_prompt = Some(PresetPrompt::Name {
+                        rename: None,
+                        text: String::new(),
+                    });
+                    OverlayEvent::None
+                } else if matches!(typed, Some('e' | 'u')) {
+                    OverlayEvent::Preset(PresetAction::Update(name))
+                } else if typed == Some('r') {
+                    self.preset_prompt = Some(PresetPrompt::Name {
+                        text: name.clone(),
+                        rename: Some(name),
+                    });
+                    OverlayEvent::None
+                } else if delete || typed == Some('x') {
+                    self.preset_prompt = Some(PresetPrompt::Delete(name));
+                    OverlayEvent::None
+                } else {
+                    return None;
+                };
+                Some(event)
+            }
+        }
+    }
+
+    fn prompt_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        let Some(prompt) = self.preset_prompt.take() else {
+            return OverlayEvent::None;
+        };
+        if keys.matches(Action::SelectCancel, key) {
+            return OverlayEvent::None;
+        }
+        match prompt {
+            PresetPrompt::Delete(name) => match typed_char(key) {
+                _ if keys.matches(Action::SelectConfirm, key) => {
+                    OverlayEvent::Preset(PresetAction::Delete(name))
+                }
+                Some('y' | 'Y') => OverlayEvent::Preset(PresetAction::Delete(name)),
+                Some('n' | 'N') => OverlayEvent::None,
+                _ => {
+                    self.preset_prompt = Some(PresetPrompt::Delete(name));
+                    OverlayEvent::None
+                }
+            },
+            PresetPrompt::Name { rename, mut text } => {
+                if keys.matches(Action::SelectConfirm, key) {
+                    let name = text.trim().to_owned();
+                    if name.is_empty() {
+                        self.preset_prompt = Some(PresetPrompt::Name { rename, text });
+                        return OverlayEvent::None;
+                    }
+                    return OverlayEvent::Preset(match rename {
+                        Some(from) => PresetAction::Rename { from, to: name },
+                        None => PresetAction::Create(name),
+                    });
+                }
+                if crate::ui::editor::delete_at_end(&mut text, key, Some(keys)).is_none()
+                    && let Some(c) = typed_char(key)
+                {
+                    text.push(c);
+                }
+                self.preset_prompt = Some(PresetPrompt::Name { rename, text });
+                OverlayEvent::None
+            }
         }
     }
 
@@ -1581,7 +1910,7 @@ impl ModelOverlay {
 
     fn list_len(&self) -> usize {
         if self.group == Group::Roles {
-            self.visible_roles().len()
+            self.role_rows_len()
         } else {
             self.rows().len()
         }
@@ -1598,13 +1927,21 @@ impl ModelOverlay {
             Event::Paste(_) if self.review.is_some() || self.deletion.is_some() => {
                 OverlayEvent::None
             }
+            Event::Paste(text) if self.preset_prompt.is_some() => {
+                if let Some(PresetPrompt::Name { text: name, .. }) = &mut self.preset_prompt {
+                    name.push_str(&text::one_line(text));
+                }
+                OverlayEvent::None
+            }
             Event::Paste(text) if self.headers_editor.is_some() => {
                 if let Some((_, _, editor)) = &mut self.headers_editor {
                     editor.paste(text);
                 }
                 OverlayEvent::None
             }
-            Event::Paste(text) if self.chooser.is_none() && !self.detail_focus => {
+            Event::Paste(text)
+                if self.chooser.is_none() && self.thinking.is_none() && !self.detail_focus =>
+            {
                 self.type_text(&text::one_line(text));
                 OverlayEvent::None
             }
@@ -1775,6 +2112,12 @@ impl ModelOverlay {
                     return event;
                 }
             }
+        }
+        if self.thinking.is_some() {
+            return self.thinking_key(key, keys);
+        }
+        if self.preset_prompt.is_some() {
+            return self.prompt_key(key, keys);
         }
         if self.chooser.is_some() {
             return self.chooser_key(key, keys);
@@ -2050,6 +2393,12 @@ impl ModelOverlay {
         if is_ctrl(key, 'a') {
             return self.open_chooser();
         }
+        if self.group == Group::Roles
+            && self.focus == Focus::List
+            && let Some(event) = self.roles_key(key, keys)
+        {
+            return event;
+        }
         if keys.matches(Action::SelectCancel, key) {
             return self.cancel();
         }
@@ -2061,6 +2410,13 @@ impl ModelOverlay {
             self.step(-(self.page as isize));
         } else if keys.matches(Action::SelectPageDown, key) {
             self.step(self.page as isize);
+        } else if self.focus == Focus::List && matches!(key.code, KeyCode::Home | KeyCode::End) {
+            let len = self.list_len();
+            self.cursor = if key.code == KeyCode::Home {
+                0
+            } else {
+                len.saturating_sub(1)
+            };
         } else if keys.matches(Action::SelectConfirm, key) {
             // Nothing to pick yet: Enter goes where models come from.
             if self.focus == Focus::List && self.group != Group::Roles && self.nothing_discovered()
@@ -2202,8 +2558,9 @@ impl ModelOverlay {
             return OverlayEvent::None;
         }
         if self.group == Group::Roles {
-            let roles = self.visible_roles();
-            let role = roles[self.cursor.min(roles.len() - 1)].0;
+            let RoleRow::Role(role) = self.current_role_row() else {
+                return OverlayEvent::None;
+            };
             self.target_role = Some(role.to_owned());
             // The memory role is picked in its own group, which shows the memory backend's status.
             self.group = if role == "memory" {
@@ -2266,6 +2623,7 @@ impl ModelOverlay {
         }
         let target = target.to_owned();
         let selection = entry.selection.clone();
+        let name = display_name(entry);
         let role = self.target_role.take();
         if let Some(role) = &role {
             self.show_roles();
@@ -2275,11 +2633,7 @@ impl ModelOverlay {
                 .position(|(name, _)| name == role)
                 .unwrap_or(0);
         }
-        OverlayEvent::AssignModel {
-            role: target,
-            selection,
-            scope: self.scope,
-        }
+        self.assign_with_thinking(target, selection, name)
     }
 
     fn open_chooser(&mut self) -> OverlayEvent {
@@ -2334,12 +2688,9 @@ impl ModelOverlay {
         } else if keys.matches(Action::SelectConfirm, key) {
             let role = chooser.roles[chooser.cursor].to_owned();
             let selection = chooser.selection.clone();
+            let name = chooser.name.clone();
             self.chooser = None;
-            return OverlayEvent::AssignModel {
-                role,
-                selection,
-                scope: self.scope,
-            };
+            return self.assign_with_thinking(role, selection, name);
         }
         OverlayEvent::None
     }
@@ -2348,8 +2699,9 @@ impl ModelOverlay {
         if self.group != Group::Roles || self.focus != Focus::List {
             return OverlayEvent::None;
         }
-        let roles = self.visible_roles();
-        let (role, _) = roles[self.cursor.min(roles.len() - 1)];
+        let RoleRow::Role(role) = self.current_role_row() else {
+            return OverlayEvent::None;
+        };
         if role == "main" {
             self.message = Some((
                 "The main model cannot be cleared: pick another model for it instead".to_owned(),
@@ -2375,6 +2727,8 @@ impl ModelOverlay {
             && self.deletion.is_none()
             && self.headers_editor.is_none()
             && self.chooser.is_none()
+            && self.thinking.is_none()
+            && self.preset_prompt.is_none()
             && let Some(index) = self.hits.hit(x, y)
         {
             self.cursor = index;
@@ -2406,7 +2760,7 @@ impl ModelOverlay {
             format!(" {label} focuses details directly.")
         });
         let help = format!(
-            "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\n{tune} tunes the selected model; Ctrl+F marks a favorite; Ctrl+D deletes a downloaded local model; Ctrl+B switches save scope. Tab cycles list, groups and details (groups are skipped on narrow panels).{details} Up/Down, PageUp/PageDown and Home/End scroll details; Escape or Tab returns without assigning. Ctrl+↑/↓ also scrolls details directly, including assignment consequences, capabilities and pricing."
+            "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\n{tune} tunes the selected model; Ctrl+F marks a favorite; Ctrl+D deletes a downloaded local model; Ctrl+B switches save scope. Tab cycles list, groups and details (groups are skipped on narrow panels).{details} Up/Down, PageUp/PageDown and Home/End scroll details; Escape or Tab returns without assigning. Ctrl+↑/↓ also scrolls details directly, including assignment consequences, capabilities and pricing.\nRoles: Enter picks a model, then its thinking level; t changes a role's thinking level; n saves the current roles as a new preset. On a preset: Enter applies, e updates it from the current roles, r renames, x deletes. Home/End jump to the first role or last preset."
         );
         if self
             .panel_keys
@@ -2590,7 +2944,7 @@ impl ModelOverlay {
         let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
 
         let len = if roles_view {
-            self.visible_roles().len()
+            self.role_rows_len()
         } else {
             self.rows().len()
         };
@@ -2604,7 +2958,7 @@ impl ModelOverlay {
         }
         self.scroll = self.scroll.min(len.saturating_sub(body_rows));
         // Record targets before borrowing discovery entries for row rendering.
-        if self.chooser.is_none() && !download_view {
+        if self.chooser.is_none() && self.thinking.is_none() && !download_view {
             let top = usize::from(show_active)
                 + usize::from(show_header)
                 + usize::from(show_kind)
@@ -2666,10 +3020,30 @@ impl ModelOverlay {
             right_top.push(Line::default());
         }
         if show_search {
-            right_top.push(if roles_view {
+            right_top.push(if let Some(prompt) = &self.preset_prompt {
+                let text = match prompt {
+                    PresetPrompt::Name { rename: None, text } => {
+                        format!(
+                            " New preset name (current roles): {text}▏  Enter save · Esc cancel"
+                        )
+                    }
+                    PresetPrompt::Name {
+                        rename: Some(from),
+                        text,
+                    } => format!(" Rename preset {from} to: {text}▏  Enter rename · Esc cancel"),
+                    PresetPrompt::Delete(name) => {
+                        format!(" Delete preset {name}? y/Enter delete · n/Esc keep")
+                    }
+                };
+                Line::from(fit(
+                    vec![Span::styled(text, theme.fg(Tok::Accent))],
+                    right_w,
+                ))
+            } else if roles_view {
                 Line::from(fit(
                     vec![Span::styled(
-                        " Enter picks the model for a role".to_owned(),
+                        " Enter picks the model (then its thinking) · t thinking · n new preset · presets below"
+                            .to_owned(),
                         theme.fg(Tok::Dim),
                     )],
                     right_w,
@@ -2718,9 +3092,14 @@ impl ModelOverlay {
                 let index = self.scroll + i;
                 let line = if let Some(chooser) = &self.chooser {
                     self.chooser_line(theme, chooser, i, list_w)
+                } else if let Some(pick) = &self.thinking {
+                    thinking_line(theme, pick, i, list_w)
                 } else if roles_view {
-                    if index < self.visible_roles().len() {
-                        self.role_line(theme, index, list_w)
+                    if index < self.role_rows_len() {
+                        match self.role_row(index) {
+                            RoleRow::Role(_) => self.role_line(theme, index, list_w),
+                            row => self.preset_line(theme, row, index == self.cursor, list_w),
+                        }
                     } else {
                         filled(vec![], list_w, Style::default())
                     }
@@ -2750,7 +3129,7 @@ impl ModelOverlay {
                     filled(vec![], list_w, Style::default())
                 };
                 spans.extend(line.spans);
-                if overflow && self.chooser.is_none() {
+                if overflow && self.chooser.is_none() && self.thinking.is_none() {
                     spans.push(scroll_cell(theme, i, list_rows, len, self.scroll));
                 }
             }
@@ -3376,7 +3755,17 @@ impl ModelOverlay {
             Some((name, RoleSource::FollowsMain)) => {
                 (format!("unassigned · follows main ({name})"), Tok::Dim)
             }
-            Some((name, source)) => (format!("{name} · {}", source_label(source)), Tok::Accent),
+            Some((name, source)) => {
+                let level = status
+                    .and_then(|status| status.assigned.as_ref())
+                    .and_then(|selection| selection.thinking.as_deref())
+                    .map(|level| format!(" ({level})"))
+                    .unwrap_or_default();
+                (
+                    format!("{name}{level} · {}", source_label(source)),
+                    Tok::Accent,
+                )
+            }
             None if role == "main" => ("not configured".to_owned(), Tok::Warning),
             None if role == "memory" && self.memory_required => {
                 ("required: assign a model".to_owned(), Tok::Warning)
@@ -3386,6 +3775,64 @@ impl ModelOverlay {
             }
             None => ("not set".to_owned(), Tok::Dim),
         }
+    }
+
+    /// A preset row (or the "save as preset" row heading them) on the Roles tab.
+    fn preset_line(
+        &self,
+        theme: &Theme,
+        row: RoleRow<'_>,
+        selected: bool,
+        w: usize,
+    ) -> Line<'static> {
+        let fill = if selected {
+            theme.bg(Tok::SelectedBg)
+        } else {
+            Style::default()
+        };
+        let pointer = if selected {
+            theme.sym(Sym::Pointer)
+        } else {
+            " "
+        };
+        let (label, value, tok) = match row {
+            RoleRow::Preset(name, preset) => {
+                let active = if self.preset_is_active(preset) {
+                    "● in use · "
+                } else {
+                    ""
+                };
+                (
+                    format!("  {name}"),
+                    format!("{active}{}", preset_summary(preset)),
+                    Tok::Text,
+                )
+            }
+            _ => (
+                "Presets".to_owned(),
+                "+ save the current roles as a new preset (Enter or n)".to_owned(),
+                Tok::Accent,
+            ),
+        };
+        let rest = w.saturating_sub(text::width(pointer) + 1 + 17);
+        let value = text::ellipsize(&value, rest, theme.ascii());
+        selected_row(
+            theme,
+            vec![
+                Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
+                Span::styled(
+                    text::pad(&text::ellipsize(&label, 16, theme.ascii()), 17),
+                    theme.fg(Tok::Text).patch(fill).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(value, theme.fg(tok).patch(fill)),
+            ],
+            w,
+            selected,
+        )
     }
 
     fn chooser_line(
@@ -3461,8 +3908,28 @@ impl ModelOverlay {
             return self.downloads.borrow().detail(theme);
         }
         if self.group == Group::Roles {
-            let roles = self.visible_roles();
-            let (role, description) = roles[self.cursor.min(roles.len() - 1)];
+            let row = self.current_role_row();
+            let RoleRow::Role(role) = row else {
+                let text = match row {
+                    RoleRow::Preset(name, preset) => format!(
+                        " Preset {name}: {}",
+                        preset_rows(preset).join(" · ")
+                    ),
+                    _ => " Save every role's model and thinking level under a name, then switch between setups with Enter.".to_owned(),
+                };
+                return (
+                    vec![Span::styled(text, theme.fg(Tok::Muted))],
+                    vec![Span::styled(
+                        " Enter applies · n new from current roles · e update to current roles · r rename · x delete · also /modelpreset".to_owned(),
+                        theme.fg(Tok::Dim),
+                    )],
+                );
+            };
+            let description = self
+                .visible_roles()
+                .iter()
+                .find(|(name, _)| *name == role)
+                .map_or("", |(_, description)| description);
             let status = self.roles.iter().find(|status| status.role == role);
             let selection = status.and_then(|status| status.assigned.as_ref());
             let reasoning = selection
@@ -3663,6 +4130,9 @@ impl ModelOverlay {
 
     fn assignment_effect(&self) -> String {
         let role = if self.group == Group::Roles {
+            if !matches!(self.current_role_row(), RoleRow::Role(_)) {
+                return "Presets are saved for all projects; applying one sets every role's model and thinking level.".into();
+            }
             self.visible_roles().get(self.cursor).map(|(role, _)| *role)
         } else {
             self.target_role.as_deref().or_else(|| {
@@ -3702,6 +4172,30 @@ impl ModelOverlay {
                 "Esc/Tab back to list (no assignment)".into(),
             ];
         }
+        if let Some(pick) = &self.thinking {
+            return vec![
+                format!(
+                    "{} thinking level",
+                    pair_label(keys, Action::SelectUp, Action::SelectDown)
+                ),
+                hint(
+                    keys,
+                    Action::SelectConfirm,
+                    if pick.assign.is_some() {
+                        "assign"
+                    } else {
+                        "set"
+                    },
+                ),
+                hint(keys, Action::SelectCancel, "cancel"),
+            ];
+        }
+        if self.preset_prompt.is_some() {
+            return vec![
+                hint(keys, Action::SelectConfirm, "confirm"),
+                hint(keys, Action::SelectCancel, "cancel"),
+            ];
+        }
         if self.chooser.is_some() {
             return vec![
                 format!(
@@ -3738,8 +4232,23 @@ impl ModelOverlay {
             ];
         }
         if self.group == Group::Roles {
+            if !matches!(self.current_role_row(), RoleRow::Role(_)) {
+                return vec![
+                    hint(keys, Action::SelectConfirm, "apply"),
+                    "n new".to_owned(),
+                    "e update".to_owned(),
+                    "r rename".to_owned(),
+                    "x delete".to_owned(),
+                    format!(
+                        "{} rows",
+                        pair_label(keys, Action::SelectUp, Action::SelectDown)
+                    ),
+                    hint(keys, Action::SelectCancel, "close"),
+                ];
+            }
             return vec![
                 hint(keys, Action::SelectConfirm, "pick model"),
+                "t thinking".to_owned(),
                 format!(
                     "{} roles",
                     pair_label(keys, Action::SelectUp, Action::SelectDown)
@@ -3881,6 +4390,105 @@ impl ModelOverlay {
 }
 
 use super::settings::{local_function_key, local_function_label};
+
+/// One row of the thinking-level picker: a header naming the model, then one radio row per level.
+fn thinking_line(theme: &Theme, pick: &ThinkingPick, row: usize, w: usize) -> Line<'static> {
+    if row == 0 {
+        return filled(
+            vec![
+                chrome::label(theme, " Thinking for: "),
+                Span::styled(
+                    format!(
+                        "{} ({})",
+                        text::one_line(&pick.name),
+                        role_label(&pick.role)
+                    ),
+                    theme.fg(Tok::Text),
+                ),
+            ],
+            w,
+            Style::default(),
+        );
+    }
+    let Some(level) = pick.levels.get(row - 1) else {
+        return filled(vec![], w, Style::default());
+    };
+    let selected = row - 1 == pick.cursor;
+    let fill = if selected {
+        theme.bg(Tok::SelectedBg)
+    } else {
+        Style::default()
+    };
+    let radio = theme.sym(if selected {
+        Sym::RadioOn
+    } else {
+        Sym::RadioOff
+    });
+    let note = match *level {
+        "default" => "the model's own default",
+        "auto" => "judged per message from the prompt",
+        "off" => "no reasoning",
+        _ => "",
+    };
+    selected_row(
+        theme,
+        vec![
+            Span::styled(format!("   {radio} "), theme.fg(Tok::Accent).patch(fill)),
+            Span::styled(text::pad(level, 10), theme.fg(Tok::Text).patch(fill)),
+            Span::styled(note.to_owned(), theme.fg(Tok::Muted).patch(fill)),
+        ],
+        w,
+        selected,
+    )
+}
+
+/// Each role a preset sets, as `Label: model (level)`, main first.
+fn preset_rows(preset: &ModelPreset) -> Vec<String> {
+    let row = |role: &str, selection: &ModelSelection| {
+        let level = selection
+            .thinking
+            .as_deref()
+            .map(|level| format!(" ({level})"))
+            .unwrap_or_default();
+        format!("{}: {}{level}", role_label(role), selection.display_name())
+    };
+    let mut rows: Vec<String> = preset.main.iter().map(|main| row("main", main)).collect();
+    rows.extend(
+        preset
+            .roles
+            .iter()
+            .map(|(role, selection)| row(role, selection)),
+    );
+    if rows.is_empty() {
+        rows.push(format!(
+            "{} working control(s), no models",
+            preset.setup.len()
+        ));
+    }
+    rows
+}
+
+/// The short form a preset row shows: the main model and level, then how many roles it sets.
+fn preset_summary(preset: &ModelPreset) -> String {
+    let level = |selection: &ModelSelection| {
+        selection
+            .thinking
+            .as_deref()
+            .map(|level| format!(" ({level})"))
+            .unwrap_or_default()
+    };
+    let main = preset
+        .main
+        .as_ref()
+        .map(|main| format!("{}{}", main.display_name(), level(main)));
+    let roles = preset.roles.len();
+    match (main, roles) {
+        (Some(main), 0) => main,
+        (Some(main), n) => format!("{main} + {n} role{}", if n == 1 { "" } else { "s" }),
+        (None, 0) => preset_rows(preset).join(", "),
+        (None, n) => format!("{n} role{}", if n == 1 { "" } else { "s" }),
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn listed_window_screenshot_targets_the_selected_id() {
+    let (result, natives) = run_worker_with_natives(
+        "const [w] = await desktop.windows({ title: 'clickup' });
+         try { await w.screenshot(); } catch (e) { return [w.width, e.message]; }",
+        brave,
+        true,
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["payload"]["returnValue"],
+        json!([10, "capture refused"])
+    );
+    let capture = natives.iter().find(|n| n["method"] == "capture").unwrap();
+    assert_eq!(capture["args"]["target"], "12086");
+}
+
+#[test]
+fn capture_alias_uses_only_the_requested_screenshot_target() {
+    let (result, natives) = run_worker_with_natives(
+        "const errors = [];
+         for (const target of [desktop, await desktop.display('active'), await desktop.window('12086')]) {
+           try { await target.capture({silent: true}); } catch (e) { errors.push(e.message); }
+         }
+         return errors;",
+        brave,
+        true,
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["payload"]["returnValue"],
+        json!(vec!["capture refused"; 3])
+    );
+    let targets: Vec<_> = natives
+        .iter()
+        .filter(|n| n["method"] == "capture")
+        .map(|n| n["args"]["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(targets, ["desktop", "display:active", "12086"]);
+}
+
+#[test]
 fn computer_explicit_id_resolves_beyond_a_truncated_listing() {
     let result = run_worker(
         "const listed = await desktop.windows();

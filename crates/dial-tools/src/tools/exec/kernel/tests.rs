@@ -200,6 +200,30 @@ fn unavailable_sandbox_never_runs_model_code() {
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+fn bundled_python_runs_the_stdlib_inside_the_workspace_sandbox() {
+    if !bundled_python::available() || !super::super::sandbox::require_for_test() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path())
+        .unwrap()
+        .with_shell_backend(crate::config::types::ShellBackend::System);
+    let mut config = Config::default();
+    config.kernel.venv = "off".into();
+    let tool = crate::tools::exec::eval::tools(&config).pop().unwrap();
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let output = tool.call(&ctx, &json!({"language":"py", "code": "import sys, re, sqlite3\nassert 'dial-python-' in sys.executable and sys.flags.isolated\nassert sqlite3.connect(':memory:').execute('select 1').fetchone() == (1,)\nre.findall(r'\\d+', 'code=42')"}));
+    assert!(!output.is_error, "{}", output.text);
+    assert_eq!(output.data.unwrap()["value"], "['42']");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
 fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
     // Linux's fence must work with and without bubblewrap. macOS sandboxed eval is covered with
     // the default dev policy in eval tests; strict mode cannot load interpreters outside system paths.
@@ -237,8 +261,8 @@ fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
                     mutation_authorizer: None,
                     confirm: None,
                 },
-                "eval",
-                &json!({"code":code,"background":false}),
+                CellAction::Eval(code),
+                &json!({"background":false}),
                 &AtomicBool::new(false),
                 &|_| Err("no background".to_owned()),
                 &mut |_| ToolOutput::err("no callbacks"),

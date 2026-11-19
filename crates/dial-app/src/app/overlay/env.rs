@@ -121,6 +121,7 @@ pub(in crate::app) fn refresh_navigation(
             }
             ActiveOverlay::Models(models) => {
                 models.set_roles(config.role_statuses());
+                models.set_presets(&config.model_presets);
                 models.set_favorites(favorite_routes(&config));
                 models.set_laya_checkpoint(crate::config::laya::expected_checkpoint(&config.laya));
                 models.set_memory_required(crate::config::memory_backend::requires_memory_role(
@@ -601,6 +602,7 @@ impl OverlayEnv<'_> {
     pub(in crate::app) fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
         if let (ActiveOverlay::Models(models), Some(config)) = (overlay, &self.latest) {
             models.set_roles(config.role_statuses());
+            models.set_presets(&config.model_presets);
             models.set_laya_checkpoint(crate::config::laya::expected_checkpoint(&config.laya));
             models.set_memory_required(crate::config::memory_backend::requires_memory_role(
                 &config.memory,

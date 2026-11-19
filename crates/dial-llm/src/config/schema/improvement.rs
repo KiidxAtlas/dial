@@ -370,7 +370,7 @@ pub(super) static LEARNING: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local edit mode",
-        "Edit grammar for locally served models when no pin chooses one. Replace is the default; Inherit follows Edit mode under Editing. Explicit pins always win.",
+        "Edit grammar for locally served models when no pin chooses one. Hashline is the default, and an explicit Edit mode under Editing still applies unless this is set. Inherit follows Edit mode under Editing. Explicit pins always win.",
         Kind::Enum(LOCAL_EDIT_MODE),
     ),
     field!(

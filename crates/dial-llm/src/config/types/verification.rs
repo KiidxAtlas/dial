@@ -34,12 +34,15 @@ pub struct VerificationConfig {
     /// Bounded completion reconciliation for substantial/sensitive changes or artifact work with
     /// weak declared coverage; uses a permitted coach or one in-context self-review by default.
     pub review: IndependentReviewConfig,
+    /// Once per instruction that changed the workspace, ask the agent to review the quality of its
+    /// finished work (rendered visuals and code) before delivering its answer.
+    pub quality_review: bool,
 }
 
 impl Default for VerificationConfig {
     fn default() -> Self {
         Self {
-            auto_registered_checks: true,
+            auto_registered_checks: false,
             enabled: true,
             automatic_checks: false,
             repair_attempts: 0,
@@ -52,6 +55,7 @@ impl Default for VerificationConfig {
             runners: BTreeMap::new(),
             inputs: BTreeMap::new(),
             review: IndependentReviewConfig::default(),
+            quality_review: false,
         }
     }
 }

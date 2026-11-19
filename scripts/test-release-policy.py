@@ -280,7 +280,7 @@ class SigningReadinessTests(unittest.TestCase):
 
 
 class WindowsReleaseTests(unittest.TestCase):
-    def test_windows_release_needs_no_azure_but_still_enters_signed_manifest(self):
+    def test_windows_candidates_stay_unprivileged_and_signed_zips_enter_manifest(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
         candidates = (SCRIPT.parent.parent / ".github/workflows/release-build.yml").read_text()
         build = candidates.split("\n  windows-build:\n", 1)[1]
@@ -289,13 +289,15 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("Test installer under Windows PowerShell 5.1", build)
         self.assertIn("Test installer under PowerShell 7", build)
         self.assertNotIn("id-token: write", build)
-        self.assertNotIn("\n  windows-sign:\n", workflow)
-        self.assertNotIn("azure/artifact-signing-action@", workflow)
-        self.assertNotIn("DIAL_WINDOWS_", workflow)
-        self.assertIn("needs: [gate, signing-ready, build]", manifest)
-        self.assertIn("needs.gate.result == 'success'", manifest)
-        self.assertIn("needs.signing-ready.result == 'success'", manifest)
-        self.assertIn("needs.build.result == 'success' || needs.build.result == 'skipped'", manifest)
+        signing = workflow.split("\n  windows-sign:\n", 1)[1].split("\n  sign:\n", 1)[0]
+        self.assertIn("environment: windows-signing", signing)
+        self.assertIn("needs: [gate, signing-ready, build]", signing)
+        self.assertIn("needs.build.result == 'success' || needs.build.result == 'skipped'", signing)
+        self.assertIn("azure/artifact-signing-action@", signing)
+        self.assertIn("Get-AuthenticodeSignature", signing)
+        self.assertIn("needs.windows-sign.result == 'success'", manifest)
+        self.assertLess(manifest.index('rm dist/*.zip'), manifest.index('pattern: authenticode-*'))
+        self.assertLess(manifest.index('pattern: authenticode-*'), manifest.index('sha256sum --'))
         self.assertIn("pattern: release-assets-*", manifest)
         self.assertIn("environment: release-signing", manifest)
         self.assertIn("openssl pkeyutl -sign", manifest)
@@ -456,15 +458,17 @@ class CandidatePromotionTests(unittest.TestCase):
         validate = ci.split("\n  validate:\n", 1)[1].split("\n  release-candidates:\n", 1)[0]
         self.assertIn("fetch-depth: 0", validate)
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", validate)
-        # Pull requests record candidates only when the tested merge tree is the built head tree.
+        # Pull requests record candidates only when the tested merge tree equals the PR head tree.
         self.assertIn('"$(git rev-parse \'HEAD^{tree}\')" != "$(git rev-parse "$HEAD_SHA^{tree}")"', validate)
-        self.assertIn("ref: ${{ needs.validate.outputs.candidate-ref }}", ci)
+        candidate_call = ci.split("\n  release-candidates:\n", 1)[1].split("\n  test:\n", 1)[0]
+        self.assertNotIn("ref:", candidate_call)
         self.assertIn('git merge-base --is-ancestor "$head" "$commit"', helper)
         self.assertIn("--event pull_request", helper)
         self.assertIn('candidate-tree "$tree"', helper)
         self.assertIn("if: steps.pr.outputs.run == ''", release)
         self.assertIn("CI_RUN: ${{ steps.pr.outputs.run || steps.ci.outputs.run }}", release)
-        self.assertIn("ref: ${{ github.sha }}", release.split("\n  build:\n", 1)[1])
+        fallback_call = release.split("\n  build:\n", 1)[1].split("\n  windows-sign:\n", 1)[0]
+        self.assertNotIn("ref:", fallback_call)
 
     def test_main_only_candidates_keep_private_keys_out_and_allow_safe_fallback(self):
         root = SCRIPT.parent.parent
@@ -473,6 +477,11 @@ class CandidatePromotionTests(unittest.TestCase):
         release = (root / ".github/workflows/release.yml").read_text()
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", ci)
         self.assertIn("uses: ./.github/workflows/release-build.yml", ci)
+        self.assertNotIn("inputs.ref", candidates)
+        self.assertNotIn("candidate-ref", ci)
+        self.assertEqual(candidates.count("ref: ${{ github.sha }}"), 3)
+        self.assertEqual(candidates.count("persist-credentials: false"), 3)
+        self.assertEqual(candidates.count("DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}"), 2)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", candidates)
         self.assertNotIn("secrets.", candidates)
         self.assertNotIn("environment: release-signing", candidates)
@@ -634,6 +643,7 @@ class ContainerStagingTests(unittest.TestCase):
         release = (root / "Dockerfile.release").read_text().split("FROM debian:", 1)[1]
         # The release archive's binary embeds the Node.js runtime, so its image also carries that license.
         expected = source.replace("COPY --from=build /out/dial", "COPY dial").replace(
+            "COPY --from=python-payload /payload/LICENSE.python", "COPY LICENSE.python").replace(
             "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "").replace(
             "USER dial\n", "COPY LICENSE.node /usr/share/doc/dial/LICENSE.node\nUSER dial\n", 1)
         self.assertEqual(release, expected)

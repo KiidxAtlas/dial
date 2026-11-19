@@ -1,5 +1,44 @@
 use super::*;
 #[test]
+fn controller_calls_with_structured_arguments_get_readable_cards() {
+    let call = |name: &str, args: Value| {
+        let view = render_call(name, &args);
+        (view.label, view.target)
+    };
+    use serde_json::json;
+    assert_eq!(
+        call(
+            "verify",
+            json!({"targets":["calc regression","tests/a.rs"]})
+        ),
+        ("Verify".into(), "calc regression, tests/a.rs".into())
+    );
+    assert_eq!(
+        call(
+            "verify",
+            json!({"repro":{"name":"calc","command":"pytest -q"}})
+        ),
+        ("Verify".into(), "repro: calc".into())
+    );
+    assert_eq!(
+        call(
+            "verify",
+            json!({"acceptance":{"name":"page","command":"curl x"}})
+        ),
+        ("Verify".into(), "acceptance: page".into())
+    );
+    assert_eq!(call("verify", json!({"plan":true})).1, "plan");
+    assert_eq!(call("verify", json!({})).1, "selected checks");
+    assert_eq!(
+        call("verify", json!({"targets":["failed"]})).1,
+        "rerun failed checks"
+    );
+    assert_eq!(
+        call("finish", json!({"outcome":"completed","summary":"done"})),
+        ("Finish".into(), "completed".into())
+    );
+}
+#[test]
 fn coherent_runtime_batched_reads_and_patch_targets_use_the_tool_contract() {
     assert_eq!(
         render_call(
@@ -162,4 +201,49 @@ fn desktop_results_summarize_windows_and_captures_without_replacing_evidence() {
         failed.preview.is_none(),
         "errors must retain their actual evidence"
     );
+}
+
+#[test]
+fn verify_results_show_counts_and_one_row_per_check_even_when_failing() {
+    let data = serde_json::json!({
+        "counts": {"passed": 1, "failed": 1},
+        "results": [
+            {"name": "repro: calc", "command": "pytest -q", "status": "passed", "reused": false},
+            {"name": "cargo check", "command": "cargo check", "status": "code_failed", "reused": false},
+            {"name": "lint", "command": "make lint", "status": "passed", "reused": true},
+        ],
+    });
+    let output = ToolOutput {
+        data: Some(data),
+        is_error: true,
+        ..ToolOutput::err("Verify: Passed 1, Failed 1\ncode_failed: cargo check")
+    };
+    let view = render_result("verify", &serde_json::json!({}), &output);
+    assert_eq!(
+        view.facts,
+        vec!["1 passed".to_owned(), "1 failed".to_owned()]
+    );
+    assert_eq!(
+        view.preview.as_deref(),
+        Some("passed · repro: calc\nfailed · cargo check\npassed, reused · lint")
+    );
+
+    let passing = ToolOutput::structured(serde_json::json!({
+        "counts": {"passed": 2, "failed": 0},
+        "results": [
+            {"name": "a", "status": "passed"},
+            {"name": "b", "status": "timed_out"},
+        ],
+    }));
+    let view = render_result("verify", &serde_json::json!({}), &passing);
+    assert_eq!(view.facts, vec!["2 passed".to_owned()]);
+    assert_eq!(view.preview.as_deref(), Some("passed · a\ntimed out · b"));
+
+    // A refusal or plan answer has no results: the text stays the body.
+    let refused = render_result(
+        "verify",
+        &serde_json::json!({}),
+        &ToolOutput::err("unknown check name"),
+    );
+    assert!(refused.facts.is_empty() && refused.preview.is_none());
 }

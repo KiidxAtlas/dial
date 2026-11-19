@@ -74,6 +74,15 @@ Each benchmark case's `metrics.tool_trace` records what the **main agent** did i
 - The counters are cumulative for the runtime. The benchmark child keeps the last snapshot, so a
   multi-turn case reports its whole session once.
 - Worker, extension and compaction-internal model calls are **outside** this trace.
+- `calls` (absent in legacy reports) lists every call that reached dispatch, in order, including
+  rejected, skipped and cache-answered ones, up to 256; `calls_omitted` counts the rest. Each record
+  has `ordinal`, `tool` (`unoffered` for any name not offered on that request), `input_sha256` (digest
+  of the canonical arguments), `input_keys` (only argument names the offered schema or the tool's
+  accepted names declare), `input_keys_omitted` (count of other names), `duration_ms`, `outcome`
+  (`ok` or `error`), `executed`, `cache` (`reused` when a read was answered from held evidence) and,
+  for errors, `error_sha256`. Raw argument values, paths, error text and undeclared argument names are
+  never stored. Digests let identical calls be correlated, but a low-entropy value can be guessed by
+  someone who enumerates candidates, so treat digests as sensitive metadata rather than anonymous.
 
 **Eligibility** here means only that the tool's schema was offered on a successful main-agent request
 under the active role and mode. It does not mean the tool was approved to execute, connected, or

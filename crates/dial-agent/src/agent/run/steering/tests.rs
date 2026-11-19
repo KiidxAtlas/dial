@@ -218,6 +218,11 @@ fn settle(agent: &mut Agent<'_>, live: &mut LiveSteering, ui: &mut Input, expect
         users, expected,
         "journal accepted prefix, uncertain suffix and later input exactly once in submission order"
     );
+    assert_eq!(
+        serde_json::to_value(&agent.efficiency_metrics).unwrap()["interventions"]["steering_message_journaled"],
+        expected.len(),
+        "live acknowledgements and repeated polls must not count the same input twice"
+    );
 }
 
 #[test]
@@ -270,6 +275,11 @@ fn local_replanning_preserves_every_message_in_a_drained_batch() {
                 .filter_map(|message| message["content"].as_str())
                 .collect();
             assert_eq!(users, expected);
+            assert_eq!(
+                serde_json::to_value(&agent.efficiency_metrics).unwrap()["interventions"]["steering_message_journaled"],
+                expected.len(),
+                "blank input and repeated polls are not extra journaled interventions"
+            );
         });
     }
 }

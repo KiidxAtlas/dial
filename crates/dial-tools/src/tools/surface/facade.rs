@@ -772,7 +772,7 @@ pub const GROUPS: &[Group] = &[
     Group {
         successor: "history",
         intro: Some(
-            "Read-only Dial history for this project; pass `source` plus that source's own arguments.",
+            "Read-only Dial history for this project; pass `source` plus that source's own arguments. Saved facts: `memory`; earlier conversation text: `session_search`.",
         ),
         selector_note: "Which history source",
         native_required: false,

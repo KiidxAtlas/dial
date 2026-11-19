@@ -98,7 +98,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, jobs finished, required checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
+        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, required jobs finished and checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
@@ -176,6 +176,8 @@ pub(in crate::agent) enum Decision {
     Incomplete(String),
 }
 
+pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For standalone files, an Eval cell can bind assertions to each saved file with dial.check(name, passed, dial.read receipt). A different engine gives only partial coverage; disclose an unavailable consumer.";
+
 impl crate::agent::Agent<'_> {
     /// Small local models keep every completion guard rail: open execution steps block, the
     /// lexical investigation nudge applies and long observation runs get the forced research
@@ -243,6 +245,14 @@ impl crate::agent::Agent<'_> {
             let gate = self.gate_unverified_edits(!nudged, ui);
             if gate.unverified.is_some() || gate.blocking {
                 let lead = match &gate.unverified {
+                    Some(checks) if gate.has_pass && gate.blocking => format!(
+                        "Current edits have a failing applicable check. Still lacking a pass: {}. ",
+                        checks.join(", ")
+                    ),
+                    Some(checks) if gate.has_pass => format!(
+                        "Current edits still lack passing evidence for: {}. ",
+                        checks.join(", ")
+                    ),
                     Some(checks) => format!(
                         "Current edits have no passing applicable check: {}. ",
                         checks.join(", ")
@@ -258,6 +268,8 @@ impl crate::agent::Agent<'_> {
                     gate.failures.join("\n")
                 };
                 blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
+            } else if let Some(reminder) = self.artifact_check_reminder() {
+                blocker = Some(reminder.to_owned());
             }
         }
         // The lexical investigation nudge is a guard rail for small local models only.
@@ -519,20 +531,6 @@ impl CapabilitySearch {
 
 /// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
 pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need and load:true, or names:[exact match], then use it; if nothing fits, give the same answer again and name what you searched for.";
-
-/// Actual runtime check callbacks, not assertion words in source or printed claims. These are
-/// local check outcomes, never evidence that unrelated files or task requirements passed.
-pub(in crate::agent) fn eval_checks(
-    output: &crate::runtime::tool_output::ToolOutput,
-) -> impl Iterator<Item = bool> {
-    output
-        .data
-        .as_ref()
-        .and_then(|data| data["checks"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|check| check["passed"].as_bool())
-}
 
 /// Preserve a candidate as unaccepted work alongside the controller's missing prerequisite.
 /// This is a terminal report for the user, never feedback injected into another model request,

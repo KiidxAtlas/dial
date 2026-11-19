@@ -430,14 +430,22 @@ impl Agent<'_> {
                 )?;
                 let message = state.apply_round(&round);
                 if message.is_some() {
-                    ui.event(&UiEvent::new(
-                        EventKind::Coach,
-                        format!(
-                            "Advisor {}: {} (unverified; added to the next request)",
-                            round.severity.label(),
-                            round.note
+                    ui.event(
+                        &UiEvent::new(
+                            EventKind::Coach,
+                            format!(
+                                "Advisor {}: {} (unverified; added to the next request)",
+                                round.severity.label(),
+                                round.note
+                            ),
+                        )
+                        .with_detail(
+                            crate::agent::ui::ui_event::EventDetail::Review {
+                                severity: round.severity.label().to_owned(),
+                                note: round.note.clone(),
+                            },
                         ),
-                    ));
+                    );
                 }
                 Ok(message)
             }

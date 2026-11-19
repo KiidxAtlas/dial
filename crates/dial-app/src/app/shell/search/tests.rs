@@ -254,7 +254,7 @@ fn returning_to_origin_is_scoped_to_the_project() {
 
 fn page(hits: Vec<SearchHit>) -> Page {
     Page {
-        hits,
+        hits: hits.into(),
         titles: Default::default(),
         has_more: false,
         limit: SEARCH_LIMIT,
@@ -288,7 +288,7 @@ fn expanding_window_uses_lookahead_and_preserves_context_invalidation() {
     search.request_window(&layout, "session", "needle", 150);
     search.invalidate();
     assert!(search.settle(&layout, "session").is_empty());
-    assert!(search.window.is_none());
+    assert!(search.ready.is_none());
 }
 
 #[test]
@@ -324,4 +324,66 @@ fn worker_hydrates_titles_before_publishing_results() {
         .unwrap();
     assert_eq!(page.titles.len(), 1);
     assert_eq!(page.titles.get(&id), Some(&expected));
+}
+
+fn await_publication(shell: &mut Shell, layout: &Layout) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !shell.poll_search(layout) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search never published"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn inspected_results_remain_available_without_rerunning_the_query() {
+    let (_home, _project, app, mut shell) = crate::app::shell::testkit::shell();
+    let calls: Calls = Default::default();
+    shell.search = Search::with_runner(recording(calls.clone()));
+    shell.start_search(&app.layout, "parser");
+    await_publication(&mut shell, &app.layout);
+    assert!(shell.search_panel(&app.layout).is_some());
+    assert!(
+        shell.search_panel(&app.layout).is_some(),
+        "reopen the same hits"
+    );
+    shell.more_search(&app.layout);
+    assert!(!shell.search.is_pending(), "all hits were already loaded");
+    assert_eq!(*calls.lock().unwrap(), ["parser"]);
+    assert!(shell.search_panel(&other_project(&app.layout)).is_none());
+}
+
+#[test]
+fn failed_expansion_retains_the_page_and_retries_the_same_window() {
+    let (_home, _project, app, mut shell) = crate::app::shell::testkit::shell();
+    let (tx, rx) = sync_channel(1);
+    let replies = Mutex::new(rx);
+    let limits = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&limits);
+    shell.search = Search::with_runner(Arc::new(move |_, _, limit| {
+        observed.lock().unwrap().push(limit);
+        replies.lock().unwrap().recv().unwrap()
+    }));
+    shell.start_search(&app.layout, "parser");
+    tx.send(Ok(vec![hit("same"); SEARCH_LIMIT + 1])).unwrap();
+    await_publication(&mut shell, &app.layout);
+    shell.more_search(&app.layout);
+    shell.more_search(&app.layout);
+    assert!(
+        shell.search_panel(&app.layout).is_some(),
+        "read while loading"
+    );
+    tx.send(Err(anyhow!("index unavailable"))).unwrap();
+    await_publication(&mut shell, &app.layout);
+    assert!(
+        shell.search_panel(&app.layout).is_some(),
+        "read after failure"
+    );
+    shell.more_search(&app.layout);
+    tx.send(Ok(vec![hit("same"); 72])).unwrap();
+    await_publication(&mut shell, &app.layout);
+    assert_eq!(shell.search.ready.as_ref().unwrap().1.hits.len(), 72);
+    assert_eq!(*limits.lock().unwrap(), [51, 101, 101]);
 }

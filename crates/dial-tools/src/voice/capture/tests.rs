@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn a_named_microphone_matches_exactly_or_by_a_unique_part_of_its_name() {
+    let names: Vec<String> = ["MacBook Pro Microphone", "USB Audio", "USB Audio Pro"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        pick_device(&names, "USB Audio"),
+        Some(1),
+        "exact wins over substring"
+    );
+    assert_eq!(pick_device(&names, "macbook"), Some(0));
+    assert_eq!(pick_device(&names, "usb"), None, "ambiguous");
+    assert_eq!(pick_device(&names, "Yeti"), None);
+}
+
+#[test]
 fn linux_recorders_emit_raw_16k_mono_s16le() {
     let candidates = recorder_candidates("linux");
     let programs: Vec<_> = candidates

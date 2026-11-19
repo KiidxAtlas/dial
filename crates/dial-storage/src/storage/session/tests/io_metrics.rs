@@ -39,6 +39,35 @@ fn control_publications_count_attempts_equal_states_and_changes_without_extra_st
 }
 
 #[test]
+fn equal_publication_flushes_runtime_only_when_something_is_waiting() {
+    let e = env();
+    let mut session = new_session(&e);
+    session.set_control_state(json!({"mode": "a"})).unwrap();
+
+    // An idle runtime makes an equal publication a no-op for runtime counters.
+    let before = session.io_metrics();
+    session.set_control_state(json!({"mode": "a"})).unwrap();
+    let idle = session.io_metrics().since(&before);
+    assert_eq!(idle.control_publication_attempts, 1);
+    assert_eq!(idle.equal_control_publications, 1);
+    assert_eq!(idle.runtime_flush_attempts, 0);
+
+    // A waiting runtime snapshot still crosses the persistence boundary on an equal publication.
+    let runtime = session.runtime();
+    let _running = runtime.start("assistant", "reply", None);
+    assert!(runtime.has_unpersisted());
+    let before = session.io_metrics();
+    session.set_control_state(json!({"mode": "a"})).unwrap();
+    let waiting = session.io_metrics().since(&before);
+    assert_eq!(waiting.equal_control_publications, 1);
+    assert_eq!(waiting.runtime_flush_attempts, 1);
+    assert!(
+        !runtime.has_unpersisted(),
+        "the waiting snapshot was persisted"
+    );
+}
+
+#[test]
 fn failed_control_publication_counts_one_failure_and_no_equal_publication() {
     let e = env();
     let mut session = new_session(&e);

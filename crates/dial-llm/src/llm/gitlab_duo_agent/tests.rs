@@ -113,6 +113,88 @@ fn connect_session(port: u16, interrupt: &Arc<AtomicBool>) -> Session {
 }
 
 #[test]
+fn workflow_upgrade_obeys_request_deadline_and_cancellation() {
+    use std::time::Duration;
+    for timeout in [1, 0] {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let api = Api {
+            base: &base,
+            token: "pat",
+            interrupt: &interrupt,
+            timeout,
+        };
+        let flag = interrupt.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.read_exact(&mut [0; 1]).unwrap();
+            if timeout == 0 {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // If setup ignores its budget, terminate the fixture with a distinct EOF error.
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        });
+        let project = Project {
+            id: "42".into(),
+            namespace_id: "7".into(),
+            root_namespace_id: transport::root_namespace("7"),
+        };
+        let access = Access {
+            token: "dat".into(),
+            headers: vec![],
+        };
+        let error = transport::connect(&api, &access, &project, "model-x").unwrap_err();
+        let ended_before_server_close = release.send(()).is_ok();
+        server.join().unwrap();
+        assert!(
+            ended_before_server_close,
+            "upgrade waited for the peer (timeout={timeout})"
+        );
+        if timeout == 0 {
+            assert!(error.is::<crate::llm::Interrupted>());
+        } else {
+            assert!(
+                format!("{error:#}").contains("setup timed out"),
+                "{error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn workflow_silence_after_checkpoint_obeys_the_request_limit() {
+    // Model time advances without a wall-clock sleep or a 90-second fixture.
+    let (clock, _) = crate::llm::cancel::TestClock::new();
+    clock.clone().install();
+    let (port, server) = serve_ws(vec![vec![
+        json!({"newCheckpoint":{"message":"partial"}}),
+        json!({"status":"FINISHED"}),
+    ]]);
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut session = connect_session(port, &interrupt);
+    let mut callback = |_: &str| {
+        clock.advance(std::time::Duration::from_secs(6));
+        true
+    };
+    let result = drive(
+        &mut session,
+        &interrupt,
+        5,
+        &mut Some(&mut callback),
+        &mut String::new(),
+    );
+    assert!(result.err().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::llm::stream::StalledStream>()
+            .is_some()
+    }));
+    drop(session);
+    server.join().unwrap();
+}
+
+#[test]
 fn status_maps_terminal_and_approval_states() {
     assert_eq!(
         wire::status_of(&json!({"status": "FINISHED"})),
@@ -332,7 +414,7 @@ fn websocket_streams_text_and_round_trips_tool_result() {
             true
         };
         let mut slot: Option<&mut dyn FnMut(&str) -> bool> = Some(&mut callback);
-        drive(&mut session, &interrupt, &mut slot, &mut shown).expect("drive")
+        drive(&mut session, &interrupt, 5, &mut slot, &mut shown).expect("drive")
     };
     assert_eq!(deltas, vec!["Hel".to_owned(), "lo".to_owned()]);
     let Step::Reply(reply) = step else {
@@ -351,7 +433,8 @@ fn websocket_streams_text_and_round_trips_tool_result() {
     )
     .expect("send tool result");
     let mut slot: Option<&mut dyn FnMut(&str) -> bool> = None;
-    let finished = drive(&mut session, &interrupt, &mut slot, &mut shown).expect("drive to finish");
+    let finished =
+        drive(&mut session, &interrupt, 5, &mut slot, &mut shown).expect("drive to finish");
     assert!(matches!(&finished, Step::Reply(done) if done.tool_calls.is_empty()));
 
     let received = server.join().expect("server");
@@ -374,7 +457,7 @@ fn approval_with_pending_action_surfaces_as_tool_call() {
     let mut session = connect_session(port, &interrupt);
     let mut shown = String::new();
     let mut slot: Option<&mut dyn FnMut(&str) -> bool> = None;
-    let step = drive(&mut session, &interrupt, &mut slot, &mut shown).expect("drive");
+    let step = drive(&mut session, &interrupt, 5, &mut slot, &mut shown).expect("drive");
     let Step::Reply(reply) = step else {
         panic!("expected a tool-call reply");
     };
@@ -391,7 +474,7 @@ fn approval_without_tool_action_is_an_error() {
     let mut session = connect_session(port, &interrupt);
     let mut shown = String::new();
     let mut slot: Option<&mut dyn FnMut(&str) -> bool> = None;
-    let Err(error) = drive(&mut session, &interrupt, &mut slot, &mut shown) else {
+    let Err(error) = drive(&mut session, &interrupt, 5, &mut slot, &mut shown) else {
         panic!("approval without an action must fail");
     };
     assert!(format!("{error:#}").contains("approval"));
@@ -420,7 +503,7 @@ fn restart_does_not_repeat_streamed_text() {
             true
         };
         let mut slot: Option<&mut dyn FnMut(&str) -> bool> = Some(&mut callback);
-        drive(&mut first, &interrupt, &mut slot, &mut shown).expect("first attempt")
+        drive(&mut first, &interrupt, 5, &mut slot, &mut shown).expect("first attempt")
     };
     assert!(matches!(first_step, Step::Restart(Restart::StepLimit)));
     drop(first);
@@ -432,7 +515,7 @@ fn restart_does_not_repeat_streamed_text() {
             true
         };
         let mut slot: Option<&mut dyn FnMut(&str) -> bool> = Some(&mut callback);
-        drive(&mut second, &interrupt, &mut slot, &mut shown).expect("second attempt")
+        drive(&mut second, &interrupt, 5, &mut slot, &mut shown).expect("second attempt")
     };
     let Step::Reply(reply) = second_step else {
         panic!("expected completion after restart");

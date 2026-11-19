@@ -168,6 +168,44 @@ fn shown_runs(text: &str) -> Vec<(&str, Vec<Run>)> {
     sections
 }
 
+/// Anchored rows in one file section of a `read` result above which dial suggests a structural
+/// lookup first. A whole-file read past the output cap already returns an elided summary; this
+/// covers the reads below the cap that still put hundreds of lines into the context.
+pub(in crate::agent) const LARGE_READ_ROWS: u32 = 300;
+
+/// A one-line `[hint]` for a successful `read` that returned at least [`LARGE_READ_ROWS`] rows of
+/// one file whose type `outline` can parse. Reads that already named declarations (`:sym=`,
+/// `:outline=`) get none. The hint shapes the next lookup; it never changes this result.
+pub(in crate::agent) fn large_read_hint(
+    call: &ToolCall,
+    text: &str,
+    outline: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let args = &call.arguments;
+    let requested = args["path"].as_str().into_iter().chain(
+        args["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str()),
+    );
+    if requested.clone().any(|path| {
+        path.contains(":sym=") || path.contains(":symbol=") || path.contains(":outline")
+    }) || requested.clone().next().is_none()
+    {
+        return None;
+    }
+    let (path, rows) = shown_runs(text).into_iter().find_map(|(header, runs)| {
+        let rows: u32 = runs.iter().map(|(a, b)| b - a + 1).sum();
+        let (path, _) = header.rsplit_once('#')?;
+        let path = serde_json::from_str::<String>(path).unwrap_or_else(|_| path.to_owned());
+        (rows >= LARGE_READ_ROWS && outline(&path)).then_some((path, rows))
+    })?;
+    Some(format!(
+        "[hint] This read returned {rows} lines of {path}. Start a file this size with `{path}:outline`, or `:sym=NAME` for one declaration, then read only the ranges you need."
+    ))
+}
+
 /// Opening of the pointer that answers an identical re-read whose earlier full result is still shown.
 pub(in crate::agent) const UNCHANGED_READ: &str = "[Unchanged read]";
 

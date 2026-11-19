@@ -3,6 +3,7 @@
 //! `ssh_hosts` or the usage reporter, and persists through the shared settings path.
 
 use crate::agent::Agent;
+use crate::app::presets::{self, Save, valid_name};
 use crate::app::{App, Shell, Step};
 use crate::config::settings_store::{self, Change, Scope};
 use crate::config::types::{Config, ModelPreset, SshHostConfig, VerificationCommand};
@@ -218,12 +219,19 @@ pub(super) fn run_live(
         ("modelpreset", "" | "list") => {
             let presets = &config.model_presets;
             let text = if presets.is_empty() {
-                "No presets saved. /modelpreset capture <name> saves safe working controls (no credentials or paths); /modelpreset save <name> saves legacy model selections.".to_owned()
-            } else {
                 format!(
-                    "Presets: {}\nUse /modelpreset preview <name> to review every write; /modelpreset switch <name> confirms before applying. Capture safe controls with /modelpreset capture <name>.",
-                    presets.keys().cloned().collect::<Vec<_>>().join(", ")
+                    "No presets saved.\n{MODELPRESET_USAGE}\nIn /models → Roles, the Presets rows do the same: n saves the current roles, Enter applies."
                 )
+            } else {
+                let rows = presets
+                    .iter()
+                    .map(|(name, preset)| {
+                        let roles = presets::describe(preset);
+                        format!("{name}\n  {}", roles.join("\n  "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Presets:\n{rows}\n\n{MODELPRESET_USAGE}")
             };
             shell.note("Model preset", text);
             Ok(Step::Done)
@@ -320,11 +328,7 @@ fn extended_context(
     Ok(step)
 }
 
-fn valid_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+const MODELPRESET_USAGE: &str = "Usage: /modelpreset [list|new <name>|update <name>|rename <old> <new>|delete <name>|preview <name>|apply <name>|capture <name>]. new saves the current roles (main model, helper roles and thinking levels); update replaces a preset's models with the current ones; apply (or switch) restores one.";
 
 fn capture_setup(config: &Config) -> ModelPreset {
     let values = [
@@ -397,49 +401,6 @@ pub(super) fn changes_preview(changes: &[Change]) -> String {
         .join("\n")
 }
 
-fn preset_changes(config: &Config, preset: &ModelPreset) -> Result<Vec<Change>> {
-    preset.validate_setup()?;
-    let mut changes = Vec::new();
-    // Safe captures contain no model fields. Legacy presets still restore their roles.
-    if preset.setup.is_empty() || !preset.roles.is_empty() {
-        changes.push(Change::Set {
-            path: "model_roles".into(),
-            value: toml::Value::try_from(&preset.roles)?,
-        });
-    }
-    if let Some(vision) = &preset.vision {
-        changes.push(Change::Set {
-            path: "vision".into(),
-            value: toml::Value::try_from(vision)?,
-        });
-    }
-    if let Some(checkpoint) = &preset.laya_checkpoint {
-        changes.push(Change::Set {
-            path: "laya.checkpoint".into(),
-            value: checkpoint.clone().into(),
-        });
-    }
-    if let Some(effort) = preset.thinking
-        && let Some(active) = config.active_model_profile()
-    {
-        let name = config
-            .model_profiles
-            .iter()
-            .find(|(_, profile)| std::ptr::eq(*profile, active))
-            .map(|(name, _)| name)
-            .ok_or_else(|| anyhow!("active model profile is not in model_profiles"))?;
-        changes.push(Change::Set {
-            path: format!("model_profiles.{name}.reasoning_effort"),
-            value: toml::Value::try_from(effort)?,
-        });
-    }
-    changes.extend(preset.setup.iter().map(|(path, value)| Change::Set {
-        path: path.clone(),
-        value: value.clone(),
-    }));
-    Ok(changes)
-}
-
 fn modelpreset(
     shell: &mut Shell,
     app: &App,
@@ -462,7 +423,7 @@ fn modelpreset(
             preset.validate_setup()?;
             let preview = format!(
                 "Save safe working setup \"{rest}\" (global). Included controls:\n{}\n\nExcluded: all model assignments, endpoints, credentials, headers, paths, vision and checkpoints. Existing names in either scope are refused to avoid inherited model fields. Apply later with /modelpreset switch {rest}.",
-                changes_preview(&preset_changes(config, &preset)?)
+                changes_preview(&presets::apply_changes(config, &preset)?)
             );
             shell.note(TITLE, &preview);
             if shell.ask(
@@ -485,35 +446,47 @@ fn modelpreset(
             shell.note(TITLE, format!("Saved safe working setup \"{rest}\"."));
             Ok(step)
         }
-        "save" => {
-            if !valid_name(rest) {
-                bail!(
-                    "Usage: /modelpreset save <name>; names start with a letter, then letters, digits, '-' or '_'"
-                );
+        "new" | "create" | "save" | "update" | "edit" => {
+            let mode = match sub {
+                "new" | "create" => Save::Create,
+                "update" | "edit" => Save::Update,
+                _ => Save::Overwrite,
+            };
+            if rest.is_empty() {
+                bail!("Usage: /modelpreset {sub} <name>; {}", presets::NAME_RULE);
             }
-            let preset = ModelPreset {
-                roles: config.model_roles.clone(),
-                thinking: config
-                    .active_model_profile()
-                    .and_then(|profile| profile.reasoning_effort),
-                vision: Some(config.vision.clone()),
-                laya_checkpoint: config.laya.checkpoint.clone(),
-                setup: Default::default(),
+            let changes = presets::save_changes(config, rest, mode)?;
+            let step = shell.save(app, agent, &changes, Scope::Global)?;
+            let verb = if mode == Save::Update {
+                "Updated"
+            } else {
+                "Saved"
             };
-            let change = Change::Set {
-                path: format!("model_presets.{rest}"),
-                value: toml::Value::try_from(&preset)?,
-            };
-            let step = shell.save(app, agent, &[change], Scope::Global)?;
-            shell.note(TITLE, format!("Saved model preset \"{rest}\"."));
+            shell.note(
+                TITLE,
+                format!("{verb} model preset \"{rest}\" from the current roles."),
+            );
             Ok(step)
         }
-        "switch" | "preview" => {
-            let Some(preset) = config.model_presets.get(rest) else {
+        "rename" => {
+            let Some((from, to)) = rest.split_once(char::is_whitespace) else {
+                bail!("Usage: /modelpreset rename <old> <new>");
+            };
+            let (from, to) = (from.trim(), to.trim());
+            let changes = presets::rename_changes(&app.layout, config, from, to)?;
+            let step = shell.save(app, agent, &changes, Scope::Global)?;
+            shell.note(
+                TITLE,
+                format!("Renamed model preset \"{from}\" to \"{to}\"."),
+            );
+            Ok(step)
+        }
+        "switch" | "apply" | "preview" => {
+            if !config.model_presets.contains_key(rest) {
                 shell.note(TITLE, format!("Preset not found: {rest}"));
                 return Ok(Step::Done);
-            };
-            let changes = preset_changes(config, preset)?;
+            }
+            let changes = presets::apply_named(config, rest)?;
             settings_store::preview_config(&app.layout, Scope::Global, &changes, &app.overlay)?;
             let preview = format!(
                 "Preset \"{rest}\" · Global defaults\n{}\n\nAll writes above are one validated transaction. Project and command-line overrides remain in effect. No downloads or provider calls. No settings have changed yet.",
@@ -537,32 +510,16 @@ fn modelpreset(
             Ok(step)
         }
         "delete" | "remove" => {
-            let project = settings_store::load_layer(&app.layout, Scope::Project)?;
-            if project
-                .get("model_presets")
-                .and_then(|value| value.as_table())
-                .is_some_and(|table| table.contains_key(rest))
-            {
-                bail!("Preset {rest} is defined in the project config; delete it there.");
-            }
             if !config.model_presets.contains_key(rest) {
                 shell.note(TITLE, format!("Preset not found: {rest}"));
                 return Ok(Step::Done);
             }
-            let step = shell.save(
-                app,
-                agent,
-                &[Change::Remove {
-                    path: format!("model_presets.{rest}"),
-                }],
-                Scope::Global,
-            )?;
+            let changes = presets::delete_changes(&app.layout, config, rest)?;
+            let step = shell.save(app, agent, &changes, Scope::Global)?;
             shell.note(TITLE, format!("Deleted model preset \"{rest}\"."));
             Ok(step)
         }
-        other => bail!(
-            "Unknown /modelpreset subcommand: {other}. Usage: /modelpreset [list|save <name>|capture <name>|preview <name>|switch <name>|delete <name>]"
-        ),
+        other => bail!("Unknown /modelpreset subcommand: {other}. {MODELPRESET_USAGE}"),
     }
 }
 

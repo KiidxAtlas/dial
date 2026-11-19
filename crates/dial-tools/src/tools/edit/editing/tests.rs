@@ -373,3 +373,181 @@ fn optional_check_is_boolean_and_valid_in_every_edit_grammar() {
         }
     }
 }
+
+#[test]
+fn hashline_default_accepts_every_edit_method_without_extra_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path())
+        .unwrap()
+        .with_edit_mode(EditMode::Hashline);
+    let path = dir.path().join("sample.txt");
+    fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+    let read = execute(&ws, "read", &json!({"path":"sample.txt"}), 20);
+    assert!(
+        !read.is_error,
+        "fixture read must witness the canonical edit path"
+    );
+
+    let offered_schema = schema(EditMode::Hashline);
+
+    // 1. Replace payload works while Hashline is default.
+    let replace_args = json!({
+        "path": "sample.txt",
+        "old_string": "beta",
+        "new_string": "BETA"
+    });
+    assert_eq!(
+        effective_mode(EditMode::Hashline, &replace_args),
+        EditMode::Replace
+    );
+    assert!(
+        crate::tools::surface::catalog::validate_tool_arguments(
+            "edit",
+            &offered_schema,
+            &replace_args
+        )
+        .is_ok()
+    );
+    let out = edit_output(&ws, &replace_args).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nBETA\ngamma\n");
+
+    // 2. ApplyPatch payload works while Hashline is default.
+    let apply_args = json!({
+        "input": "*** Begin Patch\n*** Update File: sample.txt\n@@\n alpha\n-BETA\n+BETA2\n gamma\n*** End Patch\n"
+    });
+    assert_eq!(
+        effective_mode(EditMode::Hashline, &apply_args),
+        EditMode::ApplyPatch
+    );
+    assert!(
+        crate::tools::surface::catalog::validate_tool_arguments(
+            "edit",
+            &offered_schema,
+            &apply_args
+        )
+        .is_ok()
+    );
+    let out = edit_output(&ws, &apply_args).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nBETA2\ngamma\n");
+
+    // 3. Patch payload works while Hashline is default.
+    let patch_args = json!({
+        "path": "sample.txt",
+        "edits": [{"op": "update", "diff": "@@\n alpha\n-BETA2\n+BETA3\n gamma\n"}]
+    });
+    assert_eq!(
+        effective_mode(EditMode::Hashline, &patch_args),
+        EditMode::Patch
+    );
+    assert!(
+        crate::tools::surface::catalog::validate_tool_arguments(
+            "edit",
+            &offered_schema,
+            &patch_args
+        )
+        .is_ok()
+    );
+    let out = edit_output(&ws, &patch_args).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nBETA3\ngamma\n");
+
+    // 4. Sloppy payload works while Hashline is default.
+    let sloppy_args = json!({
+        "input": "*** Edit File: sample.txt\n*** Find\nBETA3\n*** Replace\nBETA4\n"
+    });
+    assert_eq!(
+        effective_mode(EditMode::Hashline, &sloppy_args),
+        EditMode::Sloppy
+    );
+    assert!(
+        crate::tools::surface::catalog::validate_tool_arguments(
+            "edit",
+            &offered_schema,
+            &sloppy_args
+        )
+        .is_ok()
+    );
+    let out = edit_output(&ws, &sloppy_args).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nBETA4\ngamma\n");
+
+    // 5. Hashline remains default and works directly.
+    let tag = hashline::tag_of("alpha\nBETA4\ngamma\n");
+    let hashline_args = json!({
+        "input": format!("[sample.txt#{tag}]\nPUT 2.=2:\n+BETA5")
+    });
+    assert_eq!(
+        effective_mode(EditMode::Hashline, &hashline_args),
+        EditMode::Hashline
+    );
+    let out = edit_output(&ws, &hashline_args).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nBETA5\ngamma\n");
+
+    // 6. Mixed invalid payloads remain rejected.
+    let mixed = json!({"input": "foo", "old_string": "a", "new_string": "b"});
+    assert!(
+        crate::tools::surface::catalog::validate_tool_arguments("edit", &offered_schema, &mixed)
+            .is_err()
+    );
+}
+
+#[test]
+fn preferred_edit_style_still_allows_a_witnessed_hashline_edit() {
+    for mode in [
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        let (_dir, ws, path, _) = workspace("first\nsecond\n");
+        let ws = ws.with_edit_mode(mode);
+        let read = execute(&ws, "read", &json!({"path":"a.txt:2"}), 20);
+        let header = read.text.lines().next().unwrap();
+        assert!(
+            header.starts_with("[a.txt#") && header.ends_with(']'),
+            "{mode:?}: {}",
+            read.text
+        );
+        for (line, should_fail) in [(1, true), (2, false)] {
+            let args = json!({"input":format!("{header}\nPUT {line}.={line}:\n+changed")});
+            crate::tools::surface::catalog::validate_tool_arguments("edit", &schema(mode), &args)
+                .unwrap();
+            let out = execute(&ws, "edit", &args, 20);
+            assert_eq!(out.is_error, should_fail, "{mode:?}: {}", out.text);
+        }
+        assert_eq!(fs::read_to_string(path).unwrap(), "first\nchanged\n");
+    }
+}
+
+#[test]
+fn accepted_argument_names_are_exactly_the_fields_each_method_admits() {
+    let mut accepted = accepted_argument_names();
+    accepted.sort_unstable();
+    assert_eq!(
+        accepted,
+        [
+            "allow_syntax_errors",
+            "edits",
+            "input",
+            "new_string",
+            "old_string",
+            "path",
+            "replace_all",
+            "verify",
+        ]
+    );
+    for mode in [
+        EditMode::Hashline,
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        for name in mode_argument_names(mode) {
+            assert!(accepted.contains(name), "{name} missing for {mode:?}");
+        }
+    }
+}

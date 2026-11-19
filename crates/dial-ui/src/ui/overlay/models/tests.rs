@@ -518,11 +518,13 @@ fn turn_drafter_row_follows_the_turn_optimizer_setting() {
     };
     let mut o = ModelOverlay::new(None, config.role_statuses(), Scope::Global);
     o.show_roles();
-    assert_eq!(o.list_len(), ROLES.len() - 1);
+    assert_eq!(o.visible_roles().len(), ROLES.len() - 1);
+    // The roles are followed by the "save as preset" row (no presets saved yet).
+    assert_eq!(o.list_len(), ROLES.len());
     assert!(!draw(&mut o, &rig, 130, 40).contains(TURN_DRAFTER));
     config.experimental.turn_optimizer = true;
     o.set_roles(config.role_statuses());
-    assert_eq!(o.list_len(), ROLES.len());
+    assert_eq!(o.visible_roles().len(), ROLES.len());
     o.cursor = ROLES.len() - 1;
     let shown = draw(&mut o, &rig, 130, 40);
     assert!(shown.contains(TURN_DRAFTER), "{shown}");
@@ -2668,7 +2670,7 @@ fn ctrl_d_is_offered_on_downloaded_local_models_in_the_model_lists() {
     assert!(matches!(send(&mut o, &rig, ctrl('d')), OverlayEvent::None));
     assert!(o.deletion.is_none());
     let (message, ok) = o.message.clone().unwrap();
-    assert!(!ok && message.starts_with("Cannot delete:"), "{message}");
+    assert!(!ok && message.starts_with("Cannot delete:"));
 
     let mut remote = overlay();
     remote.type_text("llama3");
@@ -2721,10 +2723,7 @@ fn a_delete_shows_what_it_removes_and_needs_an_explicit_confirmation() {
     ));
     assert!(o.deletion.is_none());
     let (message, ok) = o.message.clone().unwrap();
-    assert!(
-        !ok && message.starts_with("Did not delete org/local:"),
-        "{message}"
-    );
+    assert!(!ok && message.starts_with("Did not delete org/local:"));
 }
 
 #[test]
@@ -3017,4 +3016,156 @@ fn favorite_route_policy_joins_the_name_only_when_names_collide() {
             .all(|entry| entry.model.label.contains("key env(")),
         "two favorites of one model stay distinguishable"
     );
+}
+
+#[test]
+fn picking_a_model_with_thinking_levels_asks_for_the_level_first() {
+    let rig = Rig::new();
+    let mut o = ModelOverlay::new(Some(discovery()), roles_with_main(), Scope::Global);
+    o.show_roles();
+    let haiku = ModelSelection::new("anthropic", "claude-haiku-5-5");
+    let levels = ModelOverlay::thinking_levels("task", &haiku);
+    assert_eq!(levels.first(), Some(&"default"));
+    assert!(levels.len() > 1 && !levels.contains(&"auto"), "{levels:?}");
+    assert!(matches!(
+        o.assign_with_thinking("task".into(), haiku, "Claude Haiku".into()),
+        OverlayEvent::None
+    ));
+    let shown = draw(&mut o, &rig, 130, 30);
+    assert!(shown.contains("Claude Haiku (Task workers)"), "{shown}");
+    assert!(shown.contains("default"), "{shown}");
+    send(&mut o, &rig, key(KeyCode::Down));
+    match send(&mut o, &rig, key(KeyCode::Enter)) {
+        OverlayEvent::AssignModel {
+            role, selection, ..
+        } => {
+            assert_eq!(role, "task");
+            assert_eq!(selection.thinking.as_deref(), Some(levels[1]));
+        }
+        other => panic!("expected an assignment, got {other:?}"),
+    }
+    assert!(o.thinking.is_none());
+    // Esc leaves the role as it was.
+    o.assign_with_thinking(
+        "main".into(),
+        ModelSelection::new("anthropic", "claude-haiku-5-5"),
+        "Claude Haiku".into(),
+    );
+    assert!(o.thinking.as_ref().unwrap().levels.contains(&"auto"));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(o.thinking.is_none());
+    // A model without documented levels is assigned straight away.
+    let llama = discovery().models[0].selection.clone();
+    assert!(matches!(
+        o.assign_with_thinking("task".into(), llama, "llama3".into()),
+        OverlayEvent::AssignModel { selection, .. } if selection.thinking.is_none()
+    ));
+}
+
+#[test]
+fn a_roles_thinking_level_shows_next_to_its_model_and_t_changes_it() {
+    let rig = Rig::new();
+    let mut roles = roles_with_main();
+    let mut haiku = ModelSelection::new("anthropic", "claude-haiku-5-5");
+    haiku.thinking = Some("low".into());
+    let task = roles
+        .iter_mut()
+        .find(|status| status.role == "task")
+        .unwrap();
+    assign(task, haiku);
+    let mut o = ModelOverlay::new(Some(discovery()), roles, Scope::Global);
+    o.show_roles();
+    let shown = draw(&mut o, &rig, 160, 30);
+    assert!(shown.contains("claude-haiku-5-5 (low)"), "{shown}");
+    o.cursor = o
+        .visible_roles()
+        .iter()
+        .position(|(role, _)| *role == "task")
+        .unwrap();
+    send(&mut o, &rig, ch('t'));
+    let pick = o.thinking.as_ref().expect("t opens the level picker");
+    assert!(pick.assign.is_none());
+    assert_eq!(pick.levels[pick.cursor], "low");
+    send(&mut o, &rig, key(KeyCode::Up));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::SetThinking { role, level, .. } if role == "task" && level == "default"
+    ));
+}
+
+#[test]
+fn presets_are_listed_under_the_roles_and_managed_in_place() {
+    let rig = Rig::new();
+    let mut o = ModelOverlay::new(Some(discovery()), roles_with_main(), Scope::Global);
+    let mut main = discovery().models[0].selection.clone();
+    main.thinking = None;
+    let preset = ModelPreset {
+        main: Some(main),
+        ..Default::default()
+    };
+    o.set_presets(&BTreeMap::from([("work".to_owned(), preset)]));
+    o.show_roles();
+    let roles = o.visible_roles().len();
+    assert_eq!(o.list_len(), roles + 2);
+    let shown = draw(&mut o, &rig, 160, 40);
+    assert!(shown.contains("Presets"), "{shown}");
+    assert!(shown.contains("work"), "{shown}");
+    assert!(shown.contains("● in use"), "{shown}");
+
+    // `n` on a role row names a preset rather than searching, and End reaches the last preset.
+    send(&mut o, &rig, ch('n'));
+    assert!(o.preset_prompt.is_some());
+    assert_eq!(o.group, Group::Roles);
+    send(&mut o, &rig, key(KeyCode::Esc));
+    assert!(o.preset_prompt.is_none() && o.search.is_empty());
+    send(&mut o, &rig, key(KeyCode::End));
+    assert_eq!(o.cursor, roles + 1);
+    send(&mut o, &rig, key(KeyCode::Home));
+    assert_eq!(o.cursor, 0);
+
+    // The heading row starts a new preset from the current roles.
+    o.cursor = roles;
+    send(&mut o, &rig, key(KeyCode::Enter));
+    for event in typed("fast") {
+        send(&mut o, &rig, event);
+    }
+    assert!(draw(&mut o, &rig, 160, 40).contains("New preset name"));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::Preset(PresetAction::Create(name)) if name == "fast"
+    ));
+
+    o.cursor = roles + 1;
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::Preset(PresetAction::Apply(name)) if name == "work"
+    ));
+    assert!(matches!(
+        send(&mut o, &rig, ch('e')),
+        OverlayEvent::Preset(PresetAction::Update(name)) if name == "work"
+    ));
+    send(&mut o, &rig, ch('r'));
+    for _ in 0.."work".len() {
+        send(&mut o, &rig, key(KeyCode::Backspace));
+    }
+    for event in typed("home") {
+        send(&mut o, &rig, event);
+    }
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::Preset(PresetAction::Rename { from, to }) if from == "work" && to == "home"
+    ));
+    send(&mut o, &rig, ch('x'));
+    assert!(draw(&mut o, &rig, 160, 40).contains("Delete preset work?"));
+    assert!(matches!(send(&mut o, &rig, ch('n')), OverlayEvent::None));
+    send(&mut o, &rig, ch('x'));
+    assert!(matches!(
+        send(&mut o, &rig, ch('y')),
+        OverlayEvent::Preset(PresetAction::Delete(name)) if name == "work"
+    ));
+    // Role rows keep their keys: x on a preset never clears a role.
+    assert_eq!(o.group, Group::Roles);
 }

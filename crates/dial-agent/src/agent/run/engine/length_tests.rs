@@ -12,7 +12,7 @@ fn truncated(text: &str) -> Reply {
 
 fn nudge(engine: &mut Engine, reply: &Reply) -> LengthAction {
     // No room for a larger budget: both controllers reach the shared nudge policy.
-    engine.length(1024, 1024, 1024, reply)
+    engine.length(1024, 1024, 1024, None, reply)
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn partial_novelty_cannot_rearm_recovery_after_a_detected_cycle() {
 fn larger_budget_and_advancing_continuations_remain_available() {
     let mut engine = Engine::default();
     assert_eq!(
-        engine.length(1024, 32768, 1024, &truncated("")),
+        engine.length(1024, 32768, 1024, None, &truncated("")),
         LengthAction::Retry { max_tokens: 2048 }
     );
     for part in 0..128 {

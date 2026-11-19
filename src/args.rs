@@ -268,7 +268,7 @@ pub(crate) struct Cli {
     /// only, no network) or off.
     #[arg(long, global = true, help_heading = section::SAFETY, value_parser = ["off", "dev", "strict"])]
     pub(crate) sandbox: Option<String>,
-    /// How the model writes edits.
+    /// Preferred grammar shown for the edit tool; other edit grammars are still accepted.
     #[arg(long, global = true, help_heading = section::CONTEXT, value_parser = ["apply_patch", "hashline", "patch", "replace", "sloppy"])]
     pub(crate) edit_mode: Option<String>,
     /// Automatic context policy when the window fills.
@@ -761,8 +761,14 @@ pub(crate) enum Command {
     /// Verify and install the latest signed release, or a specified release version.
     Update {
         /// Version number or v-prefixed release tag (defaults to latest).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "check")]
         version: Option<String>,
+        /// Only report whether a newer release exists; installs nothing.
+        #[arg(long)]
+        check: bool,
+        /// With --check: print the result as one JSON object.
+        #[arg(long, requires = "check")]
+        json: bool,
     },
     /// Generate shell completions from the live command and argument definitions.
     Completions {
@@ -942,9 +948,13 @@ pub(crate) enum DevCommand {
         /// Resume only if task, source, configuration and executable fingerprints still match.
         #[arg(long, requires = "checkpoint")]
         resume: bool,
-        /// Share the original subscription authentication store and refresh locks; never copy tokens.
-        #[arg(long)]
+        /// Accepted for compatibility: benchmarks already use existing subscription sign-ins.
+        #[arg(long, hide = true, conflicts_with = "isolated_auth")]
         share_auth: bool,
+        /// Keep subscription sign-ins (ChatGPT, Claude) out of the run; only API keys and local
+        /// models work. By default the original store is used in place, never copied.
+        #[arg(long)]
+        isolated_auth: bool,
         /// Measure raw (assistance off), dial (shipped defaults) and one ablation per assistance feature.
         #[arg(long)]
         ablate_assistance: bool,

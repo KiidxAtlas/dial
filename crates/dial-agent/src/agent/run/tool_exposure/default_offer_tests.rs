@@ -992,16 +992,16 @@ fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
     }
 }
 
-/// Local routes default to the replace grammar; explicit pins, `inherit`, hosted routes and a
-/// disabled profile keep `[edit] mode`.
+/// Local routes default to the hashline grammar, the same as hosted routes; pins and
+/// `assistance.local.edit_mode` still apply.
 #[test]
-fn local_routes_default_to_replace_edits_unless_pinned() {
+fn local_routes_default_to_hashline_unless_pinned() {
     use crate::config::types::EditMode;
     let mode = |overlay: &str| with_agent(overlay, |agent| agent.edit_mode());
-    assert_eq!(mode(""), EditMode::Replace);
+    assert_eq!(mode(""), EditMode::Hashline);
     assert_eq!(
         mode("[endpoint]\nbase_url='http://127.0.0.1:9/v1'"),
-        EditMode::Replace
+        EditMode::Hashline
     );
     assert_eq!(
         mode("[assistance.local]\nedit_mode='apply_patch'"),

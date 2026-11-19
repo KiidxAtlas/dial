@@ -7,10 +7,6 @@ on:
         description: Validated stable release tag matching the checkout
         required: true
         type: string
-      ref:
-        description: Commit to build; candidates record its tree, which a release must match
-        required: true
-        type: string
       epoch:
         description: Source commit timestamp
         required: true
@@ -26,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -93,7 +89,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
@@ -117,7 +114,7 @@ jobs:
           key: release-${{ matrix.target }}${{ matrix.cache-suffix }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Prepare pinned Node payload
+      - name: Prepare pinned Node and Python payloads
         env:
           RELEASE_TARGET: ${{ matrix.target }}
         run: |
@@ -125,11 +122,16 @@ jobs:
           payload="$GITHUB_WORKSPACE/target/node-payload/$RELEASE_TARGET"
           rm -rf "$payload"
           python3 scripts/prepare-node.py --target "$RELEASE_TARGET" --output "$payload"
+          payload="$GITHUB_WORKSPACE/target/python-payload/$RELEASE_TARGET"
+          rm -rf "$payload"
+          python3 scripts/prepare-python.py --target "$RELEASE_TARGET" --output "$payload"
       - name: Build release binary
         env:
+          DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           MACOSX_DEPLOYMENT_TARGET: '13.0'
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
+          DIAL_BUNDLED_PYTHON_DIR: ${{ github.workspace }}/target/python-payload/${{ matrix.target }}
         run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         env:
@@ -141,6 +143,7 @@ jobs:
           install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
           cp LICENSE README.md THIRD_PARTY_NOTICES crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
           cp "target/node-payload/$RELEASE_TARGET/LICENSE.node" "dist/$package/"
+          cp "target/python-payload/$RELEASE_TARGET/LICENSE.python" "dist/$package/"
           tar -czf "dist/$package.tar.gz" -C dist "$package"
           smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
           trap 'rm -rf "$smoke"' EXIT
@@ -149,7 +152,7 @@ jobs:
             # The musl Node payload cannot run on this glibc runner; the Alpine step below proves it.
             python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET"
           else
-            python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET" --require-bundled-node
+            python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET" --require-bundled-node --require-bundled-python
           fi
           cd "$smoke/$package"
           ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${RELEASE_TAG#v}"
@@ -175,7 +178,7 @@ jobs:
               set -eu
               apk add --no-cache python3 libstdc++ libgcc
               echo "Disclosed system libraries for the bundled musl Node: libstdc++ libgcc"
-              python3 /checks/scripts/check-artifact.py --dial /artifact/dial --target "$RELEASE_TARGET" --require-bundled-node
+              python3 /checks/scripts/check-artifact.py --dial /artifact/dial --target "$RELEASE_TARGET" --require-bundled-node --require-bundled-python
             '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -203,7 +206,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -216,7 +220,7 @@ jobs:
           key: release-${{ matrix.target }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Prepare pinned Node payload
+      - name: Prepare pinned Node and Python payloads
         shell: pwsh
         env:
           RELEASE_TARGET: ${{ matrix.target }}
@@ -225,10 +229,16 @@ jobs:
           Remove-Item -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue
           python scripts/prepare-node.py --target $env:RELEASE_TARGET --output $payload
           if ($LASTEXITCODE -ne 0) { throw 'Node payload preparation failed' }
+          $payload = Join-Path $env:GITHUB_WORKSPACE "target/python-payload/$env:RELEASE_TARGET"
+          Remove-Item -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue
+          python scripts/prepare-python.py --target $env:RELEASE_TARGET --output $payload
+          if ($LASTEXITCODE -ne 0) { throw 'Python payload preparation failed' }
       - name: Build release binary
         env:
+          DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
+          DIAL_BUNDLED_PYTHON_DIR: ${{ github.workspace }}/target/python-payload/${{ matrix.target }}
           # Ship the C runtime inside dial.exe: users should not need the VC++ redist.
           RUSTFLAGS: '-C target-feature=+crt-static'
         run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
@@ -243,6 +253,7 @@ jobs:
           Copy-Item "target/$env:RELEASE_TARGET/release/dial.exe" "$dir/dial.exe"
           Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE $dir
           Copy-Item "target/node-payload/$env:RELEASE_TARGET/LICENSE.node" $dir
+          Copy-Item "target/python-payload/$env:RELEASE_TARGET/LICENSE.python" $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
           $expected = "$env:RELEASE_TAG".Substring(1)
           # Capture all output first: piping into `Select-Object -First 1` stops the native
@@ -259,8 +270,8 @@ jobs:
               & ./dial.exe --help
               if ($LASTEXITCODE -ne 0) { throw 'Packaged help check failed' }
               $checker = Join-Path $env:GITHUB_WORKSPACE 'scripts/check-artifact.py'
-              & python $checker --dial (Join-Path (Get-Location) 'dial.exe') --target $env:RELEASE_TARGET --require-bundled-node
-              if ($LASTEXITCODE -ne 0) { throw 'Installed checks with the bundled Node runtime failed' }
+              & python $checker --dial (Join-Path (Get-Location) 'dial.exe') --target $env:RELEASE_TARGET --require-bundled-node --require-bundled-python
+              if ($LASTEXITCODE -ne 0) { throw 'Installed checks with bundled runtimes failed' }
             } finally { Pop-Location }
           } finally { Remove-Item -LiteralPath $smoke -Recurse -Force }
       - name: Verify packaged binary format

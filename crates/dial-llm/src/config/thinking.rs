@@ -286,3 +286,32 @@ pub fn apply_role_thinking(mut config: Config, level: &str) -> Result<Config> {
     config.thinking_auto = false;
     Ok(config)
 }
+
+/// The level name a reasoning effort is chosen and shown as (`none` reads as `off`).
+pub fn level_name(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "off",
+        effort => effort.as_str(),
+    }
+}
+
+/// The main model's saved thinking level: `auto`, the active profile's explicit level, or `None`
+/// for the model's default.
+pub fn main_level(config: &Config) -> Option<String> {
+    if config.thinking_auto {
+        return Some("auto".into());
+    }
+    let profile = config.active_model_profile()?;
+    match (profile.reasoning_effort, profile.thinking) {
+        (Some(effort), _) => Some(level_name(effort).into()),
+        (None, Some(false)) => Some("off".into()),
+        (None, Some(true)) => Some("on".into()),
+        (None, None) => None,
+    }
+}
+
+/// Thinking levels the catalog documents for `provider/model`, weakest first, as level names.
+/// `role` drops levels a helper role cannot hold (`auto` is main-only and is never listed here).
+pub fn catalog_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
+    crate::llm::catalog::documented_thinking_levels(provider, model, role)
+}

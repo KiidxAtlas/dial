@@ -2343,3 +2343,52 @@ fn running_runtime_snapshots_are_not_repeated_and_stream_recovery_keeps_latest_t
         crate::runtime::Phase::Interrupted
     );
 }
+
+#[test]
+fn torn_result_recovery_retains_completed_mutations_and_repairs_only_unfinished_calls() {
+    let e = env();
+    let mut session = new_session(&e);
+    session.append(user("make two changes")).unwrap();
+    session
+        .append(json!({
+            "role":"assistant",
+            "content":null,
+            "tool_calls":[
+                {"id":"committed","type":"function","function":{"name":"write","arguments":"{}"}},
+                {"id":"unfinished","type":"function","function":{"name":"write","arguments":"{}"}}
+            ]
+        }))
+        .unwrap();
+    let completed = json!({
+        "role":"tool",
+        "tool_call_id":"committed",
+        "content":"write committed",
+        "dial_effects":"known",
+        "dial_execution_status":"ok",
+        "dial_changed_paths":["kept.rs"]
+    });
+    session.append(completed.clone()).unwrap();
+    crate::platform::fs::sync_file_data(session.file.as_ref().unwrap()).unwrap();
+    let path = session.path().unwrap().to_owned();
+    drop(session);
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{\"type\":\"message\",\"id\":\"torn-result\"")
+        .unwrap();
+    drop(file);
+    let mut recovered = Session::open(&path).unwrap();
+    let messages = recovered.messages();
+    let results: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(*results[0], completed);
+    assert_eq!(results[1]["tool_call_id"], "unfinished");
+    assert_eq!(results[1]["dial_effects"], "unknown");
+    assert_eq!(results[1]["dial_execution_status"], "aborted");
+    assert_eq!(recovered.repair_incomplete_tools().unwrap(), 0);
+    drop(recovered);
+    let mut reopened = Session::open(&path).unwrap();
+    assert_eq!(reopened.messages(), messages);
+    assert_eq!(reopened.repair_incomplete_tools().unwrap(), 0);
+}

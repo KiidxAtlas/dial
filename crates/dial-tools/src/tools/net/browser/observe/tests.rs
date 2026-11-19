@@ -22,7 +22,13 @@ fn options_are_strict_and_opt_in_before_any_action() {
             "{value}"
         );
     }
-    for action in ["evaluate", "run", "call", "shutdown", "close", "screenshot"] {
+    for action in ["run", "call"] {
+        assert!(
+            validate(action, &json!({"observe":{"snapshot":true,"events":true}})).is_ok(),
+            "{action}"
+        );
+    }
+    for action in ["evaluate", "shutdown", "close", "screenshot"] {
         assert!(
             validate(action, &json!({"observe":{}})).is_err(),
             "{action}"

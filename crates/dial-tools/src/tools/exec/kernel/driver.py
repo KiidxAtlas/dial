@@ -173,7 +173,8 @@ def __dial_display__(value):
 
 namespace["__dial_prelude__"] = __dial_prelude__
 namespace["__dial_display__"] = __dial_display__
-namespace["__dial_check__"] = lambda name, passed: callback("check", name=name, passed=passed)
+namespace["__dial_check__"] = lambda name, passed, source=...: callback(
+    "check", name=name, passed=passed, **({} if source is ... else {"source": source}))
 
 
 class _ToolResult(dict):

@@ -21,7 +21,7 @@ use std::sync::{
 };
 use std::thread;
 
-const USAGE: &str = "usage: /btw <question> | /btw new <question> | /btw threads | /btw open <id> | /btw copy | /btw promote <id> | /btw cancel";
+const USAGE: &str = "Usage: /btw <question> | /btw new <question> | /btw threads | /btw open <id> | /btw copy | /btw promote <id> | /btw cancel";
 
 /// Side threads of the bound session plus at most one streaming request.
 #[derive(Default)]
@@ -218,7 +218,7 @@ impl SideThreadState {
         new: bool,
     ) -> Result<String> {
         let question = question.trim();
-        ensure!(!question.is_empty(), "usage: /btw <question>");
+        ensure!(!question.is_empty(), "Usage: /btw <question>");
         let snapshot = snapshot.ok_or_else(|| anyhow!("no side context for this session yet"))?;
         self.start(snapshot, question, new)
     }
@@ -232,7 +232,7 @@ impl SideThreadState {
         new: bool,
     ) -> Result<String> {
         let question = question.trim();
-        ensure!(!question.is_empty(), "usage: /btw <question>");
+        ensure!(!question.is_empty(), "Usage: /btw <question>");
         ensure!(
             self.session.as_deref() == Some(snapshot.session_id()),
             "that side context belongs to another session; ask again"

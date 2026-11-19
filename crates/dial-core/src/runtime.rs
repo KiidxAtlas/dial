@@ -540,6 +540,13 @@ impl Tree {
     pub fn pending_settled(&self) -> Vec<Node> {
         self.pending_where(true)
     }
+    /// Whether any body may hold a revision not yet acknowledged by the journal. Clean bodies are
+    /// removed lazily, so `true` can be conservative, but `false` means there is nothing to persist.
+    pub fn has_unpersisted(&self) -> bool {
+        let tree = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let dirty = tree.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        !dirty.is_empty()
+    }
     /// With an incremental stream journal, the main journal needs one initial running snapshot
     /// and the settled result. Intermediate revisions remain recoverable in the stream journal.
     pub fn pending_boundary_snapshots(&self) -> Vec<Node> {

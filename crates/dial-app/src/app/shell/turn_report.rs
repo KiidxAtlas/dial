@@ -1,44 +1,13 @@
 //! End-of-turn report: what changed, what was checked, and what `/undo` cannot revert.
 //! It renders the `turn_summary` the agent saves at turn end, plus the observed request timing from
-//! `control.efficiency.inference_latency`, so it keeps no state of its own. The `Summary:` line is
-//! the collapsed view; the other lines appear when tool details are expanded.
+//! `control.efficiency.inference_latency`, so it keeps no state of its own.
 
+use crate::ui::transcript::{ReceiptCheck, TurnOutcome, TurnReceipt};
 use serde_json::Value;
 use std::time::Duration;
 
 /// Changed files named before the report summarizes the rest.
 const LISTED_FILES: usize = 8;
-
-/// Project the same recorded report into the transcript's closing footer. No tools are replayed.
-pub(in crate::app) fn outcome(
-    summary: &Value,
-    latency: &Value,
-) -> crate::ui::transcript::TurnOutcome {
-    let mut handoff = Vec::new();
-    if let Some(report) = render(summary, latency) {
-        handoff.extend(
-            report
-                .lines()
-                .filter(|line| {
-                    !line.starts_with("Outcome:")
-                        && !line.starts_with("Summary:")
-                        && !line.starts_with("Next:")
-                })
-                .take(10)
-                .map(str::to_owned),
-        );
-        // Keep the actionable destination even when the detail budget is exhausted.
-        if let Some(next) = report.lines().find(|line| line.starts_with("Next:")) {
-            handoff.push(next.to_owned());
-        }
-    }
-    crate::ui::transcript::TurnOutcome {
-        status: summary["outcome"].as_str().unwrap_or("unknown").to_owned(),
-        changed_files: summary["changed_files"].as_array().map_or(0, Vec::len),
-        open_tasks: summary["open_tasks"].as_u64().unwrap_or(0) as usize,
-        handoff,
-    }
-}
 
 /// Adds the turn's observed API cost to a report that already has details, above `Next:`.
 /// A plain answer keeps its empty footer, and unpriced or local usage adds no line.
@@ -73,62 +42,77 @@ fn label(raw: &str) -> String {
     shown
 }
 
-/// The report for a turn that edited files or did not complete; `None` for a plain answer or
-/// when no summary was saved (for example, a turn that failed before it finished). `latency` is the
-/// efficiency record's `inference_latency`; absent or unmeasured timing adds no line.
-pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
-    let outcome = summary["outcome"].as_str()?;
-    let files: Vec<&str> = summary["changed_files"]
+/// Project retained facts into the compact receipt and its expanded handoff. A plain answer
+/// has neither; an absent completion record never borrows facts from an earlier turn.
+pub(in crate::app) fn outcome(summary: &Value, latency: &Value) -> TurnOutcome {
+    let status = summary["outcome"].as_str().unwrap_or("unknown");
+    let mut files = summary["changed_files"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let stopped = !matches!(outcome, "completed" | "answered");
+        .filter_map(Value::as_str);
+    let paths: Vec<_> = files.by_ref().take(LISTED_FILES).map(label).collect();
+    let mut outcome = TurnOutcome {
+        status: status.to_owned(),
+        changed_files: paths.len() + files.count(),
+        open_tasks: summary["open_tasks"].as_u64().unwrap_or(0) as usize,
+        ..TurnOutcome::default()
+    };
+    if summary["outcome"].as_str().is_none() {
+        return outcome;
+    }
+    let stopped = !matches!(status, "completed" | "answered");
     let evidence = &summary["evidence"];
+    let effects_unknown = summary["effects_unknown"] == true;
     let obligations = obligation_lines(evidence);
-    let outstanding = !obligations.is_empty() || obligations_missing(evidence);
+    let obligations_missing =
+        obligations.is_empty() && evidence["deliverable_coverage"] == "open_obligations";
+    let outstanding = !obligations.is_empty() || obligations_missing;
     let checks: &[Value] = summary["recorded_checks"]
         .as_array()
         .map_or(&[], Vec::as_slice);
-    let current = summary["checks_current"].as_bool();
-    // No checks, or current all-passing checks with nothing else to report, need no handoff.
-    let checks_clean = checks.is_empty()
-        || (current == Some(true) && checks.iter().all(|check| check["status"] == "passed"));
-    if files.is_empty()
-        && !stopped
-        && obligations.is_empty()
-        && checks_clean
-        && evidence["deliverable_coverage"] != "open_obligations"
-        && summary["open_tasks"].as_u64().unwrap_or(0) == 0
-        && summary["uncheckpointed_shell_commands"]
-            .as_u64()
-            .unwrap_or(0)
-            == 0
-        && summary["uncheckpointed_extension_calls"]
-            .as_u64()
-            .unwrap_or(0)
-            == 0
-    {
-        return None;
-    }
-    let open = summary["open_tasks"].as_u64().unwrap_or(0);
+    // A previously current check cannot establish the state after an uncertain tool effect.
+    let current = if effects_unknown {
+        None
+    } else {
+        summary["checks_current"].as_bool()
+    };
+    let open = outcome.open_tasks;
     let count = |key: &str| summary[key].as_u64().unwrap_or(0);
     let (shell, extension) = (
         count("uncheckpointed_shell_commands"),
         count("uncheckpointed_extension_calls"),
     );
-
-    // The full cause is printed just above the report; the class says what kind of failure it was.
-    let outcome_text = match summary["error_class"].as_str() {
-        Some(class) => format!("{} ({})", label(outcome), label(&class.replace('_', " "))),
-        None => label(outcome),
-    };
-    let mut lines = vec![format!("Outcome: {outcome_text}")];
-    lines.push(if files.is_empty() {
-        "Changed: none".to_owned()
+    if outcome.changed_files == 0
+        && !stopped
+        && !effects_unknown
+        && !outstanding
+        && checks.is_empty()
+        && open == 0
+        && shell == 0
+        && extension == 0
+    {
+        return outcome;
+    }
+    let mut lines = Vec::new();
+    if let Some(class) = summary["error_class"].as_str() {
+        lines.push(format!("Failure: {}", label(&class.replace('_', " "))));
+    }
+    lines.push(if paths.is_empty() {
+        if effects_unknown || shell > 0 || extension > 0 {
+            "Changed: none recorded"
+        } else {
+            "Changed: none"
+        }
+        .to_owned()
     } else {
-        format!("Changed: {}", changed_line(&files))
+        let mut changed = format!("Changed: {}", paths.join(", "));
+        let rest = outcome.changed_files - paths.len();
+        if rest > 0 {
+            use std::fmt::Write;
+            let _ = write!(changed, " +{rest} more");
+        }
+        changed
     });
     lines.push(checks_line(checks, current));
     if let Some(evidence) = evidence_line(checks) {
@@ -137,11 +121,15 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     if open > 0 {
         lines.push(format!("Open tasks: {open}"));
     }
-    for obligation in obligations {
-        lines.push(obligation);
-    }
-    if obligations_missing(evidence) {
+    lines.extend(obligations);
+    if obligations_missing {
         lines.push("Outstanding: recorded open obligations; inspect /evidence".to_owned());
+    }
+    if effects_unknown {
+        lines.push(
+            "Effects: unknown — inspect retained tool status and effects; no replay is authorized"
+                .to_owned(),
+        );
     }
     if shell + extension > 0 {
         // Name only the kinds that occurred; "and 0 extension calls" is noise.
@@ -160,7 +148,9 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     }
     // Recovery and outstanding work take precedence over optional review/undo. This is
     // presentation of retained facts, never permission to replay a turn or its tools.
-    let next = if stopped {
+    let next = if effects_unknown {
+        "inspect retained tool status and effects before continuing; do not replay uncertain or completed operations; send a follow-up message for unfinished work only"
+    } else if stopped {
         "send a follow-up message after inspecting the retained failure and effects; continue only unfinished work, not the whole turn"
     } else if outstanding || open > 0 {
         "inspect /evidence for outstanding work, then send a follow-up message with the next scoped action"
@@ -172,78 +162,84 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
         "inspect /evidence for verification gaps before requesting scoped verification"
     } else if shell + extension > 0 {
         "inspect shell/extension effects; /undo does not cover them"
-    } else if !files.is_empty() {
+    } else if !paths.is_empty() {
         "/review-file · /undo (checkpointed edits only)"
     } else {
         "send a follow-up message"
     };
-    let review = if stopped && !files.is_empty() {
+    let review = if stopped && !effects_unknown && !paths.is_empty() {
         " · /review-file · /undo (checkpointed edits only)"
     } else {
         ""
     };
     lines.push(format!("Next: {next}{review}"));
 
-    let mut compact = Vec::new();
-    if stopped {
-        compact.push(outcome_text);
-    }
-    compact.push(match files.len() {
-        0 => "no files changed".to_owned(),
-        n => format!("{} changed", plural(n as u64, "file")),
+    let (check, check_label, target) = checks_state(checks, current);
+    outcome.receipt = Some(TurnReceipt {
+        paths,
+        check,
+        check_label,
+        check_target: target.map(label),
     });
-    compact.push(checks_state(checks, current));
-    if open > 0 {
-        compact.push(plural(open, "open task"));
-    }
-    // Open tasks already name the outstanding work; repeat obligations only when they add some.
-    if outstanding && open == 0 {
-        compact.push("outstanding obligations".to_owned());
-    }
-    if shell + extension > 0 {
-        compact.push(format!(
-            "{} outside /undo",
-            plural(shell + extension, "effect")
-        ));
-    }
-    lines.push(format!("Summary: {}", compact.join(" · ")));
-    Some(crate::storage::redact::redact_text(&lines.join("\n")).into_owned())
+    outcome.handoff = lines;
+    outcome
 }
 
-fn plural(n: u64, noun: &str) -> String {
+pub(super) fn plural(n: u64, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
-fn changed_line(files: &[&str]) -> String {
-    let shown = files
-        .iter()
-        .take(LISTED_FILES)
-        .map(|file| label(file))
-        .collect::<Vec<_>>()
-        .join(", ");
-    match files.len().saturating_sub(LISTED_FILES) {
-        0 => shown,
-        rest => format!("{shown} +{rest} more"),
-    }
-}
-
-/// One word for the collapsed view: a failure wins, then staleness, then anything not passed.
-fn checks_state(checks: &[Value], current: Option<bool>) -> String {
-    let status = |check: &Value| check["status"].as_str().unwrap_or("unverified").to_owned();
-    let failed = checks.iter().filter(|c| status(c) == "failed").count() as u64;
-    if checks.is_empty() {
-        "no recorded checks".to_owned()
+/// The latest representative of the most consequential status, not merely the last entry:
+/// a later passing check for a different target cannot clear a failure.
+fn checks_state(checks: &[Value], current: Option<bool>) -> (ReceiptCheck, String, Option<&str>) {
+    let failed = checks.iter().filter(|c| c["status"] == "failed").count();
+    let last_gap = checks.iter().rfind(|c| c["status"] != "passed");
+    let (state, summary, representative) = if checks.is_empty() {
+        (
+            ReceiptCheck::Unverified,
+            "unverified (no recorded checks)".into(),
+            None,
+        )
     } else if failed > 0 {
-        format!("{} failed", plural(failed, "check"))
+        let freshness = match current {
+            Some(true) => "",
+            Some(false) => " (stale)",
+            None => " (freshness unknown)",
+        };
+        (
+            ReceiptCheck::Failed,
+            format!("{} failed{freshness}", plural(failed as u64, "check")),
+            checks.iter().rfind(|c| c["status"] == "failed"),
+        )
     } else if current == Some(false) {
-        "checks stale".to_owned()
+        (ReceiptCheck::Stale, "stale".into(), checks.last())
     } else if current.is_none() {
-        "check freshness unknown".to_owned()
-    } else if checks.iter().all(|c| status(c) == "passed") {
-        "checks passed (current)".to_owned()
+        (
+            ReceiptCheck::Unverified,
+            "unverified (freshness unknown)".into(),
+            checks.last(),
+        )
+    } else if let Some(gap) = last_gap {
+        let status = label(gap["status"].as_str().unwrap_or("unknown status"));
+        (
+            ReceiptCheck::Unverified,
+            format!("unverified ({status})"),
+            Some(gap),
+        )
     } else {
-        "checks unverified".to_owned()
-    }
+        (
+            ReceiptCheck::Passed,
+            format!("{} passed", plural(checks.len() as u64, "check")),
+            checks.last(),
+        )
+    };
+    let target = representative.and_then(|c| {
+        c["command"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| c["name"].as_str())
+    });
+    (state, summary, target)
 }
 
 fn checks_line(checks: &[Value], current: Option<bool>) -> String {
@@ -354,13 +350,9 @@ fn obligation_lines(evidence: &Value) -> Vec<String> {
     lines
 }
 
-fn obligations_missing(evidence: &Value) -> bool {
-    evidence["deliverable_coverage"] == "open_obligations" && obligation_lines(evidence).is_empty()
-}
-
-/// Observed wall-clock request timing; loading, prompt processing and retry backoff appear only
-/// when measured. Zero or missing values are omitted. It is labelled model time because it covers
-/// model requests only, not tool runs or time spent at prompts, so it never reads as the turn total.
+/// Observed request-phase durations, not provider compute attribution or turn wall time.
+/// Concurrent requests can overlap; stream stalls are already included in generation.
+/// Only measured, nonzero phases are shown; missing measurements are never filled with zero.
 fn timing_line(latency: &Value) -> Option<String> {
     let positive = |key: &str| latency[key].as_u64().filter(|value| *value > 0);
     let phases: Vec<String> = [
@@ -369,6 +361,7 @@ fn timing_line(latency: &Value) -> Option<String> {
         ("loading", "loading_ms"),
         ("prompt processing", "prompt_processing_ms"),
         ("retry backoff", "retry_backoff_ms"),
+        ("cancellation", "cancellation_ms"),
     ]
     .into_iter()
     .filter_map(|(label, key)| positive(key).map(|ms| format!("{label} {}", duration(ms))))
@@ -380,7 +373,10 @@ fn timing_line(latency: &Value) -> Option<String> {
         .filter(|count| *count > 1)
         .map(|count| format!(" over {count} requests"))
         .unwrap_or_default();
-    Some(format!("Model time: {}{requests}", phases.join(", ")))
+    Some(format!(
+        "Model time: {}{requests} (observed request phases, not turn wall time)",
+        phases.join(", ")
+    ))
 }
 
 fn duration(ms: u64) -> String {

@@ -2,7 +2,7 @@
 
 use crate::agent::workflow::todo::TodoList;
 use crate::agent::{self, Decision, Ui};
-use crate::app::bridge::Bridge;
+use crate::app::bridge::{Bridge, PendingCall};
 use crate::app::notices::RetryNotice;
 use crate::app::shell::TICK;
 use crate::app::shell::prompts::{
@@ -13,6 +13,7 @@ use crate::ui::composer::SteerStage;
 use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
 use crate::ui::status::Phase;
+use crate::ui::term_state::Prompt;
 use crate::ui::theme::Tok;
 use crate::ui::{tasks, text};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
@@ -252,6 +253,61 @@ fn policy_log_row(tool: &str, explanation: &agent::safety::approval::PolicyExpla
 }
 
 impl Bridge<'_> {
+    /// Inline preview of `reference`; an attached watch pane takes screenshots instead unless
+    /// `keep_inline` (generated images always stay in the chat).
+    fn preview_image(&mut self, reference: &Value, keep_inline: bool) {
+        if self.interrupt.load(Ordering::SeqCst) {
+            return;
+        }
+        let reference = reference.clone();
+        let native = self.shell.term.image_protocol().is_some();
+        let layout = self.app.layout.clone();
+        let session = self.shell.session_id.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("dial-image-preview".into())
+            .spawn(move || {
+                let _ = tx.send(crate::cli::watch::preview_image(
+                    &layout,
+                    &session,
+                    &reference,
+                    native,
+                    keep_inline,
+                ));
+            });
+        if worker.is_err() {
+            return;
+        }
+        loop {
+            match rx.recv_timeout(TICK) {
+                Ok(Ok((thumbnail, warning))) => {
+                    if let Some(warning) = warning {
+                        self.shell.note("Live feed", warning);
+                    }
+                    if let Some(thumbnail) = thumbnail {
+                        self.shell.transcript.image(thumbnail);
+                    } else {
+                        self.shell
+                            .note("Image", "Screenshot sent to the watch pane.");
+                    }
+                    self.repaint(true);
+                    break;
+                }
+                Ok(Err(error)) => {
+                    self.notice(&format!("Terminal image preview unavailable: {error:#}"));
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.heartbeat();
+                    if self.interrupt.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// After a prompt closes: show the stop at once when the prompt's stop key raised it.
     fn settle_prompt(&mut self, was_stopping: bool) {
         if !was_stopping && self.interrupt.load(Ordering::SeqCst) {
@@ -272,10 +328,54 @@ impl Bridge<'_> {
     /// elapsed reported with its result) starts again once the user has answered.
     fn release_from_approval(&mut self, call_id: &str, waited: Duration) {
         self.hold_for_approval(call_id, false);
-        if let Some((_, _, started)) = self.pending.iter_mut().find(|(id, _, _)| id == call_id) {
-            *started = started.checked_add(waited).unwrap_or_else(Instant::now);
-            self.shell.status.tool_started = Some(*started);
+        if let Some(call) = self.pending.iter_mut().find(|call| call.id == call_id) {
+            call.started = call
+                .started
+                .checked_add(waited)
+                .unwrap_or_else(Instant::now);
+            self.shell.status.tool_started = Some(call.started);
         }
+    }
+
+    /// Classify the arguments of a started call, never streamed fragments or summary prose.
+    fn start_tool(&mut self, id: String, name: &str, summary: &str, args: Option<&Value>) {
+        self.shell.status.model_progress = None;
+        self.shell
+            .transcript
+            .tool_start(&id, name, summary, summary);
+        if let Some(body) = self.shell.pending_result.take() {
+            self.shell.transcript.bind_tool(&id, body);
+        }
+        if let Some(args) = args {
+            self.shell.transcript.tool_input(&id, args.to_string());
+        }
+        let testing = name == "bash"
+            && args.is_some_and(|args| {
+                args["background"] != true
+                    && args["pty"] != true
+                    && args["command"]
+                        .as_str()
+                        .is_some_and(crate::ui::tool_cards::is_test_command)
+            });
+        self.pending.push(PendingCall {
+            id,
+            name: name.to_owned(),
+            started: Instant::now(),
+            testing,
+            view: None,
+        });
+        self.refresh_tool_activity();
+    }
+
+    fn refresh_tool_activity(&mut self) {
+        self.shell.status.testing = self.pending.iter().any(|call| call.testing);
+        self.shell.status.tool_started = self.pending.last().map(|call| call.started);
+        if let Some(call) = self.pending.last() {
+            self.set_activity(&format!("running {}", call.name));
+        } else {
+            self.set_activity("thinking");
+        }
+        self.repaint(true);
     }
 
     /// Saving a grant for every future session gets its own confirmation.
@@ -287,6 +387,7 @@ impl Bridge<'_> {
     ) -> bool {
         let body = project_grant_body(scope, &self.app.layout.project_root);
         self.shell.ask_with_cancel(
+            Prompt::Approval,
             &format!("Save {tool} permission for this project?"),
             &body,
             &[("Save for this project", 'p'), ("Back to the choices", 'b')],
@@ -524,21 +625,21 @@ impl Ui for Bridge<'_> {
     }
 
     fn tool_output(&mut self, name: &str, text: &str) {
-        if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, tool, _)| tool == name) {
-            self.shell.transcript.tool_delta(id, text);
+        if let Some(call) = self.pending.iter().rev().find(|call| call.name == name) {
+            self.shell.transcript.tool_delta(&call.id, text);
         }
         self.repaint(false);
     }
 
     fn tool_output_with_id(&mut self, call_id: &str, name: &str, text: &str) {
         // Calls are keyed by id: two running calls of one tool each keep their own card.
-        if let Some((id, _, _)) = self
+        if let Some(call) = self
             .pending
             .iter()
             .rev()
-            .find(|(id, tool, _)| id == call_id && tool == name)
+            .find(|call| call.id == call_id && call.name == name)
         {
-            self.shell.transcript.tool_delta(id, text);
+            self.shell.transcript.tool_delta(&call.id, text);
         }
         self.repaint(false);
     }
@@ -546,20 +647,20 @@ impl Ui for Bridge<'_> {
     fn tool_progress(&mut self, name: &str, text: &str) {
         // Progress names its tool, not its call: it belongs to the newest pending call of that tool,
         // the same call `tool_output` streams into.
-        if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, tool, _)| tool == name) {
-            self.shell.transcript.tool_progress(id, text);
+        if let Some(call) = self.pending.iter().rev().find(|call| call.name == name) {
+            self.shell.transcript.tool_progress(&call.id, text);
         }
         self.repaint(false);
     }
 
     fn tool_progress_with_id(&mut self, call_id: &str, name: &str, text: &str) {
-        if let Some((id, _, _)) = self
+        if let Some(call) = self
             .pending
             .iter()
             .rev()
-            .find(|(id, tool, _)| id == call_id && tool == name)
+            .find(|call| call.id == call_id && call.name == name)
         {
-            self.shell.transcript.tool_progress(id, text);
+            self.shell.transcript.tool_progress(&call.id, text);
         }
         self.repaint(false);
     }
@@ -628,6 +729,7 @@ impl Ui for Bridge<'_> {
     fn review_turn_draft(&mut self, drafted: &str, cancel: &AtomicBool) -> bool {
         self.shell.review_turn_draft(cancel, |shell| {
             shell.ask_with_cancel(
+                Prompt::Approval,
                 "Turn drafter · review before sending",
                 &format!("{drafted}\n\nAccept sends this instruction to the agent. Accept all draft messages also accepts pending and future drafts without review until Dial exits. Cancel sends nothing. Use Page Up/Page Down to review the full draft."),
                 &[
@@ -668,28 +770,20 @@ impl Ui for Bridge<'_> {
     }
 
     fn tool_call(&mut self, name: &str, summary: &str) {
-        self.shell.status.model_progress = None;
         self.next_id += 1;
         let id = format!("call-{}", self.next_id);
-        self.shell
-            .transcript
-            .tool_start(&id, name, summary, summary);
-        if let Some(body) = self.shell.pending_result.take() {
+        if let Some(body) = &self.shell.pending_result {
             body.correlate(&id);
-            self.shell.transcript.bind_tool(&id, body);
         }
-        self.pending.push((id, name.to_owned(), Instant::now()));
-        self.shell.status.tool_started = Some(Instant::now());
-        self.set_activity(&format!("running {name}"));
-        self.repaint(true);
+        self.start_tool(id, name, summary, None);
     }
 
     fn tool_result(&mut self, name: &str, output: &ToolOutput) {
-        let at = self.pending.iter().rposition(|(_, n, _)| n == name);
+        let at = self.pending.iter().rposition(|call| call.name == name);
         let (id, started) = match at {
             Some(i) => {
-                let (id, _, started) = self.pending.remove(i);
-                (id, started)
+                let call = self.pending.remove(i);
+                (call.id, call.started)
             }
             None => {
                 self.next_id += 1;
@@ -703,31 +797,15 @@ impl Ui for Bridge<'_> {
             started.elapsed().as_secs_f64(),
         );
         self.attach_write_preview(&id, output);
-        let activity = self.pending.last().map_or_else(
-            || "thinking".to_owned(),
-            |(_, name, _)| format!("running {name}"),
-        );
-        self.shell.status.tool_started = self.pending.last().map(|(_, _, started)| *started);
-        self.set_activity(&activity);
-        self.repaint(true);
+        self.refresh_tool_activity();
     }
 
     fn tool_call_with_id(&mut self, id: &str, name: &str, summary: &str) {
-        self.shell.status.model_progress = None;
-        self.shell.transcript.tool_start(id, name, summary, summary);
-        if let Some(body) = self.shell.pending_result.take() {
-            self.shell.transcript.bind_tool(id, body);
-        }
-        self.pending
-            .push((id.to_owned(), name.to_owned(), Instant::now()));
-        self.shell.status.tool_started = Some(Instant::now());
-        self.set_activity(&format!("running {name}"));
-        self.repaint(true);
+        self.start_tool(id.to_owned(), name, summary, None);
     }
 
     fn tool_call_with_args(&mut self, id: &str, name: &str, summary: &str, args: &Value) {
-        self.tool_call_with_id(id, name, summary);
-        self.shell.transcript.tool_input(id, args.to_string());
+        self.start_tool(id.to_owned(), name, summary, Some(args));
     }
 
     fn tool_presentation(
@@ -735,22 +813,32 @@ impl Ui for Bridge<'_> {
         id: &str,
         view: &crate::tools::surface::presentation::Presentation,
     ) {
+        if let Some(call) = self.pending.iter_mut().find(|call| call.id == id) {
+            call.view = Some(view.clone());
+        }
         self.shell.transcript.tool_presentation(id, view);
     }
 
     fn tool_result_with_id(&mut self, id: &str, _name: &str, output: &ToolOutput) {
-        let started = self
+        let (started, view) = self
             .pending
             .iter()
-            .position(|(pending_id, _, _)| pending_id == id)
-            .map(|index| self.pending.remove(index).2)
-            .unwrap_or_else(Instant::now);
+            .position(|call| call.id == id)
+            .map(|index| {
+                let call = self.pending.remove(index);
+                (call.started, call.view)
+            })
+            .unwrap_or_else(|| (Instant::now(), None));
         self.shell.transcript.tool_end_with(
             id,
             &output.text,
             crate::ui::tool_cards::ToolOutcome::of(output),
             started.elapsed().as_secs_f64(),
         );
+        // The engine's result view also saw the structured result; see `tool_result_view`.
+        if let Some(view) = view {
+            self.shell.transcript.tool_result_view(id, &view);
+        }
         if let Some(data) = &output.data {
             self.shell.transcript.tool_data(id, data);
         }
@@ -761,13 +849,7 @@ impl Ui for Bridge<'_> {
             self.shell
                 .note("Live feed", format!("Could not record edit: {error:#}"));
         }
-        let activity = self.pending.last().map_or_else(
-            || "thinking".to_owned(),
-            |(_, name, _)| format!("running {name}"),
-        );
-        self.shell.status.tool_started = self.pending.last().map(|(_, _, started)| *started);
-        self.set_activity(&activity);
-        self.repaint(true);
+        self.refresh_tool_activity();
     }
 
     fn request_policy(&mut self, control: &Value) {
@@ -824,54 +906,12 @@ impl Ui for Bridge<'_> {
     fn diagnostic(&mut self, _message: &str) {}
 
     fn image(&mut self, reference: &Value) {
-        if self.interrupt.load(Ordering::SeqCst) {
-            return;
-        }
-        let reference = reference.clone();
-        let native = self.shell.term.image_protocol().is_some();
-        let layout = self.app.layout.clone();
-        let session = self.shell.session_id.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("dial-image-preview".into())
-            .spawn(move || {
-                let _ = tx.send(crate::cli::watch::preview_image(
-                    &layout, &session, &reference, native,
-                ));
-            });
-        if worker.is_err() {
-            return;
-        }
-        loop {
-            match rx.recv_timeout(TICK) {
-                Ok(Ok((thumbnail, warning))) => {
-                    if let Some(warning) = warning {
-                        self.shell.note("Live feed", warning);
-                    }
-                    if let Some(thumbnail) = thumbnail {
-                        self.shell.transcript.image(thumbnail);
-                    } else {
-                        self.shell
-                            .note("Image", "Screenshot sent to the watch pane.");
-                    }
-                    self.repaint(true);
-                    break;
-                }
-                Ok(Err(error)) => {
-                    self.notice(&format!("Terminal image preview unavailable: {error:#}"));
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.heartbeat();
-                    if self.interrupt.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        self.preview_image(reference, false);
     }
 
+    fn generated_image(&mut self, reference: &Value) {
+        self.preview_image(reference, true);
+    }
     fn laya_activity(&mut self, status: &str, message: &str) {
         if matches!(status, "error" | "failed" | "unavailable") {
             self.shell.note("Decision advice", message);
@@ -887,15 +927,10 @@ impl Ui for Bridge<'_> {
     }
 
     fn todo(&mut self, todo: &TodoList) {
-        if let Some((id, _, _)) = self
-            .pending
-            .iter()
-            .rev()
-            .find(|(_, name, _)| name == "todo")
-        {
+        if let Some(call) = self.pending.iter().rev().find(|call| call.name == "todo") {
             self.shell
                 .transcript
-                .tool_todo(id, tasks::changes(&self.shell.todo, todo));
+                .tool_todo(&call.id, tasks::changes(&self.shell.todo, todo));
         }
         self.shell.todo = todo.clone();
         self.repaint(true);
@@ -1029,9 +1064,9 @@ impl Ui for Bridge<'_> {
                 [("Allow once", 'y'), ("Deny", 'n')],
             ),
         };
-        let choice = self
-            .shell
-            .ask_with_cancel(&title, &body, &options, Some(cancel));
+        let choice =
+            self.shell
+                .ask_with_cancel(Prompt::Approval, &title, &body, &options, Some(cancel));
         self.shell.status.phase = phase;
         self.settle_prompt(was_stopping);
         if choice == Some(0) {
@@ -1064,6 +1099,7 @@ impl Ui for Bridge<'_> {
             let decision = self
                 .shell
                 .ask_with_cancel(
+                    Prompt::Approval,
                     &format!("Allow {tool}?"),
                     &prompt.body,
                     &choices,
@@ -1097,6 +1133,7 @@ impl Ui for Bridge<'_> {
             .map(agent::safety::approval::batch_call_line)
             .collect();
         let choice = self.shell.ask_with_cancel(
+            Prompt::Approval,
             &format!("Approve {} changes?", rows.len()),
             &batch_prompt(&rows, &hint),
             &[
@@ -1113,6 +1150,7 @@ impl Ui for Bridge<'_> {
                 for (index, row) in rows.iter().enumerate() {
                     let yes = !cancel.load(Ordering::Acquire)
                         && self.shell.ask_with_cancel(
+                            Prompt::Approval,
                             &format!("Change {} of {}", index + 1, rows.len()),
                             &format!(
                                 "{row}\n\nApplies to this change only; nothing is saved.\n\n{hint}"
@@ -1160,7 +1198,7 @@ impl Ui for Bridge<'_> {
             self.show_stopping(None);
             return QuestionOutcome::Cancelled;
         }
-        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
+        let was_waiting = self.shell.awaiting_user.replace(Prompt::Question);
         let mut focus = self.shell.initial_focus();
         let mut guard = TypeAhead::default();
         let outcome = loop {
@@ -1277,20 +1315,22 @@ impl Ui for Bridge<'_> {
             .collect();
         let interrupt = self.interrupt.clone();
         let was_stopping = interrupt.load(Ordering::SeqCst);
-        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
-        let answer =
-            match self
-                .shell
-                .ask_with_cancel(title, question, &choice_refs, Some(&interrupt))
-            {
-                Some(index) if index < options.len() => Some(options[index].clone()),
-                Some(_) => self.line_prompt(
-                    &format!("{} (Enter sends, Esc cancels)", text::one_line(question)),
-                    title,
-                    question,
-                ),
-                None => None,
-            };
+        let was_waiting = self.shell.awaiting_user.replace(Prompt::Question);
+        let answer = match self.shell.ask_with_cancel(
+            Prompt::Question,
+            title,
+            question,
+            &choice_refs,
+            Some(&interrupt),
+        ) {
+            Some(index) if index < options.len() => Some(options[index].clone()),
+            Some(_) => self.line_prompt(
+                &format!("{} (Enter sends, Esc cancels)", text::one_line(question)),
+                title,
+                question,
+            ),
+            None => None,
+        };
         self.shell.awaiting_user = was_waiting;
         self.settle_prompt(was_stopping);
         answer
@@ -1298,7 +1338,7 @@ impl Ui for Bridge<'_> {
 
     fn approval_reason(&mut self) -> Option<String> {
         let was_stopping = self.interrupt.load(Ordering::SeqCst);
-        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
+        let was_waiting = self.shell.awaiting_user.replace(Prompt::Question);
         let reason = self.line_prompt(
             "Keep planning: what should change? (Enter sends, Esc skips)",
             "Plan feedback pending",

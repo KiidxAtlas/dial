@@ -132,7 +132,7 @@ fn attention_inspector_consumes_answers_paste_and_navigation_until_explicit_retu
 fn modal_attention_projects_pending_prompt_without_dispatch_or_draft_changes() {
     let (_home, _project, _app, mut shell) = shell();
     shell.composer.set_draft("keep my draft");
-    shell.awaiting_user = true;
+    shell.awaiting_user = Some(Prompt::Approval);
     let before = shell.composer.draft();
     let text = shell.modal_attention_text("Allow bash?", "Pending approval for a command");
     assert!(text.contains("Main prompt · waiting for you"));
@@ -141,7 +141,7 @@ fn modal_attention_projects_pending_prompt_without_dispatch_or_draft_changes() {
     assert!(text.contains("Return to original prompt"));
     assert!(!text.contains("command:/"));
     assert_eq!(shell.composer.draft(), before);
-    assert!(shell.awaiting_user);
+    assert_eq!(shell.awaiting_user, Some(Prompt::Approval));
     assert!(!shell.accept_all_turn_drafts);
     assert!(attention_key(&KeyEvent::new(
         KeyCode::F(6),
@@ -160,6 +160,7 @@ fn cancelled_restored_selection_preserves_draft_and_waiting_state() {
     let cancel = AtomicBool::new(true);
     assert_eq!(
         shell.ask_with_selection(
+            Prompt::Question,
             "Changed files",
             "preview",
             &[("a.rs", ' '), ("b.rs", ' ')],
@@ -169,7 +170,7 @@ fn cancelled_restored_selection_preserves_draft_and_waiting_state() {
         None
     );
     assert_eq!(shell.composer.draft(), "unfinished review follow-up");
-    assert!(!shell.awaiting_user);
+    assert_eq!(shell.awaiting_user, None);
     assert_eq!(
         shell.ask_selected("Changed files", "empty", &[], usize::MAX),
         None

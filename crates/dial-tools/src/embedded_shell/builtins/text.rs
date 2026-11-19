@@ -214,7 +214,7 @@ fn in_ranges(ranges: &[(usize, usize)], n: usize) -> bool {
 
 pub(super) fn env(io: &mut Io<'_>, args: &[String]) -> i32 {
     if !args.is_empty() {
-        return io.usage();
+        return io.decline("env with options, variable assignments or a command uses PATH env");
     }
     let vars = io.env;
     let mut sorted: Vec<&(String, String)> = vars.iter().collect();
@@ -252,7 +252,13 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
     } else {
         Whole::Any
     };
-    let re = match grep_regex(&patterns, opts.has('F'), opts.has('i'), whole) {
+    let re = match grep_regex(
+        &patterns,
+        opts.has('F'),
+        opts.has('E'),
+        opts.has('i'),
+        whole,
+    ) {
         Ok(re) => re,
         Err(error) => {
             let _ = writeln!(io.stderr, "{}: {error}", io.name);
@@ -399,9 +405,51 @@ enum Whole {
 /// compiled on its own first, so that one cannot close a group opened by another. With `-w` a
 /// match must not touch a word character (letter, digit or `_`) on either side; with `-x` it must
 /// be the whole line.
+fn bre_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    let mut class_start = false;
+    while let Some(c) = chars.next() {
+        if in_class {
+            out.push(c);
+            if c == ']' && !class_start {
+                in_class = false;
+            } else {
+                class_start = false;
+            }
+            continue;
+        }
+        if c == '[' {
+            in_class = true;
+            class_start = true;
+            out.push(c);
+            continue;
+        }
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some(op @ ('|' | '+' | '?' | '(' | ')' | '{' | '}')) => {
+                    chars.next();
+                    out.push(op);
+                }
+                Some(other) => {
+                    chars.next();
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn grep_regex(
     patterns: &[&str],
     fixed: bool,
+    extended: bool,
     ignore_case: bool,
     whole: Whole,
 ) -> Result<Regex, regex::Error> {
@@ -409,8 +457,10 @@ fn grep_regex(
     for pattern in patterns.iter().flat_map(|pattern| pattern.split('\n')) {
         let source = if fixed {
             regex::escape(pattern)
-        } else {
+        } else if extended {
             pattern.to_owned()
+        } else {
+            bre_to_regex(pattern)
         };
         RegexBuilder::new(&source)
             .case_insensitive(ignore_case)

@@ -60,6 +60,31 @@ for (const python of [false, true]) {
     assert.match(frames.find(frame => frame.result).result.error, /failed after a write/);
   });
 
+  test(`overwrites never read implicitly and forward only an explicit digest (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const digest = 'b'.repeat(64);
+    const plain = python ? "dial.writeText('x', 'new')" : "await dial.writeText('x', 'new')";
+    const explicit = python ? `dial.writeText('x', 'new', expected_sha256='${digest}')`
+      : `await dial.writeText('x', 'new', {expectedSha256:'${digest}'})`;
+    const refusal = 'x has no current source/read witness (read `x` first)';
+    const frames = run([cell(0, install), cell(1, plain), reply(1, 1, null, refusal, true),
+      cell(2, explicit), reply(2, 2, null)], python);
+    const calls = frames.filter(frame => frame.callback);
+    // The refused plain write is never followed by a read; the explicit one forwards the digest.
+    assert.deepEqual(calls.map(call => call.name), ['write', 'write']);
+    assert.deepEqual(calls[1].arguments, {path:'x', content:'new', expected_sha256:digest});
+    assert.match(frames.find(frame => frame.id === 1).result.error, /do not read files implicitly/);
+  });
+
+  test(`explicit overwrite digests are validated before any write (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const bad = python ? "dial.writeText('x', 'new', expected_sha256='short')"
+      : "await dial.writeText('x', 'new', {expectedSha256:'short'})";
+    const frames = run([cell(0, install), cell(1, bad)], python);
+    assert.equal(frames.filter(frame => frame.callback).length, 0);
+    assert.ok(frames.find(frame => frame.id === 1).result.error);
+  });
+
   test(`portable API reads bytes and gates dependent writes (${python ? 'Python' : 'Node'})`, () => {
     const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
     const read = python ? "list(dial.readBytes('source.bin'))" : "Array.from(await dial.readBytes('source.bin'))";
@@ -74,6 +99,21 @@ for (const python of [false, true]) {
     const calls = frames.filter(frame => frame.callback);
     assert.equal(calls.length, 3, 'dependent write must never run');
     assert.deepEqual(calls[1].arguments, {path:'new.bin',content:'AP8NCg==',encoding:'base64'});
+  });
+
+  test(`portable checks send only whole-file identities (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const source = {path:'short.txt', sha256:'a'.repeat(64)};
+    const receipt = {...source, encoding:'text', content:'x', bytes:1, artifact:null};
+    const check = method => python ? `dial.check('saved', True, dial.${method}('short.txt'))`
+      : `await dial.check('saved', true, await dial.${method}('short.txt'))`;
+    const local = python ? "dial.check('local', True)" : "await dial.check('local', true)";
+    const frames = run([cell(0, install), cell(1, check('read')), reply(1, 1, receipt), reply(2, 1, null),
+      cell(2, check('readLines')), reply(3, 2, {...receipt, offset:1, lines:1, next_offset:null}),
+      cell(3, local), reply(4, 3, null)], python);
+    const checks = frames.filter(frame => frame.callback === 'check');
+    assert.deepEqual(checks.map(frame => frame.source), [source, undefined]);
+    assert.match(frames.find(frame => frame.id === 2).result.error, /whole-file/);
   });
 
   test(`portable search shrinks counterexamples and compare finds disagreements (${python ? 'Python' : 'Node'})`, () => {
@@ -203,6 +243,7 @@ test('withheld globals and redeclarations explain the persistent namespace', () 
     cell(4, 'undefinedThing'),
   ]);
   assert.equal(output.length, 4);
+  for (const frame of output) assert.equal(frame.result.backend, 'node');
   assert.match(output[0].result.error, /ReferenceError: process is not defined[\s\S]*await import\('node:process'\)/);
   assert.equal(output[1].result.value, "'string'");
   assert.match(output[2].result.error, /already been declared[\s\S]*Top-level declarations persist across cells[\s\S]*Use `var`/);
@@ -254,6 +295,18 @@ test('all wire boundaries repair lone surrogates without damaging emoji or liter
 });
 
 for (const python of [false, true]) {
+  test(`listed window screenshot uses the approved ID chain (${python ? 'Python' : 'JS'})`, () => {
+    const source = fs.readFileSync(path.join(__dirname, '../../../../../dial-computer/src/computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
+    const code = python ? "w = (await computer.windows())[0]\nassert w['width'] == 10\nawait w.screenshot()\nawait w.capture(silent=True)" : 'const [w] = await computer.windows(); if (w.width !== 10) throw Error("lost geometry"); await w.screenshot(); await w.capture({silent:true})';
+    const output = run([cell(1, source), cell(2, code), reply(1, 2, { value: [{ id: '7', width: 10 }] }), reply(2, 2, { value: 'captured' }), reply(3, 2, { value: 'captured' })], python);
+    assert.equal(output.find(frame => frame.id === 2 && frame.result).result.error, null);
+    const calls = output.filter(frame => frame.callback === 'prelude');
+    assert.deepEqual(calls.at(-1).parameters.chain,
+      [{ method: 'window', args: ['7'] }, { method: 'screenshot', args: [{ silent: true }] }]);
+    assert.deepEqual(calls.at(-2).parameters.chain,
+      [{ method: 'window', args: ['7'] }, { method: 'screenshot', args: [] }]);
+  });
+
   test(`actual ${python ? 'Python' : 'JS'} computer prelude consumes raw bridge values/text/images and propagates denial`, () => {
     const source = fs.readFileSync(path.join(__dirname, '../../../../../dial-computer/src/computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
     const windows = [{ id: '7', app: 'Editor', title: 'Document' }];

@@ -182,10 +182,22 @@ impl Shell {
 
     fn revert_group(&mut self, checkpoints: &Arc<Checkpoints>, turn: u64, safe: &[String]) {
         let mut items = Vec::new();
+        let mut diffs = String::new();
         let mut unreadable = Vec::new();
         for path in safe {
             match checkpoints.review_file(turn, path) {
-                Ok((_, token)) => items.push((path.clone(), token)),
+                Ok((diff, token)) => {
+                    // Consent must bind the version shown, not another read of the same path.
+                    diffs.push_str(path);
+                    diffs.push('\n');
+                    diffs.push_str(&diff);
+                    diffs.push('\n');
+                    if diffs.len() > GROUP_DIFF_LIMIT {
+                        self.note("Review", format!("Nothing restored. The combined diff of {} files exceeds the {} KiB group preview limit, so it cannot be confirmed as a whole. Choose Review files and revert them one at a time.", safe.len(), GROUP_DIFF_LIMIT / 1024));
+                        return;
+                    }
+                    items.push((path.clone(), token));
+                }
                 Err(error) => unreadable.push(format!("{path}: {error:#}")),
             }
         }
@@ -195,28 +207,6 @@ impl Shell {
                 format!(
                     "Nothing restored. These files cannot be previewed, so the group cannot be reverted as a whole; review them individually:\n{}",
                     unreadable.join("\n")
-                ),
-            );
-            return;
-        }
-        // The user must see exactly what changes, including their own later edits to these files.
-        let mut diffs = String::new();
-        for (path, _) in &items {
-            match checkpoints.review_file(turn, path) {
-                Ok((diff, _)) => diffs.push_str(&format!("{path}\n{diff}\n")),
-                Err(error) => {
-                    self.note("Review", format!("Nothing restored. {path} cannot be previewed ({error:#}); review files individually."));
-                    return;
-                }
-            }
-        }
-        if diffs.len() > GROUP_DIFF_LIMIT {
-            self.note(
-                "Review",
-                format!(
-                    "Nothing restored. The combined diff of {} files exceeds the {} KiB group preview limit, so it cannot be confirmed as a whole. Choose Review files and revert them one at a time.",
-                    items.len(),
-                    GROUP_DIFF_LIMIT / 1024
                 ),
             );
             return;
@@ -252,19 +242,20 @@ impl Shell {
         loop {
             let review = checkpoints.review_turn(turn)?;
             let files = browser.visible(&review);
-            let labels: Vec<_> =
-                files
-                    .iter()
-                    .map(|file| {
-                        let reviewed = checkpoints.review_file(turn, &file.path).ok().is_some_and(
-                            |(_, token)| {
-                                browser.reviewed.get(&ReviewBrowser::key(turn, &file.path))
-                                    == Some(&token)
-                            },
-                        );
-                        file_label(file, reviewed)
-                    })
-                    .collect();
+            let labels: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    let reviewed = browser
+                        .reviewed
+                        .get(&ReviewBrowser::key(turn, &file.path))
+                        .is_some_and(|expected| {
+                            checkpoints
+                                .review_file(turn, &file.path)
+                                .is_ok_and(|(_, token)| &token == expected)
+                        });
+                    file_label(file, reviewed)
+                })
+                .collect();
             let mut choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
             choices.extend([("Filter writers / overlap", 'f'), ("Choose turn", 't')]);
             if browser.owner.is_some() {

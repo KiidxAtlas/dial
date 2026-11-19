@@ -593,10 +593,11 @@ provider="openai"
 context_window=32768
 approval="auto"
 worker_timeout_secs=30
-model_favorites=[{{provider="openai",model="mock-main",base_url="{url}",allow_insecure=true}},{{provider="openai",model="mock-next",base_url="{url}",allow_insecure=true}}]
+model_favorites=[{{provider="openai",model="mock-main",base_url="{url}",allow_insecure=true,protocol="chat-completions"}},{{provider="openai",model="mock-next",base_url="{url}",allow_insecure=true,protocol="chat-completions"}}]
 [endpoint]
 base_url="{url}"
 allow_insecure=true
+protocol="chat-completions"
 [improve]
 enabled=false
 [codebase]
@@ -781,6 +782,50 @@ def measured_case(name, scenario, server, binary, captures):
             "chat_requests": server.chat_requests - before, **corrections}
 
 
+def history_search_case(server, binary, captures):
+    server.busy_release.clear()
+    with tempfile.TemporaryDirectory(prefix="dial-pty-history-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port)
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-BUSY-FOLLOW-UP")
+            terminal.wait("BUSY-FOLLOW-UP-ADMITTED")
+            terminal.command("/rename Source journal")
+            terminal.wait("renamed to Source journal")
+            terminal.command("/new")
+            terminal.wait("new session ")
+            terminal.command("/rename Origin journal")
+            terminal.wait("renamed to Origin journal")
+            terminal.command("/search admitted")
+            terminal.wait("all current matches")
+            terminal.command("/search results")
+            terminal.wait_panel()
+            terminal.wait("BUSY-FOLLOW-UP-ADMITTED", history=False)
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            terminal.command("/search more")
+            terminal.wait("already loaded")
+            terminal.command("PTY-BUSY-MAIN")
+            terminal.wait("BUSY-MAIN-PREFIX")
+            requests = server.chat_requests
+            terminal.command("/search")
+            terminal.wait_panel()
+            terminal.wait("Source journal", history=False)
+            terminal.capture("history-reopened-during-turn", history=False)
+            terminal.key("Enter")
+            terminal.wait_panel(False)
+            terminal.wait("when this turn finishes")
+            server.busy_release.set()
+            terminal.wait('"Source journal"', history=False)
+            terminal.command("/search back")
+            terminal.wait('"Origin journal"', history=False)
+            assert server.chat_requests == requests, "navigation must not submit another prompt"
+        finally:
+            server.busy_release.set()
+            terminal.close()
+
+
 def busy_preference_case(server, binary, captures):
     server.busy_release.clear()
     server.busy_requests.clear()
@@ -791,6 +836,8 @@ def busy_preference_case(server, binary, captures):
             terminal.wait("mock-main")
             terminal.command("PTY-BUSY-MAIN")
             terminal.wait("BUSY-MAIN-PREFIX")
+            terminal.command("/new please")
+            terminal.wait("Usage: /new")
             terminal.command("PTY-BUSY-REMOVED")  # Plain Enter must honor the preference.
             terminal.wait("1 queued", history=False)
             terminal.command("/queue remove 1")
@@ -1140,7 +1187,7 @@ def main():
             assert (project / "b.txt").read_text() == "edited-b"
             terminal.capture("conversation-undo-preserves-selective-revert")
             terminal.command("/undo files")
-            terminal.wait('restored ["a.txt"], removed []')
+            terminal.wait("Restored 1 file: a.txt")
             assert (project / "a.txt").read_text() == "edited-a"
             assert (project / "b.txt").read_text() == "edited-b"
             terminal.capture("selective-revert-undone")
@@ -1151,9 +1198,9 @@ def main():
             terminal.command("/queue remove 1")
             terminal.wait("Removed only the selected queued message")
             terminal.command("/queue")
-            # The active tab is styled, not bracketed; this summary is shown only by the queue tab.
-            terminal.wait("Enter edits one message")
-            terminal.wait("No choices to pick from.")
+            # Check the visible empty Queue tab, not a notice still in scrollback.
+            terminal.wait("No queued messages. During a turn", history=False)
+            terminal.wait("No choices to pick from.", history=False)
             terminal.capture("streaming-queue-empty")
             terminal.key("Escape")
             terminal.wait_panel(False)
@@ -1219,7 +1266,8 @@ def main():
         for name, scenario in (("workers", workers_case), ("pool", pool_case),
                                ("draft-focus", draft_focus_case), ("side-thread", side_thread_case)):
             journeys.append(measured_case(name, scenario, server, binary, args.captures))
-        for name, scenario in (("busy-after-turn", busy_preference_case),
+        for name, scenario in (("history-search-resume", history_search_case),
+                               ("busy-after-turn", busy_preference_case),
                                ("busy-redirect", redirect_preference_case),
                                ("refused-connection-recovery", refused_connection_case),
                                ("os-job-stop-dismiss", os_job_case),

@@ -707,6 +707,30 @@ fn readiness_scan_reports_ring_loss_and_its_own_observation_limit() {
 }
 
 #[test]
+fn readiness_scan_recovers_from_ring_overrun_using_spool_file() {
+    let (_dir, ws) = open_workspace();
+    let artifacts = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let ws = ws.with_artifacts(store);
+    let store = ws.artifacts().expect("artifact store");
+    let mut spool = store.spool().expect("spool");
+    let ring = Mutex::new(Ring::new(64));
+    lock(&ring).spool_path = Some(spool.path().to_path_buf());
+    let banner = b"early-banner: READY_MARKER\n";
+    let filler = vec![b'x'; 256];
+    use std::io::Write;
+    spool.write_all(banner).unwrap();
+    spool.write_all(&filler).unwrap();
+    lock(&ring).push(banner);
+    lock(&ring).push(&filler);
+    let pattern = compile("READY_MARKER").unwrap();
+    let mut scan = ReadinessScan::default();
+    let found = find_match_with_store(&ring, false, &pattern, &mut scan, Some(store)).unwrap();
+    assert_eq!(found.as_deref(), Some("early-banner: READY_MARKER"));
+    drop(spool);
+}
+
+#[test]
 fn kill_takes_down_the_whole_process_group() {
     let (_dir, ws) = open_workspace();
     let tool = tool();

@@ -510,6 +510,27 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("session_search");
     }
+    // Saved decisions, preferences and conventions are memory; `session_search` returns raw
+    // conversation text. "Remember to run the tests" is an instruction, not a recall request, and
+    // coding work that merely touches a preference or convention ("add a preferences panel") is
+    // not recall either.
+    let recall = any(
+        terms,
+        &[
+            "recall",
+            "decided",
+            "agreed",
+            "preference",
+            "preferences",
+            "preferred",
+            "convention",
+            "conventions",
+        ],
+    ) || (terms.contains("decide") && terms.contains("did"))
+        || (terms.contains("remember") && any(terms, &["do", "did", "what", "which"]));
+    if recall && any(terms, &["we", "our", "my", "you", "us", "i"]) && !coding(terms) {
+        names.push("memory");
+    }
     if any(
         terms,
         &["history", "regression", "yesterday", "blame", "recent"],

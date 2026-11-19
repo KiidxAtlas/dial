@@ -141,6 +141,9 @@ fn expected_exit_codes_refuse_invalid_or_check_and_background_requests_before_la
         json!({"expected_exit_codes": [0, 1], "background": true}),
         json!({"expected_exit_codes": [0, 1], "pty": true}),
         json!({"expected_exit_codes": [0, 1], "trace": true}),
+        json!({"idle_timeout": 0}),
+        json!({"idle_timeout": 11}),
+        json!({"idle_timeout": 1, "background": true}),
         json!({"expected_exit_codes": [0, 0, 0, 0, 0, 0, 0, 0, 0]}),
     ] {
         let mut args = extra;
@@ -191,6 +194,66 @@ fn expected_exit_codes_cannot_accept_cancellation_or_timeout_or_trigger_adoption
         let cancelled =
             bash_tool_streaming(&ws, &args, 1, &|_| {}, &AtomicBool::new(true)).unwrap();
         assert!(cancelled.is_error, "{name}: {}", cancelled.text);
+    }
+}
+
+#[test]
+fn idle_timeout_stops_only_silent_commands_and_leaves_wall_time_unchanged() {
+    let (_dir, base) = workspace();
+    let base = base.without_sandbox();
+    for (name, backend) in unsandboxed_backends() {
+        let ws = base.clone().with_shell_backend(backend);
+        let run = |args: Value, wall: u64| {
+            bash_tool_streaming_with_adopter(
+                &ws,
+                &args,
+                wall,
+                0,
+                &|_| {},
+                &AtomicBool::new(false),
+                &|_job| panic!("an idle watchdog command must not be adopted"),
+            )
+            .unwrap()
+        };
+        // Silent for longer than its limit: killed at the limit, not at the wall deadline, and its
+        // late output never reaches the result.
+        let silent = run(
+            json!({"command": "sleep 4; echo late", "idle_timeout": 1}),
+            10,
+        );
+        assert!(silent.is_error, "{name}: {}", silent.text);
+        assert!(
+            silent
+                .text
+                .contains("no output for 1s; process group killed by idle_timeout"),
+            "{name}: {}",
+            silent.text
+        );
+        assert!(!silent.text.contains("late"), "{name}: {}", silent.text);
+        assert!(
+            silent.execution.process.as_ref().unwrap().timed_out,
+            "{name}"
+        );
+        // Quiet gaps shorter than the limit, each followed by output, never trip it: the limit
+        // measures silence, not total runtime.
+        let ticking = run(
+            json!({"command": "for i in 1 2 3; do sleep 1; echo tick; done", "idle_timeout": 2}),
+            10,
+        );
+        assert!(!ticking.is_error, "{name}: {}", ticking.text);
+        assert_eq!(
+            ticking.text.matches("tick").count(),
+            3,
+            "{name}: {}",
+            ticking.text
+        );
+        // Without the argument the wall deadline alone governs, so a 2s silence passes.
+        let default = run(json!({"command": "sleep 2; echo done"}), 10);
+        assert!(
+            !default.is_error && default.text.contains("done"),
+            "{name}: {}",
+            default.text
+        );
     }
 }
 
@@ -1829,18 +1892,39 @@ fn captured_output_never_splits_a_character_at_the_head_cut() {
 #[test]
 fn interpreter_guidance_lists_available_and_missing_helper_languages() {
     let bin = tempfile::tempdir().unwrap();
-    for program in ["perl", "gcc"] {
-        fs::write(bin.path().join(program), "").unwrap();
-    }
-    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
+    let (_root, ws) = workspace();
+    let install = |program: &str| {
+        let file = bin
+            .path()
+            .join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&file, "").unwrap();
+        crate::platform::fs::set_mode(&file, 0o755).unwrap();
+    };
+    install("perl");
+    install("gcc");
+    // A directory or a non-executable file cannot provide a helper runtime.
+    fs::create_dir(bin.path().join("node")).unwrap();
+    fs::write(bin.path().join("python3"), "").unwrap();
+    let guidance = interpreter_guidance_for(&ws, Some(bin.path().as_os_str()));
     assert!(
         guidance.contains("Shell PATH languages: perl, C compiler (gcc); not found: python3, node, ruby, go, rustc, java."),
         "{guidance}"
     );
-    fs::write(bin.path().join("python"), "").unwrap();
-    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
-    assert!(guidance.contains("python3 (python)"), "{guidance}");
-    let empty = interpreter_guidance_for(None);
+    assert!(guidance.contains("Python-specific behavior"));
+    install("python");
+    let guidance = interpreter_guidance_for(&ws, Some(bin.path().as_os_str()));
+    assert!(
+        guidance.contains("python (unverified version; no python3 launcher)"),
+        "{guidance}"
+    );
+    assert!(!guidance.contains("python3 (python)"), "{guidance}");
+    let hidden = ws.with_protected_paths(&[bin.path().to_owned()]);
+    let hidden_guidance = interpreter_guidance_for(&hidden, Some(bin.path().as_os_str()));
+    assert!(
+        hidden_guidance.contains("languages: none;"),
+        "{hidden_guidance}"
+    );
+    let empty = interpreter_guidance_for(&hidden, None);
     assert!(
         empty.contains("Shell PATH languages: none; not found: python3"),
         "{empty}"
@@ -1915,4 +1999,28 @@ fn a_writable_sqlite3_open_is_refused_before_it_can_destroy_a_damaged_wal() {
     // A valid, fully committed WAL is applied by SQLite rather than discarded.
     fs::write(dir.path().join("main.db-wal"), &original).unwrap();
     assert_eq!(guard("sqlite3 main.db 'SELECT 1'"), None);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn strict_bash_path_holds_only_trusted_package_and_system_bins() {
+    // The sandboxed PATH is built from fixed trusted directories, never from the inherited PATH.
+    let (_dir, ws) = workspace();
+    let path = bash_path_for(&ws);
+    let trusted = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/Library/Developer/CommandLineTools/usr/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ];
+    for entry in path.split(':') {
+        assert!(
+            trusted.contains(&entry),
+            "untrusted PATH entry {entry} in {path}"
+        );
+    }
+    assert!(path.ends_with("/usr/bin:/bin:/usr/sbin:/sbin"), "{path}");
 }

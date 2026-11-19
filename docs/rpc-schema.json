@@ -1923,6 +1923,31 @@
         },
         {
           "type": "object",
+          "description": "Read `text` aloud with the live session's voice (or the configured one when no session is active), replacing any reply being read; without `text`, stop reading. Playback is bracketed by `live_speech` events.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "live_speak"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "properties": {
             "id": {
               "$ref": "#/$defs/id"
@@ -2955,6 +2980,43 @@
         },
         {
           "type": "object",
+          "description": "Recorded code change history, as /code-history shows it: action search lists file versions newest first (optional query, path, branch, limit 1-200, default 30); action show returns one version and its stored diff. Read-only; runs off the agent. Refusals: refused when codebase.history is off or for action clear (terminal-confirmed), not_found for an unknown id, invalid_params for bad arguments. Result: {action, versions} or {action, version, diff}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "code_history" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "action": { "enum": ["search", "show"] },
+                "query": { "type": "string", "maxLength": 1000 },
+                "path": { "type": "string", "maxLength": 1000 },
+                "branch": { "type": "string", "maxLength": 1000 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                "id": { "type": "integer" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Cross-session usage statistics, as /stats <range> shows them: session transcripts are synced into the local statistics index, then reported for the optional range (for example 7d; omit for all time). No provider is contacted. Read-only; runs off the agent. Result: {range, report}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "stats" },
+            "params": {
+              "type": "object",
+              "properties": { "range": { "type": "string", "maxLength": 1000 } },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Tool reliability for this session, as /reliability shows it: whether it is enabled, measured results, the route, this session's counters and the contract-failure limit. Read-only; answered on the agent actor. Result: {enabled, measured, route, session, max_contract_failures, strict_tools}.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },
@@ -3843,6 +3905,18 @@
         },
         {
           "type": "object",
+          "description": "A recognized main-agent check just ran and received a passing verdict. Not a cached pass or a claim that the task is complete.",
+          "properties": {
+            "event": {"const": "check_passed"},
+            "seq": {"type": "integer", "minimum": 1},
+            "session_id": {"type": "string"},
+            "request_id": {"type": ["string", "integer", "null"]}
+          },
+          "required": ["event"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
           "properties": {
             "event": {
               "const": "tool_result"
@@ -3916,7 +3990,21 @@
                 "alert"
               ]
             },
-            "tokens": {}
+            "tokens": {},
+            "detail": {
+              "description": "Structured facts behind the event, when the engine has them; message stays the authoritative wording. model_switch: from (nullable), to, reason (fallback|restore|promotion|prewalk). review: severity, note (advisor advice, never verified).",
+              "type": "object",
+              "properties": {
+                "type": {"enum": ["model_switch", "review"]},
+                "from": {"type": ["string", "null"]},
+                "to": {"type": "string"},
+                "reason": {"enum": ["fallback", "restore", "promotion", "prewalk"]},
+                "severity": {"type": "string"},
+                "note": {"type": "string"}
+              },
+              "required": ["type"],
+              "additionalProperties": true
+            }
           },
           "required": [
             "event",
@@ -4283,6 +4371,77 @@
           "required": [
             "event",
             "message"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "description": "Live voice: what `live_listen` heard, sent before the turn it starts runs.",
+          "properties": {
+            "event": {
+              "const": "live_transcript"
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the `live_listen` request that recorded the speech.", "type": ["string", "integer", "null"]},
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "text"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "description": "Live voice: a reply started (`speaking` true) or stopped being read aloud (`speaking` false, whether it finished, was cancelled or failed).",
+          "properties": {
+            "event": {
+              "const": "live_speech"
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "speaking": {
+              "type": "boolean"
+            },
+            "cancelled": {
+              "type": "boolean",
+              "description": "With `speaking` false: the read-out was stopped before it finished."
+            }
+          },
+          "required": [
+            "event",
+            "speaking"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "description": "Live voice: the microphone level while `live_listen` records, about ten times a second.",
+          "properties": {
+            "event": {
+              "const": "live_level"
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the `live_listen` request that is recording.", "type": ["string", "integer", "null"]},
+            "level": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Loudest RMS since the previous report: 0 is silence, speech is roughly 0.02 to 0.3."
+            },
+            "speech": {
+              "type": "boolean",
+              "description": "An utterance is being recorded (speech was detected and has not ended)."
+            }
+          },
+          "required": [
+            "event",
+            "level",
+            "speech"
           ],
           "additionalProperties": true
         }

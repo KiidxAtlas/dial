@@ -309,6 +309,49 @@ class HarborDiagnosticsTests(unittest.TestCase):
         table = text.split('### Task outcomes', 1)[1].split('### Identity', 1)[0]
         self.assertEqual(len([line for line in table.splitlines() if line.startswith('|')]), 4)
 
+    def test_artifact_trace_counts_observed_checks_and_path_linked_repairs(self):
+        private = '/app/private-output'
+        def request(i):
+            return {'node': {'kind': 'inference', 'id': str(i)}}
+
+        def launch(i, marked, code):
+            args = {'command': 'private-helper', 'check_paths': [private], 'check': marked}
+            return [{'message': {'role': 'assistant', 'tool_calls': [{'id': str(i), 'function': {
+                'name': 'bash', 'arguments': json.dumps(args)}}]}}, {'message': {
+                'role': 'tool', 'tool_call_id': str(i), 'content': 'private expected A actual B',
+                'dial_execution': {'process': {'started': True, 'output_complete': True, 'exit_code': code}}}}]
+
+        def write(i, path):
+            return {'message': {'role': 'tool', 'tool_call_id': str(i), 'dial_execution': {'changed_paths': [path]}}}
+
+        events = [request(1), *launch(1, False, 0), request(2), request(1), *launch(2, True, 1),
+                  request(3), write(3, private), *launch(4, True, 0), request(4), write(5, 'other')]
+        self.journal(events)
+        self.put('agent/metrics.json', {'usage': {'requests': 4, 'tool_calls': 5}})
+        result = summarize_trial(self.root)['artifact_process']
+        self.assertEqual(result, {'observed_repeat_checks': 1, 'requests_from_first_mismatch_to_artifact_write': 1})
+        self.assertNotIn('private', json.dumps(result))
+        self.put('agent/metrics.json', {'usage': {'requests': 6, 'tool_calls': 5}})
+        self.assertTrue(all(v is None for v in summarize_trial(self.root)['artifact_process'].values()))
+
+    def test_registered_results_are_counted_once_per_node_not_publication(self):
+        trace = diagnostics.ArtifactTrace()
+        trace.observe({'kind': 'inference', 'id': 'req'}, {})
+        node = {'kind': 'tool', 'id': 'check', 'label': 'verify', 'result': {'data': {
+            'origin': 'model_registered', 'results': [{'ran': True, 'command': 'private', 'status': 'passed'}]}}}
+        for item in (node, node, {**node, 'id': 'rerun'}):
+            trace.observe(item, {})
+        self.assertEqual(trace.summary(1)['observed_repeat_checks'], 1)
+
+    def test_verifier_outcome_controls_passing_only_measurements(self):
+        rows = [{'reward': {'reward': score}, 'elapsed_sec': elapsed, 'usage': {'requests': requests}}
+                for score, elapsed, requests in ((1, 20, 3), (0, 2, 1), (None, 1, 1))]
+        summary = diagnostics.summarize_agent(rows)
+        self.assertEqual(summary['verifier_outcomes'], {'passed': 1, 'scored': 2, 'unscored': 1, 'pass_rate_scored': 0.5})
+        self.assertEqual(summary['measurements']['passing.requests']['total'], 3)
+        self.assertEqual(summary['measurements']['passing.agent_elapsed_sec']['total'], 20)
+        self.assertIsNone(diagnostics.summarize_agent([])['verifier_outcomes']['pass_rate_scored'])
+
     def test_request_coverage_cannot_reconcile_mismatches_across_trials(self):
         rows = [{'usage': {'requests': 1}, 'diagnostics': {'requests': requests}}
                 for requests in ([{'observed_latency_ms': {'total_ms': 1}}] * 2, [])]

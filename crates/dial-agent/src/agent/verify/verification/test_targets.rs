@@ -5,9 +5,9 @@
 //! `TestCalc::test_div`), a unittest `Class::method`, a Rust or Go test filter, or a jest/vitest
 //! test name. Commands are built by the harness; the path and selector are shell-quoted model input.
 use super::{
-    FocusedCheck, RustSelection, cargo_check, javascript_test_command, javascript_test_runner,
-    normalize, owning_package, owning_target, pytest_configured, python_owner, rust_selection,
-    scoped_python, shell_quote,
+    FocusedCheck, RustSelection, cargo_check, go_test_command, javascript_test_command,
+    javascript_test_runner, normalize, owning_package, owning_target, pytest_configured,
+    python_owner, rust_selection, scoped_python, shell_quote,
 };
 use std::path::{Component, Path};
 
@@ -95,14 +95,9 @@ pub fn target_check(
             name: format!("{NAME_PREFIX}{entry}"),
             ..rust
         }),
-        "go" if root.join("go.mod").is_file() => {
-            let directory = path.parent().unwrap_or(Path::new(""));
-            let package = if directory.as_os_str().is_empty() {
-                ".".to_owned()
-            } else {
-                format!("./{}", directory.to_string_lossy())
-            };
-            let mut command = format!("go test {}", shell_quote(&package));
+        "go" => {
+            let (_, mut command) = go_test_command(root, path)
+                .ok_or_else(|| format!("no owning Go module was found for `{path_text}`"))?;
             if let Some(selector) = selector {
                 command.push_str(&format!(" -run {}", shell_quote(&format!("^{selector}$"))));
             }
@@ -221,8 +216,9 @@ fn python_check(
 }
 
 fn rust_check(root: &Path, path: &Path, selector: Option<&str>) -> Result<FocusedCheck, String> {
+    let mut packages = Default::default();
     let Some(selector) = selector else {
-        return match rust_selection(root, path) {
+        return match rust_selection(root, path, &mut packages) {
             RustSelection::Check(check) => Ok(check),
             RustSelection::Gap(reason) => Err(format!("`{}`: {reason}", path.display())),
             RustSelection::Static => Err(format!(
@@ -232,58 +228,44 @@ fn rust_check(root: &Path, path: &Path, selector: Option<&str>) -> Result<Focuse
         };
     };
     let file = normalize(path);
-    let package =
-        owning_package(root, &file).map_err(|reason| format!("`{}`: {reason}", path.display()))?;
+    let package = owning_package(root, &file, &mut packages)
+        .map_err(|reason| format!("`{}`: {reason}", path.display()))?;
     let target = package
         .targets
         .iter()
         .find(|target| target.root == file)
-        .or_else(|| owning_target(root, &package, &file).map(|(target, _)| target))
+        .or_else(|| owning_target(root, package, &file).map(|(target, _)| target))
         .ok_or_else(|| {
             format!(
                 "`{}` is not inside any registered target's source tree",
                 path.display()
             )
         })?;
-    Ok(cargo_check(&package, target, Some(selector.to_owned())))
+    Ok(cargo_check(package, target, Some(selector.to_owned())))
 }
 
 fn javascript_check(root: &Path, path: &Path, selector: Option<&str>) -> Result<String, String> {
-    let runner = javascript_test_runner(root).ok_or_else(|| {
-        format!(
-            "no installed jest or vitest `test` script covers `{}`; run it with bash instead",
-            path.display()
-        )
-    })?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let is_test = name.contains(".test.")
-        || name.contains(".spec.")
-        || path
-            .components()
-            .any(|part| part.as_os_str() == "__tests__");
-    let mut command = if is_test {
-        let (kind, invocation) = &runner;
-        let mode = if *kind == "vitest" {
-            "run"
-        } else {
-            "--runInBand"
-        };
-        format!(
-            "{invocation} {mode} {}",
-            shell_quote(&path.to_string_lossy())
-        )
-    } else {
-        javascript_test_command(root, path, &runner)
+    if let Some(runner) = javascript_test_runner(root) {
+        let mut command = javascript_test_command(root, path, &runner)
             .map(|check| check.command)
-            .ok_or_else(|| format!("no test file was found for `{}`", path.display()))?
-    };
-    if let Some(selector) = selector {
-        command.push_str(&format!(" -t {}", shell_quote(selector)));
+            .ok_or_else(|| format!("no test file was found for `{}`", path.display()))?;
+        if let Some(selector) = selector {
+            command.push_str(&format!(" -t {}", shell_quote(selector)));
+        }
+        return Ok(command);
     }
-    Ok(command)
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(ext, "js" | "mjs" | "cjs") {
+        let mut command = format!("node --test {}", shell_quote(&path.to_string_lossy()));
+        if let Some(selector) = selector {
+            command.push_str(&format!(" --test-name-pattern {}", shell_quote(selector)));
+        }
+        return Ok(command);
+    }
+    Err(format!(
+        "no installed jest or vitest `test` script covers `{}`; run it with bash instead",
+        path.display()
+    ))
 }
 
 /// Totals from cargo, pytest, unittest, jest and vitest summary lines; `None` without any.
@@ -319,6 +301,18 @@ pub fn test_counts(output: &str) -> Option<TestCounts> {
         } else if pytest_summary(line) {
             let errors = labelled(line, "error") + labelled(line, "errors");
             add(labelled(line, "passed"), labelled(line, "failed") + errors);
+        } else if let Some(rest) = line.strip_prefix("ℹ ").or_else(|| line.strip_prefix("# ")) {
+            if let Some(count) = rest
+                .strip_prefix("pass ")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                add(count, 0);
+            } else if let Some(count) = rest
+                .strip_prefix("fail ")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                add(0, count);
+            }
         }
     }
     totals

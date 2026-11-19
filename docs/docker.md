@@ -1,9 +1,9 @@
 # Running Dial in Docker
 
-The image runs the Linux build of Dial as the non-root user `dial` (uid 10001). It contains
-Dial, Bubblewrap (the Linux command sandbox), Git and CA certificates, and nothing else: no
-Python/MLX runtime, so local MLX models are unavailable inside it. Use a hosted provider, a
-model server on the host, or Docker Model Runner.
+The image runs the Linux build of Dial as the non-root user `dial` (uid 10001). It includes
+Bubblewrap, Git and CA certificates. Dial carries CPython and its standard library for Python
+Eval; it does not install `python3` on the shell `PATH` or include MLX. For models, use a hosted
+provider, a model server on the host, or Docker Model Runner.
 
 ## Build
 

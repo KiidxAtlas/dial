@@ -26,8 +26,7 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   needs-input or incomplete turn left open tasks, **review** (`/review-file`) and **undo**
   (`/undo`) when files changed, and **plan steps** when the answer lists three or more numbered
   steps (drafts a request to turn them into a plan; nothing runs until Enter).
-  `Option+1`…`Option+9` on macOS (`Alt+1`…`Alt+9` elsewhere) run them while no turn runs and the
-  composer is empty; otherwise those chords reach the draft as usual.
+  With an empty, idle composer, use `Shift+F1`…`Shift+F9` on macOS or `Alt+1`…`Alt+9` on Linux and Windows. Both sets work wherever the terminal forwards them. On a Mac keyboard you may need `Fn` for the function keys. A plain digit always types into the composer.
   Time and tokens sit on the bottom edge. The outline follows the outcome: accent for done or
   answered, amber for blocked or incomplete, red for failed. Plain answers and terminals narrower
   than 40 columns keep the one-line footer.
@@ -72,8 +71,8 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   The activity label names what the model is doing (**Reasoning**, **Writing**, **Preparing** *tool*),
   and a provider retry reads **retrying…** rather than counting down to zero; once a retried request
   succeeds, one **Recovered** line closes the retry note. A tool that has run for 10 seconds shows its
-  elapsed time (**running bash · 1m 15s**). The terminal tab title
-  uses a blue circle when Dial is waiting for you.
+  elapsed time (**running bash · 1m 15s**). When you switch away, the
+  [terminal tab title](terminal-integration.md#terminal-integration) tells you whether Dial needs your input.
 - The default status line leads with the approval mode as a colored dot and plain label
   (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`): green for ask and read-only, orange for
   full auto. Config, CLI and `/approval` values stay `ask`, `write`, `auto` and `readonly`.

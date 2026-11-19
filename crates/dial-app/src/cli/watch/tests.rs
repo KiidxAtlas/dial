@@ -198,11 +198,11 @@ fn screenshots_are_verified_copied_and_only_replace_inline_when_attached() {
     let root = tempfile::tempdir().unwrap();
     let layout = layout(root.path());
     let reference = screenshot(root.path());
-    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false).unwrap();
+    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false, false).unwrap();
     assert!(thumbnail.is_some() && warning.is_none());
     assert!(!enabled(&layout, "session"));
     start(&layout, "session");
-    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false).unwrap();
+    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false, false).unwrap();
     assert!(thumbnail.is_some() && warning.is_none());
     let dir = directory(&layout, "session").unwrap();
     atomic::write_private(
@@ -210,8 +210,11 @@ fn screenshots_are_verified_copied_and_only_replace_inline_when_attached() {
         &serde_json::to_vec(&ProcId::current().unwrap()).unwrap(),
     )
     .unwrap();
-    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false).unwrap();
+    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false, false).unwrap();
     assert!(thumbnail.is_none() && warning.is_none());
+    // A generated image stays in the chat even with the pane attached, and is still mirrored.
+    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false, true).unwrap();
+    assert!(thumbnail.is_some() && warning.is_none());
     let Event::Image { file, .. } = &events(&layout, "session")[1] else {
         panic!("expected screenshot");
     };
@@ -238,7 +241,7 @@ fn feed_failure_keeps_the_inline_screenshot() {
         &serde_json::to_vec(&ProcId::current().unwrap()).unwrap(),
     )
     .unwrap();
-    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false).unwrap();
+    let (thumbnail, warning) = preview_image(&layout, "session", &reference, false, false).unwrap();
     assert!(thumbnail.is_some());
     assert!(warning.is_some());
 }

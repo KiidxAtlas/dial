@@ -109,6 +109,11 @@ def summarize_configuration(entry, repetitions):
             "all_trial_median_ms": statistics.median(case["metrics"]["elapsed_ms"] for case in cases),
             "successful_trial_median_ms": statistics.median(successful_ms) if successful_ms else None,
             "observed_tokens": sum(case["metrics"]["prompt_tokens"] + case["metrics"]["output_tokens"] for case in cases) if complete_usage else None,
+            "elapsed_ms_per_success": sum(case["metrics"]["elapsed_ms"] for case in cases) / successes
+                                     if eligible and successes else None,
+            "observed_tokens_per_success": sum(case["metrics"]["prompt_tokens"] + case["metrics"]["output_tokens"]
+                                               for case in cases) / successes
+                                           if eligible and successes and complete_usage else None,
             "tool_calls": sum(case["metrics"]["tool_calls"] for case in cases),
             "tool_errors": sum(case["metrics"]["tool_errors"] for case in cases),
             "repair_attempts": sum(repairs) if all(value is not None for value in repairs) else None,

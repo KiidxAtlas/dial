@@ -350,19 +350,27 @@ impl Agent<'_> {
 
         nudges.retain(|m| !is_plan_nudge(m));
         let next = self.prewalk_backend(&target)?;
+        let from = crate::agent::model::route::route_name(&self.auth_config.selection());
         let config = self.effective_config().with_selection(&target);
         self.install_built_route(backend, next, &config, None)?
             .release();
         self.prewalk_clear();
         self.modes.prewalk.handoff = Some(target.clone());
         self.save_modes()?;
-        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-            crate::agent::ui::ui_event::EventKind::Model,
-            format!(
-                "Prewalk: switched to {} after first {tool} call.",
-                label(&target)
-            ),
-        ));
+        ui.event(
+            &crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Model,
+                format!(
+                    "Prewalk: switched to {} after first {tool} call.",
+                    label(&target)
+                ),
+            )
+            .with_detail(crate::agent::model::route::switch_detail(
+                Some(from),
+                &target,
+                crate::agent::ui::ui_event::SwitchReason::Prewalk,
+            )),
+        );
         let mut checklist = nudge(CHECKLIST);
         crate::agent::run::guidance::tag(
             &mut checklist,

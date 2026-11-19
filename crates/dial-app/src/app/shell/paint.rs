@@ -11,7 +11,7 @@ use crate::ui::composer::ComposerCtx;
 use crate::ui::keys::Action;
 use crate::ui::status::{Lora, Phase};
 use crate::ui::term::Viewport;
-use crate::ui::term_state::{Activity, Progress, Signals};
+use crate::ui::term_state::{Activity, Progress, Prompt, Signals};
 use crate::ui::transcript::{Retire, TranscriptCtx};
 use crate::ui::{Rows, tasks};
 use anyhow::Result;
@@ -95,20 +95,25 @@ pub(super) fn terminal_signals(
     ui: &crate::llm::model_config::UiConfig,
     status: &crate::ui::status::StatusData,
     after_turn: Activity,
-    awaiting_user: bool,
+    awaiting_user: Option<Prompt>,
 ) -> Option<Signals> {
     if !ui.terminal_integration {
         return None;
     }
-    let (activity, progress) = if awaiting_user {
-        (Activity::Waiting, Progress::Paused)
+    let (activity, progress) = if let Some(prompt) = awaiting_user {
+        (Activity::Waiting(prompt), Progress::Paused)
     } else if status.busy() {
         let progress = status
             .prompt_fraction()
             .map_or(Progress::Indeterminate, |fraction| {
                 Progress::Percent((fraction * 100.0).round() as u8)
             });
-        (Activity::Working, progress)
+        let activity = if status.testing {
+            Activity::Testing
+        } else {
+            Activity::Working
+        };
+        (activity, progress)
     } else {
         (after_turn, Progress::None)
     };
@@ -165,17 +170,21 @@ fn side_rows(
 const TAB_SCOPE_WIDTH: usize = 40;
 
 /// The terminal title: `dial · <project>`, the session's scope clipped to [`TAB_SCOPE_WIDTH`],
-/// then the state circle. Keep the circle last so left-truncated, unselected tabs still show it.
-pub(super) fn tab_title(base: &str, scope: &str, marker: &str) -> String {
+/// then the state in words. Keep the label last so left-truncated tabs still show it.
+pub(super) fn tab_title(base: &str, scope: &str, activity: Activity, ascii: bool) -> String {
     let mut title = base.to_owned();
     let scope = crate::ui::text::clip(scope, TAB_SCOPE_WIDTH);
     if !scope.is_empty() {
         title.push_str(" · ");
         title.push_str(&scope);
     }
-    if !marker.is_empty() {
+    if activity != Activity::Idle {
+        if !ascii {
+            title.push(' ');
+            title.push_str(activity.marker());
+        }
         title.push(' ');
-        title.push_str(marker);
+        title.push_str(activity.label());
     }
     title
 }
@@ -457,11 +466,8 @@ impl Shell {
         let above = live.len() as u16;
         live.extend(bottom);
         let signals = terminal_signals(ui, status, self.term_activity, self.awaiting_user);
-        let marker = signals
-            .as_ref()
-            .filter(|_| !theme.ascii())
-            .map_or("", |signals| signals.activity.marker());
-        let tab = tab_title(title, tab_scope, marker);
+        let activity = signals.as_ref().map_or(Activity::Idle, |s| s.activity);
+        let tab = tab_title(title, tab_scope, activity, theme.ascii());
         term.paint(&Viewport {
             rows: &live,
             cursor: cursor.map(|(row, col)| (above + row, col)),

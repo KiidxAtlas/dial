@@ -656,10 +656,11 @@ pub(super) fn summarize_prefix_with_worker(
         !source.is_empty(),
         "nothing new to summarize after the previous summary"
     );
+    let view = crate::agent::workflow::evidence::summarizer_view(messages);
     let parts = |indices: &[usize]| {
         indices
             .iter()
-            .map(|&index| transcript_part(&messages[index]))
+            .map(|&index| transcript_part(&view[index]))
             .collect::<Result<Vec<_>>>()
     };
     let summary = if let Some(at) = turn_split(messages, &source, keep) {
@@ -905,7 +906,8 @@ pub fn summarize_branch(
         DEFAULT_SUMMARY_INPUT_WINDOW
     };
     let output = summary_output(policy, context);
-    let (kept, ops) = budgeted_tail(messages, input_budget(window, output));
+    let view = crate::agent::workflow::evidence::summarizer_view(messages);
+    let (kept, ops) = budgeted_tail(&view, input_budget(window, output));
     if kept.is_empty() {
         return Ok(BranchSummary {
             summary: "No content to summarize".to_owned(),
@@ -915,7 +917,7 @@ pub fn summarize_branch(
     }
     let parts = kept
         .iter()
-        .map(|&index| transcript_part(&messages[index]))
+        .map(|&index| transcript_part(&view[index]))
         .collect::<Result<Vec<_>>>()?;
     let summary = fold(
         backend,

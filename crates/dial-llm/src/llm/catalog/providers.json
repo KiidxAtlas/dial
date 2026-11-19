@@ -41,7 +41,7 @@
 {"id":"novita","label":"Novita","base_url":"https://api.novita.ai/openai/v1","env":["NOVITA_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":false},
 {"id":"nvidia","label":"NVIDIA","base_url":"https://integrate.api.nvidia.com/v1","env":["NVIDIA_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":false},
 {"id":"ollama-cloud","label":"Ollama Cloud","base_url":"https://ollama.com","env":["OLLAMA_API_KEY","OLLAMA_CLOUD_API_KEY"],"shared_env":[],"protocol":"ollama","default":false},
-{"id":"openai","label":"OpenAI","base_url":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":true},
+{"id":"openai","label":"OpenAI","base_url":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],"shared_env":[],"protocol":"responses","default":true},
 {"id":"opencode-go","label":"OpenCode Go","base_url":"https://opencode.ai/zen/go/v1","env":["OPENCODE_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":false},
 {"id":"opencode-zen","label":"OpenCode Zen","base_url":"https://opencode.ai/zen/v1","env":["OPENCODE_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":false},
 {"id":"openrouter","label":"OpenRouter","base_url":"https://openrouter.ai/api/v1","env":["OPENROUTER_API_KEY"],"shared_env":[],"protocol":"chat-completions","default":true},

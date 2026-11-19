@@ -898,6 +898,13 @@ impl Backend {
             .output_budget(requested)
     }
 
+    /// The model's stated output maximum (profile, live metadata or exact catalog record), or
+    /// `None` when no source states one.
+    pub fn stated_output_limit(&self) -> Option<u32> {
+        self.resolved_model(self.profile.as_ref())
+            .stated_max_output_tokens
+    }
+
     fn resolved_model(
         &self,
         profile: Option<&llm::profiles::ModelProfile>,
@@ -3018,9 +3025,10 @@ fn anthropic_request_body(
                 .into_iter()
                 .flatten()
             {
-                if let Some(parameters) =
-                    crate::llm::reliability::strict_parameters(&tool["input_schema"])
-                {
+                if let Some(parameters) = crate::llm::reliability::strict_tool_parameters(
+                    tool["name"].as_str().unwrap_or_default(),
+                    &tool["input_schema"],
+                ) {
                     tool["input_schema"] = parameters;
                     tool["strict"] = serde_json::json!(true);
                 }

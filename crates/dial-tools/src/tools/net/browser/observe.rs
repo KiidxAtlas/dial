@@ -28,6 +28,8 @@ pub(super) const ACTIONS: &[&str] = &[
     "key_down",
     "key_up",
     "clipboard_paste",
+    "run",
+    "call",
 ];
 
 pub(super) fn schema() -> Value {

@@ -549,6 +549,93 @@ fn first_run_closes_the_model_panel_once_a_main_model_is_assigned() {
 }
 
 #[test]
+fn clearing_a_role_applies_immediately_without_confirmation() {
+    use crate::ui::overlay::OverlayEvent;
+    let (_home, _project, app) = app();
+    let selection = crate::llm::model_config::ModelSelection {
+        provider: "openai".into(),
+        model: "gpt-4.1-mini".into(),
+        ..Default::default()
+    };
+    let mut keys = Keymap::defaults();
+    let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+    let mut catalog = Catalog::new();
+    let runtime = crate::runtime::Tree::default();
+    let status = StatusData::default();
+    let mut history = Vec::new();
+    let mut auth_job = None;
+    let mut extensions_pending = None;
+    let mut extensions_job = None;
+    let mut scope = Scope::Global;
+    let mut env = OverlayEnv {
+        history: &mut history,
+        runtime: &runtime,
+        todo: &Default::default(),
+        model_downloads: None,
+        compute_monitor: None,
+        first_run: false,
+        live_tasks: None,
+        verify_lora: None,
+        auth_job: &mut auth_job,
+        last_setup_failure: &mut None,
+        extensions_pending: &mut extensions_pending,
+        extensions_job: &mut extensions_job,
+        background_control: None,
+        pty_approval: Approval::Write,
+        app: &app,
+        themes: &mut themes,
+        keys: &mut keys,
+        status: &status,
+        catalog: &mut catalog,
+        scope: &mut scope,
+        dark: None,
+        latest: None,
+        next: None,
+        seen_generation: 0,
+        release_compute: None,
+        peer_source: None,
+    };
+    let mut overlay = ActiveOverlay::Models(Box::new(
+        crate::ui::overlay::models::ModelOverlay::new(None, Vec::new(), Scope::Global),
+    ));
+    assert!(!env.apply(
+        OverlayEvent::AssignModel {
+            role: "small".into(),
+            selection,
+            scope: Scope::Global,
+        },
+        &mut overlay,
+    ));
+    assert!(
+        env.latest
+            .as_ref()
+            .and_then(|cfg| cfg.role_selection("small"))
+            .is_some(),
+        "small role should be assigned before clearing"
+    );
+    assert!(!env.apply(
+        OverlayEvent::ClearRole {
+            role: "small".into(),
+            scope: Scope::Global,
+        },
+        &mut overlay,
+    ));
+    assert!(
+        env.latest
+            .as_ref()
+            .and_then(|cfg| cfg.role_selection("small"))
+            .is_none(),
+        "clearing a role must save immediately without waiting for confirmation"
+    );
+    if let ActiveOverlay::Models(models) = &mut overlay {
+        assert!(
+            models.take_confirmed_assignment().is_none(),
+            "clearing a role should not leave a pending confirmation review"
+        );
+    }
+}
+
+#[test]
 fn stop_key_leaves_every_panel_while_escape_steps_back_one() {
     use crate::app::overlay::run::overlay_input;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};

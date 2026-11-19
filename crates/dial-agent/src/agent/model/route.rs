@@ -159,6 +159,7 @@ impl Agent<'_> {
         }
         let primary_cap = self.route.fallback.as_ref().and_then(|f| f.primary_cap);
         let primary = self.primary_config();
+        let from = route_name(&self.auth_config.selection());
         if let Err(error) = self.install_route(backend, &primary, primary_cap) {
             if let Some(fallback) = &mut self.route.fallback {
                 fallback.until = Instant::now() + PRIMARY_RESTORE_RETRY;
@@ -174,10 +175,17 @@ impl Agent<'_> {
         self.record_main_model_route("Primary restored after provider-error fallback cooldown; not a worker missing-assignment default");
         self.request_phase
             .recover("fallback cooldown elapsed; returning to the primary model");
-        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-            crate::agent::ui::ui_event::EventKind::Model,
-            "Fallback cooldown elapsed; returning to the primary model",
-        ));
+        ui.event(
+            &crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Model,
+                "Fallback cooldown elapsed; returning to the primary model",
+            )
+            .with_detail(switch_detail(
+                Some(from),
+                &primary.selection(),
+                crate::agent::ui::ui_event::SwitchReason::Restore,
+            )),
+        );
         true
     }
 
@@ -257,13 +265,20 @@ impl Agent<'_> {
             self.compaction_runtime.cancel();
             self.request_phase
                 .recover("switching to a larger-window model");
-            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                crate::agent::ui::ui_event::EventKind::Model,
-                format!(
-                    "Context needs about {request_tokens} tokens; promoting from {}/{} ({current} tokens) to {}/{} ({window} tokens) instead of compacting",
-                    live.provider, live.model, target.provider, target.model
-                ),
-            ));
+            ui.event(
+                &crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Model,
+                    format!(
+                        "Context needs about {request_tokens} tokens; promoting from {}/{} ({current} tokens) to {}/{} ({window} tokens) instead of compacting",
+                        live.provider, live.model, target.provider, target.model
+                    ),
+                )
+                .with_detail(switch_detail(
+                    Some(route_name(&live)),
+                    target,
+                    crate::agent::ui::ui_event::SwitchReason::Promotion,
+                )),
+            );
             return true;
         }
         false
@@ -278,6 +293,7 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
     ) -> bool {
         let primary = self.primary_config();
+        let failed = route_name(&self.auth_config.selection());
         let selected = primary.selection();
         let fallbacks = crate::llm::fallback::fallback_models(&primary, "default", &selected);
         // A failure on the primary starts a new episode; a failure on a fallback continues the chain.
@@ -316,13 +332,20 @@ impl Agent<'_> {
             ));
             self.request_phase
                 .recover("switching to a configured fallback model");
-            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                crate::agent::ui::ui_event::EventKind::Model,
-                format!(
-                    "Primary model failed; continuing with configured fallback {}/{}",
-                    next.provider, next.model
-                ),
-            ));
+            ui.event(
+                &crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Model,
+                    format!(
+                        "Primary model failed; continuing with configured fallback {}/{}",
+                        next.provider, next.model
+                    ),
+                )
+                .with_detail(switch_detail(
+                    Some(failed),
+                    next,
+                    crate::agent::ui::ui_event::SwitchReason::Fallback,
+                )),
+            );
             return true;
         }
         false
@@ -381,6 +404,24 @@ impl Agent<'_> {
                 active.provider, active.model
             ),
         ));
+    }
+}
+
+/// `provider/model`, the way route events name a model.
+pub(in crate::agent) fn route_name(selection: &crate::llm::model_config::ModelSelection) -> String {
+    format!("{}/{}", selection.provider, selection.model)
+}
+
+/// The structured detail of a route change from `from` to `to`.
+pub(in crate::agent) fn switch_detail(
+    from: Option<String>,
+    to: &crate::llm::model_config::ModelSelection,
+    reason: crate::agent::ui::ui_event::SwitchReason,
+) -> crate::agent::ui::ui_event::EventDetail {
+    crate::agent::ui::ui_event::EventDetail::ModelSwitch {
+        from,
+        to: route_name(to),
+        reason,
     }
 }
 

@@ -147,6 +147,70 @@ pub(super) fn role_thinking_changes(
     }])
 }
 
+/// Settings writes for the main model's thinking `level`: `default` drops an explicit level (and
+/// `auto`), `auto` judges each turn, anything else is checked against the model's reasoning levels.
+pub(super) fn main_thinking_changes(config: &Config, level: &str) -> Result<Vec<Change>> {
+    if level != "default" {
+        return Ok(reasoning_changes(config, level)?.0);
+    }
+    let mut changes = vec![Change::Set {
+        path: "thinking_auto".into(),
+        value: toml::Value::Boolean(false),
+    }];
+    let selection = config.selection();
+    let named = config.model_profile.clone().or_else(|| {
+        config
+            .model_profiles
+            .iter()
+            .find(|(_, saved)| {
+                saved.provider == selection.provider && saved.model == selection.model
+            })
+            .map(|(name, _)| name.clone())
+    });
+    if let Some(name) = named.filter(|name| {
+        config
+            .model_profiles
+            .get(name)
+            .is_some_and(|profile| profile.reasoning_effort.is_some() || profile.thinking.is_some())
+    }) {
+        for field in ["reasoning_effort", "thinking"] {
+            changes.push(Change::Remove {
+                path: format!("model_profiles.{name}.{field}"),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+/// Thinking writes that go with assigning `selection` to `role`: its `thinking` level (`None` is
+/// the model's default, so a new model never inherits the previous model's level).
+pub(super) fn assignment_thinking_changes(
+    config: &Config,
+    role: &str,
+    selection: &crate::llm::model_config::ModelSelection,
+) -> Result<Vec<Change>> {
+    let mut plain = selection.clone();
+    plain.thinking = None;
+    let level = selection.thinking.as_deref();
+    if role == "main" {
+        return match level {
+            Some(level) => main_thinking_changes(&config.with_selection(&plain), level),
+            None => Ok(Vec::new()),
+        };
+    }
+    let path = format!("model_roles.{role}.thinking");
+    Ok(match level {
+        Some(level) => {
+            crate::config::thinking::apply_role_thinking(config.with_selection(&plain), level)?;
+            vec![Change::Set {
+                path,
+                value: level.into(),
+            }]
+        }
+        None => vec![Change::Remove { path }],
+    })
+}
+
 pub(super) fn reasoning_profile(
     config: &Config,
 ) -> Result<Option<crate::llm::profiles::ModelProfile>> {

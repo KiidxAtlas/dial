@@ -219,6 +219,10 @@ impl BackupOverlay {
         self.notice = message;
     }
 
+    pub(super) fn editing_chain(&self) -> bool {
+        !self.reviewing && self.row == 1
+    }
+
     pub(super) fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
         if let Event::Paste(text) = event {
             if !self.reviewing && self.row < 2 {
@@ -241,10 +245,12 @@ impl BackupOverlay {
                 _ => OverlayEvent::None,
             };
         }
-        if self.row == 1
-            && matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Delete)
-            && (key.modifiers.contains(KeyModifiers::ALT)
-                || key.modifiers.contains(KeyModifiers::CONTROL))
+        let reorder = matches!(key.code, KeyCode::Left | KeyCode::Right)
+            && matches!(key.modifiers, KeyModifiers::SHIFT | KeyModifiers::ALT);
+        if self.editing_chain()
+            && (reorder
+                || (matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Delete)))
         {
             let mut items = self.selectors();
             if !items.is_empty() {
@@ -256,7 +262,7 @@ impl BackupOverlay {
                 };
                 if key.code == KeyCode::Delete {
                     items.remove(self.backup_index);
-                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                } else if reorder {
                     items.swap(self.backup_index, next);
                     self.backup_index = next;
                 } else {
@@ -264,7 +270,7 @@ impl BackupOverlay {
                 }
                 self.chain.set(&items.join(", "));
                 self.notice = format!(
-                    "Selected backup #{} · Ctrl+←/→ select · Alt+←/→ reorder · Ctrl+Delete remove",
+                    "Selected backup #{} · Ctrl+←/→ select · Shift+←/→ reorder · Ctrl+Delete remove",
                     self.backup_index + 1
                 );
             }
@@ -390,7 +396,7 @@ impl BackupOverlay {
             Line::from(
                 "Edit the ordered list to reorder/remove; empty list explicitly disables this key.",
             ),
-            Line::from("On backups: Ctrl+←/→ select · Alt+←/→ reorder · Ctrl+Delete remove"),
+            Line::from("On backups: Ctrl+←/→ select · Shift+←/→ reorder · Ctrl+Delete remove"),
             Line::from(
                 "Cooldown: server retry-after, otherwise 5 minutes. Never = manual /model return.",
             ),

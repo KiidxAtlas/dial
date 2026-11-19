@@ -180,6 +180,70 @@ environment=[]
 }
 
 #[test]
+fn a_current_focused_check_does_not_relabel_an_older_shell_check_as_current() {
+    let server = serve(vec![
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"test ! -f payload.txt","check":true}),
+            )),
+        ),
+        response(
+            "",
+            Some((
+                "write",
+                json!({"path":"payload.txt","content":"ready","verify":["delivery"]}),
+            )),
+        ),
+        response(
+            "Saved payload.txt; delivery passed. The earlier absence check is historical.",
+            None,
+        ),
+    ]);
+    with_agent(
+        r#"
+approval='auto'
+[sandbox]
+mode='off'
+[compaction]
+enabled=false
+[verification]
+automatic_checks=false
+[[verification.commands]]
+name='delivery'
+command='test "$(cat payload.txt)" = ready'
+timeout_secs=5
+[verification.inputs.'delivery']
+paths=['payload.txt']
+environment=[]
+"#,
+        |agent| {
+            connect(agent, &server.url);
+            let report = agent
+                .turn("Check that payload.txt is absent, then create it with ready and verify delivery", &mut NullUi)
+                .unwrap();
+            let state = agent.session.control_state();
+            let summary = &state["turn_summary"];
+            assert_eq!(summary["checks_current"], false, "{summary}");
+            let checks = summary["recorded_checks"].as_array().unwrap();
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check["name"] == "delivery" && check["status"] == "passed"),
+                "{checks:?}; report: {report:?}"
+            );
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check["kind"] == "shell" && check["status"] == "passed"),
+                "{checks:?}"
+            );
+        },
+    );
+}
+
+#[test]
 fn unoffered_calls_do_not_implicitly_load_specialists_or_fail_the_session() {
     let server = serve(vec![
         response("", Some(("git", json!({"action":"status"})))),

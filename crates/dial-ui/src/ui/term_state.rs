@@ -1,7 +1,7 @@
 //! What Dial tells the hosting terminal about the session outside the drawn cells: dock attention
 //! while it waits (iTerm2), OSC 9;4 progress, `SetUserVar` values for status bars and badges, and
-//! the working directory (OSC 7). The tab's state circle lives in the title, see
-//! [`Activity::marker`]. Each paint writes only what changed; [`Signals`] the terminal does not
+//! the working directory (OSC 7). The tab's state label lives in the title, see
+//! [`Activity::label`]. Each paint writes only what changed; [`Signals`] the terminal does not
 //! support are never written, and [`SignalWriter::reset`] puts progress, attention and variables
 //! back when Dial leaves.
 use std::path::PathBuf;
@@ -10,6 +10,13 @@ use base64::Engine as _;
 
 use super::termcaps::Integration;
 
+/// What the user needs to respond to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    Approval,
+    Question,
+}
+
 /// What the session is doing, as the tab shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Activity {
@@ -17,48 +24,64 @@ pub enum Activity {
     Idle,
     /// A turn, compaction or a local-compute wait is running.
     Working,
-    /// An approval or question waits for the user (also a turn that ended asking for input).
-    Waiting,
+    /// A foreground test command is pending.
+    Testing,
+    /// A prompt waits for the user (also a turn that ended asking for input).
+    Waiting(Prompt),
     /// The last turn finished; cleared by the next key press or turn.
     Done,
+    /// The completed turn recorded file changes to review; not a verdict on its checks.
+    ReviewReady,
     /// The last turn failed, was blocked or is incomplete.
     Failed,
 }
 
 impl Activity {
-    /// The value of the `dialState` user variable.
+    /// The stable, coarse `dialState` value consumed by status bars.
     pub fn name(self) -> &'static str {
         match self {
             Activity::Idle => "idle",
-            Activity::Working => "working",
-            Activity::Waiting => "waiting",
-            Activity::Done => "done",
+            Activity::Working | Activity::Testing => "working",
+            Activity::Waiting(_) => "waiting",
+            Activity::Done | Activity::ReviewReady => "done",
             Activity::Failed => "failed",
         }
     }
 
-    /// The state a finished turn leaves behind; `Idle` for interrupted turns.
-    pub fn after_turn(outcome: crate::runtime::Phase) -> Self {
+    /// The state left by a turn, given its observed changed-file count.
+    pub fn after_turn(outcome: crate::runtime::Phase, changed_files: usize) -> Self {
         use crate::runtime::Phase;
         match outcome {
+            Phase::Completed if changed_files > 0 => Activity::ReviewReady,
             Phase::Completed => Activity::Done,
-            Phase::NeedsInput => Activity::Waiting,
+            Phase::NeedsInput => Activity::Waiting(Prompt::Question),
             Phase::Failed | Phase::Blocked | Phase::Incomplete => Activity::Failed,
             Phase::Running | Phase::Interrupted | Phase::Answered => Activity::Idle,
         }
     }
 
-    /// The circle that ends the terminal title (and so the tab) for this state, or `""` when
-    /// idle. Emoji circles carry their own color, so any terminal that shows titles shows it.
-    /// Waiting for you (blue) and failed (red) differ, so a tab asking for input never reads as
-    /// broken and a failure never reads as a question.
+    /// The rightmost text in the tab, also shown by terminals without emoji.
+    pub fn label(self) -> &'static str {
+        match self {
+            Activity::Idle => "",
+            Activity::Working => "Working",
+            Activity::Testing => "Testing",
+            Activity::Waiting(Prompt::Approval) => "Approve?",
+            Activity::Waiting(Prompt::Question) => "Question",
+            Activity::Done => "Done",
+            Activity::ReviewReady => "Review ready",
+            Activity::Failed => "Failed",
+        }
+    }
+
+    /// Optional color before the label in a Unicode title.
     pub fn marker(self) -> &'static str {
         match self {
             Activity::Idle => "",
-            Activity::Working => "\u{1F7E0}",
-            Activity::Waiting => "\u{1F535}",
+            Activity::Working | Activity::Testing => "\u{1F7E0}",
+            Activity::Waiting(_) => "\u{1F535}",
             Activity::Failed => "\u{1F534}",
-            Activity::Done => "\u{1F7E2}",
+            Activity::Done | Activity::ReviewReady => "\u{1F7E2}",
         }
     }
 }
@@ -152,7 +175,7 @@ impl SignalWriter {
     fn diff(&self, want: &Signals) -> String {
         let caps = self.caps;
         let mut out = String::new();
-        let waiting = |activity: Activity| activity == Activity::Waiting;
+        let waiting = |activity: Activity| matches!(activity, Activity::Waiting(_));
         if caps.attention && waiting(want.activity) != waiting(self.sent.activity) {
             out.push_str(&caps.wrap(&attention(waiting(want.activity))));
         }
@@ -198,10 +221,9 @@ impl SignalWriter {
     /// `want` with everything this terminal cannot show removed, values sanitized.
     fn supported(&self, want: &Signals) -> Signals {
         let caps = self.caps;
-        // The activity matters here only for attention, so `Waiting` is all it keeps; the tab's
-        // circle is drawn in the title (see [`Activity::marker`]), not written as a signal.
-        let activity = if caps.attention && want.activity == Activity::Waiting {
-            want.activity
+        // The terminal attention protocol has one bit, not different prompt kinds.
+        let activity = if caps.attention && matches!(want.activity, Activity::Waiting(_)) {
+            Activity::Waiting(Prompt::Question)
         } else {
             Activity::Idle
         };

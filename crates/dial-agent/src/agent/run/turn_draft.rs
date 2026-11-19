@@ -173,15 +173,29 @@ impl Agent<'_> {
             typed,
             self.config.experimental.turn_drafter_diagrams,
         );
-        let drafted = self
-            .role_chat(
-                main,
-                TURN_DRAFTER,
-                llm::usage::Purpose::Auxiliary,
-                &chat,
-                ui,
-            )
-            .context("turn drafter failed; your message was not sent to the main model")?;
+        let drafted = match self.role_chat(
+            main,
+            TURN_DRAFTER,
+            llm::usage::Purpose::Auxiliary,
+            &chat,
+            ui,
+        ) {
+            Ok(text) => text,
+            Err(error)
+                if self.config.model_roles.contains_key(TURN_DRAFTER)
+                    && error.downcast_ref::<llm::Interrupted>().is_none() =>
+            {
+                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Draft,
+                    format!("Turn drafter role failed ({error:#}); sending your message as typed."),
+                ));
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("turn drafter failed; your message was not sent to the main model");
+            }
+        };
         let drafted = drafted.trim();
         ensure!(
             !drafted.is_empty(),

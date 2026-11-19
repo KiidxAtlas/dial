@@ -26,6 +26,13 @@ __dial_missing_program() {
         builtin printf '[missing program: %s; available alternative in this shell PATH: %s; compatibility not checked]\n' "$1" "$candidate" >&2
     else
         builtin printf '[missing program: %s; checked alternative: %s; not available in this shell PATH]\n' "$1" "$candidate" >&2
+        case "$1" in
+            python|python3)
+                resolved=$(builtin type -P perl 2>/dev/null) || resolved=''
+                if [ -f "$resolved" ] && [ -x "$resolved" ]; then
+                    builtin printf '[available in this shell PATH: perl; not a Python interpreter]\n' >&2
+                fi ;;
+        esac
     fi
     return 0
 }

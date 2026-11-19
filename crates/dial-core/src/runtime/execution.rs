@@ -24,6 +24,10 @@ pub struct Execution {
     /// Internal accounting receipt. JSON payloads and restored sessions cannot manufacture it.
     #[serde(skip)]
     pub mutation_settled: bool,
+    /// The controller refused an unchanged failed call before dispatch. Never restored from
+    /// JSON, diagnostic prose, or tool payloads; a permission refusal cannot manufacture it.
+    #[serde(skip)]
+    pub retry_barrier: bool,
     /// A successful native eval reset repairs only the named namespace's dependencies.
     #[serde(skip)]
     pub namespace_reset: Option<EvalNamespace>,
@@ -275,16 +279,15 @@ impl Recovery {
         if status == ToolStatus::Ok && effects != Effects::Unknown {
             return None;
         }
-        let (retry, next) = if effects == Effects::Unknown {
-            (Retry::AfterInspection, NextAction::InspectState)
-        } else {
-            match status {
-                ToolStatus::Blocked => (Retry::Withheld, NextAction::RespectBoundary),
-                ToolStatus::Aborted => (Retry::OnlyByDirection, NextAction::FollowDirection),
-                ToolStatus::Timeout => (Retry::AfterInspection, NextAction::InspectProcess),
-                ToolStatus::Skipped => (Retry::AfterCorrection, NextAction::ResolvePrerequisite),
-                ToolStatus::Ok | ToolStatus::Error => (Retry::AfterCorrection, NextAction::Correct),
-            }
+        // Inspection cannot grant permission or undo a user's cancellation. Preserve those
+        // stricter boundaries while retaining uncertain effects in the recovery record.
+        let (retry, next) = match status {
+            ToolStatus::Blocked => (Retry::Withheld, NextAction::RespectBoundary),
+            ToolStatus::Aborted => (Retry::OnlyByDirection, NextAction::FollowDirection),
+            _ if effects == Effects::Unknown => (Retry::AfterInspection, NextAction::InspectState),
+            ToolStatus::Timeout => (Retry::AfterInspection, NextAction::InspectProcess),
+            ToolStatus::Skipped => (Retry::AfterCorrection, NextAction::ResolvePrerequisite),
+            ToolStatus::Ok | ToolStatus::Error => (Retry::AfterCorrection, NextAction::Correct),
         };
         Some(Self {
             status,

@@ -164,6 +164,8 @@ pub struct AgentMetrics {
 struct StepChecks {
     /// Actual non-bookkeeping tool attempts in this user turn, including failed investigations.
     observations: u64,
+    /// At least one tool settled with uncertain effects; never inferred from diagnostic prose.
+    effects_unknown: bool,
     /// Peer/monitor callbacks carry observations from their existing task, not a fresh work request.
     autonomous_continuation: bool,
     /// Slow check commands and the last observed native-edit count; hints never authorize reuse.
@@ -197,9 +199,15 @@ struct StepChecks {
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
     evidence: verify::evidence::Ledger,
+    /// Artifact-local Eval observations, kept separate from command and requirement evidence.
+    eval_checks: verify::eval_checks::History,
+    /// At most one local advisory awaiting a reply; never consulted by verification gates.
+    repair_brief: Option<verify::checks::RepairBrief>,
     /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
     /// the completion gate when the model verifies through `bash` rather than `check`.
     shell_check_passed: Option<verify::evidence::Revision>,
+    /// A foreground validation attempt exited 127. Never itself evidence of a code defect.
+    validation_launch_gap: bool,
     /// `bash` calls marked `check` that ran to an exit this turn, as `(command, passed, revision)`,
     /// so the turn report lists them beside focused checks.
     shell_check_runs: Vec<(String, bool, verify::evidence::Revision)>,

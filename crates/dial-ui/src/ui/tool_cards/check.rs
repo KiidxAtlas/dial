@@ -37,8 +37,56 @@ pub(super) enum Kind {
     Build,
 }
 
-/// Whether a shell command runs tests or a build, from its words.
+/// Recognize a direct test invocation, not a command that quotes, prints or searches for one.
+/// Ambiguous shell programs stay ordinary work; this does not establish that a test passed.
+pub fn is_test_command(command: &str) -> bool {
+    let command = command.trim();
+    if command.contains(['\n', ';', '|', '&', '`', '$']) {
+        return false;
+    }
+    let mut words = command.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    if words.clone().any(|arg| {
+        matches!(
+            arg,
+            "--no-run" | "--collect-only" | "--co" | "--list" | "--help" | "-h" | "--version"
+        )
+    }) {
+        return false;
+    }
+    test_runner(program, words)
+}
+
+fn test_runner<'a>(program: &str, mut words: impl Iterator<Item = &'a str>) -> bool {
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let sub = words.next();
+    match program {
+        "pytest" | "jest" | "vitest" | "ctest" => true,
+        "cargo" => sub == Some("test") || (sub == Some("nextest") && words.next() == Some("run")),
+        "go" | "bun" | "deno" | "swift" | "dotnet" | "mvn" | "gradle" => sub == Some("test"),
+        "npm" | "yarn" | "pnpm" => {
+            sub == Some("test") || (sub == Some("run") && words.next() == Some("test"))
+        }
+        "make" => sub.is_some_and(|target| target == "test" || target.starts_with("test-")),
+        "python" | "python3" => {
+            sub == Some("-m") && matches!(words.next(), Some("pytest" | "unittest"))
+        }
+        "npx" => matches!(sub, Some("jest" | "vitest")),
+        _ => false,
+    }
+}
+
+/// A settled card has runner output to corroborate command words, so also recognizes runners
+/// inside compound commands (e.g. `cd backend && cargo test`).
 pub(super) fn kind(command: &str) -> Option<Kind> {
+    let mut parts = command.split_ascii_whitespace();
+    while let Some(program) = parts.next() {
+        if test_runner(program, parts.clone()) {
+            return Some(Kind::Test);
+        }
+    }
     let words: Vec<&str> = command.split_whitespace().collect();
     let has = |pair: [&str; 2]| words.windows(2).any(|w| w == pair);
     let any = |names: &[&str]| {
@@ -46,20 +94,6 @@ pub(super) fn kind(command: &str) -> Option<Kind> {
             .iter()
             .any(|w| names.contains(&w.rsplit('/').next().unwrap_or(w)))
     };
-    if has(["cargo", "test"])
-        || has(["cargo", "nextest"])
-        || has(["go", "test"])
-        || has(["npm", "test"])
-        || has(["yarn", "test"])
-        || has(["pnpm", "test"])
-        || has(["make", "test"])
-        || words
-            .iter()
-            .any(|w| w.starts_with("test-") && words.contains(&"make"))
-        || any(&["pytest", "jest", "vitest"])
-    {
-        return Some(Kind::Test);
-    }
     let cargo_build = ["build", "check", "clippy"]
         .iter()
         .any(|sub| has(["cargo", sub]));
@@ -152,7 +186,7 @@ pub(super) fn parse(output: &str) -> Report {
 }
 
 /// The command text of a `bash` call, one line.
-pub(in crate::ui) fn command(t: &Tool) -> Option<String> {
+fn command(t: &Tool) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(&t.input).ok()?;
     args["command"].as_str().map(text::one_line)
 }
@@ -196,6 +230,8 @@ fn failure_reason(output: &str, test: &str) -> Option<(String, Option<String>)> 
 /// A settled test or build run reduced to its verdict, as the turn recap shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ui) struct Verdict {
+    /// The observed command, used to associate output counts with the right recorded check.
+    pub command: String,
     pub ok: bool,
     /// `tests` or `build`.
     pub what: &'static str,
@@ -209,7 +245,8 @@ pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
     if t.name != "bash" || !matches!(t.state, ToolState::Completed | ToolState::Failed) {
         return None;
     }
-    let kind = kind(&command(t)?)?;
+    let command = command(t)?;
+    let kind = kind(&command)?;
     let report = parse(&t.output);
     let failed = t.state == ToolState::Failed;
     let summary = if report.failed > 0 {
@@ -226,6 +263,7 @@ pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
         return None;
     };
     Some(Verdict {
+        command,
         ok: !failed && report.failed == 0 && report.errors.is_empty(),
         what: match kind {
             Kind::Test => "tests",
@@ -339,42 +377,54 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
     }
     let log_lines = super::split_trailer(&t.output).lines().count();
 
-    if !attention.is_empty() && w >= CARD_MIN {
-        return Some(attention_card(
-            &AttentionHead {
-                glyph: (glyph, glyph_style),
-                failed,
-                verb: (verb, verb_style),
-                command: &command,
-                facts: (facts, facts_style),
-            },
-            attention,
-            log_lines,
-            w,
-            ctx,
-        ));
-    }
+    let head = AttentionHead {
+        glyph: (glyph, glyph_style),
+        failed,
+        verb: (verb, verb_style),
+        command: &command,
+        facts: (facts, facts_style),
+    };
+    Some(if !attention.is_empty() && w >= CARD_MIN {
+        attention_card(&head, attention, log_lines, w, ctx)
+    } else {
+        compact_rows(head, attention, log_lines, w, ctx)
+    })
+}
 
+/// The summary row (mark, verb, command, counts) with any attention lines indented under it and
+/// the hidden log hint after them: a clean pass, or a run needing attention on a narrow terminal.
+fn compact_rows(
+    head: AttentionHead<'_>,
+    attention: Vec<(String, Tok)>,
+    log_lines: usize,
+    w: usize,
+    ctx: &TranscriptCtx,
+) -> Rows {
+    let theme = ctx.theme;
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let (glyph, glyph_style) = head.glyph;
+    let (verb, verb_style) = head.verb;
+    let (facts, facts_style) = head.facts;
     let lead = gutter_span(glyph, glyph_style);
     let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
-    let want = text::width(&command).min(super::TARGET_MIN);
+    let want = text::width(head.command).min(super::TARGET_MIN);
     let (facts_text, room) = fit_facts(facts, w, lead_w + VERB_W + 1, want, &sep);
-    let mut head = lead;
-    head.push(Span::styled(format!("{verb:<VERB_W$}"), verb_style));
-    head.push(Span::raw(" "));
-    head.push(Span::styled(
-        text::ellipsize(&command, room.max(1), theme.ascii()),
+    let mut row = lead;
+    row.push(Span::styled(format!("{verb:<VERB_W$}"), verb_style));
+    row.push(Span::raw(" "));
+    row.push(Span::styled(
+        text::ellipsize(head.command, room.max(1), theme.ascii()),
         theme.fg(Tok::Muted),
     ));
     if !facts_text.is_empty() {
-        let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = row.iter().map(|s| text::width(&s.content)).sum();
         let right_w = text::width(&facts_text);
-        head.push(Span::raw(
+        row.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),
         ));
-        head.push(Span::styled(facts_text, facts_style));
+        row.push(Span::styled(facts_text, facts_style));
     }
-    let mut rows = vec![fitted(head, w, theme)];
+    let mut rows = vec![fitted(row, w, theme)];
     let indent = " ".repeat(GUTTER);
     let room = w.saturating_sub(GUTTER).max(1);
     for (line, tok) in &attention {
@@ -397,7 +447,159 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
             theme,
         ));
     }
-    Some(rows)
+    rows
+}
+
+/// `CheckStatus` names as `verify` writes them at the head of each check's section.
+const VERIFY_STATUSES: &[&str] = &[
+    "passed",
+    "code_failed",
+    "failed_unknown_cause",
+    "environment_unavailable",
+    "permission_denied",
+    "cancelled",
+    "timed_out",
+    "unverified",
+];
+
+/// The check a `verify` section line opens (`code_failed: cargo check`), if it opens one.
+fn verify_section(line: &str) -> Option<&str> {
+    let (status, name) = line.split_once(": ")?;
+    VERIFY_STATUSES.contains(&status).then_some(name)
+}
+
+/// The first thing to fix in one check's section of a `verify` result: a failing test with its
+/// reason, else the first error with its location.
+fn verify_reason(output: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.iter().position(|l| verify_section(l) == Some(name))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| verify_section(l).is_some())
+        .map_or(lines.len(), |i| start + 1 + i);
+    let block = lines[start + 1..end].join("\n");
+    let report = parse(&block);
+    if let Some(test) = report.failing.first() {
+        return Some(match failure_reason(&block, test) {
+            Some((reason, Some(location))) => format!("{test}: {reason} · {location}"),
+            Some((reason, None)) => format!("{test}: {reason}"),
+            None => test.clone(),
+        });
+    }
+    let (error, location) = report.errors.first()?;
+    Some(match location {
+        Some(location) => format!("{} · {location}", text::one_line(error)),
+        None => text::one_line(error),
+    })
+}
+
+/// The verify card: every check passed reads as one row with its counts; otherwise a card lists
+/// the checks that did not pass with the first thing to fix in each. Code failures are red;
+/// environment, permission and timeout results are amber, since they are not code defects.
+/// Built from the engine's `status · name` rows, so a call without them keeps the ordinary card.
+pub(super) fn verify_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> {
+    if ctx.tools_expanded
+        || t.name != "verify"
+        || !matches!(t.state, ToolState::Completed | ToolState::Failed)
+    {
+        return None;
+    }
+    let checks: Vec<(&str, &str)> = t
+        .presentation
+        .preview
+        .as_deref()?
+        .lines()
+        .filter_map(|line| line.split_once(" · "))
+        .collect();
+    if checks.is_empty() {
+        return None;
+    }
+    let theme = ctx.theme;
+    let passed = |status: &str| status == "passed" || status.starts_with("passed,");
+    let open: Vec<&(&str, &str)> = checks.iter().filter(|(s, _)| !passed(s)).collect();
+    let code_failure = open.iter().any(|(s, _)| s.starts_with("failed"));
+    let mut facts: Vec<Fact> = t
+        .presentation
+        .facts
+        .iter()
+        .map(|text| Fact {
+            text: text.clone(),
+            drop: 0,
+        })
+        .collect();
+    if let Some(secs) = t.elapsed.filter(|s| *s >= 0.05) {
+        facts.push(Fact {
+            text: text::duration_label_precise(secs),
+            drop: 2,
+        });
+    }
+    let (glyph, glyph_style, tok) = if open.is_empty() {
+        (
+            theme.sym(Sym::Check).to_owned(),
+            theme.fg(Tok::Success),
+            Tok::Dim,
+        )
+    } else if code_failure {
+        let (glyph, style) = phase_glyph(ToolState::Failed, ctx);
+        (glyph, style, Tok::Error)
+    } else {
+        (
+            theme.sym(Sym::Warn).to_owned(),
+            theme.fg(Tok::Warning),
+            Tok::Warning,
+        )
+    };
+    let verb_style = theme
+        .fg(if code_failure {
+            Tok::Error
+        } else {
+            Tok::ToolTitle
+        })
+        .add_modifier(Modifier::BOLD);
+    let cross = theme.sym(Sym::Cross2);
+    let mut attention: Vec<(String, Tok)> = Vec::new();
+    for (i, (status, name)) in open.iter().take(LISTED).enumerate() {
+        let mark = if status.starts_with("failed") {
+            cross
+        } else {
+            theme.sym(Sym::Warn)
+        };
+        let line_tok = if status.starts_with("failed") {
+            Tok::Error
+        } else {
+            Tok::Warning
+        };
+        attention.push((
+            format!("{mark} {name} {} {status}", theme.sym(Sym::Dot)),
+            line_tok,
+        ));
+        if i < REASONS
+            && let Some(reason) = verify_reason(&t.output, name)
+        {
+            attention.push((format!("  {reason}"), Tok::Muted));
+        }
+    }
+    if open.len() > LISTED {
+        attention.push((format!("+{} more", open.len() - LISTED), Tok::Dim));
+    }
+    let log_lines = if open.is_empty() {
+        0
+    } else {
+        super::split_trailer(&t.output).lines().count()
+    };
+    let target = text::one_line(&t.presentation.target);
+    let head = AttentionHead {
+        glyph: (glyph, glyph_style),
+        failed: code_failure,
+        verb: ("Verify", verb_style),
+        command: &target,
+        facts: (facts, theme.fg(tok)),
+    };
+    Some(if !attention.is_empty() && w >= CARD_MIN {
+        attention_card(&head, attention, log_lines, w, ctx)
+    } else {
+        compact_rows(head, attention, log_lines, w, ctx)
+    })
 }
 
 /// What a check's header carries: its mark, verb, command and counts with their styles.

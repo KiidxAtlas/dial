@@ -51,15 +51,18 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   same-size, same-inode rewrites with restored timestamps invalidate old message text. Appends
   are parsed incrementally, but verification still reads prior indexed bytes; its cost grows with
   history size. No search-latency improvement is asserted.
-  Results retain their text transcript summary and can be inspected with `/search results`.
+  Use `/search` (or `/search results`) to inspect the latest results. Closing and reopening the
+  panel reuses the loaded matches without rerunning the query, whether idle or during a turn.
   The first window loads up to 50 ranked matches; the count says **loaded**, not a global total.
   When more exist, **m** (or `/search more`) expands the window by 50 through the same background
-  worker; reopen `/search results` when ready. At 1,000 loaded matches, refine `/search <query>`
+  worker; the previous page remains available while loading or if expansion fails. Reopen
+  `/search` when ready. Asking for more while loading or after the last page does not rerun the
+  search. At 1,000 loaded matches, refine `/search <query>`
   instead. Each expansion reruns the current index query, so newly recorded messages may change
   the ranking. **/** filters only the loaded window, not the full history.
   Use **Up/Down** to select a hit, **PageUp/PageDown** to read the full bounded matching message,
-  and **Enter** to open its conversation through normal safe resume. Session titles are resolved
-  in the search worker, never while opening or drawing the results panel. The preview identifies the
+  and **Enter** to open its conversation through normal safe resume. Terminal and native RPC
+  search resolve display titles together for each page, off the UI thread. The preview identifies the
   immutable matching entry; inspecting it never rewinds or appends branch markers, including for
   matches on abandoned branches. **Esc** closes the panel without touching the composer; **F1** or
   **?** shows its keys.
@@ -69,6 +72,8 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   turn finishes, with a visible notice; loading more matches still runs in the background without
   interrupting work.
   The first index query after upgrading rebuilds the advisory full-text cache to retain entry IDs.
+- On Unix, closing the recovery writer releases its session lock even if a starting child process
+  briefly holds a copy of the file descriptor. A still-active writer continues to exclude others.
 - `/draft` (also `/draft preview`, `/draft restore` or `/draft replace`) opens a read-only,
   scrollable review of this session's oldest saved unsent draft and queue beside current input.
   Queue labels distinguish automatic steering, follow-ups, steer-now and independent requests;

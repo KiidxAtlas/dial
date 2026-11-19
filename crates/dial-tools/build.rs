@@ -1,31 +1,31 @@
-//! Embeds the release-bundled Node.js runtime when `DIAL_BUNDLED_NODE_DIR` names a prepared
-//! directory. The directory holds `node.gz` (one gzip-compressed executable) and `metadata.txt`
-//! with four lines: Rust target triple, Node version (`x.y.z`), lowercase SHA-256 of the
-//! uncompressed executable, and its uncompressed byte count.
-//!
-//! Only std is used here. Digest and length of the decompressed program are checked by the
-//! preparer and again at runtime before anything executes, so this script validates shape and
-//! target only. Without the variable the generated constants are absent and source builds keep
-//! the PATH fallback.
+//! Optional, offline embedding of release-prepared Node and CPython payloads. Both use a
+//! normalized gzip payload and four-line metadata (target, version, raw SHA-256, raw size).
+//! Node verifies its executable on extraction and reuse. CPython's tar stream is verified here;
+//! the runtime extracts a fresh private tree from these exact bytes for each interpreter.
 
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-const ENV: &str = "DIAL_BUNDLED_NODE_DIR";
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed={ENV}");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let generated = match env::var_os(ENV).filter(|value| !value.is_empty()) {
-        None => absent(),
-        Some(dir) => match payload(Path::new(&dir)) {
-            Ok(text) => text,
-            Err(error) => panic!("{ENV}: {error}"),
-        },
-    };
-    fs::write(out_dir.join("bundled_node.rs"), generated).expect("write bundled_node.rs");
+    for (variable, name, filename) in [
+        ("DIAL_BUNDLED_NODE_DIR", "node", "node.gz"),
+        ("DIAL_BUNDLED_PYTHON_DIR", "python", "python.tar.gz"),
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+        let generated = match env::var_os(variable).filter(|v| !v.is_empty()) {
+            None => absent(),
+            Some(dir) => payload(Path::new(&dir), filename, &out_dir)
+                .unwrap_or_else(|e| panic!("{variable}: {e}")),
+        };
+        fs::write(out_dir.join(format!("bundled_{name}.rs")), generated)
+            .expect("write bundle metadata");
+    }
 }
 
 fn absent() -> String {
@@ -36,11 +36,11 @@ fn absent() -> String {
         .to_owned()
 }
 
-fn payload(dir: &Path) -> Result<String, String> {
+fn payload(dir: &Path, filename: &str, out_dir: &Path) -> Result<String, String> {
     let target = env::var("TARGET").map_err(|_| "cargo did not set TARGET".to_owned())?;
     let dir = fs::canonicalize(dir).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
     let metadata_path = dir.join("metadata.txt");
-    let gz_path = dir.join("node.gz");
+    let gz_path = dir.join(filename);
     println!("cargo:rerun-if-changed={}", metadata_path.display());
     println!("cargo:rerun-if-changed={}", gz_path.display());
 
@@ -79,11 +79,25 @@ fn payload(dir: &Path) -> Result<String, String> {
 
     let gz = fs::read(&gz_path).map_err(|e| format!("cannot read {}: {e}", gz_path.display()))?;
     if gz.len() < 2 || gz[..2] != [0x1f, 0x8b] {
-        return Err("node.gz is not gzip data".to_owned());
+        return Err(format!("{filename} is not gzip data"));
     }
     if gz.len() as u64 > MAX_BYTES {
-        return Err(format!("node.gz exceeds {MAX_BYTES} bytes"));
+        return Err(format!("{filename} exceeds {MAX_BYTES} bytes"));
     }
+    let gz_path = if filename == "python.tar.gz" {
+        let mut raw = flate2::read::GzDecoder::new(gz.as_slice()).take(size + 1);
+        let mut digest = Sha256::new();
+        let n = io::copy(&mut raw, &mut digest).map_err(|e| format!("decoding {filename}: {e}"))?;
+        if n != size || format!("{:x}", digest.finalize()) != *sha256 {
+            return Err(format!("{filename} raw digest or length mismatch"));
+        }
+        // Include the bytes actually verified, not an input that could change before rustc reads it.
+        let dest = out_dir.join(filename);
+        fs::write(&dest, &gz).map_err(|e| format!("staging {filename}: {e}"))?;
+        dest
+    } else {
+        gz_path
+    };
 
     Ok(format!(
         "pub const VERSION: Option<&str> = Some({version:?});\n\

@@ -223,7 +223,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # untrusted "acceptance goal" prefix. Preserve the first matching anchor.
         # Whitespace after a marker is skipped by hand so no unbounded regex
         # repetition is ever retried against untrusted text.
-        token = re.compile(r"([A-Z]+-\d+)", re.IGNORECASE)
         offset = 0
         for line in transcript.split("\n"):
             anchor = re.search("acceptance goal", line, re.IGNORECASE)
@@ -236,13 +235,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 start = position = offset + marker.end()
                 while position < len(transcript) and transcript[position].isspace():
                     position += 1
-                match = token.match(transcript, position) if position > start else None
-                if match is None:
+                token_start = position
+                while position < len(transcript) and transcript[position].isascii() and transcript[position].isalpha():
+                    position += 1
+                if token_start == start or position == token_start or transcript[position:position + 1] != "-":
                     continue
+                position += 1
+                digits = position
+                while position < len(transcript) and transcript[position].isdecimal():
+                    position += 1
+                if position == digits:
+                    continue
+                token = transcript[token_start:position]
                 if not is_actual or acceptance < 0 or marker.start() < acceptance:
-                    return match.group(1)
+                    return token
                 if actual is None:
-                    actual = match.group(1)
+                    actual = token
             if actual is not None:
                 return actual
             offset += len(line) + 1
@@ -290,7 +298,12 @@ def main():
             manifest.write_text(suite_source)
             home = root / "home"
             home.mkdir(mode=0o700)
-            config = 'model="scripted"\nprovider="openai"\ncontext_window=32768\n[endpoint]\nbase_url="http://127.0.0.1:' + str(server.server_port) + '/v1"\nallow_insecure=true\n[improve]\nenabled=false\n[harness]\nmax_steps=20\nmax_tokens=4096\n'
+            config = (
+                'model="scripted"\nprovider="openai"\ncontext_window=32768\n[endpoint]\n'
+                f'base_url="http://127.0.0.1:{server.server_port}/v1"\n'
+                'allow_insecure=true\nprotocol="chat-completions"\n'
+                '[improve]\nenabled=false\n[harness]\nmax_steps=20\nmax_tokens=4096\n'
+            )
             for name, model, edit in [("baseline", "scripted-base", "replace"), ("without-integrations", "scripted-ablated", "replace"), ("hashline", "scripted-hashline", "hashline")]:
                 config += '[model_profiles.' + name + ']\nprovider="openai"\nmodel="' + model + '"\nmax_tokens=8192\nedit_mode="' + edit + '"\n[model_profiles.' + name + '.capabilities]\ntemperature=true\ntools=true\noutput_limit="max-tokens"\n'
             (home / "config.toml").write_text(config)

@@ -82,8 +82,58 @@ fn multi_path_reads_conflict_with_each_source_and_searches_with_the_whole_scope(
         );
         assert!(!search.conflicts(&get("write", json!({"path":"a"}))));
     }
+    // An absolute filter without `path` may search an attached root rather than the primary.
+    let other = tempfile::tempdir().unwrap();
+    let attached = other.path().canonicalize().unwrap();
+    let expanded = ws
+        .clone()
+        .with_additional_roots(std::slice::from_ref(&attached))
+        .unwrap();
+    let resolve_attached =
+        |name, args| resolve(&expanded, EditMode::default(), &registry, name, &args);
+    for (name, args) in [
+        ("glob", json!({"pattern": attached.join("*.txt")})),
+        (
+            "grep",
+            json!({"pattern":"needle", "glob": attached.join("*.txt")}),
+        ),
+    ] {
+        let search = resolve_attached(name, args);
+        if cfg!(windows) {
+            // The Windows planner deliberately leaves non-primary paths behind a serial barrier.
+            assert!(search.is_none());
+        } else {
+            let search = search.unwrap();
+            assert!(search.conflicts(
+                &resolve_attached("write", json!({"path": attached.join("new.txt")})).unwrap()
+            ));
+            assert!(!search.conflicts(&get("write", json!({"path":"new.txt"}))));
+        }
+    }
     let all = get("grep", json!({"pattern":"not present"}));
     assert!(all.conflicts(&get("write", json!({"path":"new"}))));
+    for selector in [
+        "a:1-3",
+        "a:-1",
+        "a:raw:1",
+        "a:sym=foo",
+        "a:outline",
+        "a:bytes=0+1",
+    ] {
+        let projected = get("read", json!({"paths":[selector, "b"]}));
+        assert!(
+            projected.conflicts(&get("write", json!({"path":"a"}))),
+            "{selector}"
+        );
+        assert!(
+            projected.conflicts(&get("write", json!({"path":"b"}))),
+            "{selector}"
+        );
+        assert!(
+            !projected.conflicts(&get("write", json!({"path":"src/input"}))),
+            "{selector}"
+        );
+    }
 }
 
 #[test]
@@ -94,7 +144,17 @@ fn native_contracts_refuse_unknown_effects_aliases_and_nonliteral_selectors() {
     let registry = Registry::new();
     for (name, args) in [
         ("bash", json!({"command":"cat a"})),
-        ("read", json!({"path":"a:1-3"})),
+        ("read", json!({"path":"a:3-1"})),
+        ("read", json!({"path":"a:bytes=nonsense"})),
+        ("read", json!({"path":"a:1", "format":"text"})),
+        ("read", json!({"paths":["a"],"path":"a"})),
+        ("write", json!({"path":"database-SHM"})),
+        ("write", json!({"path":"database-journal"})),
+        ("write", json!({"path":"database-wal"})),
+        ("read", json!({"path":"a:table"})),
+        ("read", json!({"paths":["a:1", "file://localhost/a:1"]})),
+        ("read", json!({"path":".git/config:1"})),
+        ("read", json!({"path":"@f7:1"})),
         ("write", json!({"path":"../other"})),
         ("write", json!({"path":"new-parent/file"})),
     ] {
@@ -116,6 +176,19 @@ fn native_contracts_refuse_unknown_effects_aliases_and_nonliteral_selectors() {
             )
             .is_none()
         );
+        std::fs::write(root.path().join("a:1"), "literal wins").unwrap();
+        assert!(
+            resolve(
+                &ws,
+                EditMode::default(),
+                &registry,
+                "read",
+                &json!({"path":"a:1"})
+            )
+            .is_none()
+        );
+    }
+    {
         std::fs::hard_link(root.path().join("a"), root.path().join("hard")).unwrap();
         assert!(
             resolve(
@@ -127,6 +200,51 @@ fn native_contracts_refuse_unknown_effects_aliases_and_nonliteral_selectors() {
             )
             .is_none()
         );
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn case_variants_conflict_without_granting_alias_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let registry = Registry::new();
+    let write = |path: &str| {
+        resolve(
+            &ws,
+            EditMode::default(),
+            &registry,
+            "write",
+            &json!({"path":path}),
+        )
+    };
+    let first = write("new.txt").unwrap();
+    assert!(first.conflicts(&write("NEW.TXT").unwrap()));
+    assert!(!first.permits(&[ws.root().join("NEW.TXT")], false, false));
+    std::fs::write(ws.root().join("ReadMe"), "existing").unwrap();
+    let existing = write("ReadMe").unwrap();
+    assert!(write("README").is_none_or(|alias| existing.conflicts(&alias)));
+    assert!(existing.touches(ws.root(), &["README".into()]));
+    #[cfg(target_os = "macos")]
+    assert!(
+        write("café")
+            .unwrap()
+            .conflicts(&write("cafe\u{301}").unwrap())
+    );
+    #[cfg(windows)]
+    {
+        assert!(existing.touches(ws.root(), &["SHORT~1".into()]));
+        for alias in [
+            ".Git/config",
+            "NUL.txt",
+            "NAME~1",
+            "new.txt.",
+            "new.txt ",
+            "file:stream",
+            "résumé.txt",
+        ] {
+            assert!(write(alias).is_none(), "{alias}");
+        }
     }
 }
 

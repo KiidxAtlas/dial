@@ -106,17 +106,11 @@ pub(super) fn search(layout: &Layout, params: &Value) -> Result<Value> {
         .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
     let has_more = hits.len() > limit;
     hits.truncate(limit);
-    let mut titles = std::collections::HashMap::new();
+    let titles = Session::search_titles(layout, &hits);
     let hits: Vec<Value> = hits
         .into_iter()
         .map(|hit| {
-            let title = titles.entry(hit.session_id.clone()).or_insert_with(|| {
-                Session::find_prefix(layout, &hit.session_id)
-                    .ok()
-                    .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
-                    .map(|s| s.title)
-                    .unwrap_or_default()
-            });
+            let title = titles.get(&hit.session_id).map_or("", String::as_str);
             json!({"session_id": hit.session_id, "entry_id": hit.entry_id,
             "role": hit.role, "snippet": hit.snippet, "preview": hit.preview,
             "when": hit.when, "title": title})

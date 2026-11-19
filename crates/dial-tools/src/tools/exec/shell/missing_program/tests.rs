@@ -44,6 +44,29 @@ fn missing_python_reports_only_an_executable_in_the_current_shell_path() {
 }
 
 #[test]
+fn missing_python_reports_perl_without_running_it_or_claiming_equivalence() {
+    let (dir, ws) = workspace();
+    let ws = ws
+        .without_sandbox()
+        .with_shell_backend(ShellBackend::System);
+    let perl = dir.path().join("perl");
+    std::fs::write(&perl, "#!/bin/sh\nprintf ran > marker\n").unwrap();
+    std::fs::set_permissions(&perl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = shell_command(&ws, "export PATH=.; python3 --version", ws.root())
+        .unwrap()
+        .env_remove("BASH_ENV")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127));
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        text.contains("available in this shell PATH: perl; not a Python interpreter"),
+        "{text}"
+    );
+    assert!(!dir.path().join("marker").exists());
+}
+
+#[test]
 fn no_alternative_success_and_remote_diagnostics_do_not_invent_availability() {
     let (_dir, ws) = workspace();
     let ws = ws

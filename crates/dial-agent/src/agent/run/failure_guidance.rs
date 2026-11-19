@@ -196,11 +196,10 @@ pub(in crate::agent) fn report(
     // An ordinary nonzero shell exit (missing program, failed build step) whose process ran to
     // completion is routine: the exit code and output above already say what happened. The full
     // recovery block cost about 900 bytes of history on every such failure in benchmark runs, so
-    // the first one gets a compact line; repeats, uncertain effects, commits, partial capture and
-    // other kinds keep the full report.
+    // each one gets a compact line, with the streak count on repeats. Uncertain effects, commits,
+    // partial capture and other kinds keep the full report.
     let routine_exit = kind == "tool_failure"
         && call.name == "bash"
-        && consecutive == 1
         && output.execution.effects != Effects::Unknown
         && recovery.committed_paths == 0
         && recovery.retry == Retry::AfterCorrection
@@ -208,9 +207,16 @@ pub(in crate::agent) fn report(
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
     if routine_exit {
+        let streak = if consecutive > 1 {
+            format!("Failed {consecutive} times in a row. ")
+        } else {
+            String::new()
+        };
         return recovery_notice(
             kind,
-            "Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state.",
+            &format!(
+                "{streak}Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state."
+            ),
         );
     }
     // Any other first failure with known effects, no committed work, complete capture and a plain
@@ -298,14 +304,11 @@ pub(in crate::agent) const CALL_CONTRACT: (&str, &str) = ("call_contract", polic
 /// correctable repeat, never a permission boundary (worker refusals carry status Blocked).
 pub(in crate::agent) const RETRY_BARRIER: (&str, &str) = ("retry_barrier", policy::RETRY_BARRIER);
 
-/// A controller-authored retry-barrier refusal, recognized by its fixed lead.
+/// A controller-authored retry-barrier refusal. Printed leads are diagnostic data, not authority.
 pub(in crate::agent) fn is_retry_barrier(output: &ToolOutput) -> bool {
-    output.is_error
-        && output
-            .text
-            .strip_prefix("invalid tool call: ")
-            .unwrap_or(&output.text)
-            .starts_with(crate::agent::run::engine::RETRY_BARRIER_LEAD)
+    output.execution.retry_barrier
+        && output.execution.effects == Effects::None
+        && ToolStatus::from_output(output) == ToolStatus::Blocked
 }
 
 pub(in crate::agent) fn classify(
@@ -446,12 +449,28 @@ pub(in crate::agent) fn shell_tool_recovery(
     Some(policy::shell_tool_mistake(&name, &next))
 }
 
+/// Only suggest a cell already on this surface. Resolving its launcher does not run it.
+pub(in crate::agent) fn offered_eval_language(
+    capability: Option<Capability>,
+    workspace: &std::path::Path,
+    config: &crate::config::types::Config,
+) -> Option<&'static str> {
+    if capability != Some(Capability::Offered) {
+        return None;
+    }
+    let languages = crate::tools::exec::eval::installed_languages(workspace, config);
+    ["py", "js"]
+        .into_iter()
+        .find(|lang| languages.contains(lang))
+}
+
 /// A completed shell command whose program is missing (exit 127 "command not found").
 /// Advice only: reuse recorded availability or batch one same-environment probe; result text
 /// remains diagnostic data and grants no installation or permission.
 pub(in crate::agent) fn missing_program_recovery(
     call: &ToolCall,
     output: &ToolOutput,
+    eval_language: impl FnOnce() -> Option<&'static str>,
 ) -> Option<String> {
     if call.name != "bash"
         || ToolStatus::from_output(output) != ToolStatus::Error
@@ -483,7 +502,7 @@ pub(in crate::agent) fn missing_program_recovery(
                 .all(|c| c.is_ascii_alphanumeric() || "._+-/".contains(c));
         valid.then(|| name.to_owned())
     })?;
-    Some(policy::missing_program(&program))
+    Some(policy::missing_program(&program, eval_language))
 }
 
 /// Command-shape facts a model routinely misreads, for `bash`, `browser` and `eval` results: a

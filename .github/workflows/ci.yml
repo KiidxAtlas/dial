@@ -26,7 +26,6 @@ jobs:
       pull-requests: read
     outputs:
       candidate-tag: ${{ steps.candidate.outputs.tag }}
-      candidate-ref: ${{ steps.candidate.outputs.ref }}
       epoch: ${{ steps.candidate.outputs.epoch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,8 +85,8 @@ jobs:
             exit 0
           fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            # Tests run on the merge with main; candidates are built from the head. Record them
-            # only when both are the same tree, so a release can match them by tree.
+            # Build from the same event commit CI tests. Admit PR candidates only if the
+            # tested merge tree is also the PR head tree, so the release can reuse them.
             if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
               echo "Pull request is behind main; no release candidates for this run." >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -98,7 +97,6 @@ jobs:
           fi
           {
             echo "tag=$tag"
-            echo "ref=$HEAD_SHA"
             echo "epoch=$(git show -s --format=%ct "$HEAD_SHA")"
           } >> "$GITHUB_OUTPUT"
 
@@ -109,7 +107,6 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ needs.validate.outputs.candidate-tag }}
-      ref: ${{ needs.validate.outputs.candidate-ref }}
       epoch: ${{ needs.validate.outputs.epoch }}
 
   test:

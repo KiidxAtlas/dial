@@ -1,4 +1,6 @@
 //! Persisted UI preferences and provider-independent model selections.
+mod preset;
+pub use preset::ModelPreset;
 use serde::{Deserialize, Serialize};
 
 /// Shared budget ceiling, large enough for decimal 1.05M and 2M model windows.
@@ -613,8 +615,6 @@ pub struct UiConfig {
     pub status_right: Vec<String>,
     pub status_path_abbreviate: bool,
     pub status_git_counts: bool,
-    /// Use the terminal background instead of a tinted status line.
-    pub status_transparent: bool,
     /// Tint the composer border with a per-session color.
     pub session_accent: bool,
     pub composer_shape: ComposerShape,
@@ -661,6 +661,11 @@ pub struct UiConfig {
     #[serde(default, skip_serializing, rename = "hyperlinks")]
     #[allow(dead_code)]
     pub retired_hyperlinks: Option<serde::de::IgnoredAny>,
+    /// Retired: had no effect since the status line stopped painting a background. Still accepted
+    /// so existing config files load; never read or written.
+    #[serde(default, skip_serializing, rename = "status_transparent")]
+    #[allow(dead_code)]
+    pub retired_status_transparent: Option<serde::de::IgnoredAny>,
 }
 impl Default for UiConfig {
     fn default() -> Self {
@@ -681,7 +686,6 @@ impl Default for UiConfig {
             status_right: vec!["context".into()],
             status_path_abbreviate: true,
             status_git_counts: true,
-            status_transparent: false,
             session_accent: true,
             composer_shape: ComposerShape::Box,
             welcome: true,
@@ -705,6 +709,7 @@ impl Default for UiConfig {
             mouse: true,
             terminal_integration: true,
             retired_hyperlinks: None,
+            retired_status_transparent: None,
         }
     }
 }

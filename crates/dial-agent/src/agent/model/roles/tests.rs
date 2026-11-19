@@ -421,6 +421,11 @@ fn auxiliary_role_waits_cancellably_for_its_actual_provider_slot() {
                 "request bypassed its occupied provider slot"
             );
             assert!(ui.queued, "{mode} did not wait for the actual route");
+            assert_eq!(
+                agent.efficiency_metrics.backend_operations.borrow()["role_provider_slot_wait"]
+                    .calls,
+                1
+            );
         });
         assert!(
             server.requests().is_empty(),

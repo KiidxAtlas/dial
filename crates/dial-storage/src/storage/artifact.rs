@@ -182,7 +182,7 @@ impl ArtifactStore {
             json!({"uri":uri,"state":state,"retention":record,"note":"Lifecycle records describe storage, not task correctness. Missing legacy/foreign references cannot be distinguished without a record; a missing recorded blob does not establish why it was removed."}),
         )
     }
-    fn open(&self, uri: &str) -> Result<File> {
+    pub fn open(&self, uri: &str) -> Result<File> {
         let path = self.path(uri)?;
         let mut options = OpenOptions::new();
         options.read(true);
@@ -505,6 +505,10 @@ impl ArtifactSpool {
         self.file.write_all(bytes)?;
         self.hash.update(bytes);
         Ok(())
+    }
+    /// Live spool path on disk while the spool is open.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
     /// Bytes the cap has dropped from the middle so far (0 while the output is verbatim).
     pub fn elided_bytes(&self) -> u64 {

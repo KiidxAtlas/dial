@@ -84,6 +84,25 @@ fn external_tests_module_and_its_file_select_the_same_filter_once() {
 }
 
 #[test]
+fn repaired_member_manifest_is_visible_on_the_next_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let changed = ["member/src/a.rs", "member/src/b.rs"];
+    write(root, "member/Cargo.toml", "[broken");
+    write(root, "member/src/lib.rs", "mod a; mod b;");
+    for file in changed {
+        write(root, file, "#[test]\nfn works() {}\n");
+    }
+    let broken = plan_for(root, &changed);
+    assert!(broken.checks.is_empty());
+    assert_eq!(broken.limits.len(), 2);
+    write(root, "member/Cargo.toml", "[package]\nname='fixed'\n");
+    let fixed = plan_for(root, &changed);
+    assert_eq!(fixed.checks.len(), 2);
+    assert!(fixed.limits.is_empty(), "{:?}", fixed.limits);
+}
+
+#[test]
 fn integration_targets_filter_by_module_and_fall_back_to_the_whole_target() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -391,4 +410,44 @@ fn rust_selection_does_not_duplicate_path_only_limits() {
     let plan = plan_for(root, &["build.rs"]);
     assert!(plan.checks.is_empty());
     assert_eq!(plan.limits.len(), 1, "{:?}", plan.limits);
+}
+
+#[test]
+fn root_workspace_package_is_selected_even_when_not_a_default_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname='root-package'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=['other']\ndefault-members=['other']\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        "#[test]\nfn root_regression() { panic!(\"root package must be checked\"); }\n",
+    );
+    write(
+        root,
+        "other/Cargo.toml",
+        "[package]\nname='other'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(root, "other/src/lib.rs", "#[test]\nfn unrelated() {}\n");
+    let plan = plan_for(root, &["src/lib.rs"]);
+    assert_eq!(plan.checks.len(), 1, "{plan:?}");
+    assert!(
+        plan.checks[0].command.contains("--package 'root-package'"),
+        "{plan:?}"
+    );
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &plan.checks[0].command])
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{text}");
+        assert!(text.contains("root_regression"), "{text}");
+    }
 }

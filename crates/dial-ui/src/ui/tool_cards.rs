@@ -242,7 +242,16 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     if let Some(rows) = check::check_card(t, w as usize, ctx) {
         return rows;
     }
+    if let Some(rows) = check::verify_card(t, w as usize, ctx) {
+        return rows;
+    }
     if let Some(rows) = irc::irc_card(t, w as usize, ctx) {
+        return rows;
+    }
+    if let Some(rows) = git::git_card(t, w as usize, ctx) {
+        return rows;
+    }
+    if let Some(rows) = sources::sources_card(t, w as usize, ctx) {
         return rows;
     }
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Plan
@@ -1677,10 +1686,13 @@ fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Spa
 }
 
 mod check;
-pub(in crate::ui) use check::{Verdict, command as check_command, verdict};
+pub use check::is_test_command;
+pub(in crate::ui) use check::{Verdict, verdict};
 pub(in crate::ui) mod frame;
+mod git;
 mod irc;
 pub(super) use irc::incoming_notice;
+mod sources;
 
 #[cfg(test)]
 mod tests;

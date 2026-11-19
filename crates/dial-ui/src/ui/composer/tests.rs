@@ -132,6 +132,18 @@ fn queued_handles_survive_shifts_but_never_retarget_replacement_messages() {
 }
 
 #[test]
+fn empty_draft_during_queue_edit_does_not_retarget_another_selection() {
+    let mut c = composer();
+    c.restore_pending_messages(vec!["first".into(), "second".into()]);
+    assert!(c.edit_queued(0));
+    c.replace_draft_content(""); // Clearing the text does not cancel the edit.
+    assert!(!c.edit_queued(0), "finish or cancel the active edit first");
+    assert_eq!(c.queued_messages(), [("second".into(), false)]);
+    c.set_draft(""); // Cancel restores the first message at its original position.
+    assert_eq!(c.take_follow_up().as_deref(), Some("first"));
+}
+
+#[test]
 fn cancelling_a_queued_edit_restores_the_original_item_in_place() {
     let env = Env::new();
     let mut c = composer();
@@ -762,23 +774,16 @@ fn the_status_line_sits_in_the_top_border_and_follows_the_ui_config() {
 }
 
 #[test]
-fn transparent_status_has_no_background_in_the_composer_border() {
-    let mut env = Env::new();
+fn the_composer_border_has_no_background() {
+    let env = Env::new();
     let c = Composer::new(vec![], 10);
-    let has_bg = |env: &Env| {
+    assert!(
         c.view(100, &env.ctx()).rows[0]
             .spans
             .iter()
-            .any(|s| s.style.bg.is_some())
-    };
-    assert!(!has_bg(&env), "the default status line has no fill");
-    env.ui.status_transparent = false;
-    assert!(
-        !has_bg(&env),
-        "legacy opacity settings do not add filled blocks"
+            .all(|s| s.style.bg.is_none()),
+        "the status line has no fill"
     );
-    env.ui.status_transparent = true;
-    assert!(!has_bg(&env));
 }
 
 #[test]

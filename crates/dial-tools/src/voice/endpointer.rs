@@ -25,6 +25,13 @@ pub struct EndpointerConfig {
     pub floor_attack: f32,
     /// Absolute RMS floor so a near-silent room never trips speech detection.
     pub min_threshold: f32,
+    /// Opening audio used to measure the room before any speech is detected; it is replayed
+    /// afterwards, so speech in it is kept. Without it, a room louder than
+    /// `min_threshold * energy_ratio` reads as endless speech: the floor only adapts on
+    /// non-speech frames, so it would never learn that level.
+    pub calibrate_ms: u32,
+    /// Highest noise floor calibration may set, so speech from the first moment still counts.
+    pub max_calibrated_floor: f32,
 }
 
 impl Default for EndpointerConfig {
@@ -39,6 +46,8 @@ impl Default for EndpointerConfig {
             energy_ratio: 2.5,
             floor_attack: 0.05,
             min_threshold: 0.008,
+            calibrate_ms: 300,
+            max_calibrated_floor: 0.04,
         }
     }
 }
@@ -115,6 +124,10 @@ pub struct Endpointer {
     in_speech: bool,
     noise_floor: f32,
     silence_ms: u32,
+    /// Frames in the current segment that were above the threshold.
+    voiced_ms: u32,
+    /// Opening frames held for calibration; `None` once the floor is measured.
+    calibration: Option<Vec<Vec<f32>>>,
     segment_ms: f64,
     /// Pre-roll included at the start of the current segment; not counted as speech.
     onset_ms: f64,
@@ -131,6 +144,8 @@ impl Endpointer {
             frame_samples,
             leftover: Vec::with_capacity(frame_samples),
             in_speech: false,
+            voiced_ms: 0,
+            calibration: Some(Vec::new()),
             noise_floor: cfg.min_threshold,
             silence_ms: 0,
             segment_ms: 0.0,
@@ -173,23 +188,28 @@ impl Endpointer {
     /// End the stream; returns a trailing committed segment if one is pending.
     pub fn flush(&mut self) -> Vec<EndpointerEvent> {
         let mut events = Vec::new();
+        self.finish_calibration(&mut events);
         if self.in_speech && !self.leftover.is_empty() {
             self.segment.extend_from_slice(&self.leftover);
             self.segment_ms += self.leftover.len() as f64 * 1000.0 / self.cfg.sample_rate as f64;
         }
         self.leftover.clear();
-        if self.in_speech {
-            let speech_ms = self.speech_ms();
-            if speech_ms >= self.cfg.min_speech_ms as f64 {
-                let keep = self.endpoint_keep();
-                events.push(EndpointerEvent::Segment(self.segment[..keep].to_vec()));
-            }
+        if self.in_speech && self.committable() {
+            let keep = self.endpoint_keep();
+            events.push(EndpointerEvent::Segment(self.segment[..keep].to_vec()));
         }
         self.reset();
         events
     }
 
     fn process_frame(&mut self, frame: &[f32], events: &mut Vec<EndpointerEvent>) {
+        if let Some(held) = &mut self.calibration {
+            held.push(frame.to_vec());
+            if held.len() as u32 * self.cfg.frame_ms >= self.cfg.calibrate_ms {
+                self.finish_calibration(events);
+            }
+            return;
+        }
         let energy = super::wav::rms(frame);
         let threshold = self
             .cfg
@@ -214,6 +234,7 @@ impl Endpointer {
         self.segment_ms += self.cfg.frame_ms as f64;
         if voiced {
             self.silence_ms = 0;
+            self.voiced_ms += self.cfg.frame_ms;
         } else {
             self.silence_ms += self.cfg.frame_ms;
         }
@@ -227,6 +248,7 @@ impl Endpointer {
             self.segment_ms = 0.0;
             self.onset_ms = 0.0;
             self.silence_ms = 0;
+            self.voiced_ms = 0;
         }
     }
 
@@ -238,7 +260,28 @@ impl Endpointer {
         self.segment.extend_from_slice(onset);
         self.pre_roll.reset();
         self.silence_ms = 0;
+        self.voiced_ms = self.cfg.frame_ms;
         self.segment_ms = self.segment.len() as f64 * 1000.0 / self.cfg.sample_rate as f64;
+    }
+
+    /// Measure the room from the held opening frames (their quietest frame, capped), then
+    /// process them as usual.
+    fn finish_calibration(&mut self, events: &mut Vec<EndpointerEvent>) {
+        let Some(held) = self.calibration.take() else {
+            return;
+        };
+        let quietest = held
+            .iter()
+            .map(|frame| super::wav::rms(frame))
+            .fold(f32::INFINITY, f32::min);
+        if quietest.is_finite() {
+            self.noise_floor = quietest
+                .min(self.cfg.max_calibrated_floor)
+                .max(self.cfg.min_threshold);
+        }
+        for frame in &held {
+            self.process_frame(frame, events);
+        }
     }
 
     /// Voiced duration of the current segment: pre-roll and trailing silence excluded, so a click
@@ -247,9 +290,15 @@ impl Endpointer {
         self.segment_ms - self.silence_ms as f64 - self.onset_ms
     }
 
+    /// Long enough to be speech, counting both its span and the frames actually voiced, so
+    /// noise that only flickers over the threshold is not committed.
+    fn committable(&self) -> bool {
+        let min = self.cfg.min_speech_ms;
+        self.speech_ms() >= f64::from(min) && self.voiced_ms >= min
+    }
+
     fn finalize_segment(&mut self, events: &mut Vec<EndpointerEvent>) {
-        let speech_ms = self.speech_ms();
-        if speech_ms >= self.cfg.min_speech_ms as f64 {
+        if self.committable() {
             let keep = self.endpoint_keep();
             self.segment.truncate(keep);
             events.push(EndpointerEvent::Segment(std::mem::take(&mut self.segment)));
@@ -257,6 +306,7 @@ impl Endpointer {
         self.in_speech = false;
         self.segment.clear();
         self.silence_ms = 0;
+        self.voiced_ms = 0;
         self.segment_ms = 0.0;
         self.onset_ms = 0.0;
     }
@@ -275,6 +325,8 @@ impl Endpointer {
         self.segment.clear();
         self.pre_roll.reset();
         self.silence_ms = 0;
+        self.voiced_ms = 0;
+        self.calibration = Some(Vec::new());
         self.segment_ms = 0.0;
         self.onset_ms = 0.0;
         self.noise_floor = self.cfg.min_threshold;

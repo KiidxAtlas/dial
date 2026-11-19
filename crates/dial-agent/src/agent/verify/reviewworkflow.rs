@@ -293,7 +293,7 @@ fn snapshot(root: &Path, target: &str, interrupt: &AtomicBool) -> Result<String>
             )?
         }
         _ => anyhow::bail!(
-            "usage: /review [uncommitted | base <ref> | ref <ref> | commit <ref> | pr://<number> | pr://<owner>/<repo>/<number> | https://github.com/<owner>/<repo>/pull/<number>]"
+            "Usage: /review [uncommitted | base <ref> | ref <ref> | commit <ref> | pr://<number> | pr://<owner>/<repo>/<number> | https://github.com/<owner>/<repo>/pull/<number>]"
         ),
     };
     if words.is_empty() || words == ["uncommitted"] {

@@ -1,31 +1,27 @@
 //! REST and WebSocket I/O for GitLab Duo Agent workflows. Wire shapes live in
 //! `wire.rs`; this module only moves bytes and enforces timeouts/interrupts.
 
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
+use tungstenite::Message;
 use tungstenite::client::IntoClientRequest;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket};
 
-use crate::llm::errors::{Classified, ErrorClass};
-use crate::llm::{Interrupted, host_of, is_local_host};
+use crate::llm::{Interrupted, Patience, host_of, is_local_host, ws_setup};
 
 use super::wire;
 
 /// Socket read slice; each slice re-checks the interrupt flag.
 const POLL: Duration = Duration::from_millis(100);
-/// Silence longer than this ends the turn as a transient failure.
-pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Best-effort stop calls never wait longer than this.
 pub(super) const STOP_TIMEOUT_SECS: u64 = 5;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+// Writes on an established (possibly resumed) workflow remain bounded separately from setup.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+pub(super) type Socket = ws_setup::Socket;
 
 /// A GitLab Duo project the workflow runs against.
 #[derive(Debug)]
@@ -158,8 +154,13 @@ impl Api<'_> {
         let Ok(bytes) = serde_json::to_vec(&json!({ "status_event": "stop" })) else {
             return;
         };
+        let timeout = if self.timeout == 0 {
+            STOP_TIMEOUT_SECS
+        } else {
+            self.timeout.min(STOP_TIMEOUT_SECS)
+        };
         let _ = self
-            .agent(&url, None, self.timeout.min(STOP_TIMEOUT_SECS))
+            .agent(&url, None, timeout)
             .patch(&url)
             .header("authorization", &format!("Bearer {}", self.token))
             .header("content-type", "application/json")
@@ -264,21 +265,14 @@ pub(super) fn connect(
         let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())?;
         headers.insert(name, value.parse()?);
     }
-    let tcp = open_tcp(&base)?;
-    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    tcp.set_nodelay(true)?;
-    let (mut socket, _) = tungstenite::client_tls_with_config(request, tcp, None, None).map_err(
-        |error| match error {
-            tungstenite::handshake::HandshakeError::Failure(error) => anyhow::Error::from(error),
-            tungstenite::handshake::HandshakeError::Interrupted(_) => {
-                anyhow!("GitLab Duo Agent WebSocket handshake interrupted")
-            }
-        },
-    )?;
-
-    set_poll(&mut socket)?;
-    Ok(socket)
+    ws_setup::upgrade(
+        &url,
+        request,
+        api.timeout,
+        api.interrupt,
+        Some(POLL),
+        Some(WRITE_TIMEOUT),
+    )
 }
 
 /// GraphQL group id form of a numeric namespace id, as the server expects.
@@ -299,25 +293,6 @@ fn encode_component(text: &str) -> String {
         .collect()
 }
 
-fn open_tcp(base: &url::Url) -> Result<TcpStream> {
-    let host = base.host_str().context("GitLab base URL has no host")?;
-    let port = base
-        .port_or_known_default()
-        .context("GitLab base URL has no port")?;
-    crate::llm::ws_proxy::open(host, port, &|| Ok(Some(HANDSHAKE_TIMEOUT)))
-}
-
-fn set_poll(socket: &mut Socket) -> Result<()> {
-    let tcp = match socket.get_mut() {
-        MaybeTlsStream::Plain(tcp) => tcp,
-        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
-        _ => bail!("unsupported GitLab Duo Agent TLS transport"),
-    };
-    tcp.set_read_timeout(Some(POLL))?;
-    tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    Ok(())
-}
-
 /// Send one JSON message on the socket.
 pub(super) fn send(socket: &mut Socket, payload: &Value) -> Result<()> {
     socket
@@ -325,30 +300,27 @@ pub(super) fn send(socket: &mut Socket, payload: &Value) -> Result<()> {
         .context("GitLab Duo Agent WebSocket send failed")
 }
 
-/// Wait for the next JSON server event. Honours the interrupt flag every poll
-/// slice and fails after `IDLE_TIMEOUT` of silence.
-pub(super) fn next_event(socket: &mut Socket, interrupt: &AtomicBool) -> Result<Value> {
-    let mut idle_since = Instant::now();
+/// Poll for a workflow event without treating control frames as model progress.
+pub(super) fn next_event(
+    socket: &mut Socket,
+    interrupt: &AtomicBool,
+    patience: &Patience,
+) -> Result<Value> {
     loop {
         if interrupt.load(Ordering::SeqCst) {
             return Err(Interrupted.into());
         }
-        if idle_since.elapsed() > IDLE_TIMEOUT {
-            return Err(Classified::new(
-                ErrorClass::Transient,
-                "GitLab Duo Agent workflow went silent",
-            )
-            .into());
+        if patience.remaining().is_some_and(|left| left.is_zero()) {
+            return Err(crate::llm::stream::StalledStream.into());
         }
         match socket.read() {
             Ok(Message::Text(text)) => {
                 if let Ok(event) = serde_json::from_str::<Value>(text.as_str()) {
                     return Ok(event);
                 }
-                idle_since = Instant::now();
             }
             Ok(Message::Close(_)) => bail!("GitLab Duo Agent closed the workflow socket"),
-            Ok(_) => idle_since = Instant::now(),
+            Ok(_) => {}
             Err(tungstenite::Error::Io(error))
                 if matches!(
                     error.kind(),

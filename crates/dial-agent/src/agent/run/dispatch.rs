@@ -403,6 +403,30 @@ pub(in crate::agent) fn code_batch_calls(
         .collect()
 }
 
+/// Make validation, rule matching, grouping and approval see the same executable arguments.
+pub(in crate::agent) fn prepare_callback_arguments(
+    call: &mut ToolCall,
+    schemas: &[Value],
+    names: &[String],
+    workspace: &Workspace,
+    compatibility: bool,
+) -> std::result::Result<(), String> {
+    if compatibility
+        && let Some(parameters) = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == call.name)
+            .and_then(|schema| schema.pointer("/function/parameters"))
+    {
+        super::tool_compat::normalize(&call.name, parameters, &mut call.arguments);
+    }
+    crate::agent::window::file_handles::expand(workspace, call)
+        .map_err(|error| format!("File reference refused: {error}"))?;
+    if let Some((_, why)) = call_form_error(call, schemas, names) {
+        return Err(format!("invalid code-mode tool call: {why}"));
+    }
+    Ok(())
+}
+
 /// The ordered `tool.batch` receipt: one `{text, data, is_error}` per entry. The batch itself
 /// succeeds; a failed entry is reported in its own slot rather than raised.
 pub(in crate::agent) fn code_batch_output(outputs: Vec<ToolOutput>) -> ToolOutput {
@@ -500,7 +524,8 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
         let mutating = mutation_controller.is_some();
         let mut unique: HashMap<(&str, String), usize> = HashMap::new();
         let mut sources = Vec::with_capacity(calls.len());
-        let mut remaining = Vec::new();
+        let mut members: Vec<Vec<usize>> = Vec::new();
+        let mut jobs = Vec::with_capacity(calls.len());
         let mut first_calls: Vec<usize> = Vec::new();
         for (index, call) in calls.iter().enumerate() {
             if already_started != Some(call.id.as_str()) {
@@ -517,7 +542,7 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
                 })
             {
                 sources.push(source);
-                remaining[source] += 1;
+                members[source].push(index);
                 ui.diagnostic(&format!(
                     "Batch reuse: {} shares the result of {}; no duplicate inspection runs.",
                     call.id, calls[first_calls[source]].id
@@ -527,11 +552,8 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
             let source = first_calls.len();
             unique.insert(key, source);
             sources.push(source);
-            remaining.push(1usize);
+            members.push(vec![index]);
             first_calls.push(index);
-            let completed = completed.clone();
-            let mutations = mutations.clone();
-            let mutation_scope = turn_cancel.map(|turn| turn.mutation());
             if let Some(error) = ui.execution_error() {
                 let output = ToolOutput::err(error)
                     .with_status(tools::ToolStatus::Blocked)
@@ -540,11 +562,26 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
                 continue;
             }
             let early = streamed.as_mut().and_then(|stream| stream.extract(call));
+            jobs.push((source, index, early));
+        }
+        // Refill each slot immediately on completion, without waiting for slower siblings.
+        // Receive already-started reads first; do not queue them behind fresh dispatches.
+        jobs.sort_by_key(|(_, _, early)| early.is_none());
+        let workers = jobs.len().min(config.task.parallel_read_limit());
+        let jobs = Arc::new(std::sync::Mutex::new(jobs.into_iter()));
+        for _ in 0..workers {
+            let jobs = jobs.clone();
+            let completed = completed.clone();
+            let mutations = mutations.clone();
             let signals = signals.clone();
-            scope.spawn(move || {
+            scope.spawn(move || loop {
+                let job = jobs.lock().unwrap_or_else(|err| err.into_inner()).next();
+                let Some((source, index, early)) = job else { break };
+                let call = &calls[index];
+                let mutation_scope = turn_cancel.map(|turn| turn.mutation());
                 if let Some(outcome) = early.and_then(|early| early.receive()) {
                     let _ = completed.send((source,outcome,Vec::new(),None));
-                    return;
+                    continue;
                 }
                 let started = Instant::now();
                 let mut notices = Vec::new();
@@ -654,10 +691,9 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
                     for (source, result) in results.iter_mut().enumerate() {
                         if result.is_none() {
                             let output = ToolOutput::err("tool worker disconnected");
-                            for (index, call) in calls.iter().enumerate() {
-                                if sources[index] == source {
-                                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                                }
+                            for &index in &members[source] {
+                                let call = &calls[index];
+                                ui.tool_result_with_id(&call.id, &call.name, &output);
                             }
                             *result = Some((output, 0.0));
                         }
@@ -673,23 +709,23 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
             }
             // Visible completion is independent of the ordered provider-history settlement.
             // StateUi journals each result before forwarding it to any surface.
-            for (index, call) in calls.iter().enumerate() {
-                if sources[index] == source {
-                    ui.tool_timing(
-                        &call.id,
-                        &call.name,
-                        if index == first_calls[source] {
-                            result.1
-                        } else {
-                            0.0
-                        },
-                    );
-                    ui.tool_result_with_id(&call.id, &call.name, &result.0);
-                }
+            for &index in &members[source] {
+                let call = &calls[index];
+                ui.tool_timing(
+                    &call.id,
+                    &call.name,
+                    if index == first_calls[source] {
+                        result.1
+                    } else {
+                        0.0
+                    },
+                );
+                ui.tool_result_with_id(&call.id, &call.name, &result.0);
             }
             results[source] = Some(result);
             outstanding -= 1;
         }
+        let mut remaining: Vec<_> = members.iter().map(Vec::len).collect();
         sources
             .into_iter()
             .enumerate()
@@ -1982,6 +2018,66 @@ impl<'a> Agent<'a> {
                 }
                 let offered_before = self.offered();
                 if let Err(error) = self.select_tools(&requested, &unload) {
+                    if error.contains("unavailable tool") {
+                        let catalog = self.catalog();
+                        let missing: Vec<&str> = requested
+                            .iter()
+                            .chain(&unload)
+                            .filter(|name| !catalog.contains(*name))
+                            .map(String::as_str)
+                            .collect();
+                        let search_query = missing.join(" ");
+                        let mut descriptions = HashMap::new();
+                        let candidates: Vec<(String, String)> = self
+                            .eligible_candidates()
+                            .into_iter()
+                            .map(|(name, description, indexed)| {
+                                descriptions.insert(name.clone(), description);
+                                (name, indexed)
+                            })
+                            .collect();
+                        let ranked = crate::agent::model::assistance::discover_with_priority(
+                            &search_query,
+                            candidates.clone(),
+                            &|name| self.tool_readiness(name).routing_priority(),
+                        );
+                        let suggestions: Vec<String> = if !ranked.is_empty() {
+                            ranked
+                                .into_iter()
+                                .take(5)
+                                .map(|(n, _, _)| {
+                                    let desc: String = descriptions
+                                        .get(&n)
+                                        .map(|d| d.chars().take(120).collect())
+                                        .unwrap_or_default();
+                                    format!("{n}: {desc}")
+                                })
+                                .collect()
+                        } else {
+                            crate::agent::model::assistance::partial_matches(
+                                &search_query,
+                                candidates,
+                                &|name| self.tool_readiness(name).routing_priority(),
+                            )
+                            .into_iter()
+                            .take(5)
+                            .map(|n| {
+                                let desc: String = descriptions
+                                    .get(&n)
+                                    .map(|d| d.chars().take(120).collect())
+                                    .unwrap_or_default();
+                                format!("{n}: {desc}")
+                            })
+                            .collect()
+                        };
+                        if !suggestions.is_empty() {
+                            return denied(&format!(
+                                "{error}. Unknown: [{}]. Closest available tools:\n- {}",
+                                missing.join(", "),
+                                suggestions.join("\n- ")
+                            ));
+                        }
+                    }
                     return denied(&error);
                 }
                 let offered = self.offered();
@@ -2169,6 +2265,47 @@ impl<'a> Agent<'a> {
         if let Some(reason) = gate.blocked() {
             return ToolOutput::err(reason);
         }
+        let names = self.callback_names();
+        let (name, arguments) = match request {
+            crate::tools::integrations::ext::ToolCallback::Schemas => {
+                return match self.schemas(&names) {
+                    Ok(schemas) => ToolOutput {
+                        data: Some(Value::Array(schemas)),
+                        text: String::new(),
+                        is_error: false,
+                        execution: Default::default(),
+                    },
+                    Err(error) => {
+                        ToolOutput::err(format!("listing authorized code-mode tools: {error:#}"))
+                    }
+                };
+            }
+            crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
+                (name, arguments)
+            }
+        };
+        if name == crate::tools::exec::eval::BATCH_CALLBACK {
+            if matches!(source.mode, DispatchMode::Background { .. }) {
+                return ToolOutput::err(
+                    "bg start requires one background-capable tool, not a code-cell batch",
+                );
+            }
+            return self.code_callback_batch(backend, &arguments, &names, ui, gate, source);
+        }
+        let mut call = ToolCall {
+            id: String::new(),
+            name,
+            arguments,
+            malformed_arguments: false,
+        };
+        let mut definitions = HashMap::new();
+        if let Err(reason) = self.prepare_callback(&mut call, &names, &mut definitions) {
+            return ToolOutput::err(reason);
+        }
+        self.execute_callback_from(backend, ui, &call, &definitions[&call.name], source, gate)
+    }
+
+    fn callback_names(&self) -> Vec<String> {
         let mut names = self.offered();
         names.retain(|name| {
             !matches!(
@@ -2179,57 +2316,43 @@ impl<'a> Agent<'a> {
                 .get(name)
                 .is_some_and(|tool| tool.supports_tool_dispatch())
         });
-        let (name, arguments) = match request {
-            crate::tools::integrations::ext::ToolCallback::Schemas => {
-                return match self.schemas(&names) {
-                    Ok(schemas) => ToolOutput {
-                        execution: Default::default(),
-                        data: Some(Value::Array(schemas)),
-                        text: String::new(),
-                        is_error: false,
-                    },
-                    Err(error) => {
-                        ToolOutput::err(format!("listing authorized code-mode tools: {error:#}"))
-                    }
-                };
-            }
-            crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
-                // A consolidated member's own name still works in code: it runs as the successor
-                // call that reaches it, under the successor's scope and approval.
-                match crate::tools::surface::facade::successor_call(&name, &arguments) {
-                    Some((successor, call))
-                        if self.ext.is_folded(&name) && names.iter().any(|n| n == successor) =>
-                    {
-                        (successor.to_owned(), call)
-                    }
-                    _ => (name, arguments),
-                }
-            }
-        };
-        if name == crate::tools::exec::eval::BATCH_CALLBACK {
-            return self.code_callback_batch(backend, &arguments, &names, ui, gate, source);
+        names
+    }
+
+    fn prepare_callback(
+        &self,
+        call: &mut ToolCall,
+        names: &[String],
+        definitions: &mut HashMap<String, Vec<Value>>,
+    ) -> std::result::Result<(), String> {
+        if call.name == crate::tools::exec::eval::BATCH_CALLBACK {
+            return Err("tool.batch entries cannot nest tool.batch".into());
         }
-        if !names.contains(&name) {
-            return ToolOutput::err(format!(
-                "tool {name:?} is not available in this code-mode scope"
+        // A folded member may run only as its offered successor, under the successor's policy.
+        if self.ext.is_folded(&call.name)
+            && let Some((successor, arguments)) =
+                crate::tools::surface::facade::successor_call(&call.name, &call.arguments)
+            && names.iter().any(|name| name == successor)
+        {
+            call.name = successor.to_owned();
+            call.arguments = arguments;
+        } else if !self.hermetic {
+            call.name = super::tool_compat::canonical_name(&call.name, names).into_owned();
+        }
+        if !names.contains(&call.name) {
+            return Err(format!(
+                "tool {:?} is not available in this code-mode scope",
+                call.name
             ));
         }
-        let schemas = match self.schemas(std::slice::from_ref(&name)) {
-            Ok(schemas) => schemas,
-            Err(error) => {
-                return ToolOutput::err(format!("resolving code-mode tool schema: {error:#}"));
-            }
+        let schemas = match definitions.entry(call.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                self.schemas(std::slice::from_ref(&call.name))
+                    .map_err(|error| format!("resolving code-mode tool schema: {error:#}"))?,
+            ),
         };
-        let call = ToolCall {
-            id: String::new(),
-            name,
-            arguments,
-            malformed_arguments: false,
-        };
-        if let Some((_, why)) = call_form_error(&call, &schemas, &names) {
-            return ToolOutput::err(format!("invalid code-mode tool call: {why}"));
-        }
-        self.execute_callback_from(backend, ui, &call, &schemas, source, gate)
+        prepare_callback_arguments(call, schemas, names, &self.workspace, !self.hermetic)
     }
 
     /// `tool.batch([...])` from a code cell. Consecutive entries that are offered, hook-free,
@@ -2251,40 +2374,62 @@ impl<'a> Agent<'a> {
             Err(refusal) => return ToolOutput::err(refusal),
         };
         let mut outputs = Vec::with_capacity(calls.len());
-        let mut index = 0;
-        while index < calls.len() {
-            let group = calls[index..]
-                .iter()
-                .take_while(|call| self.shared_callback_read(call, names))
-                .count();
-            // A lone read inside a mixed batch keeps the ordinary serial callback path.
-            if group > 1 || group == calls.len() {
+        let total = calls.len();
+        let mut pending = calls.into_iter().peekable();
+        let mut live_names = names.to_vec();
+        while pending.peek().is_some() {
+            let mut definitions = HashMap::new();
+            let mut reads = Vec::new();
+            let mut serial = None;
+            // No admission ahead of a serial effect: it may change the offer, hooks or policies.
+            for mut call in pending.by_ref() {
+                let prepared = self.prepare_callback(&mut call, &live_names, &mut definitions);
+                if prepared.is_ok()
+                    && source.provenance
+                        == crate::agent::safety::approval::CallProvenance::Structured
+                    && self.shared_callback_read(&call, &live_names)
+                {
+                    reads.push(call);
+                } else {
+                    serial = Some(prepared.map(|()| call));
+                    break;
+                }
+            }
+            // A lone read in a mixed batch uses serial dispatch just like the following entry.
+            let lone = if reads.len() == 1 && total > 1 {
+                reads.pop().map(Ok)
+            } else {
+                None
+            };
+            if !reads.is_empty() {
                 outputs.extend(self.code_callback_reads(
-                    &calls[index..index + group],
-                    names,
+                    &reads,
+                    &definitions,
                     ui,
                     gate,
                     source.owner,
                 ));
-                index += group;
-                continue;
             }
-            let call = calls[index].clone();
-            index += 1;
-            outputs.push(if call.name == crate::tools::exec::eval::BATCH_CALLBACK {
-                ToolOutput::err("tool.batch entries cannot nest tool.batch")
-            } else {
-                self.code_callback_mode(
-                    backend,
-                    crate::tools::integrations::ext::ToolCallback::Call {
-                        name: call.name,
-                        arguments: call.arguments,
-                    },
-                    ui,
-                    gate,
-                    source.clone(),
-                )
-            });
+            for entry in lone.into_iter().chain(serial) {
+                outputs.push(match entry {
+                    Err(reason) => ToolOutput::err(reason),
+                    Ok(mut call) => {
+                        call.id.clear();
+                        self.execute_callback_from(
+                            backend,
+                            ui,
+                            &call,
+                            &definitions[&call.name],
+                            source.clone(),
+                            gate,
+                        )
+                    }
+                });
+            }
+            if pending.peek().is_some() {
+                live_names = self.callback_names();
+                live_names.retain(|name| names.contains(name));
+            }
         }
         code_batch_output(outputs)
     }
@@ -2307,12 +2452,12 @@ impl<'a> Agent<'a> {
             && image_question(call).is_none()
     }
 
-    /// Admitted read-only batch entries: per-entry form checks and portable-rule interception,
-    /// then the parallel-read group. Reads need no approval; their records share two flushes.
+    /// Form-checked, read-only batch entries: intercept portable rules per invocation before the
+    /// parallel-read group. Records for the admitted reads share two flushes.
     fn code_callback_reads(
         &mut self,
         calls: &[ToolCall],
-        names: &[String],
+        schemas: &HashMap<String, Vec<Value>>,
         ui: &mut dyn Ui,
         gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
         owner: &str,
@@ -2320,6 +2465,9 @@ impl<'a> Agent<'a> {
         let mut outputs: Vec<Option<ToolOutput>> = vec![None; calls.len()];
         let mut admitted = Vec::new();
         let mut positions = Vec::new();
+        // Only definitions are shared within this read group. Argument validation, rule
+        // interception and the journal-before-execution decision remain per invocation.
+        let mut identities = HashMap::new();
         for (index, call) in calls.iter().enumerate() {
             if self.interrupt.load(Ordering::SeqCst) {
                 outputs[index] = Some(interrupted_tool());
@@ -2329,21 +2477,10 @@ impl<'a> Agent<'a> {
                 outputs[index] = Some(ToolOutput::err(reason));
                 continue;
             }
-            let schemas = match self.schemas(std::slice::from_ref(&call.name)) {
-                Ok(schemas) => schemas,
-                Err(error) => {
-                    outputs[index] = Some(ToolOutput::err(format!(
-                        "resolving code-mode tool schema: {error:#}"
-                    )));
-                    continue;
-                }
-            };
-            if let Some((_, why)) = call_form_error(call, &schemas, names) {
-                outputs[index] = Some(ToolOutput::err(format!(
-                    "invalid code-mode tool call: {why}"
-                )));
-                continue;
-            }
+            let identity = identities.entry(call.name.as_str()).or_insert_with(|| {
+                tools::surface::contracts::identities(&schemas[&call.name], &self.ext)
+                    .remove(&call.name)
+            });
             if let Err(reason) = self.intercept_native_effect(gate, call, ui) {
                 outputs[index] = Some(ToolOutput::err(reason));
                 continue;
@@ -2351,7 +2488,7 @@ impl<'a> Agent<'a> {
             if let Err(error) = self.record(
                 self.cur_step,
                 "code_tool_call",
-                json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::surface::contracts::identities(&schemas,&self.ext).get(&call.name)}),
+                json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":identity}),
             ) {
                 outputs[index] = Some(ToolOutput::err(format!(
                     "recording code-mode call before execution: {error:#}"
@@ -2543,20 +2680,20 @@ impl<'a> Agent<'a> {
         self.pump_subagents(ui);
         let questions = self.side_questions.running_ids();
         if !questions.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
-            self.background_notices.push(format!("[Side questions still running]\n{}\nContinue independent work or use a bounded `task` action=question_wait; do not claim their answers are available yet.", questions.join("\n")));
+            self.background_notices.push(format!("[Side questions still running]\n{}\nDo independent work first. Use `task` action=question_wait when blocked.", questions.join("\n")));
         }
         let workers = self.live_tasks.running_ids();
         if !self.interrupt.load(Ordering::Relaxed) {
             if !jobs.is_empty() {
                 self.background_notices.push(format!(
-                    "[Background work is still running]\n{}\nContinue independent work first. If nothing useful remains, tell the user what is pending and use a bounded `bg wait`. Do not report these jobs as completed; inspect their results or stop jobs you no longer need.",
+                    "[Background work is still running]\n{}\nDo independent work first. When blocked, use a bounded `bg wait`; check the result before claiming success.",
                     jobs.join("\n")
                 ));
             }
             // Live workers are awaited like background jobs: the turn waits for their results rather than ending.
             if !workers.is_empty() {
                 self.background_notices.push(format!(
-                    "[Live workers are still running]\n{}\nWait for their results with `task wait`, or continue independent work first. Their findings arrive as they finish; do not report these workers as completed before their results are in.",
+                    "[Live workers are still running]\n{}\nDo independent work first. Use `task wait` when blocked on a worker.",
                     workers.join("\n")
                 ));
             }

@@ -101,8 +101,8 @@ fn resting_home_has_no_metadata_stack_and_offers_starters_where_room_allows() {
     );
     assert!(content_width(120) <= 56);
     assert!(
-        text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
-        "the braille knob lockup fills a tall window: {text}"
+        text.contains('▀') && !text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+        "the half-block knob lockup fills a tall window: {text}"
     );
 }
 
@@ -190,7 +190,7 @@ fn knob_turns_into_place_then_rests_on_one_fixed_frame() {
             .chain(&word)
             .flatten()
             .flat_map(|s| s.content.chars())
-            .all(|c| c == ' ' || ('\u{2801}'..='\u{28ff}').contains(&c))
+            .all(|c| matches!(c, ' ' | '▀' | '▄' | '█'))
     );
 }
 
@@ -248,13 +248,7 @@ fn the_bezel_traces_in_with_a_comet_before_the_needle_swings() {
     let (trace, level) = mark::boot_phases(0.3);
     assert!(trace > 0.5 && trace < 1.0 && level < 0.5, "{trace} {level}");
     assert_eq!(mark::boot_phases(1.0), (1.0, 1.0));
-    let dots = |rows: &Vec<Vec<Span<'static>>>| -> u32 {
-        rows.iter()
-            .flatten()
-            .flat_map(|s| s.content.chars())
-            .map(|c| (c as u32).saturating_sub(0x2800).count_ones())
-            .sum()
-    };
+    let dots = |rows: &Vec<Vec<Span<'static>>>| -> u32 { mark::pixel_count(rows) };
     let frames: Vec<u32> = [0.0, 0.15, 0.3, 0.6, 1.0]
         .iter()
         .map(|p| dots(&mark::lockup(&theme, *p, 0)))
@@ -263,8 +257,8 @@ fn the_bezel_traces_in_with_a_comet_before_the_needle_swings() {
         frames.windows(2).all(|w| w[0] <= w[1] + 8),
         "the mark fills in as it powers up: {frames:?}"
     );
-    // The untuned wordmark is already there, dim; the bezel and ticks are not.
-    assert!(frames[0] + 100 < frames[4], "{frames:?}");
+    // The untuned wordmark is already there, dim; the bezel is not.
+    assert!(frames[0] + 40 < frames[4], "{frames:?}");
     for p in [0.0, 0.2, 0.45, 0.7, 0.95] {
         for row in mark::lockup(&theme, p, 0) {
             let width: usize = row.iter().map(|s| text::width(&s.content)).sum();

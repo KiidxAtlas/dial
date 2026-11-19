@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 const TITLE: &str = "Graphify";
-const USAGE: &str = "usage: /graphify [tree|html|callflow]";
+const USAGE: &str = "Usage: /graphify [tree|html|callflow]";
 /// Builds or refreshes the graph locally with tree-sitter; no API key, nothing leaves the machine.
 const BUILD_HINT: &str = "uvx --from graphifyy graphify extract . --code-only";
 

@@ -99,6 +99,8 @@ impl<'a> Agent<'a> {
             .unwrap_or(text)
             .to_owned();
         self.push(message)?;
+        self.efficiency_metrics
+            .intervention("steering_message_journaled");
         self.task_policy = crate::learn::task_policy::Policy::for_prompt(
             text,
             self.config.reasoning_guard.max_pre_action_secs,

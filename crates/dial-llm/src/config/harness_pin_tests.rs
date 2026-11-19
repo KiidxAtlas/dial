@@ -64,11 +64,11 @@ fn explicit_temperature_pin_is_recorded_from_layers_and_never_serialized() {
     }
 }
 
-/// A project-file `[edit] mode` is recorded as explicit; on a local route the differing local
-/// default replaces it and is reported once, while `inherit`, a matching mode or an unset mode
-/// report nothing. Never serialized.
+/// The local route's default grammar is Hashline. An explicit `[edit] mode` on a local route wins over
+/// that default, while an explicitly set `assistance.local.edit_mode` replaces `[edit] mode` and is
+/// reported once. `inherit`, matching modes and unset modes report nothing. Never serialized.
 #[test]
-fn local_edit_mode_replacing_an_explicit_edit_mode_is_reported() {
+fn local_edit_mode_default_yields_to_explicit_edit_mode() {
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
     let local = "model = 'test'\n[endpoint]\nbase_url = 'http://127.0.0.1:9/v1'\n";
@@ -77,32 +77,40 @@ fn local_edit_mode_replacing_an_explicit_edit_mode_is_reported() {
         Config::from_layers(&layout, &toml::Table::new(), &project, &toml::Table::new()).unwrap()
     };
     let harness = Harness::default();
-    let explicit = resolve("[edit]\nmode = 'hashline'\n");
-    assert!(explicit.local_profile_applies());
+    let cases = [
+        ("", types::EditMode::Hashline, None),
+        (
+            "[assistance.local]\nedit_mode = 'replace'\n",
+            types::EditMode::Replace,
+            None,
+        ),
+        ("[edit]\nmode = 'patch'\n", types::EditMode::Patch, None),
+        (
+            "[edit]\nmode = 'hashline'\n[assistance.local]\nedit_mode = 'inherit'\n",
+            types::EditMode::Hashline,
+            None,
+        ),
+        (
+            "[edit]\nmode = 'patch'\n[assistance.local]\nedit_mode = 'replace'\n",
+            types::EditMode::Replace,
+            Some((types::EditMode::Replace, types::EditMode::Patch)),
+        ),
+    ];
+    for (extra, resolved, replacing) in cases {
+        let config = resolve(extra);
+        assert!(config.local_profile_applies(), "{extra:?}");
+        assert_eq!(config.resolved_edit_mode(&harness), resolved, "{extra:?}");
+        assert_eq!(
+            config.local_edit_mode_replacing_configured(&harness),
+            replacing,
+            "{extra:?}"
+        );
+    }
+    let explicit = resolve("[edit]\nmode = 'patch'\n");
     assert!(explicit.edit_mode_explicit);
-    assert_eq!(
-        explicit.local_edit_mode_replacing_configured(&harness),
-        Some((types::EditMode::Replace, types::EditMode::Hashline))
-    );
-    assert_eq!(
-        explicit.resolved_edit_mode(&harness),
-        types::EditMode::Replace,
-        "the local default still wins"
-    );
     assert!(
         !toml::Table::try_from(&explicit)
             .unwrap()
             .contains_key("edit_mode_explicit")
     );
-    for extra in [
-        "",
-        "[edit]\nmode = 'replace'\n",
-        "[edit]\nmode = 'hashline'\n[assistance.local]\nedit_mode = 'inherit'\n",
-    ] {
-        assert_eq!(
-            resolve(extra).local_edit_mode_replacing_configured(&harness),
-            None,
-            "{extra:?}"
-        );
-    }
 }

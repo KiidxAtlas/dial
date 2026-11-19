@@ -55,6 +55,179 @@ fn completed_process(exit_code: i32) -> crate::runtime::execution::ProcessOutcom
 }
 
 #[test]
+fn an_unlaunched_validation_helper_cannot_be_settled_by_a_write() {
+    use crate::agent::verify::completion::Decision;
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    let call = ToolCall {
+        id: "helper".into(),
+        name: "bash".into(),
+        malformed_arguments: false,
+        arguments: json!({"command":"cat > /tmp/test_output.py <<'PY'\nprint('examples')\nPY\npython3 /tmp/test_output.py"}),
+    };
+    agent.note_verification(
+        &call,
+        &ToolOutput::err("command not found").with_process(completed_process(127)),
+        &mut NullUi,
+    );
+    std::fs::write(root.path().join("result.txt"), "wrong").unwrap();
+    agent.step_checks.mutations += 1;
+    let decide = |agent: &mut Agent<'_>| {
+        agent.completion_decision(TurnOutcome::Completed, "Written.", &mut NullUi)
+    };
+    assert!(
+        matches!(decide(&mut agent), Decision::Continue(_)),
+        "write alone was accepted"
+    );
+    assert!(
+        matches!(decide(&mut agent), Decision::Incomplete(_)),
+        "unchecked completion was accepted on retry"
+    );
+    let acceptance =
+        json!({"acceptance":{"name":"output value","command":"grep -qx correct result.txt"}});
+    assert!(agent.register_acceptance(&acceptance, &mut NullUi).is_error);
+    assert!(matches!(decide(&mut agent), Decision::Incomplete(_)));
+    std::fs::write(root.path().join("result.txt"), "correct").unwrap();
+    agent.step_checks.mutations += 1;
+    let out = agent.register_acceptance(&acceptance, &mut NullUi);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(matches!(
+        decide(&mut agent),
+        Decision::Accept(TurnOutcome::Completed)
+    ));
+}
+
+#[test]
+fn unrelated_eval_receipt_cannot_clear_a_validation_launch_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.step_checks.validation_launch_gap = true;
+    agent.step_checks.mutations = 1;
+    let state = tempfile::tempdir().unwrap();
+    let checkpoints = Arc::new(
+        Checkpoints::new(state.path().join("session"), agent.workspace.root().into()).unwrap(),
+    );
+    agent.step_checks.turn = Some(checkpoints.begin_turn("standalone").unwrap());
+    let output = agent.workspace.root().join("out.csv");
+    checkpoints.before_write(&output).unwrap();
+    std::fs::write(&output, "a,b").unwrap();
+    agent.checkpoints = Some(checkpoints);
+    std::fs::write(root.path().join("reference.txt"), "ok").unwrap();
+    let observe = |agent: &mut Agent<'_>, path: &str, passed| {
+        let digest = crate::tools::exec::eval::check_source_digest(&agent.workspace, path).unwrap();
+        agent.step_checks.eval_checks.observe(&json!({"code":"..."}), &ToolOutput::structured(json!({
+            "checks":[{"runtime":"python","name":"file contents","passed":passed,"source":{"path":path,"sha256":digest}}]
+        })).with_observation(crate::runtime::execution::ObservationKind::Wait, true));
+    };
+    observe(&mut agent, "reference.txt", true);
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "an unrelated input is not the saved deliverable"
+    );
+    observe(&mut agent, "out.csv", true);
+    assert!(agent.artifact_check_reminder().is_none());
+    std::fs::write(&output, "x,y").unwrap();
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "same-size rewrite stales the receipt"
+    );
+    agent.step_checks.validation_launch_gap = false;
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "creation alone does not check a standalone output"
+    );
+    observe(&mut agent, "out.csv", false);
+    assert!(agent.artifact_check_reminder().is_some());
+    observe(&mut agent, "out.csv", true);
+    assert!(agent.artifact_check_reminder().is_none());
+}
+
+#[test]
+fn missing_optional_programs_and_printed_status_are_not_validation_obligations() {
+    let mut call = ToolCall {
+        id: "probe".into(),
+        name: "bash".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    };
+    let missing = ToolOutput::err("not found").with_process(completed_process(127));
+    for command in [
+        "python3 --version",
+        "echo test_output.py",
+        "node tools/generate.js",
+    ] {
+        call.arguments = json!({"command":command});
+        assert!(!validation_launch_gap(&call, &missing), "{command}");
+    }
+    call.arguments = json!({"command":"node './format.test.js'"});
+    assert!(validation_launch_gap(&call, &missing));
+    assert!(!validation_launch_gap(
+        &call,
+        &ToolOutput::err("[exit code: 127]")
+    ));
+    call.arguments = json!({"command":"project-validator", "check":true});
+    assert!(validation_launch_gap(&call, &missing));
+    let mut incomplete = completed_process(127);
+    incomplete.output_complete = false;
+    assert!(!validation_launch_gap(
+        &call,
+        &ToolOutput::err("partial").with_process(incomplete)
+    ));
+}
+
+#[test]
+fn local_repair_brief_tracks_checked_revision_and_drops_superseded_evidence() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_default_agent;
+    let command = "cargo test score";
+    let call = ToolCall {
+        id: "score-run".into(),
+        name: "bash".into(),
+        arguments: json!({"command":command}),
+        malformed_arguments: false,
+    };
+    let failed = ToolOutput::err("score.rs:19\nAssertionError: expected 5, got 4")
+        .with_process(completed_process(1));
+    with_default_agent("", |agent| {
+        // This run checks our edit, not an unchanged pre-task failure.
+        agent.step_checks.mutations += 1;
+        agent.note_verification(&call, &failed, &mut NullUi);
+        agent.step_checks.mutations += 1;
+        let note = agent.local_repair_note(Some("Fix the score")).unwrap();
+        let text = note["content"].as_str().unwrap();
+        for fact in [
+            "score.rs:19",
+            "expected 5, got 4",
+            "Fix the score",
+            "\"checkpointed_edit_since_check\":true",
+        ] {
+            assert!(text.contains(fact), "missing {fact}");
+        }
+        for superseding in [
+            ToolOutput::err("denied").with_status(crate::tools::ToolStatus::Blocked),
+            ToolOutput::ok("OK".into()).with_process(completed_process(0)),
+        ] {
+            agent.note_verification(&call, &failed, &mut NullUi);
+            assert!(agent.local_repair_note(None).is_some());
+            agent.note_verification(&call, &superseding, &mut NullUi);
+            assert!(agent.local_repair_note(None).is_none());
+        }
+    });
+    with_default_agent("[assistance.local]\nenabled=false", |agent| {
+        agent.note_verification(&call, &failed, &mut NullUi);
+        assert!(agent.local_repair_note(None).is_none());
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut hermetic = hermetic_agent(&config, root.path());
+    hermetic.note_verification(&call, &failed, &mut NullUi);
+    assert!(hermetic.local_repair_note(None).is_none());
+}
+
+#[test]
 fn printed_exit_code_earns_no_behavior_credit_without_observed_completion() {
     let root = tempfile::tempdir().unwrap();
     let mut config = Config::default();
@@ -84,12 +257,21 @@ fn printed_exit_code_earns_no_behavior_credit_without_observed_completion() {
         data: None,
         execution: Default::default(),
     };
-    agent.note_verification(&call, &prose, &mut NullUi);
+    struct PassCounter(u32);
+    impl Ui for PassCounter {
+        fn check_passed(&mut self) {
+            self.0 += 1;
+        }
+    }
+    let mut ui = PassCounter(0);
+    agent.note_verification(&call, &prose, &mut ui);
+    assert_eq!(ui.0, 0);
     assert_eq!(agent.verifications, vec![false]);
     assert_eq!(agent.behavioral_checks, vec![false]);
 
     let observed = prose.with_process(completed_process(0));
-    agent.note_verification(&call, &observed, &mut NullUi);
+    agent.note_verification(&call, &observed, &mut ui);
+    assert_eq!(ui.0, 1);
     assert_eq!(agent.verifications, vec![false, true]);
     assert_eq!(agent.behavioral_checks, vec![false, true]);
 }
@@ -1062,6 +1244,77 @@ fn background_check_overlaps_reads_and_settles_stale_inputs_without_credit() {
 }
 
 #[test]
+fn foreground_inspections_overlap_but_an_opaque_check_is_a_barrier() {
+    use crate::agent::safety::approval::{Effect, PermissionRule};
+    use verify::verification::CheckStatus;
+    #[derive(Default)]
+    struct Rows {
+        open: usize,
+        peak: usize,
+        order: Vec<String>,
+    }
+    impl Ui for Rows {
+        fn tool_call_with_args(&mut self, _: &str, _: &str, _: &str, args: &Value) {
+            if args["command"] == "touch marker" {
+                assert_eq!(self.open, 0);
+            }
+            self.open += 1;
+            self.peak = self.peak.max(self.open);
+        }
+        fn tool_result_with_id(&mut self, id: &str, _: &str, _: &ToolOutput) {
+            self.open -= 1;
+            self.order.push(id.to_owned());
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "source").unwrap();
+    let (mut config, _) = input_contract_config("cat input");
+    config.task.max_concurrency = 3;
+    for (name, cmd) in [
+        ("size", "wc -c input"),
+        ("lines", "tail input"),
+        ("writer", "touch marker"),
+        ("last", "head input"),
+    ] {
+        config.verification.commands.push(command(name, cmd));
+        let contract = config.verification.inputs["contract"].clone();
+        config.verification.inputs.insert(name.into(), contract);
+    }
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Auto;
+    agent.always.push(PermissionRule {
+        effect: Effect::Deny,
+        tool: "bash".into(),
+        command_prefix: vec!["wc".into()],
+        paths: vec![],
+    });
+    let checks = agent.current_focused_checks();
+    let mut rows = Rows::default();
+    let _ = agent.run_checks(&checks, &mut rows);
+    assert_eq!((rows.open, rows.peak), (0, 3));
+    assert_eq!(
+        rows.order,
+        checks
+            .iter()
+            .map(|c| format!("focused-check:{}", c.name))
+            .collect::<Vec<_>>()
+    );
+    assert!(root.path().join("marker").is_file());
+    for check in checks {
+        let expected = if check.name == "size" {
+            CheckStatus::PermissionDenied
+        } else {
+            CheckStatus::Passed
+        };
+        assert_eq!(
+            agent.step_checks.evidence.latest_status(&check.command),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
 fn background_check_slots_run_configured_checks_side_by_side() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("input"), "before").unwrap();
@@ -1108,6 +1361,17 @@ fn background_check_slots_run_configured_checks_side_by_side() {
             "{command}"
         );
     }
+    let before = agent.efficiency_metrics.backend_operations.borrow()["check_input_capture"].calls;
+    agent.start_background_check(&mut NullUi);
+    assert!(
+        agent.pending_check.is_none(),
+        "unchanged passes were reused"
+    );
+    assert_eq!(
+        agent.efficiency_metrics.backend_operations.borrow()["check_input_capture"].calls - before,
+        2,
+        "one fresh snapshot per reuse decision"
+    );
 }
 
 #[test]
@@ -1565,4 +1829,118 @@ fn focused_python_checks_avoid_an_interpreter_hidden_by_the_shell_sandbox() {
         python,
         "unsandboxed commands can run it"
     );
+}
+
+#[test]
+fn one_current_pass_does_not_discharge_other_stale_or_unobserved_checks() {
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.enabled = true;
+    config.verification.automatic_checks = false;
+    config.verification.commands = vec![
+        command("first", "echo first"),
+        command("second", "echo second"),
+    ];
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    observe_at(&mut agent, "echo second", CheckStatus::Passed);
+    agent.step_checks.mutations += 1;
+    agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+    observe_at(&mut agent, "echo first", CheckStatus::Passed);
+    assert_eq!(
+        agent.current_gate_outcome().unverified,
+        Some(vec!["second".into()]),
+        "neither a current first check nor an unrelated shell pass covers the stale second check"
+    );
+    agent.step_checks.evidence = Default::default();
+    observe_at(&mut agent, "echo first", CheckStatus::Passed);
+    assert_eq!(
+        agent.current_gate_outcome().unverified,
+        Some(vec!["second".into()]),
+        "neither a current first check nor an unrelated shell pass covers the unobserved second check"
+    );
+    observe_at(&mut agent, "echo second", CheckStatus::Passed);
+    assert!(agent.current_gate_outcome().unverified.is_none());
+
+    observe_at(&mut agent, "echo second", CheckStatus::CodeFailed);
+    let second = crate::agent::verify::verification::FocusedCheck {
+        name: "second".into(),
+        command: "echo second".into(),
+        timeout_secs: 5,
+    };
+    agent.step_checks.failed_checks.push(second);
+    let failing = agent.gate_unverified_edits(false, &mut NullUi);
+    assert!(
+        failing.blocking,
+        "an unrelated shell pass erased a retained failure"
+    );
+    assert_eq!(failing.unverified, Some(vec!["second".into()]));
+
+    observe_at(
+        &mut agent,
+        "echo second",
+        CheckStatus::EnvironmentUnavailable,
+    );
+    let disclosed = agent.gate_unverified_edits(false, &mut NullUi);
+    assert!(!disclosed.blocking);
+    assert_eq!(
+        disclosed.unverified, None,
+        "disclosed failures are not outstanding checks"
+    );
+}
+
+#[test]
+fn identical_clipped_presentations_cannot_hide_a_changed_baseline_failure() {
+    use crate::runtime::execution::Completeness;
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(command("unit", "cargo test unit"));
+    let mut agent = hermetic_agent(&config, root.path());
+    let store = crate::storage::artifact::ArtifactStore::new(state.path()).unwrap();
+    agent.workspace = agent.workspace.clone().with_artifacts(store.clone());
+    let call = ToolCall {
+        id: "focused-check:unit".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"cargo test unit"}),
+        malformed_arguments: false,
+    };
+    let output = |diagnostic: &str| {
+        let (uri, mut integrity) = store.retain_with_integrity(diagnostic).unwrap();
+        integrity.capture = Completeness::Complete;
+        integrity.presentation = Completeness::Partial;
+        integrity.artifact = Some(uri);
+        ToolOutput::err("failed\n[... clipped ...]")
+            .with_process(completed_process(1))
+            .with_output_integrity(integrity)
+    };
+    let before = output("AssertionError: old failure\n");
+    agent.note_verification(&call, &before, &mut NullUi);
+    agent.step_checks.mutations += 1;
+    agent.note_verification(&call, &before, &mut NullUi);
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "unit".into(),
+        command: "cargo test unit".into(),
+        timeout_secs: 5,
+    };
+    assert_eq!(
+        agent.disclosed_failure(&check, false),
+        Some("unchanged pre-existing failure outside the requested scope")
+    );
+    agent.note_verification(
+        &call,
+        &output("AssertionError: new regression\n"),
+        &mut NullUi,
+    );
+    assert!(
+        !agent
+            .step_checks
+            .evidence
+            .unchanged_unrelated_failure("cargo test unit")
+    );
+    assert_eq!(agent.disclosed_failure(&check, false), None);
 }

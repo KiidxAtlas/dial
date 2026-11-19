@@ -581,6 +581,7 @@ impl Shell {
                         .with_learning(learning_models)
                         .with_usage(&app.layout.user_dir)
                         .with_shared_downloads(downloads);
+                models.set_presets(&effective.model_presets);
                 models.set_memory_optional(
                     crate::config::memory_backend::auto_retain_uses_memory_role(&effective.memory),
                 );

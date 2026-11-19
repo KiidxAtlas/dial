@@ -365,9 +365,14 @@ impl<'a> Agent<'a> {
                 return crate::agent::workers::live_tasks::output(reply);
             }
             "peek" => {
-                let reply = self
-                    .live_tasks
-                    .pool_report(args["id"].as_str().unwrap_or(""), true);
+                let id = args["id"].as_str().unwrap_or("");
+                let reply = if self.live_tasks.is_pool(id) {
+                    self.live_tasks.pool_report(id, true)
+                } else if self.live_tasks.is_job(id) {
+                    self.live_tasks.status(Some(id))
+                } else {
+                    self.live_tasks.pool_report(id, true)
+                };
                 return crate::agent::workers::live_tasks::output(reply);
             }
             "close" => {

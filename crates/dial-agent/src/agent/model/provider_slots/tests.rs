@@ -101,38 +101,69 @@ fn explicitly_limited_remote_provider_announces_its_queue_once() {
 }
 
 #[test]
-fn queued_cancellation_exits_before_release_without_leaking_capacity() {
-    let key = "test-provider-checked-cancel".to_owned();
-    let held = acquire_key(key.clone(), 1, &AtomicBool::new(false)).unwrap();
-    let cancelled = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter_key = key.clone();
-        let cancelled = &cancelled;
-        scope.spawn(move || {
-            let result = acquire_key_checked(waiter_key, 1, || {
-                queued_tx.send(()).unwrap();
-                if cancelled.load(Ordering::SeqCst) {
-                    Err("operation cancelled")
-                } else {
-                    Ok(())
-                }
+fn cancellation_hands_capacity_to_the_next_waiter_even_if_it_races_a_grant() {
+    for cancel_after_grant in [false, true] {
+        let key = format!("test-provider-cancel-handoff-{cancel_after_grant}");
+        let interrupt = AtomicBool::new(false);
+        let mut held = try_acquire_key(key.clone(), 1);
+        assert!(held.is_some());
+        std::thread::scope(|scope| {
+            let (queued_tx, queued_rx) = mpsc::channel();
+            let (resume, paused) = mpsc::channel();
+            let waiter_key = key.clone();
+            let cancel = &interrupt;
+            let waiter = scope.spawn(move || {
+                acquire_key_checked_notify(
+                    waiter_key,
+                    1,
+                    || {
+                        if cancel.load(Ordering::SeqCst) {
+                            Err("operation cancelled")
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        queued_tx.send(()).unwrap();
+                        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                    },
+                )
+                .err()
             });
-            done_tx.send(result.err()).unwrap();
+            queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (queued_tx, queued_rx) = mpsc::channel();
+            let next_key = key.clone();
+            let next = scope.spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                acquire_key_checked_notify(
+                    next_key,
+                    1,
+                    || {
+                        (std::time::Instant::now() < deadline)
+                            .then_some(())
+                            .ok_or(())
+                    },
+                    || queued_tx.send(()).unwrap(),
+                )
+                .ok()
+            });
+            queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if cancel_after_grant {
+                drop(held.take());
+            }
+            interrupt.store(true, Ordering::SeqCst);
+            resume.send(()).unwrap();
+            assert_eq!(waiter.join().unwrap(), Some("operation cancelled"));
+            drop(held.take());
+            let granted = next
+                .join()
+                .unwrap()
+                .expect("cancelled waiter blocked its successor");
+            assert!(try_acquire_key(key.clone(), 1).is_none());
+            drop(granted);
+            assert!(try_acquire_key(key.clone(), 1).is_some());
         });
-        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        cancelled.store(true, Ordering::SeqCst);
-        let result = done_rx.recv_timeout(Duration::from_secs(2));
-        // Always release the holder even on failure, so the scoped thread can exit.
-        assert!(try_acquire_key(key.clone(), 1).is_none());
-        drop(held);
-        assert_eq!(result.unwrap(), Some("operation cancelled"));
-    });
-    let next = try_acquire_key(key.clone(), 1).expect("cancelled admission leaked capacity");
-    assert!(try_acquire_key(key.clone(), 1).is_none());
-    drop(next);
-    assert!(try_acquire_key(key, 1).is_some());
+    }
 }
 
 #[test]
@@ -242,4 +273,53 @@ fn queued_notice_fires_once_only_when_the_slot_is_taken() {
         "the wait is announced exactly once"
     );
     assert!(try_acquire_key(key, 1).is_some());
+}
+
+#[test]
+fn fifo_handoff_cannot_be_overtaken_by_another_waiter_or_a_probe() {
+    let key = "test-provider-fifo".to_owned();
+    let held = try_acquire_key(key.clone(), 1).unwrap();
+    std::thread::scope(|scope| {
+        let (grants, acquired) = mpsc::channel();
+        let mut resumes = Vec::new();
+        for id in 0..3 {
+            let key = key.clone();
+            let grants = grants.clone();
+            let (queued, ready) = mpsc::channel();
+            let (resume, paused) = mpsc::channel();
+            resumes.push(resume);
+            scope.spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let slot = acquire_key_checked_notify(
+                    key,
+                    1,
+                    || {
+                        (std::time::Instant::now() < deadline)
+                            .then_some(())
+                            .ok_or(())
+                    },
+                    || {
+                        queued.send(()).unwrap();
+                        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                    },
+                )
+                .unwrap();
+                grants.send((id, slot)).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        drop(held);
+        // No waiter has returned from its notice yet, but only the oldest owns the grant.
+        assert!(try_acquire_key(key.clone(), 1).is_none());
+        assert!(try_acquire_key("test-provider-fifo-independent".into(), 1).is_some());
+        for resume in resumes.into_iter().rev() {
+            resume.send(()).unwrap();
+        }
+        for expected in 0..3 {
+            let (id, slot) = acquired.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(id, expected);
+            drop(slot);
+        }
+        assert!(try_acquire_key(key.clone(), 1).is_some());
+    });
 }

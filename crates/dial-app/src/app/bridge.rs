@@ -16,6 +16,16 @@ use std::time::{Duration, Instant};
 // The agent <-> screen bridge
 // ---------------------------------------------------------------------------
 
+pub(super) struct PendingCall {
+    pub id: String,
+    pub name: String,
+    pub started: Instant,
+    pub testing: bool,
+    /// The newest presentation the engine sent for this call. At settle time the engine sends
+    /// the one built from the complete result (structured data included) just before the result.
+    pub view: Option<crate::tools::surface::presentation::Presentation>,
+}
+
 pub(super) struct Bridge<'a> {
     pub(super) app: &'a App,
     pub(super) shell: &'a mut Shell,
@@ -23,8 +33,8 @@ pub(super) struct Bridge<'a> {
     pub(super) started: Instant,
     pub(super) last_paint: Instant,
     pub(super) failed: bool,
-    /// (id, tool name, started) of tool calls awaiting their result, oldest first.
-    pub(super) pending: Vec<(String, String, Instant)>,
+    /// Tool calls awaiting their result, oldest first.
+    pub(super) pending: Vec<PendingCall>,
     pub(super) next_id: u64,
 }
 
@@ -129,7 +139,7 @@ impl Bridge<'_> {
     /// on this label until the turn settles (`set_activity` holds it once the flag is up).
     fn mark_stopping(&mut self, reason: Option<&str>) {
         let mut activity = match self.pending.last() {
-            Some((_, name, _)) => format!("stopping after {name}"),
+            Some(call) => format!("stopping after {}", call.name),
             None => "stopping".to_owned(),
         };
         if let Some(reason) = reason {

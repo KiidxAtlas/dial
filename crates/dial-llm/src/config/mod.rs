@@ -810,12 +810,19 @@ impl Config {
             .get("edit")
             .and_then(toml::Value::as_table)
             .is_some_and(|edit| edit.contains_key("mode"));
+        let local_edit_mode_explicit = table
+            .get("assistance")
+            .and_then(toml::Value::as_table)
+            .and_then(|assistance| assistance.get("local"))
+            .and_then(toml::Value::as_table)
+            .is_some_and(|local| local.contains_key("edit_mode"));
         layout.ensure_project_outside_storage()?;
         let mut config: Config = toml::Value::Table(table)
             .try_into()
             .context("invalid configuration")?;
         config.harness_temperature_pinned = harness_temperature_pinned;
         config.edit_mode_explicit = edit_mode_explicit;
+        config.local_edit_mode_explicit = local_edit_mode_explicit;
         if let Some(mode) = std::env::var_os("DIAL_EDIT_VARIANT") {
             let mode = mode
                 .into_string()
@@ -1468,7 +1475,10 @@ impl Config {
             .filter(|&&(role, _)| role != TURN_DRAFTER || self.experimental.turn_optimizer)
             .map(|&(role, _)| {
                 let assigned = if role == "main" {
-                    Some(self.selection())
+                    // Main's level lives in its profile or `thinking_auto`; carry it with the row.
+                    let mut main = self.selection();
+                    main.thinking = thinking::main_level(self);
+                    Some(main)
                 } else {
                     self.model_roles.get(role).cloned()
                 };
@@ -1735,14 +1745,17 @@ impl Config {
     pub fn base_edit_mode(&self, harness: &Harness) -> types::EditMode {
         self.pinned_edit_mode(harness).unwrap_or(self.edit.mode)
     }
-    /// `(local, configured)` when the local route's `assistance.local.edit_mode` replaces an
-    /// explicitly set `[edit] mode`; `None` when a pin decides, the modes agree, `[edit] mode` is
+    /// `(local, configured)` when the local route's explicitly set `assistance.local.edit_mode` replaces
+    /// an explicitly set `[edit] mode`; `None` when a pin decides, the modes agree, either mode is
     /// unset or the local profile does not apply.
     pub fn local_edit_mode_replacing_configured(
         &self,
         harness: &Harness,
     ) -> Option<(types::EditMode, types::EditMode)> {
-        if !self.edit_mode_explicit || self.pinned_edit_mode(harness).is_some() {
+        if !self.edit_mode_explicit
+            || !self.local_edit_mode_explicit
+            || self.pinned_edit_mode(harness).is_some()
+        {
             return None;
         }
         self.local_edit_mode()
@@ -1750,11 +1763,16 @@ impl Config {
             .map(|local| (local, self.edit.mode))
     }
 
-    /// `assistance.local.edit_mode` when the local profile applies to the main route.
+    /// `assistance.local.edit_mode` when the local profile applies to the main route. The built-in
+    /// local default yields to an explicit `[edit] mode`.
     fn local_edit_mode(&self) -> Option<types::EditMode> {
-        self.local_profile_applies()
-            .then_some(self.assistance.local.edit_mode.0)
-            .flatten()
+        if !self.local_profile_applies() {
+            return None;
+        }
+        if self.edit_mode_explicit && !self.local_edit_mode_explicit {
+            return None;
+        }
+        self.assistance.local.edit_mode.0
     }
 
     /// The `[assistance.local]` profile is on and the selected main model is served locally.

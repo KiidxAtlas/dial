@@ -8,6 +8,7 @@ pub(in crate::app) fn expand<'a>(name: &'a str, args: &'a str) -> (&'a str, &'a 
         .split_once(char::is_whitespace)
         .map_or((args, ""), |(sub, rest)| (sub, rest.trim()));
     match (name, sub) {
+        ("undo", "files") => ("rollback", rest),
         ("mode", "plan" | "approval" | "vibe" | "skillful") => (sub, rest),
         ("dirs", "add") => ("add-dir", rest),
         ("dirs", "remove") => ("remove-dir", rest),

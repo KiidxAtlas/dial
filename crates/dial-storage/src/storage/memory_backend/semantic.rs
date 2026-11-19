@@ -1553,7 +1553,7 @@ impl Driver for Semantic {
             "clear" => match rest.trim() {
                 "user" => self.clear_bank(op, true),
                 "" | "project" => self.clear_bank(op, false),
-                _ => Err(anyhow::anyhow!("usage: /memory clear [user]")),
+                _ => Err(anyhow::anyhow!("Usage: /memory clear [user]")),
             },
             _ => return None,
         })
@@ -1787,7 +1787,7 @@ impl Semantic {
 
     fn forget_command(&mut self, op: &Operation, rest: &str) -> Result<Value> {
         const USAGE: &str =
-            "usage: /memory forget <ref> <revision>, where <ref> is <n> or user:<n>";
+            "Usage: /memory forget <ref> <revision>, where <ref> is <n> or user:<n>";
         let (reference, after) = split_word(rest);
         let (revision_text, extra) = split_word(after);
         let fact = FactRef::parse(reference).context(USAGE)?;
@@ -1798,7 +1798,7 @@ impl Semantic {
 
     fn update_command(&mut self, op: &Operation, rest: &str) -> Result<Value> {
         const USAGE: &str =
-            "usage: /memory update <ref> <revision> <content>, where <ref> is <n> or user:<n>";
+            "Usage: /memory update <ref> <revision> <content>, where <ref> is <n> or user:<n>";
         let (reference, after) = split_word(rest);
         let (revision_text, content) = split_word(after);
         let fact = FactRef::parse(reference).context(USAGE)?;
@@ -1808,7 +1808,7 @@ impl Semantic {
 
     fn history_command(&mut self, rest: &str) -> Result<Value> {
         let fact = FactRef::parse(rest)
-            .context("usage: /memory history <ref>, where <ref> is <n> or user:<n>")?;
+            .context("Usage: /memory history <ref>, where <ref> is <n> or user:<n>")?;
         let store = if fact.global { &self.user } else { &self.store };
         let history = store.history(fact.id)?;
         Ok(
@@ -1833,7 +1833,7 @@ impl Semantic {
             "" => (true, true),
             "project" => (true, false),
             "user" => (false, true),
-            _ => anyhow::bail!("usage: /memory view [project|user]"),
+            _ => anyhow::bail!("Usage: /memory view [project|user]"),
         };
         let mut banks = Vec::new();
         for (global, wanted) in [(false, project), (true, user)] {

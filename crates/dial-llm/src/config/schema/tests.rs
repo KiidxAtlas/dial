@@ -8,17 +8,17 @@ fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
             && defaults.eval.auto_offer
             && defaults.eval.parallel_batches
     );
-    assert!(defaults.verification.auto_registered_checks);
+    assert!(!defaults.verification.auto_registered_checks);
     assert!(defaults.efficiency.preserve_task_inputs);
     assert!(!defaults.experimental.adaptive_output_effort);
     assert_eq!(defaults.compaction.argument_projection_tokens, 0);
-    let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
+    let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=true\n").unwrap();
     assert!(
         !configured.eval.portable_helpers
             && !configured.eval.auto_offer
             && !configured.eval.parallel_batches
     );
-    assert!(!configured.verification.auto_registered_checks);
+    assert!(configured.verification.auto_registered_checks);
     assert!(!configured.efficiency.preserve_task_inputs);
     let mut invalid = defaults;
     invalid.efficiency.evidence_stall_rounds = 257;
@@ -650,8 +650,8 @@ fn optional_and_ui_fields_have_routes_too() {
     let mut fields = Vec::new();
     let _ = UiConfig::deserialize(Fields(&mut fields));
     for field in fields {
-        // Retired compatibility input; never read or serialized (model_config::UiConfig).
-        if field == "hyperlinks" {
+        // Retired compatibility inputs; never read or serialized (model_config::UiConfig).
+        if matches!(field, "hyperlinks" | "status_transparent") {
             continue;
         }
         assert!(
@@ -911,6 +911,19 @@ fn failed_turns_notify_by_default_but_an_explicit_opt_out_is_kept() {
 }
 
 #[test]
+fn retired_status_transparent_still_loads_and_is_no_longer_a_setting() {
+    let old: Config = toml::from_str("[ui]\nstatus_transparent = true\n").unwrap();
+    let table = Table::try_from(old).expect("config serializes");
+    let ui = table["ui"].as_table().expect("ui table");
+    assert!(!ui.contains_key("status_transparent"), "{ui:?}");
+    assert!(
+        registry()
+            .iter()
+            .all(|def| def.path != "ui.status_transparent")
+    );
+}
+
+#[test]
 fn reasoning_strategy_is_opt_in_and_all_settings_options_roundtrip() {
     use crate::config::types::ReasoningStrategy;
     let path = "experimental.reasoning_strategy";
@@ -1083,4 +1096,44 @@ fn status_lists_written_by_a_command_name_only_known_segments() {
     // Other lists and the lenient load-time check are unaffected.
     check_status_segments("integrations", &list(&["nope"])).unwrap();
     check_value("ui.status_left", &list(&["nope"])).unwrap();
+}
+
+/// `docs/benchmarks.md` keeps one ledger row per `experimental.*` setting with its shipped
+/// default, so a flag cannot be added, removed or have its default changed without the ledger.
+#[test]
+fn experimental_ledger_lists_every_experimental_setting() {
+    let doc = include_str!("../../../../../docs/benchmarks.md");
+    let section = doc
+        .split_once("### Experimental settings ledger")
+        .expect("benchmarks.md has the experimental settings ledger")
+        .1;
+    let section = section.split("\n## ").next().unwrap();
+    let mut ledger = std::collections::BTreeMap::new();
+    for row in section
+        .lines()
+        .filter(|line| line.starts_with("| `experimental."))
+    {
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let key = cells[0].trim_matches('`').to_owned();
+        let default = cells[1].trim_matches('`').to_owned();
+        assert!(
+            ledger.insert(key.clone(), default).is_none(),
+            "duplicate ledger row {key}"
+        );
+    }
+    let declared: std::collections::BTreeMap<String, String> = registry()
+        .iter()
+        .filter(|setting| setting.path.starts_with("experimental."))
+        .map(|setting| {
+            let default = match setting.default_value().expect("experimental default") {
+                Value::String(text) => text,
+                other => other.to_string(),
+            };
+            (setting.path.to_owned(), default)
+        })
+        .collect();
+    assert_eq!(
+        ledger, declared,
+        "update the experimental settings ledger in docs/benchmarks.md"
+    );
 }

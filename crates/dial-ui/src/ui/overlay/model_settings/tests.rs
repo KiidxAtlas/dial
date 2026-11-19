@@ -192,11 +192,15 @@ fn edit_style_renders_inheritance_and_pin_changes_without_persisting_the_fallbac
         let inherited_label = format!("{inherited} (inherited)");
         let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
         assert!(text.contains(&inherited_label), "{text}");
+        let help = text.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            text.contains("Unset inherits Dial's effective edit grammar"),
+            help.contains("Unset inherits the preferred style (default: hashline)"),
             "{text}"
         );
-        assert!(text.contains("not adaptive benchmarking"), "{text}");
+        assert!(
+            help.contains("Other supported grammars still work"),
+            "{text}"
+        );
 
         let saved = press(&mut overlay, &rig, KeyCode::Right);
         assert_eq!(saved["edit_mode"].as_str(), Some("hashline"));

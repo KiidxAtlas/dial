@@ -355,6 +355,63 @@ fn delta(content: &str) -> Value {
 }
 
 #[test]
+fn a_tool_name_before_arguments_notifies_the_generation_watchdog() {
+    let mut acc = Accumulator::default();
+    let mut events = Vec::new();
+    for call in [
+        json!({"index":0,"id":"c","function":{"name":"write"}}),
+        json!({"index":0,"function":{"arguments":"{}"}}),
+    ] {
+        let frame = json!({"choices":[{"delta":{"tool_calls":[call]}}]});
+        acc.feed_with_events(&frame.to_string(), &mut |_| true, &mut |event| {
+            events.push(event.clone());
+            true
+        })
+        .unwrap();
+    }
+    let arguments: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            super::super::StreamEvent::ToolArguments { name, delta, .. } => {
+                Some((name.as_str(), delta.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arguments, [("write", ""), ("write", "{}")]);
+}
+
+#[test]
+fn refusal_only_chat_completions_are_not_empty_replies_to_retry() {
+    let message = json!({"role":"assistant","content":null,"refusal":"Cannot assist."});
+    let reason = "stop";
+    let (streamed, visible) = run(&[
+        json!({"choices":[{"delta":message}]}),
+        json!({"choices":[{"delta":{},"finish_reason":reason}]}),
+    ]);
+    let body = json!({"choices":[{"message":message,"finish_reason":reason}]}).to_string();
+    assert_eq!(visible, "Cannot assist.");
+    for reply in [streamed, super::super::parse_reply(body.as_bytes())] {
+        let reply = reply.unwrap();
+        assert_eq!(reply.text, visible);
+        assert!(matches!(
+            reply.provider_stop(),
+            Some(super::super::ProviderStop::Refusal { .. })
+        ));
+        assert!(reply.tool_calls.is_empty());
+    }
+    let filtered =
+        json!({"choices":[{"message":{"content":null},"finish_reason":"content_filter"}]})
+            .to_string();
+    assert!(
+        super::super::parse_reply(filtered.as_bytes())
+            .unwrap()
+            .provider_stop()
+            .is_some()
+    );
+}
+
+#[test]
 fn text_deltas_usage_and_finish() {
     let (reply, streamed) = run(&[
         delta("Hel"),
