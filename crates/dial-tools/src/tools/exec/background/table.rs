@@ -94,6 +94,7 @@ pub(super) struct Ring {
     /// The output reader has finished, including artifact finalization.
     pub(super) closed: bool,
     pub(super) artifact: Option<String>,
+    pub(super) spool_path: Option<std::path::PathBuf>,
     pub(super) error: Option<String>,
     pub(super) reached_eof: bool,
     pub(super) elided_bytes: u64,
@@ -156,6 +157,7 @@ impl Ring {
             cursor: 0,
             closed: false,
             artifact: None,
+            spool_path: None,
             error: None,
             reached_eof: false,
             elided_bytes: 0,
@@ -308,6 +310,9 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut spool: Option<ArtifactSpool>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<()>> {
+    if let Some(writer) = &spool {
+        lock(&ring).spool_path = Some(writer.path().to_path_buf());
+    }
     std::thread::Builder::new()
         .name("dial-bg-reader".into())
         .spawn(move || {
@@ -331,13 +336,20 @@ fn spawn_reader<R: Read + Send + 'static>(
                         break;
                     }
                     Ok(count) => {
-                        if let Some(writer) = &mut spool
-                            && let Err(e) = writer.write_all(&buffer[..count])
-                        {
-                            error = Some(format!("capturing complete output: {e}"));
-                            // Do not publish a partially written artifact, or lose live output.
-                            spool = None;
-                            lock(&ring).error = error.clone();
+                        if let Some(writer) = &mut spool {
+                            if let Err(e) = writer.write_all(&buffer[..count]) {
+                                error = Some(format!("capturing complete output: {e}"));
+                                // Do not publish a partially written artifact, or lose live output.
+                                spool = None;
+                                let mut r = lock(&ring);
+                                r.spool_path = None;
+                                r.error = error.clone();
+                            } else {
+                                let elided = writer.elided_bytes();
+                                if elided != 0 {
+                                    lock(&ring).elided_bytes = elided;
+                                }
+                            }
                         }
                         lock(&ring).push(&buffer[..count]);
                         wake::notify();
@@ -385,6 +397,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                 let mut ring = lock(&ring);
                 ring.reached_eof = reached_eof;
                 ring.elided_bytes = elided_bytes;
+                ring.spool_path = None;
                 match artifact {
                     Ok(uri) => ring.artifact = uri,
                     Err(e) => error = Some(format!("saving complete output artifact: {e}")),

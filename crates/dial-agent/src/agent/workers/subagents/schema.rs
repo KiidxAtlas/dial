@@ -43,7 +43,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate independent work: tasks[] shares context; start returns ids, wait collects results. Default: read-only on main model. source_session attaches a record to a read-only audit, never permission. Types:{types}{presets}"
+        "Delegate independent work: tasks[] shares context; start returns ids, wait collects. Default read-only; source_session attaches a record, never permission. Types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Names of configured checks, not shell commands. A mutating worker's changes merge only when these pass."},

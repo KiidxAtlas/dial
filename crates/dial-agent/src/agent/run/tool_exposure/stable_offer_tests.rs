@@ -113,6 +113,13 @@ fn hosted_and_local_core_offers_obey_the_byte_budget_and_ignore_task_routing() {
             let offered = agent.offered();
             let schemas = agent.schemas(&offered).unwrap();
             let bytes = serde_json::to_vec(&schemas).unwrap().len();
+            let pair = agent
+                .schemas(&["task".to_owned(), "message".to_owned()])
+                .unwrap();
+            eprintln!(
+                "delegation pair task+message: {} schema bytes",
+                serde_json::to_vec(&pair).unwrap().len()
+            );
             eprintln!(
                 "core ({overlay:?}): {} tools, {bytes} schema bytes: {offered:?}",
                 offered.len()

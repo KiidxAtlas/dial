@@ -21,7 +21,7 @@ pub(crate) const TOOL_POLICY: &str = "
 
 # Tool policy
 - Inspect the target and owner with the most precise tool available; make supported, reversible choices instead of asking.
-- Ask one concise question only when investigation leaves an ambiguity that materially changes correctness, scope or authorization.
+- Ask one question only when investigation leaves an ambiguity that materially changes correctness, scope or authorization.
 - Read before editing; reuse numbered lines. Inspect inputs with `read` unless generating a new artifact as below.
 - For new artifacts with clear inputs and outputs, read inputs, compute, write, and validate in one run. Inspect separately only if it could change the approach.
 - Keep tool arguments short; use `edit` for local changes.";
@@ -55,7 +55,7 @@ pub(crate) const TESTING_DECISIONS: &str = "
 - Test doubles and unavailable runtimes do not establish live behavior.";
 pub(crate) const ARTIFACT_CHECK_RULE: &str = "`verify` acceptance {name, command}";
 pub(crate) const ARTIFACT_SHELL_CHECK: &str = "foreground `bash` check:true with check_paths";
-pub(crate) const ARTIFACT_CASES: &str = "Check saved bytes; fail with input, expected, actual. Reuse after fixes; keep required checks.";
+pub(crate) const ARTIFACT_CASES: &str = "Read the saved artifact with the requested consumer; assert exact output type and value, positive/negative. Substitutes are partial; keep required checks.";
 pub(crate) const DELIVERY: &str = "
 
 # Delivery

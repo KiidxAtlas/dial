@@ -1454,6 +1454,15 @@ fn http_error(
     {
         excerpt.push_str(" — this model rejected image input; select a vision-capable model or remove the image attachment.");
     }
+    if status == 400
+        && error_type.as_deref() == Some("invalid_request_error")
+        && message.as_deref().is_some_and(|m| {
+            let trimmed = m.trim();
+            trimmed.eq_ignore_ascii_case("error") || trimmed.to_ascii_lowercase().contains("oauth")
+        })
+    {
+        excerpt.push_str(" — the provider returned an opaque 400 invalid_request_error; check provider authentication in /providers (re-authenticate if using OAuth/subscription) or try a fresh request/model.");
+    }
     // Classify from the whole (possibly truncated) body, including error codes the excerpt drops,
     // before any custom-header redaction can withhold it.
     let code = parsed

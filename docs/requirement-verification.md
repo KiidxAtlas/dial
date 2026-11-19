@@ -10,6 +10,20 @@ the current focused selection, requirement IDs, working-state deliverable IDs, a
 It includes recorded evidence statuses at the current effect revision; it does **not** revalidate
 external input freshness, record a pass, or establish that the declared checks cover the task.
 
+The latest 32 source-bound Eval checks in the turn are reported separately under
+`artifact_local_checks`. The plan and completion evidence compare each source's current bytes
+to its recorded SHA-256 and mark its freshness `current`, `stale`, or `unavailable`.
+A matching digest means the same bytes were observed, not that the assertion ran again or that
+its logic was correct. Editing another file does not invalidate this observation. Missing files
+or lost read access leave freshness unknown. These receipts never satisfy a declared requirement.
+After a validation command exits 127, a successful Eval cell may settle the missing-check reminder
+for standalone artifacts: bind a passing assertion to **each** checkpointed changed file in that
+cell, using its whole-file `dial.read` receipt. Dial rechecks those digests before completion. An
+unbound assertion or a check of an unrelated file does not cover an edit. This does not turn Eval
+into a passing shell test; disclose any intended consumer you could not run.
+The same evidence is requested for newly created CSV/TSV, JSON/JSONL, regex, and shell/Python/JS
+outputs without an applicable focused check, even when no shell command has failed.
+
 The text preview shows up to 16 checks and requirements; structured check rows are capped at 64
 with an explicit omitted count. Structured requirement coverage retains the configured mapping.
 No declared requirements means `not_independently_assessed`, not successful coverage. Establish a

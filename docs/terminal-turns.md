@@ -250,6 +250,16 @@ key shows the full text or the ordinary tool card.
   line counts, or the branch, remote and pushed range. Failures keep the full output.
 - **A completed `web_search`** lists the first five titles and hosts in a card, with the result
   count and provider on its foot.
+- **A completed `verify`** reads as one row with its counts when every check passed. Otherwise a
+  card lists each check that did not pass with the first thing to fix (a failing test and its
+  reason, or the first error and where it is). Code failures are red; environment, permission and
+  timeout results are amber, since they are not code defects.
+- **A completed `git status` or `git diff`** reads as what git reported: the branch and its
+  tracking state with staged, changed and untracked counts and one row per file, or the changed
+  files with their line counts. Piped or redirected output, a diff whose middle was cut and every
+  failure keep the ordinary card with the full output.
+- **Settled cards use the result's structured data**, not only its text, when the tool provided
+  it, so counts and rows built from typed results stay on the card after it settles.
 - **Runs of skill loads, tool loads or learning notes** fold into one row with a `×N` count. The
   session history keeps every event.
 

@@ -37,13 +37,13 @@ Set environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPT
 
 ### Bundled execution runtime and installed-feature gate
 
-Release binaries embed a compressed, target-specific Node runtime alongside the existing
-embedded shell and utilities. The executable remains the installation/update unit: no sibling
-runtime directory needs to survive an installer or self-update. Default `eval.node` and
-`browser.node` (`node`), and the computer worker, prefer this payload. Explicit executable
-overrides remain operator-owned; Python, browser packages/Chromium and project toolchains are
-not bundled by this change. A bundled runtime is extracted into Dial's private cache and its
-length and SHA-256 are checked before reuse. Corruption is an error, not a PATH fallback.
+Release binaries embed target-specific Node and CPython runtimes alongside the shell and utilities.
+The executable remains the installation/update unit. Default `eval.node`, `browser.node`, and the
+computer worker prefer bundled Node. Python Eval uses bundled CPython when no project environment or
+explicit interpreter override is selected. The stdlib is included, not third-party project packages,
+Chromium or other toolchains. Node is extracted to Dial’s private cache and verified on reuse.
+CPython is extracted to a fresh private directory held for the interpreter’s lifetime. A broken
+payload is an error, not a reason to silently switch interpreters.
 
 `runtimes/node/manifest.json` pins Node's version, target archive and SHA-256. Release builds
 run `scripts/prepare-node.py --target <triple> --output <directory>` and set
@@ -54,6 +54,16 @@ To refresh the pin, review upstream checksum inputs and license, update every ta
 then rerun payload tests and native installed-artifact checks. ARM64 musl uses the explicitly
 pinned Node unofficial-builds artifact; other targets use nodejs.org artifacts. Musl Node needs
 the system `libstdc++` and `libgcc` packages, which the Alpine release gate installs explicitly.
+
+`runtimes/python/manifest.json` pins each CPython archive. Run `scripts/prepare-python.py --target
+<triple> --output <directory>` (optionally `--archive <local-file>` for an offline build), then set
+`DIAL_BUNDLED_PYTHON_DIR` to the prepared directory for Cargo. Preparation checks the upstream
+checksum; Cargo checks the target, size and uncompressed SHA-256 before embedding the payload.
+`dial __installed-smoke --require-bundled-python` runs a Python Eval cell that reads a saved regex,
+compares Python's exact positive and negative results, and checks the interpreter version. For an
+offline Harbor checkout build, prefetch the pinned archive to `target/python-archives/<triple>.tar.gz`;
+the checkout build wrapper verifies it before Cargo runs. The task image needs no shell Python.
+Cross-compilation alone does not prove that the installed interpreter runs.
 
 The internal `dial __installed-smoke --require-bundled-node` probe verifies the runtime version,
 starts the real computer worker, exchanges ping/pong messages and requires a bounded close

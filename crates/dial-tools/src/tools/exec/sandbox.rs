@@ -108,7 +108,9 @@ use std::time::{Duration, Instant};
 
 /// Execution-owner-only launch restrictions, separate from filesystem trust policy.
 #[derive(Clone, Copy, Default)]
-pub(super) struct CommandMode {
+pub(super) struct CommandMode<'a> {
+    /// Only a verified, freshly extracted CPython installation; never a caller-provided path.
+    pub bundle: Option<&'a crate::setup::deps::bundled_python::Runtime>,
     #[cfg(not(windows))]
     pub owned_terminal: Option<i32>,
     #[cfg(not(windows))]
@@ -237,7 +239,7 @@ impl Sandbox {
         policy: &Policy,
         program: &str,
         args: &[&str],
-        mode: CommandMode,
+        mode: CommandMode<'_>,
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
@@ -270,6 +272,9 @@ impl Sandbox {
                 profile.push_str(&proxy_rule(proxy.port()));
             }
             profile.push_str(&program_rule(program)?);
+            if let Some(bundle) = mode.bundle {
+                profile.push_str(&runtime_rule(bundle)?);
+            }
             if *serial_ports {
                 profile.push_str(serial::MACOS_RULE);
             }
@@ -318,7 +323,7 @@ impl Sandbox {
         proxy: ProxyRef<'_>,
         program: &str,
         args: &[&str],
-        mode: CommandMode,
+        mode: CommandMode<'_>,
     ) -> Result<Command, String> {
         self.dev_command_mode(
             workspace,
@@ -358,7 +363,7 @@ impl Sandbox {
         program: &str,
         args: &[&str],
         env: impl Iterator<Item = (OsString, OsString)>,
-        mode: CommandMode,
+        mode: CommandMode<'_>,
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
@@ -417,6 +422,10 @@ impl Sandbox {
             }
             #[cfg(not(target_os = "linux"))]
             profile.push_str(&program_rule(program)?);
+            #[cfg(not(target_os = "linux"))]
+            if let Some(bundle) = mode.bundle {
+                profile.push_str(&runtime_rule(bundle)?);
+            }
             #[cfg(not(target_os = "linux"))]
             if serial_ports {
                 profile.push_str(serial::MACOS_RULE);
@@ -604,6 +613,19 @@ fn program_rule(program: &str) -> Result<String, String> {
             ancestors.join(" ")
         ));
     }
+    Ok(out)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn runtime_rule(bundle: &crate::setup::deps::bundled_python::Runtime) -> Result<String, String> {
+    let mut out = program_rule(
+        bundle
+            .executable()
+            .to_str()
+            .ok_or("bundled Python path is not UTF-8")?,
+    )?;
+    let root = quote(bundle.root())?;
+    out.push_str(&format!("(allow file-read* file-map-executable (subpath {root}))\n(deny file-write* (subpath {root}))\n"));
     Ok(out)
 }
 

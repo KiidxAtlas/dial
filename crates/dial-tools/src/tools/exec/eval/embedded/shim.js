@@ -387,7 +387,7 @@
 
   function runCell(request) {
     const operation = { id: request.id, active: true, callbacks: 0, stdout: new Capture(), stderr: new Capture() };
-    const result = { stdout: '', stderr: '', value: null, error: null };
+    const result = { backend: 'quickjs', stdout: '', stderr: '', value: null, error: null };
     current = operation;
     try {
       if (typeof request.code !== 'string') throw new TypeError('code must be a string');
@@ -415,8 +415,185 @@
   }
 
   globalThis.tool = tool;
+  // Minimal sandboxed shims for the two Node modules models reach for most in quick scripts.
+  // All file I/O goes through Dial's governed `tool.*` callbacks; other modules remain unavailable.
+  function makePathShim() {
+    const normalize = p => {
+      const s = String(p ?? '');
+      if (!s) return '.';
+      const abs = s.startsWith('/');
+      const trailing = s.length > 1 && s.endsWith('/');
+      const out = [];
+      for (const part of s.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') {
+          if (out.length && out[out.length - 1] !== '..') out.pop();
+          else if (!abs) out.push('..');
+        } else {
+          out.push(part);
+        }
+      }
+      let res = (abs ? '/' : '') + out.join('/');
+      if (!res) res = abs ? '/' : '.';
+      if (trailing && res !== '/' && !res.endsWith('/')) res += '/';
+      return res;
+    };
+    const join = (...parts) => {
+      const filtered = parts.filter(p => p !== undefined && p !== null && String(p).length > 0).map(String);
+      return filtered.length ? normalize(filtered.join('/')) : '.';
+    };
+    const resolve = (...parts) => {
+      let resolved = '';
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const part = String(parts[i] ?? '');
+        if (!part) continue;
+        resolved = resolved ? part + '/' + resolved : part;
+        if (part.startsWith('/')) break;
+      }
+      return normalize(resolved || '.');
+    };
+    const dirname = p => {
+      const s = String(p ?? '');
+      if (!s) return '.';
+      let end = s.length;
+      while (end > 1 && s[end - 1] === '/') end--;
+      const idx = s.lastIndexOf('/', end - 1);
+      if (idx === -1) return '.';
+      if (idx === 0) return '/';
+      return s.slice(0, idx);
+    };
+    const basename = (p, ext) => {
+      let s = String(p ?? '');
+      while (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+      const idx = s.lastIndexOf('/');
+      let base = idx === -1 ? s : s.slice(idx + 1);
+      if (ext && base.endsWith(ext)) base = base.slice(0, base.length - ext.length);
+      return base;
+    };
+    const extname = p => {
+      const base = basename(p);
+      const idx = base.lastIndexOf('.');
+      return idx <= 0 ? '' : base.slice(idx);
+    };
+    const api = {
+      sep: '/',
+      delimiter: ':',
+      isAbsolute: p => String(p ?? '').startsWith('/'),
+      normalize,
+      join,
+      resolve,
+      dirname,
+      basename,
+      extname,
+    };
+    api.posix = api;
+    return api;
+  }
+  function makeFsShim() {
+    const decodeBase64 = b64 => {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      const clean = String(b64 ?? '').replace(/[^A-Za-z0-9+/=]/g, '');
+      const bytes = [];
+      for (let i = 0; i < clean.length; i += 4) {
+        const a = chars.indexOf(clean[i]);
+        const b = chars.indexOf(clean[i + 1]);
+        const c = clean[i + 2] === '=' ? -1 : chars.indexOf(clean[i + 2]);
+        const d = clean[i + 3] === '=' ? -1 : chars.indexOf(clean[i + 3]);
+        if (a < 0 || b < 0) break;
+        bytes.push((a << 2) | (b >> 4));
+        if (c >= 0) bytes.push(((b & 15) << 4) | (c >> 2));
+        if (d >= 0) bytes.push(((c & 3) << 6) | d);
+      }
+      return new Uint8Array(bytes);
+    };
+    const readFileSync = (filePath, options) => {
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+      if (encoding === undefined || encoding === null) {
+        const res = call('read', { path: String(filePath), format: 'base64' });
+        const content = res?.data?.content;
+        if (typeof content === 'string') return decodeBase64(content);
+        return new TextEncoder().encode(res?.text ?? '');
+      }
+      const res = call('read', { path: String(filePath), format: 'text' });
+      return typeof res?.data?.content === 'string' ? res.data.content : (res?.text ?? '');
+    };
+    // Node's options argument is accepted only for an explicit digest-bound overwrite: a Dial
+    // extension `{expectedSha256}`. The write tool still requires a whole-file read of the file.
+    const writeFileSync = (filePath, data, options) => {
+      const path = String(filePath);
+      const args = data instanceof Uint8Array
+        ? { path, content: (() => {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            let out = '';
+            for (let i = 0; i < data.length; i += 3) {
+              const a = data[i], b = i + 1 < data.length ? data[i + 1] : 0, c = i + 2 < data.length ? data[i + 2] : 0;
+              const n = (a << 16) | (b << 8) | c;
+              out += chars[n >>> 18] + chars[(n >>> 12) & 63] + (i + 1 < data.length ? chars[(n >>> 6) & 63] : '=') + (i + 2 < data.length ? chars[n & 63] : '=');
+            }
+            return out;
+          })(), encoding: 'base64' }
+        : { path, content: typeof data === 'string' ? data : String(data) };
+      if (options !== undefined && options !== null && typeof options === 'object' && options.expectedSha256 !== undefined) {
+        if (data instanceof Uint8Array) throw new TypeError('binary writes are create-only; expectedSha256 is not accepted');
+        if (typeof options.expectedSha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(options.expectedSha256)) {
+          throw new TypeError('expectedSha256 must be the 64-character sha256 from a whole-file dial.read receipt');
+        }
+        args.expected_sha256 = options.expectedSha256;
+      }
+      try {
+        call('write', args);
+      } catch (error) {
+        if (/has no current source\/read witness|were not displayed in full/i.test(String(error?.message ?? ''))) {
+          throw new Error(`${error.message}\n[dial] writeFileSync does not read files implicitly. Read ${path} with fs.readFileSync or dial.read first; to overwrite that revision, pass {expectedSha256} with its sha256.`);
+        }
+        throw error;
+      }
+    };
+    const existsSync = filePath => {
+      try {
+        call('read', { path: String(filePath), format: 'text' });
+        return true;
+      } catch (error) {
+        const msg = String(error?.message ?? '');
+        if (/no such file|not found|enoent/i.test(msg)) return false;
+        if (/is a directory/i.test(msg)) return true;
+        throw error;
+      }
+    };
+    const readdirSync = dirPath => {
+      const res = call('read', { path: String(dirPath) });
+      return String(res?.text ?? '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('['));
+    };
+    return {
+      readFileSync,
+      writeFileSync,
+      existsSync,
+      readdirSync,
+      promises: {
+        readFile: async (p, o) => readFileSync(p, o),
+        writeFile: async (p, d) => writeFileSync(p, d),
+        readdir: async p => readdirSync(p),
+      },
+    };
+  }
+  const SHIM_MODULES = {
+    fs: makeFsShim(),
+    'node:fs': makeFsShim(),
+    path: makePathShim(),
+    'node:path': makePathShim(),
+  };
+  globalThis.require = function require(specifier) {
+    const key = String(specifier ?? '');
+    if (Object.hasOwn(SHIM_MODULES, key)) return SHIM_MODULES[key];
+    throw new Error(
+      `Node modules are unavailable in the embedded engine (cannot require '${key}'). Available shims: 'fs', 'path'. For other host operations use tool.read, tool.write, tool.glob, tool.grep or dial.* helpers.`
+    );
+  };
   globalThis.__dial_prelude__ = async (name, parameters) => callback('prelude', { name, parameters }).data;
-  globalThis.__dial_check__ = (name, passed) => callback('check', { name, passed });
+  globalThis.__dial_check__ = (name, passed, source) => callback('check', { name, passed, source });
   globalThis.__dial_display__ = value => {
     callback('display', { text: typeof value === 'string' ? value : inspect(value, 2) });
   };
@@ -446,7 +623,7 @@
       sendFrame({ id: request.id, result });
     } catch (error) {
       if (!(error instanceof ToolError)) throw error;
-      sendFrame({ id: request.id, result: { stdout: '', stderr: '', value: null, error: error.message.slice(-LIMIT) } });
+      sendFrame({ id: request.id, result: { backend: result.backend, stdout: '', stderr: '', value: null, error: error.message.slice(-LIMIT) } });
     }
   }
 })();

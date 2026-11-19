@@ -1205,6 +1205,31 @@ fn shared_result_revisions_update_cached_rows_and_output_settings_invalidate_the
 }
 
 #[test]
+fn the_engine_result_view_replaces_the_text_built_card_unless_it_adds_nothing() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("1", "verify", "cargo test", "");
+    t.tool_end("1", "checks ran", false, 0.4);
+    let text_built = text_of(&t.all_rows(80, &env.ctx()));
+    let bare = crate::runtime::presentation::Presentation {
+        label: "Verify".into(),
+        target: "cargo test".into(),
+        ..Default::default()
+    };
+    t.tool_result_view("1", &bare);
+    assert_eq!(text_of(&t.all_rows(80, &env.ctx())), text_built);
+    let structured = crate::runtime::presentation::Presentation {
+        facts: vec!["2 passed".into()],
+        preview: Some("passed · cargo test\npassed · cargo clippy".into()),
+        ..bare
+    };
+    t.tool_result_view("1", &structured);
+    let settled = text_of(&t.all_rows(80, &env.ctx()));
+    assert!(settled.contains("2 passed"), "{settled}");
+    t.tool_result_view("unknown", &structured);
+}
+
+#[test]
 fn output_lines_setting_controls_the_cap() {
     let mut env = Env::new();
     env.ui.tool_output_lines = 2;

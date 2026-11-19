@@ -536,6 +536,81 @@ fn main() -> anyhow::Result<()> {
             &rows_buffer(rows, width, 22),
             light,
         );
+        // The verify and git cards: a clean verify, a failing one, and git's own status and diff.
+        let mut cards = Transcript::new();
+        cards.push_user("Check the parser fix and show me what changed.");
+        let verify = |cards: &mut Transcript, id: &str, text: &str, results: serde_json::Value| {
+            let args = serde_json::json!({ "targets": ["cargo check", "cargo test -p parser"] });
+            cards.tool_start(id, "verify", "2 checks", &args.to_string());
+            let failed = text.contains("code_failed");
+            cards.tool_end(id, text, failed, 14.2);
+            let passed = results
+                .as_array()
+                .map_or(0, |r| r.iter().filter(|r| r["status"] == "passed").count());
+            let output = dial_core::runtime::tool_output::ToolOutput {
+                execution: Default::default(),
+                text: text.into(),
+                is_error: failed,
+                data: Some(serde_json::json!({
+                    "counts": { "passed": passed, "failed": 2 - passed },
+                    "results": results,
+                })),
+            };
+            let view =
+                dial_tools::tools::surface::presentation::render_result("verify", &args, &output);
+            cards.tool_result_view(id, &view);
+        };
+        verify(
+            &mut cards,
+            "v1",
+            "passed: cargo check\nFinished dev profile\npassed: cargo test -p parser\ntest result: ok. 12 passed; 0 failed",
+            serde_json::json!([
+                { "status": "passed", "name": "cargo check" },
+                { "status": "passed", "name": "cargo test -p parser" },
+            ]),
+        );
+        verify(
+            &mut cards,
+            "v2",
+            "passed: cargo check\nFinished dev profile\ncode_failed: cargo test -p parser\n  $ cargo test -p parser\ntest parser::tests::nested ... ok\ntest parser::tests::trailing_comma ... FAILED\n\nfailures:\n\n---- parser::tests::trailing_comma stdout ----\nthread 'parser::tests::trailing_comma' panicked at src/parser.rs:88:9:\nassertion `left == right` failed: trailing comma dropped\n\nfailures:\n    parser::tests::trailing_comma\n\ntest result: FAILED. 11 passed; 1 failed",
+            serde_json::json!([
+                { "status": "passed", "name": "cargo check" },
+                { "status": "code_failed", "name": "cargo test -p parser" },
+            ]),
+        );
+        cards.tool_start("gs", "bash", "git status", r#"{"command":"git status"}"#);
+        cards.tool_end(
+            "gs",
+            "On branch main\nYour branch is ahead of 'origin/main' by 2 commits.\n  (use \"git push\" to publish your local commits)\n\nChanges to be committed:\n  (use \"git restore --staged <file>...\" to unstage)\n\tnew file:   src/lexer.rs\n\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   src/parser.rs\n\tmodified:   tests/parser.rs\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnotes.md\n",
+            false,
+            0.1,
+        );
+        cards.tool_start("gd", "bash", "git diff", r#"{"command":"git diff"}"#);
+        cards.tool_end(
+            "gd",
+            "diff --git a/src/parser.rs b/src/parser.rs\nindex 1a2b3c4..5d6e7f8 100644\n--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -85,3 +85,4 @@ fn list(&mut self) {\n-        if self.peek() == Comma { break; }\n+        if self.peek() == Comma {\n+            self.bump();\n+        }\n         items.push(item);\ndiff --git a/tests/parser.rs b/tests/parser.rs\nindex 9a8b7c6..1f2e3d4 100644\n--- a/tests/parser.rs\n+++ b/tests/parser.rs\n@@ -10,0 +11,3 @@\n+#[test]\n+fn trailing_comma() { assert_eq!(parse(\"[1,]\"), vec![1]); }\n+\n",
+            false,
+            0.1,
+        );
+        cards.finish_turn();
+        let rows = cards
+            .take_settled_with_images(
+                width,
+                &TranscriptCtx {
+                    theme: &theme,
+                    ui: &ui,
+                    tick: 0,
+                    tools_expanded: false,
+                    expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+                },
+            )
+            .0;
+        screen(
+            &mut out,
+            &format!("Verify and git cards / {name}"),
+            &rows_buffer(rows, width, 30),
+            light,
+        );
         // Every kind of activity in one turn: grouped lookups, framed heavy calls, a sent note,
         // a failure, and a command still running (so the live view, not scrollback, is drawn).
         let mut lifecycle = Transcript::new();

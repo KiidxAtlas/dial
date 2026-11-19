@@ -557,21 +557,25 @@ fn read_target(
     // request for those exact lines.
     let whole = offset.is_none() && !present(args, "limit") && !sel.selects_lines() && !sel.raw;
     let offset = offset.map_or(1, |o| o.min(usize::MAX as u64) as usize);
-    match ws.edit_mode {
-        EditMode::Hashline => {
-            if whole && let Some(summary) = super::summary::try_read(ws, path_text, limit, budget) {
-                return Ok(summary);
-            }
-            if whole && let Some(folded) = super::fold::plan(ws, path_text) {
-                let mut sel = sel;
-                sel.ranges = folded.shown;
-                let body = hashline::read(ws, path_text, &sel, offset, limit, budget)?;
-                return Ok(format!("{body}\n{}", folded.note));
-            }
-            hashline::read(ws, path_text, &sel, offset, limit, budget)
+    if whole && ws.edit_mode == EditMode::Hashline {
+        if let Some(summary) = super::summary::try_read(ws, path_text, limit, budget) {
+            return Ok(summary);
         }
-        _ => read_plain(ws, path_text, &sel, offset, limit, budget),
+        if let Some(folded) = super::fold::plan(ws, path_text) {
+            sel.ranges = folded.shown;
+            let body = hashline::read(ws, path_text, &sel, offset, limit, budget)?;
+            return Ok(format!("{body}\n{}", folded.note));
+        }
     }
+    // A non-Hashline preference historically permits streaming oversized files. Those files
+    // cannot be edited with anchors; ordinary editable text uses the same snapshot in every mode.
+    if ws.edit_mode != EditMode::Hashline && !sel.raw {
+        let path = ws.resolve_read(path_text)?;
+        if fs::metadata(path).is_ok_and(|meta| meta.len() > hashline::MAX_FILE) {
+            return read_plain(ws, path_text, &sel, offset, limit, budget);
+        }
+    }
+    hashline::read(ws, path_text, &sel, offset, limit, budget)
 }
 
 /// Several targets in one call. Each keeps its own selector; a failing target is reported inline.
@@ -660,7 +664,7 @@ fn read_paths_outcomes(
     for (index, path) in targets.iter().enumerate() {
         reserved_after -= shares[index];
         let remaining = rows.saturating_sub(out.len());
-        if remaining <= READ_FOOTER_RESERVE {
+        if remaining < READ_FOOTER_RESERVE {
             // No room left for a row: name the rest so the next call can read them.
             let rest = &targets[index..];
             // The full list when it fits beside the footer; otherwise the bounded form, whose names
@@ -680,10 +684,11 @@ fn read_paths_outcomes(
         }
         // What the budget holds beyond the later plans, never below the floor, and always leaving
         // room for the section gap that follows this target.
+        let max_room = remaining.saturating_sub(SECTION_GAP.len());
         let room = remaining
             .saturating_sub(reserved_after)
-            .max(PATH_ROOM_FLOOR)
-            .min(remaining - SECTION_GAP.len());
+            .max(PATH_ROOM_FLOOR.min(max_room))
+            .min(max_room);
         single["path"] = Value::String(path.to_string());
         let status = match read_tool_streaming(ws, &single, cancel, room) {
             Ok(text) => {
@@ -921,7 +926,11 @@ pub(in crate::tools) fn read_plain(
     let mut reader = open()?;
     let mut buf = Vec::new();
     let mut consumed = 0usize; // lines pulled from the reader
-    let row_limit = budget.saturating_sub(READ_FOOTER_RESERVE);
+    let row_limit = if budget <= READ_FOOTER_RESERVE {
+        budget.saturating_sub(128).max(64)
+    } else {
+        budget.saturating_sub(READ_FOOTER_RESERVE)
+    };
     let mut out = String::new();
     let mut shown: Vec<(usize, usize)> = Vec::new();
     let mut witnessed: Vec<(usize, String)> = Vec::new();
@@ -1155,8 +1164,7 @@ fn unseen_overwrite_projection(ws: &Workspace, path: &Path, before: &str) -> Opt
     const MAX_BYTES: usize = 16 * 1024;
     let normalized = hashline::normalize(before);
     let lines = hashline::split_lines(&normalized);
-    if ws.edit_mode != crate::tools::EditMode::Hashline
-        || crate::tools::edit::edit_source::notebook_path(path)
+    if crate::tools::edit::edit_source::notebook_path(path)
         || lines.len() > MAX_LINES
         || normalized.len() > MAX_BYTES
         || lines.iter().any(|line| line.len() > select::MAX_READ_LINE)

@@ -132,6 +132,8 @@ pub const METHODS: &[Method] = &[
     write("evidence_compare", "evidence"),
     read("policy", "diagnostics"),
     read("reliability", "diagnostics"),
+    read("code_history", "diagnostics"),
+    read("stats", "diagnostics"),
     read("list_skills", "skills"),
     write("skill_action", "skills"),
     read("get_modes", "workflows"),

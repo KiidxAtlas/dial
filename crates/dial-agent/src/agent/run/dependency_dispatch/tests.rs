@@ -721,3 +721,148 @@ fn authorized_external_reads_run_together_and_a_denied_one_never_starts() {
     );
     assert_eq!(*arrived.0.lock().unwrap(), 2, "the denied call never ran");
 }
+
+#[test]
+fn literal_inspections_read_only_the_files_they_name() {
+    let root = tempfile::tempdir().unwrap();
+    for file in ["a", "b", "-x"] {
+        std::fs::write(root.path().join(file), "source").unwrap();
+    }
+    std::fs::create_dir(root.path().join("sub")).unwrap();
+    std::fs::write(root.path().join("sub/c.txt"), "source").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::new();
+    // (shell arguments, the file a sibling write targets, whether the two may share a wave).
+    // Anything not provably a literal inspection keeps the broad read and joins nothing.
+    let rows: Vec<(Value, &str, bool)> = vec![
+        (json!({"command":"cat a"}), "b", true),
+        (json!({"command":"wc -l a"}), "b", true),
+        (json!({"command":"head -n 5 a"}), "b", true),
+        (json!({"command":"tail -c 3 a"}), "b", true),
+        (json!({"command":"stat -c %s a"}), "b", true),
+        (json!({"command":"cat -- a"}), "b", true),
+        (json!({"command":"cat c.txt", "cwd":"sub"}), "b", true),
+        (json!({"command":"cat a"}), "a", false),
+        (json!({"command":"cat a b"}), "b", false),
+        (json!({"command":"wc -l a"}), "a", false),
+        // After `--`, a leading dash names an operand, not an option.
+        (json!({"command":"cat -- a -x"}), "-x", false),
+        (
+            json!({"command":"cat c.txt", "cwd":"sub"}),
+            "sub/c.txt",
+            false,
+        ),
+        (json!({"command":"cat a | wc -l"}), "b", false),
+        (json!({"command":"cat a*"}), "b", false),
+        (json!({"command":"cat -"}), "b", false),
+        (json!({"command":"wc --files0-from=a"}), "b", false),
+        (json!({"command":"cat missing.txt"}), "b", false),
+        (json!({"command":"cat ../a"}), "b", false),
+        (json!({"command":"cat $HOME"}), "b", false),
+        (json!({"command":"cat @f1"}), "b", false),
+        // GNU `stat -f` is --file-system, a boolean flag: its operand is still a file. BSD `-f` takes
+        // a format instead, which then reads as an unresolved path and falls back to the broad read.
+        (json!({"command":"stat -f a"}), "a", false),
+        (json!({"command":"stat -f a"}), "b", true),
+        (json!({"command":"stat -f %z a"}), "b", false),
+        (json!({"command":"cat sub"}), "sub/c.txt", false),
+        // Valued long options read their value as the option's argument, not as an operand.
+        (json!({"command":"tail --lines 2 a"}), "b", true),
+        (json!({"command":"head --lines 2 a"}), "b", true),
+        (json!({"command":"head --lines=2 a"}), "b", true),
+        (json!({"command":"head -n -5 a"}), "b", true),
+        (json!({"command":"head -n a"}), "b", false),
+        (json!({"command":"stat --format %s a"}), "b", true),
+        (json!({"command":"stat --format=%s a"}), "b", true),
+        (json!({"command":"stat --file-system a"}), "b", true),
+        (json!({"command":"stat --file-system a"}), "a", false),
+        (json!({"command":"cat --number a"}), "b", true),
+        (json!({"command":"wc --lines a"}), "b", true),
+        (json!({"command":"cat -- -x a"}), "b", true),
+        (json!({"command":"cat -- -x a"}), "-x", false),
+        // Unknown, abbreviated, bundled or `=`-suffixed options may take a file operand: broad read.
+        (json!({"command":"wc --future-option=a b"}), "b", false),
+        (json!({"command":"head --unknown a"}), "b", false),
+        (json!({"command":"head --lin 2 a"}), "b", false),
+        (json!({"command":"head --quiet=1 a"}), "b", false),
+        (json!({"command":"head -n5 a"}), "b", false),
+        (json!({"command":"cat -nA a"}), "b", false),
+        (json!({"command":"cat -x a"}), "b", false),
+        (json!({"command":"tail --follow=name a"}), "b", false),
+        (json!({"command":"wc --total auto a"}), "b", false),
+        // One plain command only: a newline, `;`, `&&`, `&` or a trailing newline is a second
+        // command or an operator, never a word that a literal read can absorb.
+        (json!({"command":"cat a\nwc b"}), "b", false),
+        (json!({"command":"cat a; wc b"}), "b", false),
+        (json!({"command":"cat a && wc b"}), "b", false),
+        (json!({"command":"cat a &"}), "b", false),
+        (json!({"command":"cat a\n"}), "b", false),
+    ];
+    for (arguments, target, joins) in rows {
+        let shell = ToolCall {
+            id: "shell".into(),
+            name: "bash".into(),
+            arguments: arguments.clone(),
+            malformed_arguments: false,
+        };
+        let wave = plan(
+            &workspace,
+            &registry,
+            WavePolicy::PARENT,
+            &[call("write", target), shell],
+        );
+        assert_eq!(
+            wave.calls.len() == 2,
+            joins,
+            "{arguments} beside a write to {target}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        // A symlink, or a second hard link to a file, can name bytes outside the operand.
+        std::os::unix::fs::symlink("a", root.path().join("link")).unwrap();
+        std::fs::hard_link(root.path().join("a"), root.path().join("twin")).unwrap();
+        for command in ["cat link", "cat twin"] {
+            let shell = ToolCall {
+                id: "shell".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": command }),
+                malformed_arguments: false,
+            };
+            let wave = plan(
+                &workspace,
+                &registry,
+                WavePolicy::PARENT,
+                &[call("write", "b"), shell],
+            );
+            assert_eq!(wave.calls.len(), 1, "{command} keeps the broad read");
+        }
+    }
+    #[cfg(unix)]
+    {
+        // A `cwd` must be a plain directory: a symlink, a file, a missing path, a parent escape or
+        // an absolute path outside the workspace keeps the broad read.
+        std::os::unix::fs::symlink("sub", root.path().join("subl")).unwrap();
+        for arguments in [
+            json!({"command":"cat c.txt","cwd":"subl"}),
+            json!({"command":"cat c.txt","cwd":"a"}),
+            json!({"command":"cat c.txt","cwd":"missing"}),
+            json!({"command":"cat c.txt","cwd":"../"}),
+            json!({"command":"cat c.txt","cwd":"/"}),
+        ] {
+            let shell = ToolCall {
+                id: "shell".into(),
+                name: "bash".into(),
+                arguments: arguments.clone(),
+                malformed_arguments: false,
+            };
+            let wave = plan(
+                &workspace,
+                &registry,
+                WavePolicy::PARENT,
+                &[call("write", "b"), shell],
+            );
+            assert_eq!(wave.calls.len(), 1, "{arguments} keeps the broad read");
+        }
+    }
+}

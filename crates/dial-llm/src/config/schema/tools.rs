@@ -158,7 +158,7 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         TO,
         "Editing",
         "Edit mode",
-        "Default edit grammar: exact/fuzzy replacement, snapshot hashline, apply-patch, structured hunks or sloppy source matching. Exact profile, process and CLI pins take precedence.",
+        "Preferred grammar shown for the edit tool (default: hashline). Other supported grammars are still accepted. Model, process and CLI pins can override this preference.",
         Kind::Enum(EDIT_MODE),
     ),
     field!(

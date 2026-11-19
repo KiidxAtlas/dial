@@ -245,19 +245,27 @@ fn rust_check(root: &Path, path: &Path, selector: Option<&str>) -> Result<Focuse
 }
 
 fn javascript_check(root: &Path, path: &Path, selector: Option<&str>) -> Result<String, String> {
-    let runner = javascript_test_runner(root).ok_or_else(|| {
-        format!(
-            "no installed jest or vitest `test` script covers `{}`; run it with bash instead",
-            path.display()
-        )
-    })?;
-    let mut command = javascript_test_command(root, path, &runner)
-        .map(|check| check.command)
-        .ok_or_else(|| format!("no test file was found for `{}`", path.display()))?;
-    if let Some(selector) = selector {
-        command.push_str(&format!(" -t {}", shell_quote(selector)));
+    if let Some(runner) = javascript_test_runner(root) {
+        let mut command = javascript_test_command(root, path, &runner)
+            .map(|check| check.command)
+            .ok_or_else(|| format!("no test file was found for `{}`", path.display()))?;
+        if let Some(selector) = selector {
+            command.push_str(&format!(" -t {}", shell_quote(selector)));
+        }
+        return Ok(command);
     }
-    Ok(command)
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(ext, "js" | "mjs" | "cjs") {
+        let mut command = format!("node --test {}", shell_quote(&path.to_string_lossy()));
+        if let Some(selector) = selector {
+            command.push_str(&format!(" --test-name-pattern {}", shell_quote(selector)));
+        }
+        return Ok(command);
+    }
+    Err(format!(
+        "no installed jest or vitest `test` script covers `{}`; run it with bash instead",
+        path.display()
+    ))
 }
 
 /// Totals from cargo, pytest, unittest, jest and vitest summary lines; `None` without any.
@@ -293,6 +301,18 @@ pub fn test_counts(output: &str) -> Option<TestCounts> {
         } else if pytest_summary(line) {
             let errors = labelled(line, "error") + labelled(line, "errors");
             add(labelled(line, "passed"), labelled(line, "failed") + errors);
+        } else if let Some(rest) = line.strip_prefix("ℹ ").or_else(|| line.strip_prefix("# ")) {
+            if let Some(count) = rest
+                .strip_prefix("pass ")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                add(count, 0);
+            } else if let Some(count) = rest
+                .strip_prefix("fail ")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                add(0, count);
+            }
         }
     }
     totals

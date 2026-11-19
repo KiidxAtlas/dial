@@ -35,7 +35,7 @@ bytes. Results are prepared with isolated edit witnesses; reading ahead does not
 editing authority. Only successful delivery publishes the exact displayed row ranges,
 with a fresh source check. Cancellation, changed source, missing/partial observations,
 errors, denied admission, unsupported formats and expired preparations fall back to
-ordinary execution. Plain (non-hashline) reads are not reused. Directories, URLs,
+ordinary execution. Read-ahead reuse is limited to the Hashline edit preference. Directories, URLs,
 notebooks, document/image/archive formats and multi-path reads are excluded.
 
 Preparation does not bypass approval, callback gates, pre-tool hooks, ordinary schema

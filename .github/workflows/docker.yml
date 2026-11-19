@@ -8,6 +8,9 @@ on:
       - Dockerfile
       - Dockerfile.release
       - .dockerignore
+      - runtimes/python/**
+      - scripts/prepare-python.py
+      - scripts/runtime_payload.py
       - docker-compose.yml
       - docker-compose.sandbox.yml
       - Cargo.lock
@@ -18,6 +21,9 @@ on:
       - Dockerfile
       - Dockerfile.release
       - .dockerignore
+      - runtimes/python/**
+      - scripts/prepare-python.py
+      - scripts/runtime_payload.py
       - docker-compose.yml
       - docker-compose.sandbox.yml
       - Cargo.lock
@@ -51,5 +57,6 @@ jobs:
         run: |
           docker run --rm dial:ci --version
           docker run --rm dial:ci --help >/dev/null
+          docker run --rm --network=none --entrypoint /usr/local/bin/dial -e PATH= dial:ci __installed-smoke --require-bundled-python
       - name: Validate compose file
         run: docker compose config --quiet

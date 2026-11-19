@@ -214,6 +214,14 @@ const kernel = repl.start({ input, output: sink, terminal: false, prompt: '', us
 const context = kernel.context;
 if (!vm.isContext(context)) throw new Error('Node REPL did not create a vm context');
 for (const name of ['require', 'module', 'exports', 'process', '__filename', '__dirname']) delete context[name];
+const nodeFs = require('node:fs');
+const nodePath = require('node:path');
+context.require = function shimRequire(specifier) {
+  const key = String(specifier ?? '');
+  if (key === 'fs' || key === 'node:fs') return nodeFs;
+  if (key === 'path' || key === 'node:path') return nodePath;
+  throw new Error(`require('${key}') is not available in eval cells; use await import('node:${key.replace(/^node:/, '')}') or dial.* helpers.`);
+};
 // Under `node -e` the REPL's lazy builtin-module globals (`fs`, `path`, ...) ignore assignment, so
 // `var fs = 1` or `fs = 2` in a cell silently kept the module. Assigning one now replaces it.
 const builtinModules = new Set(require('node:module').builtinModules);
@@ -229,7 +237,7 @@ for (const name of Object.getOwnPropertyNames(context)) {
 }
 context.tool = tool;
 context.__dial_prelude__ = async (name, parameters) => callback('prelude', { name, parameters }).data;
-context.__dial_check__ = (name, passed) => callback('check', { name, passed });
+context.__dial_check__ = (name, passed, source) => callback('check', { name, passed, source });
 context.__dial_display__ = value => { callback('display', { text: typeof value === 'string' ? value : util.inspect(value) }); };
 context.console = Object.fromEntries(['log', 'info', 'debug', 'warn', 'error', 'dir'].map(name => [name, (...args) => {
   const operation = operationStorage.getStore();
@@ -322,7 +330,7 @@ function evaluationHint(error) {
     }
     if (request === null) break;
     const operation = { id: request.id, active: true, callbacks: 0, stdout: new Capture(), stderr: new Capture() };
-    const result = { stdout: '', stderr: '', value: null, error: null };
+    const result = { backend: 'node', stdout: '', stderr: '', value: null, error: null };
     context.tool = tool;
     try {
       await operationStorage.run(operation, async () => {
@@ -352,7 +360,7 @@ function evaluationHint(error) {
       sendFrame({ id: request.id, result });
     } catch (error) {
       if (!(error instanceof ToolError)) throw error;
-      sendFrame({ id: request.id, result: { stdout: '', stderr: '', value: null, error: error.message.slice(-LIMIT) } });
+      sendFrame({ id: request.id, result: { backend: result.backend, stdout: '', stderr: '', value: null, error: error.message.slice(-LIMIT) } });
     }
   }
   kernel.close();

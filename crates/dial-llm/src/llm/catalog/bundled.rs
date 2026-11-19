@@ -7,6 +7,7 @@
 use super::{
     CacheWriteSplit, ModelKind, ModelMetadata, ONE_HOUR_WRITE_INPUT_MULTIPLIER, TokenPricing,
 };
+use crate::config::thinking::{level_name, parse_thinking};
 use crate::llm::{
     Reply,
     model_config::{ApiProtocol, ModelSelection},
@@ -557,6 +558,18 @@ pub fn bundled_model(provider: &str, model: &str) -> Option<BundledModel> {
         "chatgpt" => find("openai", model),
         _ => None,
     })
+}
+
+/// Thinking levels the bundled catalog documents for `provider/model`, weakest first, as level
+/// names. `role` drops levels a helper role cannot hold (`auto` is main-only and is never listed).
+pub fn documented_thinking_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
+    bundled_model(provider, model)
+        .map(|bundled| bundled.thinking_efforts)
+        .unwrap_or_default()
+        .into_iter()
+        .map(level_name)
+        .filter(|level| !role || parse_thinking(level).is_ok())
+        .collect()
 }
 
 /// Every bundled chat model of a provider (Dial or catalog id), in catalog order.

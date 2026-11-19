@@ -1848,6 +1848,21 @@ impl Transcript {
         }
     }
 
+    /// Apply the engine's view of a settled call after [`Self::tool_end_with`], which rebuilt
+    /// the card from the result text alone. The engine's view also saw the structured result
+    /// (verify counts, chosen answers, window lists), so it replaces the text-built one, unless
+    /// it says nothing beyond the call itself (no facts and no preview), which would only drop
+    /// what the text showed, such as an exit code.
+    pub fn tool_result_view(
+        &mut self,
+        id: &str,
+        view: &crate::runtime::presentation::Presentation,
+    ) {
+        if !view.target.is_empty() && (!view.facts.is_empty() || view.preview.is_some()) {
+            self.tool_presentation(id, view);
+        }
+    }
+
     pub fn tool_end(&mut self, id: &str, output: &str, is_error: bool, elapsed_secs: f64) {
         self.tool_end_with(id, output, ToolOutcome::from_error(is_error), elapsed_secs);
     }

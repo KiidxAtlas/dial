@@ -154,14 +154,15 @@ impl Agent<'_> {
         }
         // Runtime check receipts record calls that actually executed. They are local algorithm
         // checks, not blanket verification of all workspace edits at the cell's final revision.
+        let mut eval_passed = false;
         if call.name == "eval" {
-            for passed in crate::agent::verify::completion::eval_checks(&output) {
-                if passed {
-                    turn.reliability.passing_checks += 1;
-                } else {
-                    turn.reliability.failing_checks += 1;
-                }
-            }
+            let (passed, failed) = self
+                .step_checks
+                .eval_checks
+                .observe(&call.arguments, &output);
+            turn.reliability.passing_checks += passed;
+            turn.reliability.failing_checks += failed;
+            eval_passed = passed > 0;
         }
         let mut shell_check_passed = false;
         let mut shell_check_run = None;
@@ -321,11 +322,9 @@ impl Agent<'_> {
         if shell_check_passed {
             self.step_checks.shell_check_passed = Some(self.step_checks.revision());
         }
-        if committed && self.unchecked_after_launch_gap() {
+        if committed && let Some(reminder) = self.artifact_check_reminder() {
             output.text.push('\n');
-            output
-                .text
-                .push_str(crate::agent::verify::completion::UNCHECKED_AFTER_LAUNCH_GAP);
+            output.text.push_str(reminder);
         }
         if let Some(passed) = shell_check_run {
             let command = call.arguments["command"]
@@ -604,10 +603,34 @@ impl Agent<'_> {
                         })
                 })
             });
+        // A failed mutation that committed nothing is still a repeated attempt on that file.
+        if output.is_error
+            && changed.is_empty()
+            && matches!(call.name.as_str(), "edit" | "write" | "ast_edit")
+            && let Some(path) = call.arguments["path"]
+                .as_str()
+                .and_then(|path| self.workspace.resolve(path).ok())
+        {
+            turn.edit_churn.observe_failed(&self.workspace.rel(&path));
+        }
         if let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,
                 "Repeated edits to one file without a passing check; asking the model to reconsider",
+            ));
+            output.text.push_str("\n\n");
+            output.text.push_str(&advice);
+        }
+        // A committed source change or a passing check is progress; repeated similar cells are not.
+        if !changed.is_empty() || check_passed || shell_check_passed {
+            turn.eval_churn.clear();
+        }
+        if call.name == "eval"
+            && let Some(advice) = turn.eval_churn.observe(&call.arguments, eval_passed)
+        {
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Recovery,
+                "Repeated Eval cells with no passing check or source change; asking the model to reconsider",
             ));
             output.text.push_str("\n\n");
             output.text.push_str(&advice);

@@ -337,34 +337,24 @@ impl OverlayEnv<'_> {
             OverlayEvent::ClearRole { role, scope } => {
                 *self.scope = scope;
                 let outcome = (|| -> Result<String> {
-                    let review = if let ActiveOverlay::Models(models) = &mut *overlay {
-                        models.take_confirmed_assignment()
-                    } else {
-                        None
-                    };
-                    if let Some(review) = review {
-                        self.app.save_reviewed_model_settings(&review)?;
-                        let config = self.reload_saved()?;
-                        return Ok(if config.role_selection(&role).is_some() {
-                            format!(
-                                "{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+B switches scope"
-                            )
-                        } else {
-                            format!("{role} assignment cleared")
-                        });
-                    }
-                    let changes = clear_role_changes(&role, scope)?;
+                    // Clearing a role applies directly; there is no confirmation screen.
                     // Clearing a role retains its existing scope semantics, unlike explicit assignment.
+                    let changes = clear_role_changes(&role, scope)?;
                     let review = settings_store::review_model_config(
                         &self.app.layout,
                         scope,
                         &changes,
                         None,
                     )?;
-                    if let ActiveOverlay::Models(models) = &mut *overlay {
-                        models.review_assignment(review, OverlayEvent::ClearRole { role: role.clone(), scope }, format!("clear {role}"), vec![format!("This session + saved {scope:?} {role} assignment removed."), "Lower-scope assignment may become effective; otherwise this role follows main.".into(), "Main and other running sessions unchanged. Cancel saves nothing.".into()]);
-                    }
-                    Ok("Review role removal; confirm to save or cancel without saving.".into())
+                    self.app.save_reviewed_model_settings(&review)?;
+                    let config = self.reload_saved()?;
+                    Ok(if config.role_selection(&role).is_some() {
+                        format!(
+                            "{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+B switches scope"
+                        )
+                    } else {
+                        format!("{role} assignment cleared")
+                    })
                 })();
                 self.report(overlay, outcome);
                 self.refresh_roles(overlay);

@@ -199,6 +199,8 @@ struct StepChecks {
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
     evidence: verify::evidence::Ledger,
+    /// Artifact-local Eval observations, kept separate from command and requirement evidence.
+    eval_checks: verify::eval_checks::History,
     /// At most one local advisory awaiting a reply; never consulted by verification gates.
     repair_brief: Option<verify::checks::RepairBrief>,
     /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for

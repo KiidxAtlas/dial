@@ -26,6 +26,8 @@ class Dial < Formula
   def install
     bin.install "dial"
     share.install "LICENSE", "README.md", "THIRD_PARTY_NOTICES", "Silver.LICENSE", "Unscii.LICENSE"
+    # Older release archives do not carry both bundled interpreters.
+    share.install Dir["LICENSE.node", "LICENSE.python"]
   end
 
   test do

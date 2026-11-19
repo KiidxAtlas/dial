@@ -868,3 +868,58 @@ fn a_batch_is_credited_only_by_its_net_saving_not_its_gross_size() {
         }
     }
 }
+#[test]
+fn summarizer_input_points_large_old_observations_to_their_artifacts_without_pressure() {
+    let m = history();
+    let view = summarizer_view(&m);
+    assert_eq!(view.len(), m.len(), "the view keeps every message in place");
+    assert_eq!(
+        content(&view, "old-grep"),
+        prune_pointer("grep", 40_000, "artifact://old-grep"),
+        "a large old observation folds to the same pointer pressure pruning writes"
+    );
+    assert_eq!(
+        content(&view, "old-bash").len(),
+        20_000,
+        "shell output stays verbatim"
+    );
+    assert_eq!(
+        content(&view, "old-edit").len(),
+        20_000,
+        "mutations stay verbatim"
+    );
+    assert_eq!(
+        content(&view, "old-small").len(),
+        400,
+        "small results stay verbatim"
+    );
+    assert_eq!(
+        content(&view, "new-read"),
+        prune_pointer("read", 20_000, "artifact://new-read"),
+        "callers pass only the span being folded, so no protected tail is consulted here"
+    );
+    assert_eq!(
+        summarizer_view(&m),
+        view,
+        "the same history yields the same input"
+    );
+    assert_eq!(m, history(), "the stored history is not mutated");
+}
+#[test]
+fn summarizer_input_keeps_failed_and_artifactless_observations_verbatim() {
+    let mut m = exchange("failed", "grep", 20_000);
+    m[1]["dial_evidence"]["is_error"] = json!(true);
+    m.extend(exchange("unretained", "read", 20_000));
+    m[3].as_object_mut().unwrap().remove("dial_evidence");
+    let view = summarizer_view(&m);
+    assert_eq!(
+        content(&view, "failed").len(),
+        20_000,
+        "diagnostics are never replaced"
+    );
+    assert_eq!(
+        content(&view, "unretained").len(),
+        20_000,
+        "no artifact, no pointer"
+    );
+}

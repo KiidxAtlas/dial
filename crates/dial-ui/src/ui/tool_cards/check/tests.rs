@@ -256,3 +256,121 @@ fn failing_tests_show_why_and_where_under_their_names() {
         Some(("AssertionError: 1 != 2".to_owned(), None))
     );
 }
+
+fn verify(preview: &str, facts: &[&str], output: &str, failed: bool) -> Tool {
+    let mut t = run("", output, failed);
+    t.name = "verify".into();
+    t.input = "{}".into();
+    t.presentation.target = "selected checks".into();
+    t.presentation.preview = Some(preview.into());
+    t.presentation.facts = facts.iter().map(|f| (*f).to_owned()).collect();
+    t
+}
+
+const VERIFY_FAILED: &str = "Verify: Passed 1, Failed 1\npassed: lint\n  $ make lint\ncode_failed: cargo check\n  $ cargo check\nerror[E0026]: variant `Bench` does not have a field named `auth`\n   --> src/args/tests.rs:326:57\nerror: could not compile `dial` due to 1 previous error\nRepair confirmed code failures, then rerun with targets [\"failed\"].";
+
+#[test]
+fn verify_that_passes_is_one_row_with_its_counts() {
+    ctx_with(false, |ctx| {
+        let t = verify(
+            "passed · lint\npassed, reused · repro: calc",
+            &["2 passed"],
+            "Verify: Passed 2, Failed 0",
+            false,
+        );
+        let rows = rendered(&verify_card(&t, 80, ctx).unwrap());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("Verify") && rows[0].contains("selected checks"));
+        assert!(
+            rows[0].contains("2 passed") && !rows[0].contains("failed"),
+            "{rows:?}"
+        );
+    });
+}
+
+#[test]
+fn verify_that_fails_lists_each_open_check_with_its_first_error() {
+    ctx_with(false, |ctx| {
+        let t = verify(
+            "passed · lint\nfailed · cargo check",
+            &["1 passed", "1 failed"],
+            VERIFY_FAILED,
+            true,
+        );
+        for w in [1, 20, 31, 32, 60, 100] {
+            let rows = verify_card(&t, w, ctx).unwrap();
+            assert!(rows.iter().all(|r| text::line_width(r) <= w), "{w}");
+        }
+        let rows = rendered(&verify_card(&t, 100, ctx).unwrap()).join("\n");
+        assert!(
+            rows.contains("cargo check") && rows.contains("failed"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("error[E0026]") && rows.contains("src/args/tests.rs:326:57"),
+            "{rows}"
+        );
+        assert!(
+            !rows.contains("lint"),
+            "passing checks stay in the counts: {rows}"
+        );
+        assert!(
+            rows.contains("1 passed") && rows.contains("1 failed"),
+            "{rows}"
+        );
+    });
+}
+
+#[test]
+fn verify_environment_results_are_not_drawn_as_code_failures() {
+    ctx_with(false, |ctx| {
+        let t = verify(
+            "timed out · cargo test",
+            &["0 passed"],
+            "Verify: Passed 0, Failed 0\ntimed_out: cargo test\n  $ cargo test",
+            false,
+        );
+        let rows = verify_card(&t, 80, ctx).unwrap();
+        let theme = ctx.theme;
+        let styles: Vec<_> = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.style))
+            .collect();
+        assert!(!styles.contains(&theme.fg(Tok::Error)), "{rows:?}");
+        assert!(rendered(&rows).join("\n").contains("timed out"));
+    });
+}
+
+#[test]
+fn verify_without_check_rows_or_expanded_keeps_the_ordinary_card() {
+    ctx_with(false, |ctx| {
+        let mut t = verify("", &[], "unknown check name", true);
+        t.presentation.preview = None;
+        assert!(verify_card(&t, 80, ctx).is_none());
+    });
+    ctx_with(true, |ctx| {
+        let t = verify("failed · x", &["1 failed"], VERIFY_FAILED, true);
+        assert!(verify_card(&t, 80, ctx).is_none());
+    });
+}
+
+#[test]
+fn verify_sections_ignore_compiler_error_lines() {
+    assert_eq!(
+        verify_section("code_failed: cargo check"),
+        Some("cargo check")
+    );
+    assert_eq!(verify_section("error: could not compile `dial`"), None);
+    assert_eq!(
+        verify_reason(VERIFY_FAILED, "cargo check").as_deref(),
+        Some(
+            "error[E0026]: variant `Bench` does not have a field named `auth` · src/args/tests.rs:326:57"
+        )
+    );
+    assert_eq!(verify_reason(VERIFY_FAILED, "lint"), None);
+    let tests = "code_failed: cargo test -p parser\n  $ cargo test -p parser\ntest parser::tests::ok ... ok\ntest parser::tests::trailing_comma ... FAILED\n\nfailures:\n\n---- parser::tests::trailing_comma stdout ----\nthread 'parser::tests::trailing_comma' panicked at src/parser.rs:88:9:\ntrailing comma dropped\n\nfailures:\n    parser::tests::trailing_comma\n\ntest result: FAILED. 1 passed; 1 failed";
+    assert_eq!(
+        verify_reason(tests, "cargo test -p parser").as_deref(),
+        Some("parser::tests::trailing_comma: trailing comma dropped · src/parser.rs:88:9")
+    );
+}

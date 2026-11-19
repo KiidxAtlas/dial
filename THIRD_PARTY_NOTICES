@@ -54,3 +54,13 @@ Release binaries embed the target-specific Node.js runtime pinned in
 upstream licenses and notices; the complete LICENSE extracted from the verified
 runtime archive accompanies each release as `LICENSE.node`. Unbundled source
 builds do not contain that runtime.
+
+CPython runtime in release binaries
+==================================
+
+Bundled builds embed CPython from Astral's python-build-standalone release
+pinned in `runtimes/python/manifest.json`. CPython, its standard library and
+linked components retain their upstream licenses. `LICENSE.python` accompanies
+the release archive and container; the embedded distribution also retains the
+upstream license files. The build-standalone notices are reproduced from the
+same upstream source revision in `runtimes/python/LICENSE.build-standalone`.

@@ -103,6 +103,7 @@ impl TurnState<'_> {
             reliability,
             stall,
             edit_churn,
+            eval_churn,
             completion_candidate,
             capability_search,
             enrichment_epoch,
@@ -144,6 +145,7 @@ impl TurnState<'_> {
             *todo_recovery = Default::default();
             *stall = Default::default();
             *edit_churn = Default::default();
+            *eval_churn = Default::default();
             reliability.consecutive_contract_failures = 0;
         }
         if rewritten {

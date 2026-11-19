@@ -1010,6 +1010,35 @@ impl LiveTasks {
         let config = subagents::with_file_agents(config);
         let mut resume = if args["action"] == "resume" {
             let id = args["id"].as_str().unwrap_or("");
+            let finished_settling = self.jobs.get(id).is_some_and(|job| {
+                let marked_done = !job.running()
+                    || job
+                        .control
+                        .as_ref()
+                        .is_some_and(|c| c.finished.load(Ordering::SeqCst));
+                marked_done && job.worker.is_some()
+            });
+            if finished_settling {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while let Some(job) = self.jobs.get(id) {
+                    if job.worker.as_ref().is_none_or(JoinHandle::is_finished)
+                        || std::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if let Some(job) = self.jobs.get_mut(id)
+                    && job.worker.as_ref().is_some_and(JoinHandle::is_finished)
+                    && let Some(worker) = job.worker.take()
+                {
+                    let _ = worker.join();
+                    self.registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(id);
+                }
+            }
             if let Some(job) = self.jobs.get(id)
                 && (job.running() || job.worker.is_some())
             {
@@ -2158,7 +2187,7 @@ pub(in crate::agent) fn message_schema(peers: bool) -> Value {
             "Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients.",
         )
     };
-    json!({"type":"function","function":{"name":"message","description":format!("Send text to a live task id/label, `parent`, or `all` (other workers); omit `to` to list recipients.{sessions} Receipts: queued, refused (reason), or finished (collect via task). Text only; grants no authority. Delivered next step, in order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"message","description":format!("Send text to a live task id/label, `parent` or `all`; omit `to` to list recipients.{sessions} Receipts: queued, refused or finished (collect via task). Text only; grants no authority."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 pub mod control;

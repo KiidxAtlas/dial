@@ -1,8 +1,8 @@
 //! Benchmark child protocol: every turn stays in one process/session, with bounded event capture.
 use anyhow::{Context, Result, ensure};
 use dial::benchmark::{
-    AgentFailure, BenchmarkCase, PostCheckEnd, PostCheckTiming, RunMetrics, ToolTrace,
-    WorkerExecution, failure_detail, response_sha256,
+    AgentFailure, BenchmarkCase, ChildEvent, InflightProgress, PostCheckEnd, PostCheckTiming,
+    RunMetrics, ToolTrace, WorkerExecution, failure_detail, response_sha256,
 };
 use serde_json::{Value, json};
 use std::{
@@ -38,27 +38,74 @@ fn capture_diagnostics(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
         }
     }
 }
-fn check_deadline(deadline: Option<Instant>) -> Result<()> {
-    ensure!(
-        deadline.is_none_or(|deadline| Instant::now() < deadline),
-        "benchmark RPC timed out"
-    );
-    Ok(())
+/// Bounds on one wait. The wall deadline covers the whole case. The optional inactivity bound is
+/// measured from the latest dispatch or meaningful progress (`RunMetrics::last_progress_at`), so
+/// it applies to the first response as well as later silence. Whichever bound is earlier wins.
+#[derive(Clone, Copy)]
+struct Guard {
+    wall: Option<Instant>,
+    inactivity: Option<Duration>,
 }
-fn receive(rx: &mpsc::Receiver<Result<Value>>, deadline: Option<Instant>) -> Result<Value> {
-    check_deadline(deadline)?;
+
+impl Guard {
+    fn wall(deadline: Option<Instant>) -> Self {
+        Self {
+            wall: deadline,
+            inactivity: None,
+        }
+    }
+
+    /// The earliest bound in effect, and whether it is the inactivity bound.
+    fn active(self, metrics: &RunMetrics) -> (Option<Instant>, bool) {
+        let idle = self
+            .inactivity
+            .zip(metrics.last_progress_at)
+            .map(|(limit, at)| at + limit);
+        match (self.wall, idle) {
+            (Some(wall), Some(idle)) if idle < wall => (Some(idle), true),
+            (None, Some(idle)) => (Some(idle), true),
+            (wall, _) => (wall, false),
+        }
+    }
+
+    fn bound_error(self, inactivity: bool) -> anyhow::Error {
+        match (inactivity, self.inactivity) {
+            (true, Some(limit)) => anyhow::anyhow!(
+                "benchmark RPC inactive: no meaningful progress for {} s",
+                limit.as_secs()
+            ),
+            _ => anyhow::anyhow!("benchmark RPC timed out"),
+        }
+    }
+
+    fn check(self, metrics: &RunMetrics) -> Result<()> {
+        let (deadline, inactivity) = self.active(metrics);
+        match deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(self.bound_error(inactivity)),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn receive(
+    rx: &mpsc::Receiver<Result<Value>>,
+    guard: Guard,
+    metrics: &RunMetrics,
+) -> Result<Value> {
+    guard.check(metrics)?;
+    let (deadline, inactivity) = guard.active(metrics);
     let event = match deadline {
         Some(deadline) => match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
             Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!("benchmark RPC timed out")),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(guard.bound_error(inactivity)),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err(anyhow::anyhow!("benchmark RPC closed"))
             }
         },
         None => rx.recv().context("benchmark RPC closed")?,
     }?;
-    check_deadline(deadline)?;
+    guard.check(metrics)?;
     Ok(event)
 }
 fn request(
@@ -67,10 +114,11 @@ fn request(
     id: u64,
     method: &str,
     params: Value,
-    deadline: Option<Instant>,
+    guard: Guard,
     metrics: &mut RunMetrics,
 ) -> Result<Value> {
-    check_deadline(deadline)
+    guard
+        .check(metrics)
         .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))?;
     serde_json::to_writer(
         &mut *input,
@@ -78,9 +126,11 @@ fn request(
     )?;
     input.write_all(b"\n")?;
     input.flush()?;
+    // The silence window starts at dispatch, so a silent first response is bounded too.
+    metrics.last_progress_at = Some(Instant::now());
     let mut last_pass = None;
     let result = loop {
-        let event = match receive(rx, deadline)
+        let event = match receive(rx, guard, metrics)
             .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))
         {
             Ok(event) => event,
@@ -170,6 +220,29 @@ impl Phases {
     }
 }
 
+/// Names where a stalled or timed-out case was last heard from: the last child event and the
+/// live counts of any request still in flight. Live counts are a last observation, not totals.
+fn activity_summary(metrics: &RunMetrics, now: Instant) -> String {
+    let last = match &metrics.last_child_event {
+        Some(event) => format!(
+            "last child event {} {:.1} s earlier",
+            event.kind,
+            (now - event.at).as_secs_f64()
+        ),
+        None => "no child event observed".to_owned(),
+    };
+    match &metrics.inflight_progress {
+        Some(progress) => format!(
+            "{last}; in flight: {} phase, output tokens {}",
+            progress.phase,
+            progress
+                .output_tokens
+                .map_or_else(|| "unreported".to_owned(), |n| n.to_string())
+        ),
+        None => last,
+    }
+}
+
 fn completed_turns(report: &Value, previous: u64) -> Result<u64> {
     let completed = report
         .pointer("/metrics/turns_completed")
@@ -212,8 +285,28 @@ fn retain_efficiency(metrics: &mut RunMetrics, state: &Value, send: Option<u64>)
 }
 
 fn observe(m: &mut RunMetrics, event: &Value) {
+    if let Some(kind) = event["event"].as_str() {
+        m.last_child_event = Some(ChildEvent {
+            kind: kind.to_owned(),
+            at: Instant::now(),
+        });
+    }
+    // Meaningful progress restarts the inactivity window. Keep-alives, notices and repeated
+    // identical progress reports do not, so a hung child cannot reset its own bound.
+    let progressed = match event["event"].as_str() {
+        Some("text" | "reasoning") => event["delta"]
+            .as_str()
+            .is_some_and(|delta| !delta.is_empty()),
+        Some("tool_call" | "tool_result" | "tool_output" | "usage" | "check_passed") => true,
+        _ => false,
+    };
+    if progressed {
+        m.last_progress_at = Some(Instant::now());
+    }
     match event["event"].as_str() {
         Some("usage") => {
+            // A usage report closes the in-flight request, so its live counts no longer apply.
+            m.inflight_progress = None;
             if let (Some(prompt), Some(output)) = (
                 event["prompt_tokens"].as_u64(),
                 event["output_tokens"].as_u64(),
@@ -224,6 +317,16 @@ fn observe(m: &mut RunMetrics, event: &Value) {
             } else {
                 m.token_usage_incomplete = true;
             }
+        }
+        Some("model_progress") => {
+            // A live observation of the request in flight. Its counts are not usage: they
+            // are kept beside the totals, never summed into them.
+            let next: Option<InflightProgress> =
+                serde_json::from_value(event["progress"].clone()).ok();
+            if next.is_some() && next != m.inflight_progress {
+                m.last_progress_at = Some(Instant::now());
+            }
+            m.inflight_progress = next;
         }
         Some("cached_usage") => {
             m.cached_tokens += event["read_tokens"].as_u64().unwrap_or(0);
@@ -388,7 +491,25 @@ pub fn run(
     workspace: &Path,
     auth_home: Option<&Path>,
 ) -> Result<RunMetrics> {
-    run_configured(executable, user_home, case, workspace, 600, None, auth_home)
+    run_configured(
+        executable,
+        user_home,
+        case,
+        workspace,
+        CaseLimits {
+            wall_secs: 600,
+            inactivity_secs: 0,
+        },
+        None,
+        auth_home,
+    )
+}
+
+/// Wall and inactivity bounds for one case. Zero disables a bound; wall 0 means unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaseLimits {
+    pub wall_secs: u64,
+    pub inactivity_secs: u64,
 }
 
 /// Runs one case in a persistent child. A failed run returns [`AgentFailure`], carrying the
@@ -398,16 +519,29 @@ pub fn run_configured(
     user_home: &Path,
     case: &BenchmarkCase,
     workspace: &Path,
-    timeout_secs: u64,
+    limits: CaseLimits,
     adapter: Option<&Path>,
     auth_home: Option<&Path>,
 ) -> Result<RunMetrics> {
+    let CaseLimits {
+        wall_secs: timeout_secs,
+        inactivity_secs,
+    } = limits;
     ensure!(
         timeout_secs <= 600,
         "benchmark timeout must be 0 (unlimited) or 1..=600 seconds"
     );
+    ensure!(
+        inactivity_secs <= 600 && (timeout_secs == 0 || inactivity_secs <= timeout_secs),
+        "benchmark inactivity limit must be 0 (off) or 1..=600 seconds, no longer than the timeout"
+    );
     let started = Instant::now();
     let deadline = (timeout_secs != 0).then(|| started + Duration::from_secs(timeout_secs));
+    // Opt-in silence bound, separate from the wall deadline. It stays off unless configured.
+    let guard = Guard {
+        wall: deadline,
+        inactivity: (inactivity_secs != 0).then(|| Duration::from_secs(inactivity_secs)),
+    };
     let mut command = Command::new(executable);
     command
         .args(["rpc", "--yes", "--sandbox", "dev"])
@@ -488,7 +622,10 @@ pub fn run_configured(
             }
         }
     });
-    let mut metrics = RunMetrics::default();
+    let mut metrics = RunMetrics {
+        last_progress_at: Some(started),
+        ..RunMetrics::default()
+    };
     let mut ledger_read = false;
     let mut trace_snapshot: Option<Value> = None;
     let (mut trace_sends, mut trace_snapshots) = (0u64, 0u64);
@@ -496,7 +633,7 @@ pub fn run_configured(
     phases.start(started);
     let result = (|| -> Result<()> {
         loop {
-            let event = receive(&rx, deadline)?;
+            let event = receive(&rx, guard, &metrics)?;
             ensure!(
                 event["event"] != "fatal",
                 "benchmark initialization failed: {}",
@@ -515,7 +652,7 @@ pub fn run_configured(
                 id,
                 "seed_context",
                 json!({"messages":case.context_messages}),
-                deadline,
+                guard,
                 &mut metrics,
             )?;
             phases.done(format!("seed_context#{id}"), Instant::now());
@@ -533,7 +670,7 @@ pub fn run_configured(
                     id,
                     "compact",
                     json!({"keep_recent_tokens":0}),
-                    deadline,
+                    guard,
                     &mut metrics,
                 )?;
                 require_compaction(&compacted)?;
@@ -547,7 +684,7 @@ pub fn run_configured(
                 id,
                 "send",
                 json!({"text":prompt}),
-                deadline,
+                guard,
                 &mut metrics,
             )?;
             phases.done(format!("send#{id}"), Instant::now());
@@ -602,16 +739,8 @@ pub fn run_configured(
         }
         // Runtime-wide ledger (every purpose and worker), read once after the last turn. It
         // replaces the main-agent usage events above, so the two are never summed.
-        let state = request(
-            &mut input,
-            &rx,
-            id,
-            "state",
-            json!({}),
-            deadline,
-            &mut metrics,
-        )
-        .context("benchmark runtime usage snapshot unavailable")?;
+        let state = request(&mut input, &rx, id, "state", json!({}), guard, &mut metrics)
+            .context("benchmark runtime usage snapshot unavailable")?;
         ledger_read = true;
         apply_ledger(&mut metrics, read_ledger(&state));
         metrics.worker_execution = read_worker_execution(&state);
@@ -622,13 +751,20 @@ pub fn run_configured(
             id,
             "shutdown",
             json!({}),
-            deadline,
+            guard,
             &mut metrics,
         )?;
         Ok(())
     })();
     // Attribute a whole-case failure (notably the deadline) to the phase that consumed the time.
-    let result = result.map_err(|error| error.context(phases.summary(started, Instant::now())));
+    let result = result.map_err(|error| {
+        let now = Instant::now();
+        error.context(format!(
+            "{}; {}",
+            phases.summary(started, now),
+            activity_summary(&metrics, now)
+        ))
+    });
     // A turn can fail after paying for inference. When the child still speaks RPC, retain its
     // settled ledger rather than throwing away worker/auxiliary usage on the error path.
     // A dead or busy child gets only one bounded recovery read, never another model request.
@@ -646,7 +782,7 @@ pub fn run_configured(
             u64::MAX,
             "state",
             json!({}),
-            Some(Instant::now() + Duration::from_secs(2)),
+            Guard::wall(Some(Instant::now() + Duration::from_secs(2))),
             &mut metrics,
         )
     {
@@ -665,8 +801,10 @@ pub fn run_configured(
         trace_snapshots,
         result.is_ok(),
     );
-    // A failure before the ledger read leaves runtime usage unknown once the model was active.
-    let active = metrics.token_usage_observed
+    // A send that was issued may already have reached the model. Without a ledger read its usage
+    // is unknown, not zero, even when no usage event arrived before the failure.
+    let active = trace_sends > 0
+        || metrics.token_usage_observed
         || metrics.tool_calls > 0
         || metrics.turns_completed > 0
         || metrics.compactions > 0;

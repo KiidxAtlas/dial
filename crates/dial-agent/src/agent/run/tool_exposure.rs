@@ -1485,7 +1485,13 @@ impl Agent<'_> {
             .iter()
             .find(|schema| schema["function"]["name"] == call.name.as_str())?;
         let arguments = call.arguments.as_object()?;
-        if crate::tools::surface::catalog::validate_arguments(schema, &call.arguments).is_ok() {
+        if crate::tools::surface::catalog::validate_tool_arguments(
+            &call.name,
+            schema,
+            &call.arguments,
+        )
+        .is_ok()
+        {
             return None;
         }
         let declared = |schema: &Value, key: &str| {

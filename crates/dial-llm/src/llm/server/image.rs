@@ -447,7 +447,7 @@ fn launch(
             base_url: format!("{origin}/v1"),
         }),
         Err(error) => {
-            process.stop();
+            let exit_status = process.stop();
             let logs = [stdout, stderr]
                 .iter()
                 .flatten()
@@ -459,10 +459,27 @@ fn launch(
                 .collect::<Vec<_>>()
                 .join("\n");
             let program = Path::new(command.get_program()).display().to_string();
-            let message = if logs.is_empty() {
-                format!("{error:#}; image server: {program} (it wrote no log)")
+            #[cfg(unix)]
+            let sigkill = {
+                use std::os::unix::process::ExitStatusExt as _;
+                exit_status.and_then(|s| s.signal()) == Some(9)
+            };
+            #[cfg(not(unix))]
+            let sigkill = false;
+            let logs_lower = logs.to_ascii_lowercase();
+            let oom_hint = if sigkill
+                || logs_lower.contains("out of memory")
+                || logs_lower.contains("bad_alloc")
+                || logs_lower.contains("insufficient memory")
+            {
+                " — killed by SIGKILL or out of memory while loading this checkpoint; try a smaller/quantized checkpoint or free RAM before retrying"
             } else {
-                format!("{error:#}; image server: {program}; last log lines:\n{logs}")
+                ""
+            };
+            let message = if logs.is_empty() {
+                format!("{error:#}{oom_hint}; image server: {program} (it wrote no log)")
+            } else {
+                format!("{error:#}{oom_hint}; image server: {program}; last log lines:\n{logs}")
             };
             if logs.contains("Address already in use") || logs.contains("bind") {
                 Err(Launch::PortTaken(anyhow!(message)))

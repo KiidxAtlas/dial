@@ -202,3 +202,48 @@ fn desktop_results_summarize_windows_and_captures_without_replacing_evidence() {
         "errors must retain their actual evidence"
     );
 }
+
+#[test]
+fn verify_results_show_counts_and_one_row_per_check_even_when_failing() {
+    let data = serde_json::json!({
+        "counts": {"passed": 1, "failed": 1},
+        "results": [
+            {"name": "repro: calc", "command": "pytest -q", "status": "passed", "reused": false},
+            {"name": "cargo check", "command": "cargo check", "status": "code_failed", "reused": false},
+            {"name": "lint", "command": "make lint", "status": "passed", "reused": true},
+        ],
+    });
+    let output = ToolOutput {
+        data: Some(data),
+        is_error: true,
+        ..ToolOutput::err("Verify: Passed 1, Failed 1\ncode_failed: cargo check")
+    };
+    let view = render_result("verify", &serde_json::json!({}), &output);
+    assert_eq!(
+        view.facts,
+        vec!["1 passed".to_owned(), "1 failed".to_owned()]
+    );
+    assert_eq!(
+        view.preview.as_deref(),
+        Some("passed · repro: calc\nfailed · cargo check\npassed, reused · lint")
+    );
+
+    let passing = ToolOutput::structured(serde_json::json!({
+        "counts": {"passed": 2, "failed": 0},
+        "results": [
+            {"name": "a", "status": "passed"},
+            {"name": "b", "status": "timed_out"},
+        ],
+    }));
+    let view = render_result("verify", &serde_json::json!({}), &passing);
+    assert_eq!(view.facts, vec!["2 passed".to_owned()]);
+    assert_eq!(view.preview.as_deref(), Some("passed · a\ntimed out · b"));
+
+    // A refusal or plan answer has no results: the text stays the body.
+    let refused = render_result(
+        "verify",
+        &serde_json::json!({}),
+        &ToolOutput::err("unknown check name"),
+    );
+    assert!(refused.facts.is_empty() && refused.preview.is_none());
+}

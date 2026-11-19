@@ -1,5 +1,5 @@
 //! Tool-trace contracts: legacy compatibility, snapshot parsing, and the real suite parser.
-use super::{BenchmarkSuite, RunMetrics, ToolTrace, ToolTraceScope};
+use super::{BenchmarkSuite, RunMetrics, ToolCallRecord, ToolTrace, ToolTraceScope};
 use serde_json::json;
 use std::path::Path;
 
@@ -33,6 +33,19 @@ fn trace_round_trips_with_per_tool_counts() {
             .into_iter()
             .collect(),
         invoked: [("read".to_owned(), 1)].into_iter().collect(),
+        calls: Some(vec![ToolCallRecord {
+            ordinal: 1,
+            tool: "read".into(),
+            input_sha256: "digest".into(),
+            input_keys: vec!["path".into()],
+            input_keys_omitted: 0,
+            duration_ms: 7,
+            outcome: "ok".into(),
+            executed: true,
+            cache: "none".into(),
+            error_sha256: None,
+        }]),
+        calls_omitted: 2,
     };
     let metrics = RunMetrics {
         tool_trace: Some(trace.clone()),
@@ -88,6 +101,41 @@ fn repository_tool_effectiveness_suite_parses_with_the_real_suite_parser() {
                 .all(|check| !matches!(check, super::Assertion::Metric { .. })),
             "{} must not use tool-count metrics as success",
             case.id
+        );
+    }
+}
+
+#[test]
+fn per_call_records_parse_only_when_the_whole_list_is_well_formed() {
+    let record = json!({
+        "ordinal": 1, "tool": "read", "input_sha256": "d", "input_keys": ["path"], "input_keys_omitted": 0,
+        "duration_ms": 3, "outcome": "error", "executed": true, "cache": "none",
+        "error_sha256": "e"
+    });
+    let with_calls = |calls: serde_json::Value| {
+        json!({"successful_requests": 1, "offered": {}, "invoked": {"read": 1},
+               "calls": calls, "calls_omitted": 4})
+    };
+    let parsed = ToolTrace::from_snapshot(&with_calls(json!([record.clone()])), true).unwrap();
+    assert_eq!(parsed.calls.as_ref().map(Vec::len), Some(1));
+    assert_eq!(parsed.calls_omitted, 4);
+    assert_eq!(parsed.calls.unwrap()[0].error_sha256.as_deref(), Some("e"));
+
+    let legacy = json!({"successful_requests": 1, "offered": {}, "invoked": {}});
+    let legacy = ToolTrace::from_snapshot(&legacy, true).unwrap();
+    assert_eq!((legacy.calls, legacy.calls_omitted), (None, 0));
+
+    let malformed = [
+        with_calls(json!("not a list")),
+        with_calls(json!([{"ordinal": 1}])),
+        with_calls(json!([record.clone(), {"ordinal": "2"}])),
+        json!({"successful_requests": 1, "offered": {}, "invoked": {}, "calls_omitted": -1}),
+    ];
+    for snapshot in malformed {
+        assert_eq!(
+            ToolTrace::from_snapshot(&snapshot, true),
+            None,
+            "{snapshot}"
         );
     }
 }

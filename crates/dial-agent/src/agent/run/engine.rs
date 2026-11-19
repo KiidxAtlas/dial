@@ -603,9 +603,12 @@ impl Engine {
             // command with unknown dependencies may then succeed, so its barrier is released;
             // failures tied to known files still wait for those files to change.
             self.release_for_change(&[]);
-        } else if succeeded && status_is_ok(output) && starts_background_job(call) {
-            // A started server changes reachable network state the same way: a browse or request
-            // refused before it listened may now succeed. Other jobs keep their name-scoped rule.
+        } else if succeeded
+            && status_is_ok(output)
+            && (starts_background_job(call) || job_lifecycle_change(call, output).is_some())
+        {
+            // A started or killed background service changes reachable process/network state the
+            // same way: a probe or request refused before it changed may now succeed.
             self.release_for_service_start();
         }
         // Native refusals can themselves return complete source rows. Reuse those witnesses;

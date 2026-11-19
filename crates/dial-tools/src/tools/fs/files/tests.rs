@@ -1,6 +1,16 @@
 use super::*;
 use crate::tools::testkit::*;
 use serde_json::json;
+
+/// Keep assertions about selectors exact, including both snapshot headers on editable text.
+fn anchored(name: &str, source: &str, rows: &str) -> String {
+    format!(
+        "[{name}#{}]\n[Source raw SHA256:{}]\n{rows}",
+        hashline::tag_of(source),
+        crate::tools::edit::edit_source::revision_hex(source)
+    )
+}
+
 #[test]
 fn directory_listing_is_by_name_and_does_not_expand_generated_directories() {
     let (dir, ws) = workspace();
@@ -80,11 +90,7 @@ fn read_numbers_lines_and_pages() {
         json!({"path": "f.txt", "offset": 3, "limit": 2}),
     );
     assert!(!out.is_error);
-    assert!(
-        out.text.contains("     3\tline 3\n     4\tline 4\n"),
-        "{}",
-        out.text
-    );
+    assert!(out.text.contains("3:line 3\n4:line 4\n"), "{}", out.text);
     assert!(!out.text.contains("line 5\n"));
     assert!(
         out.text
@@ -103,7 +109,7 @@ fn read_numbers_lines_and_pages() {
     fs::write(dir.path().join("empty"), "").unwrap();
     assert_eq!(
         run(&ws, "read", json!({"path": "empty"})).text,
-        "(empty file)"
+        anchored("empty", "", "(empty file)\n")
     );
     fs::write(dir.path().join("bin"), b"abc\0def").unwrap();
     assert!(
@@ -244,7 +250,7 @@ fn multi_path_budget_is_shared_so_a_large_first_file_does_not_starve_later_targe
     .unwrap();
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(out.data.as_ref().unwrap()["read"], 3, "{}", out.text);
-    assert!(out.text.contains("     1\tline 1\n"), "{}", out.text);
+    assert!(out.text.contains("\n1:line 1\n"), "{}", out.text);
     assert!(
         out.text.contains("alpha") && out.text.contains("mid 20"),
         "{}",
@@ -272,7 +278,7 @@ fn multi_path_budget_is_shared_so_a_large_first_file_does_not_starve_later_targe
     // The continuation selector then reads on from exactly that row.
     let rest = run(&ws, "read", json!({"path": format!("big.txt:{next}")}));
     assert!(
-        rest.text.contains(&format!("{from:>6}\tline {from}\n")),
+        rest.text.contains(&format!("\n{from}:line {from}\n")),
         "{}",
         rest.text
     );
@@ -502,21 +508,25 @@ fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {
 fn read_accepts_path_selectors_for_ranges_tail_and_multiple_ranges() {
     let (dir, ws) = workspace();
     numbered_file(&dir, "f.txt", 20);
+    let source = fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    let expected = |rows| anchored("f.txt", &source, rows);
     let read = |path: &str| run(&ws, "read", json!({ "path": path }));
     assert_eq!(
         read("f.txt:3-4").text,
-        "     3\tline 3\n     4\tline 4\n[lines 3-4 of 20]\n"
+        expected("3:line 3\n4:line 4\n[lines 3-4 of 20]\n")
     );
     assert_eq!(read("f.txt:3+2").text, read("f.txt:3-4").text);
     let tail = read("f.txt:-2").text;
     assert_eq!(
         tail,
-        "    19\tline 19\n    20\tline 20\n[lines 19-20 of 20]\n"
+        expected("19:line 19\n20:line 20\n[lines 19-20 of 20]\n")
     );
     let multi = read("f.txt:2-3,18-").text;
     assert_eq!(
         multi,
-        "     2\tline 2\n     3\tline 3\n…\n    18\tline 18\n    19\tline 19\n    20\tline 20\n[lines 2-3, 18-20 of 20]\n"
+        expected(
+            "2:line 2\n3:line 3\n…\n18:line 18\n19:line 19\n20:line 20\n[lines 2-3, 18-20 of 20]\n"
+        )
     );
     assert_eq!(read("f.txt:raw:19-20").text, "line 19\nline 20\n");
     assert!(read("f.txt:0").is_error);
@@ -524,7 +534,7 @@ fn read_accepts_path_selectors_for_ranges_tail_and_multiple_ranges() {
     assert!(
         read("f.txt:1-20")
             .text
-            .ends_with("    20\tline 20\n[lines 1-20 of 20]\n")
+            .ends_with("20:line 20\n[lines 1-20 of 20]\n")
     );
 }
 
@@ -532,14 +542,18 @@ fn read_accepts_path_selectors_for_ranges_tail_and_multiple_ranges() {
 fn read_ranges_clip_at_the_end_of_the_file() {
     let (dir, ws) = workspace();
     numbered_file(&dir, "f.txt", 5);
+    let source = fs::read_to_string(dir.path().join("f.txt")).unwrap();
     let read = |path: &str| run(&ws, "read", json!({ "path": path })).text;
     assert_eq!(
         read("f.txt:4-99"),
-        "     4\tline 4\n     5\tline 5\n[lines 4-5 of 5]\n"
+        anchored("f.txt", &source, "4:line 4\n5:line 5\n[lines 4-5 of 5]\n")
     );
     assert!(read("f.txt:6-9").contains("no lines in that range; file has 5 lines"));
     // A range past the end is skipped; the valid one is still returned.
-    assert_eq!(read("f.txt:2-2,50-60"), "     2\tline 2\n[lines 2 of 5]\n");
+    assert_eq!(
+        read("f.txt:2-2,50-60"),
+        anchored("f.txt", &source, "2:line 2\n[lines 2 of 5]\n")
+    );
     assert!(read("f.txt:-100").contains("[lines 1-5 of 5]"));
     // Open-ended ranges are bounded by `limit` and say how to continue.
     let paged = run(&ws, "read", json!({"path": "f.txt:2-", "limit": 2})).text;
@@ -549,8 +563,8 @@ fn read_ranges_clip_at_the_end_of_the_file() {
     );
     // An empty file has no lines for any selector.
     fs::write(dir.path().join("empty"), "").unwrap();
-    assert_eq!(read("empty:3-5"), "(empty file)");
-    assert_eq!(read("empty:-3"), "(empty file)");
+    assert_eq!(read("empty:3-5"), anchored("empty", "", "(empty file)\n"));
+    assert_eq!(read("empty:-3"), read("empty:3-5"));
 }
 
 #[test]
@@ -577,7 +591,7 @@ fn read_without_trailing_newline_counts_the_last_line() {
     let (dir, ws) = workspace();
     fs::write(dir.path().join("f.txt"), "a\nb\nc").unwrap();
     let out = run(&ws, "read", json!({"path": "f.txt:-1"})).text;
-    assert_eq!(out, "     3\tc\n[lines 3 of 3]\n");
+    assert_eq!(out, anchored("f.txt", "a\nb\nc", "3:c\n[lines 3 of 3]\n"));
     let head = run(&ws, "read", json!({"path": "f.txt", "limit": 1})).text;
     assert!(
         head.ends_with("[lines 1 of 3; continue with `f.txt:2-`]\n"),
@@ -598,7 +612,7 @@ fn read_rejects_offset_combined_with_a_selector_and_reads_odd_names_literally() 
     fs::write(dir.path().join("weird:5"), "x\n").unwrap();
     assert_eq!(
         run(&ws, "read", json!({"path": "weird:5"})).text,
-        "     1\tx\n"
+        anchored("weird:5", "x\n", "1:x\n")
     );
 }
 

@@ -93,6 +93,9 @@ A failed `bg start` is likewise a prerequisite of later `wait`, `output`, `input
 `resize` actions on the same job name in that batch: they are skipped unexecuted, because the job
 does not exist. `kill`, `list` and actions on other jobs still run, and a start refused because
 the name is already running does not skip actions on the running job.
+
+Native calls in one response run together as a wave only when their resources are provably disjoint. A read-only `bash` command is narrowed to its own files only when it is one plain `cat`, `wc`, `head`, `tail` or `stat` whose operands are literal workspace paths (a directory operand covers its contents) that the native resource rules admit: not a symlink, a hard-linked file, a path outside the workspace, or a missing file. Options are matched against an exact per-program list; an unlisted, abbreviated, bundled or `=`-suffixed option keeps the whole-workspace read, as do pipes, redirection, expansion, globs, stdin reads, `wc --files0-from` and file handles. A `cwd` argument narrows only when it is an existing directory reached without a symlink. Such a read waits behind any write to a path it does not name. `--` ends option parsing. `stat -f` is read as GNU's boolean `--file-system` flag, so on BSD or macOS, where `-f` takes a format, the format is an unresolved operand and the command falls back to the broad read.
+
 An observational native no-op does not advance the source-mutation revision solely because its
 tool is named `edit`, `write` or `ast_edit`.
 
@@ -456,6 +459,11 @@ files remain available, so a failing implementation can still be repaired. A com
 foreground check, asserting eval cell or fresh passing `verify` run clears the counts; merely
 loading a checker, a skipped check or a successful status observation does not. Custom shell
 checks declare `check: true` and must preserve nonzero failure statuses.
+
+Eval cells that repeat one code shape three times in a row, with no passing check or committed source change in between, get an advisory note at each third repeat, as edited files do. Whitespace and digit values do not change the shape, so `print(1)` and `print( 2 )` count as one attempt. A failing cell counts as no progress; a passing eval callback, a passing check or a committed change resets the streak. Nothing is refused. Three failed `edit` or `write` calls to one file that commit nothing also raise the rewrite-pressure signal for the experimental adaptive output-effort setting (`experimental.adaptive_output_effort`, Anthropic reasoning models only); they add no checkpoint and withhold no write.
+
+A repeated routine nonzero `bash` exit (the process ran to completion, output is complete, no paths were committed) gets one compact recovery line with its streak count, not the full state block. Uncertain effects, committed work and partial capture keep the full report.
+
 Completion refusals for retained failed checks include a JSON `verify` call with the exact
 check names (bounded by the tool's target limit). Repair the cause before rerunning it;
 additional failures may remain. A differently named passing check does not discharge the
@@ -1367,11 +1375,11 @@ limits, reasoning budgets, approvals or verification requirements:
   - Prompt scope: tool-specific sentences of the fixed guidance (`skill`, saved project maps for
     `codebase_memory`, the LSP) appear only when that tool is offered, like the preview and
     delegation sections.
-  - Edit mode: local routes default to the `replace` grammar. Precedence is the `--edit-mode`
-    override, the model profile `edit_mode`, `[harness] edit_mode`, `[edit] model_variants`, then
-    `assistance.local.edit_mode`, then `[edit] mode`. `inherit` makes the local default follow
-    `[edit] mode`. Hermetic evaluation ignores the local default. When the local default replaces an
-    explicitly set `[edit] mode`, a one-time notice per session names both modes and `inherit`.
+  - Edit mode: local routes default to Hashline, as do hosted routes. Precedence is the
+    `--edit-mode` override, model profile `edit_mode`, `[harness] edit_mode`, `[edit] model_variants`,
+    an explicit `assistance.local.edit_mode` other than `inherit`, then `[edit] mode`. Hermetic
+    evaluation ignores the local override. The single `edit` tool also accepts the other native
+    edit grammars without loading more tools.
   - Sampling: `model` (default) leaves externally hosted local models to their serving host's API
     defaults, including LM Studio and Ollama. Dial omits `temperature` instead of substituting a
     learned harness value or guessing the host's numeric default. An explicitly configured
@@ -1823,7 +1831,11 @@ the user's interrupt flag. Both folds are joined before returning the original f
 method fallback can proceed unless the user actually stopped the operation. Cancellation remains
 cooperative with the existing bounded provider-request machinery.
 
-Recoverable pre-summary projection remains opt-in with `supersede_reads` and `drop_useless`
+Once a portable summary starts, its input replaces large successful observations with their
+artifact pointers when doing so saves space. This does not rewrite stored history, errors,
+mutations, or observations without a retrieval artifact.
+
+Projection of the live request *before* a summary starts remains opt-in with `supersede_reads` and `drop_useless`
 (both default `false`). Unique observation pruning requires `drop_useless`; mutations, skills,
 unresolved failures and unknown effects are not disposable observations. The protected recent tail
 stays expanded. New prune batches must free at least 8,000 **net estimated tokens**, after counting

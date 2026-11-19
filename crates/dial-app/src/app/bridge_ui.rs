@@ -362,6 +362,7 @@ impl Bridge<'_> {
             name: name.to_owned(),
             started: Instant::now(),
             testing,
+            view: None,
         });
         self.refresh_tool_activity();
     }
@@ -812,22 +813,32 @@ impl Ui for Bridge<'_> {
         id: &str,
         view: &crate::tools::surface::presentation::Presentation,
     ) {
+        if let Some(call) = self.pending.iter_mut().find(|call| call.id == id) {
+            call.view = Some(view.clone());
+        }
         self.shell.transcript.tool_presentation(id, view);
     }
 
     fn tool_result_with_id(&mut self, id: &str, _name: &str, output: &ToolOutput) {
-        let started = self
+        let (started, view) = self
             .pending
             .iter()
             .position(|call| call.id == id)
-            .map(|index| self.pending.remove(index).started)
-            .unwrap_or_else(Instant::now);
+            .map(|index| {
+                let call = self.pending.remove(index);
+                (call.started, call.view)
+            })
+            .unwrap_or_else(|| (Instant::now(), None));
         self.shell.transcript.tool_end_with(
             id,
             &output.text,
             crate::ui::tool_cards::ToolOutcome::of(output),
             started.elapsed().as_secs_f64(),
         );
+        // The engine's result view also saw the structured result; see `tool_result_view`.
+        if let Some(view) = view {
+            self.shell.transcript.tool_result_view(id, &view);
+        }
         if let Some(data) = &output.data {
             self.shell.transcript.tool_data(id, data);
         }

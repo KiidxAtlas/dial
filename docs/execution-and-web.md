@@ -35,6 +35,16 @@ runner. It returns a `job` handle immediately; use its `name` with the controls 
 not create a second shell-session mechanism. Explicit `timeout` and `session` are incompatible
 with this mode, and `shell.no_pty` remains enforced. See [interactive programs](shell.md#interactive-programs).
 
+`bash` also takes an opt-in `idle_timeout` (seconds, at most the command's `timeout`) for foreground
+commands. When the command prints nothing for that long, its process group is killed and the result
+says `no output for Ns; process group killed by idle_timeout`; the outcome is a timeout. It measures
+silence, not elapsed time, so a quiet command shorter than the limit is unaffected, and omitting it
+leaves the wall-time `timeout` as the only limit. It is refused with `background`, `pty` or `session`.
+
+The sandboxed `bash` PATH holds only trusted package bin directories (`/opt/homebrew/bin` and
+`/usr/local/bin` when present), the Command Line Tools bin, and the system bins. The operator's
+inherited `PATH` is never added to the sandbox.
+
 Execution metadata separates the observation (`snapshot`, `wait`, `readiness`, `input`, or
 `termination`, plus whether it was satisfied) from the child's exit code/signal. In particular,
 successful `bg wait` observation of exit 3 does not mean the command succeeded. Output metadata
@@ -79,8 +89,8 @@ confinement and execution records:
 - Helpers are methods of `dial`, not globals: in Python an undefined bare helper such as
   `readText(...)` fails with a hint naming `dial.readText(...)`. Truncated cell output keeps its
   start and says how many characters were dropped.
-- `writeText`/`writeJson` use the text editor transaction. `writeBytes` stages a new binary file,
-  limited to 1 MiB. Its parent must exist; it never overwrites an existing output or source.
+- Embedded JavaScript has no Node modules except `require('fs')` and `require('path')`. Their `fs` calls go through the same governed tool callbacks, so `writeFileSync(path, data, {expectedSha256})` is the only explicit overwrite form and nothing is read implicitly.
+- `writeText`/`writeJson` use the text editor transaction. They never read a file implicitly. Overwriting an existing file needs a whole-file `dial.read` of it in the session and `expectedSha256` (Python: `expected_sha256=`) set to that receipt's SHA-256; the write tool still checks the digest and approvals still apply. Without it, the refusal says what to read first. `writeBytes` stages a new binary file, limited to 1 MiB. Its parent must exist; it never overwrites an existing output or source.
 - `run(command, options)` calls `bash`. Mark an acceptance command with `check: true`, preserve
   its failing exit status, and name the files it exercises in `check_paths`. A passing foreground
   command releases repeated-rewrite pressure only for those paths.
@@ -90,9 +100,13 @@ confinement and execution records:
   behavior. No batch rolls back completed work. Receipts include native status, effects, changed
   paths and process/output facts. Arbitrary batch failures never trigger replay; serial fallback
   requires an explicit `unsupported_batch` result with `executed: false`.
-- `check(name, boolean)` records a check callback that actually ran and raises when false.
-  Catching the exception does not erase the failed receipt. Local checks do not certify unrelated
-  workspace edits or every task requirement. Assertion words in source/stdout earn no credit.
+- `check(name, boolean)` records a local assertion and raises when false. To bind it to a saved
+  file, pass the whole-file `dial.read` result for a literal workspace-relative path as its third argument. For example, in Python:
+  `src = dial.read("result.json")`, then `dial.check("output type", type(json.loads(src["content"])) is list, src)`
+  (after `import json`). The receipt names the file, its SHA-256 and the Eval backend that ran the
+  assertion. Use the consumer the task requested: a Node receipt is not evidence about Python.
+  A caught assertion failure is still a failure. Neither a receipt nor stdout proves coverage or
+  replaces a registered acceptance check.
 - `snapshot(paths)` retains exact artifacts for 1–16 source files and rechecks their hashes. The
   compact manifest omits content. Preserve the database/WAL/SHM set before recovery tools open it.
   Individual captures and a second hash pass are **not an atomic live-database snapshot**;
@@ -144,16 +158,16 @@ synchronous: the generator is passed positionally and options as keywords
 pass is evidence over the inputs tried, not proof.
 
 The environment prompt reports whether the configured JavaScript and Python eval launchers
-resolve before the model generates a helper. Discovery reports a missing prerequisite when
-neither resolves. These are executable-path observations: interpreter version, containment and
+resolve before the model generates a helper. A `python3` launcher is reported as such; a bare `python` is reported as an unverified launcher, not as Python 3. Discovery reports a missing prerequisite when no python3 launcher resolves. These are executable-path observations: interpreter version, containment and
 actual execution still need validation. Loading `eval` installs no interpreter; its status,
 reset and cancel actions remain loadable without one. Release binaries prefer their pinned,
 embedded Node runtime for the default `eval.node = "node"`; explicit Node 22+ executable
 overrides remain supported outside the editable workspace. Unbundled source builds use host
 Node when it resolves, otherwise Dial's embedded QuickJS engine (the default `embedded-js`
-feature). Python 3.8+ still needs the existing [dependency setup](setup.md), including in
-benchmark containers.
-Do not assume a configured absolute eval launcher is also available by name in the shell.
+feature). Release builds also carry CPython and its standard library. With no project environment
+or interpreter override, Python Eval uses that payload, even if the shell has no `python3`.
+Source builds without a payload need a host Python 3.8+ for Python Eval. Ordinary Cargo builds
+do not download Python, and Dial does not add a Python executable to the system `PATH`.
 
 Whenever `bash` is offered, the environment prompt also lists which helper languages the shell
 `PATH` provides (python3/python, node/bun/deno, perl, ruby, a C compiler, go, rustc, java) and
@@ -166,6 +180,9 @@ is recorded as verification. Background/PTY launches do not qualify. Preserve fa
 of masking them with `|| echo`, a trailing successful command or an unchecked pipeline. The
 declaration does not establish that a command covers the requested behavior or infer a verdict
 from printed words. Conventional test/build runners retain automatic recognition.
+For example, when a consumer expects a list of strings, call that consumer on the saved file
+and compare the returned list. Counting matches also passes for a list of tuples of the same
+length. A substitute runtime tests only the behavior the runtimes share.
 
 The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.
 

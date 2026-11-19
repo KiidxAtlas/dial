@@ -176,7 +176,7 @@ pub(in crate::agent) enum Decision {
     Incomplete(String),
 }
 
-pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Exercise the written artifact, not a copy: use known-answer cases including counterexamples and assert the exact outputs. Run the check with bash check:true, or register a focused acceptance check. Fix mismatches and rerun. If the required runtime is unavailable, use an available runtime for partial coverage and disclose the difference; if validation is impossible, report the concrete blocker. A reread does not test behavior.";
+pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For standalone files, an Eval cell can bind assertions to each saved file with dial.check(name, passed, dial.read receipt). A different engine gives only partial coverage; disclose an unavailable consumer.";
 
 impl crate::agent::Agent<'_> {
     /// Small local models keep every completion guard rail: open execution steps block, the
@@ -268,8 +268,8 @@ impl crate::agent::Agent<'_> {
                     gate.failures.join("\n")
                 };
                 blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
-            } else if self.unchecked_after_launch_gap() {
-                blocker = Some(UNCHECKED_AFTER_LAUNCH_GAP.to_owned());
+            } else if let Some(reminder) = self.artifact_check_reminder() {
+                blocker = Some(reminder.to_owned());
             }
         }
         // The lexical investigation nudge is a guard rail for small local models only.
@@ -531,20 +531,6 @@ impl CapabilitySearch {
 
 /// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
 pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need and load:true, or names:[exact match], then use it; if nothing fits, give the same answer again and name what you searched for.";
-
-/// Actual runtime check callbacks, not assertion words in source or printed claims. These are
-/// local check outcomes, never evidence that unrelated files or task requirements passed.
-pub(in crate::agent) fn eval_checks(
-    output: &crate::runtime::tool_output::ToolOutput,
-) -> impl Iterator<Item = bool> {
-    output
-        .data
-        .as_ref()
-        .and_then(|data| data["checks"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|check| check["passed"].as_bool())
-}
 
 /// Preserve a candidate as unaccepted work alongside the controller's missing prerequisite.
 /// This is a terminal report for the user, never feedback injected into another model request,

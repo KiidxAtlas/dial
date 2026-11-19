@@ -14,11 +14,16 @@ pub fn validate(parameters: &Value, args: &Value) -> Result<(), String> {
         super::schema::validate(parameters, args)
     };
     result.map_err(|e: String| {
-        let error = if e.contains("below the minimum") {
+        let mut error = if e.contains("below the minimum") {
             format!("{e}; value must be >= minimum")
         } else {
             e
         };
+        if args.as_object().is_some_and(serde_json::Map::is_empty)
+            && error.contains("missing required")
+        {
+            error.push_str(" (empty `{}` arguments often mean the tool call was truncated at the output token limit; split large patches or writes into smaller calls)");
+        }
         let guide = argument_guide(parameters);
         if guide.is_empty() {
             error

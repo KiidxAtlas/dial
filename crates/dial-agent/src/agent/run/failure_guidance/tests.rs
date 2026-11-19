@@ -320,11 +320,18 @@ fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
         "{first}"
     );
     assert!(first.len() < 300, "{} bytes: {first}", first.len());
-    // A repeat keeps the full report with its streak count.
+    // A repeat of the same routine exit stays one compact line that carries the streak count.
     let repeat = compact(127, 2);
+    assert!(!repeat.contains("\nRetry:"), "{repeat}");
     assert!(
-        repeat.contains("\nRetry:") && repeat.contains("2 times in a row"),
+        repeat.contains("Failed 2 times in a row.")
+            && repeat.contains("only this operation, not the turn"),
         "{repeat}"
+    );
+    assert!(
+        repeat.len() <= first.len() + 40,
+        "{} bytes: {repeat}",
+        repeat.len()
     );
     // Partial capture is not routine.
     let mut partial = process(1);

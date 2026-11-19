@@ -19,9 +19,12 @@ use super::{
 use crate::{
     config::paths::Layout,
     config::settings_store::Scope,
-    config::types::ModelPreset,
-    llm::catalog::{Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus},
-    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label},
+    llm::catalog::{
+        Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus, documented_thinking_levels,
+    },
+    llm::model_config::{
+        ModelPreset, ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label,
+    },
     setup::embeddings,
     stats::{ModelUsage, local_models::Settings},
     ui::{
@@ -1470,8 +1473,7 @@ impl ModelOverlay {
     /// Thinking levels to offer for `selection` in `role`: empty when the catalog documents none.
     fn thinking_levels(role: &str, selection: &ModelSelection) -> Vec<&'static str> {
         let main = role == "main";
-        let mut levels =
-            crate::config::thinking::catalog_levels(&selection.provider, &selection.model, !main);
+        let mut levels = documented_thinking_levels(&selection.provider, &selection.model, !main);
         if levels.is_empty() {
             return levels;
         }

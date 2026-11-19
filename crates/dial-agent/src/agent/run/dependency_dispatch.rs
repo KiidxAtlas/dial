@@ -24,12 +24,14 @@ pub(in crate::agent) fn footprint_for(
     if bookkeeping(call) {
         return Some(Footprint::default());
     }
-    // A shell command's inputs are unknowable, so a read-only one (the parallel-read form: no
-    // session, terminal or background job) reads every root; any other command stays a barrier.
+    // A plain inspection of literal workspace files reads only those files, so it can join a wave
+    // beside writes to other paths. Every other read-only shell form reads every root.
     if call.name == "bash" {
-        return crate::agent::safety::approval::parallel_read(registry, "bash", &call.arguments)
-            .then(|| crate::tools::surface::resources::workspace_read(workspace))
-            .flatten();
+        if !crate::agent::safety::approval::parallel_read(registry, "bash", &call.arguments) {
+            return None;
+        }
+        return literal_shell_reads(workspace, &call.arguments)
+            .or_else(|| crate::tools::surface::resources::workspace_read(workspace));
     }
     crate::tools::surface::resources::resolve(
         workspace,
@@ -38,6 +40,160 @@ pub(in crate::agent) fn footprint_for(
         &call.name,
         &call.arguments,
     )
+}
+
+/// Options a literal read accepts for one program. Names are exact: no abbreviations, bundled short
+/// options, or unlisted `--name=value` forms. An option outside this list may take a file operand,
+/// so it keeps the broad read. A flag takes no value; a valued option takes the next word, or
+/// `--name=value` for a long name. Where GNU and BSD differ, a name appears only where the value
+/// shape agrees, so a mismatch can only add operands, never hide one.
+struct ReadOptions {
+    flags: &'static [&'static str],
+    valued: &'static [&'static str],
+}
+
+fn read_options(program: &str) -> Option<ReadOptions> {
+    Some(match program {
+        "cat" => ReadOptions {
+            flags: &[
+                "-A",
+                "-b",
+                "-e",
+                "-E",
+                "-n",
+                "-s",
+                "-t",
+                "-T",
+                "-u",
+                "-v",
+                "--number",
+                "--number-nonblank",
+                "--show-all",
+                "--show-ends",
+                "--show-nonprinting",
+                "--show-tabs",
+                "--squeeze-blank",
+            ],
+            valued: &[],
+        },
+        "wc" => ReadOptions {
+            flags: &[
+                "-c",
+                "-l",
+                "-L",
+                "-m",
+                "-w",
+                "--bytes",
+                "--chars",
+                "--lines",
+                "--max-line-length",
+                "--words",
+            ],
+            valued: &[],
+        },
+        "head" => ReadOptions {
+            flags: &["-q", "-v", "--quiet", "--silent", "--verbose"],
+            valued: &["-c", "-n", "--bytes", "--lines"],
+        },
+        "tail" => ReadOptions {
+            flags: &[
+                "-f",
+                "-F",
+                "-q",
+                "-r",
+                "-v",
+                "--quiet",
+                "--silent",
+                "--verbose",
+            ],
+            valued: &["-c", "-n", "--bytes", "--lines"],
+        },
+        // GNU `-f` is --file-system (boolean) and BSD `-f` takes a format; both read as a flag,
+        // so a BSD format becomes an extra operand that falls back to the broad read.
+        "stat" => ReadOptions {
+            flags: &[
+                "-f",
+                "-L",
+                "-t",
+                "--dereference",
+                "--file-system",
+                "--terse",
+            ],
+            valued: &["-c", "--format", "--printf"],
+        },
+        _ => return None,
+    })
+}
+
+/// The directory relative operands resolve against: the workspace root, or the `cwd` argument when
+/// it is an existing directory whose path has no symlink and no outside component, as the native
+/// resource rules admit it. Other `cwd` values keep the broad read.
+fn read_base_directory(workspace: &Workspace, arguments: &Value) -> Option<std::path::PathBuf> {
+    let Some(cwd) = arguments.get("cwd").filter(|cwd| !cwd.is_null()) else {
+        return Some(workspace.root().to_path_buf());
+    };
+    let cwd = std::path::Path::new(cwd.as_str()?);
+    let lexical = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        workspace.root().join(cwd)
+    };
+    if !lexical.is_dir() {
+        return None;
+    }
+    // Validation only: the directory itself is not read, and the lexical path is judged so that a
+    // symlink component (which the shell would follow) is refused, not silently resolved.
+    crate::tools::surface::resources::literal_reads(workspace, std::slice::from_ref(&lexical))?;
+    Some(lexical)
+}
+
+/// Inspections whose operands are exactly the files they read: one plain command from
+/// [`read_options`], with literal operands. `None` keeps the broad read for every other shape.
+fn literal_shell_reads(workspace: &Workspace, arguments: &Value) -> Option<Footprint> {
+    let command = arguments["command"].as_str()?;
+    // `safe_bash` allows one plain command only. Newlines, `;`, `&&`, `\r` and `&` are lexer
+    // operators, so `shell_words` returns no words for them and no second command reaches here.
+    if !crate::agent::safety::approval::safe_bash(command) {
+        return None;
+    }
+    let words = crate::agent::safety::approval::shell_words(command)?;
+    let options = read_options(words.first()?.as_str())?;
+    let base = read_base_directory(workspace, arguments)?;
+    let mut operands = Vec::new();
+    let mut value_pending = false;
+    let mut operands_only = false;
+    for word in &words[1..] {
+        if word.is_empty()
+            || word == "-"
+            || word.starts_with('@')
+            || word.contains(['$', '*', '?', '[', ']', '{', '}', '~', '`', '\\'])
+        {
+            return None;
+        }
+        if std::mem::take(&mut value_pending) {
+            continue;
+        }
+        if operands_only || !word.starts_with('-') {
+            operands.push(base.join(word));
+        } else if word == "--" {
+            operands_only = true;
+        } else if options.flags.contains(&word.as_str()) {
+            continue;
+        } else if options.valued.contains(&word.as_str()) {
+            value_pending = true;
+        } else {
+            // Only `--name=value` for a listed valued long option is accepted here.
+            let (name, _) = word.split_once('=')?;
+            if !(name.starts_with("--") && options.valued.contains(&name)) {
+                return None;
+            }
+        }
+    }
+    // A valued option without its value, or no operand at all, reads nothing provable.
+    if value_pending || operands.is_empty() {
+        return None;
+    }
+    crate::tools::surface::resources::literal_reads(workspace, &operands)
 }
 
 /// A conservative prefix shared by foreground, child and recorded-call analysis.

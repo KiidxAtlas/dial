@@ -194,6 +194,18 @@ pub struct RunMetrics {
     /// tool results or notices. In particular, a tool dispatch does not establish useful work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub efficiency: Option<serde_json::Value>,
+    /// Latest live progress of a request still in flight, from the child's `model_progress`
+    /// events; cleared when that request reports usage. It is a last observation: never added to
+    /// the usage totals. Absent means no progress was observed, not zero tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inflight_progress: Option<InflightProgress>,
+    /// Most recent child event seen by the harness, used only to describe a stall in a failure.
+    #[serde(skip)]
+    pub last_child_event: Option<ChildEvent>,
+    /// Start of the current inactivity window: the latest dispatch or meaningful progress. Only the
+    /// harness reads it, to enforce `case_inactivity_secs`.
+    #[serde(skip)]
+    pub last_progress_at: Option<std::time::Instant>,
 }
 
 /// Harness wall time from the last observed passing check to the end of that RPC send.
@@ -212,6 +224,26 @@ pub enum PostCheckEnd {
     RpcError,
 }
 
+/// Live counts for one in-flight model request, as the engine last reported them. Counts are
+/// partial until the request's usage arrives and are never summed into the case totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InflightProgress {
+    pub phase: String,
+    pub processed_tokens: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+/// The last child RPC event the harness observed, with the monotonic time it arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildEvent {
+    pub kind: String,
+    pub at: std::time::Instant,
+}
+
 /// Main-agent schema offers and admitted executions for one case. Worker, extension and
 /// compaction-internal calls are outside its scope. `complete` is false when the run failed or
 /// any turn lacked a snapshot; an incomplete trace never establishes that a tool went unused.
@@ -224,6 +256,13 @@ pub struct ToolTrace {
     pub offered: std::collections::BTreeMap<String, u64>,
     /// Per tool: admitted calls that reached execution.
     pub invoked: std::collections::BTreeMap<String, u64>,
+    /// Every call that reached dispatch, in order, from the child's bounded per-call trace. Absent
+    /// for snapshots from before per-call tracing, so call details stay unknown rather than empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<ToolCallRecord>>,
+    /// Calls beyond the child's record bound. They still count in `invoked` when executed.
+    #[serde(default)]
+    pub calls_omitted: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +270,26 @@ pub struct ToolTrace {
 pub enum ToolTraceScope {
     #[default]
     MainAgent,
+}
+
+/// One call that reached dispatch, as the child recorded it. Holds digests and names only: raw
+/// argument values and tool output never enter a report. `input_sha256` is stable for identical
+/// arguments, so repeated inputs can be correlated without storing them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallRecord {
+    pub ordinal: u64,
+    pub tool: String,
+    pub input_sha256: String,
+    pub input_keys: Vec<String>,
+    /// Argument names the child could not match to a declared schema; only their count is kept.
+    pub input_keys_omitted: u64,
+    pub duration_ms: u64,
+    pub outcome: String,
+    /// False for form rejections, pre-dispatch skips and results served from a cache.
+    pub executed: bool,
+    pub cache: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_sha256: Option<String>,
 }
 
 impl ToolTrace {
@@ -247,12 +306,22 @@ impl ToolTrace {
             }
             Some(map)
         };
+        let calls = match snapshot.get("calls") {
+            None => None,
+            Some(value) => Some(serde_json::from_value::<Vec<ToolCallRecord>>(value.clone()).ok()?),
+        };
+        let calls_omitted = match snapshot.get("calls_omitted") {
+            None => 0,
+            Some(value) => value.as_u64()?,
+        };
         Some(Self {
             scope: ToolTraceScope::MainAgent,
             complete,
             successful_requests: snapshot.get("successful_requests")?.as_u64()?,
             offered: counts("offered")?,
             invoked: counts("invoked")?,
+            calls,
+            calls_omitted,
         })
     }
 }
@@ -462,6 +531,7 @@ fn failed_before_model_activity(metrics: &RunMetrics) -> bool {
     metrics.agent_error
         && !metrics.token_usage_observed
         && !metrics.token_usage_incomplete
+        && metrics.inflight_progress.is_none()
         && metrics
             .runtime_usage
             .as_ref()
@@ -1001,6 +1071,13 @@ impl PolicyOverrides {
 pub struct MachineBenchmarkPolicy {
     pub repetitions: usize,
     pub case_timeout_secs: u64,
+    /// Opt-in silence limit, distinct from the wall deadline: a case fails after this many seconds
+    /// without meaningful progress (a dispatch or new output, tool activity, or a usage report),
+    /// including before its first response. 0 (the default) disables it. Repeated identical
+    /// progress reports do not reset it. Local servers are not limited by the remote silence
+    /// watchdog, so this is their bounded wait.
+    #[serde(default)]
+    pub case_inactivity_secs: u64,
     pub minimum_correctness: f64,
     /// Remote inference requires this explicit opt-in; verification tools stay offline.
     pub allow_remote: bool,
@@ -1012,6 +1089,7 @@ impl Default for MachineBenchmarkPolicy {
         Self {
             repetitions: 1,
             case_timeout_secs: 0,
+            case_inactivity_secs: 0,
             minimum_correctness: 1.0,
             allow_remote: false,
             regression_thresholds: RegressionThresholds::default(),
@@ -1033,6 +1111,12 @@ impl MachineBenchmarkPolicy {
         ensure!(
             self.case_timeout_secs <= 600,
             "machine benchmark case timeout must be 0 (unlimited) or 1..=600 seconds"
+        );
+        ensure!(
+            self.case_inactivity_secs <= 600
+                && (self.case_timeout_secs == 0
+                    || self.case_inactivity_secs <= self.case_timeout_secs),
+            "machine benchmark case inactivity limit must be 0 (off) or 1..=600 seconds, no longer than the case timeout"
         );
         ensure!(
             self.minimum_correctness.is_finite() && (0.0..=1.0).contains(&self.minimum_correctness),

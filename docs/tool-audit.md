@@ -188,6 +188,38 @@ Do not edit inputs during an evidence run. In a shared checkout, coordinate with
 or run from an isolated copy of the intended source. Source drift is a reason to retain the run
 as stale evidence and rerun after stabilization, not to weaken freshness validation.
 
+## Core-family coverage table (offline, executed)
+
+The table records which **executed** evidence exists for each family, without a live model. Owner
+suites are `rust`-tier native tests (`cargo test --lib <filter>`); they show that a tool's contract
+holds, not that a model uses it. The smoke column comes from the dispatcher test
+`core_tools_execute_through_dispatch_and_each_call_leaves_one_redacted_record` (and
+`invented_argument_names_reach_dispatch_without_entering_the_trace`) in
+`crates/dial-agent/src/agent/tool_trace/tests.rs`. It drives one scripted admitted call through a hermetic
+agent, checks the tool's effect on the workspace, and checks that the per-call record keeps only
+declared argument names with no raw argument value in the serialized trace.
+
+| Family (tools) | Executed evidence here | Owner suite (`--lib` filter) | Behavior dimension |
+| --- | --- | --- | --- |
+| `read` | Smoke: existing file returns `ok`; missing file returns `error` | `tools::fs::files::` | gap |
+| `write` | Smoke: creates `made.txt` with the exact content | `tools::fs::write::` | gap |
+| `edit`, Replace method (`old_string`/`new_string`) | Smoke: after a prior `read`, the Replace changes `notes.txt`; the read is its own traced call | `tools::edit::` (includes the Replace and hashline suites and the accepted-name allowlist test) | gap |
+| `grep`, `glob` (`search`) | Smoke: `grep` and `glob` run and return `ok` | `tools::fs::search::` | gap |
+| `bash` (`shell`) | Smoke: `echo` runs and returns `ok` | `tools::exec::shell::` | gap |
+| `bg`, `monitor` (`background`) | none in this change | `tools::exec::background::` | gap |
+| `eval` | none in this change | `tools::exec::eval::` | gap |
+| `git` | none in this change | `tools::vcs::git::` | gap |
+| `notebook` | none in this change | `tools::fs::notebook::` | gap |
+| `archive` | none in this change | `tools::fs::archive::` | gap |
+| `edit` hashline anchors, `ast_search`/`ast_edit`, `lsp`, `dap`, `browser`, `ida`, `report_tool_issue`, `controllers`, integrations | not run by this smoke; hashline and AST edits live in their owner suites | their owner groups in `tool-audit.json` | gap or live-only |
+
+What this does **not** establish: that a model chooses these tools, that a live provider run
+behaves the same, that the smoke's fixed replies are representative, or any behavior dimension in
+`tool-audit.json`. The `behavior` cells stay gaps because only `adapter: "behavior"`, `tier: "live"`
+checks may fill them, and those need a benchmark report from a model. Native `rust`-tier tests
+cannot satisfy that dimension, and the smoke is a native test.
+
+
 ## Behavior evaluation
 
 The adapter reuses `tool_effectiveness.summarize_tools`, `reliability.py` and

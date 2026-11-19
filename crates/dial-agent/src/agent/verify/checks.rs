@@ -403,7 +403,11 @@ impl<'a> Agent<'a> {
         output: &ToolOutput,
         ui: &mut dyn Ui,
     ) {
-        self.step_checks.validation_launch_gap |= validation_launch_gap(call, output);
+        if validation_launch_gap(call, output) {
+            self.step_checks.validation_launch_gap = true;
+            self.step_checks.eval_checks.forget_recovery();
+            self.step_checks.shell_check_passed = None;
+        }
         self.note_verification_verdict(call, output, ui, None);
     }
 
@@ -1920,21 +1924,64 @@ impl<'a> Agent<'a> {
             || self.step_checks.mutations == 0)
     }
 
-    /// Don't invent a check for ordinary edits. If a validation helper could not run, a
-    /// standalone deliverable with no automatic check still needs a current check or a blocker.
-    pub(in crate::agent) fn unchecked_after_launch_gap(&self) -> bool {
-        if !self.step_checks.validation_launch_gap
-            || !self.config.verification.enabled
+    /// When no normal test applies, require evidence for a failed validation launch or a newly
+    /// generated standalone output. Ordinary source edits do not invent test obligations.
+    pub(in crate::agent) fn artifact_check_reminder(&self) -> Option<&'static str> {
+        if !self.config.verification.enabled
             || self.hermetic
             || self.plan_mode
             || self.step_checks.mutations == 0
         {
-            return false;
+            return None;
         }
+        let changed = self.step_checks.turn.zip(self.checkpoints.as_ref());
+        let (paths, reminder) = if self.step_checks.validation_launch_gap {
+            (
+                changed
+                    .map(|(turn, cp)| cp.changed_files(turn))
+                    .unwrap_or_default(),
+                super::completion::UNCHECKED_AFTER_LAUNCH_GAP,
+            )
+        } else {
+            let (turn, cp) = changed?;
+            let paths: Vec<_> = cp
+                .created_files(turn)
+                .into_iter()
+                .filter(|p| {
+                    matches!(
+                        Path::new(p).extension().and_then(|s| s.to_str()),
+                        Some(
+                            "regex"
+                                | "regexp"
+                                | "csv"
+                                | "tsv"
+                                | "json"
+                                | "jsonl"
+                                | "sh"
+                                | "py"
+                                | "js"
+                        )
+                    )
+                })
+                .collect();
+            if paths.is_empty() {
+                return None;
+            }
+            (
+                paths,
+                "New standalone output has no observed check. Run its intended consumer on the saved file (verify acceptance or bash check:true), or bind an Eval assertion to each saved output with a whole-file dial.read receipt. Report any unverified consumer.",
+            )
+        };
         let revision = self.step_checks.revision();
-        self.step_checks.shell_check_passed != Some(revision)
+        (self.step_checks.shell_check_passed != Some(revision)
             && self.step_checks.evidence.passing_behavioral(revision) == 0
             && self.current_focused_checks().is_empty()
+            && (self.step_checks.effects_unknown
+                || !self
+                    .step_checks
+                    .eval_checks
+                    .covers_artifacts(&self.workspace, &paths)))
+        .then_some(reminder)
     }
 
     /// Describe each applicable check from one selection and one refreshed evidence snapshot.
@@ -2100,6 +2147,7 @@ impl<'a> Agent<'a> {
             "reconciliation": self.deliverable_reconciliation(&working["working_state"]),
             "verification_coverage": verification,
             "visual_evidence": visual,
+            "artifact_local_checks": self.step_checks.eval_checks.snapshot(&self.workspace),
             "checks": checks,
             "requirements": requirements,
             "workflow_jobs": self.workflow_contracts.snapshot(),

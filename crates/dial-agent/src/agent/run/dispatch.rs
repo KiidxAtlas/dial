@@ -2018,6 +2018,66 @@ impl<'a> Agent<'a> {
                 }
                 let offered_before = self.offered();
                 if let Err(error) = self.select_tools(&requested, &unload) {
+                    if error.contains("unavailable tool") {
+                        let catalog = self.catalog();
+                        let missing: Vec<&str> = requested
+                            .iter()
+                            .chain(&unload)
+                            .filter(|name| !catalog.contains(*name))
+                            .map(String::as_str)
+                            .collect();
+                        let search_query = missing.join(" ");
+                        let mut descriptions = HashMap::new();
+                        let candidates: Vec<(String, String)> = self
+                            .eligible_candidates()
+                            .into_iter()
+                            .map(|(name, description, indexed)| {
+                                descriptions.insert(name.clone(), description);
+                                (name, indexed)
+                            })
+                            .collect();
+                        let ranked = crate::agent::model::assistance::discover_with_priority(
+                            &search_query,
+                            candidates.clone(),
+                            &|name| self.tool_readiness(name).routing_priority(),
+                        );
+                        let suggestions: Vec<String> = if !ranked.is_empty() {
+                            ranked
+                                .into_iter()
+                                .take(5)
+                                .map(|(n, _, _)| {
+                                    let desc: String = descriptions
+                                        .get(&n)
+                                        .map(|d| d.chars().take(120).collect())
+                                        .unwrap_or_default();
+                                    format!("{n}: {desc}")
+                                })
+                                .collect()
+                        } else {
+                            crate::agent::model::assistance::partial_matches(
+                                &search_query,
+                                candidates,
+                                &|name| self.tool_readiness(name).routing_priority(),
+                            )
+                            .into_iter()
+                            .take(5)
+                            .map(|n| {
+                                let desc: String = descriptions
+                                    .get(&n)
+                                    .map(|d| d.chars().take(120).collect())
+                                    .unwrap_or_default();
+                                format!("{n}: {desc}")
+                            })
+                            .collect()
+                        };
+                        if !suggestions.is_empty() {
+                            return denied(&format!(
+                                "{error}. Unknown: [{}]. Closest available tools:\n- {}",
+                                missing.join(", "),
+                                suggestions.join("\n- ")
+                            ));
+                        }
+                    }
                     return denied(&error);
                 }
                 let offered = self.offered();

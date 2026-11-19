@@ -7,6 +7,7 @@ pub(in crate::agent) mod checks;
 pub(in crate::agent) mod completion;
 pub(in crate::agent) mod counterfactual;
 pub(in crate::agent) mod coverage;
+pub(in crate::agent) mod eval_checks;
 pub(in crate::agent) mod evidence;
 pub(in crate::agent) mod inputs;
 pub(in crate::agent) mod mutation_cycles;

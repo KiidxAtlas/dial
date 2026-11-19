@@ -12,6 +12,7 @@ import unittest
 
 from test_quality import checks_pass
 from tool_effectiveness import load_expectations, summarize_tools
+from tool_effectiveness import trace as parse_trace
 
 ROOT = pathlib.Path(__file__).resolve().parent
 FIXTURE = ROOT / "tool-effectiveness-fixture"
@@ -312,6 +313,51 @@ class ComparisonTests(unittest.TestCase):
             rejected = subprocess.run(command, capture_output=True, text=True, timeout=20)
             self.assertEqual(rejected.returncode, 2)
             self.assertEqual(output.read_bytes(), before)
+
+
+CALL = {
+    "ordinal": 1, "tool": "read", "input_sha256": "a" * 64, "input_keys": ["path"],
+    "input_keys_omitted": 0, "duration_ms": 4, "outcome": "ok", "executed": True, "cache": "none",
+}
+ERROR_CALL = {**CALL, "ordinal": 2, "outcome": "error", "error_sha256": "b" * 64}
+
+
+class CallRecordTests(unittest.TestCase):
+    """Per-call records: optional, bounded, and limited to digests, declared names and flags."""
+
+    def parse(self, calls, **extra):
+        recorded = {**tool_trace(offered=["read"], invoked={"read": 1}), "calls": calls, **extra}
+        return parse_trace({"metrics": {"tool_trace": recorded}})
+
+    def test_valid_records_are_kept_and_legacy_traces_stay_without_calls(self):
+        parsed = self.parse([CALL, ERROR_CALL], calls_omitted=3)
+        self.assertEqual([call["outcome"] for call in parsed["calls"]], ["ok", "error"])
+        self.assertEqual(parsed["calls_omitted"], 3)
+        legacy = parse_trace({"metrics": {"tool_trace": tool_trace(offered=["read"])}})
+        self.assertNotIn("calls", legacy)
+
+    def test_malformed_records_are_refused_rather_than_partially_trusted(self):
+        cases = {
+            "secret-bearing key name": [{**CALL, "input_keys": ["SECRET-KEY-NAME-789"]}],
+            "unsorted key names": [{**CALL, "input_keys": ["path", "content"]}],
+            "raw value field": [{**CALL, "argument_value": "TOKEN-SECRET-123"}],
+            "missing digest": [{k: v for k, v in CALL.items() if k != "input_sha256"}],
+            "non-hex digest": [{**CALL, "input_sha256": "not-a-digest"}],
+            "non-contiguous ordinal": [CALL, {**CALL, "ordinal": 3}],
+            "error without error digest": [{**CALL, "outcome": "error"}],
+            "digest on success": [{**CALL, "error_sha256": "c" * 64}],
+            "unknown outcome": [{**CALL, "outcome": "partial"}],
+            "negative omitted count": [{**CALL, "input_keys_omitted": -1}],
+            "omitted count missing": [{k: v for k, v in CALL.items() if k != "input_keys_omitted"}],
+            "unbounded list": [dict(CALL, ordinal=i) for i in range(1, 258)],
+        }
+        for label, calls in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.parse(calls)
+
+    def test_omitted_count_requires_the_list_it_counts(self):
+        with self.assertRaises(ValueError):
+            parse_trace({"metrics": {"tool_trace": {**tool_trace(offered=["read"]), "calls_omitted": 2}}})
 
 
 if __name__ == "__main__":

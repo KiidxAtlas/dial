@@ -137,6 +137,7 @@ pub(in crate::agent) struct TurnState<'a> {
     stall: crate::agent::safety::guard::StallGuard,
     pace: crate::agent::safety::guard::PaceGuard,
     edit_churn: crate::agent::safety::guard::EditChurnGuard,
+    eval_churn: crate::agent::safety::guard::EvalChurnGuard,
     /// Automatic discovery is attempted once per observed gap, never on every failed round.
     capability_gaps: std::collections::BTreeSet<crate::agent::run::tool_exposure::CapabilityGap>,
     /// One catalog-search reminder before an answer that denies a capability.
@@ -478,6 +479,7 @@ impl Agent<'_> {
             stall: Default::default(),
             pace: Default::default(),
             edit_churn: Default::default(),
+            eval_churn: Default::default(),
             capability_gaps: Default::default(),
             capability_search: Default::default(),
             completion_candidate: None,

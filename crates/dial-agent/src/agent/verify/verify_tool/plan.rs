@@ -54,7 +54,7 @@ impl Agent<'_> {
         }).collect();
         let mut text = vec![
             "Verification plan: nothing ran; no configuration or evidence was changed.".to_owned(),
-            "Recorded statuses are effect-revision observations, not revalidated input freshness or new verification credit.".to_owned(),
+            "Command statuses are effect-revision observations, not revalidated input freshness or new verification credit.".to_owned(),
         ];
         for row in rows.iter().take(MAX_TEXT_ITEMS) {
             let name = row["name"].as_str().unwrap_or_default();
@@ -127,6 +127,35 @@ impl Agent<'_> {
         if configured.requirements.is_empty() {
             text.push("No operator-declared requirements: task coverage is not independently assessed. To establish a mapping, configure named verification.commands and verification.requirements.<id>.checks; optional deliverables bind working-state IDs. Do not invent checks or silently edit operator configuration.".to_owned());
         }
+        let local = self.step_checks.eval_checks.snapshot(&self.workspace);
+        if let Some(receipts) = local["receipts"].as_array() {
+            text.push("Artifact-local Eval checks (newest first; source freshness only, no command or requirement credit):".into());
+            for receipt in receipts.iter().rev().take(MAX_TEXT_ITEMS) {
+                text.push(format!(
+                    "  {}: {} — {} ({} @ {}; source {})",
+                    receipt["runtime"].as_str().unwrap_or_default(),
+                    plan_label(receipt["name"].as_str().unwrap_or_default()),
+                    if receipt["passed"] == true {
+                        "passed"
+                    } else {
+                        "failed"
+                    },
+                    plan_label(receipt["source"]["path"].as_str().unwrap_or_default()),
+                    receipt["source"]["sha256"]
+                        .as_str()
+                        .and_then(|s| s.get(..12))
+                        .unwrap_or_default(),
+                    receipt["freshness"].as_str().unwrap_or_default()
+                ));
+            }
+            if receipts.len() > MAX_TEXT_ITEMS || local["omitted"] != 0 {
+                text.push(format!(
+                    "{} retained local receipt(s); {} older omitted.",
+                    receipts.len(),
+                    local["omitted"]
+                ));
+            }
+        }
         text.push("To execute, call verify with targets naming a check (or a test file); omit arguments after edits for the focused gate selection. Normal approvals still apply.".to_owned());
         ToolOutput {
             text: text.join("\n"),
@@ -138,6 +167,7 @@ impl Agent<'_> {
             "checks":rows,"check_count":checks.len(),
             "omitted_checks":checks.len().saturating_sub(MAX_CHECKS),
             "requirements":coverage,
+            "artifact_local_checks":local,
             })),
         }
     }

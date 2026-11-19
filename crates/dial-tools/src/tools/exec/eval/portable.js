@@ -23,6 +23,31 @@ var dial = (() => {
     return new Uint8Array(out);
   };
   const read = async (path, options = {}) => (await tool.read({path, format:options.encoding || 'text', retain:options.retain === true})).data;
+  const WITNESS_REFUSAL = /has no current source\/read witness|were not displayed in full/i;
+  // An explicit digest is the only overwrite guard a helper adds: it must be the sha256 from a
+  // whole-file read receipt of the current file, and the write tool still requires that read.
+  const writeArgs = (path, content, options = {}) => {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('write options must be an object');
+    const args = {path, content};
+    if (options.expectedSha256 !== undefined) {
+      if (typeof options.expectedSha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(options.expectedSha256)) {
+        throw new TypeError('expectedSha256 must be the 64-character sha256 from a whole-file dial.read receipt');
+      }
+      args.expected_sha256 = options.expectedSha256;
+    }
+    return args;
+  };
+  const guardedWrite = async (path, args) => {
+    try {
+      return await tool.write(args);
+    } catch (error) {
+      const msg = String(error?.message || '');
+      if (WITNESS_REFUSAL.test(msg)) {
+        throw new Error(`${msg}\n[dial] Helpers do not read files implicitly. Read ${path} with dial.read (or tool.read) first; to overwrite that revision, pass {expectedSha256} with its sha256.`);
+      }
+      throw error;
+    }
+  };
   const batch = async (entries, options = {}) => {
     if (options.collect !== undefined && typeof options.collect !== 'boolean') throw new TypeError('collect must be a boolean');
     const results = await tool.batch(entries);
@@ -174,19 +199,30 @@ var dial = (() => {
     },
     readJson: async path => JSON.parse((await read(path)).content),
     readBytes: async path => decode((await read(path, {encoding:'base64'})).content),
-    writeText: async (path, content) => tool.write({path, content}),
-    writeJson: async (path, value) => {
+    // Overwrites never read implicitly: a file the session has not read whole fails with the write
+    // tool's refusal, and the caller reads it and passes that receipt's digest explicitly.
+    writeText: async (path, content, options = {}) => guardedWrite(path, writeArgs(path, content, options)),
+    writeJson: async (path, value, options = {}) => {
       const content = JSON.stringify(value, (_key, item) => {
         if (typeof item === 'number' && !Number.isFinite(item)) throw new TypeError('JSON requires finite numbers');
         return item;
       }, 2);
       if (typeof content !== 'string') throw new TypeError('value has no JSON representation');
-      return tool.write({path, content:content + '\n'});
+      return guardedWrite(path, writeArgs(path, content + '\n', options));
     },
-    writeBytes: async (path, bytes) => tool.write({path, content:encode(bytes), encoding:'base64'}),
+    writeBytes: async (path, bytes) => guardedWrite(path, {path, content:encode(bytes), encoding:'base64'}),
     run: async (command, options = {}) => tool.bash({...options, command}),
     batch,
-    check: async (name, passed) => __dial_check__(name, passed),
+    check: async (name, passed, source) => {
+      if (source === undefined) return __dial_check__(name, passed);
+      if (!source || typeof source !== 'object' || ['offset','lines','next_offset'].some(key => key in source)
+          || !['text','base64'].includes(source.encoding) || typeof source.content !== 'string'
+          || !Number.isSafeInteger(source.bytes) || source.bytes < 0
+          || typeof source.path !== 'string' || typeof source.sha256 !== 'string') {
+        throw new TypeError('check source must be a whole-file dial.read receipt');
+      }
+      return __dial_check__(name, passed, {path:source.path, sha256:source.sha256});
+    },
     gen,
     search,
     compare,

@@ -21,6 +21,9 @@ pub(super) struct PendingCall {
     pub name: String,
     pub started: Instant,
     pub testing: bool,
+    /// The newest presentation the engine sent for this call. At settle time the engine sends
+    /// the one built from the complete result (structured data included) just before the result.
+    pub view: Option<crate::tools::surface::presentation::Presentation>,
 }
 
 pub(super) struct Bridge<'a> {

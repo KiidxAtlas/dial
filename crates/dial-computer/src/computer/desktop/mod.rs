@@ -498,6 +498,32 @@ impl Worker {
         caps: &CaptureCaps,
         token: &OperationToken,
     ) -> CoreResult<DesktopCapture> {
+        let mut last_resize_error = None;
+        for attempt in 0..2 {
+            match self.capture_full_once(target, caps, token) {
+                Ok(capture) => return Ok(capture),
+                Err(error)
+                    if attempt == 0
+                        && matches!(target, Target::Window(_))
+                        && error.code == error::ErrorCode::InvalidCoordinateFrame
+                        && error.message.contains("resized since capture") =>
+                {
+                    last_resize_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    token.check()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_resize_error.expect("resize retry captured an error"))
+    }
+
+    fn capture_full_once(
+        &mut self,
+        target: &Target,
+        caps: &CaptureCaps,
+        token: &OperationToken,
+    ) -> CoreResult<DesktopCapture> {
         let selector = target.display_selector();
         let (image, mut geometry) = self.backend()?.capture(target, caps, selector.as_ref())?;
         let source_width = image.width();

@@ -146,6 +146,26 @@ pub(in crate::agent) fn prepare(
         .filter(|(_, value)| !value.is_null())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    for key in ["decisions", "constraints", "open_work", "evidence"] {
+        if let Some(value) = given.get_mut(key) {
+            match value {
+                Value::Object(map) => {
+                    let items: Vec<Value> = map
+                        .iter()
+                        .map(|(k, v)| match v.as_str() {
+                            Some(s) => Value::String(format!("{k}: {s}")),
+                            None => Value::String(format!("{k}: {v}")),
+                        })
+                        .collect();
+                    *value = Value::Array(items);
+                }
+                Value::String(s) if !s.trim().is_empty() => {
+                    *value = Value::Array(vec![Value::String(s.clone())]);
+                }
+                _ => {}
+            }
+        }
+    }
     crate::agent::run::calls::validate(
         &schema()["function"]["parameters"],
         &Value::Object(given.clone()),

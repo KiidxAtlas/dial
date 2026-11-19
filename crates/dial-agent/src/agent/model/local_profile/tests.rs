@@ -36,7 +36,7 @@ fn local_evidence_counters_follow_the_suggestions_switch() {
     };
     let on = flushed("").expect("evidence recorded");
     assert_eq!((on.rounds.ok, on.rounds.failed), (0, 1));
-    assert_eq!(on.edits.get("replace").map(|t| t.failed), Some(1));
+    assert_eq!(on.edits.get("hashline").map(|t| t.failed), Some(1));
     assert_eq!(flushed("[assistance.local]\nsuggestions=false"), None);
     let staged = flushed("[assistance.local]\nsuggestions=false\nescalate_after=1")
         .expect("the escalation step is kept");
@@ -156,7 +156,7 @@ fn prompt_text(agent: &crate::agent::Agent<'_>) -> String {
 }
 
 /// The small tier defaults to one call per response, stated by a byte-stable prompt that ends with
-/// a worked example in the replace grammar and names no unoffered `skill`. A saved record that
+/// a worked example in the active edit grammar and names no unoffered `skill`. A saved record that
 /// passed the batch fixture keeps batching; larger tiers, a disabled reliability interface and
 /// hosted routes are unchanged.
 #[test]
@@ -169,8 +169,10 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         assert!(text.contains(rule.trim_matches('"')));
         assert!(!text.contains(crate::agent::prompts::system::LEAN_BATCHING.trim()));
         assert!(text.contains("# Example"));
+        // The example is written in the active grammar (hashline by default).
+        assert_eq!(agent.edit_mode(), crate::config::types::EditMode::Hashline);
         assert!(
-            text.contains(r#"\"old_string\":\"    total / size\""#),
+            text.contains("PUT 44.=44:") && text.contains("total.div_ceil(size)"),
             "{text}"
         );
         assert!(!text.contains(crate::agent::prompts::system::SKILL_RULE));

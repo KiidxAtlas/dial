@@ -140,6 +140,9 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
             vec!["code_history"],
         ),
         ("Which recent diff broke the parser?", vec!["code_history"]),
+        ("What did we decide about caching?", vec!["memory"]),
+        ("Do you remember my preferred test command?", vec!["memory"]),
+        ("Which naming conventions did we agree on?", vec!["memory"]),
         ("Debug the runtime crash at a breakpoint", vec!["dap"]),
         (
             "Generate a logo image for the landing page",
@@ -159,6 +162,19 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
         )
         .is_empty()
     );
+    // Instructions, choices and coding work that mention a preference are not recall requests.
+    let memory = [("memory".to_owned(), "Capability".to_owned())];
+    for query in [
+        "Remember to run the tests before you finish",
+        "Help me decide which library I should use",
+        "Add a preferences panel to my settings page",
+        "Fix the naming conventions lint in our parser",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &memory).is_empty(),
+            "{query}"
+        );
+    }
     for (query, expected) in cases {
         let candidates = expected
             .iter()

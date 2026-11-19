@@ -172,6 +172,20 @@ call names that member, so it never covers the other readers or local Git. Watch
 fresh one-shot approval through `bg`. Recorded calls from older sessions are projected onto
 the successor when a session resumes.
 
+**Recall: which tool answers "what do we already know?"** Each recall store keeps its own
+tool, because their contracts differ: `session_search` is the compaction and new-context
+recovery path and is required by name there; `memory` writes; `evidence` runs experiments.
+Their descriptions name each other, and automatic task routing offers the matching one:
+
+| Question | Tool |
+| --- | --- |
+| What did we decide or agree on? What are my preferences or this project's conventions? | `memory` (`store=codebase` for saved project understanding) |
+| What was said or done in an earlier conversation? Exact raw transcript detail | `session_search` (`history: true` for raw entries) |
+| Which change introduced this? What happened in past sessions' archive? | `history` (`source=changes`, `source=sessions`) |
+| Which sources support this claim? Experiment results | `evidence` |
+
+Routing only offers a schema. It grants no permission and never answers from a store.
+
 **Tools** (file edits confined to the project; shell access follows the chosen sandbox)
 - The default core is stable across ordinary requests. Hosted routes get 25 KiB of schemas;
   lean and local routes keep 12 KiB, and lean local routes also cap the count at eight. Core
@@ -703,10 +717,16 @@ enabled = false
 enabled = false
 ```
 
+The mode selects the instructions and argument schema shown for the single `edit` tool, not a
+restriction on what Dial accepts. For example, `dial --edit-mode replace` advertises string
+replacement, but a Hashline patch using the header from a source read still works. The same
+choice is available per model under **Edit style**; neither choice adds tools to the prompt.
+
 Process/CLI pins take precedence over an explicit model-profile `edit_mode`, a learned harness pin,
 model selector rules, the applicable local-assistance default, and the global mode, in that order.
-Unpinned local routes default to `replace`; hosted routes default to the global `hashline` mode.
-`assistance.local.edit_mode = "inherit"` makes local routes follow the global mode instead. When a
+Local routes default to `hashline`, the same as hosted routes. An explicit `[edit] mode` still applies
+on a local route unless `assistance.local.edit_mode` is set explicitly, which then replaces it.
+`assistance.local.edit_mode = "inherit"` makes local routes follow `[edit] mode` instead. When a
 local route replaces an explicitly configured `[edit] mode` (and no pin decides), Dial says so once
 per session, naming both modes and the `inherit` switch.
 Selector matching is case-insensitive; the longest matching substring wins, with deterministic

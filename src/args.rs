@@ -268,7 +268,7 @@ pub(crate) struct Cli {
     /// only, no network) or off.
     #[arg(long, global = true, help_heading = section::SAFETY, value_parser = ["off", "dev", "strict"])]
     pub(crate) sandbox: Option<String>,
-    /// How the model writes edits.
+    /// Preferred grammar shown for the edit tool; other edit grammars are still accepted.
     #[arg(long, global = true, help_heading = section::CONTEXT, value_parser = ["apply_patch", "hashline", "patch", "replace", "sloppy"])]
     pub(crate) edit_mode: Option<String>,
     /// Automatic context policy when the window fills.

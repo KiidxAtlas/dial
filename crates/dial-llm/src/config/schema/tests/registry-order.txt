@@ -13,7 +13,6 @@ ui.status_left
 ui.status_right
 ui.status_path_abbreviate
 ui.status_git_counts
-ui.status_transparent
 ui.welcome
 ui.tips
 ui.motion

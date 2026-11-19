@@ -268,7 +268,7 @@ pub fn fetch(
 
 /// The path inside the archive without its top-level folder. `None` for that folder itself.
 /// Anything that is not a plain name (`..`, absolute paths, prefixes) is an error.
-fn inside_top(raw: &Path, top_folder: bool) -> Result<Option<PathBuf>> {
+pub(super) fn inside_top(raw: &Path, top_folder: bool) -> Result<Option<PathBuf>> {
     let mut parts = Vec::new();
     for component in raw.components() {
         match component {

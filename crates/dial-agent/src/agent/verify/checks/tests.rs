@@ -100,6 +100,53 @@ fn an_unlaunched_validation_helper_cannot_be_settled_by_a_write() {
 }
 
 #[test]
+fn unrelated_eval_receipt_cannot_clear_a_validation_launch_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.step_checks.validation_launch_gap = true;
+    agent.step_checks.mutations = 1;
+    let state = tempfile::tempdir().unwrap();
+    let checkpoints = Arc::new(
+        Checkpoints::new(state.path().join("session"), agent.workspace.root().into()).unwrap(),
+    );
+    agent.step_checks.turn = Some(checkpoints.begin_turn("standalone").unwrap());
+    let output = agent.workspace.root().join("out.csv");
+    checkpoints.before_write(&output).unwrap();
+    std::fs::write(&output, "a,b").unwrap();
+    agent.checkpoints = Some(checkpoints);
+    std::fs::write(root.path().join("reference.txt"), "ok").unwrap();
+    let observe = |agent: &mut Agent<'_>, path: &str, passed| {
+        let digest = crate::tools::exec::eval::check_source_digest(&agent.workspace, path).unwrap();
+        agent.step_checks.eval_checks.observe(&json!({"code":"..."}), &ToolOutput::structured(json!({
+            "checks":[{"runtime":"python","name":"file contents","passed":passed,"source":{"path":path,"sha256":digest}}]
+        })).with_observation(crate::runtime::execution::ObservationKind::Wait, true));
+    };
+    observe(&mut agent, "reference.txt", true);
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "an unrelated input is not the saved deliverable"
+    );
+    observe(&mut agent, "out.csv", true);
+    assert!(agent.artifact_check_reminder().is_none());
+    std::fs::write(&output, "x,y").unwrap();
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "same-size rewrite stales the receipt"
+    );
+    agent.step_checks.validation_launch_gap = false;
+    assert!(
+        agent.artifact_check_reminder().is_some(),
+        "creation alone does not check a standalone output"
+    );
+    observe(&mut agent, "out.csv", false);
+    assert!(agent.artifact_check_reminder().is_some());
+    observe(&mut agent, "out.csv", true);
+    assert!(agent.artifact_check_reminder().is_none());
+}
+
+#[test]
 fn missing_optional_programs_and_printed_status_are_not_validation_obligations() {
     let mut call = ToolCall {
         id: "probe".into(),

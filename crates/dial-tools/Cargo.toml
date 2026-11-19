@@ -80,6 +80,10 @@ cpal = { workspace = true, optional = true }
 windows = { workspace = true, optional = true }
 windows-sys.workspace = true
 
+[build-dependencies]
+flate2.workspace = true
+sha2.workspace = true
+
 [dev-dependencies]
 dial-core = { workspace = true, features = ["test-support"] }
 dial-llm = { workspace = true, features = ["test-support"] }

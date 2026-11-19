@@ -59,6 +59,30 @@ fn aliases_and_scalars_preserve_conflicts_and_bounds() {
 }
 
 #[test]
+fn eval_shorthand_respects_language_offer_and_conflicts() {
+    let schema = json!({"properties":{"language":{"enum":["js","py"]},"code":{"type":"string"}}});
+    for (mut args, expected) in [
+        (json!({"python":"x"}), json!({"language":"py","code":"x"})),
+        (json!({"js":"x"}), json!({"language":"js","code":"x"})),
+        (
+            json!({"script":"x", "lang":"NodeJS"}),
+            json!({"language":"js","code":"x"}),
+        ),
+        (
+            json!({"js":"x", "python":"y"}),
+            json!({"js":"x", "python":"y"}),
+        ),
+    ] {
+        normalize("eval", &schema, &mut args);
+        assert_eq!(args, expected);
+    }
+    let mut args = json!({"python":"x"});
+    let schema = json!({"properties":{"language":{"enum":["js"]},"code":{"type":"string"}}});
+    normalize("eval", &schema, &mut args);
+    assert_eq!(args, json!({"python":"x"}));
+}
+
+#[test]
 fn grep_old_parameter_names_map_onto_the_simpler_ones() {
     let parameters = &json!({"type":"object","properties":{"pattern":{"type":"string"},"literal":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["pattern"],"additionalProperties":false});
     for old in ["max_results", "max_matches"] {

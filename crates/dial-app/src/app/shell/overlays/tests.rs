@@ -240,7 +240,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
     use crate::llm::profiles::ModelProfile;
 
     for (route, settings, process, expected) in [
-        ("local", "", None, "replace"),
+        ("local", "", None, "hashline"),
         ("hosted", "", None, "hashline"),
         (
             "local",
@@ -288,7 +288,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
             ModelProfile {
                 provider: config.provider.clone().unwrap(),
                 model: config.model.clone(),
-                edit_mode: Some(EditMode::Hashline),
+                edit_mode: Some(EditMode::Replace),
                 ..Default::default()
             },
         );
@@ -299,7 +299,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
         );
         assert_eq!(
             config.active_model_profile().unwrap().edit_mode,
-            Some(EditMode::Hashline)
+            Some(EditMode::Replace)
         );
     }
 }

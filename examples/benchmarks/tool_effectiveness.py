@@ -9,6 +9,7 @@ was offered on a successful request and never executed; absent, partial or faile
 so no missed opportunity is inferred from a missing call.
 """
 import argparse
+import re
 import json
 import statistics
 import tomllib
@@ -18,6 +19,11 @@ from compare import checked_success, invalid_reason
 from reliability import group_trials, run_contract, summarize, task_contract
 
 TRACE_KEYS = {"scope", "complete", "successful_requests", "offered", "invoked"}
+# Optional per-call records (Rust `ToolTraceCounts.calls`); absent in legacy reports.
+TRACE_OPTIONAL_KEYS = {"calls", "calls_omitted"}
+CALL_KEYS = {"ordinal", "tool", "input_sha256", "input_keys", "input_keys_omitted", "duration_ms", "outcome", "executed", "cache"}
+CALL_OPTIONAL_KEYS = {"error_sha256"}
+MAX_CALL_RECORDS = 256
 EXPECTATION_KEYS = {"id", "expected_tools", "opportunity_tools", "contract_sha256"}
 MAX_TOOL_NAME_BYTES = 64
 
@@ -80,13 +86,48 @@ def count_map(value, field):
     return result
 
 
+def digest_text(value, field):
+    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise ValueError(f"invalid tool_trace digest: {field}")
+    return value
+
+
+def call_records(value):
+    """Bounded per-call records: names, digests and flags only. Unknown keys are refused, so raw values cannot ride along."""
+    if not isinstance(value, list) or len(value) > MAX_CALL_RECORDS:
+        raise ValueError("tool_trace calls must be a bounded list")
+    for index, call in enumerate(value, start=1):
+        if not isinstance(call, dict) or not CALL_KEYS <= set(call) or set(call) - CALL_KEYS - CALL_OPTIONAL_KEYS:
+            raise ValueError("tool_trace call requires exactly its name, digest and outcome fields")
+        if type(call["ordinal"]) is not int or call["ordinal"] != index:
+            raise ValueError("tool_trace call ordinals must be contiguous from 1")
+        tool_name(call["tool"], "calls.tool")
+        names = call["input_keys"]
+        if not isinstance(names, list) or names != sorted(set(names)) or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("tool_trace input_keys must be sorted unique argument names")
+        if not all(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", n) for n in names):
+            raise ValueError("tool_trace input_keys must be declared-style identifiers")
+        if type(call["input_keys_omitted"]) is not int or call["input_keys_omitted"] < 0:
+            raise ValueError("invalid tool_trace input_keys_omitted")
+        digest_text(call["input_sha256"], "input_sha256")
+        if type(call["duration_ms"]) is not int or call["duration_ms"] < 0:
+            raise ValueError("invalid tool_trace duration_ms")
+        if call["outcome"] not in ("ok", "error") or type(call["executed"]) is not bool or call["cache"] not in ("none", "reused"):
+            raise ValueError("invalid tool_trace call outcome, execution or cache")
+        if call["outcome"] == "error":
+            digest_text(call.get("error_sha256"), "error_sha256")
+        elif "error_sha256" in call:
+            raise ValueError("tool_trace error digest requires an error outcome")
+    return value
+
+
 def trace(case):
     """Validated main-agent trace for one trial, or None when the report carries no trace."""
     recorded = case["metrics"].get("tool_trace")
     if recorded is None:
         return None
-    if not isinstance(recorded, dict) or set(recorded) != TRACE_KEYS:
-        raise ValueError("tool_trace requires exactly scope, complete, successful_requests, offered and invoked")
+    if not isinstance(recorded, dict) or not TRACE_KEYS <= set(recorded) or set(recorded) - TRACE_KEYS - TRACE_OPTIONAL_KEYS:
+        raise ValueError("tool_trace requires scope, complete, successful_requests, offered and invoked; calls is optional")
     if recorded["scope"] != "main_agent":
         raise ValueError("tool_trace scope must be main_agent")
     if type(recorded["complete"]) is not bool:
@@ -94,12 +135,21 @@ def trace(case):
     requests = recorded["successful_requests"]
     if type(requests) is not int or requests < 0:
         raise ValueError("invalid tool_trace successful_requests")
-    return {
+    result = {
         "complete": recorded["complete"],
         "successful_requests": requests,
         "offered": count_map(recorded["offered"], "offered"),
         "invoked": count_map(recorded["invoked"], "invoked"),
     }
+    if "calls" in recorded:
+        result["calls"] = call_records(recorded["calls"])
+        omitted = recorded.get("calls_omitted", 0)
+        if type(omitted) is not int or omitted < 0:
+            raise ValueError("invalid tool_trace calls_omitted")
+        result["calls_omitted"] = omitted
+    elif "calls_omitted" in recorded:
+        raise ValueError("tool_trace calls_omitted requires calls")
+    return result
 
 
 def expectation_status(recorded, tool):

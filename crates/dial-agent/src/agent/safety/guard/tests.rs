@@ -896,3 +896,58 @@ fn unverified_churn_withholds_large_rewrites_but_preserves_focused_repairs() {
     guard.observe(&[], true);
     assert!(guard.rewrite_rejection("encoder.c", 10000).is_none());
 }
+
+#[test]
+fn repeated_failed_edits_to_one_file_add_pressure_without_withholding_writes() {
+    let mut guard = EditChurnGuard::default();
+    for _ in 1..EDIT_CHURN_WARN {
+        guard.observe_failed("src/lib.rs");
+    }
+    assert!(!guard.has_pressure(), "below the warning count");
+    guard.observe_failed("src/lib.rs");
+    assert!(guard.has_pressure(), "a repeated failed attempt is thrash");
+    assert!(
+        guard.rewrite_rejection("src/lib.rs", 10000).is_none(),
+        "failed attempts never withhold a write"
+    );
+    guard.observe(&[], true);
+    assert!(
+        !guard.has_pressure(),
+        "a passing check releases failed attempts"
+    );
+}
+
+#[test]
+fn eval_cells_of_one_shape_without_progress_repeat_the_advisory_per_streak() {
+    let cell = |language: &str, code: &str| json!({"language": language, "code": code});
+    // Spacing and literal values vary; the shape does not. Each third cell is one advisory.
+    let mut guard = EvalChurnGuard::default();
+    let advice: Vec<bool> = [
+        cell("py", "print(1)"),
+        cell("py", "print( 2 )  "),
+        cell("py", "print(\n3)"),
+        cell("py", "print(4)"),
+        cell("py", "print(5)"),
+        cell("py", "print(6)"),
+    ]
+    .iter()
+    .map(|args| guard.observe(args, false).is_some())
+    .collect();
+    assert_eq!(advice, [false, false, true, false, false, true]);
+    // A passing check is progress and resets the streak.
+    assert!(guard.observe(&cell("py", "print(7)"), true).is_none());
+    assert!(guard.observe(&cell("py", "print(8)"), false).is_none());
+    // A different language or shape is a different attempt.
+    let mut other = EvalChurnGuard::default();
+    other.observe(&cell("py", "x = 1"), false);
+    assert!(other.observe(&cell("js", "x = 1"), false).is_none());
+    other.observe(&cell("js", "x = 1"), false);
+    assert!(other.observe(&cell("js", "y = 1"), false).is_none());
+    // Cells without code text are not evidence of repetition.
+    assert!(guard.observe(&json!({"action": "status"}), false).is_none());
+    let mut committed = EvalChurnGuard::default();
+    committed.observe(&cell("py", "run()"), false);
+    committed.observe(&cell("py", "run()"), false);
+    committed.clear();
+    assert!(committed.observe(&cell("py", "run()"), false).is_none());
+}

@@ -34,6 +34,7 @@ mod maintenance;
 mod models;
 mod parity;
 mod read_jobs;
+mod reports;
 mod research;
 mod sessions;
 mod settings;
@@ -1046,6 +1047,8 @@ impl Admin {
                 | "list_checks"
                 | "list_skills"
                 | "get_schema"
+                | "code_history"
+                | "stats"
         )
     }
 
@@ -1101,6 +1104,8 @@ impl Admin {
             "add_check" => checks::add(&layout, params),
             "remove_check" => checks::remove(&layout, params),
             "list_skills" => skills::list(&layout, &config.skills.registries, params),
+            "code_history" => reports::code_history(&layout, &config, params),
+            "stats" => reports::stats(&layout, params),
             _ => Err(unknown_method()),
         }
     }
@@ -2065,7 +2070,7 @@ fn run_control(
                 | "list_models" | "delete_local_model" | "settings_schema" | "get_settings"
                 | "set_setting" | "reset_setting" | "list_extensions" | "get_schema"
                 | "list_checks" | "add_check" | "remove_check" | "list_skills"
-                | "search_sessions"
+                | "search_sessions" | "code_history" | "stats"
                     if !acp =>
                 {
                     let method = request["method"].as_str().unwrap_or_default().to_owned();

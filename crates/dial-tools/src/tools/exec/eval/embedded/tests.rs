@@ -37,6 +37,27 @@ fn portable_helpers_work_without_node_or_python_and_keep_partial_batch_receipts(
 }
 
 #[test]
+fn embedded_checks_forward_compact_read_receipts() {
+    let source = json!({"path":"source.txt","sha256":"a".repeat(64)});
+    let mut receipt = source.clone();
+    receipt["encoding"] = json!("text");
+    receipt["bytes"] = json!(1);
+    receipt["content"] = json!("x");
+    let frames = drive(&[
+        json!({"id":0,"code":include_str!("../portable.js")}),
+        json!({"id":1,"code":"await dial.check('saved', true, await dial.read('source.txt'))"}),
+        json!({"callback_id":1,"operation_id":1,"result":{"is_error":false,"data":receipt}}),
+        json!({"callback_id":2,"operation_id":1,"result":{"is_error":false,"data":null}}),
+    ]);
+    let check = frames
+        .iter()
+        .find(|frame| frame["callback"] == "check")
+        .unwrap();
+    assert_eq!(check["source"], source);
+    assert_eq!(frames.last().unwrap()["result"]["error"], Value::Null);
+}
+
+#[test]
 fn embedded_binary_helpers_preserve_endian_and_full_width_integers() {
     let source = format!(
         "{}\n{}\ndial.unpack('>Qh', dial.pack('>Qh', [18446744073709551615n, -2])).map(String).join(',')",
@@ -237,7 +258,8 @@ fn redeclaration_without_rewriting_gets_hint() {
 
 #[test]
 fn embedded_missing_globals_do_not_recommend_unavailable_node_imports() {
-    let result = cell("require('fs')");
+    let result = cell("require('http')");
+    assert_eq!(result["backend"], "quickjs");
     let error = result["error"].as_str().unwrap();
     assert!(error.contains("Node modules are unavailable"), "{error}");
     assert!(error.contains("tool.read"), "{error}");
@@ -245,6 +267,22 @@ fn embedded_missing_globals_do_not_recommend_unavailable_node_imports() {
     let result = cell("Buffer.from([1, 2])");
     let error = result["error"].as_str().unwrap();
     assert!(error.contains("Uint8Array and DataView"), "{error}");
+}
+
+#[test]
+fn embedded_path_and_fs_shims_work_via_tool_callbacks() {
+    let path_result = cell("const path = require('path'); path.join('a/b', '../c', 'd.txt')");
+    assert!(path_result["error"].is_null(), "{path_result}");
+    assert_eq!(path_result["value"], "'a/c/d.txt'");
+
+    let frames = drive(&[
+        json!({"id": 1, "code": "const fs = require('fs'); fs.readFileSync('a.txt', 'utf8')"}),
+        json!({"callback_id": 1, "operation_id": 1,
+               "result": {"is_error": false, "text": "ok", "data": {"content": "hello world"}}}),
+    ]);
+    let reply = frames.iter().find(|frame| frame["id"] == 1).unwrap();
+    assert!(reply["result"]["error"].is_null(), "{reply}");
+    assert_eq!(reply["result"]["value"], "'hello world'");
 }
 
 #[test]

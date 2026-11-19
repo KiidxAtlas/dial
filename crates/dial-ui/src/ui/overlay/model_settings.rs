@@ -191,7 +191,7 @@ static FIELDS: &[Field] = &[
             &["hashline", "replace", "apply_patch", "patch", "sloppy"],
             true,
         ),
-        "Unset inherits Dial's effective edit grammar; this is not adaptive benchmarking. Pin this exact model to hashline, replace, apply_patch, structured patch or sloppy matching.",
+        "Choose the grammar shown to this model for the edit tool. Unset inherits the preferred style (default: hashline). Other supported grammars still work.",
     ),
     field(
         "tools",

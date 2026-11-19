@@ -456,7 +456,7 @@ async function transferDownload(tab,scope,request) {
   }
 }
 // Validation also runs in Rust before startup, including for non-Chromium backends.
-const OBSERVE_ACTIONS = new Set(['open','navigate','back','forward','reload','click','dblclick','fill','type','press','select','check','uncheck','hover','focus','upload','scroll','drag','click_at','mouse_move','mouse_down','mouse_up','wheel','key_down','key_up','clipboard_paste']);
+const OBSERVE_ACTIONS = new Set(['open','navigate','back','forward','reload','click','dblclick','fill','type','press','select','check','uncheck','hover','focus','upload','scroll','drag','click_at','mouse_move','mouse_down','mouse_up','wheel','key_down','key_up','clipboard_paste','run','call']);
 function validateObserve(request) {
   if (request.observe === undefined) return;
   const options = request.observe;

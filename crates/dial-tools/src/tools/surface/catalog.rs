@@ -329,6 +329,27 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
     crate::runtime::arguments::validate(parameters, &arguments)
 }
 
+/// Validate arguments for `name` against `schema`. For `edit`, also accepts any other supported
+/// edit grammar (`Replace`, `Patch`, `ApplyPatch`, `Sloppy`, `Hashline`) validated against that
+/// grammar's own strict schema, so alternate edit methods work without adding tools to the prompt.
+pub fn validate_tool_arguments(
+    name: &str,
+    schema: &Value,
+    arguments: &Value,
+) -> Result<(), String> {
+    validate_arguments(schema, arguments).or_else(|error| {
+        if name != "edit" {
+            return Err(error);
+        }
+        let detected = crate::tools::edit::editing::effective_mode(
+            crate::config::types::EditMode::default(),
+            arguments,
+        );
+        let alt = crate::tools::edit::editing::schema(detected);
+        validate_arguments(&alt, arguments)
+    })
+}
+
 /// The refusal for unusable arguments. Raw text the provider sent is quoted (head and tail) with
 /// the parse error, so the model can see what it actually produced instead of a bare `{}` replay.
 fn malformed_reason(arguments: &Value) -> String {
@@ -382,7 +403,7 @@ pub fn validate_offered_call(
             ),
         ));
     };
-    validate_arguments(schema, &call.arguments)
+    validate_tool_arguments(&call.name, schema, &call.arguments)
         .err()
         .map(|error| ("schema", error))
 }

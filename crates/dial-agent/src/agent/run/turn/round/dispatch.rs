@@ -115,6 +115,8 @@ impl Agent<'_> {
                     .prepare(&self.workspace, &call.name, &call.arguments)
             }
         });
+        // Duration, execution and reuse facts for the per-call trace; only the dispatch branch sets them.
+        let mut dispatch_facts: Option<(f64, bool, bool)> = None;
         let output = if let Some(output) = preflight {
             ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
             ui.tool_result_with_id(&call.id, &call.name, &output);
@@ -413,11 +415,12 @@ impl Agent<'_> {
                     (out, started.elapsed().as_secs_f64(), true)
                 }
             };
-            let executed = executed
-                && !out
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data["read_reuse"]["fully_reused"] == true);
+            let reused = out
+                .data
+                .as_ref()
+                .is_some_and(|data| data["read_reuse"]["fully_reused"] == true);
+            let executed = executed && !reused;
+            dispatch_facts = Some((seconds, executed, reused));
             // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
             if executed {
                 self.metrics.tool_trace.record_invoked(&call.name);
@@ -490,6 +493,40 @@ impl Agent<'_> {
             }
             out
         };
+        let (seconds, executed, reused) = dispatch_facts.unwrap_or((0.0, false, false));
+        // Only argument names the offered schema declares may enter the trace (see tool_trace.rs).
+        let (offered, known_keys) = match schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == call.name.as_str())
+        {
+            Some(schema) => {
+                let mut keys: Vec<String> = schema
+                    .pointer("/function/parameters/properties")
+                    .and_then(|properties| properties.as_object())
+                    .map(|properties| properties.keys().cloned().collect())
+                    .unwrap_or_default();
+                keys.extend(
+                    crate::tools::accepted_argument_names(&call.name)
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+                (true, keys)
+            }
+            None => (false, Vec::new()),
+        };
+        self.metrics
+            .tool_trace
+            .record_call(crate::agent::tool_trace::CallObservation {
+                known_keys: &known_keys,
+                tool: &call.name,
+                offered,
+                arguments: &call.arguments,
+                seconds,
+                is_error: output.is_error,
+                error_text: &output.text,
+                executed,
+                reused,
+            });
         Ok(ExecutedCall {
             call,
             output,

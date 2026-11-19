@@ -1087,6 +1087,8 @@ fn only_sets_shell_state(head: &str) -> bool {
 /// Successful edits to one file, with no passing check in between, before the model is asked to
 /// reconsider its approach. The note repeats at each further multiple.
 const EDIT_CHURN_WARN: u32 = 3;
+/// Consecutive Eval cells of one code shape before the advisory repeats.
+const EVAL_CHURN_WARN: u32 = 3;
 const LARGE_REWRITE_BYTES: usize = 4096;
 
 /// Many small variations of one fix to the same file (a "doom loop"). Each edit is a novel
@@ -1096,12 +1098,22 @@ const LARGE_REWRITE_BYTES: usize = 4096;
 #[derive(Default)]
 pub struct EditChurnGuard {
     edits: std::collections::HashMap<String, u32>,
+    /// Mutations that failed without committing anything, per path. Repeated failures are thrash too.
+    failed: std::collections::HashMap<String, u32>,
     large_unchecked_noted: bool,
 }
 
 impl EditChurnGuard {
+    /// Rewrite pressure: committed churn or repeated failed attempts on one file.
     pub fn has_pressure(&self) -> bool {
-        self.edits.values().any(|count| *count >= EDIT_CHURN_WARN)
+        self.edits
+            .values()
+            .chain(self.failed.values())
+            .any(|count| *count >= EDIT_CHURN_WARN)
+    }
+    /// A failed `edit`/`write` that committed nothing. It adds pressure only; it never withholds a write.
+    pub fn observe_failed(&mut self, path: &str) {
+        *self.failed.entry(path.to_owned()).or_default() += 1;
     }
     /// A controller checkpoint before the first large unchecked write, not a claim that the
     /// model's algorithm was tested. The next generation sees it without losing the write.
@@ -1124,6 +1136,7 @@ impl EditChurnGuard {
     pub fn checked_paths(&mut self, paths: &[String]) {
         for path in paths {
             self.edits.remove(path);
+            self.failed.remove(path);
         }
     }
     /// Avoid regenerating a large file repeatedly while its implementation remains unverified.
@@ -1139,6 +1152,7 @@ impl EditChurnGuard {
     pub fn observe(&mut self, changed: &[String], check_passed: bool) -> Option<String> {
         if check_passed {
             self.edits.clear();
+            self.failed.clear();
             return None;
         }
         let paths: std::collections::BTreeSet<&String> = changed.iter().collect();
@@ -1159,6 +1173,80 @@ impl EditChurnGuard {
             )
         })
     }
+}
+
+/// Eval cells that repeat the same code shape back to back. Numbers and whitespace are not
+/// progress: `print(1)` and `print( 2 )` are one attempt varied. A passing check, a committed
+/// source change or a different cell resets the streak. Advisory only, like [`EditChurnGuard`].
+#[derive(Default)]
+pub struct EvalChurnGuard {
+    last: Option<String>,
+    streak: u32,
+}
+
+impl EvalChurnGuard {
+    /// Observe one settled `eval` cell. `passed` is true when the cell passed a check.
+    pub fn observe(&mut self, arguments: &serde_json::Value, passed: bool) -> Option<String> {
+        if passed {
+            self.clear();
+            return None;
+        }
+        let Some(code) = arguments["code"].as_str() else {
+            self.clear();
+            return None;
+        };
+        let key = format!(
+            "{}\0{}",
+            arguments["language"].as_str().unwrap_or_default(),
+            normalize_code_shape(code)
+        );
+        if self.last.as_deref() == Some(key.as_str()) {
+            self.streak += 1;
+        } else {
+            self.last = Some(key);
+            self.streak = 1;
+        }
+        (self.streak >= EVAL_CHURN_WARN && self.streak.is_multiple_of(EVAL_CHURN_WARN)).then(|| {
+            format!(
+                "[Eval churn: {} Eval cells in a row repeat the same code with no passing check or source change in between. Re-running an equivalent cell produces no new information. Change the hypothesis, isolate the first divergent value in one cell, or repair the source before another run.]",
+                self.streak
+            )
+        })
+    }
+
+    /// Progress: a passing check or a committed source change.
+    pub fn clear(&mut self) {
+        self.last = None;
+        self.streak = 0;
+    }
+}
+
+/// Digit runs collapse to `0`. Whitespace survives only between two word characters, so spacing
+/// around punctuation and line breaks varies without changing the shape of one attempt.
+fn normalize_code_shape(code: &str) -> String {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut shape = String::with_capacity(code.len());
+    let mut pending_space = false;
+    let mut in_digits = false;
+    for c in code.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            in_digits = false;
+            continue;
+        }
+        if std::mem::take(&mut pending_space) && shape.chars().last().is_some_and(word) && word(c) {
+            shape.push(' ');
+        }
+        if c.is_ascii_digit() {
+            if !std::mem::replace(&mut in_digits, true) {
+                shape.push('0');
+            }
+            continue;
+        }
+        in_digits = false;
+        shape.push(c);
+    }
+    shape
 }
 
 /// What to do after a generation stopped because it hit the output token limit.

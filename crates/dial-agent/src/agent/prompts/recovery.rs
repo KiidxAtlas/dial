@@ -195,7 +195,7 @@ pub(crate) fn missing_program(
             .unwrap_or_default()
     };
     format!(
-        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment.{substitute} Use recorded availability first; if unknown, probe alternatives once in that same environment (`command -v`). For validation, exercise the required behavior with equivalent semantics or report the check as unverified. A file inspection is not a behavioral check. After resolving the prerequisite, rerun the original check.</dial-notice>"
+        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment.{substitute} If availability is unknown, probe once (`command -v`). Use the intended consumer or report the check as unverified. After resolving the prerequisite, rerun the original check.</dial-notice>"
     )
 }
 

@@ -275,6 +275,18 @@ pub fn workspace_read(workspace: &Workspace) -> Option<Footprint> {
     footprint(workspace, &workspace_reads(workspace))
 }
 
+/// Reads of exactly these literal workspace paths, admitted through the same rules as `read`.
+/// `None` when any path is outside that admission, so the caller keeps its broader read.
+pub fn literal_reads(workspace: &Workspace, paths: &[PathBuf]) -> Option<Footprint> {
+    footprint(
+        workspace,
+        &Access {
+            reads: paths.to_vec(),
+            writes: Vec::new(),
+        },
+    )
+}
+
 /// Resolve a native or explicitly declared extension call. Unknown or ambiguous resources are
 /// absent, so callers keep the operation behind a serial barrier.
 pub fn resolve(

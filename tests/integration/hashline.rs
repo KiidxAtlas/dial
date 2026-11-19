@@ -993,13 +993,16 @@ fn schemas_depend_on_the_edit_mode() {
     ] {
         assert!(description.contains(needle), "missing {needle}");
     }
-    // Replace mode keeps the plain numbered read.
+    // Replace is advertised, but the read still provides the authentic header for Hashline.
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("f.txt"), "x\n").unwrap();
     let ws = Workspace::new(dir.path())
         .unwrap()
         .with_edit_mode(EditMode::Replace);
-    assert_eq!(read(&ws, "f.txt").text, "     1\tx\n");
+    assert_eq!(
+        read(&ws, "f.txt").text,
+        format!("[f.txt#{}]\n{}1:x\n", tag_of("x\n"), raw_header("x\n"))
+    );
     assert!(run(&ws, "edit", json!({"input": "[f.txt#0000]\nREM\n"})).is_error);
 }
 

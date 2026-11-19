@@ -28,7 +28,8 @@ const DIAGNOSTIC_BYTES: usize = 1500;
 /// Registered reproductions get the deadline a model `bash` call gets by default.
 const REPRO_TIMEOUT_SECS: u64 = 300;
 const REPRO_PREFIX: &str = "repro: ";
-const REPRO_NAME_BYTES: usize = 64;
+const ACCEPTANCE_PREFIX: &str = "acceptance: ";
+const REPRO_NAME_BYTES: usize = 128;
 const REPRO_COMMAND_BYTES: usize = 4000;
 
 /// `predictions` adds the optional `expect` argument (`experimental.check_predictions`).
@@ -638,9 +639,25 @@ impl Agent<'_> {
             if known(name, candidates) {
                 continue;
             }
-            let prefixed = format!("{REPRO_PREFIX}{name}");
-            if known(&prefixed, candidates) {
-                *name = prefixed;
+            let stripped = name
+                .strip_prefix(REPRO_PREFIX)
+                .or_else(|| name.strip_prefix(ACCEPTANCE_PREFIX))
+                .map(str::trim);
+            if let Some(bare) = stripped
+                && known(bare, candidates)
+            {
+                *name = bare.to_owned();
+                continue;
+            }
+            let bare = stripped.unwrap_or(name.as_str());
+            let repro_prefixed = format!("{REPRO_PREFIX}{bare}");
+            if known(&repro_prefixed, candidates) {
+                *name = repro_prefixed;
+                continue;
+            }
+            let acc_prefixed = format!("{ACCEPTANCE_PREFIX}{bare}");
+            if known(&acc_prefixed, candidates) {
+                *name = acc_prefixed;
                 continue;
             }
             match test_targets::target_check(

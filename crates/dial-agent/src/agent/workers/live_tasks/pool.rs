@@ -192,7 +192,29 @@ fn merged(shared: &Value, task: &Value) -> Result<Value, String> {
 
 fn pool_tasks(args: &Value) -> Result<Vec<Value>, String> {
     match &args["tasks"] {
-        Value::Null => Ok(Vec::new()),
+        Value::Null => {
+            if let Some(text) = args["message"]
+                .as_str()
+                .or_else(|| args["task"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let mut item = json!({"task": text});
+                for key in ["name", "solution_space"] {
+                    if let Some(value) = args.get(key) {
+                        item[key] = value.clone();
+                    }
+                }
+                for key in SHARED_KEYS {
+                    if let Some(value) = args.get(*key) {
+                        item[*key] = value.clone();
+                    }
+                }
+                Ok(vec![item])
+            } else {
+                Ok(Vec::new())
+            }
+        }
         Value::Array(tasks) => Ok(tasks.clone()),
         _ => Err("pool tasks must be an array".into()),
     }
@@ -275,6 +297,29 @@ impl LiveTasks {
     /// Queues more items on an open pool and starts whatever fits.
     pub fn pool_push(&mut self, ctx: StartContext<'_>, args: &Value) -> Result<Value, String> {
         let id = args["id"].as_str().unwrap_or("").to_owned();
+        if !self.is_pool(&id)
+            && self.is_job(&id)
+            && let Some(msg) = args["message"]
+                .as_str()
+                .or_else(|| args["task"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            let running = self.jobs.get(&id).is_some_and(JobState::running);
+            if running {
+                let receipt = self.team.send(mailbox::PARENT, &id, msg)?;
+                return Ok(receipt.json());
+            }
+            let mut resume = json!({
+                "action": "resume",
+                "id": id,
+                "message": msg,
+            });
+            if let Some(mode) = args.get("isolation") {
+                resume["isolation"] = mode.clone();
+            }
+            return self.start(ctx, &resume);
+        }
         let launch = Arc::new(PoolLaunch::capture(&ctx));
         let tasks = pool_tasks(args)?;
         if tasks.is_empty() {
@@ -319,6 +364,10 @@ impl LiveTasks {
 
     pub fn is_pool(&self, id: &str) -> bool {
         self.pools.contains_key(id)
+    }
+
+    pub fn is_job(&self, id: &str) -> bool {
+        self.jobs.contains_key(id)
     }
 
     /// Pool items are announced through their aggregate, not as duplicate per-job results.

@@ -337,6 +337,20 @@ impl Checkpoints {
         paths.dedup();
         paths
     }
+
+    /// Project files first created during the turn, excluding added directories and skipped entries.
+    pub fn created_files(&self, turn: u64) -> Vec<String> {
+        self.manifest(turn)
+            .map(|manifest| {
+                manifest
+                    .entries
+                    .into_iter()
+                    .filter(|entry| !entry.existed && entry.root.is_none())
+                    .map(|entry| entry.rel)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     /// Render the source delta captured by this turn's first-write checkpoints.
     /// The output is bounded and reports paths that need manual inspection.
     fn manifest(&self, turn: u64) -> Result<Manifest> {

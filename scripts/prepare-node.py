@@ -24,17 +24,15 @@ import stat
 import sys
 import tarfile
 import tempfile
-import urllib.request
 import zipfile
 from pathlib import Path
+
+from runtime_payload import PrepareError, download, sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "runtimes" / "node" / "manifest.json"
 
-DOWNLOAD_LIMIT = 150 * 1024 * 1024
 OUTPUT_LIMIT = 256 * 1024 * 1024
-DOWNLOAD_TIMEOUT_SECONDS = 120
-CHUNK = 1024 * 1024
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # Magic prefixes that the executable must start with for its target's platform.
@@ -44,10 +42,6 @@ MAGIC_BY_PLATFORM = {
     # Mach-O 64-bit little-endian, Mach-O 32-bit, and fat/universal binaries.
     "darwin": (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"),
 }
-
-
-class PrepareError(Exception):
-    """A refusal with a message fit for the build log; never a partial output."""
 
 
 def platform_for(triple):
@@ -99,37 +93,6 @@ def archive_kind(name):
     if lowered.endswith(".zip"):
         return "zip"
     raise PrepareError(f"unsupported archive type (expected .tar.xz, .tar.gz, .tgz or .zip): {name}")
-
-
-def download(url, destination):
-    """Stream the archive to destination, refusing anything over DOWNLOAD_LIMIT."""
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, \
-                open(destination, "wb") as out:
-            declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > DOWNLOAD_LIMIT:
-                raise PrepareError(f"archive declares {declared} bytes, over the {DOWNLOAD_LIMIT} limit")
-            while True:
-                chunk = response.read(CHUNK)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > DOWNLOAD_LIMIT:
-                    raise PrepareError(f"archive exceeds the {DOWNLOAD_LIMIT} byte download limit")
-                out.write(chunk)
-    except OSError as error:
-        raise PrepareError(f"download failed for {url}: {error}") from error
-    return total
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(CHUNK), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def read_bounded(stream, name):

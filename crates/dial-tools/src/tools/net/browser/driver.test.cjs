@@ -174,11 +174,16 @@ test('events merge tab channels in sequence order and return only newer entries'
   assert.equal(h.run('tab.seq'),153);
 });
 
-test('run uses DOM globals and assert/sleep in the page realm, not Playwright or Node', async () => {
+test('run exposes DOM globals, assert/sleep, and a page-realm page helper without Node or host Playwright', async () => {
   const { runCode } = require('./run.cjs');
   const heading = { textContent: 'Page heading' };
   const context = vm.createContext({
-    document: { title: 'DOM title', querySelector(selector) { return selector === 'h1' ? heading : null; } },
+    document: {
+      title: 'DOM title',
+      querySelector(selector) { return selector === 'h1' ? heading : null; },
+      querySelectorAll(selector) { return selector === 'h1' ? [heading] : []; },
+    },
+    window: { location: { href: 'https://example.test/' } },
     setTimeout,
   });
   // Like Playwright, serialize the actual helper into a separate page realm, without Node bindings.
@@ -189,12 +194,13 @@ test('run uses DOM globals and assert/sleep in the page realm, not Playwright or
   const result = await runCode({ page, timeoutMs: 1000, code: `
     assert(document.querySelector('h1').textContent === 'Page heading');
     await sleep(0);
-    assert(typeof page === 'undefined', 'Playwright page must not be injected');
+    assert(await page.title() === 'DOM title', 'page.title() should work in page realm');
+    assert(await page.locator('h1').textContent() === 'Page heading', 'page.locator() should work in page realm');
     assert(typeof require === 'undefined' && typeof process === 'undefined', 'Node must not be exposed');
     return document.title;
   ` });
   assert.equal(result.value, 'DOM title');
-  await assert.rejects(runCode({ page, timeoutMs: 1000, code: 'return page.title();' }), /page is not defined/);
+  await assert.rejects(runCode({ page, timeoutMs: 1000, code: 'return page.goto("https://example.test/");' }), /host-side browser action/);
   await assert.rejects(runCode({ page, timeoutMs: 1000, code: "assert(false, 'DOM assertion failed');" }), /DOM assertion failed/);
 });
 

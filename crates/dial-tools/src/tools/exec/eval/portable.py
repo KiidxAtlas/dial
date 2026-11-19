@@ -192,20 +192,52 @@ class _Dial:
     def readBytes(self, path):
         return _dial_base64.b64decode(self.read(path, encoding="base64")["content"], validate=True)
 
-    def writeText(self, path, content):
-        return tool.write(path=path, content=content)
+    def _guarded_write(self, path, **args):
+        # Overwrites never read implicitly: a file the session has not read whole is refused by the
+        # write tool, and the caller reads it and passes that receipt's digest as expected_sha256.
+        try:
+            return tool.write(path=path, **args)
+        except Exception as error:
+            # Kernel tool refusals are not importable into cells, so match on the message. The hinted
+            # error is raised after the handler, so the kernel reports it rather than the chained refusal.
+            msg = str(error)
+            if "has no current source/read witness" not in msg and "were not displayed in full" not in msg:
+                raise
+            refusal = msg
+        raise RuntimeError(
+            refusal + "\n[dial] Helpers do not read files implicitly. Read " + path
+            + " with dial.read (or tool.read) first; to overwrite that revision, pass expected_sha256=<its sha256>."
+        )
 
-    def writeJson(self, path, value):
-        return self.writeText(path, _dial_json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2) + "\n")
+    def _write_args(self, expected_sha256):
+        if expected_sha256 is None:
+            return {}
+        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64 or any(c not in "0123456789abcdefABCDEF" for c in expected_sha256):
+            raise TypeError("expected_sha256 must be the 64-character sha256 from a whole-file dial.read receipt")
+        return {"expected_sha256": expected_sha256}
+
+    def writeText(self, path, content, expected_sha256=None):
+        return self._guarded_write(path, content=content, **self._write_args(expected_sha256))
+
+    def writeJson(self, path, value, expected_sha256=None):
+        content = _dial_json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+        return self._guarded_write(path, content=content, **self._write_args(expected_sha256))
 
     def writeBytes(self, path, value):
-        return tool.write(path=path, content=_dial_base64.b64encode(bytes(value)).decode("ascii"), encoding="base64")
+        return self._guarded_write(path, content=_dial_base64.b64encode(bytes(value)).decode("ascii"), encoding="base64")
 
     def run(self, command, **options):
         return tool.bash(command=command, **options)
 
-    def check(self, name, passed):
-        return __dial_check__(name, passed)
+    def check(self, name, passed, source=...):
+        if source is ...:
+            return __dial_check__(name, passed)
+        if (not isinstance(source, dict) or any(key in source for key in ("offset", "lines", "next_offset"))
+                or source.get("encoding") not in ("text", "base64") or not isinstance(source.get("content"), str)
+                or type(source.get("bytes")) is not int or source["bytes"] < 0
+                or not isinstance(source.get("path"), str) or not isinstance(source.get("sha256"), str)):
+            raise TypeError("check source must be a whole-file dial.read receipt")
+        return __dial_check__(name, passed, {"path": source["path"], "sha256": source["sha256"]})
 
     gen = _DialGens()
 

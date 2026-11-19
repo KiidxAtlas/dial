@@ -104,13 +104,17 @@ pub fn run(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> ToolOutput {
         fs::write(&dest, content).map_err(|e| e.to_string())?;
         let overlay = ws.rebased(temp.path()).map_err(|e| e.to_string())?;
         // Keep compiler artifacts inside the overlay even when the user exports CARGO_TARGET_DIR.
+        // An operator's global `build.rustc-wrapper` (for example sccache) runs outside this
+        // preview's sandbox policy and cannot open its cache or server socket there, so the
+        // disposable type check compiles with rustc directly. The sandbox itself is unchanged.
         let target = overlay
             .root()
             .join("target")
             .to_string_lossy()
             .replace('\'', "'\"'\"'");
-        let command =
-            format!("CARGO_TARGET_DIR='{target}' cargo check --offline --all-targets --quiet -j1");
+        let command = format!(
+            "RUSTC_WRAPPER='' CARGO_TARGET_DIR='{target}' cargo check --offline --all-targets --quiet -j1"
+        );
         let output = crate::tools::exec::shell::bash_tool_streaming(
             &overlay,
             &json!({"command":command}),

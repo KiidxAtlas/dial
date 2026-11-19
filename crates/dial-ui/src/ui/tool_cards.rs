@@ -242,6 +242,9 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     if let Some(rows) = check::check_card(t, w as usize, ctx) {
         return rows;
     }
+    if let Some(rows) = check::verify_card(t, w as usize, ctx) {
+        return rows;
+    }
     if let Some(rows) = irc::irc_card(t, w as usize, ctx) {
         return rows;
     }

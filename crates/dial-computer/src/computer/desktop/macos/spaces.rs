@@ -98,21 +98,21 @@ pub(super) fn bring_to_current_space(id: &str) -> CoreResult<()> {
     // normally off the current Space and therefore absent from capture lists.
     let pid = owner_pid(spi, connection, wid)?;
     let current = active_space(spi, connection)?;
+    let number = CFNumber::new_i64(i64::from(wid));
+    let windows = CFArray::from_objects(&[&*number]);
+    let before = memberships(spi, connection, windows.as_opaque())?;
+    if before.contains(&current) {
+        // Already visible here (including windows pinned to all Spaces or on the active fullscreen Space).
+        return Ok(());
+    }
     // Moving another application's window into a fullscreen/system Space is
     // not an ordinary desktop move and can violate its ownership semantics.
     // SAFETY: The connection and Space id were read from WindowServer.
     if unsafe { (spi.space_type)(connection, current) } != 0 {
         return Err(denied(
-            "the current Space is fullscreen or system-managed; leave fullscreen or choose a desktop \
-			 Space, then retry",
+            "the current Space is fullscreen or system-managed; leave fullscreen, choose a desktop \
+			 Space, or operate on the window directly with takeover:true, then retry",
         ));
-    }
-    let number = CFNumber::new_i64(i64::from(wid));
-    let windows = CFArray::from_objects(&[&*number]);
-    let before = memberships(spi, connection, windows.as_opaque())?;
-    if before.contains(&current) {
-        // Already visible here (including windows pinned to all Spaces).
-        return Ok(());
     }
     let focus = skylight::front_window_context().ok_or_else(|| {
         denied(

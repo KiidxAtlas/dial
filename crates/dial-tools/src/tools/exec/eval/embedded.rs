@@ -21,8 +21,9 @@ use rquickjs::{Context, Ctx, Exception, Function, Object, Runtime, Value};
 /// Argument that makes `dial` run the embedded worker instead of the CLI.
 pub const WORKER_ARG: &str = "--dial-eval-js-worker";
 
-/// Same bound as the Node driver and the controller's frame reader.
-const MAX_FRAME: usize = 12 * 1024 * 1024;
+/// The controller's frame bound; `driver.cjs`, `embedded/shim.js` and the Python kernel driver
+/// declare the same value (checked by `eval::tests::driver_frame_limits_match_the_controller`).
+const MAX_FRAME: usize = crate::runtime::json_transport::MAX_FRAME;
 const SHIM: &str = include_str!("embedded/shim.js");
 
 enum Line {

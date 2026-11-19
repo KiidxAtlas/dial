@@ -1138,7 +1138,7 @@ fn select_configuration(
     }
     integration::configure_review(&mut selected);
     selected.validate()?;
-    let settings = json!({
+    let mut settings = json!({
         "context_window": selected.context_window,
         "context_window_semantics": "configured harness budget; runtime may cap to loaded model context",
         "endpoint": selected.endpoint.as_ref().map(|endpoint| &endpoint.base_url),
@@ -1162,6 +1162,10 @@ fn select_configuration(
         "case_requirement_mapping": "none_grader_independent_v2",
         "local_runtime": selected.local_runtime,
     });
+    // Off by default, so reports produced without the guard keep their contract identity.
+    if policy.case_inactivity_secs != 0 {
+        settings["case_inactivity_secs"] = json!(policy.case_inactivity_secs);
+    }
     Ok((selected, settings))
 }
 
@@ -1248,7 +1252,10 @@ fn run_machine(
                         home.path(),
                         case,
                         workspace,
-                        policy.case_timeout_secs,
+                        rpc::CaseLimits {
+                            wall_secs: policy.case_timeout_secs,
+                            inactivity_secs: policy.case_inactivity_secs,
+                        },
                         configuration.adapter.as_deref(),
                         share_auth.then_some(layout.user_dir.as_path()),
                     )

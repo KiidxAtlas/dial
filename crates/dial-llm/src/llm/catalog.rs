@@ -4,8 +4,9 @@
 
 mod bundled;
 pub use bundled::{
-    ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models, known_context_window,
-    model_capabilities, model_protocol, provider_endpoint,
+    ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models,
+    documented_thinking_levels, known_context_window, model_capabilities, model_protocol,
+    provider_endpoint,
 };
 
 mod cache;

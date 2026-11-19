@@ -774,23 +774,16 @@ fn the_status_line_sits_in_the_top_border_and_follows_the_ui_config() {
 }
 
 #[test]
-fn transparent_status_has_no_background_in_the_composer_border() {
-    let mut env = Env::new();
+fn the_composer_border_has_no_background() {
+    let env = Env::new();
     let c = Composer::new(vec![], 10);
-    let has_bg = |env: &Env| {
+    assert!(
         c.view(100, &env.ctx()).rows[0]
             .spans
             .iter()
-            .any(|s| s.style.bg.is_some())
-    };
-    assert!(!has_bg(&env), "the default status line has no fill");
-    env.ui.status_transparent = false;
-    assert!(
-        !has_bg(&env),
-        "legacy opacity settings do not add filled blocks"
+            .all(|s| s.style.bg.is_none()),
+        "the status line has no fill"
     );
-    env.ui.status_transparent = true;
-    assert!(!has_bg(&env));
 }
 
 #[test]

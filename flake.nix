@@ -20,7 +20,12 @@
             cargoLock.lockFile = ./Cargo.lock;
             # Only the `dial` binary package of the workspace is shipped.
             cargoBuildFlags = [ "-p" "dial" ];
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            # A Nix-native interpreter has the correct store loader (a generic Linux
+            # distribution cannot assume /lib64/ld-linux exists on NixOS).
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.makeBinaryWrapper ];
+            postInstall = ''
+              wrapProgram "$out/bin/dial" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 ]}
+            '';
             buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
             doCheck = false;
             meta = {

@@ -206,6 +206,8 @@ fn standalone_artifact_acceptance_guidance_requires_verify_in_every_profile() {
                 "profile {lean}/{one_call}, verify offered: {offered}"
             );
             assert_eq!(policy.contains("`bash` check:true"), !offered);
+            assert!(policy.contains("saved artifact with the requested consumer"));
+            assert!(policy.contains("exact output type and value"));
             assert_eq!(policy.contains("same response, write first"), !one_call);
         }
     }

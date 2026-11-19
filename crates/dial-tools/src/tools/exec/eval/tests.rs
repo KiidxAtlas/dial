@@ -16,6 +16,101 @@ fn settled(outcome: CellOutcome) -> Value {
     }
 }
 
+#[test]
+fn check_source_digest_obeys_read_admission_and_whole_file_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data");
+    std::fs::write(&file, b"abc").unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    assert_eq!(
+        check_source_digest(&ws, "data").as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    );
+    let denied = ws
+        .clone()
+        .with_policy(crate::tools::exec::sandbox::Policy::Dev {
+            deny_read: vec![file.clone()],
+            extra_write: vec![],
+            allow_network: false,
+            serial_ports: false,
+        });
+    assert_eq!(check_source_digest(&denied, "data"), None);
+    let protected = ws.clone().with_protected_paths(std::slice::from_ref(&file));
+    assert_eq!(check_source_digest(&protected, "data"), None);
+    std::fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_len(1024 * 1024 + 1)
+        .unwrap();
+    assert_eq!(check_source_digest(&ws, "data"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_source_digest_does_not_inherit_sensitive_or_attached_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let protected = outside.path().canonicalize().unwrap();
+    std::fs::write(protected.join("private"), b"fixture").unwrap();
+    std::os::unix::fs::symlink(&protected, dir.path().join("link")).unwrap();
+    let mut ws = Workspace::new(dir.path())
+        .unwrap()
+        .with_protected_paths(std::slice::from_ref(&protected));
+    ws.grant_sensitive_directory(&protected).unwrap();
+    assert!(ws.resolve_read("link/private").is_ok());
+    assert_eq!(check_source_digest(&ws, "link/private"), None);
+    std::fs::write(dir.path().join("ordinary"), b"allowed").unwrap();
+    assert!(check_source_digest(&ws, "ordinary").is_some());
+}
+
+/// Parses `MAX_FRAME = a * b * ...` from a driver source and returns the product.
+fn declared_frame_limit(source: &str, name: &str) -> usize {
+    let line = source
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .trim_start_matches("const ")
+                .starts_with("MAX_FRAME =")
+        })
+        .unwrap_or_else(|| panic!("{name} declares no MAX_FRAME"));
+    let expr = line.split_once('=').unwrap().1.trim().trim_end_matches(';');
+    expr.split('*')
+        .map(|factor| {
+            factor
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("{name}: unparsable MAX_FRAME factor in {line:?}"))
+        })
+        .product()
+}
+
+#[test]
+fn driver_frame_limits_match_the_controller() {
+    let controller = crate::runtime::json_transport::MAX_FRAME;
+    for (name, source) in [
+        ("eval/driver.cjs", include_str!("driver.cjs")),
+        ("eval/embedded/shim.js", include_str!("embedded/shim.js")),
+        ("kernel/driver.py", include_str!("../kernel/driver.py")),
+    ] {
+        assert_eq!(
+            declared_frame_limit(source, name),
+            controller,
+            "{name} frame limit drifted"
+        );
+    }
+}
+
+#[test]
+fn declared_frame_limit_parses_known_forms() {
+    assert_eq!(declared_frame_limit("const MAX_FRAME = 2 * 3;\n", "js"), 6);
+    assert_eq!(
+        declared_frame_limit("  const MAX_FRAME = 4 * 1024;", "shim"),
+        4096
+    );
+    assert_eq!(declared_frame_limit("MAX_FRAME = 5\n", "py"), 5);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn bundled_node_eval_runs_with_private_dial_storage_protected() {
@@ -87,6 +182,30 @@ fn control_operations_do_not_start_an_interpreter() {
     assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn invalid_cell_code_has_a_language_specific_retry_without_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = Config::default();
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    for language in ["js", "py"] {
+        for code in [None, Some(json!(null)), Some(json!([])), Some(json!(" \n"))] {
+            let mut args = json!({"language":language});
+            if let Some(code) = code {
+                args["code"] = code;
+            }
+            let output = tool.call(&context(&workspace, &config), &args);
+            assert!(output.is_error, "{args}: {}", output.text);
+            let example = format!(r#"{{"language":"{language}","code":"1 + 1"}}"#);
+            assert!(output.text.contains(&example), "{args}: {}", output.text);
+            assert_eq!(
+                output.execution.effects,
+                crate::runtime::execution::Effects::None
+            );
+        }
+    }
+}
+
 /// A Python cell whose interpreter cannot be resolved names JavaScript eval when it resolves.
 #[test]
 fn a_missing_python_points_to_javascript_only_when_it_resolves() {
@@ -109,6 +228,13 @@ fn a_missing_python_points_to_javascript_only_when_it_resolves() {
             "{}",
             output.text
         );
+        if js {
+            assert!(
+                output
+                    .text
+                    .contains("cannot verify Python-specific behavior")
+            );
+        }
     }
 }
 
@@ -132,7 +258,7 @@ fn installed_languages_reports_only_resolvable_operator_runtimes() {
     }
     let guidance = runtime_guidance(dir.path(), &config);
     let js_state = if super::embedded_js_available() {
-        "JavaScript resolved"
+        "JavaScript resolved: embedded QuickJS"
     } else {
         "JavaScript not found"
     };
@@ -141,6 +267,8 @@ fn installed_languages_reports_only_resolvable_operator_runtimes() {
     config.kernel.python = python.to_str().unwrap().into();
     assert_eq!(python_languages(dir.path(), &config), ["py"]);
     assert!(runtime_guidance(dir.path(), &config).contains("Python resolved"));
+    config.eval.node = python.to_str().unwrap().into(); // an operator-owned executable fixture
+    assert!(runtime_guidance(dir.path(), &config).contains("JavaScript resolved: Node"));
     // A launcher inside the editable workspace is never an operator-installed runtime.
     let planted = dir.path().join("python-fixture");
     std::fs::copy(&python, &planted).unwrap();
@@ -188,7 +316,13 @@ fn unknown_language_is_refused_before_any_runtime_starts() {
         &mut |_| unreachable!(),
         &AtomicBool::new(false),
     );
-    assert!(result.err().unwrap().contains("unsupported eval language"));
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported eval language")
+    );
     assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
 }
 
@@ -206,7 +340,13 @@ fn unknown_action_is_refused() {
         &mut |_| unreachable!(),
         &AtomicBool::new(false),
     );
-    assert!(result.err().unwrap().contains("unsupported eval action"));
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported eval action")
+    );
 }
 
 #[test]
@@ -337,6 +477,7 @@ fn run_cell(
         &mut |_| unreachable!(),
         &AtomicBool::new(false),
     )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "macos")]

@@ -134,9 +134,9 @@ fn literal_path(input: &str) -> Result<String, String> {
     }
     Ok(input.to_owned())
 }
-pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String> {
-    let object = args.as_object().ok_or("edit arguments must be an object")?;
-    let allowed: &[&str] = match mode {
+/// Argument names the edit tool accepts for one method. `validate_shape` enforces them per mode.
+pub(crate) fn mode_argument_names(mode: EditMode) -> &'static [&'static str] {
+    match mode {
         EditMode::Replace => &[
             "path",
             "old_string",
@@ -146,8 +146,35 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
             "verify",
         ],
         EditMode::Patch => &["path", "edits", "allow_syntax_errors", "verify"],
-        _ => &["input", "allow_syntax_errors", "verify"],
-    };
+        EditMode::Hashline | EditMode::ApplyPatch | EditMode::Sloppy => {
+            &["input", "allow_syntax_errors", "verify"]
+        }
+    }
+}
+
+/// Every argument name the edit tool accepts under any method. The offered schema declares only the
+/// default method's names, so the per-call trace allowlist needs this wider set.
+pub fn accepted_argument_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for mode in [
+        EditMode::Hashline,
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        for name in mode_argument_names(mode) {
+            if !names.contains(name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String> {
+    let object = args.as_object().ok_or("edit arguments must be an object")?;
+    let allowed = mode_argument_names(mode);
     if object
         .iter()
         .any(|(key, value)| !value.is_null() && !allowed.contains(&key.as_str()))
@@ -156,6 +183,54 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
     }
     verify_targets(args)?;
     Ok(())
+}
+
+/// Detect the edit grammar implied by `args`, falling back to `configured` (default: Hashline).
+/// Allows any supported edit method (`Replace`, `Patch`, `ApplyPatch`, `Sloppy`, `Hashline`) to
+/// work through the single `edit` tool without adding extra tools or schemas to the prompt.
+pub fn effective_mode(configured: EditMode, args: &Value) -> EditMode {
+    if present(args, "edits") {
+        return EditMode::Patch;
+    }
+    if present(args, "old_string")
+        || present(args, "new_string")
+        || (present(args, "path") && !present(args, "input"))
+    {
+        return EditMode::Replace;
+    }
+    if let Some(input) = args.get("input").and_then(Value::as_str) {
+        let mut lines = input.lines().map(str::trim).filter(|line| !line.is_empty());
+        let wrapped = lines.next();
+        let first_non_empty = if wrapped == Some("*** Begin Patch") {
+            lines.next()
+        } else {
+            wrapped
+        };
+        if first_non_empty.is_some_and(|line| line.starts_with("*** Edit File:")) {
+            return EditMode::Sloppy;
+        }
+        if first_non_empty.is_some_and(|line| line.starts_with('[')) {
+            return EditMode::Hashline;
+        }
+        if wrapped == Some("*** Begin Patch") {
+            return EditMode::ApplyPatch;
+        }
+        if configured != EditMode::ApplyPatch
+            && super::edit_native::apply_patch::parse_apply_patch(input).is_ok()
+        {
+            return EditMode::ApplyPatch;
+        }
+    }
+    configured
+}
+
+pub(crate) fn validate_effective_shape(
+    configured: EditMode,
+    args: &Value,
+) -> Result<EditMode, String> {
+    let effective = effective_mode(configured, args);
+    validate_shape(effective, args)?;
+    Ok(effective)
 }
 #[derive(Clone)]
 struct Entry {
@@ -308,8 +383,8 @@ pub fn proposed_sloppy_sources(input: &str) -> Result<Vec<(String, String)>, Str
 
 /// Permission extraction fully validates mode grammar; payload bodies never grant targets.
 pub fn targets(mode: EditMode, args: &Value) -> Result<Vec<String>, String> {
-    validate_shape(mode, args)?;
-    let mut out = match mode {
+    let effective = validate_effective_shape(mode, args)?;
+    let mut out = match effective {
         EditMode::Hashline => hashline::targets(req_str(args, "input")?)?,
         EditMode::Replace => {
             req_str(args, "old_string")?;
@@ -1055,8 +1130,8 @@ pub(crate) fn prepare_with_preview(
     preview_no_change: Option<&std::cell::Cell<bool>>,
 ) -> Result<PreparedEdit, PrepareError> {
     ws.edit_settings.validate()?;
-    validate_shape(ws.edit_mode, args)?;
-    match ws.edit_mode {
+    let effective = validate_effective_shape(ws.edit_mode, args)?;
+    match effective {
         EditMode::Replace => replace_plan(ws, args, preview_no_change),
         EditMode::Patch => entries_plan(ws, patch_entries(args)?, true)
             .map(PreparedEdit::Changes)
@@ -1083,11 +1158,12 @@ pub(crate) fn prepare_streaming_preview(
     args: &Value,
     preview_no_change: Option<&std::cell::Cell<bool>>,
 ) -> Result<PreparedEdit, PrepareError> {
-    if ws.edit_mode != EditMode::ApplyPatch {
+    let effective = effective_mode(ws.edit_mode, args);
+    if effective != EditMode::ApplyPatch {
         return prepare_with_preview(ws, args, preview_no_change);
     }
     ws.edit_settings.validate()?;
-    validate_shape(ws.edit_mode, args)?;
+    validate_shape(EditMode::ApplyPatch, args)?;
     entries_plan(ws, apply_entries(req_str(args, "input")?, true)?, false)
         .map(PreparedEdit::Changes)
         .map_err(Into::into)
@@ -1611,8 +1687,8 @@ fn edit_output_unannotated(
     ws: &Workspace,
     args: &Value,
 ) -> Result<crate::tools::ToolOutput, String> {
-    if ws.edit_mode == EditMode::Hashline {
-        validate_shape(ws.edit_mode, args)?;
+    let effective = validate_effective_shape(ws.edit_mode, args)?;
+    if effective == EditMode::Hashline {
         let execution = Execution {
             refuse_syntax_errors: syntax_gate(ws, args)?,
             ..Default::default()

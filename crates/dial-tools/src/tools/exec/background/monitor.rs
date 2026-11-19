@@ -574,7 +574,7 @@ impl Tool for Monitor {
     fn schema(&self) -> Value {
         tool_schema(
             "monitor",
-            "Approved one-shot watch of a bg job, dial run wrapper, workspace log, own pid (exit only) or after_secs timer; reports to the idle session. Future output only; a match, exit, timer or source failure disarms it. save keeps a path/run/timer watch; restore re-arms it (approval). Max 8; every start needs approval.",
+            "One-shot approved watch of a bg job, run wrapper, log file, own pid (exit only) or timer; reports to the idle session. Future output only; a match, exit or source failure disarms it. save keeps a path/run/timer watch; restore re-arms it. Max 8; start needs approval.",
             json!({
                 "action": {"type":"string", "enum":["start","list","stop","saved","restore","forget"]},
                 "pid": {"type":"integer", "minimum":2, "description":"start: your own process; reports its exit only"},

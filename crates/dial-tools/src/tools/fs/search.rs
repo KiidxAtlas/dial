@@ -279,17 +279,41 @@ fn resolve_scopes(ws: &Workspace, args: &Value, glob: Option<&Glob>) -> Result<S
     let mut missing = Vec::new();
     for input in inputs {
         let path = ws.resolve_read(input)?;
-        // Reject even in-workspace symlink scopes rather than silently changing their identity.
+        // Reject symlinked directories and symlinked ancestors rather than silently widening search
+        // scope; allow a direct single-file symlink whose canonical target stays inside an allowed
+        // root (already verified by `ws.resolve_read`).
         let original = if Path::new(input).is_absolute() {
             PathBuf::from(input)
+        } else if input == "~" || input.starts_with("~/") {
+            std::env::var_os("HOME")
+                .map(|home| {
+                    let rest = input.strip_prefix("~/").unwrap_or("");
+                    if rest.is_empty() {
+                        PathBuf::from(home)
+                    } else {
+                        PathBuf::from(home).join(rest)
+                    }
+                })
+                .unwrap_or_else(|| ws.root.join(input))
+        } else if input == "$TMPDIR"
+            || input.starts_with("$TMPDIR/")
+            || input == "${TMPDIR}"
+            || input.starts_with("${TMPDIR}/")
+        {
+            path.clone()
         } else {
             ws.root.join(input)
         };
         let mut ancestor = Some(original.as_path());
+        let mut is_leaf = true;
         while let Some(p) = ancestor {
             if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(format!("search scopes must not follow symlinks: {input:?}"));
+                let safe_file_leaf = is_leaf && fs::metadata(&path).is_ok_and(|m| m.is_file());
+                if !safe_file_leaf {
+                    return Err(format!("search scopes must not follow symlinks: {input:?}"));
+                }
             }
+            is_leaf = false;
             // Ancestors above an authorized root are not search scopes. They may
             // include OS aliases such as /var -> /private/var on macOS.
             if p.canonicalize()
@@ -300,27 +324,37 @@ fn resolve_scopes(ws: &Workspace, args: &Value, glob: Option<&Glob>) -> Result<S
             ancestor = p.parent();
         }
         if ws.read_roots().any(|root| {
-            path.strip_prefix(root).is_ok_and(|relative| {
-                relative.components().any(|part| part.as_os_str() == ".git")
-                    || relative
-                        .components()
-                        .next()
-                        .is_some_and(|part| part.as_os_str() == crate::workspace_copy::SCRATCH_DIR)
-            })
+            path.strip_prefix(root)
+                .is_ok_and(|relative| relative.components().any(|part| part.as_os_str() == ".git"))
         }) {
             return Err(format!(
-                "search scopes must not enter .git or workspace scratch ({input:?}); search the workspace without that path, use `read` for a known file under it, or `bash` with `git` for repository metadata"
+                "search scopes must not enter .git ({input:?}); search the workspace without that path, use `read` for a known file under it, or `bash` with `git` for repository metadata"
             ));
         }
         match fs::metadata(&path) {
             Ok(_) => paths.push(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Rust module directory fallback: `foo/bar.rs` -> `foo/bar/` when `foo/bar/mod.rs` exists.
+                let mod_dir = input
+                    .strip_suffix(".rs")
+                    .and_then(|stem| ws.resolve_read(stem).ok())
+                    .filter(|dir| {
+                        fs::symlink_metadata(dir)
+                            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                            && dir.join("mod.rs").is_file()
+                    });
+                if let Some(dir) = mod_dir {
+                    paths.push(dir);
+                } else {
+                    let message =
+                        super::suggest::annotate(ws, io_message("searching", input, &e), &[input]);
+                    missing.push(message);
+                }
+            }
             Err(e) => {
                 let message =
                     super::suggest::annotate(ws, io_message("searching", input, &e), &[input]);
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(message);
-                }
-                missing.push(message);
+                return Err(message);
             }
         }
     }

@@ -3,7 +3,7 @@ use crate::config::tools::eval::EvalConfig;
 
 use super::background::AdoptedJob;
 use super::kernel::{
-    ActiveGuard, BackgroundPolicy, CellOutcome, CellScope, Deadline, Handoff, MAX_CODE,
+    ActiveGuard, BackgroundPolicy, CellAction, CellOutcome, CellScope, Deadline, Handoff,
     NativeProcess, PythonRuntime, busy_job, cell_label, check_operation, code_output, deadline,
     execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
     resolve_operator_executable, strip_runtime_injection,
@@ -24,6 +24,7 @@ use std::sync::{
 };
 
 const DRIVER: &str = include_str!("eval/driver.cjs");
+const MAX_CODE: usize = 64 * 1024;
 
 /// Reserved callback name for `tool.batch([...])`; never a valid provider tool name. The
 /// execution controller runs the entries together when all are read-only, else one at a time.
@@ -31,6 +32,8 @@ const DRIVER: &str = include_str!("eval/driver.cjs");
 pub const BATCH_CALLBACK: &str = "dial.batch";
 
 pub(super) mod cells;
+pub(super) mod checks;
+pub use checks::{check_source_digest, is_check_source_path};
 #[cfg(feature = "embedded-js")]
 mod embedded;
 #[cfg(feature = "embedded-js")]
@@ -120,13 +123,20 @@ fn embedded_fallback_available(node: &str) -> bool {
     embedded_js_available() && (node != "node" || !crate::setup::deps::bundled_node::available())
 }
 
+/// `None` selects QuickJS; an unusable release payload must never silently switch engines.
+fn js_launcher(workspace: &Path, node: &str) -> Result<Option<std::path::PathBuf>, String> {
+    match resolve_operator_executable(workspace, node, "eval.node") {
+        Ok(node) => Ok(Some(node)),
+        Err(_) if embedded_fallback_available(node) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Languages backed by a resolved operator launcher or the compiled JavaScript engine. Only
 /// paths/build facts are inspected; version and containment preflight runs at cell launch.
 pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
     let mut languages = Vec::new();
-    if resolve_operator_executable(workspace, &config.eval.node, "eval.node").is_ok()
-        || embedded_fallback_available(&config.eval.node)
-    {
+    if js_launcher(workspace, &config.eval.node).is_ok() {
         languages.push("js");
     }
     if super::kernel::python_launcher_resolves(workspace, &config.kernel) {
@@ -144,7 +154,7 @@ pub fn runtime_readiness(
     use crate::tools::surface::catalog::Readiness;
     if installed_languages(workspace, config).is_empty() {
         Readiness::MissingPrerequisite {
-            reason: "No eval interpreter resolves: JavaScript needs eval.node (Node 22+) or the embedded engine, which this build does not include; Python needs kernel.python (Python 3.8+). Loading eval does not install either interpreter. Status/reset/cancel remain available.".into(),
+            reason: "No eval interpreter resolves. JavaScript needs a usable Node 22+ launcher or the embedded engine; Python needs a bundled or configured Python 3.8+ launcher. Loading eval does not install an interpreter. Status/reset/cancel remain available.".into(),
         }
     } else {
         match super::kernel::cached_fork_containment() {
@@ -156,18 +166,20 @@ pub fn runtime_readiness(
 
 /// Bounded environment facts for the session prompt, using the same resolution as eval itself.
 pub fn runtime_guidance(workspace: &std::path::Path, config: &Config) -> String {
-    let installed = installed_languages(workspace, config);
-    let state = |language| {
-        if installed.contains(&language) {
-            "resolved"
-        } else {
-            "not found"
+    let js = match js_launcher(workspace, &config.eval.node) {
+        Ok(Some(_)) => "resolved: Node (use await import('node:…'), not require)",
+        Ok(None) => {
+            "resolved: embedded QuickJS (no Node modules except require('fs') and require('path') shims, no Buffer; use tool callbacks and Uint8Array)"
         }
+        Err(_) => "not found",
+    };
+    let python = if super::kernel::python_launcher_resolves(workspace, &config.kernel) {
+        "resolved"
+    } else {
+        "not found"
     };
     format!(
-        "- Eval launchers: JavaScript {} (configured Node 22+ when it resolves, otherwise the embedded engine), Python {} (path resolution only; versions and containment are checked on execution). Loading a tool installs no runtime. Before generating a helper, check its needed interpreter/compiler in the execution environment; a configured eval launcher need not be on the shell PATH.\n",
-        state("js"),
-        state("py")
+        "- Eval launchers: JavaScript {js}; Python {python}. Version and containment are checked at execution. Loading a tool installs no runtime. Check the shell environment before generating a helper: eval launchers need not be on PATH.\n"
     )
 }
 
@@ -193,7 +205,7 @@ impl EvalTool {
     }
 }
 
-/// Persistent Node.js namespace owned by one execution owner.
+/// Persistent JavaScript namespace owned by one execution owner.
 struct JsRuntime {
     config: EvalConfig,
     session: Arc<Mutex<Option<NativeProcess>>>,
@@ -230,7 +242,7 @@ impl JsRuntime {
     fn run(
         &self,
         ctx: &ToolContext,
-        action: &str,
+        action: CellAction<'_>,
         args: &Value,
         cancel: &AtomicBool,
         adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
@@ -245,7 +257,9 @@ impl JsRuntime {
         )?)));
         let end = &cell;
         let pending_cancel = self.interrupt.swap(false, Ordering::AcqRel);
-        if cancel.load(Ordering::Acquire) || (pending_cancel && action == "eval") {
+        if cancel.load(Ordering::Acquire)
+            || (pending_cancel && matches!(action, CellAction::Eval(_)))
+        {
             return Err("JavaScript execution cancelled before startup".into());
         }
         let policy = BackgroundPolicy::from_args(args, ctx.config.shell.auto_background_secs)?;
@@ -267,7 +281,7 @@ impl JsRuntime {
             || {
                 let mut slot = lock_session(&self.session, end, &self.interrupt, cancel)?;
                 if let Some(job) = busy_job(&self.busy) {
-                    if action == "status" {
+                    if matches!(action, CellAction::Status) {
                         return Ok(CellOutcome::Value(
                             json!({"running":true,"background":job,"language":"js",
                                 "platform":crate::tools::surface::catalog::execution_platform("eval")}),
@@ -275,23 +289,19 @@ impl JsRuntime {
                     }
                     return Err(format!("runtime busy in background job {job}"));
                 }
-                if action == "reset" {
-                    slot.take();
-                    return Ok(CellOutcome::Value(json!({"reset":true})));
-                }
-                if action == "status" {
-                    return Ok(CellOutcome::Value(
-                        json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),"language":"js",
+                let code = match action {
+                    CellAction::Reset => {
+                        slot.take();
+                        return Ok(CellOutcome::Value(json!({"reset":true})));
+                    }
+                    CellAction::Status => {
+                        return Ok(CellOutcome::Value(
+                            json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),"language":"js",
                             "platform":crate::tools::surface::catalog::execution_platform("eval")}),
-                    ));
-                }
-                let code = args
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .ok_or("eval requires code")?;
-                if code.len() > MAX_CODE {
-                    return Err(format!("code exceeds {MAX_CODE} bytes"));
-                }
+                        ));
+                    }
+                    CellAction::Eval(code) => code,
+                };
                 let scope = CellScope {
                     workspace: ctx.workspace,
                     prelude_mode: if ctx.config.eval.portable_helpers {
@@ -310,32 +320,27 @@ impl JsRuntime {
                     }
                     if slot.is_none() {
                         require_fork_containment("eval")?;
-                        let (node, kernel) = match resolve_operator_executable(
-                            ctx.workspace.root(),
-                            &self.config.node,
-                            "eval.node",
-                        ) {
-                            Ok(node) => (Some(node), "Node kernel (install/configure eval.node)"),
-                            Err(node_error) => {
-                                if !embedded_fallback_available(&self.config.node) {
-                                    return Err(node_error);
-                                }
-                                (None, "embedded JavaScript engine")
-                            }
+                        let node = js_launcher(ctx.workspace.root(), &self.config.node)?;
+                        let kernel = if node.is_some() {
+                            "Node kernel (install/configure eval.node)"
+                        } else {
+                            "embedded JavaScript engine"
                         };
                         check_operation(end, &self.interrupt, cancel)?;
                         let mut command = js_kernel_command(ctx.workspace, node.as_deref())?;
                         // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
                         strip_runtime_injection(&mut command);
                         check_operation(end, &self.interrupt, cancel)?;
-                        *slot = Some(
-                            NativeProcess::start(command, self.pid.clone())
-                                .map_err(|error| format!("starting {kernel}: {error}"))?,
-                        );
+                        let mut process = NativeProcess::start(command, self.pid.clone())
+                            .map_err(|error| format!("starting {kernel}: {error}"))?;
+                        process.backend = Some(if node.is_some() {
+                            super::preludes::EvalBackend::Node
+                        } else {
+                            super::preludes::EvalBackend::QuickJs
+                        });
+                        *slot = Some(process);
                     }
                     check_operation(end, &self.interrupt, cancel)?;
-                    slot.as_mut().unwrap().prelude_language =
-                        Some(crate::tools::exec::preludes::PreludeLanguage::Js);
                     // Re-running an edited cell must not fail on its own earlier declarations.
                     let code = cells::redeclarable(code);
                     native_cell(
@@ -368,12 +373,12 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS has no Node modules; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson/writeBytes (create only), run, batch (raises unless collect:true), check (local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call; relative paths resolve in the project directory. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: in one cell read input files (don't copy their data into code), compute, write, assert; prove tricky logic on a tiny known-answer case; never print then transcribe. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
+                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS has no Node modules except require('fs') and require('path') shims; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson (overwrite only with expectedSha256, Python expected_sha256=, from a whole-file read receipt; never read implicitly), writeBytes (create only), run, batch (raises unless collect:true), check(name, bool, optional dial.read receipt; local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call; relative paths resolve in the project directory. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: in one cell read inputs, compute, write, reopen and check saved bytes; prove tricky logic on a tiny known-answer case; never print then transcribe. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
             ),
             json!({
-                "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js. Windows Python requires explicit unsandboxed opt-in."},
-                "action":{"type":"string","enum":["eval","reset","cancel","status"],"description":"reset/status/cancel are owner-scoped; cancel without language affects both runtimes."},
-                "code":{"type":"string","description":"Cell source, at most 64 KiB UTF-8."},
+                "language":{"type":"string","enum":["js","py"],"description":"Defaults to js. Windows Python requires explicit unsandboxed opt-in."},
+                "action":{"type":"string","enum":["eval","reset","cancel","status"],"description":"Default eval; reset/status/cancel need no code. Cancel without language affects both."},
+                "code":{"type":"string","description":"Required nonblank source for eval, max 64 KiB."},
                 "timeout":{"type":"integer","minimum":0,"maximum":3600,"description":"Seconds; timeout or cancel discards the namespace. Callback time is excluded."},
                 "background":{"type":"boolean","description":"Omit to follow shell.auto_background_secs (default 0: the cell stays in the foreground); false keeps it in the foreground; true moves it immediately."},
                 "title":{"type":"string","description":"Label for a backgrounded cell in the background job list."}
@@ -493,7 +498,9 @@ impl Tool for EvalTool {
                 output.data = Some(json!({"background_job": job}));
                 output
             }
-            Err(error) => {
+            Err(EvalError::Invalid(error)) => ToolOutput::err(error)
+                .with_effects(crate::runtime::execution::Effects::None),
+            Err(EvalError::Runtime(error)) => {
                 let output = code_output(Err(error));
                 if uncertain {
                     output.with_effects(crate::tools::surface::outcome::Effects::Unknown)
@@ -530,6 +537,15 @@ impl Tool for EvalTool {
 fn no_background(_job: AdoptedJob) -> Result<String, String> {
     Err("eval cells cannot move to the background without an execution controller".into())
 }
+
+#[derive(Debug, thiserror::Error)]
+enum EvalError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Runtime(String),
+}
+
 impl EvalTool {
     fn run(
         &self,
@@ -539,49 +555,74 @@ impl EvalTool {
         adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
         effect_started: &AtomicBool,
-    ) -> Result<CellOutcome, String> {
+    ) -> Result<CellOutcome, EvalError> {
+        let invalid = |message: &str| EvalError::Invalid(message.to_owned());
         let action = match args.get("action") {
             None | Some(Value::Null) => "eval",
-            Some(value) => value.as_str().ok_or("action must be a string")?,
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| invalid("action must be a string"))?,
         };
-        if !matches!(action, "eval" | "reset" | "status" | "cancel") {
-            return Err(format!("unsupported eval action {action:?}"));
-        }
+
         let language = match args.get("language") {
             None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_str().ok_or("language must be a string")?),
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| invalid("language must be a string"))?,
+            ),
         };
+        if let Some(other) = language
+            && !matches!(other, "js" | "py")
+        {
+            return Err(EvalError::Invalid(format!(
+                "unsupported eval language {other:?}; use js or py"
+            )));
+        }
         if action == "cancel" {
             // Without a language, cancel reaches both namespaces.
-            let (js, python) = match language {
-                None => (true, true),
-                Some("js") => (true, false),
-                Some("py") => (false, true),
-                Some(other) => {
-                    return Err(format!("unsupported eval language {other:?}; use js or py"));
-                }
-            };
             let mut cancelled = false;
-            if js {
+            if language != Some("py") {
                 cancelled |= self.js.cancel();
             }
-            if python {
+            if language != Some("js") {
                 cancelled |= self.python.cancel();
             }
             return Ok(CellOutcome::Value(
                 json!({"cancelled":cancelled,"namespace_discarded":cancelled}),
             ));
         }
-        match language.unwrap_or("js") {
-            "js" => self
-                .js
-                .run(ctx, action, args, cancel, adopt, dispatch, effect_started),
-            "py" => self
-                .python
+        let language = language.unwrap_or("js");
+        let action = match action {
+            "status" => CellAction::Status,
+            "reset" => CellAction::Reset,
+            "eval" => {
+                let code = args.get("code").and_then(Value::as_str);
+                if code.is_some_and(|s| s.len() > MAX_CODE) {
+                    return Err(EvalError::Invalid(format!(
+                        "code exceeds {MAX_CODE} bytes; split the cell"
+                    )));
+                }
+                let code = code.filter(|s| !s.trim().is_empty()).ok_or_else(|| EvalError::Invalid(format!(
+                    r#"No cell ran. Send a nonblank string in the top-level code field, e.g. {{"language":"{language}","code":"1 + 1"}}. Only status, reset and cancel omit code."#
+                )))?;
+                CellAction::Eval(code)
+            }
+            other => {
+                return Err(EvalError::Invalid(format!(
+                    "unsupported eval action {other:?}; use eval, status, reset or cancel"
+                )));
+            }
+        };
+        if language == "py" {
+            self.python
                 .run(ctx, action, args, cancel, adopt, dispatch, effect_started)
-                .map_err(|error| python_unavailable_hint(error, ctx)),
-            other => Err(format!("unsupported eval language {other:?}; use js or py")),
+                .map_err(|error| python_unavailable_hint(error, ctx))
+        } else {
+            self.js
+                .run(ctx, action, args, cancel, adopt, dispatch, effect_started)
         }
+        .map_err(EvalError::Runtime)
     }
 }
 
@@ -591,7 +632,7 @@ fn python_unavailable_hint(error: String, ctx: &ToolContext) -> String {
     let launcher_failed = error.contains("kernel.python");
     if launcher_failed && installed_languages(ctx.workspace.root(), ctx.config).contains(&"js") {
         format!(
-            "{error}\nJavaScript eval is available in this session: rerun the cell with language \"js\" (or omit language) instead of installing Python."
+            "{error}\nJavaScript eval is available for language-independent work. It cannot verify Python-specific behavior."
         )
     } else {
         error

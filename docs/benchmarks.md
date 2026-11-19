@@ -814,6 +814,17 @@ completed cases per second. Unavailable measurements stay null. Recommendations 
 correctness floor and per-case regression limits; reports never apply settings, activate adapters or
 start training. Scripted-provider smoke results verify this plumbing, not real-model quality.
 
+`[machine] case_inactivity_secs` is an opt-in silence bound, separate from `case_timeout_secs`.
+It defaults to `0` (off). When set (1–600, and no longer than a positive `case_timeout_secs`), a case
+fails once that many seconds pass without meaningful progress: a request dispatch (so the first
+response is bounded too), new assistant or reasoning text, tool activity, a usage report, or a
+`model_progress` report whose counts changed. Identical repeated progress reports do not reset it,
+and neither do notices. Its failure reads `benchmark RPC inactive: no meaningful progress for N s`
+and keeps the metrics and in-flight counts observed so far. Use it for local servers, which the
+remote silence watchdog does not limit. A tool that runs silently longer than the bound counts as
+silence, so set the bound above your longest silent step or leave it off. The report records the
+bound only when it is set. Tests use scripted children; no live model result is implied.
+
 Each `[[configurations]]` entry may override assistance features for that run only. Unset keys keep the
 user's config value; set keys are written into the child's isolated config and recorded under `settings.assistance`.
 
@@ -1038,6 +1049,7 @@ Diagnostics recorded per run:
   measures provider-neutral serialization/hash preparation, excluding journal publication and model
   inference; it overlaps request preparation and must not be added to turn wall time. Full historical
   messages are remeasured after hooks, so this does not assume unchanged content or provider cache hits.
+- A case that times out or stalls keeps what the harness observed. Once a send was issued without a runtime ledger read, token usage is `token_usage_incomplete`, not zero. A request still in flight reports its last `model_progress` counts as `inflight_progress`; these are a live observation, never added to usage totals. The failure detail names the last child event and how long ago it arrived. The wall deadline (`case_timeout_secs`) is unchanged; see the inactivity bound below.
 - A non-zero exit records the exit code, the stderr log path (`stderr_log`) and a bounded excerpt
   (`stderr_tail`, last 800 characters) after best-effort redaction of token-like values. Excerpts are
   not a guarantee against leaking secrets: the raw logs are unredacted private artifacts. The progress
@@ -1257,6 +1269,45 @@ available); offline fixture checks do not establish better local-model task succ
 
 The scripted `offline_compare.py` harness is a transport and wrapper regression tool. Its tool
 scripts are not a model benchmark and its results must not be reported as model quality.
+
+### Experimental settings ledger
+
+Every `experimental.*` setting stays behind its flag until a headline comparison shows it helps
+(see [design philosophy](design-philosophy.md)). This ledger records each one's shipped default
+and its measurement status, so flags cannot pile up unreviewed. A test
+(`config::schema::tests::experimental_ledger_lists_every_experimental_setting`) fails when a
+setting is added or removed without updating this table.
+
+No headline baseline is recorded yet, so every status is **unmeasured**. To give a verdict, run
+`make bench-headline` twice on the same model, profile and build, changing only that one setting,
+and compare with `BASELINE=`. Correctness regressions decide before tokens or time. Then:
+**promote** (make it the default and move it out of `experimental`), **keep** (with the
+measured reason), or **remove**. Record the run files next to the verdict.
+
+| Setting | Default | Status |
+| --- | --- | --- |
+| `experimental.adaptive_output_effort` | `false` | unmeasured |
+| `experimental.background_check_slots` | `1` | unmeasured; needs `background_checks` |
+| `experimental.background_checks` | `false` | unmeasured |
+| `experimental.batch_approvals` | `false` | unmeasured; interactive-only, not exercised by unattended runs |
+| `experimental.changed_line_coverage` | `false` | unmeasured |
+| `experimental.check_predictions` | `false` | unmeasured |
+| `experimental.context_overlap_dedup` | `false` | unmeasured |
+| `experimental.dependency_dispatch` | `true` | unmeasured against `false`; shipped on |
+| `experimental.edit_bisection_runs` | `0` | unmeasured |
+| `experimental.fault_witness` | `false` | unmeasured |
+| `experimental.mutation_runs` | `0` | unmeasured |
+| `experimental.outcome_gradient_rounds` | `0` | unmeasured |
+| `experimental.profile_matching` | `false` | unmeasured; needs configured profiles |
+| `experimental.reasoning_strategy` | `default` | unmeasured, one comparison per preset |
+| `experimental.repro_first` | `advise` | unmeasured against `off`; shipped as advice |
+| `experimental.streaming_dispatch` | `true` | unmeasured against `false`; shipped on |
+| `experimental.tool_speculation` | `false` | unmeasured |
+| `experimental.turn_drafter_diagrams` | `false` | unmeasured; needs `turn_optimizer` |
+| `experimental.turn_optimizer` | `false` | unmeasured; interactive drafts need acceptance |
+| `experimental.verification_receipts` | `false` | unmeasured |
+| `experimental.video_analysis` | `false` | unmeasured; adds a tool, so the tool pause applies |
+| `experimental.work_packet_contracts` | `false` | unmeasured |
 
 ## Recorded runs
 

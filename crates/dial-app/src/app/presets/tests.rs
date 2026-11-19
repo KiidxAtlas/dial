@@ -127,7 +127,7 @@ fn assigning_a_model_sets_or_clears_the_roles_thinking_level() {
         "auto is main-only"
     );
     assert!(
-        crate::config::thinking::catalog_levels("anthropic", "claude-haiku-5-5", true)
+        crate::llm::catalog::documented_thinking_levels("anthropic", "claude-haiku-5-5", true)
             .contains(&"low")
     );
 }

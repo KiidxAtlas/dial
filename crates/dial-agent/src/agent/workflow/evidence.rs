@@ -497,6 +497,25 @@ fn pruned_form(message: &Value, calls: &HashMap<String, Value>) -> Option<Value>
     Some(pruned)
 }
 
+/// The history a summarizer reads before it folds older turns. Every eligible old observation takes the
+/// same pointer that pressure pruning would write, because the fold replaces that turn with a summary and
+/// the full output stays retrievable from its artifact. The rule is stateless: the same history always
+/// yields the same summarizer input, and results below `PRUNE_MIN_TOKENS` or without an artifact are kept.
+pub(in crate::agent) fn summarizer_view(messages: &[Value]) -> Vec<Value> {
+    let calls = observation_calls(messages);
+    messages
+        .iter()
+        .map(|message| {
+            if estimate(message) < PRUNE_MIN_TOKENS {
+                return message.clone();
+            }
+            pruned_form(message, &calls)
+                .filter(|pruned| estimate(pruned) < estimate(message))
+                .unwrap_or_else(|| message.clone())
+        })
+        .collect()
+}
+
 pub fn working_schema() -> Value {
     super::working_state::schema()
 }

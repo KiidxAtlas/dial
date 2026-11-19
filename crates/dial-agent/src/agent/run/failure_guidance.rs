@@ -196,11 +196,10 @@ pub(in crate::agent) fn report(
     // An ordinary nonzero shell exit (missing program, failed build step) whose process ran to
     // completion is routine: the exit code and output above already say what happened. The full
     // recovery block cost about 900 bytes of history on every such failure in benchmark runs, so
-    // the first one gets a compact line; repeats, uncertain effects, commits, partial capture and
-    // other kinds keep the full report.
+    // each one gets a compact line, with the streak count on repeats. Uncertain effects, commits,
+    // partial capture and other kinds keep the full report.
     let routine_exit = kind == "tool_failure"
         && call.name == "bash"
-        && consecutive == 1
         && output.execution.effects != Effects::Unknown
         && recovery.committed_paths == 0
         && recovery.retry == Retry::AfterCorrection
@@ -208,9 +207,16 @@ pub(in crate::agent) fn report(
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
     if routine_exit {
+        let streak = if consecutive > 1 {
+            format!("Failed {consecutive} times in a row. ")
+        } else {
+            String::new()
+        };
         return recovery_notice(
             kind,
-            "Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state.",
+            &format!(
+                "{streak}Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state."
+            ),
         );
     }
     // Any other first failure with known effects, no committed work, complete capture and a plain

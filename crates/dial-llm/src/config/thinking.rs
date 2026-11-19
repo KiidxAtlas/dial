@@ -313,11 +313,5 @@ pub fn main_level(config: &Config) -> Option<String> {
 /// Thinking levels the catalog documents for `provider/model`, weakest first, as level names.
 /// `role` drops levels a helper role cannot hold (`auto` is main-only and is never listed here).
 pub fn catalog_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
-    crate::llm::catalog::bundled_model(provider, model)
-        .map(|bundled| bundled.thinking_efforts)
-        .unwrap_or_default()
-        .into_iter()
-        .map(level_name)
-        .filter(|level| !role || parse_thinking(level).is_ok())
-        .collect()
+    crate::llm::catalog::documented_thinking_levels(provider, model, role)
 }

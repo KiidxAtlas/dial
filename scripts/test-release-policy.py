@@ -636,6 +636,7 @@ class ContainerStagingTests(unittest.TestCase):
         release = (root / "Dockerfile.release").read_text().split("FROM debian:", 1)[1]
         # The release archive's binary embeds the Node.js runtime, so its image also carries that license.
         expected = source.replace("COPY --from=build /out/dial", "COPY dial").replace(
+            "COPY --from=python-payload /payload/LICENSE.python", "COPY LICENSE.python").replace(
             "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "").replace(
             "USER dial\n", "COPY LICENSE.node /usr/share/doc/dial/LICENSE.node\nUSER dial\n", 1)
         self.assertEqual(release, expected)

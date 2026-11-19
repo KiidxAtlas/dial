@@ -179,7 +179,7 @@ connection) are part of the protocol contract; `dial-client` reports them rather
   Check failures not introduced by the turn (unavailable environment, denied approval, timeout,
   unchanged baseline failure, or a failure the request only asked to diagnose) are accepted with
   disclosed gaps (`verify/checks.rs::disclosed_failure`). Optional follow-ups remain separate.
-- Default tool exposure selects a stable core under a serialized byte budget (24 KiB on hosted
+- Default tool exposure selects a stable core under a serialized byte budget (25 KiB on hosted
   routes, which adds `bg`, `task`, `message` and `ask`; 12 KiB on lean/local routes); only explicit tool
   loading (`tool_load`, or `tool_search` with `load: true`) adds specialist schemas.
   `Agent::wire_tool_surface` is the only producer of per-request tool-offer marks and runs after

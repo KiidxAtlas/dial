@@ -102,7 +102,46 @@ pub(in crate::agent) fn canonical_name<'a>(name: &'a str, catalog: &[String]) ->
 pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) {
     // Recorded or habitual pre-rename parameter names map onto the current ones.
     crate::tools::surface::contracts::legacy_arguments(name, schema, args);
-    normalize_container(schema, args);
+    // For `edit`, allow normalizing aliases for any supported edit grammar (Replace, Patch,
+    // ApplyPatch, Sloppy, Hashline) even when Hashline is the default offered schema.
+    let edit_alt_schema;
+    let effective_schema = if name == "edit" {
+        let detected =
+            args.as_object()
+                .map_or(crate::config::types::EditMode::default(), |object| {
+                    if object.contains_key("edits") {
+                        crate::config::types::EditMode::Patch
+                    } else if object.contains_key("old_string")
+                        || object.contains_key("oldString")
+                        || object.contains_key("old")
+                        || object.contains_key("new_string")
+                        || object.contains_key("newString")
+                        || object.contains_key("new")
+                        || ((object.contains_key("path")
+                            || object.contains_key("file_path")
+                            || object.contains_key("filePath")
+                            || object.contains_key("filepath")
+                            || object.contains_key("filename"))
+                            && !object.contains_key("input")
+                            && !object.contains_key("patch")
+                            && !object.contains_key("diff"))
+                    {
+                        crate::config::types::EditMode::Replace
+                    } else {
+                        crate::tools::edit::editing::effective_mode(
+                            crate::config::types::EditMode::default(),
+                            args,
+                        )
+                    }
+                });
+        edit_alt_schema = crate::tools::edit::editing::schema(detected);
+        edit_alt_schema
+            .pointer("/function/parameters")
+            .unwrap_or(schema)
+    } else {
+        schema
+    };
+    normalize_container(effective_schema, args);
     let aliases: &[(&str, &str)] = match name {
         "read" => &[
             ("file_path", "path"),
@@ -122,14 +161,41 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
         "edit" => &[
             ("file_path", "path"),
             ("filePath", "path"),
+            ("filepath", "path"),
+            ("filename", "path"),
             ("oldString", "old_string"),
             ("newString", "new_string"),
+            ("old", "old_string"),
+            ("new", "new_string"),
             ("replaceAll", "replace_all"),
             ("old_string", "old"),
             ("new_string", "new"),
             ("patch", "input"),
+            ("diff", "input"),
         ],
         "bash" => &[
+            ("cmd", "command"),
+            ("timeout_secs", "timeout"),
+            ("workdir", "cwd"),
+            ("working_dir", "cwd"),
+        ],
+        "eval" => &[
+            ("script", "code"),
+            ("source", "code"),
+            ("src", "code"),
+            ("program", "code"),
+            ("expression", "code"),
+            ("expr", "code"),
+            ("lang", "language"),
+            ("timeout_secs", "timeout"),
+        ],
+        "verify" => &[
+            ("target", "targets"),
+            ("test", "targets"),
+            ("tests", "targets"),
+            ("files", "targets"),
+        ],
+        "bg" => &[
             ("cmd", "command"),
             ("timeout_secs", "timeout"),
             ("workdir", "cwd"),
@@ -146,9 +212,10 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
         "web_search" => &[("search_query", "query")],
         _ => &[],
     };
-    if let (Some(object), Some(properties)) =
-        (args.as_object_mut(), schema["properties"].as_object())
-    {
+    if let (Some(object), Some(properties)) = (
+        args.as_object_mut(),
+        effective_schema["properties"].as_object(),
+    ) {
         for &(alias, key) in aliases {
             if !properties.contains_key(alias)
                 && properties.contains_key(key)
@@ -160,7 +227,46 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
             }
         }
     }
-    normalize_scalars(schema, args);
+    // Language-keyed cells are unambiguous only without another code or language field.
+    if name == "eval"
+        && let Some(object) = args.as_object_mut()
+        && !object.contains_key("code")
+        && !object.contains_key("language")
+        && let Some((alias, language)) = [("python", "py"), ("js", "js")]
+            .into_iter()
+            .find(|(key, _)| object.get(*key).is_some_and(Value::is_string))
+        && !(object.contains_key("python") && object.contains_key("js"))
+        && effective_schema["properties"]["language"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == language))
+        && effective_schema["properties"]["code"]["type"] == "string"
+        && let Some(code) = object.remove(alias)
+    {
+        object.insert("code".into(), code);
+        object.insert("language".into(), Value::from(language));
+    }
+    if name == "eval"
+        && let Some(language) = args.get_mut("language")
+        && let Some(raw) = language.as_str()
+    {
+        let normalized = match raw.trim().to_ascii_lowercase().as_str() {
+            "python" | "python3" | "py3" => Some("py"),
+            "javascript" | "node" | "nodejs" | "ecmascript" => Some("js"),
+            _ => None,
+        };
+        if let Some(canonical) = normalized {
+            *language = Value::from(canonical);
+        }
+    }
+    // Wrap singleton string target for `verify`.
+    if name == "verify"
+        && let Some(targets) = args.get_mut("targets")
+        && targets.is_string()
+    {
+        let single = targets.take();
+        *targets = Value::Array(vec![single]);
+    }
+    normalize_scalars(effective_schema, args);
     // This synonym means pixels, never a DOM snapshot. Don't override a declared action.
     if name == "browser"
         && let Some(action) = args.get_mut("action")
@@ -183,6 +289,59 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
     {
         let literal = keyword.take();
         *keyword = Value::Array(vec![literal]);
+    }
+    // `bg` uses `name` for job control and `job` for `watch`. Map unambiguous swaps without
+    // overriding conflicts or changing the schema contract.
+    if name == "bg"
+        && let Some(object) = args.as_object_mut()
+    {
+        match object.get("action").and_then(Value::as_str) {
+            Some("start" | "output" | "wait" | "input" | "close_stdin" | "resize" | "kill")
+                if !object.contains_key("name") && object.contains_key("job") =>
+            {
+                if let Some(val) = object.remove("job") {
+                    object.insert("name".into(), val);
+                }
+            }
+            Some("watch")
+                if !object.contains_key("job")
+                    && !object.contains_key("path")
+                    && !object.contains_key("run")
+                    && !object.contains_key("pid")
+                    && !object.contains_key("after_secs")
+                    && object.contains_key("name") =>
+            {
+                if let Some(val) = object.remove("name") {
+                    object.insert("job".into(), val);
+                }
+            }
+            _ => {}
+        }
+    }
+    // `history` / `code_history`: infer unambiguous `action` when omitted.
+    if matches!(name, "history" | "code_history")
+        && let Some(object) = args.as_object_mut()
+        && !object.contains_key("action")
+    {
+        let source = object.get("source").and_then(Value::as_str);
+        let inferred = if object.contains_key("query") {
+            Some("search")
+        } else if object.contains_key("id") {
+            Some(if source == Some("sessions") {
+                "session"
+            } else {
+                "show"
+            })
+        } else if source == Some("changes") || name == "code_history" {
+            Some("search")
+        } else if source == Some("sessions") {
+            Some("sessions")
+        } else {
+            None
+        };
+        if let Some(action) = inferred {
+            object.insert("action".into(), Value::from(action));
+        }
     }
 }
 

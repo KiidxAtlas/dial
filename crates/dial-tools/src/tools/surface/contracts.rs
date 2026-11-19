@@ -32,6 +32,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "check_paths",
             "trace",
             "expected_exit_codes",
+            "idle_timeout",
         ],
     ),
     ("bg", &["persist", "lifetime", "call"]),
