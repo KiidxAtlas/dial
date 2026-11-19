@@ -138,7 +138,6 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ github.ref_name }}
-      ref: ${{ github.sha }}
       epoch: ${{ needs.gate.outputs.epoch }}
 
   windows-sign:

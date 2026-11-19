@@ -7,8 +7,8 @@
 #
 # Only pull requests from this repository that were merged into main with a merge commit qualify:
 # the head must be an ancestor of <commit>, so the commit reported by `dial --version` is in main's
-# history. The run's candidate identity must record <commit>'s tree and the release tag; CI records
-# candidates for a pull request only when its tested merge tree equals the head tree that was built.
+# history. The run's candidate identity must record <commit>'s tree and the release tag. PR
+# candidates build the tested merge tree only if it also matches the head tree.
 # Public-key checks remain with the release workflow, which also falls back to building everything.
 set -euo pipefail
 

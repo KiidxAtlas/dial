@@ -54,6 +54,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 ### Fixed
 
 - Strict tool generation leaves the `edit` tool's preferred grammar as guidance, so the model can still send any supported edit grammar. Other eligible tools remain strict.
+- Unsigned release candidates check out the exact commit of their GitHub Actions event rather than accepting a checkout ref from the caller.
 - Updated resvg and Cargo dependencies, refreshed the hashed FastAPI CI dependency, and synchronized Homebrew and AUR metadata with the published 0.3.10 archives.
 - Model-registered acceptance checks no longer rerun after every edit batch by default. While jobs or tests run, Dial directs the model to do independent work first. Explicit checks and completion checks are unchanged. See [the agent loop](docs/agent-loop.md).
 - Desktop scripts and Eval can take a screenshot on an entry from `windows()` without a second lookup in user code. Existing window metadata remains available. See [computer run source and recovery](docs/execution-and-web.md#computer-run-source-and-recovery).

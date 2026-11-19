@@ -458,15 +458,17 @@ class CandidatePromotionTests(unittest.TestCase):
         validate = ci.split("\n  validate:\n", 1)[1].split("\n  release-candidates:\n", 1)[0]
         self.assertIn("fetch-depth: 0", validate)
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", validate)
-        # Pull requests record candidates only when the tested merge tree is the built head tree.
+        # Pull requests record candidates only when the tested merge tree equals the PR head tree.
         self.assertIn('"$(git rev-parse \'HEAD^{tree}\')" != "$(git rev-parse "$HEAD_SHA^{tree}")"', validate)
-        self.assertIn("ref: ${{ needs.validate.outputs.candidate-ref }}", ci)
+        candidate_call = ci.split("\n  release-candidates:\n", 1)[1].split("\n  test:\n", 1)[0]
+        self.assertNotIn("ref:", candidate_call)
         self.assertIn('git merge-base --is-ancestor "$head" "$commit"', helper)
         self.assertIn("--event pull_request", helper)
         self.assertIn('candidate-tree "$tree"', helper)
         self.assertIn("if: steps.pr.outputs.run == ''", release)
         self.assertIn("CI_RUN: ${{ steps.pr.outputs.run || steps.ci.outputs.run }}", release)
-        self.assertIn("ref: ${{ github.sha }}", release.split("\n  build:\n", 1)[1])
+        fallback_call = release.split("\n  build:\n", 1)[1].split("\n  windows-sign:\n", 1)[0]
+        self.assertNotIn("ref:", fallback_call)
 
     def test_main_only_candidates_keep_private_keys_out_and_allow_safe_fallback(self):
         root = SCRIPT.parent.parent
@@ -475,6 +477,11 @@ class CandidatePromotionTests(unittest.TestCase):
         release = (root / ".github/workflows/release.yml").read_text()
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", ci)
         self.assertIn("uses: ./.github/workflows/release-build.yml", ci)
+        self.assertNotIn("inputs.ref", candidates)
+        self.assertNotIn("candidate-ref", ci)
+        self.assertEqual(candidates.count("ref: ${{ github.sha }}"), 3)
+        self.assertEqual(candidates.count("persist-credentials: false"), 3)
+        self.assertEqual(candidates.count("DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}"), 2)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", candidates)
         self.assertNotIn("secrets.", candidates)
         self.assertNotIn("environment: release-signing", candidates)

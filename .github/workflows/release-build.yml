@@ -7,10 +7,6 @@ on:
         description: Validated stable release tag matching the checkout
         required: true
         type: string
-      ref:
-        description: Commit to build; candidates record its tree, which a release must match
-        required: true
-        type: string
       epoch:
         description: Source commit timestamp
         required: true
@@ -26,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -93,7 +89,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
@@ -130,6 +127,7 @@ jobs:
           python3 scripts/prepare-python.py --target "$RELEASE_TARGET" --output "$payload"
       - name: Build release binary
         env:
+          DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           MACOSX_DEPLOYMENT_TARGET: '13.0'
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
@@ -208,7 +206,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -236,6 +235,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Python payload preparation failed' }
       - name: Build release binary
         env:
+          DIAL_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
           DIAL_BUNDLED_PYTHON_DIR: ${{ github.workspace }}/target/python-payload/${{ matrix.target }}
