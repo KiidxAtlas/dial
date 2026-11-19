@@ -22,15 +22,53 @@ fn agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
 }
 
 #[test]
-fn acceptance_helpers_rerun_once_after_mutation_and_keep_their_origin() {
+fn default_defers_registered_helper_until_verification() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();
     let mut agent = agent(&config, root.path());
+    let marker = root.path().join("ready");
+    std::fs::write(&marker, "ready").unwrap();
     let output = agent.verify_tool(
-        &json!({"acceptance":{"name":"file exists","command":"test -f ready"}}),
+        &json!({"acceptance":{"name":"ready","command":"test -f ready"}}),
+        &mut NullUi,
+    );
+    assert!(!output.is_error, "{}", output.text);
+    std::fs::remove_file(marker).unwrap();
+    for _ in 0..2 {
+        agent.step_checks.mutations += 1;
+        assert!(agent.auto_registered_checks(&mut NullUi).is_none());
+    }
+    assert!(
+        agent
+            .current_focused_checks()
+            .iter()
+            .any(|c| c.name == "acceptance: ready")
+    );
+    let output = agent.verify_tool(&json!({}), &mut NullUi);
+    assert!(
+        output.is_error && output.text.contains("acceptance: ready"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn acceptance_helpers_rerun_once_after_mutation_and_keep_their_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.auto_registered_checks = true;
+    let mut agent = agent(&config, root.path());
+    std::fs::write(root.path().join("ready"), "wrong").unwrap();
+    let output = agent.verify_tool(
+        &json!({"acceptance":{"name":"file value","command":"value=$(cat ready) && { test \"$value\" = ready || { echo \"input: ready expected: ready actual: $value\"; exit 1; }; }"}}),
         &mut NullUi,
     );
     assert!(output.is_error, "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains("input: ready expected: ready actual: wrong")
+    );
     assert_eq!(output.data.as_ref().unwrap()["origin"], "model_registered");
     std::fs::write(root.path().join("ready"), "ready").unwrap();
     agent.step_checks.mutations += 1;
@@ -53,6 +91,14 @@ fn acceptance_helpers_rerun_once_after_mutation_and_keep_their_origin() {
     assert!(
         agent.config.verification.commands.is_empty(),
         "model helpers cannot become configured task checks"
+    );
+    std::fs::write(root.path().join("ready"), "stale").unwrap();
+    agent.step_checks.mutations += 1;
+    let stale = agent.auto_registered_checks(&mut NullUi).unwrap();
+    assert!(
+        stale.is_error && stale.text.contains("actual: stale"),
+        "{}",
+        stale.text
     );
 }
 
@@ -82,7 +128,8 @@ fn acceptance_registration_cannot_bypass_readonly_approval_or_replace_configured
 #[test]
 fn repeated_acceptance_failures_keep_fresh_results_without_repeating_diagnostics() {
     let root = tempfile::tempdir().unwrap();
-    let config = Config::default();
+    let mut config = Config::default();
+    config.verification.auto_registered_checks = true;
     let mut agent = agent(&config, root.path());
     std::fs::write(root.path().join("diagnostic"), "first failure").unwrap();
     std::fs::write(root.path().join("runs"), "").unwrap();
@@ -129,7 +176,8 @@ fn repeated_acceptance_failures_keep_fresh_results_without_repeating_diagnostics
 #[test]
 fn acceptance_failure_after_a_pass_is_reported_in_full_again() {
     let root = tempfile::tempdir().unwrap();
-    let config = Config::default();
+    let mut config = Config::default();
+    config.verification.auto_registered_checks = true;
     let mut agent = agent(&config, root.path());
     let first = agent.verify_tool(
         &json!({"acceptance":{"name":"ready","command":"test -f ready || { echo not-ready; exit 1; }"}}),

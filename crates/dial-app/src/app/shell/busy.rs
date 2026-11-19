@@ -38,6 +38,9 @@ impl Shell {
         }
         let (name, args) = crate::app::command_registry::hubs::expand(name, args);
         let name = canonical_command(name);
+        if self.reject_syntax(name, args) {
+            return false;
+        }
         let context = crate::ui::command_surface::AvailabilityContext {
             busy: true,
             ..self.command_context()
@@ -73,7 +76,7 @@ impl Shell {
             return false;
         }
         if name == "queue" && !args.is_empty() {
-            self.queue_command(&text);
+            self.queue_command(args);
             return false;
         }
         if name == "attachments" {
@@ -87,6 +90,10 @@ impl Shell {
         // Opening a search hit and returning from an excursion both switch the agent's
         // session. Keep the running owner intact and use the idle command path afterwards;
         // these reserved forms must never become searches for the literal words "open/back".
+        if name == "search" && args == "open" {
+            self.note("Search", "Usage: /search open <session-id>");
+            return false;
+        }
         if name == "search" && (args == "back" || args.starts_with("open ")) {
             self.note(
                 "Search",
@@ -95,13 +102,13 @@ impl Shell {
             self.deferred.push_back(text);
             return false;
         }
-        if name == "search" && args == "results" {
-            if let Some(panel) = self.take_search_panel(&app.layout) {
+        if name == "search" && (args.is_empty() || args == "results") {
+            if let Some(panel) = self.search_panel(&app.layout) {
                 if let Err(error) = self.start_busy_overlay(app, Which::HistorySearch(panel)) {
                     self.note("Search", format!("{error:#}"));
                 }
             } else {
-                self.note("Search", "No ready matches. Run /search <query> first.");
+                self.note_search_unavailable();
             }
             return false;
         }
@@ -217,16 +224,12 @@ impl Shell {
                 );
             }
             ("help" | "?", args) if args != "commands" => {
-                let text = super::help::command_help(args.trim())
-                    .or_else(|| super::help::topic_help(args.trim()))
-                    .unwrap_or_else(|| self.help_text(args.trim() == "all"));
-                self.note("Help", text);
+                self.note("Help", self.help_response(args));
             }
             ("hotkeys", "") => {
                 let text = self.hotkeys_text();
                 self.note("Hotkeys", text);
             }
-            ("search", "") => self.note("Search", Self::SEARCH_USAGE),
             ("btw", args) => {
                 if args.is_empty() {
                     let spec = self.side_thread_picker();
@@ -277,57 +280,30 @@ impl Shell {
             }
             ("jobs" | "workers", id) => {
                 let result = match &self.live_tasks {
-                    Some(control) => control.status(Some(id)),
-                    None => Err("no live jobs".to_owned()),
+                    Some(control) => control.status(Some(id)).map_err(anyhow::Error::msg),
+                    None => Err(anyhow::anyhow!("no live jobs")),
                 };
-                match result {
-                    Ok(value) => self.note("Jobs", value.to_string()),
-                    Err(error) => self.note("Jobs", error),
-                }
+                self.note_worker_reply(result);
             }
             ("message", rest) => {
-                let Some((id, text)) = rest.split_once(char::is_whitespace) else {
-                    self.note("Jobs", "Usage: /message <id> <text>");
-                    return true;
-                };
+                let (id, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
                 let result = match &self.live_tasks {
                     Some(control) => control.send(id, text.trim()),
                     None => Err(anyhow::anyhow!("no live jobs")),
                 };
-                match result {
-                    Ok(value) => self.note("Jobs", value.to_string()),
-                    Err(error) => self.note("Jobs", format!("{error:#}")),
-                }
+                self.note_worker_reply(result);
             }
             ("cancel", id) => {
-                if id.is_empty() {
-                    self.note("Jobs", "Usage: /cancel <id>");
-                    return true;
-                }
                 let result = match &self.live_tasks {
                     Some(control) => control.cancel(id),
                     None => Err(anyhow::anyhow!("no live jobs")),
                 };
-                match result {
-                    Ok(value) => self.note("Jobs", value.to_string()),
-                    Err(error) => self.note("Jobs", format!("{error:#}")),
-                }
+                self.note_worker_reply(result);
             }
             ("skills", "") => {
                 self.note("Skills", self.skills_listing.clone());
             }
-            ("commands", "") | ("help", "commands") => {
-                let text = if self.commands.is_empty() {
-                    "no custom commands (add .dial/commands/<name>.md)".to_owned()
-                } else {
-                    self.commands
-                        .iter()
-                        .map(|def| format!("/{}  {}", def.name, def.description))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.note("Commands", text);
-            }
+            ("commands", "") | ("help", "commands") => self.custom_commands_note(),
             ("context", "") => {
                 let used = self
                     .status
@@ -337,7 +313,7 @@ impl Shell {
                     "Context",
                     format!(
                         "Last sent request estimate: {used} tokens (window {}). Estimated next request unavailable while a turn is running. {} queued messages and the current draft remain pending; use /context after the turn for a fresh selected-model budget, reserve and compaction recommendation.",
-                        self.status.context_window, self.composer.queued_messages().len()
+                        self.status.context_window, self.composer.queued_count()
                     ),
                 );
             }

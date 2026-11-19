@@ -10,6 +10,7 @@ use crate::app::drive::Step;
 use crate::app::notices::{memory_status_text, memory_view_text};
 use crate::app::overlay::Which;
 use crate::app::selection::{PendingFavorite, cycle_set, next_favorite};
+use crate::app::shell::turn_report::plural;
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::selection::changes as selection_changes;
 use crate::config::types::{Approval, Outcome};
@@ -97,6 +98,69 @@ impl Shell {
         Ok(Step::Done)
     }
 
+    /// Reject a malformed command with a closed grammar before either dispatch path disturbs
+    /// ongoing work: a typo never stops the turn, changes the session or waits in the after-turn
+    /// queue only to fail later.
+    pub(super) fn reject_syntax(&mut self, name: &str, args: &str) -> bool {
+        let registered = |name: &str| crate::app::shell::help::usage_line(name);
+        let (title, usage) = match name {
+            "new" | "exit" | "fork" if !args.is_empty() => ("Session", registered(name)),
+            "undo" if turn_count(args).is_none() => (
+                "Session",
+                "Usage: /undo [n] or /undo files [n]; n must be a positive whole number.".into(),
+            ),
+            "rollback" if turn_count(args).is_none() => (
+                "Session",
+                "Usage: /undo files [n] (or /rollback [n]); n must be a positive whole number."
+                    .into(),
+            ),
+            "plan" if !matches!(args, "" | "on" | "off") => ("Plan", registered(name)),
+            "approval" if !args.is_empty() && !Approval::NAMES.contains(&args) => {
+                ("Approval", registered(name))
+            }
+            "laya" if !matches!(args, "" | "status" | "check" | "start" | "on" | "off") => {
+                ("Laya", registered(name))
+            }
+            "tree" if !matches!(args, "" | "forks") => (
+                "Tree",
+                "Usage: /tree (this session's branches) or /tree forks (session forks).".into(),
+            ),
+            "cancel" if args.is_empty() => ("Jobs", registered(name)),
+            "message"
+                if !args
+                    .split_once(char::is_whitespace)
+                    .is_some_and(|(_, text)| !text.trim().is_empty()) =>
+            {
+                ("Jobs", registered(name))
+            }
+            _ => return false,
+        };
+        self.note(title, usage);
+        true
+    }
+
+    /// A worker command's reply, as text on both the idle and the busy route.
+    pub(super) fn note_worker_reply(&mut self, result: Result<Value>) {
+        match result {
+            Ok(value) => self.note("Jobs", crate::app::shell::worker_replies::text(&value)),
+            Err(error) => self.note("Jobs", format!("{error:#}")),
+        }
+    }
+
+    /// `/commands`: the project's and user's custom commands.
+    pub(super) fn custom_commands_note(&mut self) {
+        let text = if self.commands.is_empty() {
+            "No custom commands yet. Add one as .dial/commands/<name>.md.".to_owned()
+        } else {
+            self.commands
+                .iter()
+                .map(|def| format!("/{}  {}", def.name, def.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.note("Commands", text);
+    }
+
     pub(in crate::app) fn command(
         &mut self,
         app: &App,
@@ -130,11 +194,12 @@ impl Shell {
             (name, args)
         };
         let name = canonical_command(name);
+        if self.reject_syntax(name, args) {
+            return Ok(Step::Done);
+        }
         // Compatibility spellings keep their distinct behavior through unified subactions.
         let (name, args) = if name == "help" && args == "commands" {
             ("commands", "")
-        } else if name == "undo" && (args == "files" || args.starts_with("files ")) {
-            ("rollback", args.strip_prefix("files").unwrap_or("").trim())
         } else if name == "review" && (args == "files" || args.starts_with("files ")) {
             (
                 "review-file",
@@ -223,19 +288,8 @@ impl Shell {
             "compute" => return self.open(app, agent, Which::Compute),
             "processes" | "bg" => return self.open(app, agent, Which::Jobs),
             "exit" | "quit" | "q" => return Ok(Step::Quit),
-            "help" | "?" => match args {
-                "" => return self.open(app, agent, Which::Palette),
-                "all" => {
-                    let text = self.help_text(true);
-                    self.note("Help", text);
-                }
-                _ => {
-                    let text =
-                        super::help::command_help(args).or_else(|| super::help::topic_help(args)).unwrap_or_else(|| self.help_text(false));
-                    self.note("Help", text);
-                }
-            },
-            "queue" => self.queue_command(line),
+            "help" | "?" => self.note("Help", self.help_response(args)),
+            "queue" => self.queue_command(args),
             "review" => return self.review_command(app, agent, args),
             "review-file" => self.review_checkpoints(agent, args),
             "seance" => return self.seance_command(app, agent, args),
@@ -283,10 +337,6 @@ impl Shell {
             "archive" => self.archive_note(app, args),
             "sessions" | "resume" | "tree" => {
                 // `/tree forks` is the fork browser; its argument is a keyword, not a search.
-                if name == "tree" && args != "forks" {
-                    self.note("Tree", "Usage: /tree (this session's branches) or /tree forks (session forks).");
-                    return Ok(Step::Done);
-                }
                 let query = if name == "tree" { "" } else { args };
                 match self.pick_session(agent, query, name == "tree", name == "sessions" || name == "resume") {
                     Ok(Some(session)) => {
@@ -341,22 +391,19 @@ impl Shell {
             }
             "copy" => self.copy_answer(agent),
             "plan" => {
+                // `reject_syntax` admitted only the bare toggle, `on` and `off`.
                 let next = match args {
-                    "" => !agent.plan_mode(),
                     "on" => true,
                     "off" => false,
-                    _ => {
-                        self.note("Plan", "usage: /plan [on|off]");
-                        return Ok(Step::Done);
-                    }
+                    _ => !agent.plan_mode(),
                 };
                 agent.set_plan_mode(next);
                 self.note(
                     "Plan",
                     if next {
-                        "read-only planning enabled"
+                        "Read-only planning enabled."
                     } else {
-                        "planning disabled"
+                        "Planning disabled."
                     },
                 );
             }
@@ -375,25 +422,13 @@ impl Shell {
                 };
                 let result = agent
                     .subagent_status(if args.is_empty() { None } else { Some(args) }, &mut bridge);
-                match result {
-                    Ok(value) => self.note("Jobs", value.to_string()),
-                    Err(error) => self.note("Jobs", format!("{error:#}")),
-                }
+                self.note_worker_reply(result);
             }
             "message" => {
-                let result = match args.split_once(char::is_whitespace) {
-                    Some((id, text)) => agent.subagent_message(id, text.trim()),
-                    None => Err(anyhow::anyhow!("usage: /message <id> <text>")),
-                };
-                match result {
-                    Ok(value) => self.note("Jobs", value.to_string()),
-                    Err(error) => self.note("Jobs", format!("{error:#}")),
-                }
+                let (id, text) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                self.note_worker_reply(agent.subagent_message(id, text.trim()));
             }
-            "cancel" => match agent.cancel_subagent(args) {
-                Ok(value) => self.note("Jobs", value.to_string()),
-                Err(error) => self.note("Jobs", format!("{error:#}")),
-            },
+            "cancel" => self.note_worker_reply(agent.cancel_subagent(args)),
             "fork" => match agent.gate_session_change("session_before_branch", serde_json::json!({"reason":"fork"})).map_err(anyhow::Error::msg).and_then(|()| agent.layout().context("agent has no project layout")).and_then(|layout| agent.session().fork(layout)) {
                 Ok(session) => {
                     let id = session.id().to_owned();
@@ -409,26 +444,21 @@ impl Shell {
             "compact" => return self.compact_command(app, agent, args),
             "undo" => return self.undo_command(app, agent, args),
             "rollback" => {
-                let Some(turns) = turn_count(args) else {
-                    self.note("Rollback", "Usage: /rollback [n] with a whole number of turns.");
-                    return Ok(Step::Done);
-                };
+                let turns = turn_count(args).unwrap_or(1);
                 match agent.checkpoints() {
                     Some(checkpoints) => match checkpoints.rollback(turns) {
-                        Ok(report) => self.note(
-                            "Rollback",
-                            format!(
-                                "restored {:?}, removed {:?}{}",
-                                report.restored, report.removed,
-                                {
-                                    let notes: Vec<&String> = report.unrestorable.iter().chain(&report.warnings).collect();
-                                    if notes.is_empty() { String::new() } else { format!("\n{}", notes.iter().map(|note| note.as_str()).collect::<Vec<_>>().join("\n")) }
-                                }
-                            ),
-                        ),
+                        Ok(report) => {
+                            let mut lines = restore_report_lines(&report);
+                            if !report.warnings.is_empty() {
+                                lines.push(
+                                    "Restoration incomplete. Inspect files before retrying.".into(),
+                                );
+                            }
+                            self.note("Rollback", lines.join("\n"));
+                        }
                         Err(error) => self.note("Rollback", format!("{error:#}")),
                     },
-                    None => self.note("Rollback", "checkpoints unavailable"),
+                    None => self.note("Rollback", "Checkpoints are unavailable in this session."),
                 }
             }
             "skills" => self.skills_command(app, args),
@@ -436,27 +466,24 @@ impl Shell {
                 if matches!(args, "on" | "off") {
                     return self.laya_toggle(app, Some(agent), args == "on");
                 }
-                if !matches!(args, "" | "status" | "check" | "start") {
-                    self.note("Laya", "Usage: /laya status | check | start | on | off");
-                } else {
-                    app.interrupt.store(false, Ordering::SeqCst);
-                    let mut bridge = Bridge {
-                        app,
-                        shell: self,
-                        interrupt: app.interrupt.clone(),
-                        started: Instant::now(),
-                        last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                        failed: false,
-                        pending: Vec::new(),
-                        next_id: 0,
-                    };
-                    bridge.shell.composer.set_busy(true);
-                    let result = agent.laya_status(args == "check", args == "start", &mut bridge);
-                    bridge.shell.composer.set_busy(false);
-                    match result {
-                        Ok(text) => bridge.shell.note("Laya", text),
-                        Err(error) => bridge.shell.note("Laya", format!("{error:#}")),
-                    }
+                // `reject_syntax` admitted only the status forms here.
+                app.interrupt.store(false, Ordering::SeqCst);
+                let mut bridge = Bridge {
+                    app,
+                    shell: self,
+                    interrupt: app.interrupt.clone(),
+                    started: Instant::now(),
+                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
+                    failed: false,
+                    pending: Vec::new(),
+                    next_id: 0,
+                };
+                bridge.shell.composer.set_busy(true);
+                let result = agent.laya_status(args == "check", args == "start", &mut bridge);
+                bridge.shell.composer.set_busy(false);
+                match result {
+                    Ok(text) => bridge.shell.note("Laya", text),
+                    Err(error) => bridge.shell.note("Laya", format!("{error:#}")),
                 }
             }
             "code-history" => self.code_history(app, args),
@@ -519,33 +546,19 @@ impl Shell {
             "experience" => return self.experience_command(app, agent, args),
             "understanding" => return self.understanding_command(app, args),
             "memory" => return self.memory_command(app, agent, args),
-            "commands" => {
-                let text = if self.commands.is_empty() {
-                    "no custom commands (add .dial/commands/<name>.md)".to_owned()
-                } else {
-                    self.commands
-                        .iter()
-                        .map(|def| format!("/{}  {}", def.name, def.description))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.note("Commands", text);
-            }
+            "commands" => self.custom_commands_note(),
             "search" => return self.search_command(app, agent, args),
             "attachments" => self.attachments_command(args),
             "draft" => self.draft_command(app, args),
             "context" => return self.context_command(agent),
             "approval" => {
+                // `reject_syntax` admitted only a mode name or the bare status form.
                 match args {
                     "ask" => agent.set_approval(Approval::Ask),
                     "write" => agent.set_approval(Approval::Write),
                     "auto" => agent.set_approval(Approval::Auto),
                     "readonly" => agent.set_approval(Approval::Readonly),
-                    "" => {}
-                    _ => {
-                        self.note("Approval", "usage: /approval ask|write|auto|readonly");
-                        return Ok(Step::Done);
-                    }
+                    _ => {}
                 }
                 let mode = format!("{:?}", agent.approval()).to_lowercase();
                 let label = crate::ui::status::approval_label(&mode);
@@ -798,7 +811,7 @@ impl Shell {
                 },
                 None => self.note(
                     "Permissions",
-                    "usage: /permissions remove <number> [--persist]",
+                    "Usage: /permissions remove <number> [--persist]",
                 ),
             }
         } else if args.starts_with("allow ") || args.starts_with("deny ") {
@@ -880,7 +893,7 @@ impl Shell {
                 },
             );
         } else {
-            self.note("Permissions", "usage: /permissions; /permissions why; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
+            self.note("Permissions", "Usage: /permissions; /permissions why; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
         }
         Ok(Step::Done)
     }
@@ -1068,13 +1081,8 @@ impl Shell {
     }
 
     fn undo_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
-        let Some(turns) = turn_count(args) else {
-            self.note(
-                "Undo",
-                "Usage: /undo [n] with a whole number of turns (default 1).",
-            );
-            return Ok(Step::Done);
-        };
+        // `reject_syntax` admitted only an omitted or positive whole count.
+        let turns = turn_count(args).unwrap_or(1);
         // The engine owner validates the range, runs the gate, restores files, then rewinds.
         let mut lines = Vec::new();
         let trajectory = self.last_trajectory;
@@ -1108,15 +1116,8 @@ impl Shell {
             }
         };
         if let Some(report) = &outcome.files {
-            lines.push(format!(
-                "restored {} file(s), removed {}",
-                report.restored.len(),
-                report.removed.len()
-            ));
-            // Oversized files could never be checkpointed; they are named, and the undo goes on.
-            lines.extend(report.unrestorable.iter().cloned());
+            lines.extend(restore_report_lines(report));
             if !report.warnings.is_empty() {
-                lines.extend(report.warnings.iter().cloned());
                 lines.push(
                     "Restoration incomplete; conversation kept. Inspect files before retrying."
                         .into(),
@@ -1126,9 +1127,19 @@ impl Shell {
         if let Some(error) = &outcome.rollback_error {
             lines.push(format!("rollback: {error}; conversation kept"));
         }
-        if let Some(dropped) = outcome.dropped {
-            lines.push(format!("dropped {dropped} message(s)"));
-            lines.extend(outcome.note);
+        match outcome.dropped {
+            // No user turn was in view: nothing was restored or rewound.
+            Some(0) if outcome.files.is_none() => {
+                lines.push("Nothing to undo: no turn in this conversation can be rewound.".into());
+            }
+            Some(dropped) => {
+                lines.push(format!(
+                    "Rewound the conversation by {}.",
+                    plural(dropped as u64, "message")
+                ));
+                lines.extend(outcome.note);
+            }
+            None => {}
         }
         if let Some(error) = outcome.cleanup_error {
             lines.push(format!("conversation rewound, checkpoint cleanup: {error}"));
@@ -1299,6 +1310,46 @@ impl Shell {
         self.note("Context", text);
         Ok(Step::Done)
     }
+}
+
+/// What a checkpoint restore did, in the words `/undo` and `/undo files` share: the files written
+/// back and the files removed, by name, then anything that could not be restored.
+fn restore_report_lines(report: &crate::storage::checkpoint::RollbackReport) -> Vec<String> {
+    /// Names listed per line before the rest are counted.
+    const LISTED: usize = 8;
+    let named = |files: &[String]| {
+        let mut names: Vec<String> = files
+            .iter()
+            .take(LISTED)
+            .map(|file| crate::ui::text::one_line(file))
+            .collect();
+        if files.len() > LISTED {
+            names.push(format!("and {} more", files.len() - LISTED));
+        }
+        names.join(", ")
+    };
+    let mut lines = Vec::new();
+    if !report.restored.is_empty() {
+        lines.push(format!(
+            "Restored {}: {}",
+            plural(report.restored.len() as u64, "file"),
+            named(&report.restored)
+        ));
+    }
+    if !report.removed.is_empty() {
+        lines.push(format!(
+            "Removed {} the undone work created: {}",
+            plural(report.removed.len() as u64, "file"),
+            named(&report.removed)
+        ));
+    }
+    if report.restored.is_empty() && report.removed.is_empty() {
+        lines.push("No files were restored or removed.".into());
+    }
+    // Oversized files could never be checkpointed; they are named, and the restore goes on.
+    lines.extend(report.unrestorable.iter().cloned());
+    lines.extend(report.warnings.iter().cloned());
+    lines
 }
 
 /// Share of prompt tokens served from the provider's prompt cache. Prompt totals include cached

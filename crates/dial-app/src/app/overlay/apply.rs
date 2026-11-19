@@ -4,13 +4,16 @@ use crate::app::overlay::auth::{PreparedModel, PreparedVoice};
 use crate::app::overlay::compute::compute_starts;
 use crate::app::overlay::env::{OverlayEnv, favorite_routes, settings_tables};
 use crate::app::overlay::{ActiveOverlay, start_streaming_job};
-use crate::app::selection::{clear_role_changes, provider_changes};
+use crate::app::selection::{
+    assignment_thinking_changes, clear_role_changes, main_thinking_changes, provider_changes,
+    role_thinking_changes,
+};
 use crate::app::shell::Shell;
 use crate::config::selection::changes as selection_changes;
 use crate::config::settings_store::{self, Change};
 use crate::config::types::{Approval, Config};
 use crate::llm::catalog;
-use crate::ui::overlay::OverlayEvent;
+use crate::ui::overlay::{OverlayEvent, PresetAction};
 use anyhow::{Result, ensure};
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
@@ -121,7 +124,8 @@ impl OverlayEnv<'_> {
                 let mut saved = false;
                 let outcome = (|| -> Result<String> {
                     // Selecting a model applies it directly; there is no confirmation screen.
-                    let changes = selection_changes(&config, &selection, &role)?;
+                    let mut changes = selection_changes(&config, &selection, &role)?;
+                    changes.extend(assignment_thinking_changes(&config, &role, &selection)?);
                     let review = settings_store::review_model_config(
                         &self.app.layout,
                         scope,
@@ -129,10 +133,15 @@ impl OverlayEnv<'_> {
                         Some(&role),
                     )?;
                     let changes = review.changes().to_vec();
+                    let level = selection
+                        .thinking
+                        .as_deref()
+                        .map(|level| format!(" · thinking {level}"))
+                        .unwrap_or_default();
                     let message = if role == "main" {
-                        format!("switched to {}", selection.display_name())
+                        format!("switched to {}{level}", selection.display_name())
                     } else {
-                        format!("{role} set to {}", selection.display_name())
+                        format!("{role} set to {}{level}", selection.display_name())
                     };
                     // OS models and Laya's typed service do not use chat-weight acquisition.
                     if crate::config::selection::requires_local_preparation(&config, &selection) {
@@ -356,6 +365,60 @@ impl OverlayEnv<'_> {
                         models.review_assignment(review, OverlayEvent::ClearRole { role: role.clone(), scope }, format!("clear {role}"), vec![format!("This session + saved {scope:?} {role} assignment removed."), "Lower-scope assignment may become effective; otherwise this role follows main.".into(), "Main and other running sessions unchanged. Cancel saves nothing.".into()]);
                     }
                     Ok("Review role removal; confirm to save or cancel without saving.".into())
+                })();
+                self.report(overlay, outcome);
+                self.refresh_roles(overlay);
+            }
+            OverlayEvent::SetThinking { role, level, scope } => {
+                *self.scope = scope;
+                let config = self
+                    .latest
+                    .clone()
+                    .unwrap_or_else(|| self.app.config.clone());
+                let outcome = (|| -> Result<String> {
+                    let changes = if role == "main" {
+                        main_thinking_changes(&config, &level)?
+                    } else {
+                        role_thinking_changes(&config, &role, &level)?
+                    };
+                    self.save(&changes, scope)?;
+                    Ok(format!("{role} thinking set to {level}"))
+                })();
+                self.report(overlay, outcome);
+                self.refresh_roles(overlay);
+            }
+            OverlayEvent::Preset(action) => {
+                let config = self
+                    .latest
+                    .clone()
+                    .unwrap_or_else(|| self.app.config.clone());
+                let layout = self.app.layout.clone();
+                let outcome = (|| -> Result<String> {
+                    use crate::app::presets::{self, Save};
+                    let (changes, message) = match &action {
+                        PresetAction::Apply(name) => (
+                            presets::apply_named(&config, name)?,
+                            format!("Applied preset {name}"),
+                        ),
+                        PresetAction::Create(name) => (
+                            presets::save_changes(&config, name, Save::Create)?,
+                            format!("Saved the current roles as preset {name}"),
+                        ),
+                        PresetAction::Update(name) => (
+                            presets::save_changes(&config, name, Save::Update)?,
+                            format!("Preset {name} now holds the current roles"),
+                        ),
+                        PresetAction::Rename { from, to } => (
+                            presets::rename_changes(&layout, &config, from, to)?,
+                            format!("Renamed preset {from} to {to}"),
+                        ),
+                        PresetAction::Delete(name) => (
+                            presets::delete_changes(&layout, &config, name)?,
+                            format!("Deleted preset {name}"),
+                        ),
+                    };
+                    self.save(&changes, settings_store::Scope::Global)?;
+                    Ok(message)
                 })();
                 self.report(overlay, outcome);
                 self.refresh_roles(overlay);

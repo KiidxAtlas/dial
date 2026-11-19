@@ -1,5 +1,5 @@
 //! Local scheduling measurements, not provider/model speedup claims.
-//! Run timings with `cargo test --locked --test integration scheduling_measurements -- --ignored --nocapture --test-threads=1`.
+//! See `docs/async-execution.md` for the timing command, including the real embedded shell host.
 use super::*;
 
 const READS: usize = 8;

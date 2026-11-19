@@ -51,6 +51,7 @@ pub use exec::sandbox;
 pub use fs::delta::{CoveredRun, DeltaPlan};
 pub use fs::documents;
 pub use fs::files::NativeReadSelection;
+pub use fs::outline::available as outline_available;
 pub use integrations::ext;
 pub use knowledge::{codebase, provenance};
 pub mod vcs;

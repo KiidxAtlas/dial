@@ -54,6 +54,8 @@ fn commands_are_classified_as_tests_builds_or_neither() {
         ("make test-module MOD=llm::retry", Some(Kind::Test)),
         ("python -m pytest tests/", Some(Kind::Test)),
         ("npx vitest run", Some(Kind::Test)),
+        ("cd backend && cargo test", Some(Kind::Test)),
+        ("cargo nextest run", Some(Kind::Test)),
         (
             "cargo clippy --all-targets -- -D warnings",
             Some(Kind::Build),
@@ -64,6 +66,27 @@ fn commands_are_classified_as_tests_builds_or_neither() {
         ("ls tests", None),
     ] {
         assert_eq!(kind(command), expected, "{command}");
+    }
+}
+
+#[test]
+fn live_test_status_requires_a_direct_runner_not_a_mention_or_a_plan() {
+    for command in [
+        "echo cargo test",
+        "rg pytest",
+        "cargo test --no-run",
+        "python -m pytest --collect-only",
+        "false && cargo test",
+        "cargo nextest list",
+    ] {
+        assert!(!is_test_command(command), "{command}");
+    }
+    for command in [
+        "cargo test -p api",
+        "python -m pytest tests/",
+        "npx vitest run",
+    ] {
+        assert!(is_test_command(command), "{command}");
     }
 }
 
@@ -147,6 +170,7 @@ fn a_verdict_sums_up_settled_checks_only() {
     assert_eq!(
         verdict(&run("cargo test", PASSING, false)),
         Some(Verdict {
+            command: "cargo test".into(),
             ok: true,
             what: "tests",
             summary: "2 passed".into()
@@ -155,6 +179,7 @@ fn a_verdict_sums_up_settled_checks_only() {
     assert_eq!(
         verdict(&run("cargo test", failing, true)),
         Some(Verdict {
+            command: "cargo test".into(),
             ok: false,
             what: "tests",
             summary: "2 failed".into()

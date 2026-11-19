@@ -745,7 +745,8 @@ impl<'a> Agent<'a> {
                     // Reported whether or not eval is offered: without eval the shell is the only
                     // place helpers can run, and that is when a wrong-language helper costs most.
                     if !self.hermetic && self.tool_eligible("bash") {
-                        runtimes.push_str(&tools::exec::shell::interpreter_guidance());
+                        runtimes
+                            .push_str(&tools::exec::shell::interpreter_guidance(&self.workspace));
                         runtimes.push_str(&tools::fs::system::session_inventory().compact());
                     }
                     if !self.hermetic && self.tool_eligible("eval") {

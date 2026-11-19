@@ -84,6 +84,42 @@ fn tool_startup_edits_draft_until_an_action_is_held() {
 }
 
 #[test]
+fn recap_fallback_runs_only_with_an_idle_empty_draft() {
+    use crate::ui::transcript::{TurnOutcome, TurnStats};
+    use crossterm::event::KeyEvent;
+    let (_home, _project, _app, mut shell) = shell();
+    shell
+        .transcript
+        .tool_start("1", "read", "a", r#"{"path":"a"}"#);
+    shell.transcript.tool_end("1", "ok", false, 0.1);
+    shell.transcript.turn_stats(TurnStats {
+        clock: String::new(),
+        elapsed_secs: 1.0,
+        prompt_tokens: None,
+        output_tokens: None,
+        tokens_per_second: None,
+        outcome: Some(TurnOutcome {
+            status: "failed".into(),
+            ..Default::default()
+        }),
+    });
+    let fallback = KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT);
+    assert_eq!(
+        shell.composer_key(fallback),
+        ComposerEvent::Submit("/retry".into())
+    );
+    shell.composer_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(shell.composer.draft(), "1");
+    assert_eq!(shell.composer_key(fallback), ComposerEvent::None);
+    shell.composer.set_draft("");
+    shell.composer_paste("¡");
+    assert_eq!(shell.composer.draft(), "¡");
+    shell.composer.set_draft("");
+    shell.composer.set_busy(true);
+    assert_eq!(shell.composer_key(fallback), ComposerEvent::None);
+}
+
+#[test]
 fn a_held_paste_line_break_stays_in_the_draft_while_more_held_input_follows() {
     // Keys queued while tools connected are replayed one by one; the pump queue is empty then, so
     // the rest of the paste is only visible in `held`. Its Enter must not submit the first line.

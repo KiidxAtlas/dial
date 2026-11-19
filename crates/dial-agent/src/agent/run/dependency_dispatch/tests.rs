@@ -221,6 +221,11 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
         ("grep", json!({"pattern":"cause"}), false),
         ("bash", json!({"command":"python3 a"}), true),
         ("bash", json!({"command":"python3 --version"}), false),
+        (
+            "bash",
+            json!({"command":"cat a", "check":true,"check_paths":["a"]}),
+            true,
+        ),
         ("verify", json!({"targets":["build"]}), true),
         ("bg", json!({"action":"start","command":"python3 a"}), true),
         ("bg", json!({"action":"output","name":"job"}), false),

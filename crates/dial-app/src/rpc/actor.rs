@@ -1389,7 +1389,14 @@ impl ActorRuntime<'_> {
                 .session
                 .clone()
                 .context("no live voice session is active")?;
-            let heard = session.transcribe(&self.flag)?;
+            let out = &self.worker_out;
+            let heard = session.transcribe(&self.flag, &mut |level| {
+                let rms = (f64::from(level.rms) * 1000.0).round() / 1000.0;
+                out.emit(json!({"event":"live_level","level":rms,"speech":level.speech}));
+            })?;
+            // Shown before the turn runs, so the user sees what was heard while Dial works.
+            self.worker_out
+                .emit(json!({"event":"live_transcript","text":heard}));
             (heard.clone(), Some(heard))
         } else {
             let text = params["text"]

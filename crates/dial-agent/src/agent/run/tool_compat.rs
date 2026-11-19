@@ -30,39 +30,73 @@ fn bare_name(name: &str) -> &str {
     }
 }
 
-fn folded(name: &str) -> String {
-    name.to_ascii_lowercase().replace('-', "_")
+// Compare ASCII identifiers, not arbitrary text. Ignore single word separators, but keep
+// namespace boundaries (`mcp__...`) and leading/trailing underscores significant.
+fn spelling(name: &str) -> Option<impl Iterator<Item = u8> + '_> {
+    let bytes = name.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 256
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    valid.then(|| {
+        bytes.iter().enumerate().filter_map(|(i, b)| {
+            if matches!(b, b'-' | b'_') {
+                let between_words = i > 0
+                    && bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_alphanumeric);
+                (!between_words).then_some(b'_')
+            } else {
+                Some(b.to_ascii_lowercase())
+            }
+        })
+    })
 }
 
-/// Exact catalog names take precedence over compatibility aliases. A name that is not offered is
-/// stripped of its namespace prefix and call index, mapped through the alias table, and finally
-/// matched ignoring case and `-` versus `_` when exactly one offered tool matches. Anything else
-/// is returned unchanged and fails as an unknown tool.
+fn same_spelling(left: &str, right: &str) -> bool {
+    spelling(left)
+        .zip(spelling(right))
+        .is_some_and(|(a, b)| a.eq(b))
+}
+
+fn unique<'a>(mut matches: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let first = matches.next()?;
+    matches.all(|m| m == first).then_some(first)
+}
+
+const TOOL_ALIASES: &[(&str, &str)] = &[
+    ("read_file", "read"),
+    ("write_file", "write"),
+    ("edit_file", "edit"),
+    ("run_command", "bash"),
+    ("shell", "bash"),
+    ("search_files", "grep"),
+    ("find_files", "glob"),
+    ("fetch_url", "web_fetch"),
+    ("search_web", "web_search"),
+];
+
+/// Prefer real names (including after removing provider decoration). Otherwise accept a
+/// spelling or known alias only when it identifies one tool in this caller's catalog.
 pub(in crate::agent) fn canonical_name<'a>(name: &'a str, catalog: &[String]) -> Cow<'a, str> {
     if catalog.iter().any(|n| n == name) {
         return Cow::Borrowed(name);
     }
     let bare = bare_name(name);
-    let target = match bare {
-        "read_file" | "Read" => "read",
-        "write_file" | "Write" => "write",
-        "edit_file" | "Edit" => "edit",
-        "run_command" | "shell" | "Bash" => "bash",
-        "search_files" | "Grep" => "grep",
-        "find_files" | "Glob" => "glob",
-        "fetch_url" | "WebFetch" => "web_fetch",
-        "search_web" | "WebSearch" => "web_search",
-        _ => bare,
-    };
-    if catalog.iter().any(|n| n == target) {
-        return Cow::Borrowed(target);
+    if catalog.iter().any(|n| n == bare) {
+        return Cow::Borrowed(bare);
     }
-    let wanted = folded(bare);
-    let mut matches = catalog.iter().filter(|n| folded(n) == wanted);
-    match (matches.next(), matches.next()) {
-        (Some(only), None) => Cow::Owned(only.clone()),
-        _ => Cow::Borrowed(name),
-    }
+    let targets = TOOL_ALIASES
+        .iter()
+        .filter(|(alias, _)| same_spelling(alias, bare))
+        .map(|(_, target)| *target);
+    let real_names = catalog
+        .iter()
+        .map(String::as_str)
+        .filter(|n| same_spelling(n, bare));
+    let found =
+        unique(real_names.chain(targets.filter(|target| catalog.iter().any(|n| n == *target))));
+    found.map_or(Cow::Borrowed(name), |n| Cow::Owned(n.to_owned()))
 }
 
 pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) {
@@ -127,6 +161,18 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
         }
     }
     normalize_scalars(schema, args);
+    // This synonym means pixels, never a DOM snapshot. Don't override a declared action.
+    if name == "browser"
+        && let Some(action) = args.get_mut("action")
+        && action
+            .as_str()
+            .is_some_and(|s| same_spelling(s.trim(), "capture"))
+        && let Some(actions) = schema["properties"]["action"]["enum"].as_array()
+        && !actions.contains(action)
+        && actions.iter().any(|v| v == "screenshot")
+    {
+        *action = Value::from("screenshot");
+    }
     // `find` keywords are literal text. A singleton string is unambiguous; unlike
     // general array repair, preserve commas, quotes and whitespace as one keyword.
     if name == "find"
@@ -202,10 +248,70 @@ fn string_list(schema: &Value, value: &Value) -> Option<Value> {
         .map(Value::from)
 }
 
+/// Common alternative labels, only used when one declared field in the record matches.
+fn field_family(name: &str) -> Option<&'static str> {
+    const FAMILIES: &[(&str, &[&str])] = &[
+        ("action", &["action", "operation", "op"]),
+        ("path", &["path", "file_path"]),
+        ("paths", &["paths", "file_paths"]),
+    ];
+    FAMILIES.iter().find_map(|(group, names)| {
+        names
+            .iter()
+            .any(|n| same_spelling(n, name))
+            .then_some(*group)
+    })
+}
+
+/// Rewrite only unknown fields of closed records. Open maps can carry user data, and a
+/// second spelling for a supplied field must remain a validation error, not last-write-wins.
+fn normalize_keys(schema: &Value, value: &mut Value) {
+    if schema["additionalProperties"] != false || schema.get("patternProperties").is_some() {
+        return;
+    }
+    let (Some(fields), Some(object)) = (schema["properties"].as_object(), value.as_object_mut())
+    else {
+        return;
+    };
+    let mut renames = std::collections::BTreeMap::new();
+    for key in object.keys().filter(|k| !fields.contains_key(*k)) {
+        let family = field_family(key);
+        let target = unique(fields.keys().map(String::as_str).filter(|f| {
+            same_spelling(key, f) || family.is_some_and(|group| field_family(f) == Some(group))
+        }));
+        if let Some(target) = target
+            && !object.contains_key(target)
+        {
+            renames
+                .entry(target)
+                .and_modify(|from| *from = None)
+                .or_insert_with(|| Some(key.clone()));
+        }
+    }
+    for (to, from) in renames {
+        if let Some(v) = from.and_then(|key| object.remove(&key)) {
+            object.insert(to.to_owned(), v);
+        }
+    }
+}
+
 fn normalize_scalars(schema: &Value, value: &mut Value) {
     normalize_container(schema, value);
+    normalize_keys(schema, value);
     if let Some(text) = value.as_str() {
         let converted = match schema["type"].as_str() {
+            Some("string") => schema["enum"]
+                .as_array()
+                .filter(|choices| !choices.contains(value))
+                .and_then(|choices| {
+                    unique(
+                        choices
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter(|choice| same_spelling(text.trim(), choice)),
+                    )
+                })
+                .map(Value::from),
             Some("integer") => text
                 .trim()
                 .parse::<i64>()

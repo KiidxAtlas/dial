@@ -101,6 +101,50 @@ pub fn run(version: Option<&str>) -> Result<()> {
     }
 }
 
+/// How long `dial update --check` waits for GitHub.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `dial update --check`: reports whether a newer release exists and how `dial update` would
+/// install it, without changing anything. With `json` the answer is one [`release::UpdateStatus`]
+/// object and an unreachable GitHub is reported in its `error` field rather than as a failure, so
+/// a frontend always gets a parseable reply.
+pub fn check(json: bool) -> Result<()> {
+    let installation = Installation::current();
+    let status = release::status(
+        installation,
+        &release::current_plan(),
+        release::CURRENT,
+        release::latest_tag(CHECK_TIMEOUT).map_err(|error| format!("{error:#}")),
+    );
+    if json {
+        println!("{}", serde_json::to_string(&status)?);
+        return Ok(());
+    }
+    let Some(latest) = &status.latest else {
+        bail!(
+            "could not read the latest release: {}",
+            status.error.as_deref().unwrap_or("unknown error")
+        );
+    };
+    if status.update_available {
+        println!(
+            "Dial {latest} is available (you have {}); {}.",
+            status.current,
+            if status.can_update {
+                "run `dial update`"
+            } else {
+                status.update_command.as_str()
+            }
+        );
+    } else {
+        println!(
+            "Dial {} is up to date (latest release {latest}).",
+            status.current
+        );
+    }
+    Ok(())
+}
+
 /// Runs `program ARGS` with this terminal's output (or `/update`'s transcript pipe).
 fn run_visible(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<()> {
     let shown = std::iter::once(program)

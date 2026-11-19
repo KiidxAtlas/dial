@@ -178,6 +178,41 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(total["projection_bytes"]["requests"], 3 * len(subset))
         self.assertEqual(turns[1]["efficiency"]["projection_bytes"]["first_tool_result_ms"], 100)
 
+    def test_missing_or_invalid_operation_timings_cannot_become_measured_zero(self):
+        for elapsed in (None, -1, float("inf"), float("nan")):
+            with self.subTest(elapsed=elapsed):
+                turn = {**DIAL_EFFICIENCY, "storage_io": {"write_us": elapsed}}
+                total = cross_agent.aggregate_efficiency([{"efficiency": turn}], failed=False)
+                self.assertIsNone(total["storage_io"])
+                self.assertFalse(cross_agent.efficiency_known({"efficiency": total}))
+
+    def test_explicit_interventions_aggregate_without_inventing_missing_fields(self):
+        turns = [{"efficiency": {**DIAL_EFFICIENCY, "projection_bytes": {
+            **DIAL_EFFICIENCY["projection_bytes"], "interventions": observations}}}
+            for observations in ({}, {"steering_message_journaled": 2}, {"turn_interrupted": 1})]
+        total = cross_agent.aggregate_efficiency(turns, failed=False)
+        self.assertEqual(total["projection_bytes"]["interventions"],
+                         {"steering_message_journaled": 2, "turn_interrupted": 1})
+        del turns[0]["efficiency"]["projection_bytes"]["interventions"]
+        self.assertIsNone(cross_agent.aggregate_efficiency(turns, failed=False)["projection_bytes"])
+
+    def test_unreported_and_partial_attempt_tokens_cannot_establish_tokens_per_success(self):
+        for missing in ("unreported_attempts", "partial_reported_attempts"):
+            with self.subTest(missing=missing):
+                result = {**DIAL_RESULT, "usage": {"total": {
+                    **DIAL_RESULT["usage"]["total"],
+                    "all": {**DIAL_RESULT["usage"]["total"]["all"], missing: 1}}}}
+                _, part = cross_agent.parse_dial_json(json.dumps(result))
+                total = cross_agent.empty_usage()
+                cross_agent.add_usage(total, part, {"delegation_tools": ["task"], "delegated_usage": "included"})
+                trial = {"agent": "dial", "case": "fix", "passed": True, "scored": True,
+                         "agent_error": None, "elapsed_ms": 100, "usage": total}
+                summary, _ = cross_agent.summarize([trial], [{"name": "dial"}])
+                self.assertIsNone(summary["dial"]["tokens_per_success"])
+                self.assertEqual(summary["dial"]["measurements"]["requests"]["total"], 3)
+                self.assertEqual(summary["dial"]["measurements"]["tool_errors"]["total"], 1)
+                self.assertIsNone(summary["dial"]["measurements"]["input_total"]["total"])
+
 
 class SummaryTests(unittest.TestCase):
     def test_success_efficiency_includes_failed_attempts_and_requires_complete_usage(self):

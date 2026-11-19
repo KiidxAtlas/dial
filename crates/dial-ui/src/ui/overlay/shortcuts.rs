@@ -123,10 +123,14 @@ impl ShortcutOverlay {
             self.message = None;
             return OverlayEvent::None;
         }
-        if self.recording
-            && self.edit.is_some()
-            && let Some(chord) = Chord::from_key(key)
-        {
+        if self.recording && self.edit.is_some() {
+            let Some(chord) = Chord::from_key(key) else {
+                self.message = Some((
+                    "Cannot bind that key; press another key or Esc".into(),
+                    false,
+                ));
+                return OverlayEvent::None;
+            };
             self.recording = false;
             if let Some((_, editor)) = &mut self.edit {
                 let separator = if editor.text.trim().is_empty() {

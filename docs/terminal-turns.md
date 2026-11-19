@@ -89,6 +89,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
+  A command with a mistyped argument (`/plan maybe`, `/approval nope`, `/cancel` with no id) answers with its usage at once
+  and leaves the turn running; `/workers <id>`, `/message` and `/cancel` reply in text, the same while idle or working.
   `/context` also lists the last request's estimated tokens by category: system prompt, context files, tool definitions,
   user and assistant messages, one row per tool's output, images at a fixed estimate, and provider replay shown by size only.
   These are byte-based estimates, not billed usage; during a running turn it shows only the summary line.
@@ -118,15 +120,20 @@ failures (including checkpoint failures) are not reset by this recovery.
 
 - Edited, blocked, interrupted and failed turns end with an **actionable completion footer** from
   the existing recorded turn report: changed files, named checks and their freshness/verdicts,
-  outstanding obligations, effects outside `/undo`, and a safe next action. Check freshness alone
-  never means passing. Missing freshness/verdicts remain unverified; recorded shell tests are not
-  silently promoted to configured checks. Detail is bounded; `/evidence check`, `/todo` and
+  outstanding obligations, effects outside `/undo`, and a safe next action. Read the compact receipt
+  for changed paths and check results; expand for supporting evidence. A check recorded before a
+  later edit is not a pass for the final files. Missing freshness or verdicts remain unverified;
+  recorded shell tests are not silently promoted to configured checks. Detail is bounded; `/evidence check`, `/todo` and
   `/review-file` expose the owning evidence. Plain completed answers remain quiet. These are
   observations from `turn_summary`, not permission to retry or replay completed work. Turns that
   failed on a provider or transport error suggest `/retry`.
   Recorded verification remains visible even when no files changed. `Next:` prioritizes retained
   failure/effects, outstanding obligations and verification gaps before optional review/undo.
   Continue only unfinished work after inspection; the footer never authorizes replay of the turn.
+  `effects_unknown` is retained from typed tool settlement: the footer labels missing file changes
+  as *none recorded*, withholds check freshness, and prioritizes inspection without authorizing
+  replay. A current focused check cannot make an older shell check current. Timing lists observed
+  request phases, including cancellation, not an additive breakdown of turn wall time.
   Notes are labelled `Blocked` only for explicitly blocked tasks. Attention opens the exact blocked
   step; plan evidence uses neutral observation markers, not passing-check symbols.
 - Settled test and build commands (`cargo test`, `cargo clippy`, `make test-*`, `pytest`, `tsc`, …)
@@ -167,7 +174,7 @@ failures (including checkpoint failures) are not reset by this recovery.
   shown or reverted here. Files too large to checkpoint are listed as not reviewable.
   A revert includes all changes shown for that file, including your own edits: review carefully.
   Changes after preview are refused, other files are untouched, and the revert has its own
-  `/undo files` checkpoint. Bare `/undo` also rewinds conversation and refuses unrelated newer file
+  `/undo files` checkpoint. `/undo` and `/undo files` name the files they restored and removed. Bare `/undo` also rewinds conversation and refuses unrelated newer file
   checkpoints, including a review revert. Private, binary or oversized interactive diffs require manual review.
   The checkpoint lock only keeps other checkpoint recording out; edit tools and external programs
   are not excluded, so a change can still land between a file's compare and its write. This is not
@@ -220,6 +227,31 @@ earlier reads, searches, checks and worker reports. Card hints show the current 
 Reasoning starts collapsed and per-turn statistics start hidden. Cache accounting and routine
 decision advice stay out of the transcript. Viewed images use compact inline previews when supported
 by the terminal; optional capabilities remain available through `/setup` without a startup dialog.
+
+## Transcript cards
+
+Some events and results get a card of their own instead of a plain line. The evidence-expansion
+key shows the full text or the ordinary tool card.
+
+- **Model switches** read `from → to` and say why: fallback, restored, promoted for context, or
+  a prewalk handoff.
+- **Advisor reviews** are a quoted card marked *unverified advice*, with the severity on its edge.
+- **Recoveries** are an amber card that says what went wrong and what Dial did, folded after a few
+  rows.
+- **Compactions, context resets and investigation rewinds** are dividers that show the token
+  shrink (`172k → 31k`) when it is known.
+- **Checks** that did not pass name their status in the failure color.
+- **Provider errors** name a recognised cause on the card's top edge (rate limited, not signed in,
+  context too long, model not found, provider busy, network problem) and the usual fix on its
+  bottom edge. An unrecognised error keeps the plain card with no guessed hint.
+- **A call you approved at the prompt** keeps an `approved` fact once it runs. Calls allowed by a
+  standing rule do not.
+- **A completed `git commit` or `git push`** reads as one row each: the short hash, message and
+  line counts, or the branch, remote and pushed range. Failures keep the full output.
+- **A completed `web_search`** lists the first five titles and hosts in a card, with the result
+  count and provider on its foot.
+- **Runs of skill loads, tool loads or learning notes** fold into one row with a `×N` count. The
+  session history keeps every event.
 
 ## Small terminals and safe confirmation
 

@@ -1,6 +1,19 @@
 //! Focused verification after edits: check selection, runs, publication and completion validation.
 
 use crate::agent::*;
+use std::collections::VecDeque;
+
+/// Do not fan foreground subprocesses out to a large read-tool window.
+const MAX_FOREGROUND_CHECKS: usize = 4;
+
+fn focused_check_call(check: &verify::verification::FocusedCheck) -> ToolCall {
+    ToolCall {
+        id: format!("focused-check:{}", check.name),
+        name: "bash".into(),
+        arguments: json!({"command":check.command,"timeout":check.timeout_secs}),
+        malformed_arguments: false,
+    }
+}
 
 /// One focused-check pass. `failures` keeps every final problem visible; `actionable` holds only the
 /// diagnostics of confirmed code failures, the sole input to automatic repair.
@@ -13,10 +26,124 @@ pub(in crate::agent) struct CheckRun {
 
 /// The completion gate's evidence answer: the still-unverified checks after the gate's run, and
 /// whether an undisclosed failure keeps the answer blocked (with the failure output when it ran).
+#[derive(Default)]
 pub(in crate::agent) struct GateOutcome {
     pub(in crate::agent) unverified: Option<Vec<String>>,
+    pub(in crate::agent) has_pass: bool,
     pub(in crate::agent) blocking: bool,
     pub(in crate::agent) failures: Vec<String>,
+}
+
+/// One classified failure's presentation. The ledger, not this note, owns its status and revision.
+pub(in crate::agent) struct RepairBrief {
+    command: String,
+    excerpt: Option<String>,
+    /// Recomputed after advisory selection on each request; a superseding run starts unselected.
+    pub(in crate::agent) selected: bool,
+}
+
+impl RepairBrief {
+    fn new(command: &str, output: &str) -> Self {
+        // Keep adjacent lines for assertion operands and compiler locations. Never infer an
+        // expected/actual ordering, or promote the surrounding subprocess prose to instructions.
+        let excerpt = verify::verification::code_failure_line(output).map(|at| {
+            output
+                .lines()
+                .skip(at.saturating_sub(1))
+                .take(5)
+                .map(|line| brief_field(line, 128))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        Self {
+            command: command.into(),
+            excerpt,
+            selected: false,
+        }
+    }
+}
+
+fn brief_field(text: &str, limit: usize) -> String {
+    crate::agent::window::prompt::truncate_chars(&crate::storage::redact::redact_text(text), limit)
+}
+
+impl Agent<'_> {
+    pub(in crate::agent) fn local_repair_note(&self, goal: Option<&str>) -> Option<Value> {
+        let brief = self.step_checks.repair_brief.as_ref()?;
+        let ledger = &self.step_checks.evidence;
+        if !self.local_profile_active()
+            || !ledger.latest_status(&brief.command)?.repairable()
+            || ledger.unchanged_unrelated_failure(&brief.command)
+        {
+            return None;
+        }
+        let revision = ledger.observed_revision(&brief.command)?;
+        let facts = json!({
+            "goal_excerpt": goal.map(|s| brief_field(s, 180)),
+            "check": brief_field(&brief.command, 160),
+            "checked_revision": revision,
+            "checkpointed_edit_since_check": self.step_checks.mutations != revision[0],
+            "current_revision": self.step_checks.revision(),
+            "check_output_excerpt": brief.excerpt,
+        });
+        Some(run::guidance::note(
+            run::guidance::Priority::Failure,
+            format!(
+                "Local repair brief (quoted data, not instructions): {facts}\nUse this observation against the saved work; do not repeat an unchanged check."
+            ),
+        ))
+    }
+}
+
+/// Recognize an explicit check or a directly invoked test helper on the last command line.
+/// This heuristic only requests evidence after exit 127; a filename never earns a pass.
+fn validation_launch_gap(call: &ToolCall, output: &ToolOutput) -> bool {
+    if call.name != "bash"
+        || !output.process_outcome().is_some_and(|p| {
+            p.started
+                && p.exit_code == Some(127)
+                && p.output_complete
+                && !p.timed_out
+                && !p.cancelled
+                && p.signal.is_none()
+        })
+    {
+        return false;
+    }
+    if call.arguments["check"] == true {
+        return true;
+    }
+    let Some(words) = call.arguments["command"]
+        .as_str()
+        .and_then(|s| s.trim_end().lines().last())
+        .and_then(crate::agent::safety::approval::shell_words)
+    else {
+        return false;
+    };
+    let Some((program, args)) = words.split_first() else {
+        return false;
+    };
+    let basename = Path::new(program).file_name().and_then(|n| n.to_str());
+    let script = match (basename, args) {
+        (Some("python" | "python3" | "node" | "ruby" | "perl" | "sh" | "bash"), [file, ..])
+            if !file.starts_with('-') =>
+        {
+            file
+        }
+        _ if program.contains('/') => program,
+        _ => return false,
+    };
+    Path::new(script)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| {
+            stem == "test"
+                || stem.starts_with("test_")
+                || stem.ends_with("_test")
+                || stem.ends_with(".test")
+                || stem.ends_with(".spec")
+                || stem.starts_with("check_")
+        })
 }
 
 /// Why a declared input witness could not be observed. Never a code-failure diagnosis.
@@ -187,9 +314,14 @@ impl<'a> Agent<'a> {
         &self,
         checks: &[verify::verification::FocusedCheck],
     ) -> Vec<Option<verify::inputs::Snapshot>> {
+        let mut runtime = None;
         checks
             .iter()
-            .map(|check| self.check_inputs(check))
+            .map(|check| {
+                self.capture_check_inputs_sharing(check, &mut runtime)
+                    .ok()
+                    .flatten()
+            })
             .collect()
     }
 
@@ -197,20 +329,32 @@ impl<'a> Agent<'a> {
         &mut self,
         check: &verify::verification::FocusedCheck,
     ) -> bool {
+        self.reuse_check_with_capture(check, None)
+    }
+
+    fn reuse_check_with_capture(
+        &mut self,
+        check: &verify::verification::FocusedCheck,
+        capture: Option<verify::inputs::Snapshot>,
+    ) -> bool {
         let started = Instant::now();
-        let reused = self.reuse_check_inner(check);
+        let reused = self.reuse_check_inner(check, capture);
         self.efficiency_metrics
             .backend_operation("check_reuse", started.elapsed());
         reused
     }
 
-    fn reuse_check_inner(&mut self, check: &verify::verification::FocusedCheck) -> bool {
+    fn reuse_check_inner(
+        &mut self,
+        check: &verify::verification::FocusedCheck,
+        capture: Option<verify::inputs::Snapshot>,
+    ) -> bool {
         if self.interrupt.load(Ordering::SeqCst)
             || !self.step_checks.evidence.has_inputs(&check.command)
         {
             return false;
         }
-        let Some(inputs) = self.check_inputs(check) else {
+        let Some(inputs) = capture.or_else(|| self.check_inputs(check)) else {
             self.step_checks.evidence.validate_inputs(
                 &check.command,
                 None,
@@ -259,6 +403,7 @@ impl<'a> Agent<'a> {
         output: &ToolOutput,
         ui: &mut dyn Ui,
     ) {
+        self.step_checks.validation_launch_gap |= validation_launch_gap(call, output);
         self.note_verification_verdict(call, output, ui, None);
     }
 
@@ -328,6 +473,9 @@ impl<'a> Agent<'a> {
         });
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
+        if passed {
+            ui.check_passed();
+        }
         // A previous run made before any edit, shell effect or extension effect of this
         // instruction describes the code the user handed over: keep it as the command's
         // baseline. A debugging request is about such a failure, so it never becomes one.
@@ -346,7 +494,22 @@ impl<'a> Agent<'a> {
         self.step_checks
             .evidence
             .bind_evidence_ref(command, evidence_ref);
-        self.step_checks.evidence.diagnose(command, &output.text);
+        let text = verify::verification::classification_text(output, self.workspace.artifacts());
+        self.step_checks
+            .evidence
+            .diagnose(command, text.as_deref().unwrap_or_default());
+        if verdict.repairable()
+            && self.local_profile_active()
+            && !self
+                .step_checks
+                .evidence
+                .unchanged_unrelated_failure(command)
+        {
+            self.step_checks.repair_brief = Some(RepairBrief::new(
+                command,
+                text.as_deref().unwrap_or_default(),
+            ));
+        }
         if !self.hermetic
             && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral)
             && let Some(cache) = self.codebase.clone()
@@ -441,41 +604,22 @@ impl<'a> Agent<'a> {
         }
     }
 
-    pub(in crate::agent) fn run_focused_check(
+    /// Display and authorize each check on the controller. Group admission is never authority.
+    fn focused_check_refusal(
         &mut self,
-        check: &crate::agent::verify::verification::FocusedCheck,
+        check: &verify::verification::FocusedCheck,
+        call: &ToolCall,
         ui: &mut dyn Ui,
-    ) -> ToolOutput {
-        self.drain_background_check(ui, true);
-        let args = json!({"command":check.command,"timeout":check.timeout_secs});
-        let inputs_before = self.capture_check_inputs(check);
-        let revision_before = self.step_checks.revision();
-        let coverage = (self.config.experimental.changed_line_coverage
-            && self.step_checks.mutations > 0
-            && self.behavioral_check(&check.name)
-            && !self.step_checks.evidence.is_repro(&check.command))
-        .then(|| self.turn_versions_now())
-        .flatten()
-        .and_then(|versions| verify::coverage::prepare(self.workspace.root(), &versions))
-        .and_then(|probe| {
-            let wrapped = probe.wrap(&self.workspace, &check.command)?;
-            Some((probe, wrapped))
-        });
-        // Collectors are injected through the environment; evidence keeps the declared command.
-        let run_args = coverage.as_ref().map_or_else(
-            || args.clone(),
-            |(_, wrapped)| json!({"command":wrapped,"timeout":check.timeout_secs}),
-        );
+    ) -> Option<ToolOutput> {
         // Long generated commands (an interpreter path plus inline code) say nothing the check name does not.
         let title = if check.command.len() <= 80 {
             format!("Verify {}: {}", check.name, check.command)
         } else {
             format!("Verify {}", check.name)
         };
-        let call_id = format!("focused-check:{}", check.name);
-        let mut display = args.clone();
+        let mut display = call.arguments.clone();
         display["_dial_check"] = json!(check.name);
-        ui.tool_call_with_args(&call_id, "bash", &title, &display);
+        ui.tool_call_with_args(&call.id, "bash", &title, &display);
         // Hermetic evaluation runs keep their trusted, non-prompting policy; explicit deny rules still hold.
         let approval = if self.plan_mode {
             crate::config::types::Approval::Readonly
@@ -513,8 +657,7 @@ impl<'a> Agent<'a> {
             ui,
             Some(self.interrupt.as_ref()),
         );
-        let started = Instant::now();
-        let output = match gate {
+        match gate {
             Ok(persist) => {
                 if persist && let Err(error) = self.persist_permissions() {
                     ui.notice(&format!(
@@ -522,14 +665,16 @@ impl<'a> Agent<'a> {
                     ));
                 }
                 if (repro || model_registered)
-                    && let Some(reason) = self.repro_hook_refusal(&args, ui)
+                    && let Some(reason) = self.repro_hook_refusal(&call.arguments, ui)
                 {
                     ui.notice(&reason);
-                    crate::runtime::tool_output::ToolOutput::err(format!(
-                        "automatic check {} not run: {reason}",
-                        check.name
-                    ))
-                    .with_status(crate::tools::ToolStatus::Blocked)
+                    Some(
+                        ToolOutput::err(format!(
+                            "automatic check {} not run: {reason}",
+                            check.name
+                        ))
+                        .with_status(crate::tools::ToolStatus::Blocked),
+                    )
                 } else {
                     if (repro || model_registered)
                         && !crate::agent::safety::approval::safe_bash(&check.command)
@@ -537,18 +682,52 @@ impl<'a> Agent<'a> {
                     {
                         self.step_checks.note_repro_run();
                     }
-                    // A check must finish to verify anything; it is never auto-backgrounded.
-                    self.run_foreground_tool("bash", &run_args, ui)
-                        .unwrap_or_else(|| {
-                            tools::execute(&self.workspace, "bash", &run_args, check.timeout_secs)
-                        })
+                    None
                 }
             }
             Err(denial) => {
                 ui.notice(denial.message());
-                crate::agent::safety::approval::denied_check_output(&check.name, &denial)
+                Some(crate::agent::safety::approval::denied_check_output(
+                    &check.name,
+                    &denial,
+                ))
             }
-        };
+        }
+    }
+
+    pub(in crate::agent) fn run_focused_check(
+        &mut self,
+        check: &verify::verification::FocusedCheck,
+        ui: &mut dyn Ui,
+    ) -> ToolOutput {
+        self.drain_background_check(ui, true);
+        let call = focused_check_call(check);
+        let inputs_before = self.capture_check_inputs(check);
+        let revision_before = self.step_checks.revision();
+        let coverage = (self.config.experimental.changed_line_coverage
+            && self.step_checks.mutations > 0
+            && self.behavioral_check(&check.name)
+            && !self.step_checks.evidence.is_repro(&check.command))
+        .then(|| self.turn_versions_now())
+        .flatten()
+        .and_then(|versions| verify::coverage::prepare(self.workspace.root(), &versions))
+        .and_then(|probe| {
+            let wrapped = probe.wrap(&self.workspace, &check.command)?;
+            Some((
+                probe,
+                json!({"command":wrapped,"timeout":check.timeout_secs}),
+            ))
+        });
+        let refusal = self.focused_check_refusal(check, &call, ui);
+        let started = Instant::now();
+        // Collectors are injected through the environment; evidence keeps the declared command.
+        let args = coverage.as_ref().map_or(&call.arguments, |(_, args)| args);
+        let output = refusal.unwrap_or_else(|| {
+            self.run_foreground_tool("bash", args, ui)
+                .unwrap_or_else(|| {
+                    tools::execute(&self.workspace, "bash", args, check.timeout_secs)
+                })
+        });
         let coverage_line = coverage
             .as_ref()
             .and_then(|(probe, _)| probe.report(&check.name));
@@ -563,6 +742,116 @@ impl<'a> Agent<'a> {
             output.text.push_str(&line);
         }
         output
+    }
+
+    /// Run a bounded consecutive prefix of independently admitted inspections. Input contracts
+    /// describe reads, not side effects: even two disjoint contracts do not make arbitrary test
+    /// commands compatible. Unknown shell effects, probes and registered commands stay serial.
+    pub(super) fn run_check_prefix(
+        &mut self,
+        checks: &[verify::verification::FocusedCheck],
+        allow_reuse: bool,
+        ui: &mut dyn Ui,
+    ) -> VecDeque<ToolOutput> {
+        let mut results = VecDeque::new();
+        if self.hermetic
+            || self.plan_mode
+            || self.config.experimental.changed_line_coverage
+            || checks.len() < 2
+        {
+            return results;
+        }
+        self.drain_background_check(ui, true);
+        let mut candidates: Vec<(&verify::verification::FocusedCheck, ToolCall)> = Vec::new();
+        for check in checks.iter().take(
+            self.effective_config()
+                .task
+                .parallel_read_limit()
+                .min(MAX_FOREGROUND_CHECKS),
+        ) {
+            if self.interrupt.load(Ordering::SeqCst)
+                || self.step_checks.evidence.is_repro(&check.command)
+                || self
+                    .step_checks
+                    .registered_acceptance
+                    .iter()
+                    .any(|prior| prior.command == check.command)
+                || (allow_reuse && self.step_checks.evidence.has_inputs(&check.command))
+                || !self.config.verification.inputs.contains_key(&check.name)
+                || candidates
+                    .iter()
+                    .any(|(prior, _)| prior.name == check.name || prior.command == check.command)
+            {
+                break;
+            }
+            let mut call = focused_check_call(check);
+            // Explicit zero-only exit semantics preserve the normal verdict and tell the bash
+            // runner not to hand a still-running inspection to bg on timeout or steering.
+            call.arguments["expected_exit_codes"] = json!([0]);
+            if crate::agent::run::dependency_dispatch::footprint_for(
+                &self.workspace,
+                self.edit_mode(),
+                &self.ext,
+                &call,
+            )
+            .is_none_or(|footprint| footprint.writes())
+            {
+                break;
+            }
+            candidates.push((check, call));
+        }
+        if candidates.len() < 2 {
+            return results;
+        }
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map_while(|(check, call)| {
+                self.capture_check_inputs(check)
+                    .ok()
+                    .flatten()
+                    .map(|inputs| (check, call, inputs))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return results;
+        }
+        let revision = self.step_checks.revision();
+        let mut calls = Vec::new();
+        let mut entries = Vec::new();
+        for (check, call, inputs) in candidates {
+            let refused = if self.interrupt.load(Ordering::SeqCst) {
+                Some(crate::agent::run::dispatch::interrupted_tool())
+            } else {
+                self.focused_check_refusal(check, &call, ui)
+            };
+            if refused.is_none() {
+                calls.push(call);
+            }
+            entries.push((check, inputs, Instant::now(), refused));
+        }
+        let mut ran = if calls.is_empty() {
+            Vec::new()
+        } else {
+            self.run_background_tools(&calls, ui, None, None)
+                .unwrap_or_default()
+        }
+        .into_iter();
+        for (check, inputs, started, refused) in entries {
+            let output = refused
+                .or_else(|| ran.next().map(|(output, _)| output))
+                .unwrap_or_else(|| {
+                    ToolOutput::err("focused verification worker returned no completion")
+                });
+            results.push_back(self.settle_focused_check(
+                check,
+                Ok(Some(inputs)),
+                revision,
+                started,
+                output,
+                ui,
+            ));
+        }
+        results
     }
 
     /// Bind only the native capture belonging to this result. Rendered text can be filtered,
@@ -750,7 +1039,8 @@ impl<'a> Agent<'a> {
             })
             .filter_map(|check| {
                 let inputs = self.capture_check_inputs(&check).ok().flatten()?;
-                (!self.reuse_check(&check)).then_some((check, inputs))
+                let reused = self.reuse_check_with_capture(&check, Some(inputs.clone()));
+                (!reused).then_some((check, inputs))
             })
             .take(slots)
             .collect();
@@ -1053,11 +1343,18 @@ impl<'a> Agent<'a> {
         }
     }
     pub(in crate::agent) fn publish_edit_loop_status(&mut self, ui: &mut dyn Ui) {
+        self.publish_edit_loop_results(ui, None);
+    }
+
+    pub(super) fn publish_edit_loop_results(&mut self, ui: &mut dyn Ui, results: Option<&[Value]>) {
         if self.hermetic {
             return;
         }
         let mut control = self.session.control_state();
         control["reliability"]["edit_loop"] = self.step_checks.status();
+        if let Some(results) = results {
+            control["reliability"]["verification_results"] = json!(results);
+        }
         if let Err(error) = self.session.set_control_state(control.clone()) {
             ui.diagnostic(&format!("could not save edit-loop status: {error:#}"));
         }
@@ -1122,8 +1419,9 @@ impl<'a> Agent<'a> {
             Default::default()
         };
         let source_before = receipts.then(|| self.verification_source_identity(&receipt_paths));
+        let mut grouped = VecDeque::new();
         for (index, check) in checks.iter().enumerate() {
-            if self.interrupt.load(Ordering::SeqCst) {
+            if grouped.is_empty() && self.interrupt.load(Ordering::SeqCst) {
                 for skipped in &checks[index..] {
                     self.step_checks
                         .failed_checks
@@ -1147,7 +1445,7 @@ impl<'a> Agent<'a> {
                 failures.push(format!("{} not run: verification interrupted", check.name));
                 break;
             }
-            if self.reuse_check(check) {
+            if grouped.is_empty() && self.reuse_check(check) {
                 self.step_checks
                     .failed_checks
                     .retain(|failed| failed.command != check.command);
@@ -1164,7 +1462,12 @@ impl<'a> Agent<'a> {
                 ));
                 continue;
             }
-            let output = self.run_focused_check(check, ui);
+            if grouped.is_empty() {
+                grouped = self.run_check_prefix(&checks[index..], true, ui);
+            }
+            let output = grouped
+                .pop_front()
+                .unwrap_or_else(|| self.run_focused_check(check, ui));
             if output
                 .execution
                 .process
@@ -1617,33 +1920,52 @@ impl<'a> Agent<'a> {
             || self.step_checks.mutations == 0)
     }
 
-    /// The applicable checks when this turn's file edits have no passing check on the current
-    /// revision. `None` when no evidence is owed: nothing was edited, no check applies, automatic
-    /// checks verify after the turn anyway, a relevant `check` or shell test command passed, or
-    /// every applicable check either passed or failed for a disclosed reason (`disclosed_failure`).
-    pub(in crate::agent) fn unverified_edits(&mut self) -> Option<Vec<String>> {
+    /// Don't invent a check for ordinary edits. If a validation helper could not run, a
+    /// standalone deliverable with no automatic check still needs a current check or a blocker.
+    pub(in crate::agent) fn unchecked_after_launch_gap(&self) -> bool {
+        if !self.step_checks.validation_launch_gap
+            || !self.config.verification.enabled
+            || self.hermetic
+            || self.plan_mode
+            || self.step_checks.mutations == 0
+        {
+            return false;
+        }
+        let revision = self.step_checks.revision();
+        self.step_checks.shell_check_passed != Some(revision)
+            && self.step_checks.evidence.passing_behavioral(revision) == 0
+            && self.current_focused_checks().is_empty()
+    }
+
+    /// Describe each applicable check from one selection and one refreshed evidence snapshot.
+    fn current_gate_outcome(&mut self) -> GateOutcome {
+        let mut gate = GateOutcome::default();
         if !self.unverified_edits_apply() {
-            return None;
+            return gate;
         }
         self.refresh_check_inputs();
         let revision = self.step_checks.revision();
-        if self.step_checks.shell_check_passed == Some(revision) {
-            return None;
-        }
-        let checks = self.current_focused_checks();
-        let passed = |check: &crate::agent::verify::verification::FocusedCheck| {
-            self.step_checks
+        let diagnosis = self.diagnosis_requested();
+        for check in self.current_focused_checks() {
+            if self
+                .step_checks
                 .evidence
                 .current_status(&check.command, revision)
                 == "passed"
-        };
-        let diagnosis = self.diagnosis_requested();
-        let observed = checks.iter().any(passed)
-            || checks
-                .iter()
-                .all(|check| passed(check) || self.disclosed_failure(check, diagnosis).is_some());
-        (!checks.is_empty() && !observed)
-            .then(|| checks.into_iter().map(|check| check.name).collect())
+            {
+                gate.has_pass = true;
+            } else if self.disclosed_failure(&check, diagnosis).is_none() {
+                gate.blocking |= self
+                    .step_checks
+                    .failed_checks
+                    .iter()
+                    .any(|failed| failed.command == check.command);
+                gate.unverified
+                    .get_or_insert_with(Vec::new)
+                    .push(check.name);
+            }
+        }
+        gate
     }
 
     /// The completion gate's evidence question. `unverified` is the still-unverified set after any
@@ -1654,42 +1976,17 @@ impl<'a> Agent<'a> {
         run: bool,
         ui: &mut dyn Ui,
     ) -> GateOutcome {
-        let unverified = self.unverified_edits();
-        if !run || unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
-            return GateOutcome {
-                unverified,
-                blocking: self.blocking_failure(),
-                failures: Vec::new(),
-            };
+        let gate = self.current_gate_outcome();
+        if !run || gate.unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
+            return gate;
         }
         let checks = self.current_focused_checks();
         let failures = self.run_checks(&checks, ui).failures;
-        let blocking = self.blocking_failure();
-        GateOutcome {
-            // Derived after the run: a check that just passed no longer counts as unverified.
-            unverified: self.unverified_edits(),
-            blocking,
-            failures: if blocking { failures } else { Vec::new() },
+        let mut gate = self.current_gate_outcome();
+        if gate.blocking {
+            gate.failures = failures;
         }
-    }
-
-    /// Whether an applicable check that failed on the current revision is still undisclosed. Stale
-    /// failures do not block (`disclosed_failure` treats them as not observed), and a shell test
-    /// that passed on this revision already answers the question.
-    fn blocking_failure(&self) -> bool {
-        if !self.unverified_edits_apply()
-            || self.step_checks.shell_check_passed == Some(self.step_checks.revision())
-        {
-            return false;
-        }
-        let diagnosis = self.diagnosis_requested();
-        self.current_focused_checks().iter().any(|check| {
-            self.step_checks
-                .failed_checks
-                .iter()
-                .any(|failed| failed.command == check.command)
-                && self.disclosed_failure(check, diagnosis).is_none()
-        })
+        gate
     }
 
     /// One completion boundary for plain reports and explicit finish calls. Pumps worker results

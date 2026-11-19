@@ -237,6 +237,21 @@ class TraceTests(unittest.TestCase):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_manual_or_metric_only_cases_cannot_establish_nonregression(self):
+        for manual in (True, False):
+            with self.subTest(manual=manual):
+                cases = task_cases((True, True, True))
+                for case in cases:
+                    if manual:
+                        case["evidence"]["categories"] = ["answer_requires_manual_review"]
+                    else:
+                        case["evidence"]["outcome_checks"] = 0
+                result = summarize_tools(machine({"baseline": cases}))
+                comparison = result["comparisons"][0]
+                self.assertIsNone(comparison["observed_correctness_nonregressing"])
+                self.assertEqual(comparison["matched_success_tasks"], [])
+                self.assertIsNone(comparison["matched_success_ratios"]["elapsed_ms_median"])
+
     def test_matched_success_comparison_excludes_regressed_and_uncertain_tasks(self):
         baseline = machine({"baseline": task_cases((True, True, True), calls=6, elapsed=200)})
         baseline["configurations"].append({"configuration": {"name": "candidate"}, "report": copy.deepcopy(

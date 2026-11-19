@@ -284,7 +284,7 @@ pub fn run(layout: &Layout, config: &Config, options: RunOptions<'_>) -> Result<
         println!("{}", String::from_utf8(bytes)?);
     }
     if !invalid.is_empty() {
-        return Err(invalid_run_error(layout, &invalid));
+        return Err(invalid_run_error(layout, &invalid, share_auth));
     }
     if regressed {
         bail!(
@@ -297,22 +297,25 @@ pub fn run(layout: &Layout, config: &Config, options: RunOptions<'_>) -> Result<
 /// Subscription sign-ins hold rotating refresh tokens, so isolated benchmark homes never copy them.
 const UNCOPIED_SIGN_INS: [&str; 2] = ["anthropic-subscription.json", "chatgpt-accounts.json"];
 
-fn invalid_run_error(layout: &Layout, reasons: &[String]) -> anyhow::Error {
+fn invalid_run_error(layout: &Layout, reasons: &[String], share_auth: bool) -> anyhow::Error {
     let mut message = format!(
         "benchmark run is invalid; the report was still emitted but its scores are not measurements:\n  {}",
         reasons.join("\n  ")
     );
-    if reasons.iter().any(|reason| {
+    let missing_sign_in = reasons.iter().any(|reason| {
         reason.contains("credentials are missing")
             || reason.contains("Continue with ChatGPT")
             || reason.contains("subscription sign-in")
-    }) && UNCOPIED_SIGN_INS
-        .iter()
-        .any(|file| dial::config::paths::auth_file(&layout.user_dir, file).is_file())
-    {
-        message.push_str(
-            "\nhint: benchmark agents use an isolated DIAL_HOME. Pass --share-auth to use existing subscription sign-ins and their original refresh locks without copying tokens; API-key credentials remain supported.",
-        );
+    });
+    if missing_sign_in {
+        let signed_in = UNCOPIED_SIGN_INS
+            .iter()
+            .any(|file| dial::config::paths::auth_file(&layout.user_dir, file).is_file());
+        message.push_str(match (share_auth, signed_in) {
+            (false, true) => "\nhint: --isolated-auth keeps subscription sign-ins out of benchmark runs. Drop it to use existing sign-ins in place (tokens are never copied); API-key credentials work either way.",
+            (true, _) => "\nhint: benchmarks use your existing subscription sign-ins; sign in again with `/providers` in dial (or `dial login`), or configure an API key or a local model.",
+            (false, false) => "",
+        });
     }
     anyhow::anyhow!(message)
 }
@@ -562,7 +565,7 @@ pub fn run_assist(
         println!("{}", String::from_utf8(bytes)?);
     }
     if !report.invalid_runs.is_empty() {
-        return Err(invalid_run_error(layout, &report.invalid_runs));
+        return Err(invalid_run_error(layout, &report.invalid_runs, share_auth));
     }
     Ok(())
 }

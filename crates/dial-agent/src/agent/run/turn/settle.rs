@@ -217,12 +217,12 @@ impl Agent<'_> {
                 advice,
             ));
         }
-        if !short_circuited && let Some(advice) = turn.pace.round(&reply.tool_calls) {
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Loop,
-                advice,
-            ));
-        }
+        // A round in which work was withheld is not evidence of serial lookups.
+        turn.pace.observe_round(if short_circuited {
+            &[]
+        } else {
+            &reply.tool_calls
+        });
         let gradient_rounds = self.config.experimental.outcome_gradient_rounds;
         if round_checked && self.step_checks.mutations > 0 {
             let score = self.step_checks.failed_checks.len()
@@ -506,6 +506,10 @@ impl Agent<'_> {
             // Past a deadline or cost cap the answer is delivered without another coach call.
             let reviewable = self.stop_boundary().is_none();
             if finish.outcome == TurnOutcome::Completed {
+                if reviewable && let Some(message) = self.quality_review(ui)? {
+                    turn.pending_nudges.push(message);
+                    return Ok(crate::agent::run::engine::Tick::Again);
+                }
                 if reviewable
                     && let Some(message) = self.coach_completion(
                         &mut turn.coach_turn,

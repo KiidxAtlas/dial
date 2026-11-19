@@ -1,5 +1,44 @@
 use super::*;
 #[test]
+fn controller_calls_with_structured_arguments_get_readable_cards() {
+    let call = |name: &str, args: Value| {
+        let view = render_call(name, &args);
+        (view.label, view.target)
+    };
+    use serde_json::json;
+    assert_eq!(
+        call(
+            "verify",
+            json!({"targets":["calc regression","tests/a.rs"]})
+        ),
+        ("Verify".into(), "calc regression, tests/a.rs".into())
+    );
+    assert_eq!(
+        call(
+            "verify",
+            json!({"repro":{"name":"calc","command":"pytest -q"}})
+        ),
+        ("Verify".into(), "repro: calc".into())
+    );
+    assert_eq!(
+        call(
+            "verify",
+            json!({"acceptance":{"name":"page","command":"curl x"}})
+        ),
+        ("Verify".into(), "acceptance: page".into())
+    );
+    assert_eq!(call("verify", json!({"plan":true})).1, "plan");
+    assert_eq!(call("verify", json!({})).1, "selected checks");
+    assert_eq!(
+        call("verify", json!({"targets":["failed"]})).1,
+        "rerun failed checks"
+    );
+    assert_eq!(
+        call("finish", json!({"outcome":"completed","summary":"done"})),
+        ("Finish".into(), "completed".into())
+    );
+}
+#[test]
 fn coherent_runtime_batched_reads_and_patch_targets_use_the_tool_contract() {
     assert_eq!(
         render_call(

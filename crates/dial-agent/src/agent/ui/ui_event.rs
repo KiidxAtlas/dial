@@ -109,6 +109,35 @@ pub enum BackgroundWait {
     },
 }
 
+/// Why the main model route changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchReason {
+    /// The primary failed and a configured fallback took over.
+    Fallback,
+    /// A fallback's cooldown ended and the primary returned.
+    Restore,
+    /// The context outgrew the window and a larger-window model took over instead of compacting.
+    Promotion,
+    /// Prewalk handed the turn to its target model after the first tool call.
+    Prewalk,
+}
+
+/// Structured facts behind an event, so a rich surface can draw a card instead of a sentence.
+/// The event's text stays the authoritative wording; this only names its parts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventDetail {
+    /// The main model route changed. `from` is absent when the earlier route is not known.
+    ModelSwitch {
+        from: Option<String>,
+        to: String,
+        reason: SwitchReason,
+    },
+    /// An advisor review: its severity word and its note. Advice, never a verified finding.
+    Review { severity: String, note: String },
+}
+
 /// One controller event.
 #[derive(Clone, Debug, Serialize)]
 pub struct UiEvent {
@@ -120,6 +149,8 @@ pub struct UiEvent {
     pub tokens: Option<(u64, u64)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_wait: Option<BackgroundWait>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<EventDetail>,
 }
 
 impl UiEvent {
@@ -129,6 +160,7 @@ impl UiEvent {
             text: text.into(),
             tokens: None,
             background_wait: None,
+            detail: None,
         }
     }
 
@@ -139,6 +171,11 @@ impl UiEvent {
 
     pub fn with_background_wait(mut self, wait: BackgroundWait) -> Self {
         self.background_wait = Some(wait);
+        self
+    }
+
+    pub fn with_detail(mut self, detail: EventDetail) -> Self {
+        self.detail = Some(detail);
         self
     }
 }

@@ -94,7 +94,7 @@ fn go_entries_run_the_package_with_an_anchored_filter() {
     std::fs::create_dir(root.path().join("calc")).unwrap();
     std::fs::write(root.path().join("calc/calc_test.go"), "").unwrap();
     let check = entry(root.path(), "calc/calc_test.go::TestDiv").unwrap();
-    assert_eq!(check.command, "go test './calc' -run '^TestDiv$'");
+    assert_eq!(check.command, "go test -count=1 './calc' -run '^TestDiv$'");
 }
 
 #[test]
@@ -122,4 +122,42 @@ fn counts_come_from_each_runner_summary() {
         );
     }
     assert_eq!(test_counts("all good"), None);
+}
+
+#[test]
+fn javascript_entries_use_literal_jest_paths_and_nested_go_entries_use_their_module() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"scripts":{"test":"jest"}}"#,
+    )
+    .unwrap();
+    let executable = if cfg!(windows) { "jest.cmd" } else { "jest" };
+    std::fs::write(root.path().join("node_modules/.bin").join(executable), "").unwrap();
+    std::fs::write(root.path().join("calc.test.ts"), "").unwrap();
+    let js = entry(root.path(), "calc.test.ts::divides").unwrap();
+    assert!(
+        js.command
+            .ends_with("--runInBand --runTestsByPath 'calc.test.ts' -t 'divides'"),
+        "{}",
+        js.command
+    );
+    std::fs::create_dir(root.path().join("service")).unwrap();
+    std::fs::write(
+        root.path().join("service/go.mod"),
+        "module example.com/service\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("service/calc_test.go"),
+        "package service\n",
+    )
+    .unwrap();
+    assert_eq!(
+        entry(root.path(), "service/calc_test.go::TestDiv")
+            .unwrap()
+            .command,
+        "cd 'service' && go test -count=1 '.' -run '^TestDiv$'"
+    );
 }

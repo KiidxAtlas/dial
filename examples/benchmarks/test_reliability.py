@@ -104,6 +104,28 @@ class ReliabilityTests(unittest.TestCase):
         self.assertLess(lower, 2 / 3)
         self.assertGreater(upper, 2 / 3)
 
+    def test_per_success_costs_include_failed_attempts_and_keep_unknown_usage_unknown(self):
+        payload = machine((True, False, True))
+        cases = summarize_input_cases(payload)
+        cases[1]["metrics"].update(elapsed_ms=1000, prompt_tokens=90, output_tokens=10)
+        task = summarize(payload)["configurations"][0]["tasks"][0]
+        self.assertEqual(task["successful_trial_median_ms"], 100)
+        self.assertEqual(task["elapsed_ms_per_success"], 600)
+        self.assertEqual(task["observed_tokens_per_success"], 80)
+        cases[1]["metrics"]["token_usage_incomplete"] = True
+        task = summarize(payload)["configurations"][0]["tasks"][0]
+        self.assertIsNone(task["observed_tokens_per_success"])
+        self.assertEqual(task["elapsed_ms_per_success"], 600)
+
+    def test_no_checked_success_has_no_amortized_success_estimate(self):
+        for payload in (machine((False, False, False)), machine()):
+            for case in summarize_input_cases(payload):
+                if case["passed"]:
+                    case["evidence"]["categories"] = ["answer_requires_manual_review"]
+            task = summarize(payload)["configurations"][0]["tasks"][0]
+            self.assertIsNone(task["elapsed_ms_per_success"])
+            self.assertIsNone(task["observed_tokens_per_success"])
+
     def test_fast_failure_cannot_be_presented_as_latency_win(self):
         result = summarize(machine(candidate=(True, False, True)))
         comparison = result["comparisons"][1]

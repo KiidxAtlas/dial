@@ -62,7 +62,7 @@ still assign an explicit child model.
 Ctrl-C interrupts silent HTTP response reads without replacing the configured inference deadline with
 a short timeout. Connection establishment and partial writes still use their configured deadlines.
 
-RPC `state` replies come from one worker-owned projection, the same one the worker uses, and never include message history; read `messages` or `messages_page` for history. Typed RPC `notice` events keep their plain `message` and add `kind`, `lane` (`context`, `divider` or `alert`) and `tokens` as additive fields. Plain notices remain valid without these fields.
+RPC `state` replies come from one worker-owned projection, the same one the worker uses, and never include message history; read `messages` or `messages_page` for history. Typed RPC `notice` events keep their plain `message` and add `kind`, `lane` (`context`, `divider` or `alert`), `tokens` and, when the engine has them, `detail` as additive fields. `detail` is tagged by `type`: `model_switch` carries `from` (null when unknown), `to` and `reason` (`fallback`, `restore`, `promotion` or `prewalk`); `review` carries the advisor's `severity` and `note`, which are advice and never verified. Plain notices remain valid without these fields.
 
 `messages_page` accepts an unsigned `offset` or a decimal-string `cursor` (offset takes precedence),
 and an unsigned `limit` defaulting to 50 and clamped to 1–500. Invalid types, malformed cursors and

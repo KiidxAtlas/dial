@@ -1468,7 +1468,10 @@ impl Config {
             .filter(|&&(role, _)| role != TURN_DRAFTER || self.experimental.turn_optimizer)
             .map(|&(role, _)| {
                 let assigned = if role == "main" {
-                    Some(self.selection())
+                    // Main's level lives in its profile or `thinking_auto`; carry it with the row.
+                    let mut main = self.selection();
+                    main.thinking = thinking::main_level(self);
+                    Some(main)
                 } else {
                     self.model_roles.get(role).cloned()
                 };

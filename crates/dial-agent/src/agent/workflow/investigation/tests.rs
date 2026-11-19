@@ -758,3 +758,60 @@ fn a_changed_file_reads_only_its_changed_lines_unless_fresh() {
     assert!(full.text.contains("11:code 11"), "{}", full.text);
     assert!(full.data.is_none());
 }
+
+fn anchored(header: &str, rows: std::ops::RangeInclusive<u32>) -> String {
+    let mut text = format!("[{header}]\n[Source raw SHA256:{}]\n", "a".repeat(64));
+    for n in rows {
+        text.push_str(&format!("{n}:line {n}\n"));
+    }
+    text
+}
+
+fn rust_only(path: &str) -> bool {
+    path.ends_with(".rs")
+}
+
+#[test]
+fn a_large_read_of_a_parseable_file_suggests_outline_or_symbol_first() {
+    let read = call("read", json!({"path":"src/big.rs:1-400"}));
+    let hint = large_read_hint(&read, &anchored("src/big.rs#1A2B", 1..=400), rust_only).unwrap();
+    assert!(hint.starts_with("[hint] "), "{hint}");
+    assert!(!hint.contains('\n'), "{hint}");
+    assert!(hint.contains("400 lines of src/big.rs"), "{hint}");
+    assert!(hint.contains("`src/big.rs:outline`"), "{hint}");
+    // Several ranges of one section count together; the threshold is inclusive.
+    let mut split = anchored("src/big.rs#1A2B", 1..=150);
+    split.push_str("…\n");
+    for n in 500..=649 {
+        split.push_str(&format!("{n}:line\n"));
+    }
+    let read = call("read", json!({"path":"src/big.rs:1-150,500-649"}));
+    assert!(large_read_hint(&read, &split, rust_only).is_some());
+}
+
+#[test]
+fn small_reads_unparseable_files_and_declaration_reads_get_no_hint() {
+    let read = call("read", json!({"path":"src/small.rs:1-299"}));
+    assert!(large_read_hint(&read, &anchored("src/small.rs#1A2B", 1..=299), rust_only).is_none());
+    let notes = call("read", json!({"path":"NOTES.md"}));
+    assert!(large_read_hint(&notes, &anchored("NOTES.md#1A2B", 1..=900), rust_only).is_none());
+    for path in ["src/big.rs:sym=run", "src/big.rs:outline=run"] {
+        let read = call("read", json!({ "path": path }));
+        assert!(
+            large_read_hint(&read, &anchored("src/big.rs#1A2B", 1..=900), rust_only).is_none(),
+            "{path}"
+        );
+    }
+    let batch = call("read", json!({"paths":["a.rs:sym=x","src/big.rs"]}));
+    assert!(large_read_hint(&batch, &anchored("src/big.rs#1A2B", 1..=900), rust_only).is_none());
+}
+
+#[test]
+fn a_batch_names_the_large_file_and_a_hinted_result_still_parses_as_rows() {
+    let batch = call("read", json!({"paths":["src/a.rs","src/big.rs"]}));
+    let text = anchored("src/a.rs#0001", 1..=20) + &anchored("src/big.rs#0002", 1..=350);
+    let hint = large_read_hint(&batch, &text, rust_only).unwrap();
+    assert!(hint.contains("350 lines of src/big.rs"), "{hint}");
+    let hinted = format!("{text}\n{hint}");
+    assert_eq!(shown_runs(&hinted), shown_runs(&text));
+}

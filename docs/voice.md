@@ -25,6 +25,9 @@ separate toggles, so installing a backend does not turn on the microphone or aut
 - Press once, speak, then pause: recording ends after trailing silence and the transcript is sent as a normal user turn. You can also press again to finish sooner. A short key tap no longer selects hold-to-talk just because the terminal supports key releases.
 - On macOS, terminals that send `√` instead of an Alt key event are supported too: Dial treats that key as Option+V while `Alt+V` is bound to speech input. This reserves typed `√` for the shortcut (even when speech recognition is off); bracketed paste still inserts it literally. Remapping away from `Alt+V` disables this fallback. Other layouts can use `F9` or remap in `/hotkeys`.
 - `voice.stt.backend` picks the recognition program: `auto`, `openai`, `whisper-cpp` (whisper-cli), or `mlx-whisper`.
+- `voice.stt.input_device` (**Microphone**) records from a named microphone, matched exactly or by a unique part of the name System Settings → Sound → Input shows; empty uses the system default. An unknown name fails with the list of available microphones.
+- Each recording first measures the room for 300 ms and treats sound at that level as silence, so steady noise such as a fan is not recorded as speech. Speech must also stay clearly above that level for `voice.stt.min_speech_ms` to be kept; short bursts of noise are dropped before recognition.
+- For better recognition on Apple Silicon, choose **MLX Whisper** as the recognition program: it uses `whisper-large-v3-turbo` (`voice.stt.mlx_whisper_model`). whisper.cpp uses the model file in `voice.stt.whisper_cpp_model` (setup downloads `ggml-base.en.bin`; point it at a larger ggml model to trade speed for accuracy).
 
 ### Speech key behavior
 
@@ -64,6 +67,13 @@ Protocol clients (not the TUI) run hands-free sessions over the RPC control chan
 - `live_start` (optional `voice` and `instructions`) starts a session, replacing any previous one; `[voice.live]` supplies the defaults.
 - `live_mute` (`muted`) silences spoken replies. Muting also stops a reply that is being read.
 - `live_stop` ends the session and stops any reply being read.
+- `live_speak` (`text`) reads `text` aloud, with the session's voice when one is active or the configured `voice.tts` voice otherwise, replacing any reply being read; it works outside a live session and while replies are muted, because the user asked for it. Without `text` it stops reading. Playback is bracketed by `live_speech` events like a spoken reply.
 - `live_listen` records one utterance (ends on silence; needs `voice.stt.enabled`), returns the `transcript`, and runs it as a turn. `abort` cancels the recording.
 
 While a session is active, every `send` text is prefixed with the session `instructions`, and each finished answer is read aloud. A new `send` or `live_listen` stops the reply being read. Speech failures arrive as `live_error` events. Live sessions are not available over ACP.
+
+Two events let a client run a hands-free conversation without polling:
+
+- `live_transcript` (`text`) arrives as soon as `live_listen` has recognized the speech, before the turn it starts runs, so the client can show what was heard while Dial works.
+- `live_speech` (`speaking`) brackets each read-out: `true` when a reply starts being read aloud, then `false` when it ends, whether it finished, was stopped (`cancelled: true`) or failed. A client that listens again after `speaking: false` will not record the reply as the user's speech.
+- `live_level` (`level`, `speech`) reports the microphone about ten times a second while `live_listen` records: `level` is the loudest RMS since the last report (0 is silence; speech is roughly 0.02 to 0.3), and `speech` is true while an utterance is being recorded.

@@ -46,10 +46,11 @@
 	const defineValueMethods = (target, methods, chain) => {
 		for (const method of methods) {
 			defineMethod(target, method, (...args) => callValue(chain(step(method, args))));
+			if (method === "screenshot") defineMethod(target, "capture", target.screenshot);
 		}
 	};
 
-	const windowFields = ["id", "app", "title", "pid", "bounds", "focused"];
+	const windowFields = ["id", "app", "title", "pid", "bounds", "focused", "x", "y", "width", "height"];
 	const windowValueMethods = [
 		"screenshot",
 		"zoom",
@@ -84,7 +85,6 @@
 		"holdKeys",
 		"holdMouse",
 		"displays",
-		"windows",
 		"screenshot",
 		"zoom",
 		"locate",
@@ -152,7 +152,7 @@
 		const via = next => [step("display", [snapshot.id]), next];
 		defineValueMethods(
 			target,
-			desktopValueMethods.filter(method => method !== "displays" && method !== "windows"),
+			desktopValueMethods.filter(method => method !== "displays"),
 			via,
 		);
 		return Object.freeze(target);
@@ -170,6 +170,7 @@
 			defineMethod(nested, method, (...args) => callValue([step(`${namespace}.${method}`, args)]));
 		computer[namespace] = Object.freeze(nested);
 	}
+	computer.windows = async filter => (await callValue([step("windows", [filter])])).map(makeWindow);
 	computer.window = selector => resolveWindow([step("window", [selector])]);
 	computer.focusedWindow = () => resolveWindow([step("focusedWindow", [])]);
 	computer.elementAt = (x, y) => resolveElement([step("elementAt", [x, y])]);

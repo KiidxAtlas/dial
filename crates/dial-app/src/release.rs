@@ -53,6 +53,16 @@ impl Installation {
         }
     }
 
+    /// Stable identifier for machine-readable output (`dial update --check --json`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Homebrew => "homebrew",
+            Self::Cargo => "cargo",
+            Self::Nix => "nix",
+            Self::Script => "installer",
+        }
+    }
+
     /// The package-manager command that updates this installation, when Dial can run it itself.
     /// Dial is not published on crates.io, so a Cargo installation updates from the Git
     /// repository; `tag` pins that to a release.
@@ -94,6 +104,70 @@ pub enum UpdatePlan {
     Checkout(PathBuf),
     /// Dial cannot update this installation itself; the text says what to do instead.
     Manual(String),
+}
+
+impl UpdatePlan {
+    /// Stable identifier for machine-readable output (`dial update --check --json`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::PackageManager(_) => "package_manager",
+            Self::Checkout(_) => "checkout",
+            Self::Manual(_) => "manual",
+        }
+    }
+}
+
+/// What `dial update --check` reports. Serialized as the `--json` contract that frontends such
+/// as Dial Desktop read before running `dial update`; fields are only ever added.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UpdateStatus {
+    /// This executable's version, without a `v`.
+    pub current: String,
+    /// The latest published release, without a `v`; `None` when the check failed.
+    pub latest: Option<String>,
+    /// Whether `latest` is strictly newer than `current`.
+    pub update_available: bool,
+    /// Who owns this executable: `installer`, `homebrew`, `cargo` or `nix`.
+    pub installation: &'static str,
+    /// How `dial update` would update it: `release`, `package_manager`, `checkout` or `manual`.
+    pub method: &'static str,
+    /// Whether `dial update` can update this installation itself.
+    pub can_update: bool,
+    /// `dial update` when it can, otherwise what to do instead.
+    pub update_command: String,
+    /// Why `latest` is unknown.
+    pub error: Option<String>,
+}
+
+/// The update status of an executable installed by `installation`, updated by `plan`, at
+/// `current`, given the latest release tag (or why it could not be read).
+pub fn status(
+    installation: Installation,
+    plan: &UpdatePlan,
+    current: &str,
+    latest: Result<String, String>,
+) -> UpdateStatus {
+    let can_update = !matches!(plan, UpdatePlan::Manual(_));
+    let (latest, error) = match latest {
+        Ok(tag) => (Some(tag.trim_start_matches('v').to_owned()), None),
+        Err(error) => (None, Some(error)),
+    };
+    UpdateStatus {
+        current: current.trim_start_matches('v').to_owned(),
+        update_available: latest
+            .as_deref()
+            .is_some_and(|latest| is_newer(latest, current)),
+        latest,
+        installation: installation.id(),
+        method: plan.method(),
+        can_update,
+        update_command: match plan {
+            UpdatePlan::Manual(how) => how.clone(),
+            _ => "dial update".into(),
+        },
+        error,
+    }
 }
 
 /// Chooses the update method. `verified` is whether release signatures can be checked

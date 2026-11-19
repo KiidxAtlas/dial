@@ -43,6 +43,7 @@ fn byte_selectors_parse_counts_ranges_and_hex() {
     assert_eq!(parse_bytes_spec("0x10-0x1f").unwrap(), (16, Some(16)));
     assert!(parse_bytes_spec("4+0").is_err());
     assert!(parse_bytes_spec("9-3").is_err());
+    assert!(parse_bytes_spec("0-0xffffffffffffffff").is_err());
     assert!(parse_bytes_spec("x").is_err());
 }
 

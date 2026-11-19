@@ -60,3 +60,21 @@ fn unvisited_mentions_are_listed_and_cleared_by_reads() {
     let same = [version("src/lib.rs", after, after)];
     assert!(evaluate(&workspace, &same, &BTreeSet::new()).is_null());
 }
+
+#[test]
+fn deleting_a_declaration_file_keeps_external_callers_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src/caller.rs"), "removed_helper();\n").unwrap();
+    let workspace = Workspace::new(root).unwrap();
+    let deleted = TurnVersion {
+        after: None,
+        ..version("src/api.rs", "pub fn removed_helper() {}\n", "")
+    };
+    let versions = [deleted];
+    let open = evaluate(&workspace, &versions, &BTreeSet::new());
+    assert_eq!(open["status"], "open");
+    assert_eq!(open["unvisited_mentions"][0]["path"], "src/caller.rs");
+    assert_eq!(open["changed_signatures"][0]["name"], "removed_helper");
+}

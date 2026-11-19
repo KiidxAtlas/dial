@@ -135,7 +135,7 @@ impl Shell {
             ),
             tab_scope: String::new(),
             term_activity: Default::default(),
-            awaiting_user: false,
+            awaiting_user: None,
             accept_all_turn_drafts: false,
             turn_output_tokens: 0,
             live_cost: None,

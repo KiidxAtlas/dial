@@ -2,9 +2,13 @@
 use super::*;
 
 /// A named model preset: role assignments, optional vision/checkpoint selections and thinking.
+/// `main` (with its `thinking` level) restores the Conversation model; `roles` holds the helper
+/// roles, each with its own optional `thinking`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelPreset {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main: Option<crate::llm::model_config::ModelSelection>,
     pub roles: BTreeMap<String, crate::llm::model_config::ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::llm::profiles::ReasoningEffort>,

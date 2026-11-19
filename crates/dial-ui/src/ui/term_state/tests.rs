@@ -24,11 +24,19 @@ fn writer(caps: Integration) -> SignalWriter {
 fn waiting_requests_attention_and_pauses_progress_without_coloring_the_tab() {
     let mut writer = writer(iterm(false));
     let out = writer.update(&Signals {
-        activity: Activity::Waiting,
+        activity: Activity::Waiting(Prompt::Approval),
         progress: Progress::Paused,
         ..Default::default()
     });
     assert_eq!(out, "\x1b]1337;RequestAttention=yes\x07\x1b]9;4;4\x07");
+    // Switching prompt kinds changes only the title, not the dock request.
+    let question = Signals {
+        activity: Activity::Waiting(Prompt::Question),
+        progress: Progress::Paused,
+        ..Default::default()
+    };
+    assert!(writer.is_current(&question));
+    assert_eq!(writer.update(&question), "");
     // Failed withdraws attention.
     let out = writer.update(&Signals {
         activity: Activity::Failed,
@@ -80,7 +88,7 @@ fn user_var_values_are_one_bounded_line() {
 fn unsupported_signals_are_never_written() {
     let mut writer = writer(Integration::default());
     let want = Signals {
-        activity: Activity::Waiting,
+        activity: Activity::Waiting(Prompt::Approval),
         progress: Progress::Percent(50),
         cwd: Some("/tmp".into()),
         vars: vec![("dialState", "waiting".into())],
@@ -124,21 +132,30 @@ fn reset_restores_everything_but_the_directory() {
 #[test]
 fn turn_outcomes_map_to_activity() {
     use crate::runtime::Phase;
-    assert_eq!(Activity::after_turn(Phase::Completed), Activity::Done);
-    assert_eq!(Activity::after_turn(Phase::Answered), Activity::Idle);
-    assert_eq!(Activity::after_turn(Phase::NeedsInput), Activity::Waiting);
-    assert_eq!(Activity::after_turn(Phase::Blocked), Activity::Failed);
-    assert_eq!(Activity::after_turn(Phase::Interrupted), Activity::Idle);
+    assert_eq!(Activity::after_turn(Phase::Completed, 0), Activity::Done);
+    assert_eq!(
+        Activity::after_turn(Phase::Completed, 2),
+        Activity::ReviewReady
+    );
+    assert_eq!(Activity::after_turn(Phase::Answered, 0), Activity::Idle);
+    assert_eq!(
+        Activity::after_turn(Phase::NeedsInput, 1),
+        Activity::Waiting(Prompt::Question)
+    );
+    for phase in [Phase::Failed, Phase::Blocked, Phase::Incomplete] {
+        assert_eq!(Activity::after_turn(phase, 1), Activity::Failed);
+    }
+    assert_eq!(Activity::after_turn(Phase::Interrupted, 1), Activity::Idle);
 }
 
 #[test]
 fn the_tab_circle_follows_the_state_and_idle_has_none() {
     assert_eq!(Activity::Idle.marker(), "");
     assert_eq!(Activity::Working.marker(), "\u{1F7E0}");
-    // Every active state has its own circle: input requests are not failures.
+    // The coarse states retain their distinct colors; words distinguish finer states.
     let circles = [
         Activity::Working,
-        Activity::Waiting,
+        Activity::Waiting(Prompt::Question),
         Activity::Done,
         Activity::Failed,
     ]

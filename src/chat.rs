@@ -1,6 +1,7 @@
 use crate::args::Cli;
 use anyhow::{Result, bail};
 use dial::app::{self, Options};
+use dial::cli::session_flags::{self, Selection};
 use dial::config::paths::Layout;
 use dial::config::types::Config;
 use dial::repl::{OutputFormat, PrintExit};
@@ -23,69 +24,20 @@ pub(crate) fn chat(
 
     // `--restore` picks the same session as `--continue`; the restore itself runs in the app.
     let continue_requested = cli.continue_session || cli.restore;
-    let resume_prefix = cli.resume.clone();
-    let flag_session = cli.session_flags.resolve(
-        &layout.project_root,
-        dial::cli::session_flags::Context {
+    let resume_prefix = cli.resume.as_deref();
+    let selection = cli
+        .session_flags
+        .selection(dial::cli::session_flags::Context {
             continue_or_resume: continue_requested || resume_prefix.is_some(),
             no_session: cli.no_session,
             protocol_mode: false,
-        },
-    )?;
-    let session = if let Some(imported) = flag_session {
-        Some(imported)
-    } else if cli.no_session {
-        Some(Session::ephemeral())
-    } else if continue_requested || resume_prefix.is_some() {
-        let wanted = resume_prefix.unwrap_or_default();
-        let catalogue = Session::list_by_activity(&layout, usize::MAX)?;
-        let found = if wanted.is_empty() {
-            // `-c` resumes the most recently active conversation; empty sessions never count.
-            let latest =
-                dial::storage::session::latest_conversation(&catalogue).map(|s| s.path.clone());
-            if latest.is_none() {
-                // A one-shot run that asked to continue must not silently lose its context.
-                if cli.print {
-                    bail!(
-                        "no earlier conversation in this project to continue; drop -c to start a new one"
-                    );
-                }
-                eprintln!("No earlier conversation in this project; starting a new session.");
-            }
-            latest
-        } else {
-            let matches: Vec<_> = catalogue
-                .iter()
-                .filter(|s| s.id.starts_with(&wanted))
-                .collect();
-            if matches.len() > 1 {
-                let ids: Vec<&str> = matches.iter().take(5).map(|s| s.id.as_str()).collect();
-                bail!(
-                    "session prefix {wanted:?} matches {} sessions ({}); use a longer id",
-                    matches.len(),
-                    ids.join(", ")
-                );
-            }
-            matches.first().map(|s| s.path.clone())
-        };
-        match found {
-            Some(path) => match Session::open_or_fork(&layout, &path)? {
-                dial::storage::session::Resumed::Owned(session) => Some(session),
-                dial::storage::session::Resumed::Forked { source_id, session } => {
-                    eprintln!(
-                        "dial: session {source_id} is open in another process; resumed as a fork of it"
-                    );
-                    Some(session)
-                }
-            },
-            None if wanted.is_empty() => None,
-            None => bail!(
-                "no session in this project starts with {wanted:?}; run `dial sessions` to list ids, or `dial -c` to continue the latest"
-            ),
-        }
-    } else {
-        None
-    };
+        })?;
+    if let Some(Selection::Import { source, path: None }) = selection {
+        bail!(
+            "{}",
+            session_flags::candidates_message(source, &layout.project_root)
+        );
+    }
 
     let mut text = cli.prompt.join(" ");
     let (images, stdin_image) = stdin_image_input(&cli.images, tty)?;
@@ -120,11 +72,71 @@ pub(crate) fn chat(
     if (output_schema.is_some() || cli.output_last_message.is_some()) && !cli.print {
         bail!("--output-schema and -o/--output-last-message need print mode (-p)");
     }
-    // After the session and arguments are checked, so a wrong `-r` id or a missing prompt is
-    // reported as such rather than hidden behind the model requirement.
+    if interactive && !cli.allow.is_empty() {
+        bail!("--allow is only available in print mode");
+    }
+
+    let resume_path = if continue_requested || resume_prefix.is_some() {
+        let wanted = resume_prefix.unwrap_or_default();
+        let catalogue = Session::list_by_activity(&layout, usize::MAX)?;
+        let found = if wanted.is_empty() {
+            // `-c` resumes the most recently active conversation; empty sessions never count.
+            let latest =
+                dial::storage::session::latest_conversation(&catalogue).map(|s| s.path.clone());
+            if latest.is_none() {
+                // A one-shot run that asked to continue must not silently lose its context.
+                if cli.print {
+                    bail!(
+                        "no earlier conversation in this project to continue; drop -c to start a new one"
+                    );
+                }
+                eprintln!("No earlier conversation in this project; starting a new session.");
+            }
+            latest
+        } else {
+            let matches: Vec<_> = catalogue
+                .iter()
+                .filter(|s| s.id.starts_with(wanted))
+                .collect();
+            if matches.len() > 1 {
+                let ids: Vec<&str> = matches.iter().take(5).map(|s| s.id.as_str()).collect();
+                bail!(
+                    "session prefix {wanted:?} matches {} sessions ({}); use a longer id",
+                    matches.len(),
+                    ids.join(", ")
+                );
+            }
+            matches.first().map(|s| s.path.clone())
+        };
+        if found.is_none() && !wanted.is_empty() {
+            bail!(
+                "no session in this project starts with {wanted:?}; run `dial sessions` to list ids, or `dial -c` to continue the latest"
+            );
+        }
+        found
+    } else {
+        None
+    };
+
+    // Resolve read-only diagnostics first, but never open, import or fork on a launch refusal.
     if !interactive {
         config.require_model()?;
     }
+    let session = if let Some(selection) = selection {
+        Some(selection.resolve(&layout.project_root)?)
+    } else if let Some(path) = resume_path {
+        match Session::open_or_fork(&layout, &path)? {
+            dial::storage::session::Resumed::Owned(session) => Some(session),
+            dial::storage::session::Resumed::Forked { source_id, session } => {
+                eprintln!(
+                    "dial: session {source_id} is open in another process; resumed as a fork of it"
+                );
+                Some(session)
+            }
+        }
+    } else {
+        cli.no_session.then(Session::ephemeral)
+    };
     let options = Options {
         session,
         prompt: text,
@@ -143,9 +155,6 @@ pub(crate) fn chat(
         review: None,
     };
     if interactive {
-        if !cli.allow.is_empty() {
-            bail!("--allow is only available in print mode");
-        }
         app::run_interactive(layout, config, options)
     } else {
         let code = app::run_print(layout, config, options, cli.output_format, cli.allow)?;

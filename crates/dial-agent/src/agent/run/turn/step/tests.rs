@@ -174,34 +174,35 @@ fn text_answers_during_an_open_investigation_stop_after_a_bounded_number_of_remi
     assert_eq!(reminders, 2, "two reminders, then stop");
 }
 
+fn prepare(
+    agent: &mut Agent<'_>,
+    turn: &mut TurnState<'_>,
+    backend: &mut Backend,
+    step: u32,
+) -> PreparedRequest {
+    let mut engine = crate::agent::run::engine::Engine::default();
+    let mut schemas = Vec::new();
+    let mut ui = NullUi;
+    let result = agent
+        .prepare_step_request(
+            &mut StepContext {
+                turn,
+                engine: &mut engine,
+                backend,
+                schemas: &mut schemas,
+                ui: &mut ui,
+            },
+            step,
+        )
+        .unwrap();
+    match result {
+        ControlFlow::Continue(prepared) => prepared,
+        ControlFlow::Break(_) => panic!("the request should fit without a recovery round"),
+    }
+}
+
 #[test]
 fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
-    fn prepare(
-        agent: &mut Agent<'_>,
-        turn: &mut TurnState<'_>,
-        backend: &mut Backend,
-        step: u32,
-    ) -> PreparedRequest {
-        let mut engine = crate::agent::run::engine::Engine::default();
-        let mut schemas = Vec::new();
-        let mut ui = NullUi;
-        let result = agent
-            .prepare_step_request(
-                &mut StepContext {
-                    turn,
-                    engine: &mut engine,
-                    backend,
-                    schemas: &mut schemas,
-                    ui: &mut ui,
-                },
-                step,
-            )
-            .unwrap();
-        match result {
-            ControlFlow::Continue(prepared) => prepared,
-            ControlFlow::Break(_) => panic!("the request should fit without a recovery round"),
-        }
-    }
     with_agent(
         "[compaction]\nenabled=false\n[reliability]\nmeasured_interfaces=true\n",
         |agent| {
@@ -238,7 +239,7 @@ fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
             assert!(
                 json!(batch.request.messages)
                     .to_string()
-                    .contains("Gather unrelated docs")
+                    .contains(crate::agent::prompts::recovery::DISCOVERY_BATCH)
             );
             // The response is discarded; a contract recovery changes the next request's policy.
             turn.reply_received(agent.session.message_count());
@@ -246,9 +247,12 @@ fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
             let retry = prepare(agent, &mut turn, &mut backend, 2);
             assert!(retry.single_call);
             let text = json!(retry.request.messages).to_string();
-            assert!(text.contains("inspect that declaration next"), "{text}");
             assert!(
-                !text.contains("Gather unrelated docs"),
+                text.contains(crate::agent::prompts::recovery::DISCOVERY_ONE_CALL),
+                "{text}"
+            );
+            assert!(
+                !text.contains(crate::agent::prompts::recovery::DISCOVERY_BATCH),
                 "stale batching guidance: {text}"
             );
             turn.reply_received(agent.session.message_count());
@@ -264,4 +268,66 @@ fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
             agent.backend = Some(backend);
         },
     );
+}
+
+#[test]
+fn local_repair_brief_survives_preemption_and_discard_but_not_a_kept_reply() {
+    use crate::agent::run::guidance::{Priority, note};
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let mut backend = agent.backend.take().unwrap();
+        let mut turn = agent
+            .begin_turn(&mut backend, &[], 10, "Fix the score", &mut NullUi)
+            .unwrap();
+        let has_brief = |p: PreparedRequest| {
+            p.request.messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("Local repair brief"))
+            })
+        };
+        assert!(!has_brief(prepare(agent, &mut turn, &mut backend, 0)));
+        let call = ToolCall {
+            id: "score-run".into(),
+            name: "bash".into(),
+            malformed_arguments: false,
+            arguments: json!({"command":"cargo test score"}),
+        };
+        let output = ToolOutput::err("AssertionError: expected 5, got 4").with_process(
+            crate::runtime::execution::ProcessOutcome {
+                started: true,
+                exit_code: Some(1),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                output_complete: true,
+            },
+        );
+        agent.note_verification(&call, &output, &mut NullUi);
+        let mut hosted = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "https://remote.invalid/v1".into(),
+                model: "test".into(),
+                api_key: None,
+            },
+            Default::default(),
+            5,
+        );
+        assert!(!has_brief(prepare(agent, &mut turn, &mut hosted, 1)));
+        turn.pending_nudges
+            .push(note(Priority::Blocker, "Resolve the blocker first."));
+        assert!(!has_brief(prepare(agent, &mut turn, &mut backend, 1)));
+        turn.reply_received(agent.session.message_count());
+        agent
+            .push(json!({"role":"assistant","content":"Resolving the blocker."}))
+            .unwrap();
+        assert!(has_brief(prepare(agent, &mut turn, &mut backend, 2)));
+        turn.reply_received(agent.session.message_count()); // discarded, no history entry
+        assert!(has_brief(prepare(agent, &mut turn, &mut backend, 3)));
+        turn.reply_received(agent.session.message_count());
+        agent
+            .push(json!({"role":"assistant","content":"Repairing the score."}))
+            .unwrap();
+        assert!(!has_brief(prepare(agent, &mut turn, &mut backend, 4)));
+        agent.backend = Some(backend);
+    });
 }

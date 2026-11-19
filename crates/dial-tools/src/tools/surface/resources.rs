@@ -20,9 +20,26 @@ pub struct Footprint {
     reads: Vec<PathBuf>,
     writes: Vec<PathBuf>,
 }
+/// Scheduling comparisons may overestimate overlap; authorization (`permits`) must not.
+fn overlap(a: &Path, b: &Path) -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        // An absent leaf has no canonical disk spelling yet. Even in a case-sensitive
+        // directory, treating two case variants as conflicting only costs concurrency.
+        a.components().zip(b.components()).all(|(a, b)| {
+            let (a, b) = (a.as_os_str(), b.as_os_str());
+            // APFS/HFS can fold or normalize non-ASCII names. Do not try to reproduce
+            // the volume's Unicode tables; an ambiguous component cannot prove disjointness.
+            a.eq_ignore_ascii_case(b) || !a.is_ascii() || !b.is_ascii()
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        a.starts_with(b) || b.starts_with(a)
+    }
+}
 impl Footprint {
     pub fn conflicts(&self, other: &Self) -> bool {
-        let overlap = |a: &PathBuf, b: &PathBuf| a.starts_with(b) || b.starts_with(a);
         self.writes.iter().any(|a| {
             other
                 .reads
@@ -50,6 +67,9 @@ impl Footprint {
     /// Whether a recorded change to any of `paths` (absolute, or relative to `root`) may have
     /// reached these resources: the same lexical containment as [`conflicts`](Self::conflicts).
     pub fn touches(&self, root: &Path, paths: &[PathBuf]) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         paths.iter().any(|path| {
             let path = if path.is_absolute() {
                 path.to_owned()
@@ -60,10 +80,16 @@ impl Footprint {
                 .components()
                 .filter(|part| !matches!(part, Component::CurDir))
                 .collect();
+            // An unadmitted change may be an alternate name (including a now-removed
+            // junction or short name). It cannot prove the recorded read is fresh.
+            #[cfg(windows)]
+            if !windows::unambiguous(root, &path, false) {
+                return true;
+            }
             self.reads
                 .iter()
                 .chain(&self.writes)
-                .any(|own| path.starts_with(own) || own.starts_with(&path))
+                .any(|own| overlap(&path, own))
         })
     }
     /// No workspace resources: bookkeeping or an effect-free external read.
@@ -98,8 +124,8 @@ fn file_handle(segment: &str) -> bool {
     })
 }
 
-/// Lexical admission before confinement: URL-, selector- and host-shaped literals, parent
-/// traversal, metadata directories and unexpanded file handles all stay serial barriers.
+/// Lexical admission *after* the read owner has resolved supported selectors. Unresolved
+/// selectors, URI- and host-shaped paths, traversal and metadata stay serial barriers.
 fn admissible(literal: &str, relative: &Path) -> bool {
     if literal.contains([':', '?']) || literal.contains("//") {
         return false;
@@ -108,21 +134,39 @@ fn admissible(literal: &str, relative: &Path) -> bool {
     relative.components().all(|part| match part {
         Component::ParentDir => false,
         Component::Normal(name) => {
+            // A SQLite read (including a file identified by magic) may implicitly open its
+            // siblings, and a sidecar reader inspects the database. Neither spelling is an
+            // independent resource when the sidecar itself is an explicit tool target.
             let name = name.to_string_lossy();
             // `user@host` names a remote in the leading position; scoped package directories
             // (`node_modules/@scope`) and asset names (`icon@2x.png`) below it are paths.
             let host = leading && name.find('@').is_some_and(|at| at > 0);
             leading = false;
-            !METADATA_PATHS.contains(&name.as_ref()) && !file_handle(&name) && !host
+            !METADATA_PATHS
+                .iter()
+                .any(|entry| name.eq_ignore_ascii_case(entry))
+                && !file_handle(&name)
+                && !crate::tools::fs::binary::possible_sqlite_sidecar(&name)
+                && !host
         }
         _ => true,
     })
 }
 
 fn resource(workspace: &Workspace, path: &Path, writing: bool) -> Option<PathBuf> {
+    if path.is_absolute() && workspace.root_containing(path).is_none() {
+        return None;
+    }
     let literal = path.to_str()?;
     let relative = path.strip_prefix(workspace.root()).unwrap_or(path);
-    if !admissible(literal, relative) {
+    // The trusted Windows root is canonical (usually `\\?\C:\...`); only its
+    // workspace-relative suffix is user path syntax. Other drive/UNC aliases stay unknown.
+    let syntax = if cfg!(windows) {
+        relative.to_str()?
+    } else {
+        literal
+    };
+    if !admissible(syntax, relative) {
         return None;
     }
     let lexical = if path.is_absolute() {
@@ -144,6 +188,11 @@ fn resource(workspace: &Workspace, path: &Path, writing: bool) -> Option<PathBuf
     if normalized != resolved || !resolved.parent()?.is_dir() {
         return None;
     }
+    #[cfg(windows)]
+    if !windows::unambiguous(workspace.root(), &resolved, writing) {
+        return None;
+    }
+    #[cfg(not(windows))]
     match std::fs::symlink_metadata(&resolved) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink()
@@ -151,24 +200,53 @@ fn resource(workspace: &Workspace, path: &Path, writing: bool) -> Option<PathBuf
             {
                 return None;
             }
-            if metadata.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if metadata.nlink() != 1 {
-                        return None;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.is_file() && metadata.nlink() != 1 {
                     return None;
                 }
+            }
+            #[cfg(not(unix))]
+            if metadata.is_file() {
+                return None;
             }
         }
         Err(error) if writing && error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return None,
     }
     Some(resolved)
+}
+
+/// Only projections whose reader has a known local base get a declaration. Do not strip
+/// arbitrary suffixes (document members, query strings, remote URIs or a literal `a:1`).
+fn read_base(workspace: &Workspace, input: &str) -> Option<PathBuf> {
+    use crate::tools::fs::{binary, outline, select};
+    let path = Path::new(input);
+    let syntax = path
+        .strip_prefix(workspace.root())
+        .unwrap_or(path)
+        .to_str()?;
+    if input.is_empty() || syntax.contains("//") || syntax.contains('?') {
+        return None;
+    }
+    if !syntax.contains(':') {
+        return Some(path.into());
+    }
+    // The literal-precedence probes in the selector owners touch the filesystem. Never
+    // probe an absolute target outside the declared roots (notably a Windows UNC share).
+    if path.is_absolute() && workspace.root_containing(path).is_none() {
+        return None;
+    }
+    let base = if let Some(request) = outline::target(workspace, input) {
+        request.path
+    } else if let Some((base, spec)) = binary::split_bytes_selector(workspace, input) {
+        binary::parse_bytes_spec(spec).ok()?;
+        base
+    } else {
+        select::split_target(workspace, input).ok()?.0
+    };
+    (!base.is_empty()).then(|| base.into())
 }
 
 /// The effect-free external read class: a tool that shares its batch slot and cannot touch the
@@ -209,12 +287,20 @@ pub fn resolve(
     let access = match name {
         "read" => Access {
             reads: match args.get("paths").filter(|v| !v.is_null()) {
-                Some(paths) => paths
-                    .as_array()?
-                    .iter()
-                    .map(|v| v.as_str().map(PathBuf::from))
-                    .collect::<Option<Vec<_>>>()?,
-                None => vec![PathBuf::from(args["path"].as_str()?)],
+                Some(paths) if args["path"].is_null() && args.get("format").is_none() => {
+                    let paths = paths.as_array()?;
+                    if paths.len() > crate::tools::fs::files::MAX_READ_PATHS {
+                        return None;
+                    }
+                    paths
+                        .iter()
+                        .map(|v| read_base(workspace, v.as_str()?))
+                        .collect::<Option<_>>()?
+                }
+                Some(_) => return None,
+                // Structured data mode takes a literal path, not the source reader's selectors.
+                None if args.get("format").is_some() => vec![args["path"].as_str()?.into()],
+                None => vec![read_base(workspace, args["path"].as_str()?)?],
             },
             writes: Vec::new(),
         },
@@ -235,7 +321,7 @@ pub fn resolve(
                 .collect(),
         },
         "grep" | "glob" => Access {
-            reads: crate::tools::fs::search::scheduling_scopes(workspace, args).ok()?,
+            reads: crate::tools::fs::search::scheduling_scopes(workspace, name, args).ok()?,
             writes: Vec::new(),
         },
         _ => {
@@ -277,6 +363,9 @@ fn footprint(workspace: &Workspace, access: &Access) -> Option<Footprint> {
             .collect::<Option<_>>()?,
     })
 }
+
+#[cfg(windows)]
+mod windows;
 
 #[cfg(test)]
 mod tests;

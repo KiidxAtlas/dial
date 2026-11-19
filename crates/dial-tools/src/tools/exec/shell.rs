@@ -153,7 +153,8 @@ const BASH_LINE_SLACK: usize = 512;
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
 /// Adoption hint when `bg` is offered: the job's result comes from one `bg wait`.
-pub const BG_OFFERED_HINT: &str = " `bg wait` returns its output; no polling.";
+pub const BG_OFFERED_HINT: &str =
+    " Do independent work first. When blocked, `bg wait` returns its output; no polling.";
 /// Adoption hint when `bg` is loadable but not offered. The agent replaces it with
 /// [`BG_OFFERED_HINT`] when it loads `bg` for the next request itself.
 pub const BG_LOAD_HINT: &str = " Load the Dial `bg` tool with `tool_search` names:[\"bg\"] to wait for or stop it; no polling.";
@@ -173,17 +174,30 @@ const SHELL_INTERPRETERS: &[(&str, &[&str])] = &[
 /// Which helper languages the shell's `PATH` provides, for the session prompt. Models otherwise
 /// write a whole Python or Node helper before discovering the image has neither; the bash
 /// missing-program notice arrives only after that output has been generated and paid for.
-pub fn interpreter_guidance() -> String {
-    interpreter_guidance_for(std::env::var_os("PATH").as_deref())
+pub fn interpreter_guidance(ws: &Workspace) -> String {
+    let path = std::env::var_os("PATH");
+    #[cfg(not(windows))]
+    let path = if !ws.unsandboxed && matches!(ws.policy, None | Some(Policy::Strict { .. })) {
+        Some(bash_path().into())
+    } else {
+        path
+    };
+    interpreter_guidance_for(ws, path.as_deref())
 }
 
-fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
+fn interpreter_guidance_for(ws: &Workspace, path: Option<&std::ffi::OsStr>) -> String {
     let dirs: Vec<PathBuf> = path
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
+        .map(|dir| ws.root().join(dir))
         .collect();
-    let found = |program: &str| dirs.iter().any(|dir| dir.join(program).is_file());
+    let found = |program: &str| {
+        dirs.iter().any(|dir| {
+            crate::platform::fs::executable_candidate(&dir.join(program))
+                .is_some_and(|p| !ws.sandbox_hides(&p))
+        })
+    };
     let (mut available, mut missing) = (Vec::new(), Vec::new());
     for (language, programs) in SHELL_INTERPRETERS {
         match programs.iter().copied().find(|program| found(program)) {
@@ -192,6 +206,11 @@ fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
             None => missing.push(*language),
         }
     }
+    let validation = if missing.contains(&"python3") {
+        " Neither python3 nor python resolved: do not draft Python helpers here. Use a listed launcher for portable checks; a different engine is partial evidence for Python-specific behavior."
+    } else {
+        " Use the resolved command for helpers; lookup does not test runtime compatibility."
+    };
     let available = if available.is_empty() {
         "none".to_owned()
     } else {
@@ -202,9 +221,7 @@ fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
     } else {
         format!("; not found: {}", missing.join(", "))
     };
-    format!(
-        "- Shell PATH languages: {available}{missing}. Write helper scripts only in a language listed as available.\n"
-    )
+    format!("- Shell PATH languages: {available}{missing}.{validation}\n")
 }
 
 /// Entries directly in `dir`, or `None` when it is unreadable or too large to compare.
@@ -1040,7 +1057,7 @@ pub(super) fn bash_tool_pty(
                 .process_outcome()
                 .is_some_and(|process| process.exit_code.is_some() || process.signal.is_some())
             {
-                output.text.push_str("\nPTY started as a managed bg job; this is not command completion. Use bg input, output, wait, resize or kill with the returned job name. Continue independent work or use a bounded bg wait.");
+                output.text.push_str("\nPTY running; this is not command completion. Use the job name for bg input, output, wait, resize or kill. Do independent work first.");
             }
         }
         Ok(output)

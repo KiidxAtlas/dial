@@ -672,6 +672,9 @@ impl Ui for RpcUi {
     fn efficiency(&mut self, report: &Value) {
         self.out.emit(json!({"event":"efficiency","report":report}));
     }
+    fn check_passed(&mut self) {
+        self.out.emit(json!({"event":"check_passed"}));
+    }
     fn tool_timing(&mut self, call_id: &str, name: &str, seconds: f64) {
         self.out
             .emit(json!({"event":"tool_timing","call_id":call_id,"name":name,"seconds":seconds}));
@@ -1174,9 +1177,14 @@ fn messages_page(messages: &[Value], params: &Value) -> Result<Value> {
     )
 }
 
-/// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane` and `tokens` are additive.
+/// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane`, `tokens`
+/// and `detail` (structured facts, only when the engine has them) are additive.
 pub(crate) fn typed_notice(event: &crate::agent::ui::ui_event::UiEvent) -> Value {
-    json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens})
+    let mut value = json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens});
+    if let Some(detail) = &event.detail {
+        value["detail"] = json!(detail);
+    }
+    value
 }
 /// Call-correlated `tool_output`: `call_id` names the model call whose row the delta belongs to.
 /// `name` stays for clients that predate ids.
@@ -1206,7 +1214,8 @@ fn stop_speech(state: &mut LiveState) {
 }
 
 /// Reads a finished reply aloud on a detached thread while a live session is active and unmuted.
-/// Playback failures are reported as `live_error` events.
+/// `live_speech` events bracket playback (`speaking` true, then false however it ends), so a
+/// hands-free client knows when to listen again. Playback failures are reported as `live_error`.
 fn speak_reply(live: &Mutex<LiveState>, out: &Sender, text: &str) {
     let mut state = live_state(live);
     stop_speech(&mut state);
@@ -1222,10 +1231,25 @@ fn speak_reply(live: &Mutex<LiveState>, out: &Sender, text: &str) {
     let text = text.to_owned();
     let out = out.clone();
     thread::spawn(move || {
-        if let Err(error) = session.speak(&text, &cancel) {
-            out.emit(json!({"event":"live_error","message":format!("{error:#}")}));
-        }
+        read_aloud(&session, &text, &cancel, |event| {
+            out.emit(event);
+        });
     });
+}
+
+/// Reads `text` aloud, bracketed by `live_speech` events; a failure follows as `live_error`.
+fn read_aloud(
+    session: &crate::voice::live::LiveSession,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+    emit: impl Fn(Value),
+) {
+    emit(json!({"event":"live_speech","speaking":true}));
+    let result = session.speak(text, cancel);
+    emit(json!({"event":"live_speech","speaking":false,"cancelled":cancel.load(Ordering::SeqCst)}));
+    if let Err(error) = result {
+        emit(json!({"event":"live_error","message":format!("{error:#}")}));
+    }
 }
 
 /// Run a persistent agent. Control requests received during inference can abort, steer or approve.
@@ -1930,6 +1954,33 @@ fn run_control(
                     let stopped = state.session.take().is_some();
                     drop(state);
                     out.result(&id, Ok(json!({"live":false,"stopped":stopped})));
+                }
+                "live_speak" => {
+                    let result = (|| -> Result<Value> {
+                        anyhow::ensure!(!acp, "live voice is not available over ACP");
+                        let text = request["params"]["text"].as_str().unwrap_or_default();
+                        let mut state = live_state(&live);
+                        stop_speech(&mut state);
+                        if text.trim().is_empty() {
+                            return Ok(json!({"speaking":false}));
+                        }
+                        // Asked for explicitly, so it is read even while replies are muted.
+                        let voice = state.session.as_ref().map(|s| s.voice().to_owned());
+                        let session =
+                            crate::voice::live::start(&voice_env, voice.as_deref(), None)?;
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        state.speech = Some(cancel.clone());
+                        drop(state);
+                        let text = text.to_owned();
+                        let out = out.clone();
+                        thread::spawn(move || {
+                            read_aloud(&session, &text, &cancel, |event| {
+                                out.emit(event);
+                            });
+                        });
+                        Ok(json!({"speaking":true}))
+                    })();
+                    out.result(&id, result);
                 }
                 "skill_action" if !acp => {
                     let result = admin.saved_config().and_then(|config| {

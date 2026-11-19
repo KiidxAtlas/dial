@@ -222,6 +222,25 @@ fn unreachable_server_error_has_no_prompt() {
 }
 
 #[test]
+fn local_text_call_repair_cannot_turn_a_truncation_into_an_action() {
+    let tools = vec![json!({"type":"function","function":{"name":"read"}})];
+    let call = r#"<tool_call>{"name":"read","arguments":{"path":"a"}}</tool_call>"#;
+    for (reason, lifted) in [("length", false), ("content_filter", false), ("stop", true)] {
+        let mut reply = Reply {
+            text: call.into(),
+            finish_reason: reason.into(),
+            ..Default::default()
+        };
+        lift_text_calls(&mut reply, "http://localhost/v1/chat/completions", &tools);
+        assert_eq!(reply.text_calls_lifted, lifted, "{reason}");
+        assert_eq!(!reply.tool_calls.is_empty(), lifted, "{reason}");
+        if !lifted {
+            assert_eq!(reply.finish_reason, reason);
+        }
+    }
+}
+
+#[test]
 fn server_dropped_tool_call_is_detectable() {
     let body = json!({"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant", "content": null}}]});
     let reply = parse_reply(body.to_string().as_bytes()).unwrap();

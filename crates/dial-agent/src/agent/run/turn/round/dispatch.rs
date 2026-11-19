@@ -49,8 +49,10 @@ impl Agent<'_> {
                 ) && call_form_error(first, schemas, &turn.names).is_none()
                     && engine.rejection_at(&self.workspace, first).is_none()
             });
+        let mut retry_barrier = false;
         let form = (if parallel.is_empty() && let Some(reason) = engine.rejection_at(&self.workspace, call) {
-                Some(("recovery_checkpoint", reason))
+                retry_barrier = reason.execution.retry_barrier;
+                Some(("recovery_checkpoint", reason.text))
             } else if single_call && reply.tool_calls.len() > 1 && !(first_ran && index == 0) {
                 Some(("batch_contract", if first_ran {
                     "This request permits one tool call. Only the first call (a read-only inspection) ran; this call was skipped without executing it. Await that result, then choose one action.".into()
@@ -136,6 +138,12 @@ impl Agent<'_> {
                 text: format!("invalid tool call: {why}"),
                 is_error: true,
             };
+            if recovery_blocked {
+                output = output
+                    .with_status(tools::ToolStatus::Blocked)
+                    .with_effects(tools::surface::outcome::Effects::None);
+                output.execution.retry_barrier = retry_barrier;
+            }
             if first_ran && kind == "batch_contract" {
                 output = output
                     .with_status(tools::ToolStatus::Skipped)
@@ -281,7 +289,7 @@ impl Agent<'_> {
             {
                 let count = reply.tool_calls[index..]
                     .iter()
-                    .take(self.effective_config().task.parallel_read_limit())
+                    .take(crate::agent::run::dispatch::MAX_BATCH_ENTRIES)
                     .take_while(|c| self.groupable_read(engine, schemas, &turn.names, c))
                     .count();
                 let group = &reply.tool_calls[index..index + count];
@@ -505,6 +513,11 @@ impl Agent<'_> {
         call: &ToolCall,
     ) -> bool {
         !crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), "pre_tool_use", &call.name)
+            && !crate::agent::safety::hooks::wanted_for_tool(
+                self.tool_hooks(),
+                "post_tool_use",
+                &call.name,
+            )
             && (self.pending_check.is_none() || call.name != "bash")
             && crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
             && !crate::agent::safety::approval::denied_by_rule(

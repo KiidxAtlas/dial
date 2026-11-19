@@ -176,7 +176,7 @@ fn receipts(output: &ToolOutput) -> Vec<Value> {
 #[test]
 fn worker_cells_run_read_only_batches_together_in_entry_order() {
     let (output, reviewer) = run_cell(json!([[
-        {"name":"read","arguments":{"path":"b.txt"}},
+        {"name":"functions.read_file","arguments":{"filePath":"b.txt"}},
         {"name":"read","arguments":{"path":"missing.txt"}},
         {"name":"read","arguments":{"path":"a.txt"}},
     ]]));
@@ -208,7 +208,8 @@ fn worker_batches_with_an_approval_entry_run_serially_and_never_run_denied_entri
     let (output, reviewer) = run_cell(json!([
         [
             {"name":"read","arguments":{"path":"a.txt"}},
-            {"name":"deploy","arguments":{}},
+            {"name":"functions.deploy","arguments":{}},
+            {"name":"functions.cell","arguments":{"batches":[]}},
         ],
         [{"name":BATCH_CALLBACK,"arguments":{"calls":[]}}],
         "not entries",
@@ -218,6 +219,7 @@ fn worker_batches_with_an_approval_entry_run_serially_and_never_run_denied_entri
     assert!(mixed[0]["text"].as_str().unwrap().contains("alpha"));
     assert_eq!(mixed[1]["is_error"], true);
     assert!(!mixed[1]["text"].as_str().unwrap().contains("deployed"));
+    assert_eq!(mixed[2]["is_error"], true, "recursion stays out of scope");
     assert_eq!(reviewer.asked, ["deploy"], "the serial entry asked once");
     assert_eq!(
         receipts[1]["data"][0]["is_error"], true,

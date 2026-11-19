@@ -126,10 +126,10 @@ fn terminal_signals_follow_the_session_state() {
         context_window: 10_000,
         ..Default::default()
     };
-    let idle = terminal_signals(&ui, &status, Activity::Done, false).unwrap();
+    let idle = terminal_signals(&ui, &status, Activity::ReviewReady, None).unwrap();
     assert_eq!(
         (idle.activity, idle.progress),
-        (Activity::Done, Progress::None)
+        (Activity::ReviewReady, Progress::None)
     );
     assert_eq!(
         idle.cwd.as_deref(),
@@ -145,7 +145,7 @@ fn terminal_signals_follow_the_session_state() {
     );
 
     status.phase = Phase::Working;
-    let busy = terminal_signals(&ui, &status, Activity::Done, false).unwrap();
+    let busy = terminal_signals(&ui, &status, Activity::Done, None).unwrap();
     assert_eq!(
         (busy.activity, busy.progress),
         (Activity::Working, Progress::Indeterminate)
@@ -158,76 +158,122 @@ fn terminal_signals_follow_the_session_state() {
         }))
         .unwrap(),
     );
-    let prefill = terminal_signals(&ui, &status, Activity::Idle, false).unwrap();
+    let prefill = terminal_signals(&ui, &status, Activity::Idle, None).unwrap();
     assert_eq!(prefill.progress, Progress::Percent(40));
 
-    let asking = terminal_signals(&ui, &status, Activity::Idle, true).unwrap();
-    assert_eq!(
-        (asking.activity, asking.progress),
-        (Activity::Waiting, Progress::Paused)
-    );
+    status.testing = true;
+    let testing = terminal_signals(&ui, &status, Activity::Idle, None).unwrap();
+    assert_eq!(testing.activity, Activity::Testing);
+    assert_eq!(testing.vars[0].1, "working");
+    for prompt in [Prompt::Approval, Prompt::Question] {
+        let held = terminal_signals(&ui, &status, Activity::Idle, Some(prompt)).unwrap();
+        assert_eq!(
+            (held.activity, held.progress),
+            (Activity::Waiting(prompt), Progress::Paused)
+        );
+        assert_eq!(held.vars[0].1, "waiting");
+    }
 
     ui.terminal_integration = false;
-    assert!(terminal_signals(&ui, &status, Activity::Idle, true).is_none());
+    assert!(terminal_signals(&ui, &status, Activity::Testing, Some(Prompt::Approval)).is_none());
 }
 
-/// The state circles `tab_title` can add (orange working, green done, blue waiting, red failed).
-const CIRCLES: [&str; 4] = ["\u{1F7E0}", "\u{1F7E2}", "\u{1F535}", "\u{1F534}"];
-
 #[test]
-fn the_tab_title_ends_with_the_state_circle_after_the_session_scope() {
-    assert_eq!(tab_title("dial · app", "", ""), "dial · app");
-    assert_eq!(
-        tab_title("dial · app", "fix the parser", Activity::Working.marker()),
-        "dial · app · fix the parser \u{1F7E0}"
-    );
-    assert_eq!(
-        tab_title("dial · app", "", Activity::Done.marker()),
-        "dial · app \u{1F7E2}"
-    );
+fn right_edge_keeps_the_status_in_words_even_without_color() {
     let long = "x".repeat(200);
-    let title = tab_title("dial · app", &long, Activity::Done.marker());
-    assert!(title.starts_with("dial · app · "), "{title}");
-    assert!(title.ends_with("\u{1F7E2}"), "{title}");
-    assert!(crate::ui::text::width(&title) < 70, "{title}");
-}
-
-#[test]
-fn an_idle_or_empty_state_adds_no_circle_to_the_tab_title() {
-    for scope in ["", "fix the parser"] {
-        let plain = tab_title("dial · app", scope, "");
-        assert_eq!(
-            tab_title("dial · app", scope, Activity::Idle.marker()),
-            plain
-        );
-        assert!(
-            !CIRCLES.iter().any(|circle| plain.contains(circle)),
-            "{plain}"
-        );
-    }
-}
-
-#[test]
-fn every_active_state_keeps_its_circle_on_selected_and_unselected_tabs() {
-    let long = "x".repeat(200);
-    for activity in [
-        Activity::Working,
-        Activity::Waiting,
-        Activity::Done,
-        Activity::Failed,
+    for (activity, label) in [
+        (Activity::Working, "Working"),
+        (Activity::Testing, "Testing"),
+        (Activity::Waiting(Prompt::Approval), "Approve?"),
+        (Activity::Waiting(Prompt::Question), "Question"),
+        (Activity::Done, "Done"),
+        (Activity::ReviewReady, "Review ready"),
+        (Activity::Failed, "Failed"),
     ] {
         for scope in ["", "fix the parser", long.as_str()] {
-            let title = tab_title("dial · app", scope, activity.marker());
-            assert!(title.contains(activity.marker()), "selected: {title}");
-            assert_eq!(title.matches(activity.marker()).count(), 1, "{title}");
-            // An unselected tab shows only the end of the title, so the circle must survive there.
-            let unselected = crate::ui::text::ellipsize_start(&title, 30, false);
-            assert!(
-                unselected.contains(activity.marker()),
-                "unselected: {unselected} ({activity:?})"
-            );
+            for ascii in [false, true] {
+                let title = tab_title("dial · app", scope, activity, ascii);
+                let edge = crate::ui::text::ellipsize_start(&title, 20, ascii);
+                assert!(edge.ends_with(label), "{edge}");
+                assert_eq!(title.contains(activity.marker()), !ascii, "{title}");
+                assert!(crate::ui::text::width(&title) < 70, "{title}");
+            }
         }
     }
+    assert_eq!(
+        tab_title("dial · app", "", Activity::Idle, true),
+        "dial · app"
+    );
+    assert_eq!(
+        tab_title("dial · app", "fix the parser", Activity::Idle, false),
+        "dial · app · fix the parser"
+    );
+}
+
+#[test]
+fn test_tool_lifetime_drives_the_ascii_title_once_per_transition() {
+    use crate::agent::Ui;
+    use crate::app::bridge::Bridge;
+    use crate::llm::model_config::SymbolPreset;
+    use crate::runtime::tool_output::ToolOutput;
+    let (_home, _project, app, mut shell) = super::super::testkit::shell();
+    shell.title = "dial".into();
+    shell.ui.symbols = SymbolPreset::Ascii;
+    shell.themes.apply_config(&shell.ui, None).unwrap();
+    let capture = Capture::default();
+    shell.term = crate::ui::term::with_writer(Box::new(capture.clone()), (80, 24));
+    shell.status.phase = Phase::Working;
+    let now = Instant::now();
+    let mut bridge = Bridge {
+        app: &app,
+        shell: &mut shell,
+        interrupt: app.interrupt.clone(),
+        started: now,
+        last_paint: now,
+        failed: false,
+        pending: Vec::new(),
+        next_id: 0,
+    };
+    let call = |command| serde_json::json!({"command": command});
+    bridge.tool_call_with_args("read", "bash", "cargo test", &call("echo cargo test"));
+    let output = ToolOutput::ok(String::new());
+    bridge.tool_call_with_args(
+        "bg",
+        "bash",
+        "background",
+        &serde_json::json!({"command":"cargo test","background":true}),
+    );
+    bridge.tool_result_with_id("bg", "bash", &output);
+    bridge.tool_call_with_args("test", "bash", "run the suite", &call("cargo test -p api"));
+    for prompt in [Some(Prompt::Approval), Some(Prompt::Question), None] {
+        bridge.shell.awaiting_user = prompt;
+        bridge.shell.paint(None).unwrap();
+    }
+    bridge.tool_call_with_args("other", "bash", "read", &call("ls"));
+    bridge.tool_result_with_id("other", "bash", &output);
+    bridge.tool_result_with_id("test", "bash", &output);
+    bridge.tool_result_with_id("read", "bash", &output);
+    bridge.shell.ui.terminal_integration = false;
+    bridge.shell.paint(None).unwrap();
+    let bytes = capture.0.lock().unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let titles: Vec<_> = text
+        .split("\x1b]0;")
+        .skip(1)
+        .map(|s| s.split('\x07').next().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "dial Working",
+            "dial Testing",
+            "dial Approve?",
+            "dial Question",
+            "dial Testing",
+            "dial Working",
+            "dial"
+        ]
+    );
 }
 
 #[test]

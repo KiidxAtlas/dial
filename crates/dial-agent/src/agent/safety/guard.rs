@@ -553,8 +553,8 @@ const REPEAT_LIMIT: u32 = 3;
 const FAILURE_LIMIT: u32 = 4;
 /// Length stops that repeat past this many nudges get stronger guidance; they never end the turn.
 pub const MAX_LENGTH_NUDGES: u32 = 2;
-/// Hard ceiling for a raised per-call output budget.
-const MAX_RAISED_BUDGET: u32 = 32768;
+/// Ceiling for a raised per-call output budget when no source states the model's output maximum.
+const UNSTATED_RAISED_BUDGET: u32 = 32768;
 /// Context kept free for the system prompt growth and the next tool result when raising the budget.
 const CONTEXT_MARGIN: u64 = 1024;
 
@@ -906,6 +906,35 @@ fn observing(call: &ToolCall) -> bool {
             .is_some_and(crate::storage::memory_backend::reads)
 }
 
+/// Native pagination requires a token from a previous result. Native multi-target requests
+/// already collected their known work. Neither is evidence of needless serial lookup rounds.
+fn batched_or_paged_lookup(call: &ToolCall) -> bool {
+    fn multiple<'a>(targets: impl Iterator<Item = &'a str>) -> bool {
+        let mut targets = targets.filter(|target| !target.is_empty());
+        targets
+            .next()
+            .is_some_and(|first| targets.any(|target| target != first))
+    }
+    match call.name.as_str() {
+        "read" => multiple(
+            call.arguments["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+        ),
+        "grep" | "glob" => {
+            call.arguments["cursor"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+                || call.arguments["path"]
+                    .as_str()
+                    .is_some_and(|scope| multiple(scope.split(';').map(str::trim)))
+        }
+        _ => false,
+    }
+}
+
 /// Wasted motion: repeating a shell command without an observed intervening mutation, or spending
 /// one model round per independent lookup. Guidance is advisory: the guard cannot certify external
 /// state or reuse a check pass from command identity alone.
@@ -971,15 +1000,21 @@ impl PaceGuard {
         })
     }
 
-    /// One round of tool calls finished. After every `SERIAL_WARN` consecutive rounds that each
-    /// held a single lookup (bookkeeping calls aside), the model is told to batch lookups.
+    /// Observe one round and return the default batch-capable caller's advisory, if due.
     pub fn round(&mut self, calls: &[ToolCall]) -> Option<String> {
+        self.observe_round(calls);
+        self.lookup_advice(false, true)
+    }
+
+    /// Track the evidence requested, not just the number of tool envelopes. Selector identity
+    /// is literal: two ranges of one file are useful independent requests, as are two files.
+    pub(in crate::agent) fn observe_round(&mut self, calls: &[ToolCall]) {
         let mut work = calls
             .iter()
             .filter(|call| !BOOKKEEPING_TOOLS.contains(&call.name.as_str()));
         let lookup = match (work.next(), work.next()) {
             (Some(only), None) => {
-                observing(only)
+                (!batched_or_paged_lookup(only) && observing(only))
                     || (only.name == "bash"
                         && only.arguments["command"]
                             .as_str()
@@ -987,17 +1022,41 @@ impl PaceGuard {
             }
             _ => false,
         };
-        if !lookup {
-            self.serial = 0;
+        self.serial = if lookup {
+            self.serial.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// Render for the request that will receive the advice, not the one that produced the
+    /// evidence: retries can change the call limit and the callable tool set.
+    pub(in crate::agent) fn lookup_advice(
+        &self,
+        single_call: bool,
+        has_read: bool,
+    ) -> Option<String> {
+        use crate::agent::prompts::recovery;
+        if self.serial == 0
+            || !self.serial.is_multiple_of(SERIAL_WARN)
+            || (single_call && !has_read)
+        {
             return None;
         }
-        self.serial += 1;
-        self.serial.is_multiple_of(SERIAL_WARN).then(|| {
-            format!(
-                "[{} rounds in a row each made a single lookup. Batch lookups whose arguments you already know in one response: they run concurrently and cost one round. Read every relevant search hit together (owner, tests, callers), add the next searches to that same response, and pass several `read` paths at once. Keep only result-dependent lookups for later.]",
-                self.serial
-            )
-        })
+        let read = if has_read {
+            recovery::KNOWN_READ_TARGETS
+        } else {
+            ""
+        };
+        let other = if single_call {
+            ""
+        } else {
+            recovery::KNOWN_LOOKUPS
+        };
+        Some(format!(
+            "[{} rounds in a row each made a single lookup.{read}{other} Wait for a result when it determines the next target or argument; do not guess.]",
+            self.serial
+        ))
     }
 }
 
@@ -1116,13 +1175,32 @@ pub enum LengthAction {
     Incomplete(String),
 }
 
-/// Double the output budget, bounded by what the context window can still spare for the answer.
-fn larger_budget(current: u32, window: u32, prompt_tokens: u64) -> Option<u32> {
+/// The most a raised output budget may reach: the model's stated output maximum, or a conservative
+/// default when none is stated.
+fn raise_ceiling(model_max: Option<u32>) -> u32 {
+    model_max
+        .filter(|limit| *limit > 0)
+        .unwrap_or(UNSTATED_RAISED_BUDGET)
+}
+
+/// Double the output budget, bounded by the ceiling and what the context window can still spare.
+fn larger_budget(current: u32, window: u32, prompt_tokens: u64, ceiling: u32) -> Option<u32> {
     let spare = u64::from(window)
         .saturating_sub(prompt_tokens)
         .saturating_sub(CONTEXT_MARGIN);
-    let next = u64::from(current.saturating_mul(2).min(MAX_RAISED_BUDGET)).min(spare) as u32;
+    let next = u64::from(current.saturating_mul(2).min(ceiling)).min(spare) as u32;
     (next > current).then_some(next)
+}
+
+/// Why `current` is the largest budget this request can get, in model-facing words.
+fn limit_reason(current: u32, model_max: Option<u32>) -> &'static str {
+    match model_max.filter(|limit| *limit > 0) {
+        Some(limit) if current >= limit => "the most this model allows",
+        None if current >= UNSTATED_RAISED_BUDGET => {
+            "the most Dial requests when the model states no output maximum"
+        }
+        _ => "the most the remaining context window leaves room for",
+    }
 }
 
 /// A reasoning model can spend its whole budget thinking and return no answer, or cut a tool call off
@@ -1131,10 +1209,13 @@ pub fn recover_from_length(
     current: u32,
     window: u32,
     prompt_tokens: u64,
+    model_max: Option<u32>,
     reply: &Reply,
     nudges: u32,
 ) -> LengthAction {
-    if let Some(max_tokens) = larger_budget(current, window, prompt_tokens) {
+    if let Some(max_tokens) =
+        larger_budget(current, window, prompt_tokens, raise_ceiling(model_max))
+    {
         return LengthAction::Retry { max_tokens };
     }
     // The shared engine bounds nonproductive nudges independently of the productive step budget.
@@ -1144,7 +1225,7 @@ pub fn recover_from_length(
         partial,
         message: if escalated {
             format!(
-                "[Escalation: {nudges} replies in a row hit the output limit ({current} tokens) without finishing. Make the next reply short: take one concrete action, or give the answer in a few sentences, and put long content into a file written in parts.]\n{text}"
+                "[Escalation: {nudges} replies in a row hit the output limit ({current} tokens) without finishing. Make the next reply short: take one concrete action, or give the answer in a few sentences.]\n{text}"
             )
         } else {
             text.into()
@@ -1153,7 +1234,10 @@ pub fn recover_from_length(
     if !reply.tool_calls.is_empty() {
         return nudge(
             None,
-            "Your last tool call was cut off by the output limit, so nothing ran. Make smaller calls (for a large file, write a first part and extend it with edit) and keep your reasoning short.",
+            &format!(
+                "Your last tool call was cut off at the {current}-token output limit, {}; nothing ran.",
+                limit_reason(current, model_max)
+            ),
         );
     }
     if reply.text.trim().is_empty() {

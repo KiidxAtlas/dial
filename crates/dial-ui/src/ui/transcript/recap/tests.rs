@@ -218,6 +218,131 @@ fn a_turn_with_work_closes_with_a_framed_recap_card() {
 }
 
 #[test]
+fn compact_receipt_uses_recorded_paths_and_only_matching_current_verdict_counts() {
+    use super::super::TurnReceipt;
+    let theme = Theme::dark();
+    let ui = UiConfig::default();
+    let context = ctx(&theme, &ui);
+    let cmd = "cargo test -p api";
+    let mut recap = Recap::default();
+    let check = settled(
+        "bash",
+        Tone::Shell,
+        cmd,
+        r#"{"command":"cargo test -p api"}"#,
+        "test result: ok. 9 passed; 0 failed; 0 ignored",
+        true,
+    );
+    recap.note(&check.name, check.state, &check.presentation);
+    recap.note_result(&check);
+    // The tool's display target need not be a path (batch edit); only the recorder knows.
+    recap.files.push("batch edit".into());
+    let mut outcome = TurnOutcome {
+        status: "completed".into(),
+        changed_files: 2,
+        receipt: Some(TurnReceipt {
+            paths: vec!["src/api.rs".into(), "tests/api.rs".into()],
+            check: ReceiptCheck::Passed,
+            check_label: "1 check passed".into(),
+            check_target: Some(cmd.into()),
+        }),
+        handoff: vec![
+            "Changed: src/api.rs, tests/api.rs".into(),
+            "Checks: current · passed — api passed".into(),
+            "Evidence: /evidence check api".into(),
+        ],
+        ..TurnOutcome::default()
+    };
+    let display = |outcome: &TurnOutcome, width, context: &TranscriptCtx| {
+        let stats = stats(Some(outcome.clone()));
+        let rows = card(&stats, &recap, width, context)
+            .unwrap_or_else(|| super::super::stats_rows(&stats, &recap, width, context));
+        assert!(
+            rows.iter()
+                .all(|row| text::line_width(row) <= width as usize)
+        );
+        plain(&rows).join("\n")
+    };
+    for width in [36, 40, 80] {
+        let compact = display(&outcome, width, &context);
+        assert_eq!(compact.matches("src/api.rs").count(), 1, "{compact}");
+        assert_eq!(compact.matches("tests/api.rs").count(), 1, "{compact}");
+        assert!(
+            !compact.contains("batch edit") && !compact.contains("Evidence:"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains(cmd) && compact.contains("9 passed"),
+            "{compact}"
+        );
+    }
+    let expanded = display(
+        &outcome,
+        80,
+        &TranscriptCtx {
+            tools_expanded: true,
+            ..context
+        },
+    );
+    assert!(
+        expanded.contains("Evidence: /evidence check api") && expanded.contains("current · passed"),
+        "{expanded}"
+    );
+    assert_eq!(expanded.matches("src/api.rs").count(), 1, "{expanded}");
+
+    for (state, label, target) in [
+        (ReceiptCheck::Stale, "stale", cmd),
+        (ReceiptCheck::Failed, "1 check failed (stale)", cmd),
+        (
+            ReceiptCheck::Unverified,
+            "unverified (freshness unknown)",
+            cmd,
+        ),
+        (
+            ReceiptCheck::Passed,
+            "1 check passed",
+            "cargo test -p different",
+        ),
+    ] {
+        let receipt = outcome.receipt.as_mut().unwrap();
+        receipt.check = state;
+        receipt.check_label = label.into();
+        receipt.check_target = Some(target.into());
+        let compact = display(&outcome, 80, &context);
+        assert!(
+            compact.contains(label) && compact.contains(target),
+            "{compact}"
+        );
+        assert!(
+            !compact.contains("9 passed"),
+            "do not mix mismatched verdicts: {compact}"
+        );
+    }
+
+    // An unregistered shell test is a historical observation, not current verification.
+    recap.note(
+        "edit",
+        ToolState::Completed,
+        &presentation(Tone::Edit, "src/api.rs"),
+    );
+    outcome.status = "interrupted".into();
+    let receipt = outcome.receipt.as_mut().unwrap();
+    receipt.check = ReceiptCheck::Unverified;
+    receipt.check_label = "unverified (no recorded checks)".into();
+    receipt.check_target = None;
+    let compact = plain(&card(&stats(Some(outcome)), &recap, 80, &context).unwrap()).join("\n");
+    for fact in [
+        "interrupted",
+        "unverified",
+        "Last run",
+        "tests 9 passed (stale)",
+        cmd,
+    ] {
+        assert!(compact.contains(fact), "missing {fact}: {compact}");
+    }
+}
+
+#[test]
 fn failed_turns_take_the_error_outline_and_plain_answers_keep_one_line() {
     let theme = Theme::dark();
     let ui = UiConfig::default();
@@ -329,7 +454,7 @@ fn follow_ups_lead_with_recovery_for_how_the_turn_ended() {
 }
 
 #[test]
-fn the_card_numbers_its_follow_ups_with_their_alt_digit_chords() {
+fn the_card_numbers_its_follow_ups_with_the_platform_shortcuts() {
     let theme = Theme::builtin("dial-dark").unwrap();
     let ui = UiConfig::default();
     let rows = plain(
@@ -367,11 +492,35 @@ fn alt_digit_resolves_only_against_the_latest_turn() {
     assert_eq!(run('1'), Some(RecapRun::Command("/retry")));
     assert_eq!(run('3'), Some(RecapRun::Command("/undo")));
     assert_eq!(run('4'), None);
+    let first = KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT);
+    assert_eq!(t.recap_action_for(&first).map(|a| a.run), run('1'));
+    for kind in [
+        crossterm::event::KeyEventKind::Repeat,
+        crossterm::event::KeyEventKind::Release,
+    ] {
+        assert_eq!(t.recap_action_for(&KeyEvent { kind, ..first }), None);
+    }
     // A plain digit is text, never an action.
     assert_eq!(
         t.recap_action_for(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
         None
     );
+    let us = crate::ui::keys::Keymap::defaults().with_us_layout(true);
+    let glyph = KeyEvent::new(KeyCode::Char('¡'), KeyModifiers::NONE);
+    assert_eq!(
+        t.recap_action_with_keys(&glyph, &us).map(|a| a.run),
+        if cfg!(target_os = "macos") {
+            run('1')
+        } else {
+            None
+        }
+    );
+    let mut other = us.with_us_layout(false);
+    assert_eq!(t.recap_action_with_keys(&glyph, &other), None);
+    other
+        .rebind(crate::ui::keys::Action::Settings, &["Shift+F1"])
+        .unwrap();
+    assert_eq!(t.recap_action_with_keys(&first, &other), None);
     // The next message starts a new turn: the old recap no longer answers.
     t.push_user("thanks");
     assert!(t.recap_actions().is_empty());

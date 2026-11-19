@@ -421,3 +421,26 @@ fn clipped_checks_use_complete_artifacts_and_never_infer_from_missing_evidence()
         );
     }
 }
+
+#[test]
+fn a_go_filter_matching_no_tests_is_unverified_even_without_testless_packages() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    let output = ToolOutput::ok("ok  \texample/calc\t0.001s [no tests to run]\n".into())
+        .with_process(ProcessOutcome {
+            started: true,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        });
+    assert_eq!(
+        classify_output(None, &output, false),
+        CheckStatus::Unverified
+    );
+    let mixed = ToolOutput::ok(
+        "ok  \texample/calc\t0.001s [no tests to run]\nok  \texample/tested\t0.002s\n".into(),
+    )
+    .with_process(output.process_outcome().unwrap().clone());
+    assert_eq!(classify_output(None, &mixed, false), CheckStatus::Passed);
+}

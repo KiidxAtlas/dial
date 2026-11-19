@@ -254,6 +254,18 @@ test('all wire boundaries repair lone surrogates without damaging emoji or liter
 });
 
 for (const python of [false, true]) {
+  test(`listed window screenshot uses the approved ID chain (${python ? 'Python' : 'JS'})`, () => {
+    const source = fs.readFileSync(path.join(__dirname, '../../../../../dial-computer/src/computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
+    const code = python ? "w = (await computer.windows())[0]\nassert w['width'] == 10\nawait w.screenshot()\nawait w.capture(silent=True)" : 'const [w] = await computer.windows(); if (w.width !== 10) throw Error("lost geometry"); await w.screenshot(); await w.capture({silent:true})';
+    const output = run([cell(1, source), cell(2, code), reply(1, 2, { value: [{ id: '7', width: 10 }] }), reply(2, 2, { value: 'captured' }), reply(3, 2, { value: 'captured' })], python);
+    assert.equal(output.find(frame => frame.id === 2 && frame.result).result.error, null);
+    const calls = output.filter(frame => frame.callback === 'prelude');
+    assert.deepEqual(calls.at(-1).parameters.chain,
+      [{ method: 'window', args: ['7'] }, { method: 'screenshot', args: [{ silent: true }] }]);
+    assert.deepEqual(calls.at(-2).parameters.chain,
+      [{ method: 'window', args: ['7'] }, { method: 'screenshot', args: [] }]);
+  });
+
   test(`actual ${python ? 'Python' : 'JS'} computer prelude consumes raw bridge values/text/images and propagates denial`, () => {
     const source = fs.readFileSync(path.join(__dirname, '../../../../../dial-computer/src/computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
     const windows = [{ id: '7', app: 'Editor', title: 'Document' }];

@@ -31,6 +31,15 @@ struct Store {
     record: Record,
 }
 
+#[cfg(unix)]
+impl Drop for Store {
+    fn drop(&mut self) {
+        // A concurrently spawned child can still hold a duplicate of our flock descriptor.
+        // Release ownership now, rather than waiting for the child to exec or exit.
+        let _ = File::unlock(&self._lease);
+    }
+}
+
 impl Store {
     fn open(layout: &Layout, session: &str) -> Result<Self> {
         Self::open_inner(layout, session, false)

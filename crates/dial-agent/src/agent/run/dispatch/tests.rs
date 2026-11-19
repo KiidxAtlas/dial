@@ -172,6 +172,90 @@ fn parallel_completion_reaches_the_view_before_a_slow_sibling_and_keeps_call_ord
 }
 
 #[test]
+fn read_window_refills_while_first_read_is_blocked_without_exceeding_limit() {
+    use crate::tools::integrations::ext::Tool;
+    use std::sync::atomic::AtomicUsize;
+    #[derive(Default)]
+    struct Probe {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        last: AtomicBool,
+    }
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "window_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":self.name(),"parameters":{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"]}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn read_only_hint(&self) -> bool {
+            true
+        }
+        fn call(&self, _: &ToolContext, args: &Value) -> ToolOutput {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let index = args["index"].as_u64().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            if index == 0 {
+                while !self.last.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else if index == 7 {
+                self.last.store(true, Ordering::SeqCst);
+            } else {
+                thread::sleep(Duration::from_millis(15));
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if index == 0 && !self.last.load(Ordering::SeqCst) {
+                return ToolOutput::err("read window stalled");
+            }
+            ToolOutput::ok(index.to_string())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let probe = Arc::new(Probe::default());
+    let mut registry = Registry::new();
+    registry.try_register(probe.clone()).unwrap();
+    let mut config = Config::default();
+    config.task.max_concurrency = 2;
+    let calls: Vec<_> = (0..8)
+        .map(|index| ToolCall {
+            id: index.to_string(),
+            name: "window_probe".into(),
+            arguments: json!({"index":index}),
+            malformed_arguments: false,
+        })
+        .collect();
+    struct View;
+    impl Ui for View {}
+    let results = parallel_tools(
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &config,
+            ext: &registry,
+            interrupt: &AtomicBool::new(false),
+            ui: &mut View,
+            pending_steering: &mut Vec::new(),
+        },
+        &calls,
+        None,
+        None,
+    );
+    assert_eq!(probe.peak.load(Ordering::SeqCst), 2);
+    for (index, (output, _)) in results.iter().enumerate() {
+        assert!(
+            !output.is_error && output.text == index.to_string(),
+            "{}",
+            output.text
+        );
+    }
+}
+
+#[test]
 fn rendered_pixels_from_any_tool_become_an_attachment_and_keep_the_description() {
     let root = tempfile::tempdir().unwrap();
     let store = crate::storage::artifact::ArtifactStore::new(&root.path().join(".art")).unwrap();
@@ -307,12 +391,12 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
             regenerations: &mut regenerations,
             max_regenerations: 3,
         });
-        let mut batch = |agent: &mut Agent<'_>, calls: Value| {
+        let mut callback = |agent: &mut Agent<'_>, name: &str, arguments: Value| {
             agent.code_callback(
                 &mut backend,
                 ToolCallback::Call {
-                    name: BATCH_CALLBACK.into(),
-                    arguments: json!({ "calls": calls }),
+                    name: name.into(),
+                    arguments,
                 },
                 "cell",
                 &mut NullUi,
@@ -320,10 +404,19 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
                 crate::agent::safety::approval::CallProvenance::Structured,
             )
         };
+        let single = callback(agent, "functions.read_file", json!({"filePath":"a.txt"}));
+        assert!(
+            !single.is_error && single.text.contains("alpha"),
+            "{}",
+            single.text
+        );
+        let mut batch = |agent: &mut Agent<'_>, calls: Value| {
+            callback(agent, BATCH_CALLBACK, json!({"calls":calls}))
+        };
         let reads = batch(
             agent,
             json!([
-                {"name":"read","arguments":{"path":"a.txt"}},
+                {"name":"functions.read_file","arguments":{"filePath":"a.txt"}},
                 {"name":"read","arguments":{"path":"missing.txt"}},
                 {"name":"read","arguments":{"path":"a.txt"}},
             ]),
@@ -347,7 +440,7 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
             json!([
                 {"name":"read","arguments":{"path":"a.txt"}},
                 {"name":"read","arguments":{"path":"a.txt"}},
-                {"name":"write","arguments":{"path":"b.txt","content":"x"}},
+                {"name":"write_file","arguments":{"file_path":"b.txt","text":"x"}},
                 {"name":"read","arguments":{"path":"missing.txt"}},
                 {"name":"read","arguments":{"path":"a.txt"}},
             ]),
@@ -368,5 +461,34 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
         );
         assert_eq!(nested.data.unwrap()[0]["is_error"], true);
         assert!(batch(agent, json!("not entries")).is_error);
+        // The same executable name and arguments must reach deny rules in the shared-read lane.
+        agent
+            .always
+            .push(crate::agent::safety::approval::PermissionRule {
+                effect: crate::agent::safety::approval::Effect::Deny,
+                tool: "read".into(),
+                paths: vec!["a.txt".into()],
+                command_prefix: vec![],
+            });
+        let alias = json!({"name":"read_file","arguments":{"filePath":"a.txt"}});
+        let denied = batch(agent, json!([alias, alias]));
+        for row in denied.data.unwrap().as_array().unwrap() {
+            assert_eq!(row["is_error"], true);
+            assert!(!row["text"].as_str().unwrap().contains("alpha"));
+        }
+        agent.always.clear();
+        agent.hermetic = true;
+        let strict = batch(
+            agent,
+            json!([
+                {"name":"read","arguments":{"path":"a.txt"}},
+                alias,
+                {"name":"read","arguments":{"filePath":"a.txt"}}
+            ]),
+        );
+        let rows = strict.data.unwrap();
+        assert_eq!(rows[0]["is_error"], false);
+        assert_eq!(rows[1]["is_error"], true);
+        assert_eq!(rows[2]["is_error"], true);
     });
 }

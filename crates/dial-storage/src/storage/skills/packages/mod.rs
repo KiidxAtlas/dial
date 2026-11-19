@@ -202,7 +202,7 @@ fn plan(spec: &str, registries: &BTreeMap<String, String>, base: &Path) -> Resul
     let spec = spec.trim();
     ensure!(
         !spec.is_empty(),
-        "usage: /skills install <git-url>[@ref][#path] or <registry>/<skill>[@ref]"
+        "Usage: /skills install <git-url>[@ref][#path] or <registry>/<skill>[@ref]"
     );
     if let Some((registry, rest)) = spec.split_once('/')
         && let Some(index_url) = registries.get(registry)

@@ -405,7 +405,7 @@ fn view_lists_every_fact_per_bank_with_refs_and_revisions() {
     let error = runtime
         .command(&auth, "view everything", &mut runner)
         .unwrap_err();
-    assert!(format!("{error:#}").contains("usage: /memory view [project|user]"));
+    assert!(format!("{error:#}").contains("Usage: /memory view [project|user]"));
 }
 
 #[test]

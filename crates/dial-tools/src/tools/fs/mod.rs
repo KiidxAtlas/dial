@@ -21,4 +21,5 @@ pub mod system;
 pub mod video;
 pub mod visual;
 pub(crate) mod walk;
+mod workers;
 pub(in crate::tools) mod write;

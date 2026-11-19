@@ -4,6 +4,67 @@ use crate::llm::provider::{Backend, ProviderKind};
 use crate::ui::transcript::TranscriptCtx;
 
 #[test]
+fn everyday_queue_refuses_trailing_input_without_removing_a_message() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    shell.composer.restore_pending_messages(vec!["keep".into()]);
+    shell
+        .command(&app, &mut agent, "/queue remove 1 2")
+        .unwrap();
+    assert_eq!(shell.composer.take_follow_up().as_deref(), Some("keep"));
+}
+
+#[test]
+fn malformed_session_controls_keep_work_running_and_do_not_change_session() {
+    for line in [
+        "/new please",
+        "/clear drafts",
+        "/q later",
+        "/undo files typo",
+        "/rollback 0",
+    ] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        let id = agent.session().id().to_owned();
+        shell.composer.set_draft("unfinished thought");
+        assert!(
+            !shell.route_busy_command(&app, line.into()),
+            "{line} stopped the turn"
+        );
+        assert!(
+            shell.startup.is_none() && shell.deferred.is_empty(),
+            "{line} was scheduled"
+        );
+        assert!(matches!(
+            shell.command(&app, &mut agent, line).unwrap(),
+            Step::Done
+        ));
+        assert_eq!(agent.session().id(), id, "{line}");
+        assert_eq!(shell.composer.draft(), "unfinished thought", "{line}");
+        assert!(transcript_text(&shell).contains("Usage:"), "{line}");
+    }
+}
+
+#[test]
+fn everyday_help_delivers_the_advertised_guide_and_command_idle_and_busy() {
+    for busy in [false, true] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        if busy {
+            assert!(!shell.route_busy_command(&app, "/help models".into()));
+        } else {
+            shell.command(&app, &mut agent, "/help models").unwrap();
+        }
+        let text = transcript_text(&shell);
+        assert!(text.contains("also: dial models"), "busy={busy}: {text}");
+        assert!(
+            text.contains("docs/terminal-models.md"),
+            "busy={busy}: {text}"
+        );
+    }
+}
+
+#[test]
 fn permissions_explain_native_path_scope_on_add_list_remove_and_usage() {
     for command in [
         "/permissions deny read --path '*.pem'",
@@ -393,4 +454,135 @@ fn permissions_why_lists_recent_policy_decisions_newest_first() {
         text.find("read: first").unwrap(),
     );
     assert!(second < first, "{text}");
+}
+
+/// A typo in a closed-grammar command is answered at once on both routes. It never stops the
+/// turn, waits in the after-turn queue to fail later, or changes the session it was typed in.
+#[test]
+fn malformed_closed_grammar_commands_answer_at_once_idle_and_busy() {
+    for (line, usage) in [
+        ("/plan maybe", "Usage: /plan [on|off]"),
+        ("/mode plan maybe", "Usage: /plan [on|off]"),
+        (
+            "/approval nope",
+            "Usage: /approval [ask|write|auto|readonly]",
+        ),
+        ("/laya nope", "Usage: /laya [status|check|start|on|off]"),
+        ("/tree x", "Usage: /tree"),
+        ("/fork typo", "Usage: /fork"),
+        ("/cancel", "Usage: /cancel <id>"),
+        ("/message", "Usage: /message <id> <text>"),
+        ("/message task-9", "Usage: /message <id> <text>"),
+    ] {
+        for busy in [false, true] {
+            let (_home, _project, app, mut shell) = shell();
+            let mut agent = permission_agent(&app);
+            let id = agent.session().id().to_owned();
+            let (plan, approval) = (agent.plan_mode(), agent.approval());
+            if busy {
+                assert!(
+                    !shell.route_busy_command(&app, line.into()),
+                    "{line} stopped the turn"
+                );
+                assert!(
+                    shell.startup.is_none() && shell.deferred.is_empty(),
+                    "{line} was scheduled"
+                );
+            } else {
+                assert!(matches!(
+                    shell.command(&app, &mut agent, line).unwrap(),
+                    Step::Done
+                ));
+            }
+            let text = transcript_text(&shell);
+            assert!(text.contains(usage), "{line} busy={busy}: {text}");
+            assert_eq!(agent.session().id(), id, "{line} busy={busy}");
+            assert_eq!(agent.plan_mode(), plan, "{line} busy={busy}");
+            assert_eq!(agent.approval(), approval, "{line} busy={busy}");
+        }
+    }
+}
+
+/// The syntax check must not swallow the forms it guards.
+#[test]
+fn well_formed_closed_grammar_commands_still_run() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    shell.command(&app, &mut agent, "/plan on").unwrap();
+    assert!(agent.plan_mode());
+    shell.command(&app, &mut agent, "/mode plan off").unwrap();
+    assert!(!agent.plan_mode());
+    shell
+        .command(&app, &mut agent, "/approval readonly")
+        .unwrap();
+    assert_eq!(agent.approval(), Approval::Readonly);
+    assert!(!transcript_text(&shell).contains("Usage:"));
+    // While busy they keep their declared scheduling: /plan stops the turn, /approval waits.
+    assert!(shell.route_busy_command(&app, "/plan on".into()));
+    assert_eq!(shell.startup.as_deref(), Some("/plan on"));
+    assert!(!shell.route_busy_command(&app, "/approval ask".into()));
+    assert_eq!(shell.deferred.len(), 1);
+}
+
+/// `/undo` and `/undo files` describe a file restore the same way, naming the files instead of
+/// printing counts in one command and a debug list in the other.
+#[test]
+fn file_restore_reads_the_same_for_undo_and_undo_files() {
+    for command in ["/undo", "/undo files"] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        let cp = agent.checkpoints().unwrap().clone();
+        let session = agent.session().id().to_owned();
+        let turn = cp.begin_conversation_turn("edit", &session).unwrap();
+        let kept = app.layout.project_root.join("kept.txt");
+        let created = app.layout.project_root.join("created.txt");
+        std::fs::write(&kept, "original").unwrap();
+        cp.before_write(&kept).unwrap();
+        std::fs::write(&kept, "changed").unwrap();
+        cp.before_write(&created).unwrap();
+        std::fs::write(&created, "new").unwrap();
+        agent.session_mut().append(serde_json::json!({"role":"user","content":"change files", "dial_checkpoint":{"session":session,"turn":turn}})).unwrap();
+        shell.command(&app, &mut agent, command).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "original");
+        assert!(!created.exists(), "{command}");
+        let text = transcript_text(&shell);
+        assert!(
+            text.contains("Restored 1 file: kept.txt"),
+            "{command}: {text}"
+        );
+        assert!(
+            text.contains("Removed 1 file the undone work created: created.txt"),
+            "{command}: {text}"
+        );
+        assert!(!text.contains("[\""), "{command}: {text}");
+    }
+}
+
+/// An empty conversation has nothing to rewind; say so instead of reporting zero messages.
+#[test]
+fn undo_on_an_empty_conversation_says_there_is_nothing_to_undo() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    shell.command(&app, &mut agent, "/undo").unwrap();
+    let text = transcript_text(&shell);
+    assert!(text.contains("Nothing to undo"), "{text}");
+    assert!(!text.contains("dropped 0"), "{text}");
+}
+
+/// Custom commands are listed by one owner, so the idle and busy routes cannot drift.
+#[test]
+fn custom_command_listing_matches_idle_and_busy() {
+    let mut texts = Vec::new();
+    for busy in [false, true] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        if busy {
+            assert!(!shell.route_busy_command(&app, "/commands".into()));
+        } else {
+            shell.command(&app, &mut agent, "/commands").unwrap();
+        }
+        texts.push(transcript_text(&shell));
+    }
+    assert_eq!(texts[0], texts[1]);
+    assert!(texts[0].contains("/review"), "{}", texts[0]);
 }

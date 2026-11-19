@@ -89,7 +89,7 @@ fn copy_with_snapshot(
     let (nodes, complete) = scan(source)?;
     anyhow::ensure!(
         complete,
-        "stream journal {} has an oversized row; source preserved, not copied",
+        "stream journal {} has a damaged row (oversized or malformed); source preserved, not copied",
         path(source).display()
     );
     let journal = Journal::create_new(destination).map_err(|error| {
@@ -180,6 +180,32 @@ pub fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<
         Err(_) => std::fs::rename(source, destination),
     }
 }
+/// Replay accepts only newline-terminated frames. Never promote an interrupted final frame by
+/// adding its missing newline: even syntactically valid JSON was not part of the recovered log.
+fn discard_torn_tail(file: &mut File) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let length = file.metadata()?.len();
+    let mut end = length;
+    let mut chunk = [0u8; 8192];
+    let cut = loop {
+        if end == 0 {
+            break 0;
+        }
+        let n = end.min(chunk.len() as u64) as usize;
+        end -= n as u64;
+        file.seek(SeekFrom::Start(end))?;
+        file.read_exact(&mut chunk[..n])?;
+        if let Some(newline) = chunk[..n].iter().rposition(|&byte| byte == b'\n') {
+            break end + newline as u64 + 1;
+        }
+    };
+    if cut != length {
+        file.set_len(cut)?;
+        crate::platform::fs::sync_file(file)?;
+    }
+    Ok(())
+}
+
 impl Journal {
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_writes_for_test(&self, read_only: File) {
@@ -237,12 +263,12 @@ impl Journal {
                 "stream journal requires an owner-owned regular file without hard links",
             ));
         }
-        // A killed write may leave a partial line. Separate it from all subsequent frames.
+        // Validate versions before repairing a killed write, preserving incompatible journals.
         if file.metadata()?.len() > 0 {
             recover(session).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
-            file.write_all(b"\n")?;
+            discard_torn_tail(&mut file)?;
         }
         let writer = Arc::new(Mutex::new(Writer {
             file,
@@ -373,8 +399,8 @@ impl Journal {
     }
     /// Caller must sync the main session before supplying its acknowledged runtime revisions.
     /// Unacknowledged observations from every branch survive, including an active partial reply.
-    /// Reclamation is deferred without latching the writer when the retained baselines exceed the
-    /// private-state limit or the scan skipped an oversized row: every frame stays in the stream.
+    /// Reclamation is deferred without latching the writer when retained baselines exceed the
+    /// private-state limit or the scan skipped a damaged row: every frame stays in the stream.
     pub fn checkpoint(&self, acknowledged: &BTreeMap<String, u64>) -> anyhow::Result<()> {
         let mut writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         anyhow::ensure!(
@@ -433,7 +459,7 @@ impl Journal {
     }
 }
 
-/// Replays the stream. The flag is `false` when an oversized row was skipped, so the replay cannot
+/// Replays the stream. The flag is `false` when a damaged row was skipped, so the replay cannot
 /// prove that it saw every frame. Only a real end of file counts as a torn tail.
 fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
     let path = path(session);
@@ -489,6 +515,9 @@ fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
             );
         }
         let Ok(frame) = serde_json::from_slice::<Frame>(&bytes) else {
+            if !bytes.iter().all(u8::is_ascii_whitespace) {
+                complete = false;
+            }
             continue;
         };
         match frame {
@@ -545,13 +574,13 @@ pub fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
     scan(session).map(|(nodes, _)| nodes)
 }
 
-/// Like `recover`, but refuses a journal with an oversized row instead of dropping it silently.
+/// Like `recover`, but refuses damaged rows instead of dropping them silently.
 /// Forks copy a supplement, so a partial read must not pass as the branch's complete history.
 pub fn recover_complete(session: &Path) -> anyhow::Result<Vec<Node>> {
     let (nodes, complete) = scan(session)?;
     anyhow::ensure!(
         complete,
-        "stream journal {} has an oversized row; refusing to copy a partial supplement",
+        "stream journal {} has a damaged row (oversized or malformed); refusing to copy a partial supplement",
         path(session).display()
     );
     Ok(nodes)

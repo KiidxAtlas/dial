@@ -8,7 +8,10 @@
 use crate::config::types::Config;
 use crate::tools::{ToolOutput, Workspace};
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Tools owning processes and watches that must outlive an agent rebuilt for the same session.
 const LIVE_PROCESS_TOOLS: [&str; 2] = ["bg", "monitor"];
@@ -362,7 +365,7 @@ pub struct Registry {
     /// MCP tools mirrored from the connected servers; [`Registry::sync_mcp`] applies their changes.
     mcp: super::mcp::Live,
     /// Configured servers still connecting at startup; [`Registry::adopt_mcp`] mounts them.
-    pending_mcp: Option<Arc<super::mcp::Connecting>>,
+    pending_mcp: Option<(Arc<super::mcp::Connecting>, BTreeSet<String>)>,
     /// The configured servers as connected, before this registry mirrored them, so an agent
     /// rebuilt for the same servers can adopt them ([`Registry::mcp_handoff`]).
     mcp_source: Option<Arc<super::mcp::Connecting>>,
@@ -691,7 +694,8 @@ impl Registry {
             super::mcp::Startup::Ready(loaded) => self.mount_mcp(config, loaded),
             super::mcp::Startup::Connecting(connecting) => {
                 self.register_native(connecting.inventory_tool());
-                self.pending_mcp = Some(connecting);
+                self.pending_mcp = Some((connecting, BTreeSet::new()));
+                self.adopt_mcp(false);
             }
         }
     }
@@ -709,12 +713,22 @@ impl Registry {
     /// [`super::mcp::retain`]: an agent rebuilt for the same servers adopts them instead of
     /// reconnecting. Servers added later in the session (temporary connections) are not included.
     pub fn mcp_handoff(&self) -> Option<Arc<super::mcp::Connecting>> {
-        self.pending_mcp.clone().or_else(|| self.mcp_source.clone())
+        self.pending_mcp
+            .as_ref()
+            .map(|(pass, _)| pass.clone())
+            .or_else(|| self.mcp_source.clone())
     }
 
     /// Names of the enabled MCP servers still connecting, so the prompt can say they are coming.
     pub fn mcp_connecting(&self) -> Option<Vec<String>> {
-        self.pending_mcp.as_ref().map(|pending| pending.servers())
+        self.pending_mcp.as_ref().and_then(|(pass, seen)| {
+            let names: Vec<_> = pass
+                .servers()
+                .into_iter()
+                .filter(|name| !seen.contains(name))
+                .collect();
+            (!names.is_empty()).then_some(names)
+        })
     }
 
     /// The `bg` and `monitor` tools while they own running jobs or armed watches, for an agent
@@ -748,22 +762,37 @@ impl Registry {
         }
     }
 
-    /// Mounts servers that were still connecting at startup once they finished, or waiting for
-    /// their startup budget when `wait` is set (a capability that needs them was requested).
-    /// Returns whether servers were adopted; the next [`Registry::sync_mcp`] then reports a change
-    /// so the offered schemas and system prompt are rebuilt.
+    /// Publish newly ready servers at the caller's stable boundary. Explicit discovery can wait
+    /// for the complete pass. Append to the existing mirror: previously offered tools and their
+    /// retired names must survive every later wave.
     pub fn adopt_mcp(&mut self, wait: bool) -> bool {
-        let Some(pending) = self
-            .pending_mcp
-            .take_if(|pending| wait || pending.is_finished())
-        else {
+        let Some((pending, seen)) = &mut self.pending_mcp else {
             return false;
         };
-        let loaded = pending.wait().clone();
-        let config = pending.config().clone();
-        self.mount_mcp(&config, loaded);
-        self.mcp_adopted = true;
-        true
+        let settled = (wait || pending.is_finished()).then(|| pending.wait());
+        let mut delta = super::mcp::McpLoad {
+            live: std::mem::take(&mut self.mcp),
+            ..Default::default()
+        };
+        let changed = pending.publish(seen, &mut delta);
+        self.mcp = delta.live;
+        if let Some(loaded) = settled {
+            let inventory = loaded.inventory_tool(pending.config());
+            self.mcp_source = Some(super::mcp::Connecting::ready(
+                pending.config(),
+                loaded.clone(),
+            ));
+            self.pending_mcp = None;
+            self.register_native(inventory);
+        }
+        if changed {
+            self.notices.extend(delta.notices);
+            self.mcp_instructions.extend(delta.instructions);
+            self.mcp_instructions.sort_unstable();
+            self.sync_mcp();
+            self.mcp_adopted = true;
+        }
+        changed
     }
 
     /// Startup diagnostics (for example an MCP server that failed to connect). Returned once, then cleared.

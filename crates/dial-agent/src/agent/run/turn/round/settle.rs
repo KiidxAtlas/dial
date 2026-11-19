@@ -143,6 +143,15 @@ impl Agent<'_> {
                 output.text.push_str(&format!("\n[Check cost] {note}"));
             }
         }
+        if call.name == "read"
+            && !output.is_error
+            && let Some(hint) =
+                crate::agent::workflow::investigation::large_read_hint(call, &output.text, |path| {
+                    crate::tools::outline_available(std::path::Path::new(path))
+                })
+        {
+            output.text.push_str(&format!("\n{hint}"));
+        }
         // Runtime check receipts record calls that actually executed. They are local algorithm
         // checks, not blanket verification of all workspace edits at the cell's final revision.
         if call.name == "eval" {
@@ -312,6 +321,12 @@ impl Agent<'_> {
         if shell_check_passed {
             self.step_checks.shell_check_passed = Some(self.step_checks.revision());
         }
+        if committed && self.unchecked_after_launch_gap() {
+            output.text.push('\n');
+            output
+                .text
+                .push_str(crate::agent::verify::completion::UNCHECKED_AFTER_LAUNCH_GAP);
+        }
         if let Some(passed) = shell_check_run {
             let command = call.arguments["command"]
                 .as_str()
@@ -362,7 +377,16 @@ impl Agent<'_> {
                 |name| self.recovery_capability(name, &turn.names),
             )
             .or_else(|| {
-                crate::agent::run::failure_guidance::missing_program_recovery(call, &output)
+                use crate::agent::run::failure_guidance::{
+                    missing_program_recovery, offered_eval_language,
+                };
+                missing_program_recovery(call, &output, || {
+                    offered_eval_language(
+                        self.recovery_capability("eval", &turn.names),
+                        self.workspace.root(),
+                        self.config,
+                    )
+                })
             });
             if let Some(advice) = advice {
                 output.text.push_str(&advice);
@@ -626,6 +650,8 @@ impl Agent<'_> {
         call: &ToolCall,
         output: &mut ToolOutput,
     ) -> Option<&'static str> {
+        self.step_checks.effects_unknown |=
+            output.execution.effects == tools::surface::outcome::Effects::Unknown;
         if let Some(checkpoints) = &self.checkpoints {
             checkpoints.settle_changes();
         }

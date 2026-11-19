@@ -218,12 +218,93 @@ def milliseconds(start, end):
         return None
 
 
+class ArtifactTrace:
+    """Single Dial journal, in publication order. No command or output text is exported."""
+
+    def __init__(self):
+        self.requests = {}
+        self.request = self.mismatch = self.last_repair = None
+        self.mismatch_paths = set()
+        self.verify_nodes = set()
+        self.shell = {}
+        self.seen = set()
+        self.repeats = 0
+        self.complete = True
+
+    def check(self, identity, marked, mismatch, paths=()):
+        if marked and identity in self.seen:
+            self.repeats += 1
+        self.seen.add(identity)
+        if mismatch and self.mismatch is None:
+            self.mismatch = self.request
+            self.mismatch_paths = set(paths)
+
+    def observe(self, node, message):
+        if node.get('kind') == 'inference':
+            if node['id'] not in self.requests:
+                self.request = len(self.requests) + 1
+                self.requests[node['id']] = self.request
+        if node.get('kind') == 'tool' and node.get('label') == 'verify':
+            data = (node.get('result') or {}).get('data') or {}
+            rows = data.get('results')
+            if data.get('origin') == 'model_registered' and isinstance(rows, list):
+                node_id = node.get('id')
+                if not isinstance(node_id, str):
+                    self.complete = False
+                elif node_id not in self.verify_nodes:
+                    self.verify_nodes.add(node_id)
+                    for row in rows:
+                        if isinstance(row, dict) and row.get('ran') is True and isinstance(row.get('command'), str):
+                            self.check(('acceptance', digest(row['command'].encode())), True, row.get('status') == 'code_failed')
+        if message.get('role') == 'assistant':
+            for call in message.get('tool_calls') or []:
+                if call['function'].get('name') != 'bash':
+                    continue
+                args = call['function'].get('arguments')
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = None
+                if not isinstance(args, dict) or not isinstance(args.get('command'), str):
+                    self.complete = False
+                elif not args.get('background') and not args.get('pty'):
+                    # Ignore evidence annotations, not the cwd, session, command or other launch args.
+                    launch = {k: v for k, v in args.items() if k not in ('check', 'check_paths')}
+                    paths = args.get('check_paths')
+                    self.shell[call['id']] = (digest(json.dumps(launch, sort_keys=True).encode()),
+                                              args.get('check') is True, paths if isinstance(paths, list) else [])
+        if message.get('role') != 'tool':
+            return
+        execution = message.get('dial_execution') or {}
+        changed = execution.get('changed_paths') or []
+        if changed:
+            self.seen.clear()
+            if self.mismatch_paths.intersection(p for p in changed if isinstance(p, str)):
+                self.last_repair = self.request
+        shell = self.shell.pop(message['tool_call_id'], None)
+        process = execution.get('process') or {}
+        if shell and process.get('started') is True and process.get('output_complete') is True and not (
+                process.get('cancelled') or process.get('signal') or process.get('timed_out')):
+            identity, marked, paths = shell
+            text = str(message.get('content', '')).lower()
+            mismatch = marked and process.get('exit_code') not in (None, 0, 126, 127) and 'expected' in text and 'actual' in text
+            self.check(('shell', identity), marked, mismatch, (p for p in paths if isinstance(p, str)))
+
+    def summary(self, request_count):
+        covered = self.complete and not self.shell and self.requests and len(self.requests) == request_count
+        return {'observed_repeat_checks': self.repeats if covered else None,
+                'requests_from_first_mismatch_to_artifact_write': self.last_repair - self.mismatch if covered and
+                self.mismatch is not None and self.last_repair is not None else None}
+
+
 def summarize_trial(trial):
     """Read only this trial's allowlisted logs; return metadata plus explicit coverage gaps."""
     trial = Path(trial)
     gaps, inventory, requests, tools, stderr_events = [], [], {}, {}, []
     adaptive, completion, runtime_latency = {}, None, {}
     seen_calls = Counter()
+    artifact = ArtifactTrace()
 
     def source(path, line=None):
         return {'path': path.relative_to(trial).as_posix(), **({'line': line} if line else {})}
@@ -277,6 +358,7 @@ def summarize_trial(trial):
         for line, event in records(path):
             where = source(path, line)
             node, message = event.get('node') or {}, event.get('message') or {}
+            artifact.observe(node, message)
             if node.get('kind') == 'inference':
                 active_request = (path.name, node.get('id'))
                 latency = ((node.get('result') or {}).get('data') or {}).get('latency')
@@ -446,6 +528,8 @@ def summarize_trial(trial):
             'interpretation': 'Pattern labels and repeated arguments are observations, not causes or proof of wasted work. Durations are observed call-to-result intervals, not process-only time. Token fields retain producer semantics; cache traffic is not billed cost.',
             'source_inventory': inventory, 'requests': list(requests.values()), 'tools': list(tools.values()),
             'stderr_events': stderr_events, 'final_reliability': adaptive or None, 'completion_evidence': completion,
+            'artifact_process': artifact.summary(expected_requests if len(journals) == 1 and expected == observed_tools
+                and not any(g['kind'] in ('malformed_jsonl', 'some_tool_results_unavailable') for g in gaps) else None),
             'trial_metadata': metadata, 'reported_efficiency': efficiency_metadata(raw_metrics.get('usage') or {}),
             'verifier': verifier, 'stage_durations_ms': timing, 'coverage_gaps': gaps,
             'observed_counts': {'requests': len(requests), 'tool_results': observed_tools,
@@ -467,6 +551,19 @@ def measurement(values, expected_samples=None):
 def summarize_agent(rows):
     diagnostics = [r.get('diagnostics') or {} for r in rows]
     measures = {'agent_elapsed_sec': measurement([r.get('elapsed_sec') for r in rows])}
+    def reward(row):
+        record = row.get('reward')
+        value = record.get('reward') if isinstance(record, dict) else None
+        return number(value) if type(value) in (int, float) else None
+
+    scored = [row for row in rows if reward(row) is not None]
+    passed = [row for row in scored if reward(row) == 1]
+    outcomes = {'passed': len(passed), 'scored': len(scored), 'unscored': len(rows) - len(scored),
+                'pass_rate_scored': len(passed) / len(scored) if scored else None}
+    measures['passing.agent_elapsed_sec'] = measurement([r.get('elapsed_sec') for r in passed])
+    measures['passing.requests'] = measurement([(r.get('usage') or {}).get('requests') for r in passed])
+    for key, cohort in [('observed_repeat_checks', rows), ('requests_from_first_mismatch_to_artifact_write', passed)]:
+        measures['artifact.' + key] = measurement([((r.get('diagnostics') or {}).get('artifact_process') or {}).get(key) for r in cohort])
     for key in USAGE_COUNTERS:
         measures['usage.' + key] = measurement([(r.get('usage') or {}).get(key) for r in rows])
     for stage in ('environment_setup', 'agent_setup', 'agent_execution', 'verifier', 'end_to_end'):
@@ -501,7 +598,7 @@ def summarize_agent(rows):
                          'origins': dict(Counter(t.get('origin', 'unknown') for t in selected)),
                          'call_to_result_ms': measurement([t.get('roundtrip_ms') for t in selected]),
                          'execution_duration_ms': measurement([t.get('execution_duration_ms') for t in selected])}
-    return {'trials': len(rows), 'measurements': measures, 'request_latency_ms': latency, 'tools': by_tool,
+    return {'trials': len(rows), 'verifier_outcomes': outcomes, 'measurements': measures, 'request_latency_ms': latency, 'tools': by_tool,
             'coverage_gaps': dict(Counter(g['kind'] for d in diagnostics for g in d.get('coverage_gaps', [])))}
 
 
@@ -573,6 +670,7 @@ def report_overview(rows, expected_tasks, agents, root=None, requested_batch=Non
                         'failed_tests': [t['name'] for t in tests if t['status'] == 'failed'],
                         'verifier_retries': measurement([t.get('retries') for t in tests])['total'],
                         'completion_evidence': diag.get('completion_evidence'),
+                        'artifact_process': diag.get('artifact_process'),
                         'coverage_gaps': dict(Counter(g['kind'] for g in diag.get('coverage_gaps', [])))})
                 tasks[name][label_] = attempts
         batches[batch] = {
@@ -626,6 +724,9 @@ def render_overview(overview):
                         '- Coverage gaps: ' + value(json.dumps(trial['coverage_gaps'], sort_keys=True)), ''])
         lines.extend(['', '### Identity and recorded constraints', '', *identities])
         for agent, summary in batch['agents'].items():
+            outcomes = summary['verifier_outcomes']
+            lines.extend([f"Official verifier ({agent}): {outcomes['passed']}/{outcomes['scored']} scored passed; "
+                          f"{outcomes['unscored']} unscored. Passing-only timing excludes failed and unscored attempts.", ''])
             lines.extend([f'### Measurements: {agent}', '',
                 '| Metric (unit in name) | Samples / expected | Complete total | Observed partial/full sum | Median | Nearest-rank p95 |',
                 '| --- | --- | ---: | ---: | ---: | ---: |'])

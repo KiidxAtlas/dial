@@ -98,6 +98,11 @@ pub trait Ui {
     fn diagnostic(&mut self, _message: &str) {}
     /// Display an already-authorized image reference; plain/structured surfaces may omit previews.
     fn image(&mut self, _reference: &Value) {}
+    /// Display an image Dial generated for the user. Unlike screenshots, it always stays in the
+    /// chat, even when another view (such as a watch pane) also receives it.
+    fn generated_image(&mut self, reference: &Value) {
+        self.image(reference);
+    }
     /// Effective request controls, for live status views; never a correctness claim.
     fn request_policy(&mut self, _control: &Value) {}
     /// Visible observer activity; never substituted for tool or verification results.
@@ -108,6 +113,8 @@ pub trait Ui {
     fn context_usage(&mut self, _tokens: u64, _estimated: bool) {}
     fn usage(&mut self, _prompt: Option<u64>, _output: Option<u64>, _seconds: f64) {}
     fn efficiency(&mut self, _report: &Value) {}
+    /// A check just executed and received a passing verification verdict (not cached evidence).
+    fn check_passed(&mut self) {}
     fn model_progress(&mut self, _progress: &llm::ModelProgress) {}
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     /// Latest progress snapshot for a running tool; replaces the previous one in place.

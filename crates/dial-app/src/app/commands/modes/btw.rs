@@ -32,7 +32,7 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
     }
     if verb == "promote" {
         if rest.is_empty() {
-            shell.note("BTW", "usage: /btw promote <id>");
+            shell.note("BTW", "Usage: /btw promote <id>");
             return Ok(Step::Done);
         }
         match shell.side.promote(agent, &app.layout, rest) {

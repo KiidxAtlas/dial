@@ -1,12 +1,8 @@
-//! The turn recap card: when a turn did work (tool calls), its closing line becomes a rounded card
-//! in the same frame as the tool cards. The top edge says how the turn ended and what it changed,
-//! the body shows the last test or build verdict and what the turn did as chips (lookups, edits,
-//! commands, web and service calls, workers, failures), the files it changed with their line
-//! counts and any recorded handoff, and the bottom edge carries time and tokens. A plain answer
-//! keeps the one-line closing row, and so does a terminal too narrow for a card.
+//! The closing recap puts the completion record's paths and checks above the activity chips.
+//! Expanded details retain the raw handoff; plain answers keep their one-line closing row.
 use super::{
-    super::tool_cards::{Tool, ToolState, Verdict, change_counts, check_command, frame, verdict},
-    Line, Modifier, Rows, Span, Sym, TranscriptCtx, TurnStats, text,
+    super::tool_cards::{Tool, ToolState, Verdict, change_counts, frame, verdict},
+    Line, Modifier, ReceiptCheck, Rows, Span, Sym, TranscriptCtx, TurnOutcome, TurnStats, text,
 };
 use crate::runtime::presentation::{Presentation, Tone};
 use crate::ui::theme::Tok;
@@ -37,8 +33,8 @@ pub(super) struct Recap {
     pub lines: BTreeMap<String, (u64, u64)>,
     /// The verdict of the turn's last settled test or build command.
     pub check: Option<Verdict>,
-    /// That command's text when its verdict failed, so the recap can offer to run it again.
-    pub failed_check: Option<String>,
+    /// An edit was attempted after the observed command; its result is historical.
+    pub check_stale: bool,
     /// Numbered steps (`1.`, `2)`, …) in the turn's last answer.
     pub answer_steps: usize,
 }
@@ -58,6 +54,7 @@ impl Recap {
             Tone::Connect => self.web += 1,
             Tone::Edit => {
                 self.edits += 1;
+                self.check_stale |= self.check.is_some();
                 let target = text::one_line(presentation.target.trim());
                 if state == ToolState::Completed
                     && !target.is_empty()
@@ -74,7 +71,7 @@ impl Recap {
     /// Add what a settled call reported: an edit's line counts, a check's verdict.
     pub fn note_result(&mut self, tool: &Tool) {
         if let Some(v) = verdict(tool) {
-            self.failed_check = if v.ok { None } else { check_command(tool) };
+            self.check_stale = false;
             self.check = Some(v);
         }
         if tool.presentation.tone == Tone::Edit
@@ -127,10 +124,10 @@ pub(super) fn actions(stats: &TurnStats, recap: &Recap) -> Vec<RecapAction> {
     }
     // A failed check is the most specific thing to redo: its own command, as a shell line in
     // the draft, so the user sees exactly what will run.
-    if let Some(command) = &recap.failed_check {
+    if let Some(check) = recap.check.as_ref().filter(|v| !v.ok) {
         out.push(RecapAction {
             label: "rerun check",
-            run: RecapRun::Draft(format!("!{command}")),
+            run: RecapRun::Draft(format!("!{}", check.command)),
         });
     }
     let outcome = stats.outcome.as_ref();
@@ -143,11 +140,7 @@ pub(super) fn actions(stats: &TurnStats, recap: &Recap) -> Vec<RecapAction> {
     {
         out.push(RecapAction::command("plan", "/todo"));
     }
-    if outcome
-        .map_or(0, |o| o.changed_files)
-        .max(recap.files.len())
-        > 0
-    {
+    if changed_count(outcome, recap) > 0 {
         out.push(RecapAction::command("review", "/review-file"));
         out.push(RecapAction::command("undo", "/undo"));
     }
@@ -187,12 +180,30 @@ pub(super) fn numbered_steps(answer: &str) -> usize {
         .count()
 }
 
-/// The chord that runs the `index`-th (0-based) recap action: Alt+1 … Alt+9.
+/// Primary shortcut printed on this platform's recap card.
 pub fn action_chord(index: usize) -> Option<crate::ui::keys::Chord> {
-    let digit = char::from_digit(u32::try_from(index + 1).ok()?, 10).filter(|d| *d != '0')?;
-    Some(crate::ui::keys::Chord {
-        code: crossterm::event::KeyCode::Char(digit),
-        mods: crossterm::event::KeyModifiers::ALT,
+    action_chords(index).map(|chords| chords[0])
+}
+
+pub(super) fn action_chords(index: usize) -> Option<[crate::ui::keys::Chord; 2]> {
+    use crate::ui::keys::Chord;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if index >= 9 {
+        return None;
+    }
+    let number = index as u8 + 1;
+    let digit = Chord {
+        code: KeyCode::Char(char::from(b'0' + number)),
+        mods: KeyModifiers::ALT,
+    };
+    let function = Chord {
+        code: KeyCode::F(number),
+        mods: KeyModifiers::SHIFT,
+    };
+    Some(if cfg!(target_os = "macos") {
+        [function, digit]
+    } else {
+        [digit, function]
     })
 }
 
@@ -200,8 +211,163 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// The recap card for `stats`, or `None` when the turn made no calls, the width cannot hold a
-/// card, or nothing about the turn is shown at all.
+fn changed_count(outcome: Option<&TurnOutcome>, recap: &Recap) -> usize {
+    // Only the recorder knows which paths really changed (including batches and no-op edits).
+    outcome.map_or(recap.files.len(), |o| o.changed_files)
+}
+
+/// A compact receipt replaces, rather than repeats, the verbose changed/check/evidence lines.
+pub(super) fn handoff_rows(outcome: &TurnOutcome, width: usize, ctx: &TranscriptCtx) -> Rows {
+    let detailed = ctx.tools_expanded || outcome.receipt.is_none();
+    // Older unstructured producers keep the original footer bound. Typed handoffs are already
+    // bounded by the projection, including its final recovery instruction.
+    let limit = if outcome.receipt.is_some() {
+        usize::MAX
+    } else {
+        MAX_HANDOFF
+    };
+    let rows = outcome
+        .handoff
+        .iter()
+        .filter(move |line| {
+            detailed
+                || line.as_str() == "Changed: none recorded"
+                || ![
+                    "Changed:",
+                    "Checks:",
+                    "Evidence:",
+                    "Open tasks:",
+                    "Cost:",
+                    "Model time:",
+                    "Next: /review-file",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .take(limit)
+        .map(|detail| {
+            Line::from(Span::styled(
+                text::one_line(detail),
+                ctx.theme.fg(Tok::Text),
+            ))
+        })
+        .collect();
+    if ctx.tools_expanded && outcome.receipt.is_some() {
+        text::wrap(rows, width)
+    } else {
+        rows
+    }
+}
+
+/// Recorded facts take precedence over live tool cards, which may predate a later edit.
+pub(super) fn receipt_rows(
+    outcome: &TurnOutcome,
+    recap: &Recap,
+    w: usize,
+    ctx: &TranscriptCtx,
+) -> Rows {
+    let Some(receipt) = outcome.receipt.as_ref().filter(|_| !ctx.tools_expanded) else {
+        return Vec::new();
+    };
+    let theme = ctx.theme;
+    let mut rows = Vec::new();
+    let field = |name| Span::styled(name, theme.fg(Tok::Text).add_modifier(Modifier::BOLD));
+    for (i, path) in receipt.paths.iter().take(MAX_FILES).enumerate() {
+        let prefix = if i == 0 { "Changed  " } else { "         " };
+        let counts = recap
+            .lines
+            .get(path)
+            .map(|(a, r)| format!(" +{a} {}{r}", theme.sym(Sym::Minus)));
+        let room = w.saturating_sub(prefix.len() + counts.as_deref().map_or(0, text::width));
+        let mut spans = vec![
+            field(prefix),
+            Span::styled(
+                text::ellipsize_start(path, room.max(1), theme.ascii()),
+                theme.fg(Tok::Accent),
+            ),
+        ];
+        if let Some(counts) = counts {
+            spans.push(Span::styled(counts, theme.fg(Tok::Muted)));
+        }
+        rows.push(super::fitted(spans, w, theme));
+    }
+    let rest = outcome
+        .changed_files
+        .saturating_sub(receipt.paths.len().min(MAX_FILES));
+    if rest > 0 {
+        rows.push(super::fitted(
+            vec![Span::styled(
+                format!("         +{rest} more"),
+                theme.fg(Tok::Muted),
+            )],
+            w,
+            theme,
+        ));
+    }
+    let tok = match receipt.check {
+        ReceiptCheck::Passed => Tok::Success,
+        ReceiptCheck::Failed => Tok::Error,
+        ReceiptCheck::Stale | ReceiptCheck::Unverified => Tok::Warning,
+    };
+    let mut check = vec![
+        field("Checks   "),
+        Span::styled(receipt.check_label.clone(), theme.fg(tok)),
+    ];
+    if let Some(target) = &receipt.check_target {
+        let mut add = |label, value: String, tok| {
+            let used: usize = check.iter().map(|s| text::width(&s.content)).sum();
+            if used + 3 + text::width(&value) > w {
+                rows.push(super::fitted(std::mem::take(&mut check), w, theme));
+                check.push(field(label));
+            } else {
+                check.push(Span::styled(
+                    format!(" {} ", theme.sym(Sym::Dot)),
+                    theme.fg(Tok::Dim),
+                ));
+            }
+            check.push(Span::styled(value, theme.fg(tok)));
+        };
+        if !recap.check_stale
+            && let Some(v) = &recap.check
+            && v.command == *target
+            && ((v.ok && receipt.check == ReceiptCheck::Passed)
+                || (!v.ok && receipt.check == ReceiptCheck::Failed))
+        {
+            add("Last run ", format!("{} {}", v.what, v.summary), tok);
+        }
+        add("Target   ", target.clone(), Tok::Text);
+    }
+    rows.push(super::fitted(check, w, theme));
+    if receipt.check_target.is_none()
+        && let Some(v) = &recap.check
+    {
+        // Output without a recorded check isn't proof that the final revision was verified.
+        // Keep the observed result, but do not promote the receipt to passed.
+        let historical = if recap.check_stale { " (stale)" } else { "" };
+        rows.push(super::fitted(
+            vec![
+                field("Last run "),
+                Span::styled(
+                    format!("{} {}{historical}", v.what, v.summary),
+                    theme.fg(if v.ok { Tok::Text } else { Tok::Error }),
+                ),
+                Span::styled(
+                    format!(
+                        " {} {}",
+                        theme.sym(Sym::Dot),
+                        crate::storage::redact::redact_text(&v.command)
+                    ),
+                    theme.fg(Tok::Text),
+                ),
+            ],
+            w,
+            theme,
+        ));
+    }
+    rows
+}
+
+/// The recap card for a turn with tool activity.
 pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx) -> Option<Rows> {
     let w = w as usize;
     let timing = ctx.ui.show_turn_stats;
@@ -226,9 +392,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         Span::raw(" "),
         Span::styled(word.to_owned(), theme.fg(tok).add_modifier(Modifier::BOLD)),
     ];
-    let changed = outcome
-        .map_or(0, |o| o.changed_files)
-        .max(recap.files.len());
+    let changed = changed_count(outcome, recap);
     if changed > 0 {
         head.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
         head.push(Span::styled(
@@ -247,18 +411,29 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
 
     let mut card = frame::Frame::new(head, theme.fg(border));
     let inner = w - frame::CHROME_W;
+    if let Some(o) = outcome {
+        let receipt = receipt_rows(o, recap, inner, ctx);
+        if !receipt.is_empty() {
+            card.sections.push((None, receipt));
+        }
+    }
 
     // What the turn did, as chips that wrap to the card's width; the last check's verdict first.
     let mut chips: Vec<Span<'static>> = Vec::new();
-    if let Some(check) = &recap.check {
-        let (mark, tok) = if check.ok {
+    if outcome.is_none_or(|o| o.receipt.is_none())
+        && let Some(check) = &recap.check
+    {
+        let (mark, tok) = if recap.check_stale {
+            (theme.sym(Sym::Warn), Tok::Warning)
+        } else if check.ok {
             (theme.sym(Sym::Check), Tok::Success)
         } else {
             (theme.sym(Sym::Cross2), Tok::Error)
         };
+        let freshness = if recap.check_stale { "stale: " } else { "" };
         chips.push(frame::chip(
             theme,
-            &format!("{mark} {} {}", check.what, check.summary),
+            &format!("{mark} {freshness}{} {}", check.what, check.summary),
             tok,
         ));
     }
@@ -308,7 +483,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
     card.sections.push((None, activity));
 
     // The files it changed, the path's tail kept when it is long, line counts at the right edge.
-    if !recap.files.is_empty() {
+    if changed > 0 && outcome.is_none_or(|o| o.receipt.is_none()) && !recap.files.is_empty() {
         let mark = theme.sym(Sym::Bullet).to_owned();
         let mut rows: Rows = recap
             .files
@@ -356,16 +531,13 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
     if let Some(o) = outcome
         && !o.handoff.is_empty()
     {
-        let rows = o
-            .handoff
-            .iter()
-            .take(MAX_HANDOFF)
-            .map(|detail| Line::from(Span::styled(text::one_line(detail), theme.fg(Tok::Muted))))
-            .collect();
-        card.sections.push((Some("Handoff".into()), rows));
+        let rows = handoff_rows(o, inner, ctx);
+        if !rows.is_empty() {
+            card.sections.push((Some("Handoff".into()), rows));
+        }
     }
 
-    // Follow-ups right where the outcome is reported, each under its own Alt+digit.
+    // Follow-ups use the primary shortcut on this platform.
     let follow_ups = actions(stats, recap);
     if !follow_ups.is_empty() {
         let mut spans = vec![Span::styled("next  ", theme.fg(Tok::Dim))];

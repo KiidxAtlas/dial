@@ -24,6 +24,17 @@
   use the transitive, hashed `scripts/requirements-ci.lock`. The Nix input is pinned to an immutable
   revision, but still needs a genuine resolver-generated `flake.lock` and native Nix acceptance.
 
+### Windows publisher signing
+
+CI candidates remain unsigned. On release tags the protected `windows-signing` environment
+signs each candidate's `dial.exe` before the final ZIP checksums and Ed25519 manifest.
+Restrict that GitHub environment to `v*` tags and configure required reviewers. On the Entra
+release app add a GitHub federated credential for this repository and that environment;
+assign **Artifact Signing Certificate Profile Signer** on `rootatlas` / `dial-desktop`.
+Set environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+`AZURE_SIGNING_ENDPOINT` (the signing account's regional HTTPS endpoint) and
+`AZURE_SIGNING_PUBLISHER` (the exact certificate common name). No client secret is needed.
+
 ### Bundled execution runtime and installed-feature gate
 
 Release binaries embed a compressed, target-specific Node runtime alongside the existing
@@ -120,6 +131,14 @@ version, pass a tag such as `v0.2.2`: `curl -fsSL https://dial.rootatlas.dev/ins
 `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
 `dial update` (or `/update` inside the interactive terminal, followed by `/restart`) updates Dial the way it was installed. For installer copies it checks the GitHub latest release (or `dial update --version 0.1.1`, `/update 0.1.1`). If you already run that release it says so and stops; an explicit `--version` always installs, so it can also reinstall or downgrade. It verifies the same signed manifest and asset digest, stages the candidate on the install filesystem, and checks its `--version`. On Unix it holds a lock file (`.dial-update.lock`) in the install directory so concurrent updates cannot interleave, preserves a digest-verified copy of the current binary as the rollback point, renames the candidate over the active name (never removing that name first, so an interruption leaves a complete old or new executable), fsyncs the directory, and re-checks `--version`. If the post-install check fails, the rollback copy is renamed back; if that also fails, the error reports both failures and the rollback copy is kept at `<name>.dial.bak` for manual recovery. Windows uses a deferred PowerShell swap after the running process exits, with its own rollback.
+
+`dial update --check` only reports: whether a newer release exists, and how `dial update` would install it. It changes nothing. `dial update --check --json` prints one JSON object for frontends (Dial Desktop runs it to offer engine updates):
+
+```json
+{"current":"0.3.10","latest":"0.3.11","update_available":true,"installation":"installer","method":"release","can_update":true,"update_command":"dial update","error":null}
+```
+
+`installation` is `installer`, `homebrew`, `cargo` or `nix`; `method` is `release`, `package_manager`, `checkout` or `manual`. When `can_update` is false, `update_command` says what to do instead. If GitHub cannot be reached, `latest` is `null`, `update_available` is false, `error` says why, and the command still exits 0 so the reply always parses. Fields are only ever added. `--check` cannot be combined with `--version`.
 
 Other installations are updated by their owners, which `dial update` runs for you:
 

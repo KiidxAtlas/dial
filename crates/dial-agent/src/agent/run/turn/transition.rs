@@ -124,6 +124,9 @@ impl TurnState<'_> {
             *capability_search = Default::default();
             *pending = None;
             crate::agent::run::guidance::reset_for_steering(pending_nudges);
+            // Do not coach the replacement instruction about the previous lookup streak.
+            // Shell command identities remain valid until the context or workspace changes.
+            pace.observe_round(&[]);
             *rejected_edit_previews = 0;
             *recovering_output = false;
             *repair = Default::default();
@@ -175,6 +178,7 @@ impl Agent<'_> {
         turn.reset(transition);
         match transition {
             Transition::Steering => {
+                self.step_checks.repair_brief = None;
                 let instruction = self.session.control_state()["current_instruction"]
                     .as_str()
                     .unwrap_or("")

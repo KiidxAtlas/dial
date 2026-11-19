@@ -81,6 +81,14 @@ pub enum OverlayEvent {
         role: String,
         scope: Scope,
     },
+    /// Save `level` (`default` clears it) as the thinking level of the model assigned to `role`.
+    SetThinking {
+        role: String,
+        level: String,
+        scope: Scope,
+    },
+    /// A model preset action from the Roles tab (saved globally).
+    Preset(PresetAction),
     AddProvider {
         id: String,
         spec: ProviderSpec,
@@ -253,6 +261,13 @@ impl fmt::Debug for OverlayEvent {
             Self::Action(action) => f.debug_tuple("Action").field(action).finish(),
             Self::JobStop { name } => f.debug_struct("JobStop").field("name", name).finish(),
             Self::JobDismiss { name } => f.debug_struct("JobDismiss").field("name", name).finish(),
+            Self::SetThinking { role, level, scope } => f
+                .debug_struct("SetThinking")
+                .field("role", role)
+                .field("level", level)
+                .field("scope", scope)
+                .finish(),
+            Self::Preset(action) => f.debug_tuple("Preset").field(action).finish(),
             // Typed bytes may be secrets (passwords at a prompt): never log them.
             Self::JobInput { name, bytes } => f
                 .debug_struct("JobInput")
@@ -261,6 +276,22 @@ impl fmt::Debug for OverlayEvent {
                 .finish(),
         }
     }
+}
+
+/// What the Roles tab asks the controller to do with a model preset (`model_presets.<name>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresetAction {
+    /// Apply the preset's models and thinking levels.
+    Apply(String),
+    /// Save the current roles as a new preset.
+    Create(String),
+    /// Replace an existing preset's models with the current roles.
+    Update(String),
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete(String),
 }
 
 /// Everything an overlay needs to draw consistently with the rest of the UI.

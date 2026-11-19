@@ -27,11 +27,10 @@ Dial finds its state directory from a nonempty `DIAL_HOME`, otherwise `HOME\.dia
 
 ### Publisher signatures and download warnings
 
-Dial's installer verifies the Ed25519-signed checksum manifest and archive checksum. Releases
-do not require an Azure account or paid signing certificate, and the release workflow does not
-Authenticode-sign `dial.exe`. Windows may show an unknown-publisher warning, block it under Smart
-App Control, or apply an enterprise policy block even when the installer has verified the
-download. The one-command installer simplifies setup; it does not bypass Windows security controls.
+Dial's installer verifies the Ed25519-signed checksum manifest and archive checksum. The
+release workflow also Authenticode-signs and timestamps `dial.exe` for both Windows architectures;
+older downloads are unchanged. Users do not need an Azure account. Neither signature bypasses
+Windows security controls or enterprise policy.
 
 After installing or extracting a release, inspect the executable in PowerShell:
 
@@ -42,10 +41,10 @@ $signature.SignerCertificate | Format-List Subject, Issuer
 $signature.TimeStamperCertificate | Format-List Subject, Issuer
 ```
 
-For an extracted copy not on PATH, use its full `dial.exe` path instead. `NotSigned` is expected
-for current releases; it is separate from the installer's manifest/checksum verification. Report
-`HashMismatch`, `NotTrusted`, checksum-verification failures or Windows blocks with the release
-version and exact warning, without private system data.
+For an extracted copy not on PATH, use its full `dial.exe` path instead. Expect `Valid` and the
+release publisher for a signed release. Older unsigned releases report `NotSigned`. Report an
+unexpected status, checksum failure or Windows block with the release version and exact warning,
+without private system data.
 
 SmartScreen reputation warnings can persist for new signed software; signing does not guarantee
 an immediate bypass. Antivirus detections and enterprise policy blocks are separate issues.
@@ -54,8 +53,8 @@ Do not disable Defender/SmartScreen or install an untrusted root certificate to 
 ### Smart App Control
 
 Smart App Control (Windows 11) blocks any executable that is neither signed by a trusted
-publisher nor already known to Microsoft's cloud service. Release builds of `dial.exe` are not
-Authenticode-signed, so Smart App Control blocks them. It has no per-app allow list, and
+publisher nor already known to Microsoft's cloud service. This can affect older unsigned
+releases and local builds. Smart App Control has no per-app allow list, and
 `Unblock-File` does not help. The installer tests the downloaded executable before replacing an
 existing installation. If startup fails, it reports the native exit code when available; an
 enabled Smart App Control policy is a possible cause, not proof of the cause of every failure.

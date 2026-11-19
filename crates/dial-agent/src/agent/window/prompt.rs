@@ -116,7 +116,6 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         (&["grep"], SEARCH_SCOPE_RULE),
         (&["eval", "bash"], EVAL_SHELL_RULE),
         (&["verify"], VERIFY_REPRO_RULE),
-        (&["verify"], ARTIFACT_CHECK_RULE),
     ]
     .into_iter()
     .filter(|(tools, _)| {
@@ -132,6 +131,21 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     for rule in optional {
         policy.push_str("\n- ");
         policy.push_str(rule);
+    }
+    if has("write") && (has("verify") || has("bash")) {
+        let check = if has("verify") {
+            ARTIFACT_CHECK_RULE
+        } else {
+            ARTIFACT_SHELL_CHECK
+        };
+        let order = if one_call {
+            "after the write succeeds"
+        } else {
+            "in the same response, write first"
+        };
+        policy.push_str(&format!(
+            "\n- Standalone artifact: {check} {order}. {ARTIFACT_CASES}"
+        ));
     }
     // Workflow sentences that name a tool appear only when it is offered.
     let mut rules = String::from(RULES);

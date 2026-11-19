@@ -1,8 +1,13 @@
-use super::render;
+use super::{ReceiptCheck, outcome};
 use serde_json::{Value, json};
 
 fn no_timing() -> Value {
     Value::Null
+}
+
+fn render(summary: &Value, latency: &Value) -> Option<String> {
+    let handoff = outcome(summary, latency).handoff;
+    (!handoff.is_empty()).then(|| handoff.join("\n"))
 }
 
 fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
@@ -38,13 +43,16 @@ fn completed_edit_is_short_and_omits_empty_sections() {
     let text = render(&summary, &no_timing()).expect("edits produce a report");
     assert_eq!(
         text,
-        "Outcome: completed\n\
-         Changed: src/a.rs\n\
+        "Changed: src/a.rs\n\
          Checks: current · passed — cargo test passed\n\
          Evidence: no retained log for cargo test\n\
-         Next: /review-file · /undo (checkpointed edits only)\n\
-         Summary: 1 file changed · checks passed (current)"
+         Next: /review-file · /undo (checkpointed edits only)"
     );
+    let receipt = outcome(&summary, &no_timing()).receipt.unwrap();
+    assert_eq!(receipt.paths, ["src/a.rs"]);
+    assert_eq!(receipt.check, ReceiptCheck::Passed);
+    assert_eq!(receipt.check_label, "1 check passed");
+    assert_eq!(receipt.check_target.as_deref(), Some("cargo test"));
 }
 
 #[test]
@@ -59,18 +67,17 @@ fn interrupted_turn_names_effects_outside_undo() {
         "uncheckpointed_extension_calls": 0
     });
     let text = render(&summary, &no_timing()).expect("interruptions produce a report");
-    assert_eq!(line(&text, "Outcome:"), "Outcome: interrupted");
-    assert_eq!(line(&text, "Changed:"), "Changed: none");
+    let outcome = outcome(&summary, &no_timing());
+    assert_eq!(outcome.status, "interrupted");
+    assert_eq!(outcome.open_tasks, 2);
+    assert_eq!(line(&text, "Changed:"), "Changed: none recorded");
     assert_eq!(line(&text, "Checks:"), "Checks: none recorded");
     assert_eq!(line(&text, "Open tasks:"), "Open tasks: 2");
     assert_eq!(
         line(&text, "Outside /undo:"),
         "Outside /undo: 1 shell command may have changed files"
     );
-    assert_eq!(
-        line(&text, "Summary:"),
-        "Summary: interrupted · no files changed · no recorded checks · 2 open tasks · 1 effect outside /undo"
-    );
+    assert_eq!(outcome.receipt.unwrap().check, ReceiptCheck::Unverified);
 }
 
 #[test]
@@ -83,11 +90,7 @@ fn failed_turn_names_its_failure_class() {
         "open_tasks": 0
     });
     let text = render(&summary, &no_timing()).expect("failures produce a report");
-    assert!(
-        text.starts_with("Outcome: failed (rate limited)\n"),
-        "{text}"
-    );
-    assert!(line(&text, "Summary:").starts_with("Summary: failed (rate limited) ·"));
+    assert_eq!(line(&text, "Failure:"), "Failure: rate limited");
     assert!(!text.contains("HTTP 429"), "{text}");
 }
 
@@ -107,10 +110,12 @@ fn stale_checks_and_long_file_lists_are_marked() {
         line(&text, "Checks:"),
         "Checks: stale · passed — lint passed"
     );
-    assert_eq!(
-        line(&text, "Summary:"),
-        "Summary: 10 files changed · checks stale"
-    );
+    let outcome = outcome(&summary, &no_timing());
+    assert_eq!(outcome.changed_files, 10);
+    let receipt = outcome.receipt.unwrap();
+    assert_eq!(receipt.paths.len(), super::LISTED_FILES);
+    assert_eq!(receipt.check, ReceiptCheck::Stale);
+    assert_eq!(receipt.check_target.as_deref(), Some("lint"));
 }
 
 #[test]
@@ -119,13 +124,48 @@ fn collapsed_check_state_prefers_failure_then_unverified() {
         "recorded_checks":[{"name":"lint","status":"failed"},{"name":"test","status":"passed"}]});
     let unverified = json!({"outcome":"completed", "changed_files":["a.rs"], "checks_current":true,
         "recorded_checks":[{"name":"test","status":"skipped"}]});
-    for (summary, expected) in [
-        (failed, "Summary: 1 file changed · 1 check failed"),
-        (unverified, "Summary: 1 file changed · checks unverified"),
+    for (summary, expected, label, target) in [
+        (
+            failed,
+            ReceiptCheck::Failed,
+            "1 check failed (stale)",
+            "lint",
+        ),
+        (
+            unverified,
+            ReceiptCheck::Unverified,
+            "unverified (skipped)",
+            "test",
+        ),
     ] {
-        let text = render(&summary, &no_timing()).unwrap();
-        assert_eq!(line(&text, "Summary:"), expected);
+        let receipt = outcome(&summary, &no_timing()).receipt.unwrap();
+        assert_eq!(
+            (receipt.check, receipt.check_label.as_str()),
+            (expected, label)
+        );
+        assert_eq!(receipt.check_target.as_deref(), Some(target));
     }
+}
+
+#[test]
+fn compact_receipt_prefers_the_recorded_command_to_a_generic_check_name() {
+    let summary = json!({
+        "outcome": "completed",
+        "changed_files": ["src/a.rs", "tests/a,b.rs"],
+        "checks_current": true,
+        "recorded_checks": [
+            {"name":"lint", "status":"passed"},
+            {"name":"unit", "command":"cargo test -p api --lib", "status":"passed"}
+        ]
+    });
+    let receipt = outcome(&summary, &Value::Null).receipt.unwrap();
+    assert_eq!(receipt.paths, ["src/a.rs", "tests/a,b.rs"]);
+    assert_eq!(receipt.check, ReceiptCheck::Passed);
+    assert_eq!(receipt.check_label, "2 checks passed");
+    assert_eq!(
+        receipt.check_target.as_deref(),
+        Some("cargo test -p api --lib")
+    );
 }
 
 #[test]
@@ -143,7 +183,7 @@ fn recorded_timing_lists_measured_phases() {
     let text = render(&summary, &latency).expect("edits produce a report");
     assert_eq!(
         line(&text, "Model time:"),
-        "Model time: wait 1.5 s, generation 2.5 s over 2 requests"
+        "Model time: wait 1.5 s, generation 2.5 s over 2 requests (observed request phases, not turn wall time)"
     );
 }
 
@@ -161,7 +201,7 @@ fn loading_retry_and_prompt_phases_appear_only_when_measured() {
     let text = render(&summary, &latency).expect("failures produce a report");
     assert_eq!(
         line(&text, "Model time:"),
-        "Model time: wait 120 ms, loading 800 ms, prompt processing 300 ms, retry backoff 4.0 s"
+        "Model time: wait 120 ms, loading 800 ms, prompt processing 300 ms, retry backoff 4.0 s (observed request phases, not turn wall time)"
     );
 }
 
@@ -203,7 +243,7 @@ fn next_steps_follow_turn_outcome_without_suggesting_unavailable_undo() {
     ] {
         let report = render(&summary, &no_timing()).unwrap();
         assert_eq!(line(&report, "Next:"), expected);
-        assert!(report.contains("Summary:"));
+        assert!(outcome(&summary, &no_timing()).receipt.is_some());
     }
 }
 
@@ -290,10 +330,13 @@ fn completion_without_edits_is_quiet_unless_obligations_remain() {
 }
 
 #[test]
-fn current_passing_checks_alone_need_no_report_but_gaps_still_do() {
+fn recorded_verification_without_an_edit_still_names_the_check() {
     let clean = json!({"outcome":"answered", "changed_files":[], "open_tasks":0,
         "checks_current":true, "recorded_checks":[{"name":"test", "status":"passed"}]});
-    assert_eq!(render(&clean, &no_timing()), None);
+    assert_eq!(
+        outcome(&clean, &no_timing()).receipt.unwrap().check,
+        ReceiptCheck::Passed
+    );
     for (current, status) in [
         (json!(false), "passed"),
         (json!(null), "passed"),
@@ -310,13 +353,11 @@ fn current_passing_checks_alone_need_no_report_but_gaps_still_do() {
 }
 
 #[test]
-fn open_tasks_are_not_restated_as_outstanding_obligations_in_the_summary() {
+fn open_tasks_and_their_specific_obligations_survive_in_the_handoff() {
     let summary = json!({"outcome":"completed", "changed_files":["src/a.rs"], "open_tasks":1,
         "evidence":{"outstanding_tasks":[{"content":"Ship change", "status":"pending"}]}});
     let report = render(&summary, &no_timing()).unwrap();
-    let compact = line(&report, "Summary:");
-    assert!(compact.contains("1 open task"), "{report}");
-    assert!(!compact.contains("outstanding obligations"), "{report}");
+    assert_eq!(line(&report, "Open tasks:"), "Open tasks: 1");
     assert!(
         line(&report, "Outstanding:").contains("Ship change (pending)"),
         "{report}"
@@ -336,9 +377,10 @@ fn answered_handoff_retains_open_work_and_effect_warnings() {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        let rendered = render(&summary, &Value::Null).expect("open work stays visible");
-        assert_eq!(line(&rendered, "Outcome:"), "Outcome: answered");
-        assert!(!line(&rendered, "Summary:").contains("answered"));
+        assert!(
+            render(&summary, &Value::Null).is_some(),
+            "open work stays visible"
+        );
         let outcome = super::outcome(&summary, &Value::Null);
         assert_eq!(outcome.status, "answered");
         assert_eq!(
@@ -491,10 +533,7 @@ fn task_notes_are_not_blockers_without_a_blocked_status() {
             line(&report, prefix).contains("Await review — Ship change"),
             "{report}"
         );
-        assert!(
-            line(&report, "Summary:").contains("outstanding obligations"),
-            "{report}"
-        );
+        assert!(report.contains("Ship change"), "{report}");
         assert!(
             line(&report, "Next:").contains("outstanding work"),
             "{report}"
@@ -548,5 +587,91 @@ fn shell_checks_are_reported_as_checks() {
     let text = render(&summary, &Value::Null).unwrap();
     assert!(!text.contains("none recorded"), "{text}");
     assert!(text.contains("rustc main.rs && ./main passed"), "{text}");
-    assert!(text.contains("checks passed (current)"), "{text}");
+    let receipt = outcome(&summary, &Value::Null).receipt.unwrap();
+    assert_eq!(receipt.check_label, "1 check passed");
+    assert_eq!(
+        receipt.check_target.as_deref(),
+        Some("rustc main.rs && ./main")
+    );
+}
+
+#[test]
+fn unknown_effects_are_not_hidden_by_completed_outcomes_or_current_check_claims() {
+    for outcome in ["completed", "answered", "interrupted"] {
+        let summary = json!({
+            "outcome":outcome,
+            "changed_files":[],
+            "effects_unknown":true,
+            "checks_current":true,
+            "recorded_checks":[{"name":"test","status":"passed"}]
+        });
+        let report = render(&summary, &Value::Null).expect("unknown effects stay visible");
+        assert_eq!(line(&report, "Changed:"), "Changed: none recorded");
+        assert!(line(&report, "Effects:").contains("unknown"), "{report}");
+        assert!(
+            line(&report, "Checks:").contains("freshness unknown"),
+            "{report}"
+        );
+        let receipt = super::outcome(&summary, &Value::Null).receipt.unwrap();
+        assert_eq!(receipt.check, ReceiptCheck::Unverified);
+        assert!(receipt.check_label.contains("freshness unknown"));
+        assert!(line(&report, "Next:").contains("do not replay"), "{report}");
+        let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
+        assert!(handoff.contains("Effects: unknown"), "{handoff}");
+        assert!(handoff.contains("do not replay"), "{handoff}");
+    }
+}
+
+#[test]
+fn bounded_handoff_keeps_obligations_effect_warnings_and_timing_together() {
+    let tasks: Vec<_> = (0..20)
+        .map(|i| json!({"content":format!("Task {i}"),"status":"pending"}))
+        .collect();
+    let summary = json!({
+        "outcome":"incomplete","changed_files":["src/a.rs"],"open_tasks":20,
+        "effects_unknown":true,
+        "uncheckpointed_shell_commands":1,
+        "recorded_checks":[{"name":"test","status":"failed","evidence_ref":"artifact://test"}],
+        "evidence":{"outstanding_tasks":tasks}
+    });
+    let handoff = super::outcome(&summary, &json!({"generation_ms":100})).handoff;
+    let text = handoff.join("\n");
+    for expected in [
+        "Open tasks: 20",
+        "Task 0",
+        "+17 more; /evidence",
+        "Effects: unknown",
+        "Outside /undo:",
+        "Model time:",
+        "do not replay",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(handoff.last().unwrap().starts_with("Next:"));
+}
+
+#[test]
+fn model_timing_is_observed_request_time_including_cancellation_not_turn_time() {
+    let summary = json!({"outcome":"interrupted","changed_files":[]});
+    let report = render(
+        &summary,
+        &json!({
+            "requests":2,
+            "generation_ms":100,
+            "generation_stall_ms":90,
+            "cancellation_ms":25,
+            "total_ms":125
+        }),
+    )
+    .unwrap();
+    let timing = line(&report, "Model time:");
+    assert!(timing.contains("cancellation 25 ms"), "{timing}");
+    assert!(
+        timing.contains("observed request phases, not turn wall time"),
+        "{timing}"
+    );
+    assert!(
+        !timing.contains("stall"),
+        "stalls are already included: {timing}"
+    );
 }

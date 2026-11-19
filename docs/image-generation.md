@@ -43,7 +43,8 @@ the response, refuses the whole result and writes nothing.
 ### Seeing the result
 
 Every image `image_gen` writes, whether the model called it or you ran `/image`, is previewed in the
-chat. Terminals with a graphics protocol (kitty, Ghostty, iTerm2) show the real image; others
+chat, even while a `/watch` pane is attached (the pane receives a copy; only screenshots move to
+it). Terminals with a graphics protocol (kitty, Ghostty, iTerm2) show the real image; others
 show a block-character thumbnail. The preview's `Image · <path> · <width>x<height>` header names
 the file. In terminals with hyperlink support it is a clickable link that opens the image in your
 default viewer (iTerm2 included: image links carry no line number, so they skip the text editor).

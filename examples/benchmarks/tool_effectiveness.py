@@ -256,7 +256,8 @@ def summarize_tools(payload, expectations=None):
             "matched_success_tasks": matched,
             "excluded_tasks": excluded,
             "observed_regressed_tasks": regressed,
-            "observed_correctness_nonregressing": not regressed,
+            "observed_correctness_nonregressing": not regressed if any(
+                task["checked"] for task in configuration["tasks"]) else None,
             "matched_success_ratios": ratios,
         })
     return {
@@ -289,7 +290,7 @@ def main():
     except (ValueError, KeyError, TypeError, OSError, tomllib.TOMLDecodeError) as error:
         parser.error(str(error))
     print(text, end="")
-    return int(any(not entry["observed_correctness_nonregressing"] for entry in result["comparisons"]))
+    return int(any(entry["observed_correctness_nonregressing"] is False for entry in result["comparisons"]))
 
 
 if __name__ == "__main__":

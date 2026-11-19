@@ -56,6 +56,7 @@ mod learning;
 mod notices;
 mod overlay;
 mod panel;
+mod presets;
 mod print_attachments;
 mod replay;
 mod resources;

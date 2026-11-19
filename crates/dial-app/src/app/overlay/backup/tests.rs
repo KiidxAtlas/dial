@@ -157,6 +157,11 @@ fn cached_choices_filter_and_ordered_list_reorders_without_text_editing() {
     );
     assert_eq!(panel.selectors(), ["anthropic/second", "openai/first"]);
     panel.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)),
+        &Keymap::defaults(),
+    );
+    assert_eq!(panel.selectors(), ["openai/first", "anthropic/second"]);
+    panel.handle(
         &Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL)),
         &Keymap::defaults(),
     );

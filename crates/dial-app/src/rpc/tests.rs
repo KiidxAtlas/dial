@@ -119,6 +119,17 @@ fn typed_notice_adds_lane_and_keeps_plain_text_and_tokens() {
     let alert = typed_notice(&UiEvent::new(EventKind::Recovery, "retrying"));
     assert_eq!(alert["lane"], "alert");
     assert!(alert["tokens"].is_null());
+    assert!(alert.get("detail").is_none());
+    let switch = typed_notice(&UiEvent::new(EventKind::Model, "fallback").with_detail(
+        crate::agent::ui::ui_event::EventDetail::ModelSwitch {
+            from: None,
+            to: "openai/gpt".into(),
+            reason: crate::agent::ui::ui_event::SwitchReason::Fallback,
+        },
+    ));
+    assert_eq!(switch["detail"]["type"], "model_switch");
+    assert_eq!(switch["detail"]["to"], "openai/gpt");
+    assert!(switch["detail"]["from"].is_null());
 }
 
 #[test]
@@ -379,6 +390,7 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
         "reliability",
         "list_skills",
         "skill_action",
+        "live_speak",
     ] {
         assert!(!acp_methods.contains(&json!(method)), "{method}");
         assert!(
@@ -647,4 +659,26 @@ fn list_extensions_reports_configured_and_curated_rows() {
     );
     assert!(mcp.iter().any(|row| row["origin"] == "curated"));
     assert!(listed["skills"].is_array());
+}
+#[test]
+fn a_spoken_reply_is_bracketed_by_live_speech_events_even_when_it_fails() {
+    let env = crate::voice::VoiceEnv {
+        voice: Default::default(),
+        user_dir: std::env::temp_dir(),
+    };
+    let session = crate::voice::live::start(&env, None, None).unwrap();
+    let events = Mutex::new(Vec::new());
+    // Blank text fails before any speech program is chosen, so no audio is produced.
+    read_aloud(&session, "  ", &Arc::new(AtomicBool::new(false)), |event| {
+        events.lock().unwrap().push(event);
+    });
+    let events = events.into_inner().unwrap();
+    let names: Vec<_> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["live_speech", "live_speech", "live_error"]);
+    assert_eq!(events[0]["speaking"], true);
+    assert_eq!(events[1]["speaking"], false);
+    assert_eq!(events[1]["cancelled"], false);
 }

@@ -341,6 +341,7 @@ voice.tts.auto_speak
 voice.stt.enabled
 voice.stt.backend
 voice.stt.input_mode
+voice.stt.input_device
 voice.stt.submit_trigger
 ida.python
 ida.idadir
@@ -361,6 +362,7 @@ verification.target_evidence
 verification.runners
 verification.inputs
 verification.review
+verification.quality_review
 lsp.rust-analyzer.program
 lsp.typescript-language-server.program
 lsp.pyright.program

@@ -71,11 +71,16 @@ impl LiveSession {
         let text = speakable::speakable(text, self.env.voice.tts.auto_speak_max_chars.max(1));
         tts::speak(&self.env, &text, cancel)
     }
-    /// Records one utterance until trailing silence and returns its transcript. Protocol abort
-    /// (`abort`) cancels capture and transcription in flight and yields no transcript; a live
-    /// utterance is never finished early because only silence ends it.
-    pub fn transcribe(&self, abort: &Arc<AtomicBool>) -> Result<String> {
+    /// Records one utterance until trailing silence and returns its transcript, reporting the
+    /// microphone level while it records. Protocol abort (`abort`) cancels capture and
+    /// transcription in flight and yields no transcript; a live utterance is never finished
+    /// early because only silence ends it.
+    pub fn transcribe(
+        &self,
+        abort: &Arc<AtomicBool>,
+        level: &mut dyn FnMut(super::dictation::Level),
+    ) -> Result<String> {
         let finish = Arc::new(AtomicBool::new(false));
-        super::dictation::record_and_transcribe(&self.env, &finish, abort)
+        super::dictation::record_with_level(&self.env, &finish, abort, level)
     }
 }

@@ -37,8 +37,56 @@ pub(super) enum Kind {
     Build,
 }
 
-/// Whether a shell command runs tests or a build, from its words.
+/// Recognize a direct test invocation, not a command that quotes, prints or searches for one.
+/// Ambiguous shell programs stay ordinary work; this does not establish that a test passed.
+pub fn is_test_command(command: &str) -> bool {
+    let command = command.trim();
+    if command.contains(['\n', ';', '|', '&', '`', '$']) {
+        return false;
+    }
+    let mut words = command.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    if words.clone().any(|arg| {
+        matches!(
+            arg,
+            "--no-run" | "--collect-only" | "--co" | "--list" | "--help" | "-h" | "--version"
+        )
+    }) {
+        return false;
+    }
+    test_runner(program, words)
+}
+
+fn test_runner<'a>(program: &str, mut words: impl Iterator<Item = &'a str>) -> bool {
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let sub = words.next();
+    match program {
+        "pytest" | "jest" | "vitest" | "ctest" => true,
+        "cargo" => sub == Some("test") || (sub == Some("nextest") && words.next() == Some("run")),
+        "go" | "bun" | "deno" | "swift" | "dotnet" | "mvn" | "gradle" => sub == Some("test"),
+        "npm" | "yarn" | "pnpm" => {
+            sub == Some("test") || (sub == Some("run") && words.next() == Some("test"))
+        }
+        "make" => sub.is_some_and(|target| target == "test" || target.starts_with("test-")),
+        "python" | "python3" => {
+            sub == Some("-m") && matches!(words.next(), Some("pytest" | "unittest"))
+        }
+        "npx" => matches!(sub, Some("jest" | "vitest")),
+        _ => false,
+    }
+}
+
+/// A settled card has runner output to corroborate command words, so also recognizes runners
+/// inside compound commands (e.g. `cd backend && cargo test`).
 pub(super) fn kind(command: &str) -> Option<Kind> {
+    let mut parts = command.split_ascii_whitespace();
+    while let Some(program) = parts.next() {
+        if test_runner(program, parts.clone()) {
+            return Some(Kind::Test);
+        }
+    }
     let words: Vec<&str> = command.split_whitespace().collect();
     let has = |pair: [&str; 2]| words.windows(2).any(|w| w == pair);
     let any = |names: &[&str]| {
@@ -46,20 +94,6 @@ pub(super) fn kind(command: &str) -> Option<Kind> {
             .iter()
             .any(|w| names.contains(&w.rsplit('/').next().unwrap_or(w)))
     };
-    if has(["cargo", "test"])
-        || has(["cargo", "nextest"])
-        || has(["go", "test"])
-        || has(["npm", "test"])
-        || has(["yarn", "test"])
-        || has(["pnpm", "test"])
-        || has(["make", "test"])
-        || words
-            .iter()
-            .any(|w| w.starts_with("test-") && words.contains(&"make"))
-        || any(&["pytest", "jest", "vitest"])
-    {
-        return Some(Kind::Test);
-    }
     let cargo_build = ["build", "check", "clippy"]
         .iter()
         .any(|sub| has(["cargo", sub]));
@@ -152,7 +186,7 @@ pub(super) fn parse(output: &str) -> Report {
 }
 
 /// The command text of a `bash` call, one line.
-pub(in crate::ui) fn command(t: &Tool) -> Option<String> {
+fn command(t: &Tool) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(&t.input).ok()?;
     args["command"].as_str().map(text::one_line)
 }
@@ -196,6 +230,8 @@ fn failure_reason(output: &str, test: &str) -> Option<(String, Option<String>)> 
 /// A settled test or build run reduced to its verdict, as the turn recap shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ui) struct Verdict {
+    /// The observed command, used to associate output counts with the right recorded check.
+    pub command: String,
     pub ok: bool,
     /// `tests` or `build`.
     pub what: &'static str,
@@ -209,7 +245,8 @@ pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
     if t.name != "bash" || !matches!(t.state, ToolState::Completed | ToolState::Failed) {
         return None;
     }
-    let kind = kind(&command(t)?)?;
+    let command = command(t)?;
+    let kind = kind(&command)?;
     let report = parse(&t.output);
     let failed = t.state == ToolState::Failed;
     let summary = if report.failed > 0 {
@@ -226,6 +263,7 @@ pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
         return None;
     };
     Some(Verdict {
+        command,
         ok: !failed && report.failed == 0 && report.errors.is_empty(),
         what: match kind {
             Kind::Test => "tests",

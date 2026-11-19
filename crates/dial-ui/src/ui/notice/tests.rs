@@ -216,15 +216,16 @@ fn received_messages_use_the_irc_lane_without_inventing_a_peer_body() {
 #[test]
 fn turn_report_is_compact_until_tools_are_expanded() {
     let env = Env::new();
-    let body = "Outcome: completed\nChanged: a.rs\nNext: /review · /undo\nSummary: 1 file changed · checks passed";
+    let body = "Outcome: completed\nChanged: a.rs\nChecks: stale · passed — cargo test passed\nEvidence: /evidence check test\nNext: /review · /undo\nSummary: 1 file changed · checks stale";
     let compact = plain(&rows("Turn report", body, 100, &env.ctx()));
-    assert_eq!(compact.len(), 2);
-    assert!(compact[0].contains("checks passed"));
-    assert!(compact[1].contains("Next: /review"));
+    assert_eq!(compact.len(), 3);
+    assert!(compact[0].contains("Changed: a.rs"));
+    assert!(compact[1].contains("Checks: stale") && compact[1].contains("cargo test"));
+    assert!(compact[2].contains("Next: /review"));
     let mut ctx = env.ctx();
     ctx.tools_expanded = true;
     let full = plain(&rows("Turn report", body, 100, &ctx)).join("\n");
-    assert!(full.contains("a.rs") && full.contains("Outcome:"));
+    assert!(full.contains("a.rs") && full.contains("Outcome:") && full.contains("/evidence"));
     assert!(!full.contains("Summary:"));
 }
 

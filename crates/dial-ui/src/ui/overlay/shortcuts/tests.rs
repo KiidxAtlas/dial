@@ -54,7 +54,10 @@ fn edit_paste_save_and_settle_preserve_comma_chords() {
     let mut overlay = ShortcutOverlay::new();
     select(&mut overlay, Action::Settings);
     overlay.handle(&key(KeyCode::Enter), &keys);
-    assert_eq!(overlay.edit.as_ref().unwrap().1.text, "Ctrl+, Ctrl+4");
+    assert_eq!(
+        overlay.edit.as_ref().unwrap().1.text,
+        Action::Settings.defaults().join(" ")
+    );
     overlay.handle(&ctrl('u'), &keys);
     overlay.handle(&Event::Paste("Ctrl+,\nAlt+界\x1b[31m".into()), &keys);
     assert_eq!(overlay.edit.as_ref().unwrap().1.text, "Ctrl+, Alt+界");
@@ -173,7 +176,10 @@ fn short_edit_screens_keep_the_field_and_footer_even_after_failure() {
         for height in [5, 6, 8] {
             let shown = screen(&draw(&mut overlay, &rig, 80, height));
             assert!(
-                shown.contains("Chords: Ctrl+, Ctrl+4"),
+                shown.contains(&format!(
+                    "Chords: {}",
+                    Action::Settings.defaults().join(" ")
+                )),
                 "height {height}: {shown}"
             );
             assert!(
@@ -314,6 +320,13 @@ fn tab_records_the_next_key_into_the_chord_field_and_esc_leaves_recording() {
     overlay.handle(&key(KeyCode::Enter), &keys);
     overlay.handle(&key(KeyCode::Tab), &keys);
     assert!(overlay.recording);
+    let before = overlay.edit.as_ref().unwrap().1.text.clone();
+    overlay.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER)),
+        &keys,
+    );
+    assert!(overlay.recording);
+    assert_eq!(overlay.edit.as_ref().unwrap().1.text, before);
     overlay.handle(
         &Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
         &keys,
@@ -321,7 +334,7 @@ fn tab_records_the_next_key_into_the_chord_field_and_esc_leaves_recording() {
     assert!(!overlay.recording);
     assert_eq!(
         overlay.edit.as_ref().unwrap().1.text,
-        "Ctrl+, Ctrl+4 Ctrl+K"
+        format!("{before} Ctrl+K")
     );
     overlay.handle(&key(KeyCode::Tab), &keys);
     overlay.handle(&key(KeyCode::Esc), &keys);

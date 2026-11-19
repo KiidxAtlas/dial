@@ -268,6 +268,16 @@ fn an_interrupt_keeps_finished_parallel_reads_and_marks_the_rest_not_run() {
             finished_reads: 0,
         };
         let report = agent.turn("Read both, then write", &mut ui).unwrap();
+        assert_eq!(
+            agent.session.control_state()["efficiency"]["projection_bytes"]["interventions"]["turn_interrupted"],
+            1,
+            "the settled interruption must be published once in this turn's efficiency"
+        );
+        assert_eq!(
+            agent.session.control_state()["turn_summary"]["effects_unknown"],
+            false,
+            "skipped calls and completed reads have known effects"
+        );
         assert!(agent.session.custom_records("training_turn").is_empty());
         let results: Vec<Value> = agent
             .session
@@ -311,7 +321,14 @@ fn a_deadline_passing_during_generation_cancels_it_and_stops() {
         connect(agent, &server.url);
         agent.modes.launch.deadline =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-        agent.turn("Say done", &mut NullUi).unwrap()
+        let report = agent.turn("Say done", &mut NullUi).unwrap();
+        assert!(
+            agent.session.control_state()["efficiency"]["projection_bytes"]["interventions"]
+                ["turn_interrupted"]
+                .is_null(),
+            "a deadline is not evidence of an explicit interruption"
+        );
+        report
     });
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
@@ -1578,9 +1595,18 @@ fn discovery_recovery_uses_the_next_requests_policy_and_is_delivered_once() {
         assert!(!mentions(&requests[0], "[Discovery recovery]"));
         assert!(!mentions(&requests[1], "[Discovery recovery]"));
         assert!(mentions(&requests[2], "[Discovery recovery]"));
-        assert_eq!(mentions(&requests[2], "Gather unrelated docs"), !one_call);
         assert_eq!(
-            mentions(&requests[2], "inspect that declaration next"),
+            mentions(
+                &requests[2],
+                crate::agent::prompts::recovery::DISCOVERY_BATCH
+            ),
+            !one_call
+        );
+        assert_eq!(
+            mentions(
+                &requests[2],
+                crate::agent::prompts::recovery::DISCOVERY_ONE_CALL
+            ),
             one_call
         );
         assert!(

@@ -100,6 +100,31 @@ fn desktop_result(view: &mut Presentation, args: &Value, output: &ToolOutput) {
         });
     }
 }
+/// What a `verify` call checks: its named targets, the repro or acceptance it registers, or the
+/// completion gate's own selection.
+fn verify_target(args: &Value) -> String {
+    if args["plan"].as_bool() == Some(true) {
+        return "plan".into();
+    }
+    for (key, kind) in [("repro", "repro"), ("acceptance", "acceptance")] {
+        if let Some(name) = args[key]["name"].as_str().filter(|n| !n.is_empty()) {
+            return format!("{kind}: {}", one_line(name));
+        }
+    }
+    match args["targets"].as_array().map(Vec::as_slice) {
+        // `failed` is the keyword for rerunning the checks that failed, not a target named so.
+        Some([only]) if only.as_str() == Some("failed") => "rerun failed checks".into(),
+        Some(targets) if !targets.is_empty() => targets
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map_or_else(|| one_line(&t.to_string()), one_line)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "selected checks".into(),
+    }
+}
 /// Presenters for the file/shell and controller tools. Extension definitions can override both hooks.
 pub fn render_call(name: &str, args: &Value) -> Presentation {
     if name == "bash"
@@ -137,6 +162,9 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "skill" => ("Skill", Tools, Quiet),
         // Notes between agents; the terminal draws a sent note as a quoted IRC line.
         "message" => ("IRC", Connect, Text),
+        // Controller calls whose arguments are structured, not a path or command.
+        "verify" => ("Verify", Tools, Text),
+        "finish" => ("Finish", Tools, Quiet),
         _ if name.starts_with("mcp__") => ("MCP", Connect, Text),
         _ => (name, Tools, Text),
     };
@@ -168,6 +196,8 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
                 format!("{name} · {file}")
             }
         }
+        "verify" => verify_target(args),
+        "finish" => one_line(field("outcome")),
         // The question the user is asked, not the call's JSON.
         "ask" => {
             let questions = args["questions"].as_array().map_or(&[][..], Vec::as_slice);

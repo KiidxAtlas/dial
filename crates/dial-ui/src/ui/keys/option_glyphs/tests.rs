@@ -20,6 +20,8 @@ fn option_characters_read_back_as_the_alt_chord_that_typed_them() {
         ('√', 'v', false),
         ('‘', ']', false),
         ('–', '-', false),
+        ('¡', '1', false),
+        ('§', '6', false),
         ('Å', 'a', true),
     ] {
         let mut want = KeyModifiers::ALT;
@@ -40,7 +42,7 @@ fn option_characters_read_back_as_the_alt_chord_that_typed_them() {
 
 #[test]
 fn ordinary_characters_and_other_modifiers_are_not_chords() {
-    for glyph in ['k', 'K', '§', 'é', '日', ' ', '-'] {
+    for glyph in ['k', 'K', '1', 'é', '日', ' ', '-'] {
         assert!(
             as_alt_chord(&typed(glyph, KeyModifiers::NONE)).is_none(),
             "{glyph}"

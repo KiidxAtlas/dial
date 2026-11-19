@@ -243,17 +243,27 @@ fn control_bytes(text: &str) -> usize {
         .count()
 }
 
+const SQLITE_SIDECARS: &[(&str, &str)] = &[
+    ("-wal", "SQLite write-ahead log (WAL) sidecar"),
+    ("-journal", "SQLite rollback journal sidecar"),
+    ("-shm", "SQLite shared-memory index sidecar"),
+];
+
+/// A possible database sidecar, including case aliases on case-insensitive volumes.
+pub(in crate::tools) fn possible_sqlite_sidecar(name: &str) -> bool {
+    SQLITE_SIDECARS.iter().any(|(suffix, _)| {
+        name.get(name.len().saturating_sub(suffix.len())..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    })
+}
+
 /// SQLite sidecars are binary by definition, whatever their bytes look like: a damaged WAL can be
 /// valid ASCII and still hold the newest committed rows.
 fn sidecar_kind(path: &Path) -> Option<Kind> {
     let name = path.file_name()?.to_str()?;
-    let (base, kind) = [
-        ("-wal", "SQLite write-ahead log (WAL) sidecar"),
-        ("-journal", "SQLite rollback journal sidecar"),
-        ("-shm", "SQLite shared-memory index sidecar"),
-    ]
-    .into_iter()
-    .find_map(|(suffix, kind)| name.strip_suffix(suffix).map(|base| (base, kind)))?;
+    let (base, kind) = SQLITE_SIDECARS
+        .iter()
+        .find_map(|&(suffix, kind)| name.strip_suffix(suffix).map(|base| (base, kind)))?;
     let database = head(&path.with_file_name(base))?;
     database.starts_with(SQLITE_MAGIC).then_some(Kind {
         name: kind,
@@ -284,10 +294,10 @@ pub(in crate::tools) fn split_bytes_selector<'a>(
     ws: &Workspace,
     input: &'a str,
 ) -> Option<(&'a str, &'a str)> {
+    let at = input.rfind(":bytes=")?;
     if ws.resolve_read(input).is_ok_and(|p| p.exists()) {
         return None;
     }
-    let at = input.rfind(":bytes=")?;
     let base = &input[..at];
     ws.resolve_read(base)
         .is_ok_and(|p| p.is_file())
@@ -320,7 +330,8 @@ pub(in crate::tools) fn parse_bytes_spec(spec: &str) -> Result<(u64, Option<u64>
         if end < offset {
             return Err(format!("byte range {spec:?} ends before it starts"));
         }
-        return Ok((offset, Some(end - offset + 1)));
+        let count = (end - offset).checked_add(1).ok_or(usage)?;
+        return Ok((offset, Some(count)));
     }
     Ok((parse_number(spec)?, None))
 }
@@ -666,7 +677,7 @@ pub(in crate::tools) fn journal(bytes: &[u8]) -> String {
 /// read shows state SQLite itself would hide or destroy.
 pub(in crate::tools) fn sqlite_sidecars(ws: &Workspace, base: &str) -> String {
     let mut out = String::new();
-    for suffix in ["-wal", "-journal", "-shm"] {
+    for &(suffix, _) in SQLITE_SIDECARS {
         let name = format!("{base}{suffix}");
         let Ok(path) = ws.resolve_read(&name) else {
             continue;

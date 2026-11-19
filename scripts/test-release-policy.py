@@ -280,7 +280,7 @@ class SigningReadinessTests(unittest.TestCase):
 
 
 class WindowsReleaseTests(unittest.TestCase):
-    def test_windows_release_needs_no_azure_but_still_enters_signed_manifest(self):
+    def test_windows_candidates_stay_unprivileged_and_signed_zips_enter_manifest(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
         candidates = (SCRIPT.parent.parent / ".github/workflows/release-build.yml").read_text()
         build = candidates.split("\n  windows-build:\n", 1)[1]
@@ -289,13 +289,15 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("Test installer under Windows PowerShell 5.1", build)
         self.assertIn("Test installer under PowerShell 7", build)
         self.assertNotIn("id-token: write", build)
-        self.assertNotIn("\n  windows-sign:\n", workflow)
-        self.assertNotIn("azure/artifact-signing-action@", workflow)
-        self.assertNotIn("DIAL_WINDOWS_", workflow)
-        self.assertIn("needs: [gate, signing-ready, build]", manifest)
-        self.assertIn("needs.gate.result == 'success'", manifest)
-        self.assertIn("needs.signing-ready.result == 'success'", manifest)
-        self.assertIn("needs.build.result == 'success' || needs.build.result == 'skipped'", manifest)
+        signing = workflow.split("\n  windows-sign:\n", 1)[1].split("\n  sign:\n", 1)[0]
+        self.assertIn("environment: windows-signing", signing)
+        self.assertIn("needs: [gate, signing-ready, build]", signing)
+        self.assertIn("needs.build.result == 'success' || needs.build.result == 'skipped'", signing)
+        self.assertIn("azure/artifact-signing-action@", signing)
+        self.assertIn("Get-AuthenticodeSignature", signing)
+        self.assertIn("needs.windows-sign.result == 'success'", manifest)
+        self.assertLess(manifest.index('rm dist/*.zip'), manifest.index('pattern: authenticode-*'))
+        self.assertLess(manifest.index('pattern: authenticode-*'), manifest.index('sha256sum --'))
         self.assertIn("pattern: release-assets-*", manifest)
         self.assertIn("environment: release-signing", manifest)
         self.assertIn("openssl pkeyutl -sign", manifest)

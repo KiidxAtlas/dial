@@ -6,9 +6,19 @@ use serde_json::Value;
 /// One allowlisted method invocation in a computer call chain.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ComputerCallStep {
+    #[serde(deserialize_with = "deserialize_method")]
     pub method: String,
     #[serde(default, deserialize_with = "null_as_empty")]
     pub args: Vec<Value>,
+}
+
+// Normalize at the wire boundary so approval and execution always see the same allowlisted name.
+fn deserialize_method<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let method = String::deserialize(deserializer)?;
+    Ok(match method.as_str() {
+        "capture" => "screenshot".to_owned(),
+        _ => method,
+    })
 }
 
 /// Model-supplied `null` for an optional list is the same as omitting it.

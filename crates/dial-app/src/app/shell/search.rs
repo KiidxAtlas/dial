@@ -31,8 +31,8 @@ type Runner = Arc<dyn Fn(&Layout, &str, usize) -> anyhow::Result<Vec<SearchHit>>
 
 #[derive(Debug)]
 struct Page {
-    hits: Vec<SearchHit>,
-    titles: std::collections::HashMap<String, String>,
+    hits: Arc<[SearchHit]>,
+    titles: Arc<std::collections::HashMap<String, String>>,
     has_more: bool,
     limit: usize,
 }
@@ -76,7 +76,6 @@ pub(in crate::app) struct Search {
     queued: Option<Request>,
     runner: Runner,
     ready: Option<(String, Page)>,
-    window: Option<(String, usize)>,
     origin: Option<String>,
 }
 
@@ -97,7 +96,6 @@ impl Search {
             queued: None,
             runner,
             ready: None,
-            window: None,
             origin: None,
         }
     }
@@ -112,13 +110,15 @@ impl Search {
     pub(in crate::app) fn invalidate(&mut self) {
         self.revision += 1;
         self.ready = None;
-        self.window = None;
     }
 
     /// Records the context a request or poll sees; a difference counts as a change.
     fn sync(&mut self, layout: &Layout, session: &str) {
-        let context = (layout.state_dir.clone(), session.to_owned());
-        if self.context.as_ref() != Some(&context) {
+        if !self
+            .context
+            .as_ref()
+            .is_some_and(|(state, id)| state == &layout.state_dir && id == session)
+        {
             if self
                 .context
                 .as_ref()
@@ -126,20 +126,19 @@ impl Search {
             {
                 self.origin = None;
             }
-            self.context = Some(context);
+            self.context = Some((layout.state_dir.clone(), session.to_owned()));
             self.invalidate();
         }
     }
 
     /// Makes `query` the latest request in the current context and returns at once.
     pub(in crate::app) fn request(&mut self, layout: &Layout, session: &str, query: &str) {
+        self.ready = None;
         self.request_window(layout, session, query, SEARCH_LIMIT);
     }
 
     fn request_window(&mut self, layout: &Layout, session: &str, query: &str, limit: usize) {
         self.sync(layout, session);
-        self.window = Some((query.to_owned(), limit));
-        self.ready = None;
         self.next_id += 1;
         self.latest = self.next_id;
         // Replaces any waiting request: only the latest query is worth running.
@@ -198,19 +197,10 @@ impl Search {
             let result = runner(&layout, &query, request.limit + 1).map(|mut hits| {
                 let has_more = hits.len() > request.limit;
                 hits.truncate(request.limit);
-                let mut titles = std::collections::HashMap::new();
-                for hit in &hits {
-                    titles.entry(hit.session_id.clone()).or_insert_with(|| {
-                        Session::find_prefix(&layout, &hit.session_id)
-                            .ok()
-                            .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
-                            .map(|s| s.title)
-                            .unwrap_or_default()
-                    });
-                }
+                let titles = Session::search_titles(&layout, &hits);
                 Page {
-                    hits,
-                    titles,
+                    hits: hits.into(),
+                    titles: Arc::new(titles),
                     has_more,
                     limit: request.limit,
                 }
@@ -303,47 +293,67 @@ impl Shell {
     /// Starts a background search for `query` in the current project and session.
     pub(super) fn start_search(&mut self, layout: &Layout, query: &str) {
         self.search.request(layout, &self.session_id, query);
+        self.note("Search", "Searching past messages…");
+    }
+
+    pub(super) fn note_search_unavailable(&mut self) {
+        self.note(
+            "Search",
+            if self.search.is_pending() {
+                "Search in progress. Use /search when ready."
+            } else {
+                Self::SEARCH_USAGE
+            },
+        );
     }
 
     /// Increase the existing query's ranked window through the same worker and context checks.
     pub(super) fn more_search(&mut self, layout: &Layout) {
         self.search.sync(layout, &self.session_id);
-        if let Some((query, limit)) = self.search.window.clone() {
-            if limit < SEARCH_MAX {
-                self.search.request_window(
-                    layout,
-                    &self.session_id,
-                    &query,
-                    (limit + SEARCH_LIMIT).min(SEARCH_MAX),
-                );
-                self.note(
-                    "Search",
-                    "Loading more matches… Use /search results when ready.",
-                );
-            } else {
-                self.note(
-                    "Search",
-                    "Result window limit reached. Refine with /search <query>.",
-                );
-            }
-        } else {
+        if self.search.is_pending() {
+            self.note(
+                "Search",
+                "Search in progress. Wait for the current results.",
+            );
+            return;
+        }
+        let Some((query, page)) = &self.search.ready else {
             self.note("Search", "No current search. Use /search <query> first.");
+            return;
+        };
+        if !page.has_more {
+            self.note("Search", "All current matches are already loaded.");
+        } else if page.limit >= SEARCH_MAX {
+            self.note(
+                "Search",
+                "Result window limit reached. Refine with /search <query>.",
+            );
+        } else {
+            let query = query.clone();
+            let limit = (page.limit + SEARCH_LIMIT).min(SEARCH_MAX);
+            self.search
+                .request_window(layout, &self.session_id, &query, limit);
+            self.note(
+                "Search",
+                "Loading more matches… Use /search results when ready.",
+            );
         }
     }
 
-    /// Consume hydrated results without any journal access on the UI path.
-    pub(in crate::app) fn take_search_panel(
+    /// Reopen the last published page without repeating the index query or copying hit bodies.
+    pub(super) fn search_panel(
         &mut self,
-        _layout: &Layout,
+        layout: &Layout,
     ) -> Option<crate::ui::overlay::history_search::HistorySearchOverlay> {
-        let (query, page) = self.search.ready.take()?;
+        self.search.sync(layout, &self.session_id);
+        let (query, page) = self.search.ready.as_ref()?;
         Some(
-            crate::ui::overlay::history_search::HistorySearchOverlay::new(
-                query,
-                page.hits,
+            crate::ui::overlay::history_search::HistorySearchOverlay::from_shared(
+                query.clone(),
+                Arc::clone(&page.hits),
+                Arc::clone(&page.titles),
                 self.search.origin.is_some(),
             )
-            .with_titles(page.titles)
             .with_more(page.has_more, page.limit < SEARCH_MAX),
         )
     }
@@ -353,11 +363,17 @@ impl Shell {
         let outcomes = self.search.poll(layout, &self.session_id);
         let handled = !outcomes.is_empty();
         for outcome in outcomes {
-            let text = search_text(&outcome.query, &outcome.result);
-            self.note("Search", text);
-            if let Ok(page) = outcome.result
-                && !page.hits.is_empty()
+            // An expanded page overlaps the first one; don't replay its snippets into chat.
+            if self.search.ready.is_none()
+                || !outcome.result.as_ref().is_ok_and(|p| !p.hits.is_empty())
             {
+                self.note("Search", search_text(&outcome.query, &outcome.result));
+            }
+            if let Ok(page) = outcome.result {
+                if page.hits.is_empty() {
+                    self.search.ready = Some((outcome.query, page));
+                    continue;
+                }
                 let count = page.hits.len();
                 self.note(
                     "Search",
@@ -377,7 +393,7 @@ impl Shell {
                 self.search.ready = Some((outcome.query, page));
                 self.note(
                     "Search",
-                    "Use /search results to inspect matches and open a conversation.",
+                    "Use /search to inspect matches and open a conversation.",
                 );
             }
         }

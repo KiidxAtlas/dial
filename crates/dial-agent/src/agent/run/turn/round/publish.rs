@@ -227,8 +227,13 @@ impl Agent<'_> {
                 &message["dial_images"],
             );
         }
+        let generated = call.name == crate::tools::net::image_gen::TOOL;
         for reference in message["dial_images"].as_array().into_iter().flatten() {
-            ui.image(reference);
+            if generated {
+                ui.generated_image(reference);
+            } else {
+                ui.image(reference);
+            }
         }
         if crate::agent::workflow::exploration::TOOL_NAMES.contains(&call.name.as_str())
             && !output.is_error

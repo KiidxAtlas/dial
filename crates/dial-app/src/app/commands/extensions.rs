@@ -539,7 +539,7 @@ fn parse_mcp_add(rest: &str) -> Result<(String, McpServerConfig, Scope)> {
         i += 1;
     }
     let name =
-        name.ok_or_else(|| anyhow!("usage: /mcp add <name> (--url <url> | -- <command>)"))?;
+        name.ok_or_else(|| anyhow!("Usage: /mcp add <name> (--url <url> | -- <command>)"))?;
     if !valid_server_name(&name) {
         bail!("MCP server names may only use letters, digits, '-' and '_' (max 64): {name}");
     }
@@ -691,7 +691,7 @@ fn one_arg<'a>(rest: &'a str, sub: &str) -> Result<&'a str> {
     let mut parts = rest.split_whitespace();
     match (parts.next(), parts.next()) {
         (Some(name), None) => Ok(name),
-        _ => bail!("usage: {sub} <name>"),
+        _ => bail!("Usage: {sub} <name>"),
     }
 }
 

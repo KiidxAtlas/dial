@@ -9,14 +9,15 @@
 //! response stays on the socket that accepted it; the next request either reads the server's
 //! automatic successor (attach), sends only pending tool output (create), or drops the socket and
 //! replays in full (discard).
-use super::{Chat, Interrupted, Reply, StreamEvent};
-use anyhow::{Context, Result, bail, ensure};
+use super::{Chat, Interrupted, Reply, StreamEvent, ws_setup as setup};
+use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
+#[cfg(test)]
+use std::net::TcpStream;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
-    net::TcpStream,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
@@ -24,10 +25,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
+#[cfg(test)]
+use tungstenite::WebSocket;
+use tungstenite::{Message, client::IntoClientRequest, stream::MaybeTlsStream};
 
-mod setup;
-type Socket = WebSocket<MaybeTlsStream<setup::Transport>>;
+type Socket = setup::Socket;
 /// Steering commands queued for one active response.
 const STEER_QUEUE: usize = 8;
 /// Longest quiet period a cached socket is trusted for. The backend evicts idle sockets without
@@ -717,11 +719,11 @@ fn stream_bound(
                     super::usage::transport_attempt()?;
                 }
                 content_seen = true;
-                if super::responses::advances_reply(&event.to_string()) {
+                if super::responses::advances_reply_event(&event) {
                     patience.mark_event();
                 }
-                if acc.feed(
-                    &event.to_string(),
+                if acc.feed_event(
+                    &event,
                     &mut |s| on_text.as_deref_mut().is_none_or(|cb| cb(s)),
                     on_event,
                 )? {
@@ -777,8 +779,6 @@ fn connect(
     timeout: u64,
     interrupt: &Arc<AtomicBool>,
 ) -> Result<Socket> {
-    let budget = setup::Budget::new(timeout, Arc::clone(interrupt));
-    budget.remaining()?;
     let mut url = url::Url::parse(endpoint.url)?;
     url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
         .map_err(|_| anyhow::anyhow!("invalid Codex WebSocket scheme"))?;
@@ -813,35 +813,14 @@ fn connect(
     request
         .headers_mut()
         .insert("x-client-request-id", session_id.parse()?);
-    // One elapsed budget spans resolution, all TCP addresses, any proxy tunnel, TLS and HTTP
-    // upgrade. System DNS and an in-flight blocking TCP connect cannot be preempted here.
-    let host = url.host_str().context("Codex WebSocket URL has no host")?;
-    let port = url
-        .port_or_known_default()
-        .context("Codex WebSocket URL has no port")?;
-    let tcp = super::ws_proxy::open(host, port, &|| budget.remaining())?;
-    tcp.set_nodelay(true)?;
-    let tcp = setup::Transport::new(tcp, Some(budget));
-    let result = tungstenite::client_tls_with_config(request, tcp, None, None);
-    // Preserve the typed cancellation signal, not a generic handshake/SSE fallback error.
-    if interrupt.load(Ordering::Relaxed) {
-        return Err(Interrupted.into());
-    }
-    let (mut socket, _) = result.map_err(|error| match error {
-        tungstenite::handshake::HandshakeError::Failure(error) => anyhow::Error::from(error),
-        tungstenite::handshake::HandshakeError::Interrupted(_) => {
-            anyhow::anyhow!("Codex WebSocket handshake interrupted")
-        }
-    })?;
-    let tcp = match socket.get_mut() {
-        MaybeTlsStream::Plain(tcp) => tcp,
-        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
-        _ => bail!("unsupported Codex WebSocket TLS transport"),
-    };
-    tcp.finish()?;
-    tcp.set_read_timeout(None)?;
-    tcp.set_write_timeout((timeout > 0).then(|| Duration::from_secs(timeout)))?;
-    Ok(socket)
+    setup::upgrade(
+        &url,
+        request,
+        timeout,
+        interrupt,
+        None,
+        (timeout > 0).then(|| Duration::from_secs(timeout)),
+    )
 }
 
 #[cfg(test)]

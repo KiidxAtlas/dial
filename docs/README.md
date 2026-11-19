@@ -64,7 +64,6 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 - [Autoresearch and archive](autoresearch-and-archive.md) — Understand automated research and archive workflows.
 - [Local benchmark improvement batch](benchmark-measurements.md) — Interpret benchmark measurements and their limitations.
 - [Benchmarks and measurement](benchmarks.md) — Run benchmark suites and inspect evaluation reports.
-- [Surface inventory, November 2026](plans/surface-inventory-2026-11.md) — Review experimental flags and optional modes with the evidence available for each.
 - [Client compatibility and conformance](client-contracts.md) — Understand client-facing contracts and protocol behavior.
 - [Public API compatibility](compatibility.md) — Review retained Rust exports, deprecations and migration paths.
 - [Experimental evidence foundation](evidence.md) — Understand evidence identity, retention and verification boundaries.

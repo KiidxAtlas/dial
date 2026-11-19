@@ -17,7 +17,7 @@ fn scheduling_records_sizes_barriers_and_delivered_worker_metrics_once() {
     metrics.worker_results(&worker);
     assert_eq!(metrics.worker_scheduling.groups["native"].groups, 1);
     assert_eq!(metrics.worker_scheduling.groups["native"].sizes[&2], 1);
-    assert_eq!(metrics.worker_scheduling.groups["native"].work_us, 13);
+    assert_eq!(metrics.worker_scheduling.groups["native"].work_us, Some(13));
     assert_eq!(metrics.worker_scheduling.groups["native"].elapsed_us, 10);
     assert_eq!(metrics.worker_scheduling.barriers["resource_conflict"], 1);
     assert_eq!(metrics.worker_scheduling.early_reads_discarded, 1);
@@ -388,4 +388,78 @@ fn prefix_timing_uses_the_existing_operation_ledger() {
         report["backend_operations"]["request_prefix"]["elapsed_us"],
         18
     );
+}
+
+#[test]
+fn scheduling_never_fills_missing_or_invalid_work_with_zero() {
+    for seconds in [
+        vec![0.25],
+        vec![0.25, f64::NAN],
+        vec![0.25, f64::INFINITY],
+        vec![0.25, -0.01],
+        vec![0.25, 0.5, 0.75],
+    ] {
+        let mut scheduling = Scheduling::default();
+        scheduling.group(
+            "reads",
+            2,
+            std::time::Duration::from_millis(100),
+            seconds.into_iter(),
+        );
+        assert_eq!(scheduling.groups["reads"].work_us, None);
+        assert_eq!(scheduling.groups["reads"].elapsed_us, 100_000);
+        let report = serde_json::to_value(&scheduling).unwrap();
+        assert!(report["groups"]["reads"]["work_us"].is_null());
+    }
+}
+
+#[test]
+fn unknown_work_stays_unknown_when_groups_and_workers_are_merged() {
+    fn measured() -> Scheduling {
+        let mut scheduling = Scheduling::default();
+        scheduling.group(
+            "reads",
+            1,
+            std::time::Duration::from_millis(100),
+            [0.0].into_iter(),
+        );
+        assert_eq!(scheduling.groups["reads"].work_us, Some(0));
+        scheduling
+    }
+    fn partial() -> Scheduling {
+        serde_json::from_value(serde_json::json!({
+            "groups":{"reads":{
+                "groups":1,"calls":1,"sizes":{"1":1},"elapsed_us":50_000
+            }},
+            "barriers":{},
+            "early_reads_started":0,"early_reads_reused":0,"early_reads_discarded":0
+        }))
+        .unwrap()
+    }
+    for (mut first, second) in [(measured(), partial()), (partial(), measured())] {
+        first.extend(second);
+        first.group(
+            "reads",
+            1,
+            std::time::Duration::from_millis(10),
+            [0.01].into_iter(),
+        );
+        assert_eq!(first.groups["reads"].groups, 3);
+        assert_eq!(first.groups["reads"].work_us, None);
+    }
+    let mut empty = Scheduling::default();
+    empty.extend(measured());
+    assert_eq!(empty.groups["reads"].work_us, Some(0));
+}
+
+#[test]
+fn intervention_counts_are_explicit_events_without_message_content() {
+    let mut metrics = Metrics::default();
+    metrics.intervention("steering_message_journaled");
+    metrics.intervention("steering_message_journaled");
+    metrics.intervention("turn_interrupted");
+    let report = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(report["interventions"]["steering_message_journaled"], 2);
+    assert_eq!(report["interventions"]["turn_interrupted"], 1);
+    assert!(report["interventions"].get("corrections").is_none());
 }

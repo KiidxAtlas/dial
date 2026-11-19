@@ -130,3 +130,53 @@ fn only_strictly_newer_releases_are_reported() {
     assert!(!is_newer("v0.3", "0.2.6"));
     assert!(!is_newer("v0.3.0.1", "0.2.6"));
 }
+
+#[test]
+fn update_status_is_the_stable_check_contract() {
+    let status = super::status(
+        Installation::Script,
+        &UpdatePlan::Release,
+        "0.2.6",
+        Ok("v0.2.7".into()),
+    );
+    assert_eq!(
+        serde_json::to_value(&status).unwrap(),
+        serde_json::json!({
+            "current": "0.2.6",
+            "latest": "0.2.7",
+            "update_available": true,
+            "installation": "installer",
+            "method": "release",
+            "can_update": true,
+            "update_command": "dial update",
+            "error": null,
+        })
+    );
+
+    let current = super::status(
+        Installation::Homebrew,
+        &UpdatePlan::PackageManager(Installation::Homebrew),
+        "0.2.7",
+        Ok("v0.2.7".into()),
+    );
+    assert!(!current.update_available);
+    assert_eq!(
+        (current.installation, current.method),
+        ("homebrew", "package_manager")
+    );
+
+    // A failed lookup never claims an update, and a manual installation names what to do.
+    let offline = super::status(
+        Installation::Nix,
+        &UpdatePlan::Manual("update the dial flake input and rebuild".into()),
+        "0.2.6",
+        Err("timed out".into()),
+    );
+    assert_eq!(offline.latest, None);
+    assert!(!offline.update_available && !offline.can_update);
+    assert_eq!(offline.error.as_deref(), Some("timed out"));
+    assert_eq!(
+        offline.update_command,
+        "update the dial flake input and rebuild"
+    );
+}

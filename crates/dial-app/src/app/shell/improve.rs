@@ -263,7 +263,7 @@ impl Shell {
                     .find(|word| *word != "--yes")
                     .map(|word| word.trim_start_matches('v').parse::<i64>())
                     .transpose()
-                    .context("usage: /improve rollback [version]")?;
+                    .context("Usage: /improve rollback [version]")?;
                 let active = store.active()?;
                 let parent = active
                     .parent

@@ -494,6 +494,12 @@ fn main() -> anyhow::Result<()> {
             status: "blocked".into(),
             changed_files: 2,
             open_tasks: 1,
+            receipt: Some(dial_ui::ui::transcript::TurnReceipt {
+                paths: vec!["src/parser.rs".into(), "tests/parser.rs".into()],
+                check: dial_ui::ui::transcript::ReceiptCheck::Failed,
+                check_label: "1 check failed (stale)".into(),
+                check_target: Some("parser-check".into()),
+            }),
             handoff: vec![
                 "Changed: src/parser.rs, tests/parser.rs".into(),
                 "Checks: failed · freshness stale · parser-check failed".into(),

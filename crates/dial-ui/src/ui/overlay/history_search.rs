@@ -15,13 +15,14 @@ use ratatui::{
     text::{Line, Span},
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct HistorySearchOverlay {
     panel_keys: super::panel_keys::PanelKeys,
     query: String,
-    hits: Vec<SearchHit>,
+    hits: Arc<[SearchHit]>,
     /// Session titles by id, shown instead of raw ids when the controller supplies them.
-    titles: HashMap<String, String>,
+    titles: Arc<HashMap<String, String>>,
     /// Narrows the hits by session, role and text; `/` starts typing it.
     filter: String,
     filtering: bool,
@@ -37,12 +38,22 @@ pub struct HistorySearchOverlay {
 
 impl HistorySearchOverlay {
     pub fn new(query: String, hits: Vec<SearchHit>, return_available: bool) -> Self {
+        Self::from_shared(query, hits.into(), Arc::default(), return_available)
+    }
+
+    /// Open a fresh view onto an immutable result window without copying message previews.
+    pub fn from_shared(
+        query: String,
+        hits: Arc<[SearchHit]>,
+        titles: Arc<HashMap<String, String>>,
+        return_available: bool,
+    ) -> Self {
         let shown = (0..hits.len()).collect();
         Self {
             panel_keys: Default::default(),
             query,
             hits,
-            titles: HashMap::new(),
+            titles,
             filter: String::new(),
             filtering: false,
             shown,
@@ -56,7 +67,7 @@ impl HistorySearchOverlay {
 
     /// Session titles by session id; rows show a title instead of the raw id when one is known.
     pub fn with_titles(mut self, titles: HashMap<String, String>) -> Self {
-        self.titles = titles;
+        self.titles = Arc::new(titles);
         self
     }
 
@@ -315,7 +326,7 @@ impl HistorySearchOverlay {
                 .push(scroll_cell(theme, row, list_h, self.shown.len(), start));
             rows.push(line);
         }
-        if let Some(hit) = self.selected().cloned() {
+        if let Some(hit) = self.selected() {
             let mut detail = vec![format!("Match {}", text::one_line(&hit.entry_id))];
             if !hit.when.trim().is_empty() {
                 detail.push(text::one_line(&hit.when));

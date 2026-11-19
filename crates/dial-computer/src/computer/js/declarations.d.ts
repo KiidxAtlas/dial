@@ -280,8 +280,8 @@ interface ComputerDesktop extends ComputerInputTarget {
 		/** Read the live native ownership state, including revocation by interruption. */
 		state(): Promise<{ active: boolean }>;
 	};
-	/** Fresh native snapshot; macOS lists at most 48 on-screen, shareable windows. Returns an array; filter-resolution errors report whether the snapshot was truncated. */
-	windows(filter?: ComputerWindowFilter): Promise<ComputerWindowInfo[]>;
+	/** Fresh listing of handles with snapshot geometry. macOS lists at most 48 on-screen, shareable windows. */
+	windows(filter?: ComputerWindowFilter): Promise<(ComputerWindow & ComputerWindowInfo)[]>;
 	/** Filters resolve from a fresh bounded enumeration; explicit IDs use targeted native lookup, bypassing the macOS listing cap but preserving on-screen/shareability and permission checks. Candidates may disappear before the next call. */
 	window(selector: string | number | ComputerWindowFilter): Promise<ComputerWindow>;
 	focusedWindow(): Promise<ComputerWindow | null>;

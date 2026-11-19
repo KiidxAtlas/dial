@@ -39,19 +39,23 @@ the test in tests/test_parser.py fails, fix it without changing the public API
 
 Shell commands run unconfined by default. Set `sandbox.mode = "dev"` to confine them to the OS
 sandbox on macOS and Linux/WSL2 ([shell](shell.md)). While Dial works you can type a correction and
-choose whether it steers the current task or is queued; **Esc** interrupts.
+choose whether it steers the current task or is queued. **Esc** dismisses a chooser. To interrupt
+the turn, press **Ctrl+C** at the empty composer; with a draft or panel open, the first press
+clears the draft or closes the panel instead.
 
 ## 4. Review the evidence
 
 When the turn ends, the report lists the changed files and the checks that ran, with their results.
 **Ctrl+O** expands the commands and output. A change reported without a passing check is marked
-unverified, not done. `/review` asks for a read-only review of your uncommitted changes.
+unverified, not done. Use `/review uncommitted` for a read-only AI review, or `/review files` to
+inspect checkpointed changes yourself. Opening file review does not revert anything.
 
 ## 5. Keep or undo
 
-`/undo` reverts the last turn's edits (`/undo 3` for three turns), even after a restart. Shell and
-extension effects outside the edit checkpoints are named in the report, because undo cannot reverse
-them. When you are happy, commit as usual.
+Keep the changes by leaving them in place; commit when ready. To restore files from the latest
+checkpoint **without changing the conversation**, use `/undo files`. To restore captured edits
+**and rewind the conversation**, use `/undo` (`/undo 3` for three turns). These are restore
+commands, not previews. Neither reverses external effects such as a push or a running process.
 
 ## Next
 

@@ -429,6 +429,20 @@ impl Action {
     }
 
     pub fn defaults(self) -> &'static [&'static str] {
+        self.defaults_for(cfg!(target_os = "macos"), cfg!(windows))
+    }
+
+    fn defaults_for(self, macos: bool, windows: bool) -> &'static [&'static str] {
+        // Keep the same chords; lead hints with a function key where Option may type text.
+        macro_rules! alt_or_function {
+            ($alt:literal, $function:literal) => {
+                if macos {
+                    &[$function, $alt]
+                } else {
+                    &[$alt, $function]
+                }
+            };
+        }
         match self {
             Action::Submit => &["Enter"],
             // Windows Terminal takes Alt+Enter for fullscreen; Ctrl+Q ("queue") always arrives.
@@ -443,22 +457,21 @@ impl Action {
             Action::EditExternal => &["Ctrl+G"],
             Action::DisplayReset => &["Ctrl+L", "Alt+L"],
             // Ctrl+P is list/history navigation (with Ctrl+N), so the palette uses chords of its own.
-            Action::CommandPalette => &["Alt+K", "F1"],
-            // Function keys back up Option chords, which macOS terminals often turn into symbols.
-            Action::ModelSelect if cfg!(target_os = "macos") => &["F2", "Alt+M"],
-            Action::ModelSelect => &["Alt+M", "F2"],
-            Action::ModelRoles => &["Alt+R", "F3"],
-            Action::ModelFavoriteNext => &["Alt+]", "F8"],
-            Action::ProviderSetup => &["Alt+P", "F4"],
+            Action::CommandPalette => alt_or_function!("Alt+K", "F1"),
+            Action::ModelSelect => alt_or_function!("Alt+M", "F2"),
+            Action::ModelRoles => alt_or_function!("Alt+R", "F3"),
+            Action::ModelFavoriteNext => alt_or_function!("Alt+]", "F8"),
+            Action::ProviderSetup => alt_or_function!("Alt+P", "F4"),
+            Action::Settings if windows => &["Ctrl+4", "Ctrl+,"],
             Action::Settings => &["Ctrl+,", "Ctrl+4"],
             Action::ToolsExpand => &["Ctrl+O"],
-            Action::ToolsToggle => &["Alt+O", "F5"],
+            Action::ToolsToggle => alt_or_function!("Alt+O", "F5"),
             Action::ThinkingToggle => &["Ctrl+T"],
-            Action::StatusExpand => &["Alt+S", "F11"],
+            Action::StatusExpand => alt_or_function!("Alt+S", "F11"),
             Action::StatusFocus => &["F10"],
             Action::ApprovalCycle => &["Shift+Tab"],
-            Action::SubagentsHub => &["Alt+A", "F6"],
-            Action::SubagentsRecent => &["Alt+Shift+A", "F7"],
+            Action::SubagentsHub => alt_or_function!("Alt+A", "F6"),
+            Action::SubagentsRecent => alt_or_function!("Alt+Shift+A", "F7"),
             // Option+letter chords type glyphs on macOS, so the primary default is a Ctrl chord.
             Action::WorkTab => &["Ctrl+X", "Alt+W", "F12"],
             Action::RateGood => &["Alt+Up"],
@@ -475,10 +488,10 @@ impl Action {
             Action::SectionPrev => &["Shift+Tab"],
             // Windows Terminal binds Ctrl+V to its own text paste, which drops an image-only
             // clipboard; Alt+V attaches the image there, and voice keeps F9.
-            Action::PasteImage if cfg!(windows) => &["Alt+V", "Ctrl+V"],
+            Action::PasteImage if windows => &["Alt+V", "Ctrl+V"],
             Action::PasteImage => &["Ctrl+V"],
-            Action::VoiceInput if cfg!(windows) => &["F9"],
-            Action::VoiceInput => &["Alt+V", "F9"],
+            Action::VoiceInput if windows => &["F9"],
+            Action::VoiceInput => alt_or_function!("Alt+V", "F9"),
             Action::EditorLeft => &["Left", "Ctrl+B"],
             Action::EditorRight => &["Right", "Ctrl+F"],
             Action::EditorWordLeft => &["Alt+Left", "Ctrl+Left", "Alt+B"],
@@ -582,8 +595,10 @@ impl Chord {
     /// The chord a pressed key would be written as, for recording a binding. `None` for keys that
     /// cannot be written back as a chord (modifier-only, media keys, Insert, …).
     pub fn from_key(key: &KeyEvent) -> Option<Chord> {
-        let mut mods =
-            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let mut mods = key.modifiers;
+        if !(mods - KeyModifiers::CONTROL - KeyModifiers::ALT - KeyModifiers::SHIFT).is_empty() {
+            return None;
+        }
         let code = match key.code {
             KeyCode::BackTab => {
                 mods |= KeyModifiers::SHIFT;
@@ -1072,8 +1087,12 @@ impl Keymap {
             .unwrap_or(&[])
     }
     pub fn matches(&self, action: Action, key: &KeyEvent) -> bool {
-        let key = self.option_key(action, *key);
-        self.chords(action).iter().any(|c| c.matches(&key))
+        self.matches_chords(self.chords(action), key)
+    }
+
+    pub(super) fn matches_chords(&self, chords: &[Chord], key: &KeyEvent) -> bool {
+        let key = option_key(chords, *key, self.us_layout);
+        chords.iter().any(|c| c.matches(&key))
     }
 
     /// Like [`Keymap::matches`] for a shortcut checked ahead of other contexts (the composer
@@ -1090,42 +1109,11 @@ impl Keymap {
 
     /// True when `key` releases one of `action`'s bound keys (see [`Chord::matches_release`]).
     pub fn release_matches(&self, action: Action, key: &KeyEvent) -> bool {
-        let key = self.option_key(action, *key);
+        let key = option_key(self.chords(action), *key, self.us_layout);
         self.chords(action).iter().any(|c| c.matches_release(&key))
     }
 
-    /// macOS terminals whose Option key types characters send Option+K as `˚`, not Alt+K (see
-    /// [`option_glyphs`]). Such a character counts as its Alt chord only for an action bound to
-    /// that chord, and only on a U.S. or ABC layout, where no plain key types it. `√` (Option+V)
-    /// keeps working on every layout, as voice input always has. Bracketed paste bypasses key
-    /// matching, so these characters can still be pasted into the draft.
-    fn option_key(&self, action: Action, key: KeyEvent) -> KeyEvent {
-        if !cfg!(target_os = "macos") {
-            return key;
-        }
-        let Some(alias) = option_glyphs::as_alt_chord(&key) else {
-            return key;
-        };
-        let press = KeyEvent {
-            kind: KeyEventKind::Press,
-            ..alias
-        };
-        if !self
-            .chords(action)
-            .iter()
-            .any(|chord| chord.matches(&press))
-        {
-            return key;
-        }
-        let us_layout = self.us_layout.unwrap_or_else(option_glyphs::us_layout);
-        if us_layout || key.code == KeyCode::Char('√') {
-            alias
-        } else {
-            key
-        }
-    }
-
-    /// Fix the layout [`Keymap::option_key`] assumes instead of reading the system setting.
+    /// Fix the layout [`option_key`] assumes instead of reading the system setting.
     #[cfg(test)]
     pub fn with_us_layout(mut self, us: bool) -> Keymap {
         self.us_layout = Some(us);
@@ -1214,6 +1202,32 @@ impl Keymap {
     }
 }
 
+/// macOS terminals whose Option key types characters send Option+K as `˚`, not Alt+K (see
+/// [`option_glyphs`]). Such a character counts as its Alt chord only for an action bound to
+/// that chord, and only on a U.S. or ABC layout, where no plain key types it. `√` (Option+V)
+/// keeps working on every layout, as voice input always has. Bracketed paste bypasses key
+/// matching, so these characters can still be pasted into the draft.
+fn option_key(chords: &[Chord], key: KeyEvent, us_layout: Option<bool>) -> KeyEvent {
+    if !cfg!(target_os = "macos") {
+        return key;
+    }
+    let Some(alias) = option_glyphs::as_alt_chord(&key) else {
+        return key;
+    };
+    let press = KeyEvent {
+        kind: KeyEventKind::Press,
+        ..alias
+    };
+    if !chords.iter().any(|chord| chord.matches(&press)) {
+        return key;
+    }
+    let us_layout = us_layout.unwrap_or_else(option_glyphs::us_layout);
+    if us_layout || key.code == KeyCode::Char('√') {
+        alias
+    } else {
+        key
+    }
+}
 mod option_glyphs;
 #[cfg(test)]
 mod tests;

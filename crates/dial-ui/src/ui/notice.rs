@@ -60,6 +60,28 @@ pub(super) fn rows_with_severity(
         if !ctx.tools_expanded
             && let Some(summary) = summary
         {
+            // Older sessions can carry a textual report instead of a typed completion.
+            // Prefer its recorded paths and verdict over the count-only Summary line.
+            if body.lines().any(|l| l.starts_with("Changed: "))
+                && body.lines().any(|l| l.starts_with("Checks: "))
+            {
+                return body
+                    .lines()
+                    .filter(|line| {
+                        !matches!(*line, "Outcome: completed" | "Outcome: answered")
+                            && !["Summary:", "Evidence:", "Cost:", "Model time:"]
+                                .iter()
+                                .any(|prefix| line.starts_with(prefix))
+                    })
+                    .map(|line| {
+                        fitted(
+                            vec![Span::styled(text::one_line(line), ctx.theme.fg(Tok::Text))],
+                            w as usize,
+                            ctx.theme,
+                        )
+                    })
+                    .collect();
+            }
             let mut rows = vec![fitted(
                 vec![Span::styled(summary.to_owned(), ctx.theme.fg(Tok::Muted))],
                 w as usize,

@@ -292,6 +292,7 @@ impl Shell {
         self.status.background_wait = None;
         self.status.provider_retry = None;
         self.status.tool_started = None;
+        self.status.testing = false;
         self.retry_attempt = None;
         self.request_phase = Default::default();
         self.retry_control = None;
@@ -373,7 +374,6 @@ impl Shell {
         {
             crate::ui::termcaps::notify(notice.kind, "Dial", notice.body, &self.session_id);
         }
-        self.term_activity = crate::ui::term_state::Activity::after_turn(outcome);
         // The first message names an untitled session, so the tab learns its scope here.
         self.set_scope(&agent.session().title());
         self.transcript.finish_turn();
@@ -382,13 +382,11 @@ impl Shell {
         }
         let control = agent.session().control_state();
         let latency = &control["efficiency"]["inference_latency"];
-        match &result {
-            Ok(_) => self
-                .transcript
-                .completion(crate::app::shell::turn_report::with_cost(
-                    crate::app::shell::turn_report::outcome(&control["turn_summary"], latency),
-                    &agent.usage().1.all,
-                )),
+        let closing = match &result {
+            Ok(_) => crate::app::shell::turn_report::with_cost(
+                crate::app::shell::turn_report::outcome(&control["turn_summary"], latency),
+                &agent.usage().1.all,
+            ),
             Err(error) => {
                 // A fatal error may precede durable completion. Never reuse an older turn's summary.
                 let recorded = &control["turn_summary"];
@@ -401,10 +399,12 @@ impl Shell {
                         |class| class,
                     )
                     .to_owned();
-                self.transcript
-                    .completion(failed_turn_outcome(fresh, latency, &class));
+                failed_turn_outcome(fresh, latency, &class)
             }
-        }
+        };
+        self.term_activity =
+            crate::ui::term_state::Activity::after_turn(outcome, closing.changed_files);
+        self.transcript.completion(closing);
         self.transcript.turn_stats(TurnStats {
             clock: local_time("%Y-%m-%d %H:%M:%S"),
             elapsed_secs: elapsed,

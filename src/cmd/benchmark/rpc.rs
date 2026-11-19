@@ -1,8 +1,8 @@
 //! Benchmark child protocol: every turn stays in one process/session, with bounded event capture.
 use anyhow::{Context, Result, ensure};
 use dial::benchmark::{
-    AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, WorkerExecution, failure_detail,
-    response_sha256,
+    AgentFailure, BenchmarkCase, PostCheckEnd, PostCheckTiming, RunMetrics, ToolTrace,
+    WorkerExecution, failure_detail, response_sha256,
 };
 use serde_json::{Value, json};
 use std::{
@@ -78,19 +78,37 @@ fn request(
     )?;
     input.write_all(b"\n")?;
     input.flush()?;
-    loop {
-        let event = receive(rx, deadline)
-            .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))?;
+    let mut last_pass = None;
+    let result = loop {
+        let event = match receive(rx, deadline)
+            .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))
+        {
+            Ok(event) => event,
+            Err(error) => break Err(error),
+        };
+        if method == "send" && event["event"] == "check_passed" && event["request_id"] == id {
+            last_pass = Some(Instant::now());
+        }
         observe(metrics, &event);
         if event["id"] == id {
-            ensure!(
-                event.get("error").is_none(),
-                "benchmark RPC failed: {}",
-                event["error"]
-            );
-            return Ok(event["result"].clone());
+            if event.get("error").is_some() {
+                break Err(anyhow::anyhow!("benchmark RPC failed: {}", event["error"]));
+            }
+            break Ok(event["result"].clone());
         }
+    };
+    if let Some(mark) = last_pass {
+        metrics.post_check_timings.push(PostCheckTiming {
+            send_id: id,
+            elapsed_ms: mark.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            end: if result.is_ok() {
+                PostCheckEnd::Reply
+            } else {
+                PostCheckEnd::RpcError
+            },
+        });
     }
+    result
 }
 /// The child's snapshots are cumulative, so the last one covers the case. It is complete only when
 /// the run succeeded and every send reported a snapshot; with no snapshot the trace stays unknown.
@@ -408,6 +426,18 @@ pub fn run_configured(
     configure_subscription_auth(&mut command, auth_home)?;
     if let Some(adapter) = adapter {
         command.env("DIAL_BENCHMARK_ADAPTER", adapter);
+    }
+    // One launch deadline covers every turn in this child. The parent's monotonic
+    // deadline remains authoritative, including time spent starting the process.
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "benchmark RPC timed out before launch"
+        );
+        command
+            .arg("--max-time")
+            .arg(remaining.as_secs_f64().to_string());
     }
     let mut child = ChildGuard(
         dial::platform::process::spawn_group(&mut command)

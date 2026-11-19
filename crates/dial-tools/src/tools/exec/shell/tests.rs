@@ -1829,18 +1829,35 @@ fn captured_output_never_splits_a_character_at_the_head_cut() {
 #[test]
 fn interpreter_guidance_lists_available_and_missing_helper_languages() {
     let bin = tempfile::tempdir().unwrap();
-    for program in ["perl", "gcc"] {
-        fs::write(bin.path().join(program), "").unwrap();
-    }
-    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
+    let (_root, ws) = workspace();
+    let install = |program: &str| {
+        let file = bin
+            .path()
+            .join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&file, "").unwrap();
+        crate::platform::fs::set_mode(&file, 0o755).unwrap();
+    };
+    install("perl");
+    install("gcc");
+    // A directory or a non-executable file cannot provide a helper runtime.
+    fs::create_dir(bin.path().join("node")).unwrap();
+    fs::write(bin.path().join("python3"), "").unwrap();
+    let guidance = interpreter_guidance_for(&ws, Some(bin.path().as_os_str()));
     assert!(
         guidance.contains("Shell PATH languages: perl, C compiler (gcc); not found: python3, node, ruby, go, rustc, java."),
         "{guidance}"
     );
-    fs::write(bin.path().join("python"), "").unwrap();
-    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
+    assert!(guidance.contains("Python-specific behavior"));
+    install("python");
+    let guidance = interpreter_guidance_for(&ws, Some(bin.path().as_os_str()));
     assert!(guidance.contains("python3 (python)"), "{guidance}");
-    let empty = interpreter_guidance_for(None);
+    let hidden = ws.with_protected_paths(&[bin.path().to_owned()]);
+    let hidden_guidance = interpreter_guidance_for(&hidden, Some(bin.path().as_os_str()));
+    assert!(
+        hidden_guidance.contains("languages: none;"),
+        "{hidden_guidance}"
+    );
+    let empty = interpreter_guidance_for(&hidden, None);
     assert!(
         empty.contains("Shell PATH languages: none; not found: python3"),
         "{empty}"

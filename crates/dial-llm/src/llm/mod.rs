@@ -82,6 +82,7 @@ mod vertex;
 mod vertex_adc;
 pub mod wire;
 mod ws_proxy;
+mod ws_setup;
 pub(crate) use cancel::Patience;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
@@ -364,11 +365,26 @@ impl Reply {
     /// The refusal or pause this reply ended with, when it did not finish or truncate normally.
     pub fn provider_stop(&self) -> Option<ProviderStop> {
         match self.finish_reason.as_str() {
-            "refusal" => Some(ProviderStop::Refusal {
+            "refusal" | "content_filter" => Some(ProviderStop::Refusal {
                 category: self.refusal_category.clone(),
             }),
             "pause_turn" => Some(ProviderStop::PauseTurn),
             _ => None,
+        }
+    }
+
+    /// Terminal explanation for a provider decline; never a reason to retry an empty answer.
+    pub fn refusal_message(&self) -> Option<String> {
+        match self.provider_stop()? {
+            ProviderStop::Refusal {
+                category: Some(category),
+            } => Some(format!(
+                "The provider declined this request (category: {category})."
+            )),
+            ProviderStop::Refusal { category: None } => {
+                Some("The provider declined this request.".into())
+            }
+            ProviderStop::PauseTurn => None,
         }
     }
 }
@@ -955,6 +971,11 @@ fn chat_stream_at_controlled(
 /// ends the reasoning of a reply with no answer text is lifted too, and so is a reply that is
 /// nothing but pythonic calls to an offered tool.
 fn lift_text_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
+    // Only a normal terminal reply can promote text into an executable call. In particular,
+    // a complete-looking example before the token limit does not commit the truncated turn.
+    if !matches!(reply.finish_reason.as_str(), "" | "stop" | "tool_calls") {
+        return;
+    }
     let structured = !reply.tool_calls.is_empty();
     lift_calls(reply, url, tools);
     reply.text_calls_lifted = !structured && !reply.tool_calls.is_empty();
@@ -1504,7 +1525,7 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
     let message = choice
         .get("message")
         .context("chat response choice has no message")?;
-    let text = match message.get("content") {
+    let mut text = match message.get("content") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(parts)) => parts
@@ -1513,7 +1534,14 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
             .collect(),
         Some(_) => bail!("chat response message content is not a string or text parts"),
     };
+    let refusal = message["refusal"].as_str().filter(|s| !s.is_empty());
+    if let Some(refusal) = refusal {
+        text.push_str(refusal);
+    }
+    let finish_reason =
+        stream::chat_finish_reason(choice["finish_reason"].as_str(), refusal.is_some())?;
     let tool_calls = match message.get("tool_calls") {
+        _ if matches!(finish_reason.as_str(), "refusal" | "content_filter") => Vec::new(),
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(calls)) => parse_tool_calls(calls)?,
         Some(_) => bail!("chat response tool_calls is not an array"),
@@ -1521,12 +1549,7 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
     Ok(Reply {
         text,
         tool_calls,
-        finish_reason: stream::normalized_finish_reason(
-            choice
-                .get("finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )?,
+        finish_reason,
         prompt_tokens: root.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
         completion_tokens: root
             .pointer("/usage/completion_tokens")

@@ -204,7 +204,13 @@ fn run_turn(
     let mut budget = Budget::default();
     let mut shown = String::new();
     loop {
-        match drive(&mut session, api.interrupt, on_text, &mut shown) {
+        match drive(
+            &mut session,
+            api.interrupt,
+            api.timeout,
+            on_text,
+            &mut shown,
+        ) {
             Ok(Step::Reply(reply)) => {
                 if reply.tool_calls.is_empty() {
                     api.stop_workflow(&session.workflow_id);
@@ -282,14 +288,17 @@ fn start(
 fn drive(
     session: &mut Session,
     interrupt: &AtomicBool,
+    timeout: u64,
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
     shown: &mut String,
 ) -> Result<Step> {
+    let patience = super::Patience::for_stream(timeout, false);
     loop {
-        let event = transport::next_event(&mut session.socket, interrupt)?;
+        let event = transport::next_event(&mut session.socket, interrupt, &patience)?;
         if let Some(checkpoint) = wire::checkpoint_text(&event) {
             let delta = unseen(shown, checkpoint);
             if !delta.is_empty() {
+                patience.mark_event();
                 if let Some(callback) = on_text.as_deref_mut()
                     && !callback(delta)
                 {

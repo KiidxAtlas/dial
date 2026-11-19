@@ -978,7 +978,7 @@ fn queue_picker_handles_do_not_remove_a_shifted_or_replacement_message() {
         .restore_pending_messages(vec!["consumed".into(), "keep".into()]);
     let id = shell.composer.queued_items()[0].0;
     assert_eq!(shell.composer.take_follow_up().as_deref(), Some("consumed"));
-    shell.queue_command(&format!("/queue remove @{id}"));
+    shell.queue_command(&format!("remove @{id}"));
     assert_eq!(
         shell.composer.queued_messages(),
         vec![("keep".into(), false)]
@@ -986,7 +986,7 @@ fn queue_picker_handles_do_not_remove_a_shifted_or_replacement_message() {
     shell
         .composer
         .restore_pending_messages(vec!["consumed".into()]);
-    shell.queue_command(&format!("/queue edit @{id}"));
+    shell.queue_command(&format!("edit @{id}"));
     assert_eq!(shell.composer.draft(), "");
     assert_eq!(shell.composer.queued_messages().len(), 2);
 }

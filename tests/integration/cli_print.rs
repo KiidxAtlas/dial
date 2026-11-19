@@ -484,6 +484,40 @@ fn errors_and_empty_answers_have_distinct_exit_statuses_and_json_results() {
 }
 
 #[test]
+fn rejected_print_launch_does_not_create_a_fork() {
+    use dial::config::paths::Layout;
+    use dial::storage::session::{Session, SessionMeta};
+    let env = Env::new();
+    let layout = Layout::with_user_dir(env.project.path(), env.home.path().into()).unwrap();
+    let source = Session::create(
+        &layout,
+        SessionMeta {
+            model: "scripted".into(),
+        },
+    )
+    .unwrap();
+    let id = source.id().to_owned();
+    let server = Server::new(vec![]);
+    let rejected = env.run(&server, &["--fork", &id], "");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("needs a prompt"));
+    // Resuming this still-owned session would fork it too; refuse before opening it.
+    let invalid_schema = env.run(
+        &server,
+        &["--resume", &id, "--output-schema", "absent.json", "hello"],
+        "",
+    );
+    assert!(!invalid_schema.status.success());
+    assert!(String::from_utf8_lossy(&invalid_schema.stderr).contains("absent.json"));
+    assert_eq!(
+        Session::count_for_picker(&layout, false).unwrap(),
+        1,
+        "invalid invocation left a fork behind"
+    );
+    assert!(server.requests.lock().is_empty());
+}
+
+#[test]
 fn sessions_cli_renames_exports_and_lists_across_projects() {
     use dial::config::paths::Layout;
     use dial::storage::session::{Session, SessionMeta};

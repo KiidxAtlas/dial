@@ -494,7 +494,8 @@ impl<'a> Agent<'a> {
             self.auth_config.clone()
         };
         let provider_slot = if wait_for_slot {
-            crate::agent::model::provider_slots::acquire_checked(
+            let mut queued_at = None;
+            let acquired = crate::agent::model::provider_slots::acquire_checked(
                 &route,
                 || -> Result<()> {
                     if cancel.load(Ordering::SeqCst) {
@@ -502,8 +503,16 @@ impl<'a> Agent<'a> {
                     }
                     Ok(())
                 },
-                || ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
-            )?
+                || {
+                    queued_at = Some(Instant::now());
+                    ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE);
+                },
+            );
+            if let Some(queued_at) = queued_at {
+                self.efficiency_metrics
+                    .backend_operation("role_provider_slot_wait", queued_at.elapsed());
+            }
+            acquired?
         } else {
             ensure!(!cancel.load(Ordering::SeqCst), "{role} request cancelled");
             crate::agent::model::provider_slots::try_acquire(&route)
@@ -682,6 +691,10 @@ pub(in crate::agent) fn accept_auxiliary_reply(
     role: &str,
     reply: llm::Reply,
 ) -> Result<String> {
+    if let Some(reason) = reply.refusal_message() {
+        backend.record_discarded_response()?;
+        anyhow::bail!("{role}: {reason}");
+    }
     if reply.finish_reason == "length" || !reply.tool_calls.is_empty() || reply.dropped_tool_call()
     {
         backend.record_discarded_response()?;

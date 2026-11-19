@@ -129,6 +129,12 @@ Both plain replies and `finish` with `outcome=completed` share the guard. An uns
 
 Parent and worker settlement share bounded, cause-specific advice. Typed policy/permission refusals call for respecting the boundary, not changing tools to bypass it. Timeouts and interruptions call for inspecting completed effects, not assuming rollback. Skipped operations remain unexecuted. Recognized selected-runner setup failures are kept separate from observed code/assertion failures; only the latter should drive application repair. Stale/unseen source failures call for a targeted fresh range, not a new repository inventory. Unknown effects still stop automatic continuation before any recovery advice can authorize a retry. Unclassified extension errors retain their diagnostic rather than receiving a guessed cause.
 
+Controller retry-barrier refusals carry private typed provenance; matching text from a tool cannot
+turn a permission denial into a correctable retry. Unknown effects retain explicit permission and
+cancellation restrictions: inspection does not authorize crossing a boundary or resuming cancelled
+work. On session recovery, an unterminated stream-journal frame is not a committed observation;
+malformed interior frames are retained and prevent reclamation rather than silently losing evidence.
+
 Recovery results can carry bounded `recovery_advisory` records alongside producer data. Each
 record identifies the source call, evidence basis, required observation and capability state;
 native launch suggestions include schema-validated arguments only when the recipient can use
@@ -145,7 +151,17 @@ module = "unittest"
 
 Declarations must name an existing unique configured check. Only completed launches with a literal matching runner and narrowly recognized missing program/module diagnostics are classified as environment-unavailable. Affirmative compiler, source-located diagnostic or assertion evidence can establish `code_failed`; a complete nonzero exit alone is `failed_unknown_cause`. Both remain failed checks, but an unknown cause does not authorize automatic application repair or earn reproduction credit: inspect bounded diagnostic/runner evidence to distinguish a source defect from a setup prerequisite, without weakening the acceptance criterion. Exact bounded diagnostics matching a nonbehavioral pre-edit code failure outside declared requirements remain disclosed without automatic unrelated repair, and such a failure no longer refuses completion; changed, absent or oversized diagnostics remain actionable. The pre-edit observation comes from the configured baseline under `automatic_checks`, or otherwise from the first run of that check before the instruction's first effect (never on a debugging request). Environment-unavailable, permission-denied and timed-out checks are likewise disclosed with an accepted answer unless the same check passed before the first effect; see [agent loop](agent-loop.md#completion-and-loop-gates). Requirement membership does not invent behavioral credit. Rust source compilation selects each owning package, including non-default members; manifests, lockfiles and shared root changes intentionally broaden to workspace checks.
 
-The completion gate's evidence answer is taken after its own run. A check that passed in that run no longer counts as unverified, but an undisclosed failure of another applicable check on the current revision still blocks the answer, even after the single reminder round, until a later run passes it or a disclosed reason applies. Stale failures from an earlier revision do not block. The reminder names only the checks that remain unverified.
+The completion gate's evidence answer is taken after its own run. Every applicable check needs
+current passing evidence or an explicitly supported disclosure; one passing check cannot hide a
+different stale, unobserved or undisclosed failed check. The reminder names only the checks that
+remain unverified. An earlier failure does not block once a later current pass or valid disclosure
+supersedes it.
+
+Focused Rust source checks explicitly select their owning package, including a root package
+excluded by workspace `default-members`. Deleted declaration files still leave obligations to
+inspect external callers. Changed JavaScript test files are selected directly, with literal Jest
+paths rather than path regular expressions. Go checks use the nearest module, disable cached
+results, and do not treat a run that matched no tests as passing behavioral evidence.
 
 ## Selective independent review
 
@@ -187,6 +203,27 @@ regenerated outputs, and asks for a brief final outcome/checks/gaps report. It d
 or certify the full patch. Findings remain unverified suggestions; local executable checks are
 authoritative, and unresolved findings stay disclosed. Self-review creates no passing evidence.
 This is bounded judgment, not measured proof of better real-model outcomes.
+
+## Quality review before finishing
+
+```toml
+[verification]
+quality_review = true # off by default
+```
+
+With `quality_review` on, the first finished answer to a request that changed files (or ran shell
+commands whose effects are not checkpointed) is held back once. The agent is then asked to review
+its own work with its tools before delivering: render or open anything visual and inspect a fresh
+screenshot, reread the changed code, run relevant tests, linters or type checks, fix material
+problems, and report what it reviewed, what it changed and what remains unverified. The request
+names up to 12 changed files.
+
+The review happens at most once per user instruction, for both plain answers and `finish`, and
+runs before any coach review. It is skipped for answers that changed nothing, in plan mode, in
+hermetic runs and past a deadline or cost cap. It costs at least one extra model request. The
+review is the model's own judgment: it creates no passing check evidence, and the completion
+gates still apply to the reviewed answer. It is also available as **Review work quality before
+finishing** under Verification in `/settings`.
 
 ## Tool discovery
 

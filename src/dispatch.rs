@@ -24,7 +24,15 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(Command::Update { version }) = &cli.command {
+    if let Some(Command::Update {
+        version,
+        check,
+        json,
+    }) = &cli.command
+    {
+        if *check {
+            return cmd::update::check(*json);
+        }
         return cmd::update::run(version.as_deref());
     }
     if let Some(mode) =
@@ -326,7 +334,8 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         resume,
         ablate_assistance,
         allow_remote,
-        share_auth,
+        isolated_auth,
+        ..
     })) = cli.command.as_ref()
     {
         if *ablate_assistance {
@@ -342,7 +351,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                     .unwrap_or(std::path::Path::new("examples/benchmarks/efficiency.toml")),
                 report.as_deref(),
                 *allow_remote,
-                *share_auth,
+                !*isolated_auth,
             );
         }
         let manifest = manifest.as_deref().ok_or_else(|| {
@@ -358,7 +367,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                 profiles_path: profiles.as_deref(),
                 checkpoint_path: checkpoint.as_deref(),
                 resume: *resume,
-                share_auth: *share_auth,
+                share_auth: !*isolated_auth,
             },
         );
     }

@@ -195,9 +195,9 @@ fn standalone_artifact_acceptance_guidance_requires_verify_in_every_profile() {
     for (lean, one_call) in [(false, false), (true, false), (true, true)] {
         for offered in [false, true] {
             let tools = if offered {
-                names(&["read", "edit", "bash", "verify"])
+                names(&["read", "write", "bash", "verify"])
             } else {
-                names(&["read", "edit", "bash"])
+                names(&["read", "write", "bash"])
             };
             let policy = guidance_for(&tools, lean, one_call);
             assert_eq!(
@@ -205,8 +205,14 @@ fn standalone_artifact_acceptance_guidance_requires_verify_in_every_profile() {
                 offered,
                 "profile {lean}/{one_call}, verify offered: {offered}"
             );
+            assert_eq!(policy.contains("`bash` check:true"), !offered);
+            assert_eq!(policy.contains("same response, write first"), !one_call);
         }
     }
+    assert!(
+        !guidance_for(&names(&["read", "bash"]), false, false)
+            .contains("same response, write first")
+    );
 }
 
 #[test]
@@ -214,7 +220,7 @@ fn generated_artifact_policy_reaches_all_builtin_message_profiles() {
     let harness = Harness::default();
     let template = prompt_template::compile("CUSTOM TEMPLATE").unwrap();
     let tools = names(&["eval", "write", "read"]);
-    let marker = "Produce data and generated files with code that also checks the result";
+    let marker = "read inputs, compute, write, and validate in one run";
     for (lean, one_call, concise) in [
         (false, false, false),
         (true, false, false),
@@ -234,9 +240,14 @@ fn generated_artifact_policy_reaches_all_builtin_message_profiles() {
         let messages = build(None);
         let policy = messages[0]["content"].as_str().unwrap();
         assert_eq!(policy.matches(marker).count(), 1, "{policy}");
-        assert!(policy.contains("Read a file before editing it"), "{policy}");
         assert!(
-            policy.contains("Inspect task inputs with `read`"),
+            policy.contains("Read before editing; reuse numbered lines"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains("For new artifacts with clear inputs and outputs")
+                && policy.contains("Inspect separately only if it could change the approach")
+                && policy.contains("Inspect inputs with `read` unless generating a new artifact"),
             "{policy}"
         );
         assert!(
@@ -319,6 +330,8 @@ fn planning_and_delivery_keep_optional_work_separate_in_every_profile() {
             "finish or block each step",
             "optional follow-ups separate",
             "keeps the unfinished work",
+            "not after each edit",
+            "Wait only when progress or completion needs the result",
         ] {
             assert!(
                 guidance.contains(contract),

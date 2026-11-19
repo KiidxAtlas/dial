@@ -13,6 +13,9 @@ exercise a real model, download weights, sign in, or change the user's configura
 
 | Journey | Required observations | Evidence boundary |
 | --- | --- | --- |
+| Start or resume | An empty print request with `--fork` reports the missing prompt without creating a session or calling the provider; a valid resume retains history | Real CLI against disposable session storage and a scripted provider |
+| Protect ongoing work | A malformed `/new`, `/exit`, or restore count reports usage without interrupting the answer, scheduling a command, or changing sessions | Idle/busy command tests |
+| Review and restore | Group restore compares each file against the same version shown in the confirmation. If a file changed, review it again; reviewing is not a passing check | Checkpoint review and compare-before-restore tests |
 | Correct running work | Visible busy-send behavior; chooser cancellation preserves the draft; steering is shown as pending, received, then recorded as the current instruction, without claiming model compliance; queued work is not silently sent | Composer/controller tests plus real-PTY scripted provider |
 | Verify a model | Existing text check remains text-only; coding check requires separate default-Cancel consent; structured invocation and tool-result continuation are distinct; failed/cancelled probes never become verified | Diagnostic tests and scripted provider, not coding-quality certification |
 | Stop owned work | Current answer, workers and jobs retain separate scopes; requested stop differs from observed termination; retained output is inspectable; dismissing history does not stop running work | Background lifecycle tests and Jobs presentation; real external-service cleanup remains separate |
@@ -32,6 +35,8 @@ only by explicit retry, scripted expired credentials, test-owned SIGKILL draft r
 process Stop/output/Dismiss, including 38-column retained-output Back navigation without replaying
 the process. Runtime Cargo lease files are not model edits; the fixture rejects other project files
 and symlinks. Refused-connection recovery uses the coding diagnostic, not ordinary chat.
+The history-search case closes results while idle, reopens them during a turn, opens a hit after
+the turn finishes, and returns to the original conversation without another chat request.
 The suite's captures are terminal text, not native screenshots or evidence of real-provider quality.
 
 ## Measurement

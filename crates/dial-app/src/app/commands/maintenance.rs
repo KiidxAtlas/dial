@@ -97,7 +97,7 @@ pub(super) fn run_live(
 
 fn watch(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
     if !args.trim().is_empty() {
-        shell.note("Watch", "usage: /watch");
+        shell.note("Watch", "Usage: /watch");
         return Ok(());
     }
     crate::cli::watch::append(
@@ -143,7 +143,7 @@ fn toggle(args: &str, usage: &str) -> Result<Option<bool>> {
         "on" | "enable" => Ok(Some(true)),
         "off" | "disable" => Ok(Some(false)),
         "" | "status" => Ok(None),
-        _ => bail!("usage: {usage}"),
+        _ => bail!("Usage: {usage}"),
     }
 }
 
@@ -478,7 +478,7 @@ fn weights_job(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
             | "knowledge"
     ) {
         crate::weights::Operation::parse(op).context(
-            "usage: /weights [status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate --experiment E --cases FILE|direction NAME --experiment E --positive FILE --negative FILE|edit NAME --experiment E --direction D --layers 10,11|evaluate EDIT --cases FILE|promote EDIT|revert]",
+            "Usage: /weights [status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate --experiment E --cases FILE|direction NAME --experiment E --positive FILE --negative FILE|edit NAME --experiment E --direction D --layers 10,11|evaluate EDIT --cases FILE|promote EDIT|revert]",
         )?;
     }
     crate::weights::target(&app.config)?;
@@ -527,7 +527,7 @@ fn weights_improve(
     };
     if goal.is_empty() || driver == Some("") {
         bail!(
-            "usage: /weights improve [--with MODEL] GOAL, for example /weights improve stop endless repetition in long lists"
+            "Usage: /weights improve [--with MODEL] GOAL, for example /weights improve stop endless repetition in long lists"
         );
     }
     let config = agent.effective_config();
@@ -692,7 +692,7 @@ fn weights_switch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
     let switch = match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["promote", name] => crate::weights::promotion(&app.config, name)?,
         ["revert"] => crate::weights::reversion(&app.config)?,
-        _ => bail!("usage: /weights promote EDIT or /weights revert"),
+        _ => bail!("Usage: /weights promote EDIT or /weights revert"),
     };
     app.save_settings(
         crate::config::settings_store::Scope::Project,
@@ -885,7 +885,7 @@ fn relay(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
                     .to_owned(),
             },
         ),
-        _ => shell.note(TITLE, "usage: /relay start [ADDR] | stop | status"),
+        _ => shell.note(TITLE, "Usage: /relay start [ADDR] | stop | status"),
     }
     Ok(())
 }

@@ -122,7 +122,7 @@ impl Agent<'_> {
                             .context("image resolves outside the project")?;
                         crate::llm::images::attachment(self.workspace.root(), relative)
                     }) {
-                    Ok(reference) => ui.image(&reference),
+                    Ok(reference) => ui.generated_image(&reference),
                     Err(error) => ui.notice(&format!("Image preview unavailable: {error:#}")),
                 }
             }

@@ -174,6 +174,8 @@ pub struct StatusData {
     /// When the running tool named by `activity` started; a long run shows its elapsed time so
     /// a slow tool reads as working rather than stuck. `None` when no tool runs.
     pub tool_started: Option<std::time::Instant>,
+    /// A foreground tool call with a recognized test command is awaiting its result.
+    pub testing: bool,
     pub model_progress: Option<crate::llm::ModelProgress>,
     pub model_silence_secs: u64,
     /// Controller-owned wait; independent of model progress and inference timers.

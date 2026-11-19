@@ -42,6 +42,7 @@ pub mod smithery;
 pub use oauth::{login, logout};
 mod live;
 mod signals;
+mod startup;
 mod tool;
 use crate::config::types::{Config, McpServerConfig};
 use crate::runtime::integration::{
@@ -618,8 +619,8 @@ pub fn load(config: &Config) -> McpLoad {
 /// The configured servers as startup finds them.
 pub enum Startup {
     Ready(McpLoad),
-    /// A [`prefetch`] for the same servers that is still connecting. The owner adopts it once
-    /// [`Connecting::is_finished`], or waits with [`Connecting::wait`] when a capability needs it.
+    /// A matching [`prefetch`]. The registry publishes ready servers at turn boundaries;
+    /// [`Connecting::wait`] still waits for the complete inventory when explicitly requested.
     Connecting(Arc<Connecting>),
 }
 
@@ -627,8 +628,7 @@ pub enum Startup {
 /// first model request should not wait for servers it may never use.
 pub fn start(config: &Config) -> Startup {
     match take_prefetch(config) {
-        Some(connecting) if connecting.is_finished() => Startup::Ready(connecting.wait().clone()),
-        Some(connecting) => Startup::Connecting(connecting),
+        Some(connecting) => connecting.startup(),
         None => Startup::Ready(load_with(config, CONNECT_TIMEOUT)),
     }
 }
@@ -728,7 +728,8 @@ fn pending_in(slot: &std::sync::Mutex<Option<Prefetch>>) -> bool {
 pub struct Connecting {
     config: Config,
     cancel: Arc<AtomicBool>,
-    handle: Mutex<Option<thread::JoinHandle<McpLoad>>>,
+    progress: Option<Arc<startup::Attempts>>,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
     loaded: std::sync::OnceLock<McpLoad>,
 }
 
@@ -736,13 +737,16 @@ impl Connecting {
     fn spawn(config: &Config) -> Option<Arc<Self>> {
         let cancel = Arc::new(AtomicBool::new(false));
         let (owned, flag) = (config.clone(), cancel.clone());
+        let progress = Arc::new(startup::Attempts::new(config));
+        let worker = progress.clone();
         let handle = thread::Builder::new()
             .name("mcp-prefetch".into())
-            .spawn(move || load_cancellable(&owned, CONNECT_TIMEOUT, &flag))
+            .spawn(move || worker.run(&owned, CONNECT_TIMEOUT, &flag))
             .ok()?;
         Some(Arc::new(Self {
             config: config.clone(),
             cancel,
+            progress: Some(progress),
             handle: Mutex::new(Some(handle)),
             loaded: std::sync::OnceLock::new(),
         }))
@@ -758,6 +762,7 @@ impl Connecting {
         Arc::new(Self {
             config: config.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
+            progress: None,
             handle: Mutex::new(None),
             loaded: finished,
         })
@@ -776,19 +781,43 @@ impl Connecting {
     pub fn wait(&self) -> &McpLoad {
         let mut handle = self.handle.lock();
         if let Some(running) = handle.take() {
-            let loaded = running.join().unwrap_or_else(|_| McpLoad {
-                notices: vec!["mcp: the connection thread panicked".into()],
-                ..McpLoad::default()
-            });
-            let _ = self.loaded.set(loaded);
+            let _ = running.join(); // finish() accounts for any missing outcomes after a panic.
         }
-        drop(handle);
-        self.loaded.get_or_init(McpLoad::default)
+        self.loaded.get_or_init(|| {
+            self.progress
+                .as_ref()
+                .map_or_else(McpLoad::default, |pass| pass.finish())
+        })
+    }
+
+    fn startup(self: Arc<Self>) -> Startup {
+        if !self.is_finished() {
+            return Startup::Connecting(self);
+        }
+        let loaded = self.wait();
+        // A partially consumed pass may have been handed over just before it settled.
+        Startup::Ready(
+            self.progress
+                .as_ref()
+                .and_then(|p| p.handed_over_load())
+                .unwrap_or_else(|| loaded.clone()),
+        )
     }
 
     /// The configuration this pass connects.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Publish only newly ready, non-conflicting server groups into the registry's existing mirror.
+    pub(crate) fn publish(
+        &self,
+        seen: &mut std::collections::BTreeSet<String>,
+        delta: &mut McpLoad,
+    ) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|progress| progress.publish(seen, delta))
     }
 
     /// Names of the enabled servers this pass connects.
@@ -810,12 +839,11 @@ impl Connecting {
 impl Drop for Connecting {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
-        let finished = self
-            .handle
-            .get_mut()
-            .take()
-            .and_then(|running| running.join().ok());
-        if let Some(loaded) = finished.or_else(|| self.loaded.take()) {
+        self.wait();
+        // Completion slots share session references with the load. Release them before the
+        // parallel shutdown so the last references are dropped by the per-server workers.
+        drop(self.progress.take());
+        if let Some(loaded) = self.loaded.take() {
             stop_together(loaded);
         }
     }
@@ -838,67 +866,13 @@ fn stop_together(loaded: McpLoad) {
 }
 
 fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
-    load_cancellable(config, connect_timeout, &Arc::default())
-}
-
-fn load_cancellable(
-    config: &Config,
-    connect_timeout: Duration,
-    cancel: &Arc<AtomicBool>,
-) -> McpLoad {
-    let mut loaded = McpLoad::default();
-    let attempts: Vec<_> = config
-        .mcp
-        .iter()
-        .filter(|(_, server)| server.enabled)
-        .map(|(name, server)| {
-            let (thread_name, server_name, server, root, user_dir, cancel) = (
-                format!("mcp-{name}-connect"),
-                name.clone(),
-                server.clone(),
-                config.project_root.clone(),
-                config.user_dir.clone(),
-                cancel.clone(),
-            );
-            let handle = thread::Builder::new().name(thread_name).spawn(move || {
-                let cancelled = || cancel.load(Ordering::SeqCst);
-                connect(
-                    &server_name,
-                    &server,
-                    &root,
-                    &user_dir,
-                    connect_timeout,
-                    &cancelled,
-                )
-            });
-            (name, handle)
-        })
-        .collect();
-
-    for (server, handle) in attempts {
-        let outcome = match handle {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("connection thread panicked"))),
-            Err(error) => Err(error.into()),
-        };
-        match outcome {
-            Ok(connected) => add_tools(&mut loaded, server, connected),
-            Err(error) => {
-                if error
-                    .downcast_ref::<http::AuthRequired>()
-                    .is_some_and(http::AuthRequired::oauth_sign_in)
-                {
-                    loaded.sign_in.push(server.clone());
-                }
-                loaded.notices.push(format!("mcp `{server}`: {error:#}"));
-            }
-        }
-    }
-    loaded
+    let pass = startup::Attempts::new(config);
+    pass.run(config, connect_timeout, &AtomicBool::new(false));
+    pass.finish()
 }
 
 /// Everything one connected server contributes to the registry.
+#[derive(Clone)]
 struct Connected {
     session: Arc<Session>,
     /// Whether `tools/list` returned any tool at connect time.

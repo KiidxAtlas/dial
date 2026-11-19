@@ -143,6 +143,8 @@ def _make_computer():
         async def screenshot(self, *args, **kwargs):
             return await self._method("screenshot", args, kwargs)
 
+        capture = screenshot
+
         async def zoom(self, region, *args, **kwargs):
             return await self._method("zoom", (region, *args), kwargs)
 
@@ -219,6 +221,15 @@ def _make_computer():
             snapshot = await _call([_step("ref", (ref,), {})])
             return _Element(snapshot) if isinstance(snapshot, dict) else None
 
+    class _ListedWindow(dict):
+        """Keep existing mapping access while routing helpers through the original window ID."""
+        def __init__(self, snapshot):
+            super().__init__(snapshot)
+            self._window = _Window(snapshot)
+
+        def __getattr__(self, name):
+            return getattr(self._window, name)
+
     class _Clipboard:
         __slots__ = ()
 
@@ -249,7 +260,7 @@ def _make_computer():
             return await self._method("displays", args, kwargs)
 
         async def windows(self, *args, **kwargs):
-            return await self._method("windows", args, kwargs)
+            return [_ListedWindow(w) for w in await self._method("windows", args, kwargs)]
 
         async def window(self, *args, **kwargs):
             """Resolve one window by id ("74" or 74) or by `app`/`title` filter keywords."""

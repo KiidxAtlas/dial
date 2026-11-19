@@ -329,6 +329,7 @@ Direct `computer` scripts use exactly one source field: `code` is a JavaScript f
 (for example `return await desktop.windows();`), while `fn` is function source invoked with
 `({ desktop, wait, assert }, ...args)` (for example `async ({ desktop }) => await desktop.windows()`).
 The parameter schema describes both forms. Eval exposes `computer`; run scripts expose `desktop`.
+For a screenshot without a script, use `{"action":"call","chain":[{"method":"window","args":[{"app":"Calculator"}]},{"method":"screenshot"}]}` with the intended app. This read-only call refuses ambiguous targets. In scripts and Eval, each entry in `await desktop.windows(filter)` (Eval: `await computer.windows(filter)`) has window helpers such as `screenshot()`. The list itself does not. Flat geometry fields and Python dictionary access are preserved. Across a JSON boundary only metadata survives; resolve `record.id` to get a handle again.
 `find()` and `children()` return arrays of elements; select one (`const [el] = await win.find({ role:
 "textfield" })`) before calling `click()`, `focus()`, `setValue()` or another element helper. Calling an
 element helper on the array fails with that instruction and sends nothing. A window's `bounds` is a

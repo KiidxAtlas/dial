@@ -898,6 +898,13 @@ impl Backend {
             .output_budget(requested)
     }
 
+    /// The model's stated output maximum (profile, live metadata or exact catalog record), or
+    /// `None` when no source states one.
+    pub fn stated_output_limit(&self) -> Option<u32> {
+        self.resolved_model(self.profile.as_ref())
+            .stated_max_output_tokens
+    }
+
     fn resolved_model(
         &self,
         profile: Option<&llm::profiles::ModelProfile>,

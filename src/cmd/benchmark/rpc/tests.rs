@@ -48,6 +48,53 @@ fn diagnostics_are_bounded_and_drained() {
     assert_eq!(*captured.lock().unwrap(), vec![b'x'; MAX_DIAGNOSTIC_BYTES]);
 }
 
+// Observe the real child launch without starting Dial or a model. Closing stdout after
+// recording argv deliberately stops the benchmark at the ready handshake.
+#[cfg(unix)]
+#[test]
+fn rpc_child_inherits_only_a_bounded_case_deadline() {
+    use clap::Parser as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("rpc-child");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DIAL_HOME/args\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for limit in [180, 0] {
+        let home = tempfile::tempdir().unwrap();
+        let error = run_configured(
+            &child,
+            home.path(),
+            &BenchmarkCase::default(),
+            dir.path(),
+            limit,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("benchmark RPC closed"),
+            "{error:#}"
+        );
+        let args = std::fs::read_to_string(home.path().join("args")).unwrap();
+        let cli =
+            crate::args::Cli::try_parse_from(std::iter::once("dial").chain(args.lines())).unwrap();
+        match limit {
+            0 => assert!(cli.model_flags.max_time.is_none()),
+            _ => assert!(
+                cli.model_flags
+                    .max_time
+                    .is_some_and(|s| s > 0.0 && s <= limit as f64),
+                "missing or invalid child time budget: {args}"
+            ),
+        }
+    }
+}
+
 #[test]
 fn closed_rpc_is_not_misreported_as_timeout() {
     let (tx, rx) = mpsc::channel();
@@ -107,6 +154,69 @@ fn deadline_failures_attribute_time_to_completed_and_pending_phases() {
         phases.summary(started, started + Duration::from_secs(180)),
         "case elapsed 180.0 s; completed: ready 3.0 s, send#1 40.0 s, compact#2 57.0 s; \
          pending for 80.0 s"
+    );
+}
+
+#[test]
+fn timing_survives_a_lost_reply_and_only_counts_passes_from_this_send() {
+    let mut metrics = RunMetrics::default();
+    for (id, method, events) in [
+        (
+            1,
+            "send",
+            vec![
+                json!({"event":"tool_result","is_error":false}),
+                json!({"event":"check_passed","request_id":2}),
+                json!({"id":1,"result":{}}),
+            ],
+        ),
+        (
+            2,
+            "send",
+            vec![
+                json!({"event":"check_passed","request_id":2}),
+                json!({"event":"check_passed","request_id":2}),
+                json!({"id":2,"result":{}}),
+            ],
+        ),
+        (
+            3,
+            "send",
+            vec![json!({"event":"check_passed","request_id":3})],
+        ),
+        (
+            4,
+            "state",
+            vec![
+                json!({"event":"check_passed","request_id":4}),
+                json!({"id":4,"result":{}}),
+            ],
+        ),
+    ] {
+        let (tx, rx) = mpsc::channel();
+        for event in events {
+            tx.send(Ok(event)).unwrap();
+        }
+        drop(tx);
+        let result = request(
+            &mut Vec::new(),
+            &rx,
+            id,
+            method,
+            json!({}),
+            None,
+            &mut metrics,
+        );
+        assert_eq!(result.is_err(), id == 3);
+    }
+    let observed: Vec<_> = metrics
+        .post_check_timings
+        .iter()
+        .map(|t| (t.send_id, t.end))
+        .collect();
+    assert_eq!(
+        observed,
+        [(2, PostCheckEnd::Reply), (3, PostCheckEnd::RpcError)]
     );
 }
 

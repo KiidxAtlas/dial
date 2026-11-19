@@ -110,7 +110,10 @@ impl Shell {
                     if (key.modifiers - KeyModifiers::SHIFT).is_empty()
                         && match key.code {
                             // A plain character can be rebound to an action; those wait.
-                            KeyCode::Char(_) => self.keys.actions_for(&key).is_empty(),
+                            KeyCode::Char(_) => {
+                                self.keys.actions_for(&key).is_empty()
+                                    && self.idle_recap_action(&key).is_none()
+                            }
                             KeyCode::Backspace | KeyCode::Delete => true,
                             _ => false,
                         } =>
@@ -124,6 +127,16 @@ impl Shell {
             }
             let _ = self.paint(None);
         }
+    }
+
+    fn idle_recap_action(
+        &self,
+        key: &crossterm::event::KeyEvent,
+    ) -> Option<crate::ui::transcript::RecapAction> {
+        if self.composer.is_busy() || !self.composer.is_resting() {
+            return None;
+        }
+        self.transcript.recap_action_with_keys(key, &self.keys)
     }
 
     pub(in crate::app) fn composer_key(
@@ -146,13 +159,8 @@ impl Shell {
             self.composer.handle_paste(text);
             return ComposerEvent::None;
         }
-        // Alt+1…: the latest recap card's follow-ups (rerun check, retry, plan, review, undo),
-        // offered only while idle with nothing typed, so the chord never competes with editing or
-        // a busy turn. A rerun only fills the draft; Enter runs it.
-        if !self.composer.is_busy()
-            && self.composer.is_resting()
-            && let Some(action) = self.transcript.recap_action_for(&key)
-        {
+        // Recap commands only run on an empty, idle composer; a rerun fills a reviewable draft.
+        if let Some(action) = self.idle_recap_action(&key) {
             return match action.run {
                 RecapRun::Command(command) => ComposerEvent::Submit(command.to_owned()),
                 RecapRun::Draft(text) => {

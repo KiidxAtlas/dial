@@ -36,6 +36,12 @@ other but hold one shared workspace serial-operation boundary, so they must tole
 by side (separate outputs, build-tool locks). The normal final gate handles the remaining selected
 commands.
 
+Foreground verification can also run consecutive read-only inspections together (at most four,
+or `task.max_concurrency` if smaller). Each check needs a capturable input contract, a known
+read-only footprint and its own authorization. Opaque shell commands, test runners with unknown
+effects, reproductions and coverage-instrumented checks stay serial. Freshness and results are
+settled separately in selection order.
+
 Configured commands retain ordinary shell authorization, explicit denies and sandbox policy.
 Denied commands start no process. The controller owns the process until its actual outcome is
 settled. Native admitted read operations may progress while it runs; shell calls, hooks, unknown
@@ -91,15 +97,20 @@ conflicting or unknown dependencies in that response; diagnostic reads and disjo
 available. Stop and steer take effect at group boundaries; already-started calls finish and keep
 their outcomes. Set `dependency_dispatch = false` to serialize native mutations again. Ordinary
 read batching remains available with that setting.
+Within an admitted prefix of reads, each completion frees a slot immediately, even if an earlier
+read is still running. `task.max_concurrency` bounds the read runners for the group, including
+reads submitted through `tool.batch`. Duplicate inspections can share one execution; each call
+still gets its own result, and the provider sees those results in request order.
 
-File handles that cannot be expanded, selectors, aliases, symlinks, hardlinks, version-control
+File handles that cannot be expanded, ambiguous selectors, aliases, symlinks, hardlinks, version-control
 and Dial metadata directories (`.git`, `.hg`, `.svn`, `.jj`, `.dial`), host-shaped leading
 segments (`user@host/...`), missing parent directories, shell commands other than read-only
 ones, hooks and unknown effects
 remain barriers. Ordinary dotfile directories such as `.github/` and `.cargo/`, and scoped package
 directories such as `node_modules/@scope/`, are schedulable paths.
-Existing-file resource admission currently requires Unix hardlink metadata; other platforms
-conservatively keep those operations serial. Native editor parsing supplies every source,
+Local line, symbol, outline, raw and byte selectors conflict with writes to the underlying file.
+On Windows only unambiguous primary-workspace paths with a verified handle and (for files) one
+hardlink are eligible; uncertain identity keeps the operation serial. Native editor parsing supplies every source,
 destination and rename target. AST preview tokens supply their exact retained targets; directory
 AST applies stay serial. Native preparation can overlap, while commits keep the workspace lock,
 transaction validation and checkpoint observer.
@@ -191,7 +202,7 @@ workspace metadata. Most barriers were unknown resources. The traces were not ex
 these counts do not reconstruct historical timing. Reproduce the local timings with:
 
 ```sh
-cargo test --locked --test integration scheduling_measurements -- --ignored --nocapture --test-threads=1
+python3 scripts/embedded-host.py -- cargo test --locked --test integration scheduling_measurements -- --ignored --nocapture --test-threads=1
 ```
 
 ## Stop receipts and job history

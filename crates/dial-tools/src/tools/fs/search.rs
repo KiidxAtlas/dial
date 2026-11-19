@@ -208,38 +208,25 @@ fn probe(
     }
 }
 
-/// Probe `paths` on up to `workers` threads; results come back in input order.
-fn probe_all(
+type ProbeMap<'a> = super::workers::OrderedMap<'a, PathBuf, Probed>;
+
+/// Share lanes (and each lane's regex cache) between all microbatches and roots in this grep.
+fn with_prober<R>(
     ws: &Workspace,
-    paths: &[PathBuf],
     workers: usize,
-    matcher: &Regex,
+    matcher: Regex,
     multiline: bool,
     mode: OutputMode,
-) -> Vec<Probed> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Probed>>> =
-        paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..workers.min(paths.len()) {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(path) = paths.get(index) else { break };
-                    let probed = probe(ws, path, matcher, multiline, mode);
-                    *slots[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(probed);
-                }
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .unwrap_or_else(|e| e.into_inner())
-                .expect("every slot is filled before the workers join")
-        })
-        .collect()
+    run: impl FnOnce(Option<&mut ProbeMap<'_>>) -> R,
+) -> R {
+    if workers <= 1 {
+        return run(None);
+    }
+    super::workers::with_workers(
+        workers.min(PREFETCH_FILES),
+        move |path: PathBuf| probe(ws, &path, &matcher, multiline, mode),
+        |prepare| run(Some(prepare)),
+    )
 }
 
 fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> {
@@ -267,20 +254,23 @@ impl Scopes {
     }
 }
 
-fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
-    resolve_scopes(ws, args).map(|scopes| scopes.roots)
-}
-
 /// Literal filenames win over semicolon splitting; validate every scope before searching.
 /// A missing scope among several is skipped and reported, as long as one scope exists: the
 /// search of the others is still the answer the caller asked for.
-fn resolve_scopes(ws: &Workspace, args: &Value) -> Result<Scopes, String> {
-    let input = opt_str(args, "path")?.unwrap_or(".");
-    let literal = ws.resolve_read(input)?;
-    let inputs = if literal.exists() {
-        vec![input]
-    } else {
+fn resolve_scopes(ws: &Workspace, args: &Value, glob: Option<&Glob>) -> Result<Scopes, String> {
+    let default = glob
+        .and_then(|g| g.anchor.as_deref())
+        // Keep primary-workspace ignore rules even when another readable root is nested in it.
+        .filter(|anchor| !anchor.starts_with(ws.root()))
+        .and_then(Path::to_str)
+        .unwrap_or(".");
+    let input = opt_str(args, "path")?.unwrap_or(default);
+    // A pair of absolute roots joined by ';' need not itself resolve under either root.
+    // A readable literal still wins, and every split scope must pass resolution below.
+    let inputs = if input.contains(';') && !ws.resolve_read(input).is_ok_and(|p| p.exists()) {
         input.split(';').map(str::trim).collect()
+    } else {
+        vec![input]
     };
     if inputs.len() > 64 || inputs.iter().any(|s| s.is_empty()) {
         return Err("path accepts at most 64 non-empty semicolon-separated scopes".into());
@@ -309,12 +299,14 @@ fn resolve_scopes(ws: &Workspace, args: &Value) -> Result<Scopes, String> {
             }
             ancestor = p.parent();
         }
-        if path.strip_prefix(&ws.root).is_ok_and(|relative| {
-            relative.components().any(|part| part.as_os_str() == ".git")
-                || relative
-                    .components()
-                    .next()
-                    .is_some_and(|part| part.as_os_str() == crate::workspace_copy::SCRATCH_DIR)
+        if ws.read_roots().any(|root| {
+            path.strip_prefix(root).is_ok_and(|relative| {
+                relative.components().any(|part| part.as_os_str() == ".git")
+                    || relative
+                        .components()
+                        .next()
+                        .is_some_and(|part| part.as_os_str() == crate::workspace_copy::SCRATCH_DIR)
+            })
         }) {
             return Err(format!(
                 "search scopes must not enter .git or workspace scratch ({input:?}); search the workspace without that path, use `read` for a known file under it, or `bash` with `git` for repository metadata"
@@ -347,8 +339,23 @@ fn resolve_scopes(ws: &Workspace, args: &Value) -> Result<Scopes, String> {
 }
 
 /// Scheduling uses the same whole search scopes, including directory membership, as execution.
-pub(crate) fn scheduling_scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
-    scopes(ws, args)
+pub(crate) fn scheduling_scopes(
+    ws: &Workspace,
+    tool: &str,
+    args: &Value,
+) -> Result<Vec<PathBuf>, String> {
+    // A filter changes the default scope only when it is an absolute local pattern.
+    // Don't compile ordinary search expressions just to plan a batch.
+    let filter = match tool {
+        "glob" => args["pattern"].as_str(),
+        "grep" if args["ast"] != true => args["glob"].as_str(),
+        _ => None,
+    };
+    let glob = filter
+        .filter(|p| args["path"].is_null() && Path::new(p).is_absolute())
+        .map(|pattern| Glob::new(ws, pattern))
+        .transpose()?;
+    resolve_scopes(ws, args, glob.as_ref()).map(|scopes| scopes.roots)
 }
 
 /// Where a page starts: a walk position with the matches already consumed in that file, plus
@@ -584,24 +591,57 @@ fn match_segments(pattern: &[Vec<char>], path: &[Vec<char>]) -> bool {
 /// Compiled glob: brace alternatives, each a list of segments.
 struct Glob {
     alternatives: Vec<Vec<Vec<char>>>,
+    /// Absolute patterns remain bound to this readable root across all explicit search scopes.
+    anchor: Option<PathBuf>,
     /// Common literal directory prefix; an empty prefix leaves the walk unpruned.
     prefix: PathBuf,
 }
 
 impl Glob {
-    fn new(pattern: &str) -> Result<Glob, String> {
-        if pattern.is_empty() || pattern.len() > MAX_PATTERN {
+    fn new(ws: &Workspace, pattern: &str) -> Result<Glob, String> {
+        let path = Path::new(pattern);
+        let trailing_separator = pattern.ends_with(std::path::is_separator);
+        #[cfg(windows)]
+        let windows_path = path.is_absolute().then(|| extended_glob_path(pattern));
+        #[cfg(windows)]
+        let path = windows_path.as_deref().map_or(path, Path::new);
+        let (anchor, suffix) = if path.is_absolute() {
+            // Compare the caller's literal root prefix, never canonicalize a wildcard (or
+            // erase `..` / follow a symlink). Windows stores canonical roots in extended form.
+            let root = ws
+                .root_containing(path)
+                .ok_or("absolute glob pattern is outside the workspace roots")?;
+            let suffix = path
+                .strip_prefix(root)
+                .expect("containing root")
+                .to_str()
+                .ok_or("glob pattern is not UTF-8")?;
+            (Some(root.to_path_buf()), suffix)
+        } else {
+            (None, pattern)
+        };
+        if suffix.len() > MAX_PATTERN
+            || suffix.is_empty() && !(anchor.is_some() && trailing_separator)
+        {
             return Err(format!("glob pattern must be 1..={MAX_PATTERN} bytes"));
         }
+        // Glob syntax uses slash-separated segments; preserve literal backslashes on Unix.
+        let mut pattern = native_pattern(suffix);
+        if trailing_separator && !pattern.ends_with('/') {
+            let ending = if pattern.is_empty() { "**" } else { "/" };
+            pattern.to_mut().push_str(ending);
+        }
         let mut expanded = Vec::new();
-        expand_braces(pattern, &mut expanded)?;
+        expand_braces(&pattern, &mut expanded)?;
         let mut alternatives = Vec::new();
         for mut alt in expanded {
-            if alt.starts_with('/') {
-                return Err(
-                    "glob patterns are relative to the workspace root; remove the leading '/'"
-                        .to_string(),
-                );
+            if Path::new(&alt).has_root()
+                || matches!(
+                    Path::new(&alt).components().next(),
+                    Some(std::path::Component::Prefix(_))
+                )
+            {
+                return Err("absolute glob alternatives must share a workspace root prefix".into());
             }
             while let Some(rest) = alt.strip_prefix("./") {
                 alt = rest.to_string();
@@ -612,7 +652,7 @@ impl Glob {
             if alt.ends_with('/') {
                 alt.push_str("**");
             }
-            if !alt.contains('/') {
+            if anchor.is_none() && !alt.contains('/') {
                 alt = format!("**/{alt}");
             }
             let mut segments: Vec<Vec<char>> = Vec::new();
@@ -645,8 +685,27 @@ impl Glob {
             .collect();
         Ok(Glob {
             alternatives,
+            anchor,
             prefix,
         })
+    }
+
+    fn grep_filter(ws: &Workspace, args: &Value) -> Result<Option<Self>, String> {
+        opt_str(args, "glob")?
+            .map(|pattern| Self::new(ws, pattern))
+            .transpose()
+    }
+
+    fn pattern_root<'a>(&'a self, ws: &'a Workspace, scope: &Path) -> &'a Path {
+        self.anchor
+            .as_deref()
+            .unwrap_or_else(|| ws.root_containing(scope).unwrap_or(ws.root()))
+    }
+
+    fn matches_path(&self, path: &Path, root: &Path) -> bool {
+        path.strip_prefix(root)
+            .ok()
+            .is_some_and(|relative| self.matches(&native_pattern(&relative.to_string_lossy())))
     }
 
     fn matches(&self, relative: &str) -> bool {
@@ -675,24 +734,33 @@ pub(in crate::tools) fn conventional_test(path: &std::path::Path) -> bool {
         || stem.ends_with("Tests")
 }
 
-/// An absolute pattern that names a place under the workspace root (`/app/data/*.csv` with root
-/// `/app` or `/`) is the same pattern written relative to it; others stay absolute and are refused.
-fn root_relative<'a>(ws: &Workspace, pattern: &'a str) -> std::borrow::Cow<'a, str> {
-    let root = ws.root().to_string_lossy();
-    let root = root.trim_end_matches('/');
-    match pattern
-        .strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
-        Some(rest) if pattern.starts_with('/') && !rest.is_empty() => rest.to_owned().into(),
-        _ => pattern.into(),
+#[cfg(windows)]
+fn extended_glob_path(pattern: &str) -> String {
+    use std::path::{Component, Prefix};
+    let pattern = pattern.replace('/', "\\");
+    match Path::new(&pattern).components().next() {
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {
+            format!(r"\\?\{pattern}")
+        }
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(_, _)) => {
+            format!(r"\\?\UNC\{}", &pattern[2..])
+        }
+        _ => pattern,
+    }
+}
+
+fn native_pattern(input: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) && input.contains('\\') {
+        input.replace('\\', "/").into()
+    } else {
+        input.into()
     }
 }
 
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
-    let glob = Glob::new(&root_relative(ws, pattern))?;
-    let Scopes { roots, missing } = resolve_scopes(ws, args)?;
+    let glob = Glob::new(ws, pattern)?;
+    let Scopes { roots, missing } = resolve_scopes(ws, args, Some(&glob))?;
     let unsearched = Scopes {
         roots: Vec::new(),
         missing,
@@ -717,17 +785,13 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
     let mut next = None;
     let mut unrepresentable = 0;
     for root in roots {
-        let pattern_root = ws.root_containing(&root).unwrap_or(ws.root());
+        let pattern_root = glob.pattern_root(ws, &root);
         walk.run_with_prefix(&root, &pattern_root.join(&glob.prefix), &mut |path| {
             if path.to_str().is_none() {
                 unrepresentable += 1;
                 return true;
             }
-            let relative = path
-                .strip_prefix(pattern_root)
-                .unwrap_or(path)
-                .to_string_lossy();
-            if !glob.matches(&relative) {
+            if !glob.matches_path(path, pattern_root) {
                 return true;
             }
             if skip > 0 {
@@ -805,21 +869,10 @@ pub(in crate::tools) fn glob_source_targets(
     if args["preview"] != true {
         return Vec::new();
     }
-    let (Ok(roots), Ok(pattern)) = (scopes(ws, args), req_str(args, "pattern")) else {
+    let Ok(glob) = req_str(args, "pattern").and_then(|p| Glob::new(ws, p)) else {
         return Vec::new();
     };
-    let Ok(glob) = Glob::new(&root_relative(ws, pattern)) else {
-        return Vec::new();
-    };
-    crate::tools::code::navigation::source_paths(ws, text)
-        .into_iter()
-        .filter(|path| {
-            glob.matches(path)
-                && ws
-                    .resolve_read(path)
-                    .is_ok_and(|path| roots.iter().any(|root| path.starts_with(root)))
-        })
-        .collect()
+    preview::source_targets(ws, args, Some(&glob), text)
 }
 /// Restore only fresh numbered grep previews, constrained to the original scope and glob.
 pub(in crate::tools) fn grep_source_targets(
@@ -827,7 +880,13 @@ pub(in crate::tools) fn grep_source_targets(
     args: &Value,
     text: &str,
 ) -> Vec<String> {
-    preview::source_targets(ws, args, text)
+    if args["preview"] != true || OutputMode::parse(args) != Ok(OutputMode::Lines) {
+        return Vec::new();
+    }
+    let Ok(glob) = Glob::grep_filter(ws, args) else {
+        return Vec::new();
+    };
+    preview::source_targets(ws, args, glob.as_ref(), text)
 }
 
 /// Lead of a pattern that failed to parse; `grep_tool` then searches it as literal text.
@@ -1113,10 +1172,10 @@ impl GrepState {
         ws: &Workspace,
         batch: &mut Vec<PathBuf>,
         bytes: &mut Vec<u8>,
-        workers: usize,
+        mut prepare: Option<&mut ProbeMap<'_>>,
     ) {
         let paths = std::mem::take(batch);
-        let parallel = workers > 1 && paths.len() >= PARALLEL_MIN_FILES;
+        let parallel = prepare.is_some() && paths.len() >= PARALLEL_MIN_FILES;
         let mut index = 0;
         while index < paths.len() {
             // Reserve a full read per admitted file, even if it grows after stat.
@@ -1129,18 +1188,11 @@ impl GrepState {
                 0
             }
             .min(paths.len() - index);
-            let probes = if count > 1 {
-                probe_all(
-                    ws,
-                    &paths[index..index + count],
-                    workers,
-                    &self.matcher,
-                    self.multiline,
-                    self.mode,
-                )
-                .into_iter()
-                .map(Some)
-                .collect::<Vec<_>>()
+            let probes = if let Some(prepare) = prepare.as_deref_mut().filter(|_| count > 1) {
+                prepare(&paths[index..index + count])
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>()
             } else {
                 vec![None]
             };
@@ -1860,7 +1912,8 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         return Ok(out);
     }
     let mode = OutputMode::parse(args)?;
-    let resolved = resolve_scopes(ws, args)?;
+    let glob = Glob::grep_filter(ws, args)?;
+    let resolved = resolve_scopes(ws, args, glob.as_ref())?;
     let roots = &resolved.roots;
     let (resume, skip) = continuation(args, ws)?;
     if mode != OutputMode::Lines && resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
@@ -1877,7 +1930,6 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     if max_matches == 0 {
         return Err(format!("limit must be 1..={MAX_GREP_MATCHES}"));
     }
-    let glob = opt_str(args, "glob")?.map(Glob::new).transpose()?;
     let per_file = if args.get("limit").is_some_and(|value| !value.is_null()) {
         usize::MAX
     } else {
@@ -1930,33 +1982,41 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let mut bytes = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::new();
     let batch_size = if batched { PARALLEL_BATCH } else { 1 };
-    let workers = if batched { workers } else { 1 };
-    for root in roots {
-        let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
-        let prefix = glob.as_ref().map_or_else(
-            || pattern_root.to_path_buf(),
-            |g| pattern_root.join(&g.prefix),
+    let walk_pattern = |root| {
+        let base = glob.as_ref().map_or_else(
+            || ws.root_containing(root).unwrap_or(ws.root()),
+            |g| g.pattern_root(ws, root),
         );
-        walk.run_with_prefix(root, &prefix, &mut |path| {
-            let relative = path
-                .strip_prefix(pattern_root)
-                .unwrap_or(path)
-                .to_string_lossy();
-            if glob.as_ref().is_none_or(|g| g.matches(&relative)) && !state.before_resume(path) {
-                batch.push(path.to_path_buf());
-                if batch.len() >= batch_size {
-                    state.search_batch(ws, &mut batch, &mut bytes, workers);
+        (
+            base,
+            glob.as_ref()
+                .map_or_else(|| base.to_owned(), |g| base.join(&g.prefix)),
+        )
+    };
+    with_prober(ws, workers, matcher, multiline, mode, |mut prepare| {
+        for root in roots {
+            let (pattern_root, prefix) = walk_pattern(root);
+            walk.run_with_prefix(root, &prefix, &mut |path| {
+                if glob
+                    .as_ref()
+                    .is_none_or(|g| g.matches_path(path, pattern_root))
+                    && !state.before_resume(path)
+                {
+                    batch.push(path.to_path_buf());
+                    if batch.len() >= batch_size {
+                        state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
+                    }
                 }
+                state.next.is_none()
+            });
+            if state.next.is_none() {
+                state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
             }
-            state.next.is_none()
-        });
-        if state.next.is_none() {
-            state.search_batch(ws, &mut batch, &mut bytes, workers);
+            if state.next.is_some() || walk.next.is_some() {
+                break;
+            }
         }
-        if state.next.is_some() || walk.next.is_some() {
-            break;
-        }
-    }
+    });
     if let Some((stop, _)) = state.next.as_ref().filter(|_| batched) {
         walk = SearchWalk::new(
             ws,
@@ -1966,11 +2026,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         );
         let mut reached = false;
         for root in roots {
-            let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
-            let prefix = glob.as_ref().map_or_else(
-                || pattern_root.to_path_buf(),
-                |g| pattern_root.join(&g.prefix),
-            );
+            let (_, prefix) = walk_pattern(root);
             walk.run_with_prefix(root, &prefix, &mut |path| {
                 reached = path == stop;
                 !reached

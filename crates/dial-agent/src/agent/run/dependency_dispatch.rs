@@ -260,6 +260,7 @@ impl BatchPrerequisites {
                 Some("output" | "wait" | "list" | "kill")
             ))
             || (call.name != "verify"
+                && !is_check_call(call)
                 && crate::agent::safety::approval::is_read_only(
                     registry,
                     &call.name,
@@ -425,7 +426,11 @@ impl Agent<'_> {
             "native",
             calls.iter().filter(|call| !bookkeeping(call)).count(),
             started.elapsed(),
-            results.iter().map(|(_, seconds)| *seconds),
+            calls
+                .iter()
+                .zip(&results)
+                .filter(|(call, _)| !bookkeeping(call))
+                .map(|(_, (_, seconds))| *seconds),
         );
         for (call, (output, _)) in calls.iter().zip(&results) {
             if !bookkeeping(call) {

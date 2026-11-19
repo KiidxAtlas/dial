@@ -264,18 +264,18 @@ impl<'a> Agent<'a> {
                 "kind": "shell",
             }));
         }
-        let checks_current = self.step_checks.checks_current()
+        let checks_current = (self.step_checks.checks_current()
             || (state["reliability"]["verification_results"]
                 .as_array()
                 .is_none_or(Vec::is_empty)
-                && !shell_checks.is_empty()
-                && shell_checks.iter().all(|(_, _, current)| *current));
+                && !shell_checks.is_empty()))
+            && shell_checks.iter().all(|(_, _, current)| *current);
         let recorded_checks = if recorded_checks.is_empty() {
             Value::Null
         } else {
             json!(recorded_checks)
         };
-        let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":recorded_checks,"checks_current":checks_current,"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
+        let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":recorded_checks,"checks_current":checks_current,"effects_unknown":self.step_checks.effects_unknown,"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
         observed.completion(&summary);
         let mut control = self.session.control_state();
         control["turn_summary"] = summary;

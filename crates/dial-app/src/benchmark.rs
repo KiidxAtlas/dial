@@ -120,6 +120,9 @@ pub struct RunMetrics {
     pub prompt_tokens: u64,
     pub output_tokens: u64,
     pub elapsed_ms: u64,
+    /// RPC sends in which the harness observed a passing check, including interrupted sends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_check_timings: Vec<PostCheckTiming>,
     pub tool_calls: u64,
     pub tool_errors: u64,
     #[serde(default)]
@@ -191,6 +194,22 @@ pub struct RunMetrics {
     /// tool results or notices. In particular, a tool dispatch does not establish useful work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub efficiency: Option<serde_json::Value>,
+}
+
+/// Harness wall time from the last observed passing check to the end of that RPC send.
+/// An RPC error measures only the observed interval, not the time to a final response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostCheckTiming {
+    pub send_id: u64,
+    pub elapsed_ms: u64,
+    pub end: PostCheckEnd,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostCheckEnd {
+    Reply,
+    RpcError,
 }
 
 /// Main-agent schema offers and admitted executions for one case. Worker, extension and

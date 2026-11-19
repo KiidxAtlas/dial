@@ -141,10 +141,63 @@ jobs:
       ref: ${{ github.sha }}
       epoch: ${{ needs.gate.outputs.epoch }}
 
-  sign:
-    name: Sign release manifest
+  windows-sign:
+    name: Authenticode-sign Windows candidates
     needs: [gate, signing-ready, build]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.signing-ready.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: windows-2025
+    environment: windows-signing
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    env:
+      PACKAGE: dial-${{ github.ref_name }}-${{ matrix.target }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.gate.outputs.candidates || github.run_id }}
+          name: release-assets-${{ matrix.target }}
+          path: candidate
+      - name: Unpack tested archive
+        run: Expand-Archive -LiteralPath "candidate/$env:PACKAGE.zip" -DestinationPath unpacked
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: rootatlas
+          certificate-profile-name: dial-desktop
+          files: ${{ github.workspace }}/unpacked/${{ env.PACKAGE }}/dial.exe
+          cache-dependencies: false
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+      - name: Verify publisher and repack without executing candidate code
+        env:
+          PUBLISHER: ${{ vars.AZURE_SIGNING_PUBLISHER }}
+        run: |
+          $sig = Get-AuthenticodeSignature -LiteralPath "unpacked/$env:PACKAGE/dial.exe"
+          if (!$env:PUBLISHER -or $sig.Status -ne 'Valid' -or !$sig.TimeStamperCertificate -or
+              $sig.SignerCertificate.GetNameInfo('SimpleName', $false) -ne $env:PUBLISHER) {
+            throw 'Expected a valid, timestamped release publisher signature on dial.exe.'
+          }
+          Compress-Archive -LiteralPath "unpacked/$env:PACKAGE" -DestinationPath "$env:PACKAGE.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: authenticode-${{ matrix.target }}
+          path: ${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+
+  sign:
+    name: Sign release manifest
+    needs: [gate, windows-sign]
+    if: ${{ !cancelled() && needs.windows-sign.result == 'success' }}
     runs-on: ubuntu-22.04
     # Configure required reviewers and tag deployment rules in repository settings.
     environment: release-signing
@@ -180,6 +233,18 @@ jobs:
           set -euo pipefail
           python3 scripts/release-policy.py identity "$(git rev-parse 'HEAD^{tree}')" dist/candidate.json
           rm dist/candidate.json
+      - name: Discard unsigned Windows archives before hashing
+        run: rm dist/*.zip
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: authenticode-*
+          merge-multiple: true
+          path: dist
+      - name: Require both signed archives
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          for arch in x86_64 aarch64; do test -s "dist/dial-$RELEASE_TAG-$arch-pc-windows-msvc.zip" || exit 1; done
       - name: Prepare installers and manifest (no private key)
         env:
           DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}

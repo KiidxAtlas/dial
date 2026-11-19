@@ -164,13 +164,21 @@ style suggestion; one-call, trust, disclosure and capability-scoping rules remai
 request counts, elapsed time and token-use effects are unmeasured pending controlled evaluation.
 Rebuild/restart Dial to use the source changes; an existing binary is not patched in place.
 
-Request-efficient execution is guided at the shared policy owner: inspect named targets directly,
-combine related shell inspections, and compute/serialize/check permitted generated artifacts in
-one run rather than transcribing the result in another call. Stop after the requested requirements
-and required gates are satisfied; rereads, version probes and repeated checks need a concrete uncertainty.
-This does not waive required gates, missing runtime disclosures or source/config edit contracts.
-Generic specialized-tool/edit preferences apply to source/config files; generated-data files
-follow the single-run rule rather than a competing preference to transcribe them with `write`.
+Request-efficient execution is guided at the shared policy owner. For a new generated artifact
+with known inputs and a clear output contract, Dial is guided to read, compute, write, and check
+the written artifact in one run. Separate inspection is useful when it could change the approach;
+there is no need to transcribe the result into `write` or reread an artifact already checked in that
+run. Required external checks, source/config edit contracts, and permission boundaries still apply.
+When using `write`, the built-in prompt pairs it with a reusable check of the saved file: `verify`
+acceptance when offered, otherwise foreground `bash` with `check:true` and `check_paths`. Batch
+routes can send both calls in one response; single-call routes wait for write success. A failed
+write blocks dependent checks even when the shell command itself is read-only. An expected/actual
+mismatch should identify the failing input, so the next request can repair and rerun the same check.
+The runtime inventory resolves executable names on the shell's configured path, excluding hidden
+paths. If neither Python name resolves, it advises choosing an available helper before drafting one;
+a different engine is only partial evidence for Python-specific behavior. No probing turn or
+installation is required, and a resolved path is not a guarantee that execution will succeed.
+Once the requirements and required checks are satisfied, further probes need a concrete uncertainty.
 The existing `verify` tool revalidates declared inputs before reusing a pass; the shell pace
 guard remains advisory because command identity alone cannot prove an external environment fresh.
 The shell pace guard compares complete commands, working directories and named sessions rather
@@ -182,6 +190,13 @@ failed preparation omits its automatic offer, including retained task routing. P
 only reads the cached result, while explicit loads, pinned and child selections retain control
 operations. Cell execution still fails closed. Repositories offer `git` without a loading round.
 Pinned selections and model/mode restrictions still apply; registration policy is unchanged.
+When Bash cannot find Python, recovery recommends an `eval` cell only if the current tool
+offer includes it and its language launcher resolves. JavaScript is not a substitute for a
+Python-specific validation requirement: run an equivalent behavioral check or report the gap.
+When a foreground validation command exits 127 and a subsequent edit has no applicable check,
+Dial asks for a check against the saved result. The completion gate allows one recovery, not an
+unlimited retry loop. Reading the file back is not a passing check; if no suitable runtime exists,
+report what could not be verified.
 Python checks reporting a located `RuntimeWarning: coroutine ... was never awaited` are unverified,
 even with exit zero; the coroutine did not establish behavioral coverage. Testing guidance calls
 out queued work and awaited cancellation cleanup, not syntax-only or synchronous cleanup stand-ins.
@@ -216,8 +231,12 @@ invariant or failure boundary, at the lowest sufficient layer, without duplicati
 matrices. Worker/test-runner role guidance and the example test-runner skill follow the same
 decision rule. Reports briefly identify reused coverage or the gap requiring new tests.
 Checks are optional unless required by configured/user gates; when warranted they start focused
-once relevant edits settle, not after each edit. Diagnose errors before a rerun and disclose gaps
-rather than inventing required optional checks. When three model rounds in a row each make one lookup (`read`, search or safe
+once relevant edits settle, not after each edit. While a job or test runs, do independent work
+without changing its inputs. Wait only if its result blocks progress or completion.
+A model-registered acceptance helper runs on registration and stays in the turn's verification
+selection. To rerun it automatically between
+edit batches, opt in with `verification.auto_registered_checks = true`. Diagnose errors before a
+rerun and disclose gaps rather than inventing required optional checks. When three model rounds in a row each make one lookup (`read`, search or safe
 shell, ignoring a `todo` call beside it), the turn adds advice to batch known
 lookups in one response — read every relevant search hit together with the next searches — and
 repeats it every three such rounds. Broader runs need affected interfaces,
@@ -445,7 +464,11 @@ failure, and recovery guidance does not change approvals or weaken acceptance re
 Both the foreground turn and child workers decide how to recover from a reply in
 `agent/run/reply_triage.rs`. A reply cut off at the output limit with no text or tool call uses the
 single per-turn reasoning-gate recovery (a second hit stops). Otherwise the limit is raised, the
-partial answer is kept with a continuation request, or recovery stops as incomplete. A dropped tool
+partial answer is kept with a continuation request, or recovery stops as incomplete. A raised limit
+doubles each time, up to the model's stated output maximum (operator profile, live metadata or
+bundled catalog; 32,768 tokens when none is stated) and what the context window can spare. A tool
+call that still does not fit is not run; the next request states the limit and whether the model
+or the context window bounds it, without prescribing how to restructure the call. A dropped tool
 call with invalid JSON, or a tool call written as plain text, is a form failure. It is never run,
 and it gets one shared correction. Each loop keeps its own UI, journaling and message placement.
 Each request's tail is assembled once by `run::guidance::assemble`: advisory notes are curated to
@@ -1312,6 +1335,12 @@ limits, reasoning budgets, approvals or verification requirements:
   over every local-profile policy below. Its keys are `enabled` (default `true`), `small_window`
   (default 16384; 0 disables the small tier, otherwise 1024..=1048576), `edit_mode`, `sampling`,
   `reasoning_share` (default 50), `escalate_after` (default 2), and the keys below.
+  - After a recognized check reports a classified code failure, the next local request can show
+    one repair brief: the current goal, the checked and current revisions, whether a checkpointed
+    edit followed the check, and a short quotation of the failure when available. Locations, inputs
+    and assertion values come from the diagnostic, not a guessed cause. A superseding pass or denial
+    for that check suppresses the brief; steering discards it. It starts no extra request or check,
+    grants no retry or completion credit, and yields to safety and blocker guidance.
   - Tiers: a lean local route whose planned window is at most `small_window` gets the small tier:
     a fixed minimal tool set (`read`, `write`, `edit`, `bash`, `grep`, `glob`, `todo`, `finish`, `verify`,
     `tool_search`, `tool_load`) plus explicitly loaded tools; everything else loads on demand. A

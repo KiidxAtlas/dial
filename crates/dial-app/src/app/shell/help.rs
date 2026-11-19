@@ -106,23 +106,61 @@ pub(super) fn topic_help(topic: &str) -> Option<String> {
     })
 }
 
-/// Exact command help wins over topic introductions; aliases resolve through the registry.
-pub(super) fn command_help(name: &str) -> Option<String> {
-    let spec = crate::ui::command_surface::command_spec(name.trim().trim_start_matches('/'))?;
-    let mut text = format!("/{} {}\n\n{}", spec.name, spec.usage, spec.description);
+/// Keep command usage first, including when the same name also identifies a guide.
+fn command_help(name: &str) -> Option<String> {
+    let spec = crate::ui::command_surface::command_spec(name)?;
+    let mut text = format!("/{}", spec.name);
+    if !spec.usage.is_empty() {
+        text.push(' ');
+        text.push_str(spec.usage);
+    }
+    text.push_str(&format!("\n\n{}", spec.description));
     if let Some(cli) = spec.cli {
         text.push_str(&format!("\n\nalso: dial {cli}"));
     }
     if let Some(note) = spec.note {
         text.push_str(&format!("\n\n{note}"));
     }
+    if let Some(guide) = topic_help(spec.name)
+        .or_else(|| spec.aliases.iter().find_map(|alias| topic_help(alias.name)))
+    {
+        text.push_str("\n\n");
+        text.push_str(&guide);
+    }
     Some(text)
 }
 
+/// The one-line usage of a built-in command, from the metadata `/help <command>` shows.
+pub(super) fn usage_line(name: &str) -> String {
+    match crate::ui::command_surface::command_spec(name) {
+        Some(spec) if !spec.usage.is_empty() => format!("Usage: /{} {}", spec.name, spec.usage),
+        Some(spec) => format!("Usage: /{}", spec.name),
+        None => format!("Usage: /{name}"),
+    }
+}
+
+fn topic_index() -> String {
+    let names: Vec<_> = HELP_TOPICS.iter().map(|(name, ..)| *name).collect();
+    format!("/help <topic>: {}.", names.join(", "))
+}
+
 impl Shell {
-    pub(super) const SEARCH_USAGE: &str = "Search past sessions in this project.\nUsage: /search <words>\nExample: /search parser error";
+    pub(super) const SEARCH_USAGE: &str = "Search past sessions in this project.\nUsage: /search <words>\nExample: /search parser error\nUse /search to reopen results, /search more to load more, or /search back to return after opening a hit.";
 
     pub(super) const OUTCOME_USAGE: &str = "Rate the last completed turn so improvement runs learn from it.\nUsage: /outcome <0-100> [note]\nExample: /outcome 90 fixed the bug on the first try";
+
+    pub(super) fn help_response(&self, args: &str) -> String {
+        match args.trim() {
+            "all" => self.help_text(true),
+            "" | "text" => self.help_text(false),
+            query => {
+                let name = query.trim_start_matches('/').to_ascii_lowercase();
+                command_help(&name).or_else(|| topic_help(&name)).unwrap_or_else(|| {
+                    format!("No matching built-in command or help topic. Use /help to search actions or /help commands for custom commands.\n\n{}", topic_index())
+                })
+            }
+        }
+    }
 
     /// `/help`: how to start, then keys, then turn behaviour, then every command. Rows are
     /// `name  description` pairs so the transcript lays them out as aligned columns.
@@ -168,7 +206,7 @@ impl Shell {
         lines.push("While a turn is running".to_owned());
         lines.push(row(
             &self.keys.label(Action::Submit),
-            "choose: add direction now or queue for later",
+            &self.composer.busy_send_hint(),
         ));
         lines.push(row(
             &self.keys.label(Action::FollowUp),
@@ -221,7 +259,7 @@ impl Shell {
                 Some(hint) => format!(
                     "{}\n{}",
                     row(&name, &description),
-                    row("", &format!("usage: {name} {hint}"))
+                    row("", &format!("Usage: {name} {hint}"))
                 ),
                 None => row(&name, &description),
             }
@@ -268,7 +306,7 @@ impl Shell {
             ));
         }
         lines.push(String::new());
-        lines.push("/help <topic>: composer, command-reference, shortcuts, sessions, models, settings, turns, terminal, everyday, tools, setup.".into());
+        lines.push(topic_index());
         lines.push("/sessions browses all sessions; Ctrl+T opens this session's branches and labels. /sessions branch rewinds; /sessions label bookmarks a message; /sessions fork copies the conversation.".into());
         lines.push("/review offers AI review or keep/revert files; /review files opens checkpoint review directly. /undo files restores files without removing conversation turns.".into());
         lines.push("/todo inspects Plan and Progress tabs. /btw browses side threads. /help commands lists custom commands.".into());
@@ -291,94 +329,47 @@ impl Shell {
         during_turn(name, "") == DuringTurn::Stop
     }
 
-    pub(super) fn queue_command(&mut self, line: &str) {
-        let snapshot = self.composer.queued_items();
-        let items = self.composer.queued_messages();
-        if items.is_empty() {
-            self.note("Queue", "No queued messages. While busy, submit a draft to choose between adding direction now and queuing for later; the follow-up shortcut queues directly.");
-            return;
-        }
-        let words: Vec<_> = line.split_whitespace().collect();
-        let handle = words
-            .get(2)
-            .and_then(|word| word.strip_prefix('@'))
-            .and_then(|id| id.parse::<u64>().ok());
-        let requested = if let Some(id) = handle {
-            self.composer.queued_index(id)
-        } else {
-            words
-                .get(2)
-                .and_then(|number| number.parse::<usize>().ok())
-                .and_then(|number| number.checked_sub(1))
-        };
-        let selected = if words.len() == 1 {
-            let labels: Vec<_> = items
-                .iter()
-                .enumerate()
-                .map(|(index, (message, follow_up))| {
-                    format!(
-                        "{} {}: {}",
-                        index + 1,
-                        if *follow_up { "follow-up" } else { "steering" },
-                        crate::ui::text::ellipsize(&crate::ui::text::one_line(message), 72, true)
-                    )
-                })
-                .collect();
-            let options: Vec<_> = labels
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    (
-                        label.as_str(),
-                        char::from_digit((index + 1) as u32, 36).unwrap_or('?'),
-                    )
-                })
-                .collect();
-            self.ask(
-                "Queued messages",
-                "Choose a message to edit or remove. Esc keeps the queue unchanged.",
-                &options,
-            )
-        } else {
-            requested.filter(|index| *index < items.len())
-        };
-        let Some(index) = selected else {
-            if words.len() > 1 {
-                self.note(
-                    "Queue",
-                    "Use /queue, /queue edit <number> or /queue remove <number>. Queue unchanged.",
-                );
-            }
-            return;
-        };
-        // Modal prompts can run callbacks. Revalidate the selected identity after every prompt,
-        // not just the position captured before it opened.
-        let selected_id = snapshot.get(index).map(|item| item.0);
-        let action = if words.get(1) == Some(&"edit") {
-            Some(0)
-        } else if words.get(1) == Some(&"remove") {
-            Some(1)
-        } else if words.len() == 1 {
-            self.ask(
-                "Queued message",
-                &items[index].0,
-                &[("Edit", 'e'), ("Remove", 'r'), ("Keep", 'k')],
-            )
-        } else {
-            None
-        };
-        let Some(index) = selected_id.and_then(|id| self.composer.queued_index(id)) else {
+    /// Bare `/queue` opens Activity. Text actions resolve one current row or picker handle.
+    pub(super) fn queue_command(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let (Some(action @ ("edit" | "remove")), Some(target), None) =
+            (words.next(), words.next(), words.next())
+        else {
             self.note(
                 "Queue",
-                "That queued message is no longer available. Queue unchanged; reopen /queue.",
+                "Use /queue edit <number> or /queue remove <number>. Queue unchanged.",
             );
             return;
         };
-        match action {
-            Some(0) if self.composer.edit_queued(index) => self.note("Queue", "Message moved to the composer for editing. Your other queued messages are unchanged."),
-            Some(0) => self.note("Queue", "Draft kept. Clear or send it before editing a queued message."),
-            Some(1) => { self.composer.remove_queued(index); self.note("Queue", "Removed only the selected queued message."); }
-            _ => {}
+        let index = if let Some(handle) = target.strip_prefix('@') {
+            handle
+                .parse()
+                .ok()
+                .and_then(|id| self.composer.queued_index(id))
+        } else {
+            target
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .filter(|&i| i < self.composer.queued_count())
+        };
+        let Some(index) = index else {
+            self.note(
+                "Queue",
+                "No matching queued message. Queue unchanged; reopen /queue.",
+            );
+            return;
+        };
+        if action == "remove" {
+            self.composer.remove_queued(index);
+            self.note("Queue", "Removed only the selected queued message.");
+        } else if self.composer.edit_queued(index) {
+            self.note("Queue", "Message moved to the composer for editing. Your other queued messages are unchanged.");
+        } else {
+            self.note(
+                "Queue",
+                "Draft kept. Finish or cancel the current draft before editing a queued message.",
+            );
         }
     }
 }

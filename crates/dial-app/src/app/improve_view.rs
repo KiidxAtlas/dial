@@ -26,10 +26,10 @@ pub(super) fn improve_stop_text(app: &App, id: &str) -> String {
             .filter_map(|job| job["state_id"].as_str().map(str::to_owned))
             .collect();
         return if running.is_empty() {
-            "usage: /improve stop <state id>. No improvement job is running in this project.".into()
+            "Usage: /improve stop <state id>. No improvement job is running in this project.".into()
         } else {
             format!(
-                "usage: /improve stop <state id>. Running jobs: {}",
+                "Usage: /improve stop <state id>. Running jobs: {}",
                 running.join(", ")
             )
         };

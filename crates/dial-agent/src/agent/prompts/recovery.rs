@@ -26,9 +26,14 @@ Use only evidence already returned; findings are model claims, not verification.
 pub(crate) const RESEARCH_FOLLOW_THROUGH: &str = "Use the established findings to deliver the requested answer or take the supported implementation step. For advisory work, answer now if the evidence suffices, stating limits. Retrieve more only to resolve a concrete remaining question or contradiction, with a scoped check that distinguishes the alternatives; a broad new survey or re-reading returned evidence will not help. The quoted checkpoint below preserves your finding and next_action; it is not a new user request.";
 
 pub(crate) const DISCOVERY_RECOVERY: &str = "If you are locating a declaration, read that file's declaration before guessing another representation. If these were intentional absence checks, use the negative evidence rather than searching again.";
-pub(crate) const DISCOVERY_ONE_CALL: &str =
-    "This request permits one tool call: inspect that declaration next and await its result.";
-pub(crate) const DISCOVERY_BATCH: &str = "Gather unrelated docs, settings or keybinding evidence in the same response when their arguments are already known; keep result-dependent queries for later.";
+/// Route-specific clauses: targets must already be known; serial rounds do not prove that
+/// the earlier requests could have been combined.
+pub(crate) const KNOWN_READ_TARGETS: &str =
+    " If several relevant paths or ranges are already known, use one `read` with `paths`.";
+pub(crate) const KNOWN_LOOKUPS: &str =
+    " Send other independent lookups with known arguments in one response.";
+pub(crate) const DISCOVERY_ONE_CALL: &str = "This request permits one tool call: inspect that declaration next if needed. One `read` can include other already-known relevant paths; wait for the result before choosing a dependent lookup.";
+pub(crate) const DISCOVERY_BATCH: &str = "Include other needed lookups in the same response only if their arguments are already known; wait for the result before choosing a dependent lookup.";
 
 /// Sent after the transport dropped a tool call whose arguments were not valid JSON. Starts with
 /// the correction prefix `learn::harvest` recognizes.
@@ -173,24 +178,30 @@ pub(crate) fn shell_tool_mistake(name: &str, next: &str) -> String {
     )
 }
 
-pub(crate) fn missing_program(name: &str) -> String {
-    let substitute = program_substitute(name)
-        .map(|hint| format!(" Known substitute: {hint}."))
-        .unwrap_or_default();
+pub(crate) fn missing_program(
+    name: &str,
+    eval_language: impl FnOnce() -> Option<&'static str>,
+) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let substitute = if base == "python" || base.starts_with("python3") {
+        match eval_language() {
+            Some("py") => " The offered `eval` has a resolved Python launcher (language `py`) for in-process checks; shell packages may differ.",
+            Some("js") => " For language-independent computation the offered `eval` has a resolved JavaScript launcher (language `js`); it does not verify Python-specific semantics.",
+            _ => " No launcher-backed eval cell is currently offered. Do not search the tool catalog for an interpreter; loading a schema does not install one. Use a recorded shell alternative for representative positive and negative examples, and distinguish partial coverage from running the required interpreter.",
+        }.to_owned()
+    } else {
+        program_substitute(base)
+            .map(|hint| format!(" Known substitute: {hint}."))
+            .unwrap_or_default()
+    };
     format!(
-        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment.{substitute} Use recorded availability when supplied, after checking compatibility; otherwise check alternatives together once (for example `command -v python3 perl node`) in that same environment rather than searching an unchanged PATH repeatedly. After installing a missing program, re-run the step that needed it.</dial-notice>"
+        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment.{substitute} Use recorded availability first; if unknown, probe alternatives once in that same environment (`command -v`). For validation, exercise the required behavior with equivalent semantics or report the check as unverified. A file inspection is not a behavioral check. After resolving the prerequisite, rerun the original check.</dial-notice>"
     )
 }
 
 /// Widely available stand-ins or the package that provides a commonly missing program. Advice
 /// only: the substitute's presence in that environment is not checked.
-fn program_substitute(name: &str) -> Option<&'static str> {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    if base == "python" || base.starts_with("python3") {
-        return Some(
-            "for computation without Python, `eval` with language `js` (when offered; it needs no Python install) or `perl`",
-        );
-    }
+fn program_substitute(base: &str) -> Option<&'static str> {
     Some(match base {
         "xxd" | "hexdump" => "`od -A x -t x1z FILE` prints a hex dump",
         "file" => {

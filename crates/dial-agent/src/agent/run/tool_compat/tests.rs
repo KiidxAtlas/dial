@@ -236,3 +236,51 @@ fn replace_arguments_never_translate_into_a_hashline_patch() {
     );
     assert!(crate::agent::run::calls::validate(parameters, &arguments).is_ok());
 }
+
+#[test]
+fn identifier_variants_are_schema_directed_and_do_not_change_payloads() {
+    let catalog = vec!["custom_lookup".into(), "read".into()];
+    assert_eq!(canonical_name("customLookup", &catalog), "custom_lookup");
+    assert_eq!(canonical_name("Read-File", &catalog), "read");
+    assert_eq!(canonical_name("readFile", &["write".into()]), "readFile");
+    assert_eq!(canonical_name("mcp_ab", &["mcp__ab".into()]), "mcp_ab");
+    let schema = json!({"type":"object", "additionalProperties":false, "properties":{
+        "action":{"type":"string","enum":["trace_start","snapshot","screenshot"]},
+        "options":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+            "max_count":{"type":"integer"}, "text":{"type":"string"}}}},
+        "payload":{"type":"object","properties":{"keep_key":{"type":"string"}}}
+    }});
+    let mut args = json!({"operation":"TraceStart","options":[{"max-count":"2","text":" TraceStart "}],"payload":{"keepKey":"untouched"}});
+    normalize("extension", &schema, &mut args);
+    assert_eq!(
+        args,
+        json!({"action":"trace_start","options":[{"max_count":2,"text":" TraceStart "}],"payload":{"keepKey":"untouched"}})
+    );
+    assert!(crate::agent::run::calls::validate(&schema, &args).is_ok());
+    let mut args = json!({"action":"capture"});
+    normalize("browser", &schema, &mut args);
+    assert_eq!(args, json!({"action":"screenshot"}));
+}
+
+#[test]
+fn spelling_collisions_and_unknown_actions_are_not_guessed() {
+    let names = vec!["get_info".into(), "getInfo".into()];
+    assert_eq!(canonical_name("Get-Info", &names), "Get-Info");
+    assert_eq!(canonical_name("tools.getInfo", &names), "getInfo");
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{
+        "max_count":{"type":"integer"}, "wait_for":{}, "waitFor":{},
+        "action":{"type":"string","enum":["log_in","logIn","shutdown"]}
+    }});
+    for original in [
+        json!({"maxCount":1,"max-count":2}),
+        json!({"maxCount":1,"max_count":2}),
+        json!({"Wait-For":1}),
+        json!({"action":"LOG-IN"}),
+        json!({"action":"shutdow"}),
+    ] {
+        let mut args = original.clone();
+        normalize("extension", &schema, &mut args);
+        assert_eq!(args, original);
+        assert!(crate::agent::run::calls::validate(&schema, &args).is_err());
+    }
+}

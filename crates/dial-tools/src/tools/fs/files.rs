@@ -634,16 +634,29 @@ fn read_paths_outcomes(
     // Room for the omitted-target notice and the outcome footer is held back from the rows, so the
     // combined text stays within `total` whichever targets end up omitted.
     let rows = total.saturating_sub(COMPACT_NOTICE_BOUND + PATHS_FOOTER_BOUND);
-    let shares = fair_shares(
-        &targets
-            .iter()
-            .map(|target| target_demand(ws, args, target))
-            .collect::<Vec<_>>(),
-        rows,
+    // Plan independent metadata in parallel. These are hints, never cached authorization,
+    // file contents or edit witnesses. Exact reads use their actual room in request order.
+    let workers = if targets.len() >= 4 {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+    } else {
+        1
+    };
+    let demands = super::workers::with_workers(
+        workers,
+        |target| target_demand(ws, args, target),
+        |prepare| prepare(&targets),
     );
+    let shares = fair_shares(&demands, rows);
     let mut reserved_after: usize = shares.iter().sum();
     let mut out = String::new();
     let mut outcomes = Vec::with_capacity(targets.len());
+    let mut single = args.clone();
+    single
+        .as_object_mut()
+        .expect("paths field validated")
+        .remove("paths");
     for (index, path) in targets.iter().enumerate() {
         reserved_after -= shares[index];
         let remaining = rows.saturating_sub(out.len());
@@ -671,11 +684,7 @@ fn read_paths_outcomes(
             .saturating_sub(reserved_after)
             .max(PATH_ROOM_FLOOR)
             .min(remaining - SECTION_GAP.len());
-        let mut single = args.clone();
-        if let Some(object) = single.as_object_mut() {
-            object.remove("paths");
-            object.insert("path".into(), Value::String(path.to_string()));
-        }
+        single["path"] = Value::String(path.to_string());
         let status = match read_tool_streaming(ws, &single, cancel, room) {
             Ok(text) => {
                 out.push_str(&bounded_section(ws, path, &text, room));
@@ -859,7 +868,7 @@ pub(in crate::tools) fn read_paths_output(
     })
 }
 
-const MAX_READ_PATHS: usize = 16;
+pub(in crate::tools) const MAX_READ_PATHS: usize = 16;
 const MAX_READ_PATHS_BYTES: usize = 96 * 1024;
 /// Room every target is given at least, and the overhead its planned size keeps beyond its file's
 /// bytes: enough for a header, a footer and a few rows.

@@ -21,6 +21,17 @@ fn restart_is_session_scoped_and_a_second_writer_cannot_modify_or_discard() {
     assert!(reopened.record.current.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn closing_recovery_releases_writer_even_with_a_duplicated_descriptor() {
+    let (_home, _project, app, _shell) = super::super::testkit::shell();
+    let writer = Store::open(&app.layout, "session-a").unwrap();
+    let _inherited = writer._lease.try_clone().unwrap();
+    assert!(Store::open(&app.layout, "session-a").is_err());
+    drop(writer);
+    Store::open(&app.layout, "session-a").expect("released writer must not block resume");
+}
+
 #[test]
 fn corrupt_or_wrong_identity_records_are_not_overwritten() {
     let (_home, _project, app, _shell) = super::super::testkit::shell();

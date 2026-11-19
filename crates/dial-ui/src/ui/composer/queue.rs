@@ -290,6 +290,11 @@ impl Composer {
             || self.explicit.iter().any(|item| item.untaken)
     }
 
+    /// Number of queued messages, including held input, without copying their bodies.
+    pub fn queued_count(&self) -> usize {
+        self.queued.len()
+    }
+
     pub fn queued_messages(&self) -> Vec<(String, bool)> {
         self.queued.iter().cloned().collect()
     }
@@ -313,10 +318,9 @@ impl Composer {
     }
 
     pub fn edit_queued(&mut self, index: usize) -> bool {
-        if !self.editor.text.is_empty() {
+        if !self.editor.text.is_empty() || self.editing_queue.is_some() {
             return false;
         }
-        self.restore_queued_edit();
         let Some((text, follow_up)) = self.queued.remove(index) else {
             return false;
         };

@@ -268,6 +268,8 @@ function hintWrongGlobal(error, desktopHandle) {
 	if (error?.name === "TypeError" && /\.bounds is not a function$/.test(error.message ?? "")) {
 		error.message +=
 			"; a window's `bounds` is a property (`win.bounds` → {x, y, width, height}); only elements have the method `await el.bounds()`.";
+	} else if (error?.name === "TypeError" && /\.screenshot is not a function$/.test(error.message ?? "")) {
+		error.message += "; screenshot() needs an awaited target, not a list, Promise, or serialized record. Use `const w = await desktop.window({ app: 'Calculator' }); await w.screenshot()` with the intended app, or `await (await desktop.window(record.id)).screenshot()` for a saved window ID.";
 	} else if (error?.name === "TypeError") {
 		hintHandleMethods(error, desktopHandle);
 	}
@@ -1658,6 +1660,12 @@ class Win {
 	}
 }
 
+// A getter keeps this fallback out of both enumerable keys and the callable-method hint below.
+function withCaptureAlias(target) {
+	return Object.defineProperty(target, "capture", { get() { return this.screenshot; } });
+}
+withCaptureAlias(Win.prototype);
+
 /** Callable names on window handles (`desktop.windows()` items); used by the TypeError hint. */
 const WINDOW_METHODS = Object.getOwnPropertyNames(Win.prototype).filter(
 	name => name !== "constructor" && typeof Object.getOwnPropertyDescriptor(Win.prototype, name)?.value === "function",
@@ -1974,7 +1982,7 @@ class ComputerWorkerCore {
 			height: 0,
 			focused: false,
 		});
-		return {
+		return withCaptureAlias({
 			capabilities: async () => {
 				const { signal } = getContext();
 				return await nativeCall(signal, () => session.capabilities());
@@ -2000,7 +2008,7 @@ class ComputerWorkerCore {
 					height: 0,
 					focused: false,
 				});
-				return {
+				return withCaptureAlias({
 					id: selector,
 					screenshot: target.screenshot.bind(target),
 					zoom: target.zoom.bind(target),
@@ -2014,7 +2022,7 @@ class ComputerWorkerCore {
 					press: target.press.bind(target),
 					holdKeys: target.holdKeys.bind(target),
 					holdMouse: target.holdMouse.bind(target),
-				};
+				});
 			},
 			apps: {
 				list: async options => {
@@ -2053,7 +2061,9 @@ class ComputerWorkerCore {
 			},
 			windows: async filter => {
 				const { signal, snapshot } = getContext();
-				return (await listWindowSnapshot(session, signal, snapshot.runtimeIdentity)).windows.filter(window => matchesFilter(window, filter));
+				const listing = await listWindowSnapshot(session, signal, snapshot.runtimeIdentity);
+				// Preserve the listing's flat geometry alongside the usual window helpers.
+				return listing.windows.filter(window => matchesFilter(window, filter)).map(window => Object.assign(makeWin(window), window));
 			},
 			window: async selector => {
 				const context = getContext();
@@ -2117,7 +2127,7 @@ class ComputerWorkerCore {
 					await nativeCall(context.signal, () => native("clipboardWrite", { text }));
 				},
 			},
-		};
+		});
 	}
 
 	async #close() {

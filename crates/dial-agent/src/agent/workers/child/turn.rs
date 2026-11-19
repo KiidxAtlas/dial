@@ -1436,6 +1436,11 @@ impl<'a> ChildTurn<'a> {
             // `false` means a newer branch or recall superseded this one: nothing to publish.
             let _ = prepared.commit(&children.memory_authority());
         }
+        if let Some(reason) = reply.refusal_message() {
+            return Ok(ControlFlow::Break(Tick::Finished(Outcome::failed(
+                self.steps, reason,
+            ))));
+        }
         // Schemas retained for protocol history are not permission to act on the reserved
         // summary request. Stop before recovery, inline-edit conversion or tool admission.
         if summary_step
@@ -1509,6 +1514,7 @@ impl<'a> ChildTurn<'a> {
             requested_tokens: self.max_tokens,
             window: child_window(env, backend),
             prompt_tokens: reply.prompt_tokens.unwrap_or(0),
+            model_max_output: backend.stated_output_limit(),
         };
         if let Some(truncation) = crate::agent::run::reply_triage::truncation(
             engine,
@@ -2169,16 +2175,19 @@ impl<'a> ChildTurn<'a> {
             }
             if parallel.is_empty()
                 && !reply.text_calls_lifted
-                && !child_speculation_key(env, job, call, &children.namespace)
-                    .is_some_and(|key| env.workspace.speculation.pending(&key, &call.arguments))
                 && !crate::agent::safety::hooks::wanted(&env.config.hooks, "pre_tool_use")
+                && !crate::agent::safety::hooks::wanted(&env.config.hooks, "post_tool_use")
             {
                 let count = reply.tool_calls[index..]
                     .iter()
-                    .take(env.config.task.parallel_read_limit())
+                    .take(crate::agent::run::dispatch::MAX_BATCH_ENTRIES)
                     .take_while(|call| {
                         approval::parallel_read(env.ext, &call.name, &call.arguments)
                             && call_form_error(call, &self.schemas, &self.names).is_none()
+                            && !child_speculation_key(env, job, call, &children.namespace)
+                                .is_some_and(|key| {
+                                    env.workspace.speculation.pending(&key, &call.arguments)
+                                })
                             && approver
                                 .authorize_with_cancel(call, &summarize(call), false, env.interrupt)
                                 .is_ok()
@@ -2239,14 +2248,7 @@ impl<'a> ChildTurn<'a> {
                     seconds = Some(elapsed);
                     output
                 }
-                None if rejection.is_some() => crate::runtime::tool_output::ToolOutput {
-                    execution: Default::default(),
-                    data: None,
-                    text: rejection.unwrap(),
-                    is_error: true,
-                }
-                .with_status(tools::ToolStatus::Blocked)
-                .with_effects(tools::surface::outcome::Effects::None),
+                None if rejection.is_some() => rejection.unwrap(),
                 None => {
                     if let Some(stream) = self.streamed.as_mut() {
                         stream.invalidate();
@@ -2323,7 +2325,16 @@ impl<'a> ChildTurn<'a> {
                 },
             )
             .or_else(|| {
-                crate::agent::run::failure_guidance::missing_program_recovery(call, &output)
+                use crate::agent::run::failure_guidance::{
+                    LaunchCapabilities, missing_program_recovery, offered_eval_language,
+                };
+                missing_program_recovery(call, &output, || {
+                    offered_eval_language(
+                        LaunchCapabilities::child_tool("eval", &self.names, env.config, env.ext),
+                        env.workspace.root(),
+                        env.config,
+                    )
+                })
             }) {
                 output.text.push_str(&advice);
             }

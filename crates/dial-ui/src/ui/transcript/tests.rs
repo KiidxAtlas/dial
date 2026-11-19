@@ -2517,7 +2517,7 @@ fn recorded_handoff_footer_is_bounded_sanitized_and_width_safe() {
                 ..TurnOutcome::default()
             }),
         };
-        let rows = stats_rows(&stats, width, &env.ctx());
+        let rows = stats_rows(&stats, &recap::Recap::default(), width, &env.ctx());
         assert!(rows.len() <= 12, "unbounded footer at width {width}");
         for line in plain(&rows) {
             assert!(
@@ -2552,7 +2552,10 @@ fn completed_answer_without_handoff_preserves_single_closing_line() {
             ..TurnOutcome::default()
         }),
     };
-    assert_eq!(stats_rows(&stats, 80, &env.ctx()).len(), 1);
+    assert_eq!(
+        stats_rows(&stats, &recap::Recap::default(), 80, &env.ctx()).len(),
+        1
+    );
 }
 
 #[test]
@@ -2570,7 +2573,7 @@ fn answered_footer_is_neutral_and_keeps_open_work_visible() {
             ..TurnOutcome::default()
         }),
     };
-    let rows = stats_rows(&stats, 100, &env.ctx());
+    let rows = stats_rows(&stats, &recap::Recap::default(), 100, &env.ctx());
     let text = text_of(&rows);
     assert!(
         text.contains("answered") && text.contains("2 open"),
@@ -2894,4 +2897,53 @@ fn provider_retry_retires_only_argument_drafts_and_allows_reused_call_ids() {
     assert!(draft.outcome.is_none(), "draft never executed");
     t.tool_arguments_delta("draft", "write", "{}");
     assert_eq!(t.blocks.len(), 4);
+}
+
+#[test]
+fn a_call_approved_at_the_prompt_keeps_an_approved_receipt() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("held", "bash", "rm build", r#"{"command":"rm -r build"}"#);
+    t.tool_awaiting_approval("held", true);
+    let waiting = text_of(&t.all_rows(100, &env.ctx()));
+    assert!(waiting.contains("waiting for your approval") && !waiting.contains("approved"));
+    t.tool_awaiting_approval("held", false);
+    t.tool_end("held", "", false, 0.2);
+    assert!(text_of(&t.all_rows(100, &env.ctx())).contains("approved"));
+    t.tool_start("free", "bash", "ls", r#"{"command":"ls"}"#);
+    t.tool_end("free", "a", false, 0.1);
+    let rows = t.all_rows(100, &env.ctx());
+    assert_eq!(
+        text_of(&rows).matches("approved").count(),
+        1,
+        "{}",
+        text_of(&rows)
+    );
+}
+
+#[test]
+fn a_run_of_skill_loads_folds_into_one_counted_row() {
+    use crate::agent::ui::ui_event::{EventKind, UiEvent};
+    let env = Env::new();
+    let mut t = Transcript::new();
+    for name in ["debugging", "rust-review", "test-runner"] {
+        t.event(&UiEvent::new(
+            EventKind::Skill,
+            format!("Loaded skill {name}"),
+        ));
+    }
+    t.event(&UiEvent::new(EventKind::Steering, "steer one"));
+    t.event(&UiEvent::new(EventKind::Steering, "steer two"));
+    let rows = plain(&t.all_rows(100, &env.ctx()));
+    let skills: Vec<_> = rows.iter().filter(|r| r.contains("skill")).collect();
+    assert_eq!(skills.len(), 1, "{rows:?}");
+    assert!(
+        skills[0].contains("test-runner") && skills[0].contains("×3"),
+        "{rows:?}"
+    );
+    let all = rows.join("\n");
+    assert!(
+        all.contains("steer one") && all.contains("steer two"),
+        "{all}"
+    );
 }

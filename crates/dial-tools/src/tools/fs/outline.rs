@@ -38,11 +38,18 @@ pub(in crate::tools) struct Outline<'a> {
     pub expand: Vec<String>,
 }
 
+/// Whether `path:outline` and `path:sym=NAME` can parse this file type (by extension).
+pub fn available(path: &Path) -> bool {
+    SupportLang::from_path(path).is_some()
+}
+
 /// The outline request in `input`, unless a file literally named like the selector exists.
 pub(in crate::tools) fn target<'a>(ws: &Workspace, input: &'a str) -> Option<Outline<'a>> {
-    if ws.resolve_read(input).is_ok_and(|literal| literal.exists()) {
-        return None;
-    }
+    let requested = parse(input)?;
+    (!ws.resolve_read(input).is_ok_and(|literal| literal.exists())).then_some(requested)
+}
+
+fn parse(input: &str) -> Option<Outline<'_>> {
     if let Some(path) = input.strip_suffix(SELECTOR).filter(|p| !p.is_empty()) {
         return Some(Outline {
             path,

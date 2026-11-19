@@ -98,7 +98,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, jobs finished, required checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
+        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, required jobs finished and checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
@@ -176,6 +176,8 @@ pub(in crate::agent) enum Decision {
     Incomplete(String),
 }
 
+pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Exercise the written artifact, not a copy: use known-answer cases including counterexamples and assert the exact outputs. Run the check with bash check:true, or register a focused acceptance check. Fix mismatches and rerun. If the required runtime is unavailable, use an available runtime for partial coverage and disclose the difference; if validation is impossible, report the concrete blocker. A reread does not test behavior.";
+
 impl crate::agent::Agent<'_> {
     /// Small local models keep every completion guard rail: open execution steps block, the
     /// lexical investigation nudge applies and long observation runs get the forced research
@@ -243,6 +245,14 @@ impl crate::agent::Agent<'_> {
             let gate = self.gate_unverified_edits(!nudged, ui);
             if gate.unverified.is_some() || gate.blocking {
                 let lead = match &gate.unverified {
+                    Some(checks) if gate.has_pass && gate.blocking => format!(
+                        "Current edits have a failing applicable check. Still lacking a pass: {}. ",
+                        checks.join(", ")
+                    ),
+                    Some(checks) if gate.has_pass => format!(
+                        "Current edits still lack passing evidence for: {}. ",
+                        checks.join(", ")
+                    ),
                     Some(checks) => format!(
                         "Current edits have no passing applicable check: {}. ",
                         checks.join(", ")
@@ -258,6 +268,8 @@ impl crate::agent::Agent<'_> {
                     gate.failures.join("\n")
                 };
                 blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
+            } else if self.unchecked_after_launch_gap() {
+                blocker = Some(UNCHECKED_AFTER_LAUNCH_GAP.to_owned());
             }
         }
         // The lexical investigation nudge is a guard rail for small local models only.

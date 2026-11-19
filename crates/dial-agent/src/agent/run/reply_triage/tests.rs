@@ -15,6 +15,7 @@ fn facts(reasoning_guard: bool, plan_gate: bool) -> LengthFacts {
         requested_tokens: 1024,
         window: 128_000,
         prompt_tokens: 1000,
+        model_max_output: None,
     }
 }
 

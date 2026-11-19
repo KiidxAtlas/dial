@@ -434,13 +434,15 @@ impl Agent<'_> {
         let mut cancelled = false;
         let mut refused = None;
         let mut unexpected_failure = false;
-        for check in &selected {
+        let mut grouped = std::collections::VecDeque::new();
+        for (index, check) in selected.iter().enumerate() {
             // The reproduction just registered always executes; other checks may reuse passes.
-            let reused = names.is_none()
+            let reused = grouped.is_empty()
+                && names.is_none()
                 && !failed_only
                 && registered.as_ref() != Some(&check.name)
                 && self.reuse_check(check);
-            let (status, output) = if self.interrupt.load(Ordering::SeqCst) {
+            let (status, output) = if grouped.is_empty() && self.interrupt.load(Ordering::SeqCst) {
                 self.step_checks.evidence.observe(
                     &check.command,
                     &format!("focused-check:{}", check.name),
@@ -453,13 +455,23 @@ impl Agent<'_> {
             } else if reused {
                 (CheckStatus::Passed, None)
             } else {
-                let output = self.run_focused_check(check, ui);
+                if grouped.is_empty() {
+                    grouped = self.run_check_prefix(
+                        &selected[index..],
+                        names.is_none() && !failed_only,
+                        ui,
+                    );
+                }
+                let output = grouped
+                    .pop_front()
+                    .unwrap_or_else(|| self.run_focused_check(check, ui));
                 // Include the focused runner's declared-input freshness verdict, not only exit facts.
                 let status = self
                     .step_checks
                     .evidence
                     .latest_status(&check.command)
                     .unwrap_or(CheckStatus::Unverified);
+                cancelled |= status == CheckStatus::Cancelled;
                 (status, Some(output))
             };
             if status != CheckStatus::Cancelled {
@@ -536,9 +548,7 @@ impl Agent<'_> {
             results.push(result);
         }
         self.step_checks.failed = !self.step_checks.failed_checks.is_empty();
-        if !self.hermetic {
-            self.publish_edit_loop_status(ui);
-        }
+        self.publish_edit_loop_results(ui, Some(&results));
         let changed_paths: Vec<PathBuf> = self
             .step_checks
             .turn

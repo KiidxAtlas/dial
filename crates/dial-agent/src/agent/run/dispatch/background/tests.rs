@@ -114,6 +114,7 @@ fn invalid_or_unavailable_nested_calls_start_no_work() {
         json!({"name":"not_offered","arguments":{}}),
         json!({"name":"bg","arguments":{"action":"list"}}),
         json!({"name":"finish","arguments":{}}),
+        json!({"name":crate::tools::exec::eval::BATCH_CALLBACK,"arguments":{"calls":[{"name":"functions.bg_probe","arguments":{"value":1}}]}}),
     ] {
         with_agent(|agent, hits| {
             let output = agent.dispatch(

@@ -40,11 +40,11 @@ impl Capture {
         cancel: &AtomicBool,
     ) -> Result<(Capture, mpsc::Receiver<Chunk>)> {
         match config.capture {
-            CaptureChoice::Native => native::start(cancel),
+            CaptureChoice::Native => native::start(&config.input_device, cancel),
             CaptureChoice::Command => Self::start_command(config),
             CaptureChoice::Auto => {
                 if config.capture_command.is_empty() && native::AVAILABLE {
-                    match native::start(cancel) {
+                    match native::start(&config.input_device, cancel) {
                         Ok(started) => return Ok(started),
                         Err(native_error) => {
                             return Self::start_command(config).map_err(|command_error| {
@@ -329,7 +329,35 @@ mod native {
         }
     }
 
-    pub fn start(cancel: &AtomicBool) -> Result<(Capture, mpsc::Receiver<Chunk>)> {
+    /// The microphone named `wanted` (exact, else the only case-insensitive substring match),
+    /// or the system default when `wanted` is blank.
+    fn input_device(host: &cpal::Host, wanted: &str) -> Result<cpal::Device> {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
+            return host
+                .default_input_device()
+                .context("no default microphone; check System Settings > Sound > Input");
+        }
+        let devices: Vec<(String, cpal::Device)> = host
+            .input_devices()
+            .context("listing microphones")?
+            .map(|device| (device.name().unwrap_or_default(), device))
+            .collect();
+        let names: Vec<String> = devices.iter().map(|(name, _)| name.clone()).collect();
+        let index = super::pick_device(&names, wanted).with_context(|| {
+            format!(
+                "no microphone matches voice.stt.input_device = {wanted:?}; available: {}",
+                names.join(", ")
+            )
+        })?;
+        Ok(devices.into_iter().nth(index).expect("index from names").1)
+    }
+
+    pub fn start(
+        device_name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(Capture, mpsc::Receiver<Chunk>)> {
+        let device_name = device_name.to_owned();
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -338,9 +366,7 @@ mod native {
         let thread = std::thread::spawn(move || {
             let stream = (|| -> Result<(cpal::Stream, String)> {
                 let host = cpal::default_host();
-                let device = host
-                    .default_input_device()
-                    .context("no default microphone; check System Settings > Sound > Input")?;
+                let device = input_device(&host, &device_name)?;
                 let name = device.name().unwrap_or_else(|_| "microphone".into());
                 let supported = device
                     .default_input_config()
@@ -472,11 +498,30 @@ mod native {
     pub const AVAILABLE: bool = false;
 
     pub fn start(
+        _device: &str,
         _cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Capture, mpsc::Receiver<Chunk>)> {
         anyhow::bail!(
             "native microphone capture is not compiled into this build (it needs the `voice` feature on macOS); set voice.stt.capture = \"command\" to use a recorder program"
         )
+    }
+}
+
+/// The index of the device named `wanted`: an exact name, else the one name containing it
+/// (ignoring case). `None` when nothing or several devices match.
+#[cfg_attr(not(all(feature = "voice", target_os = "macos")), allow(dead_code))]
+fn pick_device(names: &[String], wanted: &str) -> Option<usize> {
+    if let Some(exact) = names.iter().position(|name| name == wanted) {
+        return Some(exact);
+    }
+    let wanted = wanted.to_lowercase();
+    let mut matches = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.to_lowercase().contains(&wanted));
+    match (matches.next(), matches.next()) {
+        (Some((index, _)), None) => Some(index),
+        _ => None,
     }
 }
 

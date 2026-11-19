@@ -77,7 +77,7 @@ pub fn replay_scheduling(
                 if count == 0 {
                     count = rest
                         .iter()
-                        .take(config.task.parallel_read_limit())
+                        .take(crate::agent::run::dispatch::MAX_BATCH_ENTRIES)
                         .take_while(|call| {
                             !call.malformed_arguments
                                 && ["pre_tool_use", "post_tool_use"].iter().all(|event| {

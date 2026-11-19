@@ -71,7 +71,10 @@ pub(in crate::agent) struct GroupTiming {
     pub calls: u64,
     pub sizes: BTreeMap<usize, u64>,
     pub elapsed_us: u64,
-    pub work_us: u64,
+    /// Inclusive sum of per-call observations, never elapsed time or measured speedup.
+    /// Unknown if any group's samples are missing, invalid or not one per declared call.
+    #[serde(default)]
+    pub work_us: Option<u64>,
 }
 impl Scheduling {
     pub fn group(
@@ -81,26 +84,48 @@ impl Scheduling {
         elapsed: std::time::Duration,
         seconds: impl Iterator<Item = f64>,
     ) {
+        let mut observations = 0_usize;
+        let mut work_us = Some(0_u64);
+        for seconds in seconds {
+            observations = observations.saturating_add(1);
+            work_us = work_us.and_then(|total| {
+                (seconds.is_finite() && seconds >= 0.0)
+                    .then(|| total.saturating_add((seconds * 1_000_000.0) as u64))
+            });
+        }
+        if observations != size {
+            work_us = None;
+        }
         let group = self.groups.entry(kind.to_owned()).or_default();
-        group.groups += 1;
-        group.calls += size as u64;
-        *group.sizes.entry(size).or_default() += 1;
+        group.work_us = if group.groups == 0 {
+            work_us
+        } else {
+            group.work_us.zip(work_us).map(|(a, b)| a.saturating_add(b))
+        };
+        group.groups = group.groups.saturating_add(1);
+        group.calls = group.calls.saturating_add(size as u64);
+        let count = group.sizes.entry(size).or_default();
+        *count = count.saturating_add(1);
         group.elapsed_us = group
             .elapsed_us
             .saturating_add(elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
-        group.work_us = group.work_us.saturating_add(
-            seconds
-                .map(|s| (s.max(0.0) * 1_000_000.0) as u64)
-                .fold(0_u64, u64::saturating_add),
-        );
     }
     pub fn extend(&mut self, other: Self) {
         for (kind, timing) in other.groups {
             let group = self.groups.entry(kind).or_default();
+            if timing.groups > 0 {
+                group.work_us = if group.groups == 0 {
+                    timing.work_us
+                } else {
+                    group
+                        .work_us
+                        .zip(timing.work_us)
+                        .map(|(a, b)| a.saturating_add(b))
+                };
+            }
             group.groups = group.groups.saturating_add(timing.groups);
             group.calls = group.calls.saturating_add(timing.calls);
             group.elapsed_us = group.elapsed_us.saturating_add(timing.elapsed_us);
-            group.work_us = group.work_us.saturating_add(timing.work_us);
             for (size, count) in timing.sizes {
                 let entry = group.sizes.entry(size).or_default();
                 *entry = entry.saturating_add(count);
@@ -152,6 +177,8 @@ pub(in crate::agent) struct Metrics {
     pub observed_reply_text_bytes: u64,
     pub observed_tool_argument_bytes: u64,
     pub recovery_attempts: BTreeMap<String, u64>,
+    /// Explicit controller-observed events, not inferred corrections or judgments of user intent.
+    pub interventions: BTreeMap<&'static str, u64>,
     pub backend_operations: std::cell::RefCell<BTreeMap<&'static str, OperationTiming>>,
     pub system_bytes: u64,
     pub history_bytes: u64,
@@ -295,6 +322,10 @@ impl Metrics {
 
     pub fn recovery(&mut self, kind: &'static str) {
         *self.recovery_attempts.entry(kind.to_owned()).or_default() += 1;
+    }
+    pub fn intervention(&mut self, event: &'static str) {
+        let count = self.interventions.entry(event).or_default();
+        *count = count.saturating_add(1);
     }
     pub fn result(&mut self, full: &str, visible: &str) {
         self.full_result_bytes += full.len() as u64;

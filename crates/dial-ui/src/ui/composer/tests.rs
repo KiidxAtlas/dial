@@ -132,6 +132,18 @@ fn queued_handles_survive_shifts_but_never_retarget_replacement_messages() {
 }
 
 #[test]
+fn empty_draft_during_queue_edit_does_not_retarget_another_selection() {
+    let mut c = composer();
+    c.restore_pending_messages(vec!["first".into(), "second".into()]);
+    assert!(c.edit_queued(0));
+    c.replace_draft_content(""); // Clearing the text does not cancel the edit.
+    assert!(!c.edit_queued(0), "finish or cancel the active edit first");
+    assert_eq!(c.queued_messages(), [("second".into(), false)]);
+    c.set_draft(""); // Cancel restores the first message at its original position.
+    assert_eq!(c.take_follow_up().as_deref(), Some("first"));
+}
+
+#[test]
 fn cancelling_a_queued_edit_restores_the_original_item_in_place() {
     let env = Env::new();
     let mut c = composer();

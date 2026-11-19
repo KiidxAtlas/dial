@@ -147,3 +147,45 @@ fn noise_floor_adapts_to_a_louder_room() {
     assert!(early.len() <= 1, "{early:?}");
     assert_eq!(after.len(), 1, "{after:?}");
 }
+
+/// Steady background at `level` RMS.
+fn room(level: f32, ms: usize) -> Vec<f32> {
+    (0..RATE * ms / 1000)
+        .map(|i| if i % 2 == 0 { level } else { -level })
+        .collect()
+}
+
+#[test]
+fn a_room_louder_than_the_starting_threshold_is_measured_not_heard_as_speech() {
+    // 0.03 RMS is above `min_threshold * energy_ratio` (0.02): before calibration every frame
+    // read as speech and the floor never adapted, so noise ran to the segment cap.
+    let mut e = Endpointer::new(EndpointerConfig::default());
+    let mut events = feed(&mut e, &room(0.03, 15_000), 480);
+    events.extend(e.flush());
+    assert!(events.is_empty(), "{:?}", segments(&events));
+}
+
+#[test]
+fn speech_in_a_loud_room_is_still_one_segment() {
+    let mut e = Endpointer::new(EndpointerConfig::default());
+    let mut signal = room(0.03, 800);
+    signal.extend(tone(900));
+    signal.extend(room(0.03, 1200));
+    assert_eq!(segments(&feed(&mut e, &signal, 480)).len(), 1);
+}
+
+#[test]
+fn noise_flickering_over_the_threshold_is_not_committed() {
+    // 30 ms bursts every 150 ms (each touches two 30 ms frames, so ~180 ms voiced in all): the
+    // segment spans well over `min_speech_ms`, but too little of it is voiced.
+    let mut e = Endpointer::new(EndpointerConfig::default());
+    let mut signal = silence(400);
+    for _ in 0..3 {
+        signal.extend(tone(30));
+        signal.extend(silence(120));
+    }
+    signal.extend(silence(1000));
+    let mut events = feed(&mut e, &signal, 480);
+    events.extend(e.flush());
+    assert!(events.is_empty(), "{:?}", segments(&events));
+}

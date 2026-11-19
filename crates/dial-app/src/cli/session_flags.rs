@@ -98,12 +98,18 @@ impl SessionFlagArgs {
     /// Runs the selected action and returns the session the process should continue with.
     /// `Ok(None)` means no session flag was given.
     pub fn resolve(&self, cwd: &Path, ctx: Context) -> Result<Option<Session>> {
-        match self.selection(ctx)? {
-            None => Ok(None),
-            Some(Selection::Fork(selector)) => fork(cwd, &selector).map(Some),
-            Some(Selection::Import { source, path }) => {
-                import(source, cwd, path.as_deref()).map(Some)
-            }
+        self.selection(ctx)?
+            .map(|selection| selection.resolve(cwd))
+            .transpose()
+    }
+}
+
+impl Selection {
+    /// Open the validated request only after launch preflight succeeds.
+    pub fn resolve(self, cwd: &Path) -> Result<Session> {
+        match self {
+            Self::Fork(selector) => fork(cwd, &selector),
+            Self::Import { source, path } => import(source, cwd, path.as_deref()),
         }
     }
 }
@@ -162,7 +168,8 @@ pub fn import(source: Source, cwd: &Path, path: Option<&Path>) -> Result<Session
     Ok(imported.session)
 }
 
-fn candidates_message(source: Source, cwd: &Path) -> String {
+/// Describe import candidates without opening a session or requiring a configured model.
+pub fn candidates_message(source: Source, cwd: &Path) -> String {
     let cwd = cwd.display().to_string();
     let list = match source {
         Source::Claude => session_import::list_claude(&session_import::claude_root(), &cwd),

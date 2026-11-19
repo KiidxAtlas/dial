@@ -227,18 +227,24 @@ fn load_image(dir: &Path, file: &str, label: &str, native: bool) -> Result<Thumb
 }
 
 /// Called on the existing image worker so file publication never blocks terminal input.
+/// An attached watch pane replaces the inline preview unless `keep_inline` is set (generated
+/// images always stay in the chat and are only mirrored to the pane).
 pub(crate) fn preview_image(
     layout: &Layout,
     session: &str,
     reference: &serde_json::Value,
     native: bool,
+    keep_inline: bool,
 ) -> Result<(Option<Thumbnail>, Option<String>)> {
     let thumbnail = Thumbnail::load_with_native(reference, native)?;
     let mut warning = None;
     if enabled(layout, session) {
         match image(layout, session, reference) {
-            Ok(()) if attached(layout, session) => return Ok((None, None)),
+            Ok(()) if !keep_inline && attached(layout, session) => return Ok((None, None)),
             Ok(()) => {}
+            Err(error) if keep_inline => {
+                warning = Some(format!("Could not send image to the watch pane: {error:#}"))
+            }
             Err(error) => {
                 warning = Some(format!(
                     "Could not send screenshot; keeping inline preview: {error:#}"

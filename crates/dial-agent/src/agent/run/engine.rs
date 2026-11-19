@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-/// Opening of the failed-operation retry refusal; recognizes a result that ran nothing.
+/// Opening of the failed-operation retry refusal's model-facing diagnostic.
 pub(in crate::agent) const RETRY_BARRIER_LEAD: &str = "Failed-operation retry barrier:";
 
 /// Error text that usually means the command line itself is wrong (a misspelled program or
@@ -283,10 +283,17 @@ impl Engine {
         requested: u32,
         window: u32,
         prompt: u64,
+        model_max: Option<u32>,
         reply: &crate::llm::Reply,
     ) -> guard::LengthAction {
-        let action =
-            guard::recover_from_length(requested, window, prompt, reply, self.length_nudges);
+        let action = guard::recover_from_length(
+            requested,
+            window,
+            prompt,
+            model_max,
+            reply,
+            self.length_nudges,
+        );
         if let guard::LengthAction::Nudge { partial, .. } = &action {
             use std::hash::{Hash, Hasher};
             const MAX_STALLED: u32 = 8;
@@ -394,7 +401,7 @@ impl Engine {
             }
         }
     }
-    pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<String> {
+    pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<ToolOutput> {
         let identity = failed_identity(call);
         if self.failed.contains(&identity)
             && !self.tree_changed_since_failure(workspace, call)
@@ -417,18 +424,28 @@ impl Engine {
             let hint = error
                 .and_then(|error| malformed_command_hint(call, error))
                 .unwrap_or_default();
-            return Some(format!(
+            let mut output = ToolOutput::err(format!(
                 "{RETRY_BARRIER_LEAD} this unchanged `{}` call already failed and was not executed again.{original}{hint} This is not a permission boundary. Change the arguments to fix that cause, or first change what the call depends on (an edit, an install or a started `bg` job releases it). Do not resend it unchanged.",
                 call.name
-            ));
+            ))
+            .with_status(crate::runtime::execution::ToolStatus::Blocked)
+            .with_effects(Effects::None);
+            output.execution.retry_barrier = true;
+            return Some(output);
         }
         if let Some(path) = self.cycles.blocked(&call_identity(call)) {
-            return Some(format!(
+            return Some(ToolOutput::err(format!(
                 "This call was not executed: it is one of the edits that kept returning `{}` to content it already had earlier in this turn. Read the file's current content, decide its final state, then make one different, complete edit (for example, write the full intended content) or continue with the rest of the task.",
                 workspace.rel(path)
-            ));
+            ))
+            .with_status(crate::runtime::execution::ToolStatus::Blocked)
+            .with_effects(Effects::None));
         }
-        self.checkpoint.rejection_at(workspace, call)
+        self.checkpoint.rejection_at(workspace, call).map(|reason| {
+            ToolOutput::err(reason)
+                .with_status(crate::runtime::execution::ToolStatus::Blocked)
+                .with_effects(Effects::None)
+        })
     }
     /// Release only failures whose own file content changed outside this controller.
     fn sources_changed_since_failure(

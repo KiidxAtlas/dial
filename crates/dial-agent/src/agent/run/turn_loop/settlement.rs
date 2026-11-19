@@ -108,6 +108,9 @@ impl Agent<'_> {
         if let (Ok(report), Some(predecessor)) = (&result, capture_start) {
             self.schedule_memory_capture(report, predecessor.as_deref(), ui);
         }
+        if result.as_ref().is_ok_and(|report| report.interrupted) {
+            self.efficiency_metrics.intervention("turn_interrupted");
+        }
         let (_, usage) = self.usage_scope.snapshot();
         let efficiency = json!({
             "version":1,

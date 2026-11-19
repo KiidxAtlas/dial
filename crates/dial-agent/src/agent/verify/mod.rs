@@ -10,6 +10,7 @@ pub(in crate::agent) mod coverage;
 pub(in crate::agent) mod evidence;
 pub(in crate::agent) mod inputs;
 pub(in crate::agent) mod mutation_cycles;
+pub(in crate::agent) mod quality_review;
 pub(in crate::agent) mod repair;
 pub(crate) mod repair_evidence;
 pub(in crate::agent) mod repro_first;

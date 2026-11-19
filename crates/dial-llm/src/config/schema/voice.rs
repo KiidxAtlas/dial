@@ -47,6 +47,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Enum(&[("toggle", "Press to talk"), ("hold", "Hold to talk")]),
     ),
     field!(
+        "voice.stt.input_device",
+        voice.stt.input_device,
+        VO,
+        "Dictation",
+        "Microphone",
+        "Microphone to record from, by name (or a unique part of it) as System Settings > Sound > Input lists it. Empty uses the system default.",
+        Kind::Text,
+    ),
+    field!(
         "voice.stt.submit_trigger",
         voice.stt.submit_trigger,
         VO,

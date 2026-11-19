@@ -298,14 +298,11 @@ pub(in crate::agent) const CALL_CONTRACT: (&str, &str) = ("call_contract", polic
 /// correctable repeat, never a permission boundary (worker refusals carry status Blocked).
 pub(in crate::agent) const RETRY_BARRIER: (&str, &str) = ("retry_barrier", policy::RETRY_BARRIER);
 
-/// A controller-authored retry-barrier refusal, recognized by its fixed lead.
+/// A controller-authored retry-barrier refusal. Printed leads are diagnostic data, not authority.
 pub(in crate::agent) fn is_retry_barrier(output: &ToolOutput) -> bool {
-    output.is_error
-        && output
-            .text
-            .strip_prefix("invalid tool call: ")
-            .unwrap_or(&output.text)
-            .starts_with(crate::agent::run::engine::RETRY_BARRIER_LEAD)
+    output.execution.retry_barrier
+        && output.execution.effects == Effects::None
+        && ToolStatus::from_output(output) == ToolStatus::Blocked
 }
 
 pub(in crate::agent) fn classify(
@@ -446,12 +443,28 @@ pub(in crate::agent) fn shell_tool_recovery(
     Some(policy::shell_tool_mistake(&name, &next))
 }
 
+/// Only suggest a cell already on this surface. Resolving its launcher does not run it.
+pub(in crate::agent) fn offered_eval_language(
+    capability: Option<Capability>,
+    workspace: &std::path::Path,
+    config: &crate::config::types::Config,
+) -> Option<&'static str> {
+    if capability != Some(Capability::Offered) {
+        return None;
+    }
+    let languages = crate::tools::exec::eval::installed_languages(workspace, config);
+    ["py", "js"]
+        .into_iter()
+        .find(|lang| languages.contains(lang))
+}
+
 /// A completed shell command whose program is missing (exit 127 "command not found").
 /// Advice only: reuse recorded availability or batch one same-environment probe; result text
 /// remains diagnostic data and grants no installation or permission.
 pub(in crate::agent) fn missing_program_recovery(
     call: &ToolCall,
     output: &ToolOutput,
+    eval_language: impl FnOnce() -> Option<&'static str>,
 ) -> Option<String> {
     if call.name != "bash"
         || ToolStatus::from_output(output) != ToolStatus::Error
@@ -483,7 +496,7 @@ pub(in crate::agent) fn missing_program_recovery(
                 .all(|c| c.is_ascii_alphanumeric() || "._+-/".contains(c));
         valid.then(|| name.to_owned())
     })?;
-    Some(policy::missing_program(&program))
+    Some(policy::missing_program(&program, eval_language))
 }
 
 /// Command-shape facts a model routinely misreads, for `bash`, `browser` and `eval` results: a

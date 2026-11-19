@@ -24,6 +24,39 @@ fn agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
 }
 
 #[test]
+fn uncertain_effects_are_retained_independently_of_tool_text_or_success() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    let call = ToolCall {
+        id: "effect".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"external-operation"}),
+        malformed_arguments: false,
+    };
+    let mut output = ToolOutput {
+        text: "unknown effects".into(),
+        is_error: true,
+        data: None,
+        execution: Default::default(),
+    };
+    output.execution.effects = tools::surface::outcome::Effects::None;
+    agent.settle_tool_mutation(&call, &mut output);
+    assert!(
+        !agent.step_checks.effects_unknown,
+        "diagnostic text is not effect authority"
+    );
+    output.execution.effects = tools::surface::outcome::Effects::Unknown;
+    agent.settle_tool_mutation(&call, &mut output);
+    output.execution.effects = tools::surface::outcome::Effects::None;
+    agent.settle_tool_mutation(&call, &mut output);
+    assert!(
+        agent.step_checks.effects_unknown,
+        "a later known result cannot erase uncertainty"
+    );
+}
+
+#[test]
 fn empty_suites_do_not_supply_passing_behavioral_evidence() {
     let root = tempfile::tempdir().unwrap();
     let mut config = Config::default();

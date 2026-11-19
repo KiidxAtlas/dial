@@ -98,7 +98,10 @@ swallowed. Lists in Settings and Providers stop at their first and last rows rat
   process entries open the exact selected owner, without starting, retrying or attaching work.
   Back from an Attention drill-down restores its filter and selection; switching sibling Activity
   tabs does not add extra Back steps.
-  Queue picker actions identify the original queued item, so a stale picker cannot edit its replacement.
+  `/queue` opens this same Queue tab whether idle or working. Picker actions identify the original
+  message, so a stale selection cannot edit or remove its replacement. Typed `/queue edit N` and
+  `/queue remove N` target one current row; extra arguments leave the queue unchanged.
+  To edit a second message, finish or cancel the first edit—even if its draft text is empty.
 - **`/extensions`** browses MCP servers, skills, tool groups and hooks; `/extensions
   mcp|skills|tools|hooks` opens a tab and `/hooks` opens the Hooks tab.
 - **`/stats`** opens searchable Usage / cost, Tokens, Sessions and Tools tabs across sessions.
@@ -120,6 +123,8 @@ swallowed. Lists in Settings and Providers stop at their first and last rows rat
 
 Use `/help <topic>` to print a documentation path and a short introduction. Topics include
 `composer`, `command-reference`, `shortcuts`, `sessions`, `models`, `settings`, `turns`,
-`terminal`, `everyday`, `tools` and `setup`. `/help commands` keeps its existing custom-command
-list; `/help text` and `/help all` keep the plain-text built-in command lists. Topic help
-never opens an external program or starts a model request.
+`terminal`, `everyday`, `stop-scopes`, `undo-meanings`, `tools` and `setup`. If a name is both a
+command and a guide (for example, `/help models`), the response includes usage and the guide.
+An unknown name shows the topic index rather than the full command list. `/help commands` lists
+custom commands; `/help text` and `/help all` keep the plain-text built-in command lists. Topic
+help never opens an external program or starts a model request.
