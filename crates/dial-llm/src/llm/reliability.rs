@@ -47,6 +47,19 @@ pub fn strict_parameters(schema: &Value) -> Option<Value> {
     }
     Some(schema)
 }
+/// Built-in tools whose authored schema is guidance, not a generation contract. The edit tool's
+/// selected grammar (hashline, replace, ...) is shown to the model; under an explicit strict-tools
+/// profile it keeps its authored schema instead of being promoted to strict generation.
+const GUIDANCE_TOOLS: &[&str] = &["edit"];
+
+/// Strict lowering for one outbound tool. `None` leaves the authored schema untouched, either
+/// because the tool is guidance-only or because its schema has no strict form.
+pub fn strict_tool_parameters(name: &str, schema: &Value) -> Option<Value> {
+    if GUIDANCE_TOOLS.contains(&name) {
+        return None;
+    }
+    strict_parameters(schema)
+}
 pub fn constrain_openai(body: &mut Value, profile: &ModelProfile) {
     if let Some(tools) = body
         .get_mut("tools")
@@ -58,7 +71,10 @@ pub fn constrain_openai(body: &mut Value, profile: &ModelProfile) {
                 docker_grammar_schema(&mut tool["function"]["parameters"]);
             }
             if profile.capabilities.strict_tools
-                && let Some(parameters) = strict_parameters(&tool["function"]["parameters"])
+                && let Some(parameters) = strict_tool_parameters(
+                    tool["function"]["name"].as_str().unwrap_or_default(),
+                    &tool["function"]["parameters"],
+                )
             {
                 tool["function"]["parameters"] = parameters;
                 tool["function"]["strict"] = json!(true);

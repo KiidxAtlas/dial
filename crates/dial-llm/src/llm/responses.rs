@@ -507,8 +507,10 @@ fn request_inner(
             function["type"] = json!("function");
             function["strict"] = json!(false);
             if profile.is_some_and(|p| p.capabilities.strict_tools)
-                && let Some(parameters) =
-                    crate::llm::reliability::strict_parameters(&function["parameters"])
+                && let Some(parameters) = crate::llm::reliability::strict_tool_parameters(
+                    function["name"].as_str().unwrap_or_default(),
+                    &function["parameters"],
+                )
             {
                 function["parameters"] = parameters;
                 function["strict"] = json!(true);

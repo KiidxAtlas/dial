@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-11-19
+
 ### Added
 
 - Benchmark traces record every main-agent call that reached dispatch as a bounded per-call record: tool, a digest of its arguments, declared argument names only, duration, ok/error outcome, execution and read-reuse status, and an error digest. Raw argument values, paths, error text and undeclared argument names are never stored, and the report validator refuses records outside that shape. [Tool effectiveness](docs/tool-effectiveness.md#tool-trace-main-agent).
@@ -51,6 +53,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Strict tool generation leaves the `edit` tool's preferred grammar as guidance, so the model can still send any supported edit grammar. Other eligible tools remain strict.
+- Updated resvg and Cargo dependencies, refreshed the hashed FastAPI CI dependency, and synchronized Homebrew and AUR metadata with the published 0.3.10 archives.
 - Model-registered acceptance checks no longer rerun after every edit batch by default. While jobs or tests run, Dial directs the model to do independent work first. Explicit checks and completion checks are unchanged. See [the agent loop](docs/agent-loop.md).
 - Desktop scripts and Eval can take a screenshot on an entry from `windows()` without a second lookup in user code. Existing window metadata remains available. See [computer run source and recovery](docs/execution-and-web.md#computer-run-source-and-recovery).
 - Model tool calls tolerate more unambiguous spelling variations without adding aliases to tool definitions or bypassing validation and approval. See [tool reliability](docs/tools.md#tool-reliability-and-measured-interfaces).
@@ -3085,7 +3089,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.10...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.11...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3132,3 +3136,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.8]: https://github.com/KiidxAtlas/dial/tree/v0.3.8
 [0.3.9]: https://github.com/KiidxAtlas/dial/tree/v0.3.9
 [0.3.10]: https://github.com/KiidxAtlas/dial/tree/v0.3.10
+[0.3.11]: https://github.com/KiidxAtlas/dial/tree/v0.3.11

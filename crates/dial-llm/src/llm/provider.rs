@@ -3025,9 +3025,10 @@ fn anthropic_request_body(
                 .into_iter()
                 .flatten()
             {
-                if let Some(parameters) =
-                    crate::llm::reliability::strict_parameters(&tool["input_schema"])
-                {
+                if let Some(parameters) = crate::llm::reliability::strict_tool_parameters(
+                    tool["name"].as_str().unwrap_or_default(),
+                    &tool["input_schema"],
+                ) {
                     tool["input_schema"] = parameters;
                     tool["strict"] = serde_json::json!(true);
                 }

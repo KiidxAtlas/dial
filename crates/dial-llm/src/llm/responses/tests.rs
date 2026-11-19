@@ -1221,3 +1221,22 @@ fn a_rejected_reasoning_effort_is_named_and_not_retried() {
     assert_eq!(classify(&err), ErrorClass::Fatal);
     assert!(!err.to_string().contains("/effort"), "{err}");
 }
+
+#[test]
+fn strict_tools_keep_the_edit_guidance_tool_unpromoted() {
+    let schema = json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false});
+    let mut chat = chat();
+    chat.tools = vec![
+        json!({"type":"function","function":{"name":"edit","description":"e","parameters":schema.clone()}}),
+        json!({"type":"function","function":{"name":"write_notes","description":"w","parameters":schema.clone()}}),
+    ];
+    let mut profile = crate::llm::profiles::ModelProfile::minimal("openai", "gpt-test");
+    profile.capabilities.strict_tools = true;
+    let body = request("gpt-test", &chat, Some(&profile)).unwrap();
+    let tools = &body["tools"][0]["tools"];
+    assert_eq!(tools[0]["name"], "edit");
+    assert_eq!(tools[0]["strict"], false);
+    assert_eq!(tools[0]["parameters"], schema);
+    assert_eq!(tools[1]["name"], "write_notes");
+    assert_eq!(tools[1]["strict"], true);
+}
