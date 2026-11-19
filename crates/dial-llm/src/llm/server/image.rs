@@ -447,7 +447,10 @@ fn launch(
             base_url: format!("{origin}/v1"),
         }),
         Err(error) => {
+            #[cfg(unix)]
             let exit_status = process.stop();
+            #[cfg(not(unix))]
+            process.stop();
             let logs = [stdout, stderr]
                 .iter()
                 .flatten()
