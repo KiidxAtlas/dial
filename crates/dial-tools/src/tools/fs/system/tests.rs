@@ -253,7 +253,9 @@ fn failing_version_probes_count_as_missing() {
 fn version_probe_bounds_inherited_pipes_and_noisy_output() {
     use std::os::unix::fs::PermissionsExt;
     for (script, expected) in [
-        ("#!/bin/sh\nsleep 1 &\necho 'shim 1.2.3'\n", "shim 1.2.3"),
+        // The background sleep keeps the inherited stdout open far past the deadline, so a
+        // probe that waited for pipe EOF (or blocked on a full pipe) would time out instead.
+        ("#!/bin/sh\nsleep 30 &\necho 'shim 1.2.3'\n", "shim 1.2.3"),
         (
             "#!/bin/sh\necho 'noisy 2.0'\nhead -c 262144 /dev/zero\n",
             "noisy 2.0",
@@ -264,10 +266,10 @@ fn version_probe_bounds_inherited_pipes_and_noisy_output() {
         std::fs::write(&shim, script).unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = std::time::Instant::now();
-        let result =
-            inventory::version(&shim, &[], started + std::time::Duration::from_millis(200));
+        // A generous deadline keeps slow CI runners from timing out the probe itself.
+        let result = inventory::version(&shim, &[], started + std::time::Duration::from_secs(5));
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(800),
+            started.elapsed() < std::time::Duration::from_secs(4),
             "{result:?}"
         );
         assert_eq!(result, inventory::Probe::Ran(Some(expected.into())));
