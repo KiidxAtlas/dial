@@ -684,6 +684,7 @@ fn upstream(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) ->
     let repo = match recipe.id {
         "llama-cpp" => "ggml-org/llama.cpp",
         "sd-cpp" => "leejet/stable-diffusion.cpp",
+        "mlx-serve" => "ddalcu/mlx-serve",
         "bun" => "oven-sh/bun",
         "uv" => "astral-sh/uv",
         "node" => "nodejs/node",

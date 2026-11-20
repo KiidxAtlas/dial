@@ -1,15 +1,17 @@
-//! Dial-launched stable-diffusion.cpp `sd-server` for downloaded image checkpoints.
+//! Dial-launched image servers for downloaded image models.
 //!
-//! [`components`] maps a checkpoint on disk to `sd-server` loading flags from its files alone (no
-//! weights are read, only JSON configs and safetensors headers). [`ImageServer`] runs one server for
-//! one generation: it listens on loopback only, runs in its own process group (or Windows Job
-//! Object) and is killed with its descendants when dropped, so no server outlives the request that
-//! started it. The model loads again for the next generation.
+//! Checkpoints run on stable-diffusion.cpp's `sd-server`: [`components`] maps a checkpoint on disk
+//! to `sd-server` loading flags from its files alone (no weights are read, only JSON configs and
+//! safetensors headers). MLX-quantized packs (mflux, MLX-Serve) store packed integer weights that
+//! stable-diffusion.cpp cannot read; on macOS with Apple Silicon they run on MLX-Serve instead
+//! ([`ImageServer::start_mlx_serve`]), and elsewhere they are refused with a reason.
 //!
-//! Runs on every platform stable-diffusion.cpp ships for (macOS Metal, Linux and Windows CPU, with
-//! Vulkan/CUDA builds selectable through `DIAL_SD_SERVER`). MLX-quantized packs (mflux, MLX-Serve)
-//! store packed integer weights that stable-diffusion.cpp cannot read, so they are refused with a
-//! reason instead of failing inside the server.
+//! [`ImageServer`] runs one server for one generation: it listens on loopback only, runs in its own
+//! process group (or Windows Job Object) and is killed with its descendants when dropped, so no
+//! server outlives the request that started it. The model loads again for the next generation.
+//!
+//! `sd-server` runs on every platform stable-diffusion.cpp ships for (macOS Metal, Linux and
+//! Windows CPU, with Vulkan/CUDA builds selectable through `DIAL_SD_SERVER`).
 
 use super::{
     ERROR_TAIL_BYTES, POLL_INTERVAL, PORT_ATTEMPTS, Supervised, Tail, collect_stderr, free_port,
@@ -32,6 +34,33 @@ pub const REQUEST_MODEL: &str = "sd-cpp-local";
 
 /// What to tell the user when no `sd-server` is installed.
 pub const MISSING_RUNTIME: &str = "local image checkpoints run on stable-diffusion.cpp's `sd-server`: run `/setup sd-cpp` to install it, or set DIAL_SD_SERVER to an existing sd-server";
+
+/// What to tell the user when no `mlx-serve` is installed.
+pub const MISSING_MLX_SERVE: &str = "MLX image packs run on MLX-Serve: run `/setup mlx-serve` to install it, or set DIAL_MLX_SERVE to an existing mlx-serve";
+
+/// Whether this machine can run MLX-Serve, which ships for macOS on Apple Silicon only.
+#[must_use]
+pub const fn mlx_serve_supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+/// Whether `model` is a downloaded MLX image pack: a folder whose weights are MLX-quantized, which
+/// only MLX-Serve can run (see [`ImageServer::start_mlx_serve`]).
+#[must_use]
+pub fn is_mlx_pack(model: &Path) -> bool {
+    model.is_dir() && mlx_quantized(model).is_some()
+}
+
+/// Whether Dial runs the downloaded image model at `model` on MLX-Serve rather than
+/// stable-diffusion.cpp: an MLX image pack, or a model in MLX-Serve's own store
+/// (`~/.mlx-serve/models`), which it downloaded for itself.
+#[must_use]
+pub fn runs_on_mlx_serve(model: &Path) -> bool {
+    is_mlx_pack(model)
+        || (model.is_dir()
+            && crate::config::paths::home_dir()
+                .is_some_and(|home| model.starts_with(home.join(".mlx-serve").join("models"))))
+}
 
 /// Weight file extensions stable-diffusion.cpp loads as a checkpoint.
 const WEIGHT_EXTENSIONS: [&str; 4] = ["safetensors", "sft", "ckpt", "gguf"];
@@ -360,10 +389,33 @@ fn server_args(components: &[Component], model_dir: &Path, port: u16) -> Vec<OsS
     args
 }
 
-/// One running `sd-server` with a model loaded; stopped when dropped.
+/// The command-line arguments for MLX-Serve serving the pack at `model` on loopback `port`.
+fn mlx_serve_args(model: &Path, port: u16) -> Vec<OsString> {
+    vec![
+        "--model".into(),
+        model.as_os_str().to_owned(),
+        "--serve".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+    ]
+}
+
+/// Which server a launch waits for, by how it reports a loaded model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    SdCpp,
+    MlxServe,
+}
+
+/// One running image server with a model loaded; stopped when dropped.
 pub struct ImageServer {
     process: Supervised,
     base_url: String,
+    /// The id the server lists its model under; requests must name it. `None` for `sd-server`,
+    /// which accepts any id ([`REQUEST_MODEL`]).
+    model: Option<String>,
 }
 
 impl ImageServer {
@@ -387,28 +439,75 @@ impl ImageServer {
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
         };
-        let deadline = (startup_timeout_secs != 0)
-            .then(|| Instant::now() + Duration::from_secs(startup_timeout_secs));
-        let mut last_race = None;
-        for _ in 0..PORT_ATTEMPTS {
-            let port = free_port()?;
+        start_on_free_port(Kind::SdCpp, startup_timeout_secs, &interrupt, |port| {
             let mut command = Command::new(&program);
             command.args(server_args(&parts, &model_dir, port));
-            match launch(command, port, deadline, &interrupt) {
-                Ok(server) => return Ok(server),
-                Err(Launch::PortTaken(error)) => last_race = Some(error),
-                Err(Launch::Fatal(error)) => return Err(error),
-            }
-        }
-        Err(last_race.unwrap_or_else(|| anyhow!("no image server start attempt was made"))).context(
-            format!("image server could not claim a port after {PORT_ATTEMPTS} attempts"),
-        )
+            command
+        })
+    }
+
+    /// Start MLX-Serve for the MLX image pack at `model` and wait until it reports the model
+    /// ready. Same timeout, cancellation and cleanup as [`ImageServer::start`].
+    ///
+    /// # Errors
+    /// An unsupported platform, no installed MLX-Serve, a load failure (MLX-Serve exits and logs
+    /// why, for example too little free memory), a timeout or cancellation.
+    pub fn start_mlx_serve(
+        model: &Path,
+        startup_timeout_secs: u64,
+        interrupt: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        ensure!(
+            mlx_serve_supported(),
+            "{} is an MLX image pack, and MLX-Serve runs only on macOS with Apple Silicon",
+            model.display()
+        );
+        ensure!(
+            model.is_dir(),
+            "MLX image pack {} does not exist",
+            model.display()
+        );
+        let program = llm::local_format::mlx_serve().ok_or_else(|| anyhow!(MISSING_MLX_SERVE))?;
+        start_on_free_port(Kind::MlxServe, startup_timeout_secs, &interrupt, |port| {
+            let mut command = Command::new(&program);
+            command.args(mlx_serve_args(model, port));
+            command
+        })
     }
 
     /// The OpenAI-compatible base URL (`http://127.0.0.1:<port>/v1`).
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// The model id requests must name, when the server requires one (MLX-Serve).
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+}
+
+/// Launch `command(port)` on a free loopback port, retrying when another process takes the port
+/// between choosing and binding it.
+fn start_on_free_port(
+    kind: Kind,
+    startup_timeout_secs: u64,
+    interrupt: &Arc<AtomicBool>,
+    command: impl Fn(u16) -> Command,
+) -> Result<ImageServer> {
+    let deadline = (startup_timeout_secs != 0)
+        .then(|| Instant::now() + Duration::from_secs(startup_timeout_secs));
+    let mut last_race = None;
+    for _ in 0..PORT_ATTEMPTS {
+        let port = free_port()?;
+        match launch(kind, command(port), port, deadline, interrupt) {
+            Ok(server) => return Ok(server),
+            Err(Launch::PortTaken(error)) => last_race = Some(error),
+            Err(Launch::Fatal(error)) => return Err(error),
+        }
+    }
+    Err(last_race.unwrap_or_else(|| anyhow!("no image server start attempt was made"))).context(
+        format!("image server could not claim a port after {PORT_ATTEMPTS} attempts"),
+    )
 }
 
 impl Drop for ImageServer {
@@ -423,6 +522,7 @@ enum Launch {
 }
 
 fn launch(
+    kind: Kind,
     mut command: Command,
     port: u16,
     deadline: Option<Instant>,
@@ -436,15 +536,20 @@ fn launch(
     )
     .context("starting the image server")
     .map_err(Launch::Fatal)?;
-    // sd-server logs loading progress and errors on both streams; keep bounded tails of each.
+    // Both servers log loading progress and errors on both streams; keep bounded tails of each.
     let stdout = child.stdout.take().map(collect_stderr);
     let stderr = child.stderr.take().map(collect_stderr);
     let mut process = Supervised::new(child);
     let origin = format!("http://127.0.0.1:{port}");
-    match wait_loaded(&mut process, &origin, deadline, interrupt) {
-        Ok(()) => Ok(ImageServer {
+    let ready = match kind {
+        Kind::SdCpp => wait_loaded(&mut process, &origin, deadline, interrupt).map(|()| None),
+        Kind::MlxServe => wait_served(&mut process, &origin, deadline, interrupt).map(Some),
+    };
+    match ready {
+        Ok(model) => Ok(ImageServer {
             process,
             base_url: format!("{origin}/v1"),
+            model,
         }),
         Err(error) => {
             #[cfg(unix)]
@@ -556,6 +661,83 @@ fn loaded(status: &Value) -> Result<bool> {
         ),
         _ => Ok(false),
     }
+}
+
+/// Poll MLX-Serve until it lists a ready model, and return that model's id. MLX-Serve loads the
+/// command-line model before it listens and exits when the load fails (for example on too little
+/// free memory), so an early exit carries the reason in its log.
+fn wait_served(
+    process: &mut Supervised,
+    origin: &str,
+    deadline: Option<Instant>,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<String> {
+    let models_url = format!("{origin}/v1/models");
+    let mut last_probe = "no response yet".to_owned();
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            return Err(llm::Interrupted.into());
+        }
+        ensure!(
+            !process.exited().context("observing MLX-Serve exit")?,
+            "MLX-Serve exited while loading the model"
+        );
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        ensure!(
+            remaining.is_none_or(|remaining| !remaining.is_zero()),
+            "image model not loaded before the timeout (image.timeout_secs); last status: {last_probe}"
+        );
+        match llm::agent_with(2, false, Some(Arc::clone(interrupt)), None)
+            .get(&models_url)
+            .call()
+        {
+            Ok(mut response) if response.status().as_u16() == 200 => {
+                let listing: Value = response
+                    .body_mut()
+                    .with_config()
+                    .limit(1 << 20)
+                    .read_json()
+                    .unwrap_or(Value::Null);
+                match served_model(&listing)? {
+                    Some(id) => return Ok(id),
+                    None => last_probe = "no ready model listed".to_owned(),
+                }
+            }
+            Ok(response) => last_probe = format!("HTTP {}", response.status().as_u16()),
+            Err(error) => last_probe = error.to_string(),
+        }
+        std::thread::sleep(
+            remaining.map_or(POLL_INTERVAL, |remaining| POLL_INTERVAL.min(remaining)),
+        );
+    }
+}
+
+/// The id of the ready model in an MLX-Serve `/v1/models` listing, preferring one that declares
+/// the `image` capability; `None` while nothing is ready. A model in the `error` state fails.
+fn served_model(listing: &Value) -> Result<Option<String>> {
+    let rows = listing["data"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(failed) = rows.iter().find(|row| row["state"] == "error") {
+        bail!(
+            "MLX-Serve could not load the model: {}",
+            failed["error"].as_str().unwrap_or("no reason given")
+        );
+    }
+    let ready = |row: &&Value| row["state"] == "ready" || row["loaded"] == true;
+    let image = |row: &&Value| {
+        row["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "image"))
+    };
+    Ok(rows
+        .iter()
+        .filter(ready)
+        .find(image)
+        .or_else(|| rows.iter().find(ready))
+        .and_then(|row| row["id"].as_str())
+        .map(str::to_owned))
 }
 
 #[cfg(test)]

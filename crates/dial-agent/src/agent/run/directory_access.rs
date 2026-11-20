@@ -41,37 +41,38 @@ impl Agent<'_> {
         let canonical = self
             .workspace
             .directory_request(Path::new(path), sensitive)?;
-        let ask = |ui: &mut dyn Ui, tool, summary: &str| {
-            matches!(
-                ui.approve_call(&call.id, tool, summary, Some(&self.interrupt)),
-                Decision::Allow
-            )
+        // Only an exact one-time Allow grants. A reusable answer ("always"/"project") from a client
+        // that offered those buttons is refused too, but says why, so the user can answer again.
+        let ask = |ui: &mut dyn Ui, tool, summary: &str, denied: &str| -> Result<()> {
+            match ui.approve_call(&call.id, tool, summary, Some(&self.interrupt)) {
+                Decision::Allow => Ok(()),
+                Decision::AllowAlways | Decision::AllowProject => bail!(
+                    "{denied}: directory access is granted once per request, so an \"always\" or \"project\" answer cannot grant it. Request access again and choose Allow (once)"
+                ),
+                Decision::Deny => bail!("{denied}"),
+            }
         };
-        ensure!(
+        ask(
+            ui,
+            "request_directory",
+            &format!(
+                "Add directory for this session?\nCanonical directory: {}\nReason: {}\nNormal read/write and sandboxed command access. Existing tool approvals, credential and protected Dial storage restrictions remain. This does NOT approve sensitive access.",
+                canonical.display(),
+                reason
+            ),
+            "directory access denied",
+        )?;
+        if sensitive {
             ask(
                 ui,
-                "request_directory",
+                "request_sensitive_directory",
                 &format!(
-                    "Add directory for this session?\nCanonical directory: {}\nReason: {}\nNormal read/write and sandboxed command access. Existing tool approvals, credential and protected Dial storage restrictions remain. This does NOT approve sensitive access.",
+                    "Separate sensitive access approval\nCanonical directory: {}\nReason: {}\nAllow native file tools to read AND write protected Dial storage inside ONLY this directory for this process? Shell commands remain blocked by sandbox storage protection. Credentials remain inaccessible. This grant is not restored on resume.",
                     canonical.display(),
                     reason
-                )
-            ),
-            "directory access denied"
-        );
-        if sensitive {
-            ensure!(
-                ask(
-                    ui,
-                    "request_sensitive_directory",
-                    &format!(
-                        "Separate sensitive access approval\nCanonical directory: {}\nReason: {}\nAllow native file tools to read AND write protected Dial storage inside ONLY this directory for this process? Shell commands remain blocked by sandbox storage protection. Credentials remain inaccessible. This grant is not restored on resume.",
-                        canonical.display(),
-                        reason
-                    )
                 ),
-                "sensitive directory access denied; no access changed"
-            );
+                "sensitive directory access denied; no access changed",
+            )?;
         }
         ensure!(
             !self.interrupt.load(Ordering::SeqCst),

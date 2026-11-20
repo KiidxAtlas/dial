@@ -11,7 +11,8 @@ fn onboarding_has_explicit_hosted_and_local_paths_and_escape_is_cancel() {
         Some(Which::Models)
     ));
     assert_eq!(ONBOARDING_CHOICES[0].0, "Local model");
-    assert_eq!(ONBOARDING_CHOICES.last().unwrap().0, "Quit setup");
+    assert_eq!(ONBOARDING_CHOICES.last().unwrap().0, "Skip for now");
+    assert!(SKIPPED_SETUP_NOTICE.contains("/model"));
     for cancel in [None, Some(2), Some(99)] {
         assert!(onboarding_destination(cancel).is_none(), "{cancel:?}");
     }
@@ -46,7 +47,7 @@ fn onboarding_names_running_local_servers_and_highlights_local() {
         prompt.starts_with("Running on this machine: Ollama, LM Studio."),
         "{prompt}"
     );
-    assert!(prompt.contains("Esc cancels"), "{prompt}");
+    assert!(prompt.contains("Esc skips setup"), "{prompt}");
 }
 
 #[test]
@@ -119,4 +120,25 @@ fn first_run_saves_edit_freely_only_when_approval_was_never_chosen() {
     later.config.approval = Approval::Ask;
     assert!(adopt_first_run_approval(&mut later).is_none());
     assert_eq!(later.config.approval, Approval::Ask);
+}
+
+#[test]
+fn skipped_setup_builds_an_agent_without_a_model() {
+    let (_home, _project, layout, mut config) = crate::app::tests::config();
+    config.model.clear();
+    let mut app = App::new(
+        layout,
+        config,
+        toml::Table::new(),
+        Default::default(),
+        Vec::new(),
+        Default::default(),
+    )
+    .unwrap();
+    assert!(
+        app.make_agent(Session::ephemeral()).is_err(),
+        "without a skip, a missing model still refuses"
+    );
+    app.model_deferred = true;
+    assert!(app.make_agent(Session::ephemeral()).is_ok());
 }

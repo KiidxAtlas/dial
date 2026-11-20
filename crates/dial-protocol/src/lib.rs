@@ -98,6 +98,7 @@ pub const METHODS: &[Method] = &[
     write("delete_session", "session_admin"),
     write("pin_session", "session_admin"),
     read("list_models", "model"),
+    read("image_settings", "model"),
     write("delete_local_model", "model"),
     read("settings_schema", "settings"),
     read("get_settings", "settings"),

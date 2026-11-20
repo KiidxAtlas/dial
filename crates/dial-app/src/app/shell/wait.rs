@@ -309,7 +309,8 @@ impl Shell {
     }
 
     pub(super) fn prepare_local(&mut self, app: &App) -> Result<bool> {
-        if !app.config.runs_dial_mlx() {
+        // Setup was skipped: there is no model to prepare; the request reports how to pick one.
+        if app.model_deferred || !app.config.runs_dial_mlx() {
             return Ok(true);
         }
         if crate::llm::local_format::serves_with_llama_cpp(&app.config.model) {

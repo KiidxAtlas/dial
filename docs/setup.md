@@ -7,15 +7,18 @@ outside software. Dial sets it up on request, never at startup.
 
 First launch offers **Hosted provider** and **Local model** explicitly. Hosted opens the existing
 Providers panel for sign-in/API keys; Local opens Models for a running endpoint or downloaded model.
-Esc backs out of a panel to the path choice; Esc or Cancel at the choice exits without selecting a
-model. Browsing is not permission to install software, download weights, or send an inference request.
+Esc backs out of a panel to the path choice. Esc or **Skip for now** at the choice opens Dial without
+a model: the shell, settings and commands work, and sending a prompt says to pick a model with
+`/model` or set up a provider with `/providers`. The same applies when a previously configured model
+cannot be loaded at startup; the failure is shown, and later setting changes do not ask again for that
+session. Browsing is not permission to install software, download weights, or send an inference request.
 Provider/model panels may discover endpoint metadata using their existing catalog checks.
 
 Before asking, first launch checks for local inference servers that are already listening at their
 usual addresses (LM Studio, Ollama, MLX-Serve, llama.cpp, Docker Model Runner, Osaurus; the
 `*_BASE_URL` variables and `OLLAMA_HOST` override them). It names the ones it finds and highlights
 **Local model**, so Enter opens Models. This is a TCP connection check only: it does not list
-models, send a request or select anything, and Esc still exits without choosing. When no server is
+models, send a request or select anything, and Esc still skips without choosing. When no server is
 listening on Apple Silicon, it instead suggests the largest MLX coding model in the `dial models
 recommend` list (7B and up) that fits physical memory, and highlights **Local model**. That is an
 estimate by RAM tier, not a measurement, and nothing downloads until you confirm in **Get models**.

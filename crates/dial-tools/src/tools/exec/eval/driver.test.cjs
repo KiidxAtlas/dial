@@ -157,6 +157,24 @@ for (const python of [false, true]) {
     assert.match(results[1].error, /use dial\.readText\(\.\.\.\)/);
     assert.doesNotMatch(results[2].error, /\[dial\]/);
   });
+
+  if (python) test('Python import dial binds the same portable helpers', () => {
+    const install = fs.readFileSync(path.join(__dirname, 'portable.py'), 'utf8');
+    const frames = run([cell(0, 'helpers = None'), cell(1, install), cell(2, 'helpers = dial'),
+      cell(3, "import dial\nfrom dial import readText\n[dial is helpers, readText.__self__ is helpers]")], true);
+    const results = frames.filter(frame => frame.result).map(frame => frame.result);
+    assert.equal(results[3].error, null);
+    assert.equal(results[3].value, '[True, True]');
+  });
+
+  if (python) test('Python import dial keeps an existing dial module', () => {
+    const install = fs.readFileSync(path.join(__dirname, 'portable.py'), 'utf8');
+    const frames = run([cell(0, "import sys, types\nreal = types.ModuleType('dial')\nsys.modules['dial'] = real"),
+      cell(1, install), cell(2, "import dial\ndial is real")], true);
+    const results = frames.filter(frame => frame.result).map(frame => frame.result);
+    assert.equal(results[2].error, null);
+    assert.equal(results[2].value, 'True');
+  });
 }
 
 test('Python shorthand preserves dictionary/keyword calls, validation and controller denial', () => {

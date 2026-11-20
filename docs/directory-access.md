@@ -6,6 +6,8 @@ When a tool reports a path outside the workspace, the agent can call
 approval the agent retries the original tool. Relative directory requests resolve
 against the primary workspace, not the shell's current directory. Use an absolute
 path rather than a shell expression such as `~`.
+A refusal for a system temp path such as `/tmp/...` also suggests a workspace scratch path
+(`.tmp/<name>`), which needs no approval.
 
 ## Normal access
 

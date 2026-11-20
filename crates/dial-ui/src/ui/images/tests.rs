@@ -143,6 +143,35 @@ fn previews_decode_supported_formats_and_preserve_real_pixel_colors() {
 }
 
 #[test]
+fn header_underlines_the_whole_file_name_and_drops_other_parts_before_cutting_it() {
+    let (_root, reference) = fixture(4, 2, image::ImageFormat::Png);
+    let thumbnail = Thumbnail::load(&reference).unwrap();
+    let theme = Theme::dark();
+    let header = |columns| thumbnail.rows(columns, &theme)[0].clone();
+    let underlined = |line: &Line<'_>| {
+        line.spans
+            .iter()
+            .filter(|s| {
+                s.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+    };
+    let wide = header(80);
+    assert_eq!(wide.to_string(), "Image · viewed.png · 4x2");
+    assert_eq!(underlined(&wide), ["viewed.png"]);
+    // Narrower: the prefix goes, then the size; the name itself stays whole and linkable.
+    assert_eq!(header(18).to_string(), "viewed.png · 4x2");
+    assert_eq!(header(12).to_string(), "viewed.png");
+    assert_eq!(underlined(&header(12)), ["viewed.png"]);
+    // Only when the name alone cannot fit is it shortened, as plain muted text.
+    assert!(underlined(&header(6)).is_empty());
+    assert!(header(6).width() <= 6);
+}
+
+#[test]
 fn previews_fit_narrow_terminals_and_bound_large_and_portrait_images() {
     for (width, height) in [(1600, 900), (900, 1600), (1200, 1200)] {
         let (_root, reference) = fixture(width, height, image::ImageFormat::Png);

@@ -76,7 +76,13 @@ its `images/edits` route. Configured `steps` and `seed` travel in sd-server's
 `<sd_cpp_extra_args>` prompt extension, and `image.timeout_secs` bounds the model load and then the
 generation. When no `sd-server` is installed, the call asks to install one (as `/setup sd-cpp` does)
 and fails with that hint if declined or unattended; `DIAL_SD_SERVER` selects another build.
-MLX-quantized packs are refused before any server starts. See [model downloads](model-downloads.md).
+An MLX image pack (MLX-quantized weights, or a model in `~/.mlx-serve/models`) runs on MLX-Serve
+instead, on macOS with Apple Silicon only: `image_gen` starts `mlx-serve --model <pack> --serve` on
+a free loopback port, waits until `/v1/models` lists the model as ready, sends the MLX-Serve Images
+request and stops the server afterwards. When no `mlx-serve` is installed, the call first installs
+the pinned, checksum-verified MLX-Serve release into Dial's `tools/mlx-serve` folder without asking
+(as `/setup mlx-serve` does); `DIAL_MLX_SERVE` selects another build. On other systems MLX packs are
+refused before any server starts. See [model downloads](model-downloads.md).
 
 Edit support in this table is what **Dial's adapter** accepts, not a statement that other APIs or
 workflows cannot edit images. Unsupported edits fail before submission. Nothing is uploaded merely

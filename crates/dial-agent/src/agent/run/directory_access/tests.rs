@@ -178,3 +178,34 @@ fn directory_access_unattended_and_hermetic_never_grant() {
         assert!(answers.asked.is_empty());
     });
 }
+
+#[test]
+fn directory_access_reusable_answers_explain_the_one_time_rule_and_grant_nothing() {
+    with_agent(|agent, tmp| {
+        let other = tmp.join("other");
+        std::fs::create_dir(&other).unwrap();
+        for decision in [Decision::AllowAlways, Decision::AllowProject] {
+            let mut answers = Answers {
+                interactive: true,
+                decisions: vec![decision],
+                ..Default::default()
+            };
+            let output = agent.request_directory(&call(&other, false), &mut answers);
+            assert!(output.is_error);
+            assert!(
+                output.text.starts_with("directory access denied: ")
+                    && output.text.contains("choose Allow (once)"),
+                "{}",
+                output.text
+            );
+            assert!(agent.workspace.resolve(other.to_str().unwrap()).is_err());
+        }
+        let mut deny = Answers {
+            interactive: true,
+            decisions: vec![Decision::Deny],
+            ..Default::default()
+        };
+        let output = agent.request_directory(&call(&other, false), &mut deny);
+        assert_eq!(output.text, "directory access denied");
+    });
+}

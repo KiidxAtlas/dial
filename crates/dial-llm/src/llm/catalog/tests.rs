@@ -2194,7 +2194,7 @@ fn krea_root_transformer_layout_is_an_image_not_chat() {
 }
 
 #[test]
-fn image_checkpoints_are_available_when_stable_diffusion_cpp_can_load_them() {
+fn image_checkpoints_are_available_when_dial_can_run_them() {
     let runnable = tempfile::tempdir().unwrap();
     for part in ["transformer", "vae", "text_encoder"] {
         fs::create_dir_all(runnable.path().join(part)).unwrap();
@@ -2224,12 +2224,22 @@ fn image_checkpoints_are_available_when_stable_diffusion_cpp_can_load_them() {
     annotate_image_checkpoints(&mut models);
     assert!(models[0].available, "{}", models[0].source);
     assert!(models[0].source.contains("stable-diffusion.cpp"));
-    assert!(!models[1].available);
-    assert!(
-        models[1].source.contains("not runnable: MLX-quantized"),
-        "{}",
-        models[1].source
-    );
+    // MLX packs run on MLX-Serve, which exists only for macOS on Apple Silicon.
+    if crate::llm::server::image::mlx_serve_supported() {
+        assert!(models[1].available, "{}", models[1].source);
+        assert!(
+            models[1].source.contains("run by Dial on MLX-Serve"),
+            "{}",
+            models[1].source
+        );
+    } else {
+        assert!(!models[1].available);
+        assert!(
+            models[1].source.contains("not runnable: MLX-quantized"),
+            "{}",
+            models[1].source
+        );
+    }
 }
 
 /// Direct provider discovery: an exact documented id is annotated only when the live row declares

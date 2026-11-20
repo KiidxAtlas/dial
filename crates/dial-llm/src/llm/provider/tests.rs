@@ -4010,6 +4010,31 @@ fn live_handoff_is_offered_only_to_stateless_remote_routes() {
 }
 
 #[test]
+fn unconfigured_route_refuses_requests_with_model_setup_guidance() {
+    let mut skipped = backend(ProviderKind::Unconfigured {
+        reason: String::new(),
+    });
+    assert_eq!(skipped.model_label(), UNCONFIGURED_MODEL);
+    assert!(!skipped.local_inference());
+    let error = skipped
+        .chat(None, &request(), 1, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("No model is selected"), "{error}");
+    assert!(error.contains("/model"), "{error}");
+
+    let mut failed = backend(ProviderKind::Unconfigured {
+        reason: "credentials expired".into(),
+    });
+    let error = failed
+        .chat(None, &request(), 1, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("(credentials expired)"), "{error}");
+    assert!(error.contains("/providers"), "{error}");
+}
+
+#[test]
 fn anthropic_handoff_forces_tool_choice_none_and_keeps_tool_wire() {
     let req = Chat {
         messages: vec![

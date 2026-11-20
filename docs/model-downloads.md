@@ -76,8 +76,10 @@ MLX-quantized packs (mflux 4/8-bit, MLX-Serve conversions) store packed integer 
 stable-diffusion.cpp cannot read. Enter on one, in the **Images** group or shelf, looks up the
 model the pack declares as its `base_model` on Hugging Face and asks whether to download that
 original (with its size); `y` downloads it as above, `n` or Esc downloads nothing. Gated originals
-are refused with the license and `hf auth login` steps. Serving a pack with MLX-Serve on Apple
-Silicon still works: F5 rescan and select its endpoint. Roles / `Ctrl+A` offer the same
+are refused with the license and `hf auth login` steps. On macOS with Apple Silicon the pack itself
+is available instead: assigned to the `image` role, it runs on an MLX-Serve that `image_gen` starts
+for each call and installs on first use (see [image generation](image-generation.md)). An
+MLX-Serve you run yourself still works: F5 rescan and select its endpoint. Roles / `Ctrl+A` offer the same
 assignment. Image-only checkpoints are not assigned to `main`, `memory` or `embedding`. An
 unassigned `image` role follows the main model; this does not turn a chat-only model into an
 image-generation endpoint.

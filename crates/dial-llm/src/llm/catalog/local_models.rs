@@ -622,16 +622,21 @@ pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
             }
         }
     }
-    // Native MLX-Serve uses the same publisher/repository store layout. Keep offline weights
-    // visible, but never claim that Dial's chat worker can serve a diffusion checkpoint.
+    // Native MLX-Serve uses the same publisher/repository store layout. Dial runs these image
+    // models on MLX-Serve itself where it can (macOS on Apple Silicon); elsewhere they stay visible
+    // but unavailable, since Dial's chat worker cannot serve a diffusion checkpoint.
     if let Some(home) = crate::config::paths::home_dir() {
         for mut entry in lmstudio_mlx_models(&home.join(".mlx-serve/models"), None)
             .into_iter()
             .filter(ModelEntry::supports_images)
         {
-            entry.source =
-                "MLX-Serve download · start MLX-Serve and F5 rescan to select its endpoint".into();
-            entry.available = false;
+            entry.source = if crate::llm::server::image::mlx_serve_supported() {
+                entry.available = true;
+                format!("MLX-Serve download · {}", mlx_serve_runner())
+            } else {
+                entry.available = false;
+                "MLX-Serve download · MLX-Serve runs only on macOS with Apple Silicon".into()
+            };
             if models.len() < MAX_MODELS && !models.iter().any(|known| known.label == entry.label) {
                 models.push(entry);
             }
@@ -641,9 +646,18 @@ pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
     models
 }
 
+/// How Dial runs an MLX image pack, for a listing's source line.
+fn mlx_serve_runner() -> &'static str {
+    if crate::llm::local_format::mlx_serve().is_some() {
+        "MLX image pack, run by Dial on MLX-Serve"
+    } else {
+        "MLX image pack, run by Dial on MLX-Serve (installed on first use)"
+    }
+}
+
 /// Downloaded diffusion checkpoints run on a Dial-launched stable-diffusion.cpp `sd-server` when
-/// their files are a layout it loads. Packs it cannot read (MLX-quantized mflux/MLX-Serve packs)
-/// stay listed but unavailable, with the reason.
+/// their files are a layout it loads. MLX-quantized packs run on a Dial-launched MLX-Serve on
+/// macOS with Apple Silicon; elsewhere they stay listed but unavailable, with the reason.
 pub(super) fn annotate_image_checkpoints(models: &mut [ModelEntry]) {
     for entry in models {
         if entry.metadata.kind != ModelKind::Image
@@ -652,7 +666,16 @@ pub(super) fn annotate_image_checkpoints(models: &mut [ModelEntry]) {
         {
             continue;
         }
-        match crate::llm::server::image::components(Path::new(&entry.selection.model)) {
+        let model = Path::new(&entry.selection.model);
+        if crate::llm::server::image::mlx_serve_supported()
+            && crate::llm::server::image::is_mlx_pack(model)
+        {
+            entry.available = true;
+            entry.source.push_str(" · ");
+            entry.source.push_str(mlx_serve_runner());
+            continue;
+        }
+        match crate::llm::server::image::components(model) {
             Ok(_) => {
                 entry.available = true;
                 entry.source.push_str(if crate::llm::local_format::sd_server().is_some() {
@@ -665,7 +688,7 @@ pub(super) fn annotate_image_checkpoints(models: &mut [ModelEntry]) {
                 entry.available = false;
                 let reason = format!("{error:#}");
                 let reason = if reason.contains("MLX-quantized") {
-                    "MLX-quantized pack: stable-diffusion.cpp cannot read it; serve it with MLX-Serve, or download the original safetensors".to_owned()
+                    "MLX-quantized pack: it runs on MLX-Serve, which needs macOS with Apple Silicon; elsewhere download the original safetensors".to_owned()
                 } else {
                     reason
                 };

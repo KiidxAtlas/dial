@@ -1082,6 +1082,37 @@ fn scrollback_links_existing_paths_and_urls_but_not_the_live_region() {
 }
 
 #[test]
+fn generated_image_header_links_the_saved_file_without_a_line_fragment() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("image-gen-test.png"), b"png").unwrap();
+    let mut rig = Rig::new(80, 6);
+    rig.term.set_integration_for_test(every_integration());
+    let signals = crate::ui::term_state::Signals {
+        cwd: Some(root.path().to_path_buf()),
+        ..Default::default()
+    };
+    rig.commit(&["Image · image-gen-test.png · 1024x1024"]);
+    rig.term
+        .paint(&Viewport {
+            rows: &lines(&["live"]),
+            cursor: None,
+            title: None,
+            signals: Some(&signals),
+        })
+        .unwrap();
+    rig.sync();
+    let text = String::from_utf8(rig.raw.clone()).unwrap();
+    let file = url::Url::from_file_path(root.path().join("image-gen-test.png")).unwrap();
+    // No `#line`: iTerm2 would hand a fragment to the text editor instead of the image viewer.
+    assert!(
+        text.contains(&format!(
+            "\x1b]8;;{file}\x1b\\image-gen-test.png\x1b]8;;\x1b\\"
+        )),
+        "{text:?}"
+    );
+}
+
+#[test]
 fn signals_are_written_on_change_and_restored_on_leave() {
     use crate::ui::term_state::{Activity, Progress, Signals};
     let mut rig = Rig::new(40, 4);

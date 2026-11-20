@@ -28,6 +28,7 @@ mod diagnostics;
 mod extensions;
 mod host_tools;
 mod host_uris;
+mod images;
 mod jobs;
 mod live_snapshot;
 mod maintenance;
@@ -1041,6 +1042,7 @@ impl Admin {
             "list_sessions"
                 | "search_sessions"
                 | "list_models"
+                | "image_settings"
                 | "settings_schema"
                 | "get_settings"
                 | "list_extensions"
@@ -1076,12 +1078,32 @@ impl Admin {
                     ),
                     None => None,
                 };
-                let models = if model.provider.is_empty() {
+                let purpose = match params.get("purpose").filter(|value| !value.is_null()) {
+                    None => None,
+                    Some(value) => match value.as_str() {
+                        Some("chat") => None,
+                        Some("image") => Some(models::Purpose::Image),
+                        Some("embedding") => Some(models::Purpose::Embedding),
+                        _ => {
+                            return Err(coded(
+                                ErrorCode::InvalidParams,
+                                "purpose must be \"chat\", \"image\" or \"embedding\"",
+                            ));
+                        }
+                    },
+                };
+                let models = if let Some(purpose) = purpose {
+                    models::list_for(&config, &layout.user_dir, provider, purpose)
+                } else if model.provider.is_empty() {
                     models::list(&config, &config.selection(), &layout.user_dir, provider)
                 } else {
                     models::list(&config, &model, &layout.user_dir, provider)
                 };
                 Ok(json!({"models":models}))
+            }
+            "image_settings" => {
+                drop(config);
+                Ok(images::settings(&self.saved_config()?))
             }
             "delete_local_model" => {
                 drop(config);
@@ -2067,9 +2089,9 @@ fn run_control(
                     out.result(&id, result);
                 }
                 "list_jobs" | "stop_job" | "list_sessions" | "delete_session" | "pin_session"
-                | "list_models" | "delete_local_model" | "settings_schema" | "get_settings"
-                | "set_setting" | "reset_setting" | "list_extensions" | "get_schema"
-                | "list_checks" | "add_check" | "remove_check" | "list_skills"
+                | "list_models" | "image_settings" | "delete_local_model" | "settings_schema"
+                | "get_settings" | "set_setting" | "reset_setting" | "list_extensions"
+                | "get_schema" | "list_checks" | "add_check" | "remove_check" | "list_skills"
                 | "search_sessions" | "code_history" | "stats"
                     if !acp =>
                 {

@@ -378,6 +378,14 @@ Remote routes use the declared protocol: OpenAI-compatible chat completions, Res
 Messages, Gemini or Ollama native streaming. Both **ChatGPT subscription** and **Claude subscription**
 have dedicated OAuth sign-in flows and use their respective official inference APIs.
 
+**Gemini 4 Neon on a Google AI subscription.** In `/providers`, sign in to **Google Antigravity**
+with the account that holds your subscription, then select `gemini-4-neon` in `/models`.
+For a one-shot request, use `dial -p --provider google-antigravity --model gemini-4-neon "Reply with OK."`.
+Google lists Neon for paid Pro and Ultra (and eligible device trials), not Free or Plus; a bundled
+model entry does not verify entitlement. See [Google's Antigravity model availability](https://antigravity.google/docs/models#gemini-4-neon).
+The separate **Google Gemini CLI** sign-in no longer serves consumer Google AI subscriptions.
+The **Google Gemini** API-key route does not use Antigravity subscription quota.
+
 **Use your ChatGPT/Codex subscription.** Restart Dial, open `/providers`, select **ChatGPT
 subscription**, and choose **Continue with ChatGPT (add account)**. In the browser, authorize Dial
 to use your ChatGPT plan. Return to Dial, open `/models`, and assign an account model to the main

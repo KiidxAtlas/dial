@@ -1,4 +1,15 @@
-use super::IdleSleepGuard;
+use super::{IdleSleepGuard, report_once};
+use std::sync::atomic::AtomicBool;
+
+#[test]
+fn an_unavailable_mechanism_is_reported_once_and_success_still_returns_the_guard() {
+    let reported = AtomicBool::new(false);
+    let failure = || Err::<u8, _>(anyhow::anyhow!("no system bus"));
+    assert!(report_once(failure(), &reported).is_err());
+    assert!(matches!(report_once(failure(), &reported), Ok(None)));
+    assert!(matches!(report_once(Ok(7), &reported), Ok(Some(7))));
+    assert!(matches!(report_once(failure(), &reported), Ok(None)));
+}
 
 #[test]
 fn guard_can_move_between_worker_threads() {

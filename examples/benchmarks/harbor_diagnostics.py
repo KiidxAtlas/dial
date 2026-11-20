@@ -522,6 +522,14 @@ def summarize_trial(trial):
     metadata = trial_metadata(result if isinstance(result, dict) else {}, raw_metrics)
     if metadata['metric_agent'] and metadata['reported_agent'] and metadata['metric_agent'] != metadata['reported_agent']:
         gaps.append({'kind': 'agent_identity_mismatch', 'source': metadata['source']})
+    # The agent's own clock (monotonic in Dial) excludes host suspend; Harbor's wall interval does not.
+    agent_elapsed, wall_ms = number(raw_metrics.get('elapsed_sec')), timing.get('agent_execution_ms')
+    if agent_elapsed is not None and wall_ms is not None:
+        excess = wall_ms / 1000 - agent_elapsed
+        if excess > max(30, agent_elapsed / 2):
+            gaps.append({'kind': 'wall_clock_exceeds_agent_elapsed', 'wall_ms': wall_ms,
+                         'agent_elapsed_ms': agent_elapsed * 1000,
+                         'note': 'Possible host sleep or a stalled harness; treat timings in this window as unreliable.'})
     if completion is None:
         gaps.append({'kind': 'completion_evidence_unavailable'})
     return {'schema_version': 1, 'privacy': 'Metadata only; raw logs remain private and may contain secrets. Do not publish them.',

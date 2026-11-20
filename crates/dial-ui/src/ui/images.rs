@@ -261,20 +261,7 @@ impl Thumbnail {
             self.pixels.clone()
         };
         let separator = if theme.ascii() { " | " } else { " · " };
-        let mut rows = vec![Line::from(Span::styled(
-            text::clip(
-                &text::ellipsize(
-                    &text::one_line(&format!(
-                        "Image{separator}{}{separator}{}x{}",
-                        self.label, self.original.0, self.original.1,
-                    )),
-                    width as usize,
-                    theme.ascii(),
-                ),
-                width as usize,
-            ),
-            theme.fg(Tok::Muted),
-        ))];
+        let mut rows = vec![self.header(width as usize, separator, theme)];
         for y in (0..pixels.height()).step_by(2) {
             let mut spans = vec![Span::raw(" ".repeat(indent as usize))];
             for x in 0..pixels.width() {
@@ -301,6 +288,41 @@ impl Thumbnail {
             rows.push(Line::from(spans));
         }
         rows
+    }
+
+    /// `Image · images/sunset.png · 1024x1024`, with the file name underlined as a link: a
+    /// terminal that supports links opens it on ⌘-click (scrollback rows link existing paths).
+    /// Parts drop from the ends before the name is ever cut, since a shortened path links nowhere.
+    fn header(&self, width: usize, separator: &str, theme: &Theme) -> Line<'static> {
+        let muted = theme.fg(Tok::Muted);
+        let label = text::one_line(&self.label);
+        let size = format!("{separator}{}x{}", self.original.0, self.original.1);
+        let prefix = format!("Image{separator}");
+        let name = text::width(&label);
+        let (lead, tail) = match () {
+            _ if text::width(&prefix) + name + text::width(&size) <= width => (prefix, size),
+            _ if name + text::width(&size) <= width => (String::new(), size),
+            _ if name <= width => (String::new(), String::new()),
+            _ => {
+                let line = format!("Image{separator}{label}{size}");
+                let short = text::ellipsize(&line, width, theme.ascii());
+                return Line::from(Span::styled(text::clip(&short, width), muted));
+            }
+        };
+        let mut spans = Vec::new();
+        if !lead.is_empty() {
+            spans.push(Span::styled(lead, muted));
+        }
+        spans.push(Span::styled(
+            label,
+            theme
+                .fg(Tok::Text)
+                .add_modifier(ratatui::style::Modifier::UNDERLINED),
+        ));
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, muted));
+        }
+        Line::from(spans)
     }
 }
 
