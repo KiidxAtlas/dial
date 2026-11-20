@@ -94,6 +94,39 @@ fn same_origin(url: &str, origin: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+/// Per-thread test override of one provider's first-party host. Each provider owns its slot, so
+/// overriding one host never reroutes another provider.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) type FirstPartySlot = std::thread::LocalKey<std::cell::RefCell<Option<String>>>;
+
+/// Restores a provider's first-party host check when dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestFirstParty(&'static FirstPartySlot);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestFirstParty {
+    fn drop(&mut self) {
+        self.0.with(|cell| cell.borrow_mut().take());
+    }
+}
+
+/// Treat `origin` (`scheme://host:port`) as the provider's first-party host on this thread.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn override_first_party(slot: &'static FirstPartySlot, origin: &str) -> TestFirstParty {
+    slot.with(|cell| *cell.borrow_mut() = Some(origin.to_owned()));
+    TestFirstParty(slot)
+}
+
+/// Whether `url` is on the origin this thread's test override names in `slot`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_origin_matches(slot: &'static FirstPartySlot, url: &str) -> bool {
+    slot.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .is_some_and(|origin| same_origin(url, origin))
+    })
+}
+
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -612,6 +645,22 @@ pub(crate) fn is_local_host(host: &str) -> bool {
         || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".docker.internal")
+}
+
+/// Whether `url` names this machine: `localhost` or a loopback address (bracketed IPv6 included).
+/// Private ranges are not loopback, so LAN servers still need an explicit key variable.
+pub fn is_loopback_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|url| url.host_str().is_some_and(is_loopback_host))
+}
+
+/// Whether a URL host names this machine: `localhost` or a loopback address (bracketed IPv6
+/// included). Private ranges are not loopback, so LAN servers still need an explicit key variable.
+pub fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn host_of(url: &str) -> Option<String> {
@@ -1506,6 +1555,18 @@ fn read_bounded(reader: impl Read, limit: usize) -> Result<Bounded> {
     let truncated = data.len() > limit;
     data.truncate(limit);
     Ok(Bounded { data, truncated })
+}
+
+/// `reader` read whole when it holds at most `limit` bytes; `None` when longer or unreadable.
+fn read_within(reader: impl Read, limit: u64) -> Option<Vec<u8>> {
+    let bounded = read_bounded(reader, usize::try_from(limit).ok()?).ok()?;
+    (!bounded.truncated).then_some(bounded.data)
+}
+
+/// Parse the JSON file at `path` when it holds at most `limit` bytes; `None` when it is missing,
+/// longer than `limit`, unreadable or not JSON.
+pub(crate) fn read_json_within(path: &std::path::Path, limit: u64) -> Option<serde_json::Value> {
+    serde_json::from_slice(&read_within(std::fs::File::open(path).ok()?, limit)?).ok()
 }
 
 fn excerpt(bytes: &[u8], truncated: bool) -> String {

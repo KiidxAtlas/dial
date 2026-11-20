@@ -1028,8 +1028,8 @@ fn execute_child_call(
             if !env.config.model_roles.contains_key("coach") {
                 return Err("edit repair requires a configured coach model role".into());
             }
-            let chat =
-                crate::agent::run::edit_runtime::repair_request(request, env.harness.max_tokens);
+            let repair =
+                crate::agent::run::edit_runtime::repair_request(request, env.harness.max_tokens)?;
             let text = child_role_chat(
                 env,
                 context.backend,
@@ -1037,7 +1037,7 @@ fn execute_child_call(
                 ChildRoleCall {
                     role: "coach",
                     purpose: llm::usage::Purpose::Repair,
-                    request: &chat,
+                    request: &repair.chat,
                     steps: context.steps,
                     budget: context.budget,
                     model_override: None,
@@ -1048,7 +1048,7 @@ fn execute_child_call(
                 context.children,
             )
             .map_err(|error| format!("{error:#}"))?;
-            let response = crate::agent::run::edit_runtime::repair_response(&text);
+            let response = repair.complete(&text);
             if response.is_err() {
                 with_child_role_backend(
                     env,

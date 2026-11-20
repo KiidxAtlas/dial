@@ -83,11 +83,7 @@ struct File {
     entries: Vec<Entry>,
 }
 
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
+pub use crate::runtime::clock::unix_secs as now;
 
 /// `30s`, `5m`, `2h`, `1d`; a bare number is seconds.
 pub fn parse_duration(text: &str) -> Result<u64> {

@@ -10,6 +10,7 @@ use crate::runtime::evidence::{
 };
 use crate::storage::artifact::{ArtifactStore, StoredEvidence};
 use crate::tools::integrations::ext::{Tool, ToolContext};
+use crate::tools::surface::facade::merge_properties;
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -132,15 +133,18 @@ fn retired_schema(tool: &str) -> Option<Value> {
 }
 
 /// The merged schema: the native properties unchanged, each retired tool's properties added, and
-/// the merged actions appended. A property two retired tools define differently is widened (enum
-/// values united, other constraints dropped); the exact bounds are checked per action on call.
+/// the merged actions appended. A property two retired tools define differently is widened by the
+/// facade's shared algorithm (enum values united, other constraints dropped); the exact bounds are
+/// checked per action on call.
 pub(crate) fn schema() -> Value {
     let mut schema = native_schema();
     let properties = schema
         .pointer_mut("/function/parameters/properties")
         .and_then(Value::as_object_mut)
         .expect("native evidence schema has properties");
+    // Native fields (including `action`) are never widened by a retired tool's schema.
     let native: Vec<String> = properties.keys().cloned().collect();
+    let skip: Vec<&str> = native.iter().map(String::as_str).collect();
     let mut seen: Vec<&str> = Vec::new();
     for &(tool, _, merged) in MERGED_ACTIONS {
         if let Some(actions) = properties["action"]["enum"].as_array_mut() {
@@ -151,73 +155,9 @@ pub(crate) fn schema() -> Value {
         }
         seen.push(tool);
         let retired = retired_schema(tool).expect("merged tool has a schema");
-        let Some(added) = retired
-            .pointer("/function/parameters/properties")
-            .and_then(Value::as_object)
-        else {
-            continue;
-        };
-        for (name, property) in added {
-            if name == "action" || native.contains(name) {
-                continue;
-            }
-            match properties.get_mut(name) {
-                None => {
-                    properties.insert(name.clone(), property.clone());
-                }
-                Some(existing) if existing != property => widen(existing, property),
-                Some(_) => {}
-            }
-        }
+        merge_properties(properties, &retired, &skip);
     }
     schema
-}
-
-/// Widen `existing` so it also accepts every value `other` accepts.
-fn widen(existing: &mut Value, other: &Value) {
-    if let (Some(left), Some(right)) = (
-        existing.get("enum").and_then(Value::as_array).cloned(),
-        other.get("enum").and_then(Value::as_array),
-    ) {
-        let mut values = left;
-        for value in right {
-            if !values.contains(value) {
-                values.push(value.clone());
-            }
-        }
-        existing["enum"] = Value::Array(values);
-        return;
-    }
-    // Bounds differ between owners; the shape without them is shared and the bounds are
-    // enforced per action by the owner's own schema.
-    let unbounded = |value: &Value| {
-        let mut value = value.clone();
-        if let Some(object) = value.as_object_mut() {
-            for bound in [
-                "minItems",
-                "maxItems",
-                "minLength",
-                "maxLength",
-                "minimum",
-                "maximum",
-            ] {
-                object.remove(bound);
-            }
-        }
-        value
-    };
-    let (left, right) = (unbounded(existing), unbounded(other));
-    if left == right {
-        *existing = left;
-        return;
-    }
-    let kind = existing
-        .get("type")
-        .filter(|kind| other.get("type") == Some(*kind));
-    *existing = match kind {
-        Some(kind) => json!({ "type": kind }),
-        None => json!({}),
-    };
 }
 
 /// The retired tool and its own arguments for a merged `action`; `None` for a native action.

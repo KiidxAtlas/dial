@@ -11,9 +11,10 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::common::{days_from_civil, parse_iso_ms_lenient};
+use super::common::parse_iso_ms_lenient;
 use super::{UsageAmount, UsageLimit, UsageReport, UsageScope, UsageUnit, UsageWindow};
 use crate::llm::oauth::{self, util};
+use crate::platform::time::calendar::{MILLIS_PER_DAY, civil_from_days, days_from_civil};
 
 const ID: &str = "google-gemini-cli";
 const CLIENT_METADATA: &str =
@@ -318,35 +319,15 @@ pub(super) fn opt_f64(object: &Map<String, Value>, key: &str) -> Result<Option<f
 /// `Date.prototype.setUTCMonth(getUTCMonth() + 1)` on a Unix ms value. Day overflow rolls into
 /// the following month, matching JavaScript (Jan 31 → Mar 3 in a non-leap year).
 pub(super) fn add_one_month_ms(ms: i64) -> Option<i64> {
-    const DAY: i64 = 86_400_000;
-    let days = ms.div_euclid(DAY);
-    let time = ms.rem_euclid(DAY);
-    let (year, month, day) = civil_from_days(days);
-    let total = year * 12 + (month - 1) + 1;
-    let first = i64::try_from(days_from_civil(
-        total.div_euclid(12),
-        total.rem_euclid(12) + 1,
-        1,
-    ))
-    .ok()?;
+    let days = ms.div_euclid(MILLIS_PER_DAY);
+    let time = ms.rem_euclid(MILLIS_PER_DAY);
+    let date = civil_from_days(days);
+    let total = date.year * 12 + (date.month - 1) + 1;
+    let first = days_from_civil(total.div_euclid(12), total.rem_euclid(12) + 1, 1)?;
     first
-        .checked_add(day - 1)?
-        .checked_mul(DAY)?
+        .checked_add(date.day - 1)?
+        .checked_mul(MILLIS_PER_DAY)?
         .checked_add(time)
-}
-
-/// Calendar date `(year, month, day)` for days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
 }
 
 #[cfg(test)]

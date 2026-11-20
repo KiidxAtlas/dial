@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::testkit::plain;
 use crate::ui::{
     composer::{Composer, ComposerCtx},
     keys::Keymap,
@@ -19,12 +20,6 @@ fn info() -> WelcomeInfo {
         dismiss_key: "Esc".into(),
         ..Default::default()
     }
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
 }
 
 fn render_home(width: u16, height: u16, selected: Option<usize>, draft: &str) -> ComposerView {
@@ -497,6 +492,33 @@ fn the_home_names_the_approval_mode_and_the_key_that_changes_it() {
     };
     assert_eq!(position("ask"), position("write"));
     assert_eq!(position("readonly"), position("auto"));
+}
+
+#[test]
+fn welcome_warning_and_model_shortcut_fit_the_launch_card() {
+    let mut info = info();
+    info.model.clear();
+    info.approval = "write".into();
+    info.sandbox = "off".into();
+    for width in [38, 80] {
+        let view = frame(
+            &info,
+            width,
+            24,
+            &Theme::dark(),
+            View::default(),
+            ComposerView {
+                rows: vec![Line::from("draft")],
+                cursor: (0, 0),
+            },
+            vec![],
+        );
+        let shown = plain(&view.rows).join("\n");
+        assert!(
+            shown.contains("Ctrl+K") && shown.contains("isolation") && !shown.contains("isola…"),
+            "{shown}"
+        );
+    }
 }
 
 #[test]

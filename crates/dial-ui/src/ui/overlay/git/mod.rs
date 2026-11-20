@@ -12,7 +12,10 @@ mod render;
 mod tree;
 mod view;
 
-use super::{DrawCtx, OverlayEvent, settings::pressed};
+use super::{
+    DrawCtx, OverlayEvent,
+    widgets::{pressed, typed_char},
+};
 use crate::{
     git_panel::{AiSummary, Generated, Repo, Watch},
     ui::{
@@ -34,7 +37,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use render::plain_char;
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -235,9 +237,8 @@ impl GitOverlay {
         )
     }
 
-    /// Mouse input. Geometry mirrors `compose`: the border takes row 0 and column 0, compose's
-    /// rows start at row 1 (the diff header), and the sidebar starts after the diff column and a
-    /// one-cell separator.
+    /// Mouse input. Geometry comes from [`render::Columns`], the split `compose` draws with: the
+    /// border takes row 0 and column 0, and compose's rows start at row 1 (the diff header).
     fn mouse(&mut self, event: MouseEvent) {
         let (width, _) = self.area.get();
         let (Some(x), Some(y)) = (
@@ -249,14 +250,9 @@ impl GitOverlay {
         if y >= self.body_h.get() {
             return;
         }
-        let side_w = if width >= view::NARROW_COLS {
-            (width * 3 / 10).clamp(26, 48)
-        } else {
-            0
-        };
-        let diff_w = width - side_w - usize::from(side_w > 0);
-        let in_sidebar = side_w > 0 && x > diff_w;
-        let in_diff = x < diff_w;
+        let cols = render::Columns::split(width);
+        let in_sidebar = cols.side_w > 0 && x > cols.diff_w;
+        let in_diff = x < cols.diff_w;
         match event.kind {
             MouseEventKind::ScrollUp if in_sidebar => self.select_file(-1),
             MouseEventKind::ScrollDown if in_sidebar => self.select_file(1),
@@ -265,7 +261,7 @@ impl GitOverlay {
             MouseEventKind::Down(MouseButton::Left) if in_sidebar => self.focus = Focus::Sidebar,
             MouseEventKind::Down(MouseButton::Left) if in_diff => {
                 self.focus = Focus::Diff;
-                if diff_w >= 40 && x + 2 >= diff_w {
+                if cols.diff_w >= 40 && x + 2 >= cols.diff_w {
                     self.seek(y);
                 } else {
                     self.cursor_to(self.diff_top.get() + y);
@@ -325,7 +321,7 @@ impl GitOverlay {
                 if key.kind == KeyEventKind::Repeat
                     && !self.editing
                     && self.ai_prompt.is_none()
-                    && (key.code == KeyCode::Delete || plain_char(key) == Some('x')) =>
+                    && (key.code == KeyCode::Delete || typed_char(key) == Some('x')) =>
             {
                 OverlayEvent::None
             }
@@ -415,7 +411,7 @@ impl GitOverlay {
 
     fn key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         if self.help {
-            if keys.matches(Action::SelectCancel, key) || plain_char(key) == Some('?') {
+            if keys.matches(Action::SelectCancel, key) || typed_char(key) == Some('?') {
                 self.help = false;
             }
             return OverlayEvent::None;
@@ -470,14 +466,14 @@ impl GitOverlay {
                 && let Some((sha, _)) = entries.get(self.log_cursor)
             {
                 return OverlayEvent::Action(format!("command:/git {sha}"));
-            } else if plain_char(key) == Some('r') {
+            } else if typed_char(key) == Some('r') {
                 self.sync();
-            } else if plain_char(key) == Some('?') {
+            } else if typed_char(key) == Some('?') {
                 self.help = true;
             }
             return OverlayEvent::None;
         }
-        if plain_char(key) != Some('x') {
+        if typed_char(key) != Some('x') {
             self.discard_patch = None;
         }
         let pending = self.confirm.take();
@@ -485,7 +481,7 @@ impl GitOverlay {
             self.discard_request(pending);
             return OverlayEvent::None;
         }
-        let ch = plain_char(key);
+        let ch = typed_char(key);
         if self.focus == Focus::Diff
             && keys.matches(Action::SelectCancel, key)
             && self.clear_line_selection()

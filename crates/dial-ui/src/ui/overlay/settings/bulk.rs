@@ -191,26 +191,24 @@ impl SettingsOverlay {
             lines.extend(review.details.clone());
             lines.push("End of review. Enter continues; Esc cancels.".to_owned());
         }
-        let wrapped: Vec<String> = lines.into_iter().flat_map(|line| wrap(&line, w)).collect();
+        let wrapped = text::wrap(
+            lines
+                .into_iter()
+                .map(|line| Line::styled(line, ctx.theme.fg(Tok::Text)))
+                .collect(),
+            w,
+        );
         if review.confirmed || review.waiting {
             // A long project name or error must never hide the confirmation summary.
             review.display_ready = wrapped.len() <= h && !review.waiting;
-            return wrapped
-                .into_iter()
-                .take(h)
-                .map(|s| Line::styled(s, ctx.theme.fg(Tok::Text)))
-                .collect();
+            return wrapped.into_iter().take(h).collect();
         }
         let room = h.saturating_sub(1);
         review.end = wrapped.len().saturating_sub(room);
         review.offset = review.offset.min(review.end);
         review.display_ready = true;
-        let mut visible: Vec<Line<'static>> = wrapped
-            .into_iter()
-            .skip(review.offset)
-            .take(room)
-            .map(|s| Line::styled(s, ctx.theme.fg(Tok::Text)))
-            .collect();
+        let mut visible: Vec<Line<'static>> =
+            wrapped.into_iter().skip(review.offset).take(room).collect();
         visible.push(hint_line(
             ctx.theme,
             &[
@@ -222,17 +220,4 @@ impl SettingsOverlay {
         ));
         visible
     }
-}
-
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    for grapheme in text.graphemes(true) {
-        let last = lines.last_mut().expect("one line");
-        if text::width(last) + text::width(grapheme) > width {
-            lines.push(grapheme.to_owned());
-        } else {
-            last.push_str(grapheme);
-        }
-    }
-    lines
 }

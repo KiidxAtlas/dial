@@ -8,7 +8,6 @@ use crate::config::types::Config;
 use anyhow::Result;
 mod btw;
 mod cleanse;
-mod compaction;
 mod contract;
 mod debug;
 mod drafter;

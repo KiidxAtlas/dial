@@ -53,12 +53,7 @@ fn epoch(messages: &[Value]) -> Option<String> {
         .iter()
         .find(|message| is_history(message) && message.get(MARKER).is_none())?;
     let digest = Sha256::digest(serde_json::to_vec(first).ok()?);
-    Some(
-        digest[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    Some(crate::hex(&digest[..8]))
 }
 
 /// The trailing notes of a sent request, in their re-send form.

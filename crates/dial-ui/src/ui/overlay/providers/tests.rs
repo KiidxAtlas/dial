@@ -1,6 +1,7 @@
 use super::super::settings::testkit::*;
 use super::*;
 
+use crate::llm::catalog::UNREACHABLE_DETAIL;
 use crossterm::event::KeyModifiers;
 // Extract the rendered secondary rows, excluding pinned input, footer and paging hint.
 // Clamped last pages overlap; retain each first-seen row to reconstruct the reviewed copy.
@@ -228,6 +229,10 @@ fn a_local_server_that_is_not_running_is_expected_but_real_failures_stay_red() {
         models: 0,
         spec: configured.then(ProviderSpec::default),
     };
+    let expected_absent = |e: &Entry| {
+        chrome::provider_status(&e.state, &e.detail, e.base_url.as_deref())
+            == (chrome::Status::Missing, "not running")
+    };
     for base in [
         "http://127.0.0.1:11434",
         "http://localhost:1234/v1",
@@ -389,9 +394,9 @@ fn overlay() -> ProviderOverlay {
 #[test]
 fn cached_and_unknown_provider_evidence_is_neutral_not_success() {
     let rig = Rig::new();
-    let o = overlay();
     for state in ["cached", "unknown"] {
-        let chip = o.chip(&rig.theme, state);
+        let (status, label) = chrome::provider_status(state, "", None);
+        let chip = chrome::status_chip(&rig.theme, status, label);
         assert_eq!(chip.style.fg, rig.theme.fg(Tok::Muted).fg, "{state}");
         assert_ne!(chip.style.fg, rig.theme.fg(Tok::Success).fg, "{state}");
     }
@@ -1619,6 +1624,22 @@ fn narrow_scope_caption_does_not_overwrite_the_provider_title() {
 }
 
 #[test]
+fn provider_detail_uses_spare_rows_or_points_to_the_complete_copy() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    select(&mut o, "work");
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail = words(&o.detail(o.selected().as_ref()));
+    let shown = draw(&mut o, &rig, 60, 30);
+    assert!(words(&shown).contains(&detail), "{shown}");
+    assert!(draw(&mut o, &rig, 60, 9).contains("F1 more details"));
+    send(&mut o, &rig, key(KeyCode::F(1)));
+    draw(&mut o, &rig, 60, 16);
+    send(&mut o, &rig, key(KeyCode::End));
+    assert!(words(&draw(&mut o, &rig, 60, 16)).contains(&detail));
+}
+
+#[test]
 fn named_scope_and_connection_actions_separate_endpoint_credentials_and_status() {
     let rig = Rig::new();
     let mut o = overlay().with_project_name("example-project");
@@ -1778,4 +1799,37 @@ fn mouse_selects_provider_without_opening_actions() {
     assert!(matches!(o.mode, Mode::List));
     o.click(0, 0);
     assert_eq!(o.entries()[o.cursor].id, "openai");
+}
+
+#[test]
+fn provider_footers_keep_the_way_out_and_fit_every_width() {
+    let rig = Rig::new();
+    for width in [38, 60, 120] {
+        let mut o = overlay();
+        select(&mut o, "work");
+        let list = draw(&mut o, &rig, width, 20);
+        let footer = list
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        assert!(footer.contains("Esc close"), "width {width}: {list}");
+        assert!(
+            crate::ui::text::width(footer) <= usize::from(width),
+            "{footer}"
+        );
+        send(&mut o, &rig, ch('k'));
+        assert!(matches!(o.mode, Mode::Key { .. }), "width {width}");
+        let key_form = draw(&mut o, &rig, width, 20);
+        let footer = key_form
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        assert!(footer.contains("Esc cancel"), "width {width}: {footer}");
+        assert!(
+            crate::ui::text::width(footer) <= usize::from(width),
+            "{footer}"
+        );
+    }
 }

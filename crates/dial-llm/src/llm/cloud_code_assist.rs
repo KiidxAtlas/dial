@@ -1,6 +1,6 @@
 //! Google Cloud Code Assist / Gemini CLI streaming transport.
 use super::identity::{Axis, Family, Identity};
-use super::profiles::ModelProfile;
+use super::profiles::{ModelProfile, ReasoningApi};
 use super::transports::{OnText, Route};
 use super::{Chat, Endpoint, Reply, StreamEvent};
 use anyhow::{Context, Result, ensure};
@@ -194,7 +194,13 @@ fn request_headers(route: &Route<'_>) -> Result<Vec<(String, String)>> {
     Ok(headers)
 }
 
-fn envelope(route: &Route<'_>, mut request: Value, chat: &Chat, scope: &str) -> Result<Value> {
+fn envelope(
+    route: &Route<'_>,
+    model: &str,
+    mut request: Value,
+    chat: &Chat,
+    scope: &str,
+) -> Result<Value> {
     let antigravity = route.protocol == super::model_config::ApiProtocol::Antigravity;
     let project = route
         .project_id
@@ -202,8 +208,8 @@ fn envelope(route: &Route<'_>, mut request: Value, chat: &Chat, scope: &str) -> 
     if antigravity {
         let state = antigravity_state(route, chat, scope)?;
         request["sessionId"] = json!(state.session_id);
-        let (model_enum, max_output_tokens) = antigravity_model_profile(route.model);
-        let used_claude = (Identity::new(route.model).family(Axis::CloudCodeClaude)
+        let (model_enum, max_output_tokens) = antigravity_model_profile(model);
+        let used_claude = (Identity::new(model).family(Axis::CloudCodeClaude)
             == Some(Family::Claude))
         .to_string();
         let mut labels = serde_json::Map::new();
@@ -225,7 +231,7 @@ fn envelope(route: &Route<'_>, mut request: Value, chat: &Chat, scope: &str) -> 
             request["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
         }
         Ok(json!({
-            "model": route.model,
+            "model": model,
             "project": project,
             "request": request,
             "userAgent": "antigravity",
@@ -233,7 +239,7 @@ fn envelope(route: &Route<'_>, mut request: Value, chat: &Chat, scope: &str) -> 
             "requestType": "agent"
         }))
     } else {
-        Ok(json!({"model": route.model, "project": project, "request": request}))
+        Ok(json!({"model": model, "project": project, "request": request}))
     }
 }
 
@@ -248,6 +254,34 @@ fn antigravity_fallback(route: &Route<'_>) -> Option<String> {
             Some("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse".into()),
         _ => None,
     }
+}
+
+/// The wire model for this request. An Antigravity model-variant profile selects the listed
+/// variant for its active effort. Without an active effort, or off Antigravity, the selected model
+/// is kept unchanged. An effort the profile does not list, or one with no wire ID, is refused.
+fn wire_model(route: &Route<'_>, profile: Option<&ModelProfile>) -> Result<String> {
+    let Some(profile) = profile.filter(|profile| {
+        profile.capabilities.reasoning == ReasoningApi::AntigravityModelVariant
+            && route.protocol == super::model_config::ApiProtocol::Antigravity
+    }) else {
+        return Ok(route.model.to_owned());
+    };
+    let Some(effort) = profile.reasoning_effort else {
+        return Ok(route.model.to_owned());
+    };
+    ensure!(
+        profile.capabilities.reasoning_efforts.contains(&effort),
+        "Antigravity effort {} is not listed for {}",
+        effort.as_str(),
+        route.model
+    );
+    crate::llm::catalog::antigravity_effort_model(route.model, effort).with_context(|| {
+        format!(
+            "Antigravity model {} has no wire ID for effort {}",
+            route.model,
+            effort.as_str()
+        )
+    })
 }
 
 pub(super) fn exchange(
@@ -269,10 +303,11 @@ pub(super) fn exchange(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
+    let model = wire_model(route, profile)?;
     let endpoint = Endpoint {
         url: route.base_url,
         auth: route.auth,
-        model: route.model,
+        model: model.as_str(),
         headers: &headers,
     };
     let scope = super::model_config::native_replay_scope(
@@ -282,13 +317,13 @@ pub(super) fn exchange(
             "cloud-code-assist"
         },
         route.base_url,
-        Some(route.model),
+        Some(model.as_str()),
         route.account_id,
         route.auth,
         &headers,
     );
     let request = super::gemini::request_for_proxy(&endpoint, req, profile, &scope)?;
-    let body = envelope(route, request, req, &scope)?;
+    let body = envelope(route, model.as_str(), request, req, &scope)?;
     let patience = super::Patience::for_stream(timeout, false);
     let mut response = match super::send_with_headers(
         &url,

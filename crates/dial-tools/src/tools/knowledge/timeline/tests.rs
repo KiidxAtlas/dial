@@ -1,12 +1,5 @@
 use super::*;
-use crate::storage::artifact::ArtifactStore;
 use crate::tools::testkit;
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
 fn retain(ws: &Workspace, producer: &str, location: Location, media: &str, text: &str) -> String {
     let e = Evidence {
         source: "fixture".into(),
@@ -32,7 +25,7 @@ fn event(reference: &str, id: &str, start: i64) -> Value {
 }
 #[test]
 fn explicit_times_are_attributed_and_unrelated_clocks_not_sorted_together() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let a = retain(&ws, "log", Location::Whole, "text/plain", "entry");
     let out = run(
         &ws,
@@ -57,7 +50,7 @@ fn explicit_times_are_attributed_and_unrelated_clocks_not_sorted_together() {
 }
 #[test]
 fn negative_offset_retains_basis_uncertainty_and_overlap() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let a = retain(&ws, "log", Location::Whole, "text/plain", "entry");
     let out=run(&ws,&json!({"action":"reconstruct","events":[event(&a,"a",100),event(&a,"b",0)],"alignments":[{"from":"a","to":"b","offset_ms":-100,"uncertainty_ms":10,"basis":[a]}]})).unwrap();
     let d = out.data.as_ref().unwrap();
@@ -73,7 +66,7 @@ fn negative_offset_retains_basis_uncertainty_and_overlap() {
 }
 #[test]
 fn exact_audio_segments_and_video_frame_citations_are_selected_not_enclosing_interval() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let audio = retain(
         &ws,
         "dial/audio-whisper.cpp",
@@ -124,7 +117,7 @@ fn exact_audio_segments_and_video_frame_citations_are_selected_not_enclosing_int
 }
 #[test]
 fn missing_quotes_missing_refs_overflow_and_limits_fail_closed() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let a = retain(&ws, "log", Location::Whole, "text/plain", "entry");
     let mut e = event(&a, "a", i64::MAX);
     e["uncertainty_ms"] = json!(1);
@@ -152,7 +145,7 @@ fn missing_quotes_missing_refs_overflow_and_limits_fail_closed() {
 
 #[test]
 fn unspecified_caller_uncertainty_is_unknown_and_clock_origins_cannot_collide() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let a = retain(&ws, "log", Location::Whole, "text/plain", "entry");
     let mut e = event(&a, "a", 0);
     e.as_object_mut().unwrap().remove("uncertainty_ms");

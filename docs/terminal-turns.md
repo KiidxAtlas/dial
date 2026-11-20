@@ -185,15 +185,16 @@ failures (including checkpoint failures) are not reset by this recovery.
   clock, with no invented job percentage or ETA. Results or messages resume the turn without model
   polling; new input changes direction. Interrupting ends the agent turn, not the background job.
   Use Activity (`/activity`) to inspect and explicitly cancel owned work. Provider retry status shows
-  its observed attempt and the delay until the next request, reading **retrying…** once it is due;
-  `/retry` skips that delay,
+  the upcoming attempt and the delay until the next request, reading **retrying…** once it is due.
+  The attempt limit includes the original request; `/retry` skips the wait,
   while the interrupt key stops the agent request. Neither operation replays completed tools.
   `/model restart` explicitly confirms unloading only Dial's managed local main model, which reloads
   with the same selection next request. Busy turns, running children and external endpoints are
   refused; the command never switches models or kills external servers. Failed/cancelled inference
   on a Dial-managed server retires its process before retry so abandoned work cannot block the next request.
 - `/plan [on|off]` enforces read-only planning. The model's `exit_plan` request asks for approval
-  before enabling edits. `/permissions` lists scoped rules; for example,
+  before enabling edits; an approved plan is saved with the session and survives compaction, and
+  `[plan] autosave` also writes it to the workspace ([Plan mode](extensibility.md)). `/permissions` lists scoped rules; for example,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
   `/permissions why` lists the 20 most recent approval-policy decisions of this session, newest

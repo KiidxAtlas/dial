@@ -1246,10 +1246,11 @@ fn notices(log: &Log) -> usize {
 }
 
 #[test]
-fn write_through_reaches_only_the_session_that_executed_the_edit() {
+fn forks_share_one_server_and_each_edit_reaches_it_once() {
     let dir = tempfile::tempdir().unwrap();
     let parent_ws = Workspace::new(dir.path()).unwrap();
-    // A forked session over the same project has its own workspace instance and its own server.
+    // A forked session over the same project has its own workspace instance but joins the
+    // parent's server instead of indexing the project a second time.
     let child_ws = Workspace::new(dir.path()).unwrap();
     let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
     let parent = owner_tool(&fake_config(false), &logs);
@@ -1258,35 +1259,68 @@ fn write_through_reaches_only_the_session_that_executed_the_edit() {
     std::fs::write(&file, "one\n").unwrap();
     let symbols = json!({"action": "document_symbols", "path": "a.fk"});
     assert!(!run_as(&*parent, &parent_ws, symbols.clone()).is_error);
-    assert!(!run_as(&*child, &child_ws, symbols).is_error);
-    wait_until("both sessions started a server", || logs.lock().len() == 2);
-    let (parent_log, child_log) = {
-        let logs = logs.lock();
-        (Arc::clone(&logs[0]), Arc::clone(&logs[1]))
-    };
+    assert!(!run_as(&*child, &child_ws, symbols.clone()).is_error);
+    assert_eq!(logs.lock().len(), 1, "the fork started a second server");
+    let shared_log = Arc::clone(&logs.lock()[0]);
 
+    // Each session publishes its own edits once; the shared server sees each edit once.
     std::fs::write(&file, "one\ntwo\n").unwrap();
     writethrough(&parent_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
-    wait_until("parent notified of its edit", || notices(&parent_log) == 1);
-    assert_eq!(
-        notices(&child_log),
-        0,
-        "a parent edit reached the fork's server"
-    );
-
+    wait_until("server notified of the parent edit", || {
+        notices(&shared_log) == 1
+    });
     writethrough(&child_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
-    wait_until("fork notified of its edit", || notices(&child_log) == 1);
-    assert_eq!(
-        notices(&parent_log),
-        1,
-        "a fork edit reached the parent's server"
-    );
+    wait_until("server notified of the fork edit", || {
+        notices(&shared_log) == 2
+    });
 
-    // Dropping the fork releases only its own binding and server; the parent keeps receiving edits.
+    // Dropping the fork releases only its binding; the parent keeps the server and its edits.
     drop(child);
     writethrough(&parent_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
     wait_until("parent still notified after the fork is dropped", || {
-        notices(&parent_log) == 2
+        notices(&shared_log) == 3
+    });
+    assert_eq!(logs.lock().len(), 1);
+
+    // Another root never receives this server.
+    let other = tempfile::tempdir().unwrap();
+    let other_ws = Workspace::new(other.path()).unwrap();
+    std::fs::write(other_ws.root().join("a.fk"), "one\n").unwrap();
+    let elsewhere = parent.fork_session().unwrap();
+    assert!(!run_as(&*elsewhere, &other_ws, symbols).is_error);
+    assert_eq!(
+        logs.lock().len(),
+        2,
+        "another root reused this root's server"
+    );
+}
+
+#[test]
+fn cancelling_one_session_leaves_a_shared_servers_other_requests_running() {
+    let (_dir, ws) = project();
+    let (client, log) = fake_client(ws.root(), fast());
+    let client = Arc::new(client);
+    thread::scope(|scope| {
+        let waiting = {
+            let client = Arc::clone(&client);
+            scope.spawn(move || client::with_owner(7, || client.request("test/never", json!({}))))
+        };
+        let cancelled = {
+            let client = Arc::clone(&client);
+            scope.spawn(move || client::with_owner(8, || client.request("test/never", json!({}))))
+        };
+        wait_until("both requests reached the server", || {
+            methods(&log).iter().filter(|m| *m == "test/never").count() == 2
+        });
+        client.cancel_pending_requests(8);
+        let error = cancelled.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(
+            !waiting.is_finished(),
+            "another session's request was cancelled"
+        );
+        client.cancel_pending_requests(7);
+        assert!(waiting.join().unwrap().is_err());
     });
 }
 

@@ -10,10 +10,7 @@ fn line_start(src: &str, at: usize) -> usize {
 /// End (exclusive, before the newline) of the line containing byte `at`.
 fn line_end(src: &str, at: usize) -> usize {
     // `at` can land inside a multibyte char when a splice ends with one; back up to its start.
-    let mut at = at;
-    while !src.is_char_boundary(at) {
-        at -= 1;
-    }
+    let at = src.floor_char_boundary(at);
     src[at..].find('\n').map_or(src.len(), |i| at + i)
 }
 

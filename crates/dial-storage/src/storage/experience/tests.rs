@@ -23,7 +23,7 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Root, Experience) {
     let store = Experience::open(&layout).unwrap();
     #[cfg(windows)]
     assert!(
-        platform_fs::is_owner_only(
+        crate::platform::fs::is_owner_only(
             &fs::File::open(layout.state_dir.join("experience.sqlite3")).unwrap()
         )
         .unwrap()

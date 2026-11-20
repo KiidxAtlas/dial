@@ -769,10 +769,7 @@ fn bounded_section(ws: &Workspace, input: &str, text: &str, room: usize) -> Stri
     if text.len() <= room || can_witness(ws, input) {
         return text.to_owned();
     }
-    let mut end = room.saturating_sub(CUT.len()).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(room.saturating_sub(CUT.len()));
     let kept = &text[..end];
     let kept = kept.rfind('\n').map_or("", |newline| &kept[..newline]);
     format!("{kept}{CUT}")
@@ -828,10 +825,7 @@ fn error_line(path: &str, error: &str) -> String {
     if line.len() <= ERROR_LINE_CAP {
         return line;
     }
-    let mut end = ERROR_LINE_CAP - "…".len();
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = line.floor_char_boundary(ERROR_LINE_CAP - "…".len());
     format!("{}…", &line[..end])
 }
 
@@ -1174,9 +1168,7 @@ fn unseen_overwrite_projection(ws: &Workspace, path: &Path, before: &str) -> Opt
     // Use the already-loaded snapshot, not another disk read that could return a larger file.
     let tag = ws.store().record(path, &normalized, &[(1, lines.len())]);
     let rel = crate::tools::edit::edit_source::display_path(ws.rel(path));
-    let revision = crate::tools::edit::edit_source::hex_revision(
-        crate::tools::edit::edit_source::revision(before),
-    );
+    let revision = crate::tools::edit::edit_source::revision_hex(before);
     let mut text = format!("[{rel}#{tag}]\n[Source raw SHA256:{revision}]\n");
     for (index, line) in lines.iter().enumerate() {
         use std::fmt::Write;

@@ -6,7 +6,8 @@
 //! Typed search always covers every registered command; the category tabs stay one key away.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{
+    panel_keys::{Edge, list_move},
+    widgets::{
         editor_spans, filled, hint_line, panel, pressed, scroll_cell, tab_strip, typed_char,
     },
 };
@@ -844,14 +845,8 @@ impl PaletteOverlay {
         }
         let rows = self.rows();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
-        if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(rows.len().saturating_sub(1));
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(self.page);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + self.page).min(rows.len().saturating_sub(1));
+        if let Some(cursor) = list_move(keys, key, self.cursor, rows.len(), self.page, Edge::Stop) {
+            self.cursor = cursor;
         } else if keys.matches(Action::SelectConfirm, key) {
             if let Some(&row) = rows.get(self.cursor) {
                 return self.activate(row);
@@ -1304,16 +1299,15 @@ impl PaletteOverlay {
                 rows.len().min(room)
             };
             self.page = list_h;
-            if self.cursor < self.scroll {
-                self.scroll = self.cursor;
-            }
-            if self.cursor >= self.scroll + list_h {
-                self.scroll = (self.cursor + 1).saturating_sub(list_h.max(1));
-            }
-            self.scroll = self.scroll.min(rows.len().saturating_sub(list_h));
+            self.scroll = chrome::keep_in_view(self.cursor, self.scroll, list_h, rows.len());
             let picker = self.choice.is_some();
             let name_w = self.name_width(&rows, w);
-            let mut pending_empty: Vec<String> = Vec::new();
+            let mut empty = if rows.is_empty() {
+                super::widgets::empty_rows(theme, &self.empty_message(), w, list_h)
+            } else {
+                Vec::new()
+            }
+            .into_iter();
             for row in 0..list_h {
                 if let Some(&picked) = rows.get(self.scroll + row) {
                     let selected = self.scroll + row == self.cursor;
@@ -1464,19 +1458,8 @@ impl PaletteOverlay {
                     line.spans
                         .push(scroll_cell(theme, row, list_h, rows.len(), self.scroll));
                     out.push(line);
-                } else if row == 0 {
-                    // The empty message names the way out, so it wraps rather than clipping it.
-                    let room = w.saturating_sub(2).max(1);
-                    let wrapped = text::wrap_words(self.empty_message().trim(), room);
-                    let mut wrapped = wrapped.into_iter();
-                    if let Some(first) = wrapped.next() {
-                        out.push(line(format!(" {first}"), Tok::Muted));
-                    }
-                    pending_empty = wrapped.collect();
-                } else if !pending_empty.is_empty() {
-                    out.push(line(format!(" {}", pending_empty.remove(0)), Tok::Muted));
                 } else {
-                    out.push(Line::default());
+                    out.push(empty.next().unwrap_or_default());
                 }
             }
             if let Some(&picked) = rows.get(self.cursor) {
@@ -1631,10 +1614,8 @@ impl PaletteOverlay {
 /// The longest of `extras` that fits on a `width`-cell panel top row beside `title` without
 /// touching it; the last candidate (usually empty) when none does.
 pub(super) fn title_extra(theme: &Theme, title: &str, width: u16, extras: &[&str]) -> String {
-    let title_w = 1 + crate::ui::chrome::fig_label(theme, Section::Dial, title)
-        .iter()
-        .map(|span| text::width(&span.content))
-        .sum::<usize>();
+    let label = crate::ui::chrome::fig_label(theme, Section::Dial, title);
+    let title_w = 1 + text::spans_width(&label);
     extras
         .iter()
         .find(|extra| extra.is_empty() || title_w + 2 + text::width(extra) < usize::from(width))

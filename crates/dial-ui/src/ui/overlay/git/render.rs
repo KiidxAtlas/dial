@@ -1,6 +1,6 @@
 use super::super::{
     DrawCtx,
-    settings::{Axis, arrows, editor_spans, filled, hint, hint_line, scroll_cell},
+    widgets::{Axis, arrows, editor_spans, filled, hint, hint_line, scroll_cell},
 };
 use super::{
     GitOverlay,
@@ -15,11 +15,35 @@ use crate::ui::{
     text,
     theme::{Sym, Theme, Tok},
 };
-use crossterm::event::KeyEvent;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+
+/// The column split of the panel body. `compose` draws with it and the mouse hit tests read it, so a
+/// click lands on the column that was drawn there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Columns {
+    /// Width of the diff column, minimap included.
+    pub(super) diff_w: usize,
+    /// Width of the changes sidebar; zero in narrow panels, where the sidebar stacks under the diff.
+    pub(super) side_w: usize,
+}
+
+impl Columns {
+    pub(super) fn split(width: usize) -> Self {
+        let side_w = if width < view::NARROW_COLS {
+            0
+        } else {
+            (width * 3 / 10).clamp(26, 48)
+        };
+        let sep = usize::from(side_w > 0);
+        Self {
+            diff_w: width - side_w - sep,
+            side_w,
+        }
+    }
+}
 
 impl GitOverlay {
     // ---- rendering ----
@@ -119,13 +143,7 @@ impl GitOverlay {
         }
         let theme = ctx.theme;
         let narrow = w < view::NARROW_COLS;
-        let side_w = if narrow {
-            0
-        } else {
-            (w * 3 / 10).clamp(26, 48)
-        };
-        let sep = if side_w > 0 { 1 } else { 0 };
-        let diff_w = w - side_w - sep;
+        let Columns { diff_w, side_w, .. } = Columns::split(w);
         let body_h = h - 2;
         // Narrow terminals stack the changes sheet under the diff and keep the top share for the diff.
         let stack_h = if narrow {
@@ -279,9 +297,7 @@ impl GitOverlay {
             right.extend(chips.iter().cloned());
             right
         };
-        let cells = |spans: &[Span<'static>]| -> usize {
-            spans.iter().map(|s| text::width(&s.content)).sum()
-        };
+        let cells = |spans: &[Span<'static>]| -> usize { text::spans_width(spans) };
         // The file comes first: on a narrow pane its directory, its staging area and finally the
         // other view tabs give way so the file name stays readable.
         let parts = self.shown.as_ref().map(|shown| {
@@ -492,6 +508,12 @@ impl GitOverlay {
             .collect();
 
         let focused = self.focus == Focus::Diff;
+        let mut empty = if visible.is_empty() {
+            super::super::widgets::empty_rows(theme, &self.empty_message(), text_w, body_h)
+        } else {
+            Vec::new()
+        }
+        .into_iter();
         let mut visible = visible.into_iter();
         (0..body_h)
             .map(|i| {
@@ -504,11 +526,10 @@ impl GitOverlay {
                         }
                         spans
                     }
-                    None if i == 0 => pad(
-                        vec![Span::styled(self.empty_message(), theme.fg(Tok::Muted))],
-                        text_w,
-                    ),
-                    None => pad(Vec::new(), text_w),
+                    None => empty
+                        .next()
+                        .map(|line| line.spans)
+                        .unwrap_or_else(|| pad(Vec::new(), text_w)),
                 };
                 spans.extend(Self::minimap_cell(&marks, i, body_h, top, mm, theme));
                 spans
@@ -824,10 +845,6 @@ impl GitOverlay {
 
 fn pad(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     filled(spans, width, Style::default()).spans
-}
-
-pub(super) fn plain_char(key: &KeyEvent) -> Option<char> {
-    crate::ui::keys::typed_char(key)
 }
 
 fn skip_chars(text: &str, count: usize) -> String {

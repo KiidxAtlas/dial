@@ -32,6 +32,59 @@ fn accumulator_streams_wrapped_cca_parts_and_retains_signature_and_execution_id(
 }
 
 #[test]
+fn antigravity_pro_catalog_effort_reaches_gemini_request() {
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hey"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 1024,
+        seed: None,
+    };
+    for (model, effort, thinking, expected) in [
+        (
+            "gemini-3.1-pro",
+            Some(ReasoningEffort::Low),
+            true,
+            json!({"includeThoughts": true, "thinkingLevel": "LOW"}),
+        ),
+        (
+            "gemini-3.1-pro",
+            Some(ReasoningEffort::High),
+            true,
+            json!({"includeThoughts": true, "thinkingLevel": "HIGH"}),
+        ),
+        (
+            "gemini-2.5-pro",
+            None,
+            false,
+            json!({"includeThoughts": false, "thinkingBudget": 0}),
+        ),
+    ] {
+        let config = crate::config::Config {
+            provider: Some("google-antigravity".into()),
+            model: model.into(),
+            ..Default::default()
+        };
+        let mut profile = crate::config::thinking::reasoning_profile(&config)
+            .unwrap()
+            .unwrap();
+        profile.reasoning_effort = effort;
+        profile.thinking = Some(thinking);
+        let endpoint = Endpoint {
+            url: "https://example.test",
+            model,
+            auth: None,
+            headers: &[],
+        };
+        let body = request(&endpoint, &chat, Some(&profile), "scope").unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"], expected,
+            "{model}"
+        );
+    }
+}
+
+#[test]
 fn reasoning_effort_wire_reaches_gemini_thinking_level_and_none_keeps_zero_budget() {
     use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
     use std::collections::BTreeMap;
@@ -103,4 +156,61 @@ fn foreign_tool_history_replays_as_text_instead_of_refusing_the_chat() {
     assert!(text.contains("read({\\\"path\\\":\\\"a.rs\\\"})"), "{text}");
     assert!(text.contains("fn main() {}"), "{text}");
     assert_eq!(body["contents"][1]["role"], "model");
+}
+
+#[test]
+fn antigravity_model_variant_sends_no_thinking_config_and_refuses_stale_effort() {
+    use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    let chat = Chat {
+        messages: vec![serde_json::json!({"role":"user","content":"hi"})],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 64,
+        seed: None,
+    };
+    let endpoint = Endpoint {
+        url: "https://example.test",
+        auth: None,
+        model: "gemini-3.5-flash-high",
+        headers: &[],
+    };
+    let profile = |thinking, effort| ModelProfile {
+        provider: "google-antigravity".into(),
+        model: "gemini-3.5-flash".into(),
+        thinking,
+        reasoning_effort: Some(effort),
+        capabilities: ModelCapabilities {
+            reasoning: ReasoningApi::AntigravityModelVariant,
+            reasoning_efforts: vec![ReasoningEffort::High],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let body = request(
+        &endpoint,
+        &chat,
+        Some(&profile(None, ReasoningEffort::High)),
+        "main",
+    )
+    .unwrap();
+    assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    // A stale or unlisted effort, or a thinking switch, is refused before any wire model is chosen.
+    assert!(
+        request(
+            &endpoint,
+            &chat,
+            Some(&profile(None, ReasoningEffort::Low)),
+            "main"
+        )
+        .is_err()
+    );
+    assert!(
+        request(
+            &endpoint,
+            &chat,
+            Some(&profile(Some(true), ReasoningEffort::High)),
+            "main"
+        )
+        .is_err()
+    );
 }

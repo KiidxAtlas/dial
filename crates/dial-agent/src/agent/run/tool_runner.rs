@@ -694,7 +694,10 @@ impl Agent<'_> {
                         Event::Repair(request, reply) => {
                             let result = if self.interrupt.load(Ordering::SeqCst) {
                                 Err("edit repair cancelled".into())
-                            } else if !guarded_edit || !self.config.edit.auto_repair.enabled {
+                            } else if !guarded_edit
+                                || !self.config.edit.auto_repair.enabled
+                                || !self.config.edit.auto_repair.coach
+                            {
                                 Err("edit repair is not enabled for this execution owner".into())
                             } else if let Some(main) = backend.as_deref_mut() {
                                 self.repair_edit(main, &request, ui)

@@ -1,11 +1,11 @@
 //! History browsing and incremental history search.
 use super::super::{
-    Rows,
+    Rows, chrome,
     keys::Action,
     text,
     theme::{Sym, Tok},
 };
-use super::render::{finish_row, highlighted, list_rows, render_list, substring_hits, window};
+use super::render::{finish_row, list_rows, render_list, substring_hits};
 use super::{Composer, ComposerCtx, ComposerEvent, HistoryProvider, Search};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{style::Modifier, text::Span};
@@ -180,7 +180,7 @@ impl Composer {
                 search.selected =
                     (search.selected as isize + delta).clamp(0, total as isize - 1) as usize;
             }
-            search.scroll = window(search.selected, search.scroll, rows, total);
+            search.scroll = chrome::keep_in_view(search.selected, search.scroll, rows, total);
         };
         if keys.matches(Action::SelectUp, &key) {
             step(search, -1);
@@ -297,7 +297,7 @@ impl Composer {
         }
         let total = matches.len();
         let shown = list_rows(ctx.ui).min(total);
-        let start = window(search.selected, search.scroll, shown, total);
+        let start = chrome::keep_in_view(search.selected, search.scroll, shown, total);
         let pointer = theme.sym(Sym::Pointer);
         let blank_pointer = " ".repeat(text::width(pointer));
         let accent = theme.fg(Tok::Accent);
@@ -326,7 +326,7 @@ impl Composer {
                     ),
                     Span::raw(" "),
                 ];
-                spans.extend(highlighted(&entry, &hits, theme.fg(Tok::Text), hit));
+                spans.extend(chrome::highlighted(&entry, &hits, theme.fg(Tok::Text), hit));
                 spans
             },
         ));

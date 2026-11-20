@@ -2,15 +2,8 @@ use super::*;
 use crate::runtime::evidence::{
     Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
 };
-use crate::storage::artifact::ArtifactStore;
 use crate::tools::testkit;
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
 fn retain(
     ws: &Workspace,
     media: &str,
@@ -39,7 +32,7 @@ fn find(ws: &Workspace, value: Value) -> Retrieved {
 }
 #[test]
 fn mixed_sources_preserve_quotes_values_coordinates_and_manifests() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = retain(
         &ws,
         "text/plain",
@@ -88,7 +81,7 @@ fn mixed_sources_preserve_quotes_values_coordinates_and_manifests() {
 }
 #[test]
 fn semantic_selects_lexical_misses_and_rejects_invalid_selections() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = retain(
         &ws,
         "text/plain",
@@ -120,7 +113,7 @@ fn semantic_selects_lexical_misses_and_rejects_invalid_selections() {
 }
 #[test]
 fn explicit_gaps_for_missing_tampered_binary_and_oversize_artifacts() {
-    let (_work, state, ws) = fixture();
+    let (_work, state, ws) = testkit::workspace_with_artifacts();
     let a = retain(
         &ws,
         "text/plain",
@@ -169,7 +162,7 @@ fn explicit_gaps_for_missing_tampered_binary_and_oversize_artifacts() {
 }
 #[test]
 fn budgets_and_cancellation_are_enforced() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = retain(
         &ws,
         "text/plain",

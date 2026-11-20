@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{Axis, arrows, filled, hint, hint_line, panel},
+    widgets::{Axis, arrows, filled, hint, hint_line, panel, section_rule},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -726,8 +726,8 @@ impl SubagentsOverlay {
         // Counts share the top border with the title; drop the least urgent ones until they fit.
         let room = usize::from(area.width).saturating_sub(text::width("Workers") + 6);
         let extra = fit_counts(
-            &status_counts(&self.agents, &sep(ctx.theme)),
-            &sep(ctx.theme),
+            &status_counts(&self.agents, &ctx.theme.dot_sep()),
+            &ctx.theme.dot_sep(),
             room,
         );
         let inset = u16::from(area.width >= 5 && area.height >= 5);
@@ -808,13 +808,13 @@ impl SubagentsOverlay {
             tab("1 Workers", self.tab == Tab::Agents),
             tab("2 Events", self.tab == Tab::Activity),
         ];
-        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&spans);
         let room = w.saturating_sub(used + 2);
         if !parts.is_empty() && room >= 6 {
             spans.push(Span::styled(
                 format!(
                     "  {}",
-                    text::ellipsize(&parts.join(&sep(theme)), room, theme.ascii())
+                    text::ellipsize(&parts.join(&theme.dot_sep()), room, theme.ascii())
                 ),
                 theme.fg(Tok::Dim),
             ));
@@ -828,7 +828,7 @@ impl SubagentsOverlay {
             .iter()
             .map(|route| text::one_line(route).trim().to_owned())
             .collect::<Vec<_>>()
-            .join(&sep(theme));
+            .join(&theme.dot_sep());
         filled(
             vec![Span::styled(
                 format!(" roles: {}", text::clip(&joined, w.saturating_sub(8))),
@@ -854,7 +854,7 @@ impl SubagentsOverlay {
                     return Line::default();
                 }
                 (
-                    format!(" filter: {query}{}Esc clear search", sep(theme)),
+                    format!(" filter: {query}{}Esc clear search", theme.dot_sep()),
                     Tok::Dim,
                 )
             }
@@ -1189,16 +1189,12 @@ impl SubagentsOverlay {
             // A count of letters sent to it, not a read state: nothing here marks them read.
             let envelope = if ascii { "" } else { "✉ " };
             left.push(Span::styled(
-                format!(
-                    "  {envelope}{} msg{}",
-                    agent.inbound,
-                    if agent.inbound == 1 { "" } else { "s" }
-                ),
+                format!("  {envelope}{}", text::counted(agent.inbound, "msg")),
                 theme.fg(Tok::Accent),
             ));
         }
         let badge = badge_of(agent, theme);
-        let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
+        let left_w: usize = text::spans_width(&left);
         let room = w.saturating_sub(left_w + 2);
         let badge = if room >= 4 {
             text::ellipsize(&badge, room, ascii)
@@ -1217,7 +1213,7 @@ impl SubagentsOverlay {
                 text::one_line(&agent.task)
             };
             let suffix = if shared > 1 {
-                format!("{}{shared} workers", sep(theme))
+                format!("{}{shared} workers", theme.dot_sep())
             } else {
                 String::new()
             };
@@ -1248,7 +1244,7 @@ impl SubagentsOverlay {
                 };
                 let mut d = format!("{lead} {}", text::one_line(current));
                 if let Some((n, max)) = retry {
-                    d.push_str(&format!("{}retry {n}/{max}", sep(theme)));
+                    d.push_str(&format!("{}retry {n}/{max}", theme.dot_sep()));
                 }
                 d
             }
@@ -1261,7 +1257,7 @@ impl SubagentsOverlay {
                     _ => format!("{} {result}", if ascii { "=>" } else { "→" }),
                 }
             }
-            _ => metrics(agent, epoch_ms()).join(&sep(theme)),
+            _ => metrics(agent, epoch_ms()).join(&theme.dot_sep()),
         };
         let detail_tok = match agent.status {
             AgentStatus::Waiting | AgentStatus::NeedsInput | AgentStatus::Blocked => Tok::Warning,
@@ -1336,7 +1332,7 @@ impl SubagentsOverlay {
         }
         lines.push(filled(status, w, Style::default()));
 
-        lines.push(heading("Task", w, theme));
+        lines.push(section_rule(theme, "Task", w));
         let task = text::one_line(&agent.task);
         if task.trim().is_empty() {
             lines.push(field(" No task text recorded.", w, theme));
@@ -1359,7 +1355,7 @@ impl SubagentsOverlay {
             .filter(|c| !c.trim().is_empty());
         match agent.status {
             AgentStatus::Running => {
-                lines.push(heading("Now", w, theme));
+                lines.push(section_rule(theme, "Now", w));
                 lines.extend(kv_wrapped(
                     "doing",
                     current.as_deref().unwrap_or("thinking"),
@@ -1368,7 +1364,7 @@ impl SubagentsOverlay {
                 ));
             }
             AgentStatus::Waiting | AgentStatus::NeedsInput => {
-                lines.push(heading("Needs your input", w, theme));
+                lines.push(section_rule(theme, "Needs your input", w));
                 lines.extend(kv_wrapped(
                     "asks",
                     current
@@ -1387,7 +1383,7 @@ impl SubagentsOverlay {
             }
             _ => {
                 if let Some(result) = result.as_deref() {
-                    lines.push(heading("Outcome", w, theme));
+                    lines.push(section_rule(theme, "Outcome", w));
                     lines.extend(kv_wrapped("result", result, w, theme));
                 }
             }
@@ -1397,7 +1393,7 @@ impl SubagentsOverlay {
         }
 
         if let Some(config) = &agent.config {
-            lines.push(heading("Settings", w, theme));
+            lines.push(section_rule(theme, "Settings", w));
             let state = match config.state.as_str() {
                 "not_applied" => "failed (not applied)",
                 "launch" => "launch config",
@@ -1435,7 +1431,7 @@ impl SubagentsOverlay {
             }
         }
 
-        lines.push(heading("Usage", w, theme));
+        lines.push(section_rule(theme, "Usage", w));
         let usage = usage_rows(agent, w, theme);
         if usage.is_empty() {
             lines.push(field(" No usage reported yet.", w, theme));
@@ -1459,7 +1455,7 @@ impl SubagentsOverlay {
             details.push((label.clone(), path.clone()));
         }
         if !details.is_empty() {
-            lines.push(heading("Details", w, theme));
+            lines.push(section_rule(theme, "Details", w));
             for (label, value) in &details {
                 lines.push(kv(label, value, w, theme));
             }
@@ -1471,7 +1467,7 @@ impl SubagentsOverlay {
             .filter(|event| event.agent_id == agent.id)
             .collect();
         if !recent.is_empty() {
-            lines.push(heading("Recent activity", w, theme));
+            lines.push(section_rule(theme, "Recent activity", w));
         }
         for event in recent.iter().rev().take(RECENT_ACTIVITY).rev() {
             let age = if event.timed {
@@ -1496,7 +1492,7 @@ impl SubagentsOverlay {
     fn activity_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {
         let rows = self.activity_rows();
         let pos = self.activity_pos(rows.len());
-        let dot = sep(theme);
+        let dot = theme.dot_sep();
         let mut status = format!(
             " {}{dot}{} shown",
             activity_phrase(self.activity_filter, &self.activity_scope),
@@ -1609,29 +1605,14 @@ impl SubagentsOverlay {
     }
 }
 
-/// The list separator in the theme's glyph set: ` · `, or ` - ` in ASCII.
-fn sep(theme: &Theme) -> String {
-    format!(" {} ", theme.sym(Sym::Dot))
-}
-
 fn plain(key: &KeyEvent) -> bool {
     !key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn status_glyph(status: AgentStatus, theme: &Theme) -> (String, Tok) {
-    match status {
-        AgentStatus::Running => (theme.sym(Sym::Working).to_string(), Tok::Accent),
-        AgentStatus::Waiting | AgentStatus::NeedsInput => {
-            (theme.sym(Sym::Warn).to_string(), Tok::Warning)
-        }
-        AgentStatus::Blocked => (theme.sym(Sym::Blocked).to_string(), Tok::Warning),
-        AgentStatus::Done => (theme.sym(Sym::Check).to_string(), Tok::Success),
-        AgentStatus::Answered => (theme.sym(Sym::Dot).to_string(), Tok::Muted),
-        AgentStatus::Failed => (theme.sym(Sym::Cross2).to_string(), Tok::Error),
-        AgentStatus::Cancelled => (theme.sym(Sym::Dot).to_string(), Tok::Dim),
-        AgentStatus::Interrupted => (theme.sym(Sym::Warn).to_string(), Tok::Warning),
-    }
+    let mark = status.state_mark();
+    (mark.glyph(theme).to_owned(), mark.tok())
 }
 
 fn kind_glyph(kind: ActivityKind, theme: &Theme) -> String {
@@ -1667,7 +1648,7 @@ fn badge_of(agent: &AgentEntry, theme: &Theme) -> String {
         Some(agent.model.as_str())
     };
     match (role, model) {
-        (Some(role), Some(model)) => format!("{role}{}{model}", sep(theme)),
+        (Some(role), Some(model)) => format!("{role}{}{model}", theme.dot_sep()),
         (Some(role), None) => role.to_owned(),
         (None, Some(model)) => model.to_owned(),
         (None, None) => agent.agent.clone(),
@@ -1683,10 +1664,7 @@ fn status_counts(agents: &[AgentEntry], sep: &str) -> String {
     }
     let counts = StatusCounts::of(agents);
     let total = counts.total;
-    let mut parts = vec![format!(
-        "{total} worker{}",
-        if total == 1 { "" } else { "s" }
-    )];
+    let mut parts = vec![text::counted(total, "worker")];
     let attention = if counts.trouble == 1 {
         "needs attention"
     } else {
@@ -1741,15 +1719,10 @@ fn activity_phrase(filter: ActivityFilter, scope: &ActivityScope) -> String {
 /// Inspector status line in words the operator acts on.
 fn status_phrase(status: AgentStatus) -> &'static str {
     match status {
-        AgentStatus::Running => "running",
         AgentStatus::Waiting => "needs your input",
         AgentStatus::NeedsInput => "finished; needs your input",
         AgentStatus::Blocked => "finished blocked",
-        AgentStatus::Done => "completed",
-        AgentStatus::Answered => "answered",
-        AgentStatus::Failed => "failed",
-        AgentStatus::Cancelled => "stopped",
-        AgentStatus::Interrupted => "interrupted",
+        _ => status.label(),
     }
 }
 
@@ -1769,7 +1742,7 @@ fn usage_rows(agent: &AgentEntry, w: usize, theme: &Theme) -> Vec<(&'static str,
             format!(
                 "in {}{}out {}",
                 i.map_or("?".into(), text::compact_count),
-                sep(theme),
+                theme.dot_sep(),
                 o.map_or("?".into(), text::compact_count)
             ),
         )),
@@ -1827,22 +1800,6 @@ fn metrics(agent: &AgentEntry, now: u64) -> Vec<String> {
         parts.push(agent.status.label().to_owned());
     }
     parts
-}
-
-fn heading(title: &str, w: usize, theme: &Theme) -> Line<'static> {
-    let label = format!(" {title} ");
-    let fill = w.saturating_sub(text::width(&label) + 1);
-    filled(
-        vec![
-            Span::styled(label, theme.fg(Tok::Muted).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                theme.sym(Sym::BoxH).repeat(fill),
-                theme.fg(Tok::BorderMuted),
-            ),
-        ],
-        w,
-        Style::default(),
-    )
 }
 
 fn field(value: &str, w: usize, theme: &Theme) -> Line<'static> {
@@ -1914,13 +1871,7 @@ fn cell(value: &str, n: usize) -> String {
 }
 
 fn ago(at_ms: u64, now: u64) -> String {
-    let secs = now.saturating_sub(at_ms) / 1000;
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        3600..86_400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
-    }
+    text::age_compact(now.saturating_sub(at_ms) / 1000)
 }
 
 fn duration(ms: u64) -> String {

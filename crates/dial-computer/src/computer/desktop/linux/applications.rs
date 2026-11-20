@@ -253,10 +253,7 @@ fn executable_path(executable: &str, working_directory: Option<&Path>) -> Option
         return None;
     }
     let executable = Path::new(executable);
-    let usable = |path: PathBuf| {
-        let metadata = fs::metadata(&path).ok()?;
-        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(path)
-    };
+    let usable = |path: PathBuf| crate::platform::fs::is_executable(&path).then_some(path);
     if executable.is_absolute() {
         return usable(executable.to_owned());
     }

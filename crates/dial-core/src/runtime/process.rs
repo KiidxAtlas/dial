@@ -214,10 +214,7 @@ impl Finished {
         if text.len() <= max {
             return text.to_owned();
         }
-        let mut start = text.len() - max;
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
+        let start = text.ceil_char_boundary(text.len() - max);
         format!("…{}", &text[start..])
     }
     pub fn output_integrity(&self) -> super::execution::OutputIntegrity {

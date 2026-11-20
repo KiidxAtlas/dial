@@ -320,3 +320,66 @@ fn local_commit_installs_every_target_and_leaves_no_staging_entries() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+/// The shared preflight refuses each invalid batch before any target is touched: duplicate targets,
+/// an oversized replacement, a `before` that went stale, and a batch over the target cap. The
+/// target and the staging directory are unchanged afterwards.
+#[test]
+fn preflight_refuses_each_invalid_batch_before_any_write() {
+    type Build = fn(&Workspace, &Path) -> Vec<Change>;
+    let cases: [(&str, Build, &str); 4] = [
+        (
+            "duplicate target",
+            |ws: &Workspace, a: &Path| {
+                vec![
+                    Change::load(ws, a.to_path_buf(), Some("one\n".into())).unwrap(),
+                    Change::load(ws, a.to_path_buf(), Some("two\n".into())).unwrap(),
+                ]
+            },
+            "duplicate edit target",
+        ),
+        (
+            "oversized replacement",
+            |ws: &Workspace, a: &Path| {
+                let oversized = "x".repeat(super::MAX_FILE + 1);
+                vec![Change::load(ws, a.to_path_buf(), Some(oversized)).unwrap()]
+            },
+            "exceeds 4 MiB",
+        ),
+        (
+            "stale before",
+            |ws: &Workspace, a: &Path| {
+                let change = Change::load(ws, a.to_path_buf(), Some("edited\n".into())).unwrap();
+                std::fs::write(a, "moved\n").unwrap();
+                vec![change]
+            },
+            "changed before commit",
+        ),
+        (
+            "target cap",
+            |ws: &Workspace, _: &Path| {
+                (0..=128)
+                    .map(|i| {
+                        let path = ws.root().join(format!("f{i}.txt"));
+                        Change::load(ws, path, Some("x\n".into())).unwrap()
+                    })
+                    .collect()
+            },
+            "exceeds 128 targets",
+        ),
+    ];
+    for (name, build, expected) in cases {
+        let (dir, ws, a) = project(None);
+        let changes = build(&ws, &a);
+        let before = std::fs::read_to_string(&a).unwrap();
+        let error = commit(&ws, &changes).unwrap_err();
+        assert!(error.contains(expected), "{name}: {error}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), before, "{name}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".dial-edit-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{name}: {leftovers:?}");
+    }
+}

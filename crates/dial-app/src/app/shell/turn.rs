@@ -5,8 +5,8 @@ use crate::app::bridge::Bridge;
 use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
+use crate::app::shell::Shell;
 use crate::app::shell::teach::TEACH_OFF;
-use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::cli::watch::state::ChatRole;
 use crate::config::types::Outcome;
 use crate::platform;
@@ -262,16 +262,7 @@ impl Shell {
             self.note("BTW", format!("error: {error:#}"));
         }
         let (result, failed, streamed_tokens) = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started,
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::started_at(app, self, started);
             bridge.repaint(true);
             let result = match input {
                 TurnInput::Peer => agent.resume_from_peer(&mut bridge),
@@ -417,6 +408,7 @@ impl Shell {
         let halted = result
             .as_ref()
             .map_or(true, |report| report.halts_automation());
+        self.last_turn_halted = halted;
         if !automatic {
             self.loop_mode.turn_settled(Instant::now(), halted);
         }

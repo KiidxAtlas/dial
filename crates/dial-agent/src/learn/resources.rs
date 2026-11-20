@@ -8,18 +8,9 @@
 use crate::config::settings_store;
 use crate::config::types::ImproveConfig;
 use anyhow::{Context, Result, bail};
-use std::{
-    path::Path,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, process::Command};
 
-/// Seconds since the epoch.
-pub(super) fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
+pub(super) use crate::runtime::clock::unix_secs as now;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {

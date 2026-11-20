@@ -381,7 +381,7 @@ Routing only offers a schema. It grants no permission and never answers from a s
       without structured result URLs report that there are no eligible pages rather than parsing
       links from prose. The approved search explicitly includes these fetches; it does not enable
       unrestricted network access or forward search-provider credentials to result pages.
-  - `lsp`: definitions, references, hover, implementations, type definitions, symbols and diagnostics, plus transactional rename/code-action edits with document-version, UTF-16, freshness and complete-target permission checks. Server commands/startup remain explicit trusted effects; language servers come from `PATH` or `[lsp.<language>]`. After an edit, if a language server for that file is already running, Dial waits up to 1.5 s and appends `[LSP advisory, not verification]` with up to 8 `path:line:col: message` lines: only error diagnostics the edit introduced, compared with what the server reported for that file before the edit. With no running server nothing waits and no server is started. Turn it off with `[lsp] diagnostics_on_write = false`.
+  - `lsp`: definitions, references, hover, implementations, type definitions, symbols and diagnostics, plus transactional rename/code-action edits with document-version, UTF-16, freshness and complete-target permission checks. Server commands/startup remain explicit trusted effects; language servers come from `PATH` or `[lsp.<language>]`. Sessions in one Dial process (a session and its subagents, or several RPC sessions) share a running server when the language, command, arguments, settings, initialization options and workspace root all match; each session still cancels only its own requests, and the server stops once no session uses it (a reload stops it for everyone). After an edit, if a language server for that file is already running, Dial waits up to 1.5 s and appends `[LSP advisory, not verification]` with up to 8 `path:line:col: message` lines: only error diagnostics the edit introduced, compared with what the server reported for that file before the edit. With no running server nothing waits and no server is started. Turn it off with `[lsp] diagnostics_on_write = false`.
     - `request` (`action="request"`, approval required, may run any server method the session advertises): `query` is one LSP method such as `textDocument/inlayHint`, `payload` is a JSON object of its params, and `path` selects the server. Absent `textDocument` and `position` fields are filled from `path` and the 1-based `line`/`column`/`symbol`. Lifecycle, `$/*`, `window/*`, `client/*`, `*/refresh`, notifications, `workspace/executeCommand`, `workspace/applyEdit` and `codeAction/resolve` are refused with the action that replaces them. Results are bounded to 32 KiB of pretty JSON; a `WorkspaceEdit` result is validated and previewed as one transaction but never applied.
     - `format` applies whole-document formatting as one approved, checkpointed transaction; `apply:false` previews without writing. `completion` and `signature_help` report suggestions and signatures read-only. `call_hierarchy` lists callers (`direction:"incoming"`, the default) or callees (`"outgoing"`) of the first symbol prepared at the cursor. Each action requires the corresponding advertised server capability.
   - `dep_source` (read-only, loadable): the source of a dependency at the version this workspace locked or installed, for cargo (Cargo.lock + cargo registry/git checkouts), npm (`node_modules`), python (project `.venv` site-packages) go (`go.mod` + `vendor/` or the module cache), jvm (`gradle.lockfile` or the root `pom.xml`, including `${property}` versions, + the `-sources.jar` in `~/.m2/repository` or the Gradle module cache, read inside the jar without extracting it), ruby (`Gemfile.lock` + the bundle path or a gem directory from `GEM_HOME`, `GEM_PATH`, `~/.gem` or rbenv), composer (`composer.lock` + `vendor/`) and nuget (`packages.lock.json` or `obj/project.assets.json`, in the root or one directory below, + the NuGet global packages folder). Arguments: `name` (optionally `@version`; JVM names are `group:artifact`), `ecosystem` (inferred if omitted), `query` (literal search, `path:line` results), `path` (package-relative file with optional `:N-M`, or a directory). It never fetches, installs or runs package code and never leaves the package root. Packages in the resolved dependency caches outside the workspace (`CARGO_HOME/registry/src`, `CARGO_HOME/git/checkouts`, the Go module cache, the local Maven repository, the Gradle module cache, gem directories and the NuGet packages folder) are readable by this tool under both sandbox policies, never inside a denied path; other paths outside the workspace need the Dev policy or `/add-dir` under Strict. Read-only subagents may use it too.
@@ -508,6 +508,15 @@ Routing only offers a schema. It grants no permission and never answers from a s
     Capability-gated `restart` reuses the original launch and accepts no replacement arguments.
     If the adapter reopens configuration, resend breakpoints and exception filters, then
     `configurationDone`; an adapter may also complete restart without reopening configuration.
+    `readMemory` (`memoryReference`, `count` of 1–4096 bytes, optional `offset`) returns an
+    addressed hex/ASCII dump instead of base64, and `disassemble` (`memoryReference`,
+    `instructionCount` of 1–256, optional `offset`, `instructionOffset`, `resolveSymbols`)
+    returns the adapter's instructions. Each is refused unless the adapter advertises
+    `supportsReadMemoryRequest` or `supportsDisassembleRequest`; memory references come from
+    `evaluate`, `variables` or a stack frame's `instructionPointerReference`. `sessions` lists
+    the open sessions of every DAP tool in this Dial session, including subagents' (tool,
+    adapter, launch or attach target, state, stopped reason, breakpoint counts); it reports a
+    session in the middle of a call as busy and never starts an adapter.
   - `notebook`: revision-checked cell listing/read/source edits/insert/delete/move with immutable fresh source witnesses, JSON metadata preservation, stale-output handling and atomic rollback. It never executes cells.
   - `glab_mr` (opt-in via `integrations = ["glab_mr"]`): GitLab merge requests through the `glab` CLI, the GitLab counterpart of `github`. Read ops `mr_list`, `mr_view`, `mr_diff` need no approval; `mr_create`, `mr_checkout`, `mr_comment`, `mr_approve`, `mr_merge` need approval. `mr_checkout` adds a detached worktree (the primary checkout is untouched) and removes it if glab fails. `repo` takes `group/project` or `host/group/project`; when a token environment variable is set, an explicit host not listed in `GITLAB_HOST` is refused rather than sent the token. A missing `glab` or unauthenticated session is reported with install and `glab auth login` guidance.
   - `gitea_pr` (opt-in via `integrations = ["gitea_pr"]`): Gitea and Forgejo pull requests through the `tea` CLI, reached as `git` with `forge: "gitea"`. Read ops `pr_list`, `pr_view` need no approval; `pr_create`, `pr_comment`, `pr_approve`, `pr_merge` (`style`: merge, rebase, squash, rebase-merge) need approval. No op changes the local checkout. `repo` takes `owner/repo` only: the server and token come from tea's own login (`tea login add`) for the checkout's remote. There is no diff op; fetch the pull request ref with `git` instead. A missing `tea` or login is reported with setup guidance.
@@ -715,6 +724,7 @@ enabled = false
 
 [edit.auto_repair]
 enabled = false
+coach = false
 ```
 
 The mode selects the instructions and argument schema shown for the single `edit` tool, not a
@@ -774,9 +784,29 @@ the file points to `write` for whole-file rewrites, on both misses and successes
 All grammars retain fresh-file checks, complete-target approvals, cancellation and atomic rollback.
 Only full verbatim returned read/search lines establish edit witnesses; truncated, skipped,
 lossy and declaration-summary rows do not. Generated-file protection and seen-line enforcement
-are operator controls, not model arguments. Optional parse repair uses the actual coach role,
-returns complete source, is reparsed and is authorized again before any write. Blackbox recording
-stores bounded source in private state without promising secret redaction; opt in deliberately.
+are operator controls, not model arguments. Setting `edit.auto_repair.enabled = true` enables a
+local repair; it does not enable syntax checking or authorize a coach call. Only when an edit would
+otherwise be refused for breaking a previously valid file can Dial restore
+one lost `)`, `]` or `}` from the working version. The unchanged suffix locates the insertion;
+both syntax trees must place the token at the end of the same delimited construct. Apart from
+that byte, the entire edit must be a single identifier, number or `+`/`-` substitution within
+the construct on that line. This skips edits with no matching original delimiter, multi-hunk edits,
+reversions, lower-confidence grammars, and files over 64 KiB. It cannot distinguish an accidentally
+dropped closer from an intended *move* of the same closer: both possible files can parse but do
+different things. For this reason repair remains off by default. The edit result shows the committed
+change instead of a separate repair message. Advisory-only edits and explicit `allow_syntax_errors`
+keep their ordinary behavior, even with repair enabled.
+
+For the previous coach behavior, **also** set `edit.auto_repair.coach = true` and configure the
+coach role. Only after the local rule abstains does the built-in coach receive one changed hunk,
+its working version and file-relative parser positions. For separated changes,
+Dial tries undoing each hunk in memory and proceeds only if exactly one undo restores parsing.
+Ambiguous changes, exhausted isolation budgets and spans over 64 KiB skip the helper rather than
+sending the whole file. The built-in coach cannot return the original hunk as the fix.
+Dial splices the replacement into the proposal locally, reparses the
+complete file and rechecks authorization before writing. An unsuccessful helper leaves the ordinary
+syntax policy in charge. Blackbox recording stores bounded source in private state without promising
+secret redaction; opt in deliberately.
 Configured syntax blocking uses the same high-confidence error-count gate for native edits,
 whole-file writes and AST rewrites, including staged AST token apply. The complete AST candidate
 is checked before any sibling commits. Unsupported grammars remain nonblocking, existing error
@@ -814,6 +844,12 @@ unambiguous identifier spelling before validation: a tool name, a field of a clo
 a string enum value. This is not fuzzy execution: ambiguous matches and conflicting fields
 are not resolved by guessing. Free-form text (including source code, commands and filenames)
 is not spell-corrected. Normal scope, approval, sandbox and edit-witness requirements still apply.
+The same local compatibility step handles built-in and extension tool arguments. For a field
+declared `integer | null`, for example, it can turn `"3"` into `3` while preserving JSON `null`.
+This also works for nullable numbers and booleans in nested records and lists. If the schema
+also permits strings, the string stays a string. JSON-quoted field names are only unwrapped
+in closed records, not in open maps where the quotes may be part of the user's data.
+These conversions do not request another completion or retry a tool that has already run.
 
 Tolerated argument forms, each equivalent to the canonical call: an object- or array-typed
 field sent as a JSON string holding that container (`"repro": "{\"name\": …}"`) is decoded before

@@ -2,13 +2,6 @@ use super::*;
 use crate::tools::testkit;
 use std::fs;
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
-
 fn call(ws: &Workspace, args: Value) -> Result<ToolOutput> {
     super::run(ws, serde_json::from_value(args)?)
 }
@@ -34,7 +27,7 @@ fn missing_reference() -> String {
 
 #[test]
 fn capture_preserves_exact_bytes_and_reopens_durable_citations_with_original_context() {
-    let (work, state, ws) = fixture();
+    let (work, state, ws) = testkit::workspace_with_artifacts();
     let original = "first\r\nsecond café\r\nthird\nlast";
     fs::write(work.path().join("source.txt"), original).unwrap();
     let out = call(&ws, json!({"action":"capture", "path":"source.txt", "start":2, "count":1, "retain_source":true})).unwrap();
@@ -104,7 +97,7 @@ fn capture_preserves_exact_bytes_and_reopens_durable_citations_with_original_con
 
 #[test]
 fn context_without_original_cannot_read_outside_retained_representation() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("source.txt"), "first\nsecond\nthird\n").unwrap();
     let out = call(
         &ws,
@@ -155,7 +148,7 @@ fn context_without_original_cannot_read_outside_retained_representation() {
 
 #[test]
 fn comparison_and_freshness_distinguish_selected_bytes_from_original_snapshot() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     let path = work.path().join("source.txt");
     fs::write(&path, "same\nold\n").unwrap();
     let first = citation(
@@ -209,7 +202,7 @@ fn comparison_and_freshness_distinguish_selected_bytes_from_original_snapshot() 
 
 #[test]
 fn capture_and_freshness_reject_outside_workspace_sources() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     let outside = tempfile::tempdir().unwrap();
     let outside_path = outside.path().join("outside.txt");
     fs::write(&outside_path, "outside\n").unwrap();
@@ -240,7 +233,7 @@ fn capture_and_freshness_reject_outside_workspace_sources() {
 
 #[test]
 fn derive_retains_inference_lineage_and_rejects_missing_parents() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("a.txt"), "observation A\n").unwrap();
     fs::write(work.path().join("b.txt"), "observation B\n").unwrap();
     let a = capture(&ws, "a.txt");
@@ -256,7 +249,7 @@ fn derive_retains_inference_lineage_and_rejects_missing_parents() {
 
 #[test]
 fn alignment_applies_signed_offset_preserves_uncertainty_and_requires_retained_basis() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("clock.txt"), "sync pulse\n").unwrap();
     let reference = capture(&ws, "clock.txt");
     let alignment = json!({"from":"camera", "to":"log", "offset_ms":-250, "uncertainty_ms":12, "basis":[reference]});
@@ -296,7 +289,7 @@ fn alignment_applies_signed_offset_preserves_uncertainty_and_requires_retained_b
 
 #[test]
 fn crop_retains_exact_pixel_dimensions_and_parent_reference() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("source.txt"), "image provenance\n").unwrap();
     let seed = capture(&ws, "source.txt");
     let pixels = image::RgbaImage::from_fn(8, 6, |x, y| image::Rgba([x as u8, y as u8, 128, 255]));
@@ -340,7 +333,7 @@ fn crop_retains_exact_pixel_dimensions_and_parent_reference() {
 
 #[test]
 fn malformed_ranges_oversized_sources_and_unknown_fields_are_rejected() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("source.txt"), "one\ntwo\n").unwrap();
     for args in [
         json!({"action":"capture", "path":"source.txt", "start":0}),
@@ -364,7 +357,7 @@ fn malformed_ranges_oversized_sources_and_unknown_fields_are_rejected() {
 
 #[test]
 fn missing_retained_payload_never_falls_back_to_mutable_source() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("source.txt"), "captured\n").unwrap();
     let reference = capture(&ws, "source.txt");
     let record = stored(&ws, &reference);
@@ -392,7 +385,7 @@ fn missing_retained_payload_never_falls_back_to_mutable_source() {
 
 #[test]
 fn binary_snapshot_hashes_original_without_claiming_interpretation_and_checks_freshness() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     let bytes = b"\x00\xff\xfeoriginal\n";
     fs::write(work.path().join("binary.dat"), bytes).unwrap();
     let out = call(
@@ -438,7 +431,7 @@ fn binary_snapshot_hashes_original_without_claiming_interpretation_and_checks_fr
 #[test]
 fn capture_and_freshness_honor_both_sandbox_deny_read_policies() {
     use crate::tools::exec::sandbox::Policy;
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     let path = work.path().join("private.txt");
     fs::write(&path, "not for this read policy\n").unwrap();
     let reference = capture(&ws, "private.txt");
@@ -549,7 +542,7 @@ fn merged_actions_round_trip_to_the_retired_tool_arguments() {
 
 #[test]
 fn merged_actions_run_their_owner_with_its_own_bounds() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     fs::write(work.path().join("a.txt"), "timeout after five seconds\n").unwrap();
     fs::write(work.path().join("b.txt"), "timeout after nine seconds\n").unwrap();
     let a = capture(&ws, "a.txt");
@@ -616,7 +609,7 @@ fn budget_actions_keep_perception_approval_confirmation_and_exclusivity() {
         assert_eq!(tool.concurrency(&args), expected, "{args}");
     }
 
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let config = Config::default();
     let mut ctx = ToolContext {
         workspace: &ws,

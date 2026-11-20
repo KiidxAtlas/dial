@@ -14,7 +14,7 @@
 //! content as indented rows. The expand key shows the ordinary card with the complete output.
 use super::{
     Fact, GUTTER, Rows, Tool, ToolState, VERB_W, fit_facts, frame, gutter_span, hidden_hint,
-    phase_glyph, plural,
+    phase_glyph,
 };
 use crate::ui::{
     text,
@@ -252,7 +252,7 @@ pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
     let summary = if report.failed > 0 {
         format!("{} failed", report.failed)
     } else if !report.errors.is_empty() {
-        plural(report.errors.len(), "error")
+        text::counted(report.errors.len(), "error")
     } else if failed {
         "failed".to_owned()
     } else if report.summarized {
@@ -312,10 +312,10 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
         });
     }
     if !report.errors.is_empty() {
-        facts.push(keep(plural(report.errors.len(), "error")));
+        facts.push(keep(text::counted(report.errors.len(), "error")));
     }
     if report.warnings > 0 {
-        facts.push(keep(plural(report.warnings as usize, "warning")));
+        facts.push(keep(text::counted(report.warnings, "warning")));
     }
     if facts.is_empty() {
         facts.push(keep("clean".to_owned()));
@@ -342,7 +342,7 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
         .fg(if failed { Tok::Error } else { Tok::ToolTitle })
         .add_modifier(Modifier::BOLD);
     let facts_style = theme.fg(if failed { Tok::Error } else { Tok::Dim });
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
 
     // Only what needs attention: failing tests, else the first errors with their locations.
     let cross = theme.sym(Sym::Cross2);
@@ -401,12 +401,12 @@ fn compact_rows(
     ctx: &TranscriptCtx,
 ) -> Rows {
     let theme = ctx.theme;
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     let (glyph, glyph_style) = head.glyph;
     let (verb, verb_style) = head.verb;
     let (facts, facts_style) = head.facts;
     let lead = gutter_span(glyph, glyph_style);
-    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
+    let lead_w: usize = text::spans_width(&lead);
     let want = text::width(head.command).min(super::TARGET_MIN);
     let (facts_text, room) = fit_facts(facts, w, lead_w + VERB_W + 1, want, &sep);
     let mut row = lead;
@@ -417,7 +417,7 @@ fn compact_rows(
         theme.fg(Tok::Muted),
     ));
     if !facts_text.is_empty() {
-        let used: usize = row.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&row);
         let right_w = text::width(&facts_text);
         row.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),
@@ -466,6 +466,13 @@ const VERIFY_STATUSES: &[&str] = &[
 fn verify_section(line: &str) -> Option<&str> {
     let (status, name) = line.split_once(": ")?;
     VERIFY_STATUSES.contains(&status).then_some(name)
+}
+
+/// Whether a check's status word reports a failed run: `failed`, `failed, cause unknown`, or a
+/// lane's `code failed`. The other words (passed, unavailable, denied, timed out, cancelled,
+/// unverified) never contain `failed`, so lanes and cards classify a check the same way.
+pub(in crate::ui) fn is_failure_word(status: &str) -> bool {
+    status.contains("failed")
 }
 
 /// The first thing to fix in one check's section of a `verify` result: a failing test with its
@@ -517,7 +524,7 @@ pub(super) fn verify_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Row
     let theme = ctx.theme;
     let passed = |status: &str| status == "passed" || status.starts_with("passed,");
     let open: Vec<&(&str, &str)> = checks.iter().filter(|(s, _)| !passed(s)).collect();
-    let code_failure = open.iter().any(|(s, _)| s.starts_with("failed"));
+    let code_failure = open.iter().any(|(s, _)| is_failure_word(s));
     let mut facts: Vec<Fact> = t
         .presentation
         .facts
@@ -559,12 +566,12 @@ pub(super) fn verify_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Row
     let cross = theme.sym(Sym::Cross2);
     let mut attention: Vec<(String, Tok)> = Vec::new();
     for (i, (status, name)) in open.iter().take(LISTED).enumerate() {
-        let mark = if status.starts_with("failed") {
+        let mark = if is_failure_word(status) {
             cross
         } else {
             theme.sym(Sym::Warn)
         };
-        let line_tok = if status.starts_with("failed") {
+        let line_tok = if is_failure_word(status) {
             Tok::Error
         } else {
             Tok::Warning
@@ -622,7 +629,7 @@ fn attention_card(
     ctx: &TranscriptCtx,
 ) -> Rows {
     let theme = ctx.theme;
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let (glyph, glyph_style) = &head.glyph;
     let (verb, verb_style) = head.verb;
     let border = if head.failed {

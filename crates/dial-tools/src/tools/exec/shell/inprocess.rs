@@ -4,6 +4,7 @@
 //! path; the differences (no automatic backgrounding, no named sessions, no hard kill of a
 //! builtin that never yields) are documented in docs/shell.md.
 
+use super::super::sandbox::child_env_allowed;
 use super::*;
 use crate::embedded_shell::inprocess::{Request, Run, Termination};
 

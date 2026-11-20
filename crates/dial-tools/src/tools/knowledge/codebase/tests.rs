@@ -130,7 +130,7 @@ fn ambient_retrieval_excludes_unrelated_documents_and_inventory() {
     let cache = Codebase::open(&layout).unwrap();
     #[cfg(windows)]
     assert!(
-        platform_fs::is_owner_only(
+        crate::platform::fs::is_owner_only(
             &fs::File::open(layout.state_dir.join("codebase.sqlite3")).unwrap()
         )
         .unwrap()

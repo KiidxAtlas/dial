@@ -221,16 +221,19 @@ pub fn exit(root: &Path, state: &Path) -> Result<String> {
     ))
 }
 pub fn run(root: &Path, state: &Path) -> Result<Run> {
-    let e = current(state)?.context("no experiment initialized")?;
-    ensure_clean(
-        root,
-        "a benchmark run needs a clean working tree so the recorded commit is what was measured",
-    )?;
     // Workspace::new applies the tool-call admission boundary (canonical directory, not the
     // filesystem root) and the default strict sandbox, shared with the bash tool.
-    let ws = crate::tools::Workspace::new(root)?;
+    run_in(&crate::tools::Workspace::new(root)?, state)
+}
+/// [`run`] in an existing workspace, so callers with a session keep its shell backend and sandbox.
+pub fn run_in(ws: &crate::tools::Workspace, state: &Path) -> Result<Run> {
+    let e = current(state)?.context("no experiment initialized")?;
+    ensure_clean(
+        ws.root(),
+        "a benchmark run needs a clean working tree so the recorded commit is what was measured",
+    )?;
     let workspace = ws.root();
-    let mut command = crate::tools::exec::shell::verifier_command(&ws, &e.benchmark)
+    let mut command = crate::tools::exec::shell::verifier_command(ws, &e.benchmark)
         .map_err(anyhow::Error::msg)
         .context("building sandboxed benchmark command")?;
     let output = command.output().context("running sandboxed benchmark")?;
@@ -324,6 +327,256 @@ pub fn notes(state: &Path) -> Result<String> {
     )
     .optional()?
     .unwrap_or_default())
+}
+
+/// What the host did with one self-driving iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The candidate beat the best run: its commit stays and the best ref moved to it.
+    Kept,
+    /// The candidate measured no better: the branch was reset to the iteration's start.
+    Reverted,
+    /// The agent changed nothing.
+    NoChange,
+    /// The benchmark failed or emitted no metric: the branch was reset to the iteration's start.
+    Crashed,
+}
+
+/// One evaluated iteration of `/autoresearch auto`.
+#[derive(Debug, Clone)]
+pub struct Iteration {
+    pub verdict: Verdict,
+    pub metric: Option<f64>,
+    /// The candidate commit, also when it was reverted (still reachable through the reflog).
+    pub commit: Option<String>,
+    /// Benchmark failure or other detail worth showing.
+    pub detail: String,
+}
+
+/// The commit `HEAD` names; the driver records it before each iteration.
+pub fn head(root: &Path) -> Result<String> {
+    let commit = run_checked(root, &["rev-parse", "HEAD"], false)
+        .map_err(|error| anyhow::anyhow!("reading Git HEAD failed: {error}"))?;
+    Ok(commit.trim().to_owned())
+}
+
+/// The best recorded metric of the current experiment, if any run has been kept.
+pub fn best(state: &Path) -> Result<Option<f64>> {
+    let Some(e) = current(state)? else {
+        return Ok(None);
+    };
+    Ok(db(state)?
+        .query_row(
+            "SELECT metric FROM runs WHERE experiment=?1 AND kept=1 ORDER BY id DESC LIMIT 1",
+            params![e.name],
+            |r| r.get::<_, f64>(0),
+        )
+        .optional()?)
+}
+
+/// Measure the unchanged branch when no run has been kept yet, so the first candidate must beat
+/// the starting code rather than nothing. Returns the baseline run when one was taken.
+pub fn ensure_baseline(ws: &crate::tools::Workspace, state: &Path) -> Result<Option<Run>> {
+    if best(state)?.is_some() {
+        return Ok(None);
+    }
+    run_in(ws, state)
+        .context("measuring the baseline failed")
+        .map(Some)
+}
+
+/// Host-side judgement of one iteration that started at commit `start`: commit whatever the
+/// agent changed on the experiment branch, benchmark it, then keep it only when it beats the best
+/// run and otherwise reset the branch to `start`. The agent never decides keep or revert.
+pub fn evaluate(
+    ws: &crate::tools::Workspace,
+    state: &Path,
+    start: &str,
+    iteration: u32,
+) -> Result<Iteration> {
+    let root = ws.root();
+    let e = current(state)?.context("no experiment initialized")?;
+    let branch = current_branch(root)?;
+    if branch != e.branch {
+        bail!(
+            "the working tree is on {branch}, not the experiment branch {}; the loop stopped without touching it",
+            e.branch
+        )
+    }
+    let status = run_checked(root, &["status", "--porcelain"], false)
+        .map_err(|error| anyhow::anyhow!("inspecting the working tree failed: {error}"))?;
+    if !status.trim().is_empty() {
+        run_checked(root, &["add", "-A"], true)
+            .map_err(|error| anyhow::anyhow!("staging the candidate failed: {error}"))?;
+        let message = format!("autoresearch {}: candidate {iteration}", e.name);
+        run_checked(
+            root,
+            &["commit", "-q", "--no-verify", "-m", message.as_str()],
+            true,
+        )
+        .map_err(|error| anyhow::anyhow!("committing the candidate failed: {error}"))?;
+    }
+    let candidate = head(root)?;
+    if candidate == start {
+        return Ok(Iteration {
+            verdict: Verdict::NoChange,
+            metric: None,
+            commit: None,
+            detail: String::new(),
+        });
+    }
+    let revert = || {
+        run_checked(root, &["reset", "-q", "--hard", start], true)
+            .map_err(|error| anyhow::anyhow!("reverting to {start} failed: {error}"))
+    };
+    match run_in(ws, state) {
+        Ok(measured) if measured.kept => Ok(Iteration {
+            verdict: Verdict::Kept,
+            metric: Some(measured.metric),
+            commit: Some(candidate),
+            detail: String::new(),
+        }),
+        Ok(measured) => {
+            revert()?;
+            Ok(Iteration {
+                verdict: Verdict::Reverted,
+                metric: Some(measured.metric),
+                commit: Some(candidate),
+                detail: String::new(),
+            })
+        }
+        Err(error) => {
+            revert()?;
+            Ok(Iteration {
+                verdict: Verdict::Crashed,
+                metric: None,
+                commit: Some(candidate),
+                detail: clip(&format!("{error:#}"), 2000),
+            })
+        }
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let end = text.floor_char_boundary(max);
+    format!("{}…", &text[..end])
+}
+
+/// Stop rules for `/autoresearch auto`: an iteration cap, and a patience budget of consecutive
+/// iterations that did not improve the best run (reverted, crashed or unchanged).
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub max_iterations: u32,
+    pub patience: u32,
+    done: u32,
+    stale: u32,
+}
+
+impl Policy {
+    pub const DEFAULT_ITERATIONS: u32 = 10;
+    pub const DEFAULT_PATIENCE: u32 = 3;
+    pub const MAX_ITERATIONS: u32 = 100;
+
+    /// Parse `[iterations] [--patience N]`; both are optional and must be positive.
+    pub fn parse(args: &str) -> Result<Self> {
+        let mut policy = Self {
+            max_iterations: Self::DEFAULT_ITERATIONS,
+            patience: Self::DEFAULT_PATIENCE,
+            done: 0,
+            stale: 0,
+        };
+        let mut words = args.split_whitespace();
+        let positive = |word: Option<&str>, what: &str| -> Result<u32> {
+            match word.map(str::parse::<u32>) {
+                Some(Ok(n)) if n > 0 => Ok(n),
+                _ => bail!("{what} must be a positive number"),
+            }
+        };
+        while let Some(word) = words.next() {
+            if word == "--patience" {
+                policy.patience = positive(words.next(), "--patience")?;
+            } else {
+                policy.max_iterations = positive(Some(word), "iterations")?;
+            }
+        }
+        if policy.max_iterations > Self::MAX_ITERATIONS {
+            bail!("at most {} iterations per run", Self::MAX_ITERATIONS)
+        }
+        Ok(policy)
+    }
+
+    /// The 1-based number of the next iteration.
+    pub fn next(&self) -> u32 {
+        self.done + 1
+    }
+
+    /// Record an iteration; returns why the loop stops, if it does.
+    pub fn record(&mut self, verdict: Verdict) -> Option<String> {
+        self.done += 1;
+        self.stale = if verdict == Verdict::Kept {
+            0
+        } else {
+            self.stale + 1
+        };
+        if self.stale >= self.patience {
+            Some(format!(
+                "{} iteration(s) in a row without improvement (patience {})",
+                self.stale, self.patience
+            ))
+        } else if self.done >= self.max_iterations {
+            Some(format!(
+                "reached the cap of {} iteration(s)",
+                self.max_iterations
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// The instruction the host sends the agent for iteration `number` of `max`.
+pub fn iteration_prompt(state: &Path, number: u32, max: u32) -> Result<String> {
+    let e = current(state)?.context("no experiment initialized")?;
+    let direction = if e.maximize { "maximize" } else { "minimize" };
+    let best = best(state)?.map_or_else(|| "none yet".to_owned(), |v| v.to_string());
+    let recent = log(state)?
+        .into_iter()
+        .take(5)
+        .map(|r| {
+            format!(
+                "- #{} {}={}{} at {}",
+                r.id,
+                e.metric,
+                r.metric,
+                if r.kept { " (best)" } else { "" },
+                &r.commit[..r.commit.len().min(12)]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notes = notes(state)?;
+    Ok(format!(
+        "Autoresearch iteration {number} of {max} for experiment `{name}`: {direction} `{metric}`, measured by `{benchmark}`. Best so far: {best}.\n\
+Recent runs:\n{recent}\n{notes_block}\
+Make exactly one focused change that you expect to improve `{metric}`, then end your turn. Dial commits it, runs the benchmark, keeps it only if it beats the best, and otherwise reverts it.\n\
+Rules: do not commit, switch branches, reset, or stash; do not change the benchmark or the way it measures `{metric}`; do not game the metric; preserve correctness. If you have no promising idea left, change nothing and say so.",
+        name = e.name,
+        metric = e.metric,
+        benchmark = e.benchmark,
+        recent = if recent.is_empty() {
+            "- none".to_owned()
+        } else {
+            recent
+        },
+        notes_block = if notes.trim().is_empty() {
+            String::new()
+        } else {
+            format!("Notes:\n{}\n", notes.trim())
+        },
+    ))
 }
 trait OptionalExt<T> {
     fn optional(self) -> rusqlite::Result<Option<T>>;

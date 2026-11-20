@@ -17,8 +17,6 @@ use std::{
     time::Duration,
 };
 
-use crate::platform::fs as platform_fs;
-
 pub const MAX_STEPS: usize = 16;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,30 +147,12 @@ pub fn failure_kind(text: &str) -> &'static str {
 }
 impl Experience {
     pub fn open(layout: &Layout) -> Result<Self> {
-        layout.ensure_project_outside_storage()?;
-        match platform_fs::create_dir_owner_only(
-            fs::DirBuilder::new().recursive(true),
-            &layout.state_dir,
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let state_meta = fs::symlink_metadata(&layout.state_dir)?;
-        ensure!(
-            state_meta.is_dir() && !state_meta.file_type().is_symlink(),
-            "state directory must be a regular directory"
-        );
-        platform_fs::set_owner_only(&layout.state_dir)?;
-        let path = layout.state_dir.join("experience.sqlite3");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
-        let _file = platform_fs::open_owner_only(&options, &path)?;
-        platform_fs::set_owner_only(&path)?;
-        let conn = Connection::open(&path)?;
-        conn.busy_timeout(Duration::from_millis(200))?;
-        super::sqlite::check_version(&conn, 1)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let conn = super::sqlite::open_private_writable(
+            layout,
+            "experience.sqlite3",
+            Duration::from_millis(200),
+            1,
+        )?;
         super::sqlite::migrate(&conn, &["CREATE TABLE IF NOT EXISTS experience (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, model TEXT NOT NULL,
             impressions INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,

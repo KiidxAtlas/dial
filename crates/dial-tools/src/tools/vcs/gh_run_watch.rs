@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dial_core::platform::time::calendar::days_from_civil;
+use dial_llm::url::encode_uri_component;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
@@ -232,19 +234,6 @@ fn resolve_watch_repo(
         return checked_repo(run_repo);
     }
     resolve_repo_from_cwd(ws, cancel)
-}
-
-/// JavaScript `encodeURIComponent`.
-fn encode_uri_component(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -717,17 +706,6 @@ fn timestamp_pattern() -> &'static Regex {
     })
 }
 
-/// Days since 1970-01-01 (proleptic Gregorian).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_index = (month + 9) % 12;
-    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
 /// Parse GitHub's RFC 3339 timestamps into epoch milliseconds.
 fn parse_timestamp_ms(value: &str) -> Option<i64> {
     let captures = timestamp_pattern().captures(value.trim())?;
@@ -765,7 +743,7 @@ fn parse_timestamp_ms(value: &str) -> Option<i64> {
             sign * (hours * 3_600 + minutes * 60)
         }
     };
-    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let seconds = days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second;
     Some((seconds - offset_seconds) * 1000 + millis)
 }
 

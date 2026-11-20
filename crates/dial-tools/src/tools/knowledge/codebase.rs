@@ -32,8 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::platform::fs as platform_fs;
-
 const MAX_FILE: u64 = 256 * 1024;
 const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 2048;
@@ -831,32 +829,17 @@ fn migrate_outline_version(conn: &Connection) -> Result<()> {
 
 impl Codebase {
     pub fn open(layout: &Layout) -> Result<Self> {
-        layout.ensure_project_outside_storage()?;
-        match platform_fs::create_dir_owner_only(
-            fs::DirBuilder::new().recursive(true),
-            &layout.state_dir,
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let state_meta = fs::symlink_metadata(&layout.state_dir)?;
-        ensure!(
-            state_meta.is_dir() && !state_meta.file_type().is_symlink(),
-            "state directory must be a regular directory"
-        );
-        platform_fs::set_owner_only(&layout.state_dir)?;
-        let path = layout.state_dir.join("codebase.sqlite3");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
-        let _file = platform_fs::open_owner_only(&options, &path)?;
-        platform_fs::set_owner_only(&path)?;
-        let conn = Connection::open(&path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS codebase_files(path TEXT PRIMARY KEY,digest TEXT NOT NULL,outline TEXT NOT NULL,outline_version INTEGER NOT NULL DEFAULT 1);
+        let conn = crate::storage::sqlite::open_private_writable(
+            layout,
+            "codebase.sqlite3",
+            Duration::from_secs(5),
+            0,
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS codebase_files(path TEXT PRIMARY KEY,digest TEXT NOT NULL,outline TEXT NOT NULL,outline_version INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS codebase_notes(topic TEXT PRIMARY KEY,content TEXT NOT NULL,sources TEXT NOT NULL,session_id TEXT NOT NULL,revision INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS codebase_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS codebase_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
+        )?;
         migrate_outline_version(&conn)?;
         Ok(Self {
             root: layout.project_root.clone(),

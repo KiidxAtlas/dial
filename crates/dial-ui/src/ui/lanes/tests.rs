@@ -140,6 +140,22 @@ fn a_check_that_did_not_pass_names_its_status_in_the_failure_color() {
         &ctx,
     );
     assert_ne!(baseline[0].spans[0].style.fg, theme.fg(Tok::Success).fg);
+    // The ASCII preset joins the status with its ASCII dot, never a Unicode `·`.
+    let ascii = theme.clone().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let plain: String = rows(
+        &UiEvent::new(EventKind::Verification, "Verification lint: CodeFailed"),
+        60,
+        &TranscriptCtx {
+            theme: &ascii,
+            ..ctx
+        },
+    )[0]
+    .spans
+    .iter()
+    .map(|s| s.content.as_ref())
+    .collect();
+    assert!(plain.contains("lint - code failed"), "{plain}");
+    assert!(!plain.contains('·'), "{plain}");
 }
 
 #[test]

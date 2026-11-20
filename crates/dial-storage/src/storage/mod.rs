@@ -25,7 +25,7 @@ pub mod share;
 pub mod side_thread;
 pub mod skills;
 pub mod snapcompact;
-mod sqlite;
+pub mod sqlite;
 pub mod store;
 pub mod subagent;
 pub mod transcript;

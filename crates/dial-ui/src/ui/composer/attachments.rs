@@ -19,6 +19,22 @@ pub struct Preview {
     pub items: Vec<PreviewItem>,
 }
 
+/// Lead with missing or partial context so clipping token estimates cannot hide a warning.
+pub fn count_summary(included: usize, truncated: usize, skipped: usize) -> String {
+    let mut parts = Vec::new();
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    if truncated > 0 {
+        parts.push(format!("{truncated} truncated"));
+    }
+    if parts.is_empty() {
+        return format!("Attachments: {included} included");
+    }
+    parts.push(format!("{included} included"));
+    parts.join(", ")
+}
+
 #[derive(Clone, Debug)]
 pub struct PreviewItem {
     pub reference: String,

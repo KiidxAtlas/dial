@@ -90,6 +90,15 @@ class Tools(unittest.TestCase):
         def failing() -> str:
             raise ToolError("nope")
 
+    def test_registration_checks_engine_timeout_bounds(self):
+        for register, limit in [(self.plugin.tool, 3600),
+                                (lambda **kw: self.plugin.hook("before_compact", **kw), 600)]:
+            for invalid in [-1, limit + 1, True, 0.5, "30"]:
+                with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "timeout_secs"):
+                    register(timeout_secs=invalid)
+            for valid in [0, limit]:
+                register(timeout_secs=valid, name=f"limit_{valid}")(lambda: None)
+
     def test_call_checks_arguments_and_renders_results(self):
         self.assertEqual(self.plugin.call_tool("add", {"a": 2}), "3")
         self.assertEqual(self.plugin.tools["add"].description, "Add two numbers.")

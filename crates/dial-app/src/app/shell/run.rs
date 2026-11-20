@@ -6,7 +6,7 @@ use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::overlay::auth::AuthJob;
-use crate::app::shell::{PAINT_EVERY, STATUS_TTL, Shell, TICK};
+use crate::app::shell::{STATUS_TTL, Shell, TICK};
 use crate::ui::composer::ComposerEvent;
 use crate::ui::input::{poll, read};
 use crate::ui::status::Phase;
@@ -178,16 +178,7 @@ impl Shell {
                 }
             }
             {
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 agent.pump_subagents(&mut bridge);
                 if bridge.failed {
                     anyhow::bail!("terminal draw failed");
@@ -209,16 +200,7 @@ impl Shell {
                 continue;
             }
             {
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 match agent.maintenance_tick(&mut bridge, maintenance_busy) {
                     Ok(Some(_)) => dirty = true,
                     Ok(None) => {}

@@ -27,6 +27,7 @@ pub(in crate::app) fn draft(name: &str, args: &str) -> Option<&'static str> {
         ("dirs", "add") => Some("/dirs add "),
         ("dirs", "remove") => Some("/dirs remove "),
         ("collab", "join") => Some("/collab join "),
+        ("collab", "answer") => Some("/collab answer "),
         _ => None,
     }
 }
@@ -126,6 +127,11 @@ pub(in crate::app) fn picker(name: &str, args: &str) -> Option<ChoiceSpec> {
                     "abort",
                     "Stop the host's turn",
                     "Request cancellation as a guest.",
+                ),
+                (
+                    "answer",
+                    "Answer the host's question…",
+                    "Enter the option number in the composer.",
                 ),
             ],
         ),

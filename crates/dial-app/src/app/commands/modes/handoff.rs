@@ -14,5 +14,5 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         require_method: true,
         ..CompactionOptions::default()
     };
-    super::compaction::run(shell, app, agent, options)
+    shell.run_manual_compaction(app, agent, options)
 }

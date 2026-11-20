@@ -241,8 +241,8 @@ fn fuse_unmount(merged: &Path) -> Result<(), String> {
 }
 
 fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    let path = std::env::var_os("PATH");
+    crate::platform::fs::find_program(Path::new(program), path.as_deref()).is_some()
 }
 
 /// Whether the kernel lists `overlay` among its filesystems.

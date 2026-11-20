@@ -1,11 +1,6 @@
 use super::*;
+use crate::ui::testkit::plain;
 use crate::ui::theme::Glyphs;
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
-}
 
 fn sample(theme: &Theme, head: &str) -> Frame {
     let mut frame = Frame::new(

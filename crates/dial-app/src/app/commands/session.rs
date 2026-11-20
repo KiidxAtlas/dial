@@ -2,7 +2,7 @@ use crate::agent::Agent;
 use crate::app::{App, AuthJob, Shell, Step};
 use crate::config::paths::Layout;
 use crate::llm::{chatgpt, oauth};
-use crate::stats::{self, Db};
+use crate::stats;
 use crate::storage::session::{Session, SessionMeta, pack};
 use crate::storage::session_pins;
 use crate::ui::text::one_line;
@@ -813,10 +813,7 @@ fn stats_command(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
         shell.note("Stats", format!("Dashboard: http://{address}"));
         return Ok(Step::Done);
     }
-    let since = stats::parse_range(&range.join(" "))?;
-    let mut db = Db::open_default(&user_dir)?;
-    db.sync_sessions(&user_dir)?;
-    let report = db.report(since, stats::now_ms())?;
+    let report = stats::ReportRange::parse(&range.join(" "))?.report(&user_dir)?;
     shell.note("Stats", stats::render_text(&report));
     Ok(Step::Done)
 }
@@ -826,10 +823,7 @@ pub(in crate::app) fn stats_overlay(
     app: &App,
     range: &str,
 ) -> Result<crate::ui::overlay::stats::StatsOverlay> {
-    let since = stats::parse_range(range)?;
-    let mut db = Db::open_default(&app.layout.user_dir)?;
-    db.sync_sessions(&app.layout.user_dir)?;
-    let report = db.report(since, stats::now_ms())?;
+    let report = stats::ReportRange::parse(range)?.report(&app.layout.user_dir)?;
     Ok(crate::ui::overlay::stats::StatsOverlay::new(stats_tabs(
         &report,
     )))

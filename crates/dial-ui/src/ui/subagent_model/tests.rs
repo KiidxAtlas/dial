@@ -114,7 +114,7 @@ fn status_mapping_covers_every_phase() {
         AgentStatus::from_wire("interrupted"),
         AgentStatus::Interrupted
     );
-    assert_eq!(AgentStatus::Done.label(), "completed");
+    assert_eq!(AgentStatus::Done.label(), "done");
     assert_ne!(AgentStatus::Cancelled, AgentStatus::Interrupted);
 }
 
@@ -830,4 +830,27 @@ fn recorded_model_explanation_projects_header_final_and_runtime_without_reconstr
             Some("explicit replacement receipt")
         );
     }
+}
+
+#[test]
+fn every_worker_status_draws_from_the_shared_state_vocabulary() {
+    use crate::ui::chrome::StateMark;
+    use crate::ui::theme::Tok;
+    let cases = [
+        (AgentStatus::Running, StateMark::Running),
+        (AgentStatus::Waiting, StateMark::NeedsInput),
+        (AgentStatus::NeedsInput, StateMark::NeedsInput),
+        (AgentStatus::Done, StateMark::Done),
+        (AgentStatus::Answered, StateMark::Answered),
+        (AgentStatus::Failed, StateMark::Failed),
+        (AgentStatus::Cancelled, StateMark::Cancelled),
+        (AgentStatus::Interrupted, StateMark::Interrupted),
+        (AgentStatus::Blocked, StateMark::Blocked),
+    ];
+    for (status, mark) in cases {
+        assert_eq!(status.state_mark(), mark, "{status:?}");
+    }
+    // A stopped worker reads as muted "stopped", never as a failure.
+    assert_eq!(AgentStatus::Cancelled.state_mark().word(), "stopped");
+    assert_eq!(AgentStatus::Cancelled.state_mark().tok(), Tok::Muted);
 }

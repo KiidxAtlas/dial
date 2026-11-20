@@ -3,15 +3,17 @@
 use crate::agent::window::context;
 use crate::agent::{Agent, Ui};
 use crate::app::bridge::Bridge;
-use crate::app::command_registry::{canonical_command, command_panel, turn_count};
+use crate::app::command_registry::{
+    command_panel, resolve_invocation, split_invocation, turn_count,
+};
 use crate::app::core::App;
 use crate::app::display::short;
 use crate::app::drive::Step;
 use crate::app::notices::{memory_status_text, memory_view_text};
 use crate::app::overlay::Which;
 use crate::app::selection::{PendingFavorite, cycle_set, next_favorite};
+use crate::app::shell::Shell;
 use crate::app::shell::turn_report::plural;
-use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::selection::changes as selection_changes;
 use crate::config::types::{Approval, Outcome};
 use crate::llm::usage;
@@ -161,6 +163,23 @@ impl Shell {
         self.note("Commands", text);
     }
 
+    /// Hub spellings that only fill the composer (`/dirs add `). Returns true when handled, so
+    /// idle and busy routing share one draft-keeping rule instead of two copies.
+    pub(super) fn hub_draft(&mut self, name: &str, args: &str) -> bool {
+        let Some(draft) = crate::app::command_registry::hubs::draft(name, args) else {
+            return false;
+        };
+        if self.composer.draft().trim().is_empty() {
+            self.composer.set_draft(draft);
+        } else {
+            self.note(
+                "Command",
+                format!("Your draft is kept. Enter {draft}<value> to continue."),
+            );
+        }
+        true
+    }
+
     pub(in crate::app) fn command(
         &mut self,
         app: &App,
@@ -170,46 +189,14 @@ impl Shell {
         let Some(rest) = line.strip_prefix('/') else {
             return self.run_turn(app, agent, line);
         };
-        let (name, args) = rest
-            .split_once(char::is_whitespace)
-            .map_or((rest, ""), |(name, args)| (name, args.trim()));
-        if let Some(draft) = crate::app::command_registry::hubs::draft(name, args) {
-            if self.composer.draft().trim().is_empty() {
-                self.composer.set_draft(draft);
-            } else {
-                self.note(
-                    "Command",
-                    format!("Your draft is kept. Enter {draft}<value> to continue."),
-                );
-            }
+        let (name, args) = split_invocation(rest);
+        if self.hub_draft(name, args) {
             return Ok(Step::Done);
         }
-        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
-        // `/accounts pin` is the clearer spelling of `/session pin`, which pins a ChatGPT account.
-        let accounts_pin;
-        let (name, args) = if name == "accounts" && (args == "pin" || args.starts_with("pin ")) {
-            accounts_pin = format!("pin{}", &args[3..]);
-            ("session", accounts_pin.as_str())
-        } else {
-            (name, args)
-        };
-        let name = canonical_command(name);
+        let (name, args) = resolve_invocation(name, args);
         if self.reject_syntax(name, args) {
             return Ok(Step::Done);
         }
-        // Compatibility spellings keep their distinct behavior through unified subactions.
-        let (name, args) = if name == "help" && args == "commands" {
-            ("commands", "")
-        } else if name == "review" && (args == "files" || args.starts_with("files ")) {
-            (
-                "review-file",
-                args.strip_prefix("files").unwrap_or("").trim(),
-            )
-        } else if name == "sessions" && args == "fork" {
-            ("fork", "")
-        } else {
-            (name, args)
-        };
         if let Some(reason) =
             crate::ui::command_surface::unavailable_reason(name, args, self.command_context())
         {
@@ -333,7 +320,7 @@ impl Shell {
                 }
                 Err(error) => self.note("Session", format!("error: {error:#}")),
             },
-            "autoresearch" => return self.autoresearch_command(agent, args),
+            "autoresearch" => return self.autoresearch_command(app, agent, args),
             "archive" => self.archive_note(app, args),
             "sessions" | "resume" | "tree" => {
                 // `/tree forks` is the fork browser; its argument is a keyword, not a search.
@@ -410,16 +397,7 @@ impl Shell {
             "permissions" => return self.permissions_command(agent, args),
             "cost" => return self.cost_command(agent),
             "workers" => {
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 let result = agent
                     .subagent_status(if args.is_empty() { None } else { Some(args) }, &mut bridge);
                 self.note_worker_reply(result);
@@ -468,16 +446,7 @@ impl Shell {
                 }
                 // `reject_syntax` admitted only the status forms here.
                 app.interrupt.store(false, Ordering::SeqCst);
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 bridge.shell.composer.set_busy(true);
                 let result = agent.laya_status(args == "check", args == "start", &mut bridge);
                 bridge.shell.composer.set_busy(false);
@@ -493,16 +462,7 @@ impl Shell {
                 if !self.wait_compute(app)? || !self.prepare_local(app)? {
                     return Ok(Step::Done);
                 }
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 bridge.shell.composer.set_busy(true);
                 let result = agent.synthesize_architecture(true, &mut bridge);
                 bridge.shell.composer.set_busy(false);
@@ -650,16 +610,7 @@ impl Shell {
             .unwrap_or_default();
         let started = Instant::now();
         let result = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started,
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::started_at(app, self, started);
             bridge.repaint(true);
             agent.review_target(args, &guidance, &mut bridge)
         };
@@ -726,16 +677,7 @@ impl Shell {
         }
         let started = Instant::now();
         let result = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started,
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::started_at(app, self, started);
             bridge.repaint(true);
             agent.run_seance(source, question, &mut bridge)
         };
@@ -750,7 +692,12 @@ impl Shell {
         Ok(Step::Done)
     }
 
-    fn autoresearch_command(&mut self, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+    fn autoresearch_command(
+        &mut self,
+        app: &App,
+        agent: &mut Agent<'_>,
+        args: &str,
+    ) -> Result<Step> {
         let layout = agent
             .layout()
             .ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?
@@ -760,6 +707,10 @@ impl Shell {
             .splitn(5, char::is_whitespace)
             .filter(|word| !word.is_empty());
         let action = words.next().unwrap_or("status");
+        if action == "auto" {
+            let rest = args.trim().strip_prefix("auto").unwrap_or("");
+            return self.autoresearch_auto(app, agent, &state, rest);
+        }
         let result = match action {
             "init" => match (words.next(), words.next(), words.next(), words.next()) {
                 (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::knowledge::autoresearch::experiment::parse_direction(direction) {
@@ -773,7 +724,7 @@ impl Shell {
             "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::knowledge::autoresearch::experiment::notes(&state) } else { crate::tools::knowledge::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
             "resume" | "status" | "" => crate::tools::knowledge::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::knowledge::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
             "exit" => crate::tools::knowledge::autoresearch::experiment::exit(&layout.project_root, &state),
-            other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume, exit."),
+            other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, auto, log, notes, resume, exit."),
         };
         match result {
             Ok(text) => self.note("Autoresearch", text),
@@ -1053,6 +1004,18 @@ impl Shell {
         if !review(self, &preview) {
             return Ok(Step::Done);
         }
+        self.run_manual_compaction(app, agent, options)
+    }
+
+    /// The manual compaction run that `/compact` (after its confirmation), `/handoff` and `/shake`
+    /// share: wait for the current compute, show the compacting phase and drive the engine.
+    pub(in crate::app) fn run_manual_compaction(
+        &mut self,
+        app: &App,
+        agent: &mut Agent<'_>,
+        mut options: crate::config::compaction::CompactionOptions,
+    ) -> Result<Step> {
+        options.suppress_continuation = true;
         if !self.wait_compute(app)? {
             return Ok(Step::Done);
         }
@@ -1060,16 +1023,7 @@ impl Shell {
         self.status.phase = Phase::Compacting;
         self.status.activity = "compacting".into();
         let result = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, self);
             bridge.repaint(true);
             agent.compact_with_options(&mut bridge, options)
         };
@@ -1171,16 +1125,7 @@ impl Shell {
                             .map(|report| crate::storage::experience::render(&report)),
                     );
                 });
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started: Instant::now(),
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::new(app, self);
                 loop {
                     match rx.recv_timeout(Duration::from_millis(80)) {
                         Ok(result) => break result,
@@ -1215,16 +1160,7 @@ impl Shell {
                         }),
                 );
             });
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, self);
             bridge.set_activity("inspecting saved understanding");
             loop {
                 match rx.recv_timeout(Duration::from_millis(80)) {
@@ -1256,16 +1192,7 @@ impl Shell {
         }
         self.composer.set_busy(true);
         let result = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, self);
             agent
                 .selected_memory_command(args, &mut bridge)
                 .and_then(|value| {

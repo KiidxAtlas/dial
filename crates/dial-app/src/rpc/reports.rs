@@ -6,7 +6,7 @@
 use super::coded;
 use crate::config::paths::Layout;
 use crate::config::types::Config;
-use crate::stats::{self, Db};
+use crate::stats;
 use crate::tools::knowledge::history::ChangeHistory;
 use anyhow::Result;
 use dial_protocol::ErrorCode;
@@ -91,12 +91,11 @@ pub(super) fn code_history(layout: &Layout, config: &Config, params: &Value) -> 
 /// index first, as the terminal does; no provider is contacted.
 pub(super) fn stats(layout: &Layout, params: &Value) -> Result<Value> {
     let range = optional_text(params, "range")?.unwrap_or_default();
-    let since = stats::parse_range(&range)
+    let window = stats::ReportRange::parse(&range)
         .map_err(|error| coded(ErrorCode::InvalidParams, format!("{error:#}")))?;
-    let failed = |error: anyhow::Error| coded(ErrorCode::Failed, format!("{error:#}"));
-    let mut db = Db::open_default(&layout.user_dir).map_err(failed)?;
-    db.sync_sessions(&layout.user_dir).map_err(failed)?;
-    let report = db.report(since, stats::now_ms()).map_err(failed)?;
+    let report = window
+        .report(&layout.user_dir)
+        .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
     Ok(json!({"range":range,"report":report}))
 }
 

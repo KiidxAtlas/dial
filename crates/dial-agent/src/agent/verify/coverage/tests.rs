@@ -58,7 +58,10 @@ fn changed_lines_skip_unchanged_blank_and_comment_lines() {
     assert_eq!(changed_lines(Some(before), after), BTreeSet::from([4, 5]));
     assert_eq!(changed_lines(None, "x\n  // y\nz"), BTreeSet::from([1, 3]));
     assert_eq!(ranges(&[3, 4, 5, 9, 11, 12]), "3-5, 9, 11-12");
-    assert_eq!(percent_decode("file:///a%20b/c.js"), "file:///a b/c.js");
+    assert_eq!(
+        dial_llm::url::decode_uri_component_lossy("file:///a%20b/c.js"),
+        "file:///a b/c.js"
+    );
 }
 
 #[test]

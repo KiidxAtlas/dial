@@ -5,7 +5,8 @@
 //! inside Dial's install directory. Extraction rejects absolute paths, `..`, hard links and
 //! symlinks that leave the install directory. Nothing is fetched unless the user confirms the plan.
 
-use super::run::{download_to, sha256_file};
+use super::run::download_to;
+use crate::runtime::fingerprint::sha256_file;
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::{self, File};
 use std::io::{self, Read};

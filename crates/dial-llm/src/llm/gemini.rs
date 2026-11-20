@@ -192,7 +192,10 @@ fn request(
         ensure!(
             matches!(
                 profile.capabilities.reasoning,
-                ReasoningApi::None | ReasoningApi::GeminiBudget | ReasoningApi::GeminiLevel
+                ReasoningApi::None
+                    | ReasoningApi::GeminiBudget
+                    | ReasoningApi::GeminiLevel
+                    | ReasoningApi::AntigravityModelVariant
             ),
             "profile reasoning API does not match Gemini"
         );

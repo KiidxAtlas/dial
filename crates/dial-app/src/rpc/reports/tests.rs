@@ -112,6 +112,11 @@ fn stats_reports_an_empty_user_directory_and_rejects_a_bad_range() {
     let report = stats(&layout, &json!({"range":"7d"})).unwrap();
     assert_eq!(report["range"], "7d");
     assert_eq!(report["report"]["sessions"]["sessions"], 0, "{report}");
+    let cutoff = report["report"]["since_ms"].as_i64().unwrap();
+    assert_eq!(
+        report["report"]["generated_ms"].as_i64().unwrap() - cutoff,
+        7 * 86_400_000
+    );
     let error = stats(&layout, &json!({"range":"not a range"})).unwrap_err();
     assert_eq!(code(error), ErrorCode::InvalidParams);
     let error = stats(&layout, &json!({"range":7})).unwrap_err();

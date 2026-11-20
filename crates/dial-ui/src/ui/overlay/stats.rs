@@ -1,5 +1,5 @@
 //! Read-only statistics tabs. The application supplies reports from the existing stats database.
-use super::settings::{Axis, arrows, hint, hint_line, panel, scroll_cell, tab_strip};
+use super::widgets::{Axis, arrows, hint, hint_line, panel, scroll_cell, tab_strip};
 use super::{DrawCtx, OverlayEvent, panel_keys};
 use crate::ui::{
     chrome::Section,
@@ -138,7 +138,7 @@ impl StatsOverlay {
                 KeyCode::Enter => self.searching = false,
                 _ if crate::ui::editor::delete_at_end(&mut self.query, key, Some(keys))
                     .is_some() => {}
-                _ => self.query.extend(super::settings::typed_char(key)),
+                _ => self.query.extend(super::widgets::typed_char(key)),
             }
             self.scroll = 0;
         } else if key.code == KeyCode::Char('/') {

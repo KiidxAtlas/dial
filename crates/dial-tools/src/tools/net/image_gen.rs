@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 
 use crate::config::image::{ImageConfig, ImageModelSettings, SIZES};
 use crate::config::types::Config;
+use crate::llm::images::sniff_mime;
 use crate::storage::redact::redact_text;
 use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, tool_schema};
@@ -53,7 +54,6 @@ const MAX_ERROR_CHARS: usize = 300;
 /// The most images one call writes. A model asked for one image may still return several; each
 /// is saved next to the requested output, and a larger batch is refused as unexpected.
 const MAX_IMAGES: usize = 8;
-const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// GPT Image 2.6 is the first OpenAI family with animated GIF output (Images API and the
 /// Responses image tool). Flare is the fast variant, used when no GIF-capable model was chosen.
 const GIF_MODEL: &str = "gpt-image-2.6-flare";
@@ -901,17 +901,10 @@ enum Format {
 
 impl Format {
     fn detect(bytes: &[u8]) -> Option<Self> {
-        if bytes.starts_with(PNG_SIGNATURE) {
-            Some(Self::Png)
-        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            Some(Self::Jpeg)
-        } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-            Some(Self::Webp)
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            Some(Self::Gif)
-        } else {
-            None
-        }
+        let mime = sniff_mime(bytes)?;
+        [Self::Png, Self::Jpeg, Self::Webp, Self::Gif]
+            .into_iter()
+            .find(|format| format.mime() == mime)
     }
 
     fn name(self) -> &'static str {

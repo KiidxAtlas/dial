@@ -24,6 +24,12 @@ introduced. Launch one local stdio process per controller; stdout is exclusively
 - Session IDs identify durable state, not request idempotency keys. There is no exactly-once retry
   or event replay cursor. Never automatically repeat a mutating request after an ambiguous failure.
 
+To check an independently built consumer against a local executable, run
+`cargo run --locked --manifest-path sdk/client-smoke/Cargo.toml -- /absolute/path/to/dial`.
+The [consumer](../sdk/client-smoke/src/main.rs) uses its own Cargo workspace and lockfile, a temporary
+project and a temporary Dial home. It expects negotiated v2, an empty history page, and the coded
+`invalid_params` refusal. It sends no prompt. This checks the supplied binary, not historical releases.
+
 ## Client parity
 
 This matrix describes implemented paths, not proof that a particular editor, model, device or

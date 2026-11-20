@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 mod attachments;
+mod autoresearch;
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
@@ -99,6 +100,9 @@ pub(super) struct Shell {
     /// Publisher and request handler for the `/watch` side pane.
     pub(in crate::app) live_pane: live_pane::LivePane,
     pub(super) loop_mode: crate::agent::modes::loop_runner::LoopMode,
+    /// The last foreground turn ended waiting for the human (question, blocker, failure or
+    /// interrupt); host-driven loops such as `/autoresearch auto` stop on it.
+    pub(super) last_turn_halted: bool,
     pub(super) runtime: crate::runtime::Tree,
     pub(super) pending_result: Option<crate::runtime::Body>,
     pub(super) shared_prose: bool,

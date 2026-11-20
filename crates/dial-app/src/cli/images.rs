@@ -6,6 +6,7 @@
 
 use crate::config::paths::Layout;
 use crate::storage::image_refs::{self, IMAGE_TTL_HOURS};
+use crate::units::human_bytes;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use std::{
     path::Path,
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 10;
@@ -87,7 +88,7 @@ fn status(layout: &Layout) -> Result<Output> {
     let user_dir = &layout.user_dir;
     let found = image_refs::scan_all_sessions(user_dir)?;
     let refs = image_refs::list(user_dir)?;
-    let now = now_secs();
+    let now = crate::runtime::clock::unix_secs();
     let bytes: u64 = refs.iter().map(|r| r.bytes).sum();
     let sessions: BTreeSet<&str> = refs
         .iter()
@@ -110,7 +111,7 @@ fn status(layout: &Layout) -> Result<Output> {
         format!(
             "References: {} ({}), {expired} expired (window {IMAGE_TTL_HOURS}h)",
             refs.len(),
-            format_bytes(bytes)
+            human_bytes(bytes)
         ),
         format!("Sessions covered: {}", sessions.len()),
         format!("Images found in transcripts this run: {found}"),
@@ -172,7 +173,7 @@ fn probe(layout: &Layout, timeout_secs: Option<u64>) -> Result<Output> {
         Ok(Ok((count, bytes))) => (
             true,
             count,
-            format!("read {count} blob(s), {}", format_bytes(bytes)),
+            format!("read {count} blob(s), {}", human_bytes(bytes)),
         ),
         Ok(Err(e)) => (false, 0, format!("{e:#}")),
         Err(e) => (false, 0, e),
@@ -214,13 +215,13 @@ fn purge(layout: &Layout, all: bool, apply: bool) -> Result<Output> {
             "Purged {} of {} {scope} ({})",
             report.deleted,
             report.selected.len(),
-            format_bytes(bytes)
+            human_bytes(bytes)
         )
     } else {
         format!(
             "Dry run: {} {scope} would be purged ({}); re-run with --apply",
             report.selected.len(),
-            format_bytes(bytes)
+            human_bytes(bytes)
         )
     }];
     out.extend(report.errors.iter().map(|e| format!("error: {e}")));
@@ -271,26 +272,6 @@ fn bounded<T: Send + 'static>(
 
 fn lines(items: &[String]) -> String {
     items.iter().map(|line| format!("{line}\n")).collect()
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn format_bytes(n: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    let value = n as f64;
-    if value < KIB {
-        format!("{n} B")
-    } else if value < MIB {
-        format!("{:.1} KiB", value / KIB)
-    } else {
-        format!("{:.1} MiB", value / MIB)
-    }
 }
 
 #[cfg(test)]

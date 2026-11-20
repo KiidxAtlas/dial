@@ -1,5 +1,6 @@
 //! Project-local artifact imports for session relocation. Never follows embedded paths or roots.
 use super::*;
+use crate::runtime::fingerprint::{sha256_file, sha256_reader};
 
 mod references;
 
@@ -15,7 +16,7 @@ impl ArtifactStore {
     pub(crate) fn import_blob(&self, uri: &str, staged: &std::path::Path) -> Result<()> {
         let id = artifact_id(uri).map_err(anyhow::Error::msg)?;
         ensure!(
-            file_sha256(staged)? == id,
+            sha256_file(staged)? == id,
             "staged artifact {uri} has corrupt content"
         );
         let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
@@ -26,7 +27,7 @@ impl ArtifactStore {
             Ok(_) => {}
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 ensure!(
-                    file_sha256(&self.path(uri)?)? == id,
+                    sha256_file(&self.path(uri)?)? == id,
                     "target artifact {uri} has corrupt content"
                 );
             }
@@ -66,16 +67,8 @@ impl ArtifactStore {
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let mut existing = target.open(uri)?;
                 crate::platform::atomic::check_file(&existing)?;
-                let mut hash = Sha256::new();
-                loop {
-                    let n = existing.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..n]);
-                }
                 ensure!(
-                    format!("{:x}", hash.finalize()) == id,
+                    sha256_reader(&mut existing)? == id,
                     "target artifact {uri} has corrupt content"
                 );
             }
@@ -228,19 +221,4 @@ pub(crate) fn collect_references(
         }
         _ => {}
     }
-}
-
-/// Streams a file through SHA-256 and returns the lowercase hex digest.
-pub(crate) fn file_sha256(path: &std::path::Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }

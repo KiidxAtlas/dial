@@ -278,7 +278,7 @@ fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
         tool.cancel();
         let result = receive.recv_timeout(INTERRUPT_GRACE + Duration::from_secs(2));
         if result.is_err() {
-            let pid = tool.pid.load(Ordering::Acquire);
+            let pid = tool.cell.pid.load(Ordering::Acquire);
             if pid > 0 {
                 // SAFETY: positive owned child PID; regression cleanup must not rely on its group.
                 unsafe {
@@ -295,8 +295,8 @@ fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
             result.as_ref().is_ok_and(|(failed, _)| *failed),
             "sandboxed={sandboxed}: cancellation failed to finish promptly: {result:?}"
         );
-        assert_eq!(tool.pid.load(Ordering::Acquire), 0);
-        assert!(tool.session.lock().is_none());
+        assert_eq!(tool.cell.pid.load(Ordering::Acquire), 0);
+        assert!(tool.cell.session.lock().is_none());
     }
 }
 #[cfg(target_os = "macos")]

@@ -24,17 +24,8 @@ pub(crate) fn display_path(path: String) -> String {
 pub(crate) fn revision(raw: &str) -> [u8; 32] {
     Sha256::digest(raw.as_bytes()).into()
 }
-pub(crate) fn hex_revision(digest: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 15) as usize] as char);
-    }
-    output
-}
 pub(crate) fn revision_hex(raw: &str) -> String {
-    hex_revision(revision(raw))
+    crate::hex(&revision(raw))
 }
 pub(crate) fn parse_revision(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {

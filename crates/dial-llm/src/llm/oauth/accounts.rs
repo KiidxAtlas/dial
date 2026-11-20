@@ -158,10 +158,7 @@ pub(crate) fn is_blocked(blocks: &Blocks, scope: &str, key: &str) -> bool {
 /// on this lock; other accounts refresh in parallel.
 pub(crate) fn refresh_lock_path(user_dir: &Path, id: &str, key: &str) -> PathBuf {
     let digest = Sha256::digest(key.as_bytes());
-    let hex: String = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hex = crate::hex(&digest[..8]);
     crate::config::paths::oauth_refresh_lock_file(user_dir, id, &hex)
 }
 

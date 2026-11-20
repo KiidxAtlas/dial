@@ -6,7 +6,6 @@ use super::super::model_config::ApiProtocol;
 use super::{Access, Credentials, Flow, Login, util};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use std::sync::atomic::Ordering;
 
 pub const FLOW: Flow = Flow {
     id: "cloudflare-ai-gateway",
@@ -72,7 +71,7 @@ fn prompt_required(
     } else {
         l.ui.prompt(message, Some(placeholder), true)?
     };
-    ensure!(!l.cancel.load(Ordering::SeqCst), "sign-in cancelled");
+    util::check_cancelled(&l.cancel)?;
     let value = value.trim();
     ensure!(!value.is_empty(), "{missing}");
     Ok(value.to_owned())

@@ -67,7 +67,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn tok(self) -> Tok {
+    pub(crate) fn tok(self) -> Tok {
         match self {
             Status::Ready => Tok::Success,
             Status::Missing => Tok::Muted,
@@ -76,7 +76,7 @@ impl Status {
         }
     }
 
-    fn mark(self, ascii: bool) -> &'static str {
+    pub(crate) fn mark(self, ascii: bool) -> &'static str {
         match (self, ascii) {
             (Status::Ready, false) => "●",
             (Status::Missing, false) => "○",
@@ -100,6 +100,26 @@ pub fn label(theme: &Theme, text: &str) -> Span<'static> {
     Span::styled(text.to_uppercase(), theme.fg(Tok::Muted))
 }
 
+/// Map discovery evidence to the same badge in the model browser and provider setup.
+pub(crate) fn provider_status<'a>(
+    state: &'a str,
+    detail: &str,
+    url: Option<&str>,
+) -> (Status, &'a str) {
+    match state {
+        "reachable" => (Status::Ready, state),
+        "cached" | "unknown" | "disabled" => (Status::Missing, state),
+        "auth-required" | "not-set-up" => (Status::Missing, "not set up"),
+        "unavailable"
+            if detail == crate::llm::catalog::UNREACHABLE_DETAIL
+                && url.is_some_and(crate::llm::is_loopback_url) =>
+        {
+            (Status::Missing, "not running")
+        }
+        _ => (Status::Error, state),
+    }
+}
+
 /// Status mark and word as colored text: `● ready`, `○ missing`, `▲ warn`, `✗ error`.
 pub fn status_chip(theme: &Theme, status: Status, text: &str) -> Span<'static> {
     Span::styled(
@@ -117,7 +137,7 @@ pub fn status_chip(theme: &Theme, status: Status, text: &str) -> Span<'static> {
 /// panel has no fields) are `tabs`; Enter names the row's main action. The last hint is always
 /// the way out, and its label follows what Esc will do next.
 pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static>> {
-    let sep = if theme.ascii() { " | " } else { " · " };
+    let sep = separator(theme);
     let mut spans = Vec::with_capacity(hints.len() * 3);
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {
@@ -140,9 +160,18 @@ pub fn hint_line(theme: &Theme, hints: &[(&str, &str)], width: usize) -> Line<'s
     hint_line_after(theme, "", hints, width)
 }
 
+/// The Unicode footer separator, the default for plain-text rows that have no theme.
+pub const UNICODE_SEPARATOR: &str = " · ";
+/// The ASCII footer separator, used under the ASCII glyph preset.
+pub const ASCII_SEPARATOR: &str = " | ";
+
 /// The separator between footer segments: ` · `, or ` | ` under the ASCII glyph preset.
 pub fn separator(theme: &Theme) -> &'static str {
-    if theme.ascii() { " | " } else { " · " }
+    if theme.ascii() {
+        ASCII_SEPARATOR
+    } else {
+        UNICODE_SEPARATOR
+    }
 }
 
 /// [`hint_line`] after a muted `lead` such as a list position (`3/12`). The lead stays in front
@@ -161,10 +190,7 @@ pub fn hint_line_after(
         .filter(|(key, label)| !key.is_empty() || !label.is_empty())
         .collect();
     let exit_width = keep.last().map_or(0, |hint| {
-        key_hint_spans(theme, &[*hint])
-            .iter()
-            .map(|s| text::width(&s.content))
-            .sum::<usize>()
+        text::spans_width(&key_hint_spans(theme, &[*hint]))
     });
     let lead_room = if keep.is_empty() {
         width
@@ -172,7 +198,7 @@ pub fn hint_line_after(
         width.saturating_sub(exit_width + text::width(sep))
     };
     let lead: String =
-        super::markdown::truncate_spans(vec![Span::raw(lead)], lead_room, theme.sym(Sym::Ellipsis))
+        super::text::truncate_spans(vec![Span::raw(lead)], lead_room, theme.sym(Sym::Ellipsis))
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
@@ -187,14 +213,12 @@ pub fn hint_line_after(
         spans.extend(key_hint_spans(theme, keep));
         spans
     };
-    let cells =
-        |spans: &[Span<'static>]| spans.iter().map(|s| text::width(&s.content)).sum::<usize>();
     let mut spans = build(&keep);
-    while keep.len() > 1 && cells(&spans) > width {
+    while keep.len() > 1 && text::spans_width(&spans) > width {
         keep.remove(keep.len() - 2);
         spans = build(&keep);
     }
-    Line::from(super::markdown::truncate_spans(
+    Line::from(super::text::truncate_spans(
         spans,
         width,
         theme.sym(Sym::Ellipsis),
@@ -236,6 +260,7 @@ pub fn approval_tok(mode: &str) -> Tok {
 pub enum StateMark {
     Running,
     Waiting,
+    NeedsInput,
     Done,
     Answered,
     Failed,
@@ -249,6 +274,7 @@ impl StateMark {
     pub const ALL: &'static [StateMark] = &[
         StateMark::Running,
         StateMark::Waiting,
+        StateMark::NeedsInput,
         StateMark::Done,
         StateMark::Answered,
         StateMark::Failed,
@@ -263,6 +289,7 @@ impl StateMark {
         match self {
             StateMark::Running => Sym::Working,
             StateMark::Waiting => Sym::Pending,
+            StateMark::NeedsInput => Sym::Warn,
             StateMark::Done | StateMark::Answered => Sym::Check,
             StateMark::Failed => Sym::Cross2,
             StateMark::Interrupted | StateMark::Cancelled | StateMark::Denied => Sym::Interrupted,
@@ -283,7 +310,7 @@ impl StateMark {
             | StateMark::Denied => Tok::Muted,
             StateMark::Done | StateMark::Answered => Tok::Success,
             StateMark::Failed => Tok::Error,
-            StateMark::Blocked => Tok::Warning,
+            StateMark::NeedsInput | StateMark::Blocked => Tok::Warning,
         }
     }
 
@@ -292,6 +319,7 @@ impl StateMark {
         match self {
             StateMark::Running => "running",
             StateMark::Waiting => "waiting",
+            StateMark::NeedsInput => "needs input",
             StateMark::Done => "done",
             StateMark::Answered => "answered",
             StateMark::Failed => "failed",
@@ -415,8 +443,8 @@ pub fn framed_lines(
     let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
     let mut head = vec![Span::raw(" ")];
     let label = fig_label(theme, section, &text::one_line(title));
-    head.extend(super::markdown::truncate_spans(label, width - 2, &ellipsis));
-    let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+    head.extend(super::text::truncate_spans(label, width - 2, &ellipsis));
+    let used: usize = text::spans_width(&head);
     let extra = text::one_line(extra);
     let tail = if extra.is_empty() || used + text::width(&extra) + 3 > width {
         String::new()
@@ -436,8 +464,8 @@ pub fn framed_lines(
     for row in rows {
         let style = fill.patch(row.style);
         let mut spans = vec![Span::raw("  ")];
-        let body = super::markdown::truncate_spans(row.spans, inner, &ellipsis);
-        let used: usize = body.iter().map(|s| text::width(&s.content)).sum();
+        let body = super::text::truncate_spans(row.spans, inner, &ellipsis);
+        let used: usize = text::spans_width(&body);
         spans.extend(body.into_iter().map(|mut span| {
             span.style = style.patch(span.style);
             span
@@ -494,9 +522,9 @@ pub fn selected_style(theme: &Theme) -> Style {
 /// cells, then filled with the selection background to exactly `width` cells. The one selected-row
 /// look for every list.
 pub fn selected_row(theme: &Theme, spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let mut spans = super::markdown::truncate_spans(spans, width, theme.sym(Sym::Ellipsis));
+    let mut spans = super::text::truncate_spans(spans, width, theme.sym(Sym::Ellipsis));
     select_spans(theme, &mut spans);
-    let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+    let used: usize = text::spans_width(&spans);
     if used < width {
         spans.push(Span::styled(
             " ".repeat(width - used),
@@ -504,6 +532,43 @@ pub fn selected_row(theme: &Theme, spans: Vec<Span<'static>>, width: usize) -> L
         ));
     }
     Line::from(spans).style(theme.bg(Tok::SelectedBg))
+}
+
+/// First visible row that keeps the selection on screen while moving the previous scroll as little as possible.
+pub(crate) fn keep_in_view(selected: usize, scroll: usize, height: usize, total: usize) -> usize {
+    let last = total.saturating_sub(height.max(1));
+    scroll
+        .min(selected)
+        .max(selected.saturating_sub(height.saturating_sub(1)))
+        .min(last)
+}
+
+/// `value` as spans with the characters at `hits` (char indexes) emphasized. Shared by the overlay
+/// panels and the composer's history and completion menus.
+pub(crate) fn highlighted(
+    value: &str,
+    hits: &[usize],
+    normal: Style,
+    hit: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_hit = false;
+    for (index, ch) in value.chars().enumerate() {
+        let is_hit = hits.contains(&index);
+        if is_hit != run_hit && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_hit { hit } else { normal },
+            ));
+        }
+        run_hit = is_hit;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_hit { hit } else { normal }));
+    }
+    spans
 }
 
 /// Restyles the spans of the selected list row the way the menus draw it: the selection fill under

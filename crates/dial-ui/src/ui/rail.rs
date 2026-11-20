@@ -1,11 +1,10 @@
 //! Bounded session rows. Inputs are snapshots, never formatted tool-result strings.
 use super::{
-    Rows,
-    markdown::truncate_spans,
-    text,
+    Rows, text,
     theme::{Sym, Theme, Tok},
+    transcript::fitted,
 };
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -28,7 +27,7 @@ pub fn session(
     if width < 24 || max == 0 {
         return Vec::new();
     }
-    let fit = |spans| Line::from(truncate_spans(spans, width, theme.sym(Sym::Ellipsis)));
+    let fit = |spans| fitted(spans, width, theme);
     let label = if title.trim().is_empty() {
         id.get(..8).unwrap_or(id)
     } else {
@@ -49,10 +48,9 @@ pub fn session(
                 format!(" {} no changes", theme.sym(Sym::Dot))
             } else {
                 format!(
-                    " {} {} changed file{}",
+                    " {} {}",
                     theme.sym(Sym::Dot),
-                    files.len(),
-                    if files.len() == 1 { "" } else { "s" }
+                    text::counted(files.len(), "changed file")
                 )
             },
             theme.fg(if files.is_empty() {

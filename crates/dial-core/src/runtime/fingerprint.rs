@@ -1,19 +1,26 @@
 //! Streaming file identity for immutable artifacts and reproducible build/run manifests.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path};
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
+
+/// Streams `reader` through SHA-256 and returns the lowercase hex digest.
+pub fn sha256_reader(reader: &mut impl Read) -> std::io::Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
         digest.update(&buffer[..count]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Streams a file through SHA-256 and returns the lowercase hex digest. An open failure names the path.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(sha256_reader(&mut file)?)
 }
 
 /// Identity of the exact bytes an observation engine consumed, rather than a later reread.

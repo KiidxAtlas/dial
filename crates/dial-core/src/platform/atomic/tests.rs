@@ -13,6 +13,23 @@ fn policies_replace_without_leaving_temporary_files() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
+#[test]
+fn owner_only_store_entry_replaces_and_cleans_up_after_failed_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("store");
+    private_dir(&dir).unwrap();
+    let path = dir.join("entry");
+    write_owner_only_entry(&path, b"old").unwrap();
+    write_owner_only_entry(&path, b"new").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert!(platform_fs::is_owner_only(&File::open(&path).unwrap()).unwrap());
+    let occupied = dir.join("occupied");
+    fs::create_dir(&occupied).unwrap();
+    assert!(write_owner_only_entry(&occupied, b"cannot replace a directory").is_err());
+    assert!(occupied.is_dir());
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
+}
+
 /// Verifying an existing private file through a read-only handle must still be able to restrict
 /// it: on Windows that handle has no WRITE_DAC (the bundled Node runtime check failed with
 /// "Access is denied").

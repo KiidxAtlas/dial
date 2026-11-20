@@ -13,10 +13,10 @@ use std::{
 
 use super::{
     Rows, chrome,
-    markdown::truncate_spans,
     subagent_model::{AgentEntry, AgentStatus, HubCache, HubSnapshot, StatusCounts},
     text,
     theme::{Sym, Theme, Tok},
+    transcript::fitted,
 };
 use crate::{
     agent::LiveTaskControl, config::paths::Layout, llm::model_config::PinnedWorkers, runtime::Tree,
@@ -372,7 +372,7 @@ pub fn rows(
     if pinned.is_empty() {
         return Vec::new();
     }
-    let fit = |spans| Line::from(truncate_spans(spans, width, theme.sym(Sym::Ellipsis)));
+    let fit = |spans| fitted(spans, width, theme);
     let own = StatusCounts::of(
         board
             .agents()
@@ -404,7 +404,7 @@ pub fn rows(
     if in_cards > 0 {
         counts.push(format!("+{in_cards} in task cards"));
     }
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     for count in counts {
         header.push(Span::styled(format!("{sep}{count}"), theme.fg(Tok::Dim)));
     }
@@ -444,12 +444,14 @@ fn worker_rows(
     theme: &Theme,
 ) -> Rows {
     let elapsed_ms = agent.elapsed_ms.unwrap_or(0);
-    let (state, marker) = match agent.status {
-        AgentStatus::Running => (Tok::Accent, theme.spinner(tick)),
-        AgentStatus::Failed => (Tok::Error, theme.sym(Sym::Cross2)),
-        _ => (Tok::Warning, theme.sym(Sym::Warn)),
+    // The shared state mark sets the glyph and tone; a running worker animates its glyph instead.
+    let mark = agent.status.state_mark();
+    let state = mark.tok();
+    let marker = match agent.status {
+        AgentStatus::Running => theme.spinner(tick).to_owned(),
+        _ => mark.glyph(theme).to_owned(),
     };
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     // Status comes before free-form names/tasks so requests for input survive narrow widths.
     let mut head = vec![
         Span::styled(

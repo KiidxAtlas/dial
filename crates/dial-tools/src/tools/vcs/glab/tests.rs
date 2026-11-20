@@ -330,12 +330,20 @@ fn missing_glab_reports_install_and_login_steps() {
 }
 
 #[test]
-fn resolve_program_finds_named_file_on_path() {
+fn resolve_program_finds_only_executables_on_path() {
     let dir = tempfile::tempdir().unwrap();
-    let exe = dir.path().join("glab");
+    let exe = dir
+        .path()
+        .join(format!("glab{}", std::env::consts::EXE_SUFFIX));
     fs::write(&exe, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(resolve_program(Some(dir.path().as_os_str()), "glab").is_err());
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let found = resolve_program(Some(dir.path().as_os_str()), "glab").unwrap();
-    assert_eq!(found, exe);
+    assert_eq!(found.canonicalize().unwrap(), exe.canonicalize().unwrap());
 }
 
 #[test]

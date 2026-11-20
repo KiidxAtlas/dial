@@ -1,5 +1,6 @@
 //! Shared fixtures for the tool tests.
 use super::{EditMode, ToolOutput, Workspace, execute};
+use crate::storage::artifact::ArtifactStore;
 use serde_json::Value;
 
 /// The directory is created under the canonical temp root so `dir.path()` equals `ws.root`
@@ -11,6 +12,15 @@ pub(crate) fn workspace() -> (tempfile::TempDir, Workspace) {
         .unwrap()
         .with_edit_mode(EditMode::Replace);
     (dir, ws)
+}
+
+/// `workspace()` plus an artifact store in a separate state directory, so retained evidence never
+/// lands in the work tree. Returns (work directory, state directory, workspace).
+pub(crate) fn workspace_with_artifacts() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
+    let (work, ws) = workspace();
+    let state = tempfile::tempdir().unwrap();
+    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
+    (work, state, ws)
 }
 
 pub(crate) fn run(ws: &Workspace, name: &str, args: Value) -> ToolOutput {

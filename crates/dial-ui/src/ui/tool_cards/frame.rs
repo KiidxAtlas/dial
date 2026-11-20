@@ -1,11 +1,10 @@
 //! The frame heavy tool cards are drawn in: a rounded border whose top edge carries the call's
 //! title, whose body holds optionally titled sections, and whose bottom edge carries the facts
 //! (`╰─ exit 1 · 1.20s ─╯`). One primitive draws every framed card (MCP service calls, commands,
-//! edits, web calls, workers), so their edges, clipping and fills agree.
+//! edits, web calls, workers and the work panel), so their edges, clipping and fills agree.
 use crate::ui::{
-    Rows,
-    markdown::truncate_spans,
-    text,
+    Rows, text,
+    text::truncate_spans,
     theme::{Sym, Theme, Tok},
 };
 use ratatui::{
@@ -102,7 +101,7 @@ impl Pen<'_> {
         let mut spans = vec![Span::styled(format!("{}{h}", theme.sym(left)), self.border)];
         // Two corner cells, one rule cell each side and a space each side of the label.
         let label = truncate_spans(label, self.w.saturating_sub(6), mark);
-        let label_w: usize = label.iter().map(|s| text::width(&s.content)).sum();
+        let label_w: usize = text::spans_width(&label);
         let mut used = 2;
         if label_w > 0 {
             spans.push(Span::styled(" ", self.border));
@@ -118,7 +117,7 @@ impl Pen<'_> {
             self.border,
         ));
         spans.push(Span::styled(theme.sym(right).to_owned(), self.border));
-        clip(spans, self.w, mark)
+        Line::from(truncate_spans(spans, self.w, mark))
     }
 
     /// `│ row … │`, the row clipped to the inner width and padded on the fill.
@@ -129,7 +128,7 @@ impl Pen<'_> {
         let inner = self.w.saturating_sub(CHROME_W);
         let style = self.fill.patch(row.style);
         let body = truncate_spans(row.spans, inner, mark);
-        let used: usize = body.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&body);
         let mut spans = vec![Span::styled(format!("{v} "), self.border)];
         spans.extend(body.into_iter().map(|mut span| {
             span.style = style.patch(span.style);
@@ -137,17 +136,7 @@ impl Pen<'_> {
         }));
         spans.push(Span::styled(" ".repeat(inner.saturating_sub(used)), style));
         spans.push(Span::styled(format!(" {v}"), self.border));
-        clip(spans, self.w, mark)
-    }
-}
-
-/// Frames narrower than their chrome degrade to clipped rows instead of overflowing.
-fn clip(spans: Vec<Span<'static>>, w: usize, mark: &str) -> Line<'static> {
-    let width: usize = spans.iter().map(|s| text::width(&s.content)).sum();
-    if width <= w {
-        Line::from(spans)
-    } else {
-        Line::from(truncate_spans(spans, w, mark))
+        Line::from(truncate_spans(spans, self.w, mark))
     }
 }
 

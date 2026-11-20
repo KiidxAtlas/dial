@@ -194,7 +194,14 @@ pub(super) fn list_for(
 
 fn describe(config: &Config, row: Row, current: bool) -> Value {
     let bundled = catalog::bundled_model(&row.provider, &row.model);
-    let levels = thinking_levels(config, &row.provider, &row.model);
+    let levels = thinking_levels(
+        config,
+        &row.provider,
+        &row.model,
+        row.local
+            .as_ref()
+            .and_then(|metadata| metadata.declared_reasoning),
+    );
     let mut value = json!({
         "provider": row.provider,
         "model_id": row.model,
@@ -246,12 +253,28 @@ fn thinking_profile<'a>(
 }
 
 /// Reasoning levels declared for `provider/model`: the profile's documented efforts, else the
-/// bundled catalog row's.
-fn thinking_levels(config: &Config, provider: &str, model: &str) -> Vec<&'static str> {
-    let declared = thinking_profile(config, provider, model)
-        .map(|profile| profile.capabilities.reasoning_efforts.clone())
-        .filter(|levels| !levels.is_empty())
+/// efforts a model group's listing declares (`listed`; its wire IDs accept only those), else the
+/// bundled catalog row's, else the efforts any other saved listing declares.
+fn thinking_levels(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    listed: Option<catalog::DeclaredReasoning>,
+) -> Vec<&'static str> {
+    let listed_efforts = |listed: catalog::DeclaredReasoning| {
+        Some(listed.efforts()).filter(|levels| !levels.is_empty())
+    };
+    let grouped = listed
+        .filter(|listed| listed.mode == catalog::ThinkingMode::ModelVariant)
+        .and_then(listed_efforts);
+    let declared = grouped
+        .or_else(|| {
+            thinking_profile(config, provider, model)
+                .map(|profile| profile.capabilities.reasoning_efforts.clone())
+                .filter(|levels| !levels.is_empty())
+        })
         .or_else(|| catalog::bundled_model(provider, model).map(|bundled| bundled.thinking_efforts))
+        .or_else(|| listed.and_then(listed_efforts))
         .unwrap_or_default();
     declared.into_iter().map(|effort| effort.as_str()).collect()
 }
@@ -262,6 +285,16 @@ fn thinking_levels(config: &Config, provider: &str, model: &str) -> Vec<&'static
 fn current_reasoning(config: &Config) -> Option<(crate::llm::profiles::ModelProfile, bool)> {
     let selection = config.selection();
     if let Some(profile) = thinking_profile(config, &selection.provider, &selection.model) {
+        // A saved model-group profile takes its levels from the current listing. When that listing
+        // cannot be read the saved levels may be stale, so the model offers none rather than them.
+        if profile.capabilities.reasoning
+            == crate::llm::profiles::ReasoningApi::AntigravityModelVariant
+        {
+            return crate::config::thinking::reasoning_profile(config)
+                .ok()
+                .flatten()
+                .map(|fresh| (fresh, true));
+        }
         return Some((profile.clone(), true));
     }
     let ambiguous = config
@@ -296,7 +329,7 @@ pub(super) fn current(config: &Config) -> Value {
             .iter()
             .map(|effort| effort.as_str())
             .collect(),
-        _ => thinking_levels(config, &selection.provider, &selection.model),
+        _ => thinking_levels(config, &selection.provider, &selection.model, None),
     };
     let (level, default_level) = match &reasoning {
         Some((profile, true)) => (profile.reasoning_effort, None),

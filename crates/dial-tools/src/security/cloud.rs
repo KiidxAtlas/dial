@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use dial_llm::url::percent_encode;
 use serde_json::{Map, Value, json};
 
 use super::contracts::{
@@ -455,19 +456,6 @@ fn jwt_subject(token: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("The selected ChatGPT credential is not a valid JWT"))?;
     let subject = field(&claims, "sub").or_else(|| field(&claims, "user_id"));
     req_str(subject, "authenticated user id")
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Repo-relative, forward-slash path; rejects absolute, drive-qualified and `..` paths.

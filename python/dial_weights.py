@@ -793,16 +793,6 @@ def mlp_hook(model, index, callback):
         yield
 
 
-def answer_mean(sink, offset):
-    import mlx.core as mx
-
-    def capture(output):
-        steering.hidden(output)
-        sink.append(mx.mean(output[0, offset:, :].astype(mx.float32), axis=0))
-        return output
-    return capture
-
-
 def region_means(sink, regions):
     """Capture the mean output over each region, in order. A region is a list of (start, end)
     position ranges averaged together."""
@@ -3247,30 +3237,6 @@ def pairwise_auc(high, low):
     if not (high and low):
         return None
     return sum((a > b) + 0.5 * (a == b) for a in high for b in low) / (len(high) * len(low))
-
-
-def welch_z(first, second):
-    """Difference of means over its standard error (Welch); None when a group has under two values."""
-    import numpy as np
-    first, second = np.asarray(first, dtype=np.float64), np.asarray(second, dtype=np.float64)
-    if len(first) < 2 or len(second) < 2:
-        return None
-    difference = float(first.mean() - second.mean())
-    error = math.sqrt(first.var(ddof=1) / len(first) + second.var(ddof=1) / len(second))
-    if error == 0:
-        return 0.0 if difference == 0 else math.copysign(1e6, difference)
-    return difference / error
-
-
-def position_nll(model, tokens):
-    """Negative log-likelihood of each next token of `tokens` (one value per input position)."""
-    import mlx.core as mx
-    import numpy as np
-    logits = model(mx.array([tokens[:-1]], dtype=mx.int32))[0].astype(mx.float32)
-    targets = mx.array(tokens[1:], dtype=mx.int32)
-    nll = mx.logsumexp(logits, axis=-1) - mx.take_along_axis(logits, targets[:, None], axis=-1)[:, 0]
-    mx.eval(nll)
-    return np.array(nll)
 
 
 def router_logits(layer):

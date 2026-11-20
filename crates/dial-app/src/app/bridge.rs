@@ -1,8 +1,8 @@
 //! `Bridge`: the `Ui` adapter that carries agent events into the shell.
 
 use crate::app::core::App;
-use crate::app::shell::Shell;
 use crate::app::shell::frame_pacing::Phase;
+use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::runtime::tool_output::ToolOutput;
 use crate::ui::composer::ComposerEvent;
 use crate::ui::input::{poll, read};
@@ -36,6 +36,27 @@ pub(super) struct Bridge<'a> {
     /// Tool calls awaiting their result, oldest first.
     pub(super) pending: Vec<PendingCall>,
     pub(super) next_id: u64,
+}
+
+impl<'a> Bridge<'a> {
+    /// A bridge for a fresh agent call on `shell`, started now.
+    pub(super) fn new(app: &'a App, shell: &'a mut Shell) -> Self {
+        Self::started_at(app, shell, Instant::now())
+    }
+
+    /// A bridge whose turn clock began at `started` (the caller already timed the run).
+    pub(super) fn started_at(app: &'a App, shell: &'a mut Shell, started: Instant) -> Self {
+        Self {
+            app,
+            shell,
+            interrupt: app.interrupt.clone(),
+            started,
+            last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
+            failed: false,
+            pending: Vec::new(),
+            next_id: 0,
+        }
+    }
 }
 
 impl Bridge<'_> {

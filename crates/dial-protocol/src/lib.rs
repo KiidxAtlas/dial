@@ -157,6 +157,7 @@ pub const METHODS: &[Method] = &[
     read("collaboration_status", "collaboration"),
     write("collaboration_join", "collaboration"),
     write("collaboration_leave", "collaboration"),
+    write("collaboration_answer", "collaboration"),
     write("collaboration_start", "collaboration"),
     write("collaboration_stop", "collaboration"),
     write("collaboration_invite", "collaboration"),

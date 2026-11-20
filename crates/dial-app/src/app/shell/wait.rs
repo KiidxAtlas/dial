@@ -8,7 +8,7 @@ use crate::app::learning::Learning;
 use crate::app::overlay::auth::AuthJob;
 use crate::app::overlay::run::WaitFlow;
 use crate::app::overlay::start_streaming_job;
-use crate::app::shell::{PAINT_EVERY, Shell, TICK};
+use crate::app::shell::{Shell, TICK};
 use crate::learn::auto;
 use crate::llm::model_config::ModelSelection;
 use crate::storage::store::Store;
@@ -438,16 +438,7 @@ impl Shell {
                     config, &cancel,
                 ));
             });
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started,
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::started_at(app, self, started);
             bridge.set_activity("verifying LoRA support");
             loop {
                 bridge.heartbeat();

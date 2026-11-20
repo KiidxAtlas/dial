@@ -192,6 +192,7 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
                 | ReasoningApi::OpenaiResponses
                 | ReasoningApi::GeminiLevel
                 | ReasoningApi::OllamaThink
+                | ReasoningApi::AntigravityModelVariant
         ) {
             profile.thinking = None;
         }
@@ -200,6 +201,25 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
     // (such as a saved Anthropic effort) without mutating the operator's named profile.
     install_thinking_profile(config, profile)
 }
+/// A saved Antigravity model-variant profile keeps its own fields, but its declared levels come from
+/// the current scoped listing: a saved list can name levels the account no longer offers. Without a
+/// current listing nothing can be validated, so the refresh is refused rather than reused.
+fn refresh_variant_efforts(config: &Config, profile: &ModelProfile) -> Result<ModelProfile> {
+    let mut profile = profile.clone();
+    if profile.capabilities.reasoning == ReasoningApi::AntigravityModelVariant {
+        let selection = config.selection();
+        let declared = crate::llm::catalog::declared_reasoning(&config.user_dir, &selection)
+            .filter(|declared| declared.mode == crate::llm::catalog::ThinkingMode::ModelVariant)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no current listing of reasoning levels for {}; refresh /models and select it again",
+                    selection.model
+                )
+            })?;
+        profile.capabilities.reasoning_efforts = declared.efforts();
+    }
+    Ok(profile)
+}
 
 /// The reasoning profile for the selected model: the active model profile, a ChatGPT account
 /// profile, one built from the bundled catalog's thinking metadata, or, for a model the bundle
@@ -207,7 +227,7 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
 /// nothing declares the model's reasoning controls.
 pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
     if let Some(profile) = config.active_model_profile() {
-        return Ok(Some(profile.clone()));
+        return refresh_variant_efforts(config, profile).map(Some);
     }
     if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
         && let Some(profile) = crate::llm::chatgpt::model_profile(&config.user_dir, &config.model)?
@@ -216,42 +236,54 @@ pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
     }
     let selection = config.selection();
     let identity = format!("{}/{}", selection.provider, selection.model);
+    use crate::llm::catalog::ThinkingMode;
+    use crate::llm::model_config::ApiProtocol;
+    let declared = crate::llm::catalog::declared_reasoning(&config.user_dir, &selection);
+    // The live listing's model-variant rows outrank the bundle: the account names each wire model.
+    let variant = declared.filter(|declared| declared.mode == ThinkingMode::ModelVariant);
     let bundled = crate::llm::catalog::model_capabilities(&identity)
         .and_then(|model| Some((model.thinking?, model)));
-    let (mode, efforts, effort_wire, default_effort) = match bundled {
-        Some((mode, model)) => (
+    let (mode, efforts, effort_wire, default_effort) = match (variant, bundled) {
+        (Some(declared), _) => (declared.mode, declared.efforts(), Default::default(), None),
+        (None, Some((mode, model))) => (
             mode,
             model.thinking_efforts,
             model.effort_wire,
             model.default_effort,
         ),
-        None => {
-            let Some(declared) =
-                crate::llm::catalog::declared_reasoning(&config.user_dir, &selection)
-            else {
+        (None, None) => {
+            let Some(declared) = declared else {
                 return Ok(None);
             };
             (declared.mode, declared.efforts(), Default::default(), None)
         }
     };
-    use crate::llm::catalog::ThinkingMode;
     let reasoning = match mode {
         ThinkingMode::Effort => {
-            if selection.protocol == Some(crate::llm::model_config::ApiProtocol::Responses) {
+            if selection.protocol == Some(ApiProtocol::Responses) {
                 ReasoningApi::OpenaiResponses
             } else {
                 ReasoningApi::OpenaiEffort
             }
         }
-        ThinkingMode::Budget => match selection.provider.as_str() {
-            "anthropic" => ReasoningApi::AnthropicBudget,
-            "gemini" => ReasoningApi::GeminiBudget,
+        ThinkingMode::Budget => match selection
+            .protocol
+            .unwrap_or_else(|| ApiProtocol::builtin(&selection.provider))
+        {
+            ApiProtocol::Anthropic => ReasoningApi::AnthropicBudget,
+            ApiProtocol::Gemini | ApiProtocol::Antigravity | ApiProtocol::CloudCodeAssist => {
+                ReasoningApi::GeminiBudget
+            }
             _ => ReasoningApi::OpenaiEffort,
         },
         ThinkingMode::AnthropicAdaptive => ReasoningApi::AnthropicAdaptive,
         ThinkingMode::AnthropicBudgetEffort => ReasoningApi::AnthropicBudget,
         ThinkingMode::GoogleLevel => ReasoningApi::GeminiLevel,
+        ThinkingMode::ModelVariant => ReasoningApi::AntigravityModelVariant,
     };
+    // A model-variant family selects its thinking through the wire ID, so no thinking switch
+    // accompanies it; every other family starts enabled at the model's documented effort.
+    let is_variant = reasoning == ReasoningApi::AntigravityModelVariant;
     Ok(Some(ModelProfile {
         provider: selection.provider,
         model: selection.model,
@@ -262,7 +294,7 @@ pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
             ..Default::default()
         },
         reasoning_effort: default_effort,
-        thinking: Some(true),
+        thinking: (!is_variant).then_some(true),
         ..Default::default()
     }))
 }
@@ -315,3 +347,6 @@ pub fn main_level(config: &Config) -> Option<String> {
 pub fn catalog_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
     crate::llm::catalog::documented_thinking_levels(provider, model, role)
 }
+
+#[cfg(test)]
+mod tests;

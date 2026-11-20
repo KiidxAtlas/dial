@@ -59,15 +59,19 @@ keeps `Alt+Enter` (fullscreen), `Ctrl+V` (its text paste) and `Ctrl+,` (its sett
 Panel keys (such as `Shift+F2` and `Shift+F3` in `/models`) are panel-local. A panel never gives a global
 function key a second meaning: the settings Appearance preview answers `Shift+F4` and the model
 tuner `Shift+F7`, and the plain key works there only after you rebind provider setup or the latest
-worker shortcut away from it; hints always show the key that works. Panel footers show at most four
-keys (the main action, search, `F1 keys` and the way out); `F1` (or `?` where typing does not
-search) opens the full key sheet. In the HTTP header editor `Ctrl+O` adds a row
+worker shortcut away from it; hints always show the key that works. Models, Providers and Settings
+summarize long footers with up to four hints, including `F1 keys` and the way out. Extensions keeps
+applicable row actions visible when space allows. `F1` (or `?` outside text entry) opens the full key sheet in browse mode. In the HTTP header editor `Ctrl+O` adds a row
 (`Ctrl+P`/`Ctrl+N` move between rows) and `Ctrl+S` saves, since
 GNOME Terminal takes `F10`. A key you bind to an editing action is not shadowed by an application
 default on the same key. `/model` works on every platform, and the footer and `/hotkeys` show your
 active bindings, including custom overrides.
 The key sheet scrolls with arrows, PageUp/PageDown and Home/End while keeping its close hint visible.
-Peers keeps recipient selection separate from board scrolling: PageUp/PageDown reveals longer claims.
+The session and tree pickers, model details, model and image settings forms, and Appearance preview honor the configured movement and page keys. Model and image settings use the configured confirm key to save a typed value; releasing a shortcut does not apply it again.
+On narrow terminals, Models, Settings and Shortcuts keep the search caret in view. Compute and Improve keep the active tab visible, and a one-row settings list shows the selected field rather than just its heading. Models and Providers use the same readiness marks: cached metadata is neutral, not evidence of a live connection.
+Appearance preview shows scrolling keys only when the sample overflows; switch back to controls to filter or change a choice. In Providers, **F1 more details** means the complete selected-provider explanation is at the end of the key sheet. Compact model roles show the assignment destination below the list; focus details for the full effect. Settings puts `Ctrl+O` (saved only / all settings) before the override count.
+In history search, PageUp/PageDown scroll one visible page of the selected message. The busy-send chooser keeps confirm and cancel first. Attachment previews show skipped and truncated counts before token estimates. Process help blocks clicks on the list behind it; `Stopping` in a compact process list means a stop was requested, not that the process has exited.
+Peers uses the configured page keys (by default PageUp/PageDown) to scroll longer claims without changing the selected recipient. A stopped worker has the same state mark in the worker list and its detail view; running jobs and working peers use the running accent, not the success color.
 In Activity, Ctrl+Shift+F11/F12 navigates inner tabs. Alt+PageUp/PageDown and Ctrl+Tab remain alternatives where the terminal forwards them.
 Models, Providers and Settings use Ctrl+B for scope outside text editors; Ctrl+S means Save in headers.
 Shortcut labels use **Option** on macOS and **Alt** elsewhere. **Ctrl** always means Control,

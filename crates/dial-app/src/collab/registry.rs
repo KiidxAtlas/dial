@@ -1,13 +1,11 @@
 //! Local directory of live collab hosts. Each hosting process writes one
 //! owner-only JSON record under `<user_dir>/run/collab-hosts/`. Records carry metadata only, never
 //! a link or key. Listing drops records whose process is gone.
-use crate::platform::fs as platform_fs;
 use crate::platform::procinfo::ProcId;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -34,15 +32,7 @@ pub fn write(user_dir: &Path, record: &HostRecord) -> Result<PathBuf> {
     let dir = dir(user_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{}.json", record.id));
-    let tmp = dir.join(format!(".{}.{}.tmp", record.id, rand::random::<u32>()));
-    let body = serde_json::to_vec(record)?;
-    let mut out =
-        platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-    out.write_all(&body)?;
-    platform_fs::sync_file(&out)?;
-    drop(out);
-    fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
+    crate::platform::atomic::write_owner_only_entry(&path, &serde_json::to_vec(record)?)?;
     Ok(path)
 }
 

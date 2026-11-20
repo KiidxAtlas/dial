@@ -83,6 +83,34 @@ fn projected_history_replaces_only_messages() {
 }
 
 #[test]
+fn a_wire_only_read_tool_cannot_authorize_a_history_migration() {
+    use crate::llm::tool_offer::{self, Mark};
+    let mut original = request(vec![json!({"role":"assistant", "dial_tool_contracts":{
+        "call": {"name":"artifact_read","revision":1,"schema_sha256":"legacy"}}})]);
+    tool_offer::mark(
+        &mut original.tools[0],
+        Mark {
+            callable: false,
+            deferred: false,
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let error = prepare_provider_request(
+        &original,
+        &Registry::new(),
+        &[],
+        dir.path(),
+        &AtomicBool::new(false),
+        &mut |_| panic!("projection must precede hooks"),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("read, which is unavailable"),
+        "{error}"
+    );
+}
+
+#[test]
 fn parallel_completion_reaches_the_view_before_a_slow_sibling_and_keeps_call_order() {
     use crate::tools::integrations::ext::{Concurrency, Tool};
     use std::sync::{

@@ -7,12 +7,11 @@ use crate::agent::Agent;
 use crate::agent::workers::child_transcript::{self, TranscriptSummary};
 use crate::app::bridge::Bridge;
 use crate::app::core::App;
-use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::app::shell::Shell;
 use crate::config::paths::Layout;
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::collections::HashSet;
-use std::time::Instant;
 
 /// Continuation sent to each restored worker. It resumes the saved assignment; it is not the
 /// user's prompt.
@@ -129,16 +128,7 @@ fn restore_ids(
     for id in ids {
         let args = json!({"action": "resume", "id": id, "message": CONTINUE});
         let (result, failed) = {
-            let mut bridge = Bridge {
-                app,
-                shell: &mut *shell,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, &mut *shell);
             let result = agent.start_subagents(&args, &mut bridge);
             (result, bridge.failed)
         };

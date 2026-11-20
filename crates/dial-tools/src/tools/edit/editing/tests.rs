@@ -322,6 +322,7 @@ fn hashline_exact_noop_is_stable_but_stale_and_mixed_batches_remain_atomic_refus
 fn parse_repair_that_reverts_the_request_is_not_already_applied() {
     let (_dir, mut ws, _, observed) = workspace("");
     ws.edit_settings.auto_repair.enabled = true;
+    ws.edit_settings.auto_repair.coach = true;
     let path = ws.root().join("a.rs");
     let original = "fn main() {}\n";
     fs::write(&path, original).unwrap();
@@ -329,6 +330,7 @@ fn parse_repair_that_reverts_the_request_is_not_already_applied() {
     let repair = |_: &EditRepairRequest| Ok(original.to_owned());
     let execution = Execution {
         repair: Some(&repair),
+        refuse_syntax_errors: true,
         ..Default::default()
     };
     let args = json!({"path":"a.rs", "old_string":"fn main() {}", "new_string":"fn main( {"});

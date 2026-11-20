@@ -1,14 +1,7 @@
 use super::super::evidence::source;
 use super::*;
-use crate::storage::artifact::ArtifactStore;
 use crate::tools::testkit;
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
 fn source_record(ws: &Workspace, text: &str, parents: Vec<String>) -> String {
     let item = Evidence {
         source: "fixture.txt".into(),
@@ -32,7 +25,7 @@ fn source_record(ws: &Workspace, text: &str, parents: Vec<String>) -> String {
 }
 #[test]
 fn lineage_reports_conflicting_revisions_and_never_reopens_sources() {
-    let (work, _state, ws) = fixture();
+    let (work, _state, ws) = testkit::workspace_with_artifacts();
     let a = source_record(&ws, "before", vec![]);
     let b = source_record(&ws, "after", vec![a]);
     std::fs::write(
@@ -48,7 +41,7 @@ fn lineage_reports_conflicting_revisions_and_never_reopens_sources() {
 }
 #[test]
 fn unavailable_citations_and_depth_gaps_are_visible() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = source_record(&ws, "before", vec![]);
     let b = source_record(&ws, "after", vec![a.clone()]);
     let out = run(&ws, &json!({"action":"lineage","references":[b],"depth":0})).unwrap();
@@ -62,7 +55,7 @@ fn unavailable_citations_and_depth_gaps_are_visible() {
 }
 #[test]
 fn correction_is_append_only_parent_linked_and_not_automatically_human() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = source_record(&ws, "before", vec![]);
     let old = ws.artifacts().unwrap().evidence_record(&a).unwrap();
     let out = run(
@@ -84,7 +77,7 @@ fn correction_is_append_only_parent_linked_and_not_automatically_human() {
 }
 #[test]
 fn terminal_preview_sanitizes_controls_and_bounds_unicode() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = source_record(
         &ws,
         &format!("\u{1b}[2J\u{202e}{}", "é".repeat(4096)),
@@ -98,7 +91,7 @@ fn terminal_preview_sanitizes_controls_and_bounds_unicode() {
 
 #[test]
 fn missing_retained_manifest_is_distinguished_from_unknown_reference() {
-    let (_work, state, ws) = fixture();
+    let (_work, state, ws) = testkit::workspace_with_artifacts();
     let reference = source_record(&ws, "retained", vec![]);
     std::fs::remove_file(
         state
@@ -115,7 +108,7 @@ fn missing_retained_manifest_is_distinguished_from_unknown_reference() {
 
 #[test]
 fn exhausted_representation_budget_is_visible_and_lineage_node_limit_is_honest() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let large = source_record(&ws, &"x".repeat(MAX_BYTES + 1), vec![]);
     let small = source_record(&ws, "small", vec![]);
     let out = run(

@@ -1,4 +1,6 @@
 //! Lifetime of the scripted loopback servers used by the image transport fixtures.
+use std::io::{BufRead, BufReader, Read};
+use std::net::TcpStream;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -30,4 +32,27 @@ impl Server {
         self.stop.store(true, Ordering::SeqCst);
         self.handle.join()
     }
+}
+
+/// Reads one request head and its body from a loopback connection, as raw text.
+pub(super) fn read_request(stream: &TcpStream) -> String {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut raw = String::new();
+    let mut length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+        let end = line == "\r\n" || line.is_empty();
+        raw.push_str(&line);
+        if end {
+            break;
+        }
+    }
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).unwrap();
+    raw.push_str(&String::from_utf8_lossy(&body));
+    raw
 }

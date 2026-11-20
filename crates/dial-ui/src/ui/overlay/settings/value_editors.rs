@@ -7,9 +7,10 @@
 use crate::config::schema::PathKind;
 use crate::ui::editor::Editor;
 use crate::ui::keys::{Action, Keymap};
+use crate::ui::overlay::panel_keys::{Edge, list_move};
 use crate::ui::overlay::path_browser::{BrowseStep, BrowserView, PathBrowser};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::Path;
+use std::{cell::Cell, path::Path};
 use toml::{Table, Value};
 
 /// What a key did.
@@ -45,22 +46,6 @@ fn window(len: usize, cursor: usize, height: usize) -> std::ops::Range<usize> {
     first..(first + height).min(len)
 }
 
-/// Move the cursor for the shared navigation keys; `None` when the key is not navigation.
-fn navigate(keys: &Keymap, key: &KeyEvent, cursor: usize, len: usize) -> Option<usize> {
-    let last = len.saturating_sub(1);
-    if keys.matches(Action::SelectUp, key) {
-        Some(if cursor == 0 { last } else { cursor - 1 })
-    } else if keys.matches(Action::SelectDown, key) {
-        Some(if cursor >= last { 0 } else { cursor + 1 })
-    } else if keys.matches(Action::SelectPageUp, key) {
-        Some(cursor.saturating_sub(8))
-    } else if keys.matches(Action::SelectPageDown, key) {
-        Some((cursor + 8).min(last))
-    } else {
-        None
-    }
-}
-
 /// How a list adds a value that is not offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AddBy {
@@ -81,6 +66,8 @@ pub(super) struct ListEditor {
     ordered: bool,
     add_by: AddBy,
     cursor: usize,
+    /// Rows a page key moves: the list height from the last draw.
+    page: Cell<usize>,
     adding: Option<Adding>,
     /// Where the folder browser starts.
     base: std::path::PathBuf,
@@ -107,6 +94,7 @@ impl ListEditor {
             ordered,
             add_by,
             cursor: 0,
+            page: Cell::new(1),
             adding: None,
             base: base.to_path_buf(),
         }
@@ -199,7 +187,7 @@ impl ListEditor {
         }
         let len = self.len();
         self.cursor = self.cursor.min(len - 1);
-        if let Some(next) = navigate(keys, key, self.cursor, len) {
+        if let Some(next) = list_move(keys, key, self.cursor, len, self.page.get(), Edge::Wrap) {
             self.cursor = next;
             return Step::Stay;
         }
@@ -209,7 +197,7 @@ impl ListEditor {
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
         match key.code {
-            KeyCode::Enter if on_add => {
+            _ if on_add && keys.matches(Action::SelectConfirm, key) => {
                 self.adding = Some(match self.add_by {
                     AddBy::Text => Adding::Text(Editor::default()),
                     AddBy::Folder => Adding::Folder(Box::new(PathBrowser::open(
@@ -248,6 +236,7 @@ impl ListEditor {
     }
 
     pub(super) fn view(&self, height: usize) -> View {
+        self.page.set(height.max(1));
         if let Some(Adding::Folder(browser)) = &self.adding {
             return View {
                 rows: Vec::new(),
@@ -393,6 +382,8 @@ pub(super) struct EntriesEditor {
     /// The working copy: a table of named entries, or an array of items.
     value: Value,
     cursor: usize,
+    /// Rows a page key moves: the list height from the last draw.
+    page: Cell<usize>,
     input: Option<(Target, Editor)>,
     note: Option<String>,
     changed: bool,
@@ -414,6 +405,7 @@ impl EntriesEditor {
         EntriesEditor {
             value,
             cursor: 0,
+            page: Cell::new(1),
             input: None,
             note: None,
             changed: false,
@@ -655,7 +647,14 @@ impl EntriesEditor {
                     self.note = None;
                     return Step::Stay;
                 }
-                if let Some(next) = navigate(keys, key, *cursor, ENTRY_TYPES.len()) {
+                if let Some(next) = list_move(
+                    keys,
+                    key,
+                    *cursor,
+                    ENTRY_TYPES.len(),
+                    self.page.get(),
+                    Edge::Wrap,
+                ) {
                     *cursor = next;
                 } else if keys.matches(Action::SelectConfirm, key) {
                     let name = name.clone();
@@ -796,7 +795,7 @@ impl EntriesEditor {
         }
         let len = self.len();
         self.cursor = self.cursor.min(len - 1);
-        if let Some(next) = navigate(keys, key, self.cursor, len) {
+        if let Some(next) = list_move(keys, key, self.cursor, len, self.page.get(), Edge::Wrap) {
             self.cursor = next;
             return Step::Stay;
         }
@@ -863,17 +862,25 @@ impl EntriesEditor {
     }
 
     pub(super) fn view(&self, height: usize) -> View {
+        self.page.set(height.max(1));
         if let Some(creating) = &self.creating {
             return match creating {
                 Creating::Nested { editor, .. } => editor.view(height),
                 Creating::Kind { cursor, .. } => {
                     let range = window(ENTRY_TYPES.len(), *cursor, height);
                     View {
-                        rows: ENTRY_TYPES.iter().enumerate().skip(range.start).take(range.len())
-                            .map(|(index, label)| (format!("{label} →"), index == *cursor)).collect(),
+                        rows: ENTRY_TYPES
+                            .iter()
+                            .enumerate()
+                            .skip(range.start)
+                            .take(range.len())
+                            .map(|(index, label)| (format!("{label} →"), index == *cursor))
+                            .collect(),
                         input: None,
                         browser: None,
-                        note: Some("Choose the new value's type. Enter: continue; Esc: cancel; Ctrl+E: Advanced TOML.".into()),
+                        note: Some(
+                            "Choose the new value's type. Ctrl+E switches to advanced TOML.".into(),
+                        ),
                     }
                 }
                 Creating::Name(editor) | Creating::Scalar { editor, .. } => {
@@ -891,9 +898,9 @@ impl EntriesEditor {
                         input: Some((prompt, shown)),
                         browser: None,
                         note: self.note.clone().or_else(|| Some(if sensitive {
-                            "New value masked. Ctrl+R: reveal/hide; Enter: accept; Esc: cancel; Ctrl+E: Advanced TOML.".into()
+                            "New value masked. Ctrl+R reveals or hides it. Confirm to accept the value; Ctrl+E switches to advanced TOML.".into()
                         } else {
-                            "Enter: choose type; Esc: cancel; Ctrl+E: Advanced TOML.".into()
+                            "Confirm the name to choose its type. Ctrl+E switches to advanced TOML.".into()
                         })),
                     }
                 }
@@ -942,9 +949,9 @@ impl EntriesEditor {
             browser: None,
             note: self.note.clone().or_else(|| self.input.as_ref().map(|(target, _)| {
                 if self.input_sensitive(target) {
-                    "Value masked. Ctrl+R: reveal/hide; Enter: accept field; Esc: discard field.".into()
+                    "Value masked. Ctrl+R reveals or hides it. Confirm to accept the field or cancel to discard it.".into()
                 } else {
-                    "Enter: accept field; Esc: discard field. Save changes applies the collection.".into()
+                    "Confirm to accept the field or cancel to discard it. Save changes applies the collection.".into()
                 }
             })),
         }

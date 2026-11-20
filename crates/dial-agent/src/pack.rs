@@ -3,6 +3,7 @@
 //! A pack carries weights and provenance only. Importing never activates anything: an adapter
 //! enters as a pending candidate that must pass the local gate, and a steering vector is re-bound
 //! to this checkout with its evaluation cleared, so it cannot steer until local evaluation passes.
+use crate::runtime::fingerprint::sha256_file;
 use crate::{
     config::types::{Config, Version},
     hex, steering,
@@ -47,12 +48,6 @@ struct Entry {
     bytes: u64,
 }
 
-fn file_sha(path: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
-    Ok(hex(&hasher.finalize()))
-}
-
 /// Portable base-checkpoint fingerprint: config and tokenizer contents plus weight file names
 /// and sizes. Unlike the worker's machine-local identity (absolute path and mtime), this is equal
 /// across machines holding the same checkpoint.
@@ -95,7 +90,7 @@ pub fn base_fingerprint(model: &Path) -> Result<String> {
         hasher.update(b"\0");
         hasher.update(meta.len().to_le_bytes());
         if !name.ends_with(".safetensors") && meta.len() <= MAX_JSON_HASH_BYTES {
-            hasher.update(file_sha(&path)?.as_bytes());
+            hasher.update(sha256_file(&path)?.as_bytes());
         }
     }
     Ok(hex(&hasher.finalize()))
@@ -108,7 +103,7 @@ fn entries(sources: &[(String, PathBuf)]) -> Result<Vec<Entry>> {
             ensure!(path.is_file(), "pack source {name} is missing");
             Ok(Entry {
                 name: name.clone(),
-                sha256: file_sha(path)?,
+                sha256: sha256_file(path)?,
                 bytes: fs::metadata(path)?.len(),
             })
         })
@@ -231,7 +226,7 @@ fn open_pack(
             file.name
         );
         ensure!(
-            file_sha(&path)? == file.sha256,
+            sha256_file(&path)? == file.sha256,
             "pack member {} failed its checksum",
             file.name
         );

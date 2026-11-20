@@ -20,6 +20,7 @@ use std::{
 };
 
 use crate::platform::fs as platform_fs;
+use crate::runtime::clock::format_utc_seconds;
 
 /// Prompt history and recap journal, shared by every project.
 pub const HISTORY_DB: &str = "history.db";
@@ -956,7 +957,7 @@ fn scan_session(path: &Path) -> Option<ArchiveSession> {
             }
         });
     let created = if state.started.is_empty() {
-        iso(modified)
+        format_utc_seconds(modified)
     } else {
         state.started.clone()
     };
@@ -966,7 +967,7 @@ fn scan_session(path: &Path) -> Option<ArchiveSession> {
         project: state.cwd,
         title,
         created,
-        modified: iso(modified),
+        modified: format_utc_seconds(modified),
         messages: state.messages,
         messages_exact: exact,
         status,
@@ -1453,7 +1454,7 @@ impl Archive {
 
 fn to_prompt(entry: HistoryEntry) -> ArchivePrompt {
     ArchivePrompt {
-        at: iso(entry.created_at),
+        at: format_utc_seconds(entry.created_at),
         at_secs: entry.created_at,
         text: entry.prompt,
         project: entry.cwd,
@@ -1464,7 +1465,7 @@ fn to_prompt(entry: HistoryEntry) -> ArchivePrompt {
 
 fn to_recap(row: SessionRecap) -> ArchiveRecap {
     ArchiveRecap {
-        at: iso(row.created_at),
+        at: format_utc_seconds(row.created_at),
         at_secs: row.created_at,
         text: row.recap,
         session: row.session_id,
@@ -1526,27 +1527,6 @@ fn clip(text: &str, max: usize) -> String {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text.to_owned(),
     }
-}
-
-/// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.
-fn iso(secs: i64) -> String {
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Howard Hinnant's civil-from-days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
 }
 
 /// `~/x` and relative paths resolve like a shell would; the archive matches canonical roots.

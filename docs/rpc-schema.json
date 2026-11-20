@@ -1259,6 +1259,36 @@
         },
         {
           "type": "object",
+          "description": "Native RPC only. As a joined, writable guest, answer the host's open question with a 1-based option number from collaboration_status room.question.options. The host offers only question prompts, never tool approvals, and only with [collab].allow_guest_answers. Returns {routed:\"collaboration_host\",option}; no guest returns not_pending; a read-only link, closed question or unknown option returns refused.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_answer"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "option": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "option"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Open, query or stop the local comparison workspace without starting inference. Returns status and a capability-scoped loopback URL. Confirm and start selected runs through that workspace; Python 3.11+ and a Dial benchmark checkout are required. Native RPC only; busy open and invalid actions have coded refusals.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },

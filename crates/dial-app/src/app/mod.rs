@@ -18,14 +18,13 @@ use crate::app::drive::{Step, drive};
 use crate::app::overlay::auth::AuthJob;
 use crate::app::overlay::{Which, start_streaming_job};
 use crate::app::selection::{reasoning_changes, reasoning_profile, thinking_label};
-use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::app::shell::Shell;
 use crate::cli::print_output;
 use crate::config::paths::Layout;
 use crate::config::types::{Approval, Config};
 use crate::learn::auto;
 use crate::repl::{OutputFormat, PrintExit, PrintUi};
 use crate::storage::session::{Session, SessionMeta};
-use crate::ui::status::Phase;
 use anyhow::Result;
 use std::time::{Duration, Instant};
 

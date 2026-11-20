@@ -339,7 +339,8 @@ impl RetryNotice {
         let (attempt, max) = attempts.strip_suffix(')')?.split_once('/')?;
         let attempt = attempt.parse::<u32>().ok()?;
         let maximum = max.trim().parse::<u32>().ok()?;
-        if attempt == 0 || maximum == 0 || attempt > maximum {
+        // The provider reports the upcoming attempt, not the one that just failed.
+        if attempt < 2 || attempt > maximum {
             return None;
         }
         let cause = head
@@ -374,12 +375,14 @@ impl RetryNotice {
         };
         match explained {
             None => Some(format!(
-                "The model request failed ({}). Dial retries up to {} times; /retry skips the wait, {stop} stops.",
+                "The model request failed ({}). Dial allows up to {} total attempts; /retry skips the wait, {stop} stops.",
                 self.cause, self.max
             )),
             Some(previous) if previous != self.cause_key() => Some(format!(
                 "Attempt {} of {} failed differently ({}).",
-                self.attempt, self.max, self.cause
+                self.attempt - 1,
+                self.max,
+                self.cause
             )),
             Some(_) => None,
         }

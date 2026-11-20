@@ -67,6 +67,57 @@ fn row(name: &str, running: bool) -> JobRow {
 }
 
 #[test]
+fn compact_audit_jobs_help_never_selects_or_attaches_hidden_jobs() {
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    let mut o = JobsOverlay::new();
+    o.set_jobs(vec![row("first", true), row("second", true)]);
+    draw_rows(&mut o, &theme, 38, 16);
+    o.handle(&Event::Key(key(KeyCode::F(1), KeyModifiers::NONE)), &keys);
+    assert!(o.panel_keys.open());
+    for y in [2, 1] {
+        o.click(y);
+        assert_eq!((o.cursor, o.attached()), (0, None));
+        assert!(matches!(
+            o.handle(&Event::Paste("x".into()), &keys),
+            OverlayEvent::None
+        ));
+    }
+    o.handle(&Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)), &keys);
+    o.click(1);
+    assert_eq!(o.attached(), Some("first"));
+}
+
+#[test]
+fn compact_audit_job_headers_separate_the_name_and_statuses_read_in_full() {
+    let ascii = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let mut stopping = row("test-build", true);
+    stopping.stop_requested = true;
+    let mut stopped = stopping.clone();
+    stopped.name = "old-test".into();
+    stopped.running = false;
+    stopped.process_outcome = Some(crate::runtime::execution::ProcessOutcome {
+        started: true,
+        signal: Some(15),
+        exit_code: None,
+        timed_out: false,
+        cancelled: false,
+        output_complete: true,
+    });
+    let mut o = JobsOverlay::new();
+    o.set_jobs(vec![stopping, stopped]);
+    let rows = draw_rows(&mut o, &ascii, 38, 16);
+    assert!(rows.iter().any(|r| r.contains(" Stopping ")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains(" Stopped ")), "{rows:?}");
+    o.click(1);
+    let header = &draw_rows(&mut o, &ascii, 38, 16)[0];
+    assert!(
+        header.contains("Output ") && header.contains(" test-build"),
+        "{header}"
+    );
+}
+
+#[test]
 fn stop_and_dismiss_are_distinct_and_never_infer_cancellation() {
     let keys = Keymap::defaults();
     let mut overlay = JobsOverlay::new();

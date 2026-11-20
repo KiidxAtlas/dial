@@ -45,7 +45,7 @@ pub fn default_anthropic_thinking(model: &str) -> Option<ReasoningApi> {
         ThinkingMode::AnthropicBudgetEffort | ThinkingMode::Budget => {
             Some(ReasoningApi::AnthropicBudget)
         }
-        ThinkingMode::Effort | ThinkingMode::GoogleLevel => None,
+        ThinkingMode::Effort | ThinkingMode::GoogleLevel | ThinkingMode::ModelVariant => None,
     }
 }
 
@@ -68,6 +68,8 @@ pub enum ReasoningApi {
     GeminiBudget,
     GeminiLevel,
     OllamaThink,
+    /// Antigravity account rows that list one wire model per effort; the effort selects the model.
+    AntigravityModelVariant,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -641,6 +643,10 @@ impl ModelProfile {
                     );
                 }
             }
+            ReasoningApi::AntigravityModelVariant => ensure!(
+                self.thinking.is_none() && self.thinking_budget.is_none(),
+                "Antigravity model variants select thinking through the model ID; thinking controls are not accepted"
+            ),
         }
         Ok(())
     }

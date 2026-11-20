@@ -2150,10 +2150,7 @@ fn grep_text(
         context_rows(&mut out, hit + 1, until + 1);
         written = Some(until.max(hit));
         if out.len() >= MAX_GREP_OUTPUT {
-            let mut end = MAX_GREP_OUTPUT;
-            while !out.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = out.floor_char_boundary(MAX_GREP_OUTPUT);
             out.truncate(end);
             out.push_str("\n[output capped]\n");
             capped = true;

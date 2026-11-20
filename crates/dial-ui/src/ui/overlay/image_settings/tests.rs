@@ -1,5 +1,7 @@
 use super::*;
-use crate::ui::overlay::settings::testkit::{Rig, ch, key, render, screen, status_preview};
+use crate::ui::overlay::settings::testkit::{
+    Rig, ch, ctrl, key, released, remapped_keys, render, screen, status_preview,
+};
 
 const MLX: &[&str] = &["size", "steps", "seed", "strength", "loras", "cond_weights"];
 const OPENAI: &[&str] = &["size", "quality", "background", "moderation"];
@@ -241,4 +243,159 @@ fn native_provider_settings_are_editable_and_validated() {
     assert!(matches!(event, OverlayEvent::Set { .. }));
     comfy.settled(Ok(()));
     assert!(comfy.settings.comfyui.is_some());
+}
+
+#[test]
+fn remapped_keys_drive_paging_editing_and_cancel() {
+    let rig = Rig::new();
+    let keys = remapped_keys();
+    let all = [
+        "size",
+        "quality",
+        "background",
+        "moderation",
+        "steps",
+        "seed",
+        "strength",
+        "cond_weights",
+        "loras",
+        "input",
+        "comfyui",
+    ];
+    let mut overlay = overlay(&all);
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let _ = render(70, 12, |frame| overlay.draw(frame, &ctx));
+    assert!(
+        overlay.page > 0 && overlay.page < overlay.fields.len(),
+        "a short panel pages by fewer rows than it has"
+    );
+    let page = overlay.page;
+    overlay.event(&ctrl('n'), &keys);
+    assert_eq!(overlay.cursor, page, "the remapped page down moves a page");
+    overlay.event(&ctrl('p'), &keys);
+    assert_eq!(overlay.cursor, 0, "the remapped page up moves back");
+    overlay.event(&key(KeyCode::PageDown), &keys);
+    assert_eq!(overlay.cursor, 0, "PageDown is no longer bound to paging");
+
+    go(&mut overlay, "steps");
+    overlay.event(&ctrl('y'), &keys);
+    assert!(
+        overlay.editor.is_some(),
+        "the remapped confirm opens the editor"
+    );
+    overlay.event(&key(KeyCode::Enter), &keys);
+    assert!(overlay.editor.is_some(), "Enter no longer confirms");
+    overlay.event(&ch('1'), &keys);
+    overlay.event(&ch('2'), &keys);
+    let OverlayEvent::Set { value, .. } = overlay.event(&ctrl('y'), &keys) else {
+        panic!("the remapped confirm saves the typed value");
+    };
+    assert_eq!(
+        value.get("steps").and_then(toml::Value::as_integer),
+        Some(12)
+    );
+    overlay.settled(Ok(()));
+
+    overlay.event(&ctrl('y'), &keys);
+    overlay.event(&ctrl('g'), &keys);
+    assert!(
+        overlay.editor.is_none(),
+        "the remapped cancel discards the editor"
+    );
+    assert!(
+        matches!(overlay.event(&ctrl('g'), &keys), OverlayEvent::Close),
+        "the remapped cancel closes the form"
+    );
+    assert!(
+        matches!(overlay.event(&key(KeyCode::Esc), &keys), OverlayEvent::None),
+        "Esc is no longer cancel"
+    );
+}
+
+/// Press then release of each key: the press acts once and the release changes nothing, whether or
+/// not an editor is open. Remapped confirm and cancel open, commit and discard only on their press.
+#[test]
+fn released_keys_never_act_and_remapped_keys_drive_the_editor() {
+    let rig = Rig::new();
+    let state =
+        |o: &ImageSettingsOverlay| (o.cursor, o.scope, o.editor.is_some(), o.message.is_some());
+    for code in [
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Tab,
+        KeyCode::Enter,
+        KeyCode::Esc,
+        KeyCode::Backspace,
+        KeyCode::Char('r'),
+        KeyCode::Char('s'),
+    ] {
+        let mut overlay = overlay(MLX);
+        go(&mut overlay, "steps");
+        let before = state(&overlay);
+        overlay.event(&key(code), &rig.keys);
+        let pressed = state(&overlay);
+        if code == KeyCode::Char('s') {
+            assert!(pressed.1 != before.1, "the press switches the scope once");
+        }
+        assert!(
+            matches!(
+                overlay.event(&released(key(code)), &rig.keys),
+                OverlayEvent::None
+            ),
+            "{code:?} released acted on the form"
+        );
+        assert!(
+            state(&overlay) == pressed,
+            "{code:?} released changed the form"
+        );
+    }
+
+    let keys = remapped_keys();
+    let mut overlay = overlay(MLX);
+    go(&mut overlay, "steps");
+    assert!(matches!(
+        overlay.event(&released(ctrl('y')), &keys),
+        OverlayEvent::None
+    ));
+    assert!(
+        overlay.editor.is_none(),
+        "a released confirm opened the editor"
+    );
+    overlay.event(&ctrl('y'), &keys);
+    assert!(matches!(
+        overlay.event(&released(ctrl('y')), &keys),
+        OverlayEvent::None
+    ));
+    overlay.event(&ch('7'), &keys);
+    assert!(matches!(
+        overlay.event(&released(ctrl('g')), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(
+        overlay.editor.as_ref().map(|e| e.text.as_str()),
+        Some("7"),
+        "a released key changed the typed value"
+    );
+    let rendered = screen(&render(100, 30, |frame| {
+        overlay.draw(
+            frame,
+            &DrawCtx {
+                theme: &rig.theme,
+                keys: &keys,
+                status: &rig.status,
+                preview_status: &status_preview,
+            },
+        )
+    }));
+    assert!(rendered.contains("Ctrl+Y save"), "{rendered}");
+    overlay.event(&ctrl('g'), &keys);
+    assert!(
+        overlay.editor.is_none(),
+        "the remapped cancel press discards the editor"
+    );
 }

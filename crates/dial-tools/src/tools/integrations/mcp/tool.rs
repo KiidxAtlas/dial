@@ -909,10 +909,7 @@ fn bound(text: &str) -> String {
     if text.len() <= MAX_RESULT {
         return text.to_owned();
     }
-    let mut end = MAX_RESULT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(MAX_RESULT);
     format!(
         "{}\n[output truncated: {} of {} bytes shown]",
         &text[..end],

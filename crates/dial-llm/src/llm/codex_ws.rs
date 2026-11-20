@@ -511,7 +511,16 @@ pub(super) fn exchange(
 }
 
 fn chained(body: &Value, previous: Option<&str>, input: Vec<Value>) -> Value {
-    let mut request = body.clone();
+    // Copy options, not the transcript that this delta replaces. `exchange` takes only
+    // Responses request objects and keeps the full body for validation and replay.
+    let mut request = Value::Object(
+        body.as_object()
+            .expect("Responses request object")
+            .iter()
+            .filter(|(key, _)| key.as_str() != "input")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
     if let Some(id) = previous {
         request["previous_response_id"] = json!(id);
     }

@@ -2,6 +2,7 @@
 use super::profiles::ModelProfile;
 use super::transports::{OnText, Route, Wire};
 use super::{Chat, Interrupted, Reply, StreamEvent};
+use crate::url::percent_encode;
 use anyhow::{Result, ensure};
 use std::sync::{
     Arc,
@@ -25,19 +26,6 @@ fn url(base: &str) -> Result<String> {
         "{base}{path}?api-version={}",
         percent_encode(&version)
     ))
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            use std::fmt::Write;
-            write!(out, "%{byte:02X}").expect("string write");
-        }
-    }
-    out
 }
 
 pub(super) fn exchange(

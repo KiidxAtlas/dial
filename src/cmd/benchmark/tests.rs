@@ -228,6 +228,23 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
 }
 
 #[test]
+fn advisory_ablation_never_changes_an_operator_block() {
+    use dial::config::tools::bash_interceptor::InterceptMode;
+    let mut config = Config::default();
+    let variant = assist_configurations(&config, "openai", "model")
+        .into_iter()
+        .find(|v| v.name == "ablate-bash_hints")
+        .unwrap();
+    apply_assistance(&mut config, &variant.assistance);
+    assert!(!config.bash_interceptor.enabled);
+    config.bash_interceptor.enabled = true;
+    config.bash_interceptor.mode = InterceptMode::Block;
+    apply_assistance(&mut config, &variant.assistance);
+    assert!(config.bash_interceptor.enabled);
+    assert_eq!(assistance_settings(&config)["bash_hints"], false);
+}
+
+#[test]
 fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
     let shipped = Config::default();
     let mut user = Config::default();

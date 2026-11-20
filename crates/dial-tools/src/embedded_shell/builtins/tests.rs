@@ -36,6 +36,32 @@ pub(super) fn run_script(dir: &Path, script: &str) -> u8 {
     })
 }
 
+/// Runs one builtin in `cwd` with `args` and `stdin`. Returns `(status, stdout, stderr)`.
+pub(super) fn run(f: RunFn, cwd: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    let mut input = stdin.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let code = f(
+        &mut Io {
+            name: "cmd",
+            cwd,
+            env: &[],
+            synopsis: "",
+            stdin: &mut input,
+            stdout: &mut out,
+            stderr: &mut err,
+            declined: None,
+        },
+        &args,
+    );
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
 #[test]
 fn every_command_has_a_unique_name_and_synopsis() {
     let mut names: Vec<&str> = UTILS.iter().map(|u| u.name).collect();

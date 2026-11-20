@@ -5,6 +5,10 @@
 //!
 //! This file also holds the small drawing helpers shared by the model and provider panels.
 use super::path_browser::PathBrowser;
+use super::widgets::{
+    Axis, arrows, fit, hint_line, is_ctrl, local_function_key, local_function_label, other_scope,
+    panel, pressed, scope_name,
+};
 use super::{DrawCtx, OverlayEvent};
 use crate::config::schema::{Kind, PathKind, SettingDef, Source};
 use crate::config::settings_store::Scope;
@@ -28,14 +32,7 @@ use ratatui::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use toml::{Table, Value};
-use unicode_segmentation::UnicodeSegmentation;
 use value_editors::{AddBy, EntriesEditor, ListEditor};
-pub(crate) use widgets::scroll_cell;
-pub(super) use widgets::{
-    Axis, arrows, editor_spans, filled, fit, highlighted, hint, hint_line, hint_line_after,
-    is_ctrl, list_row, local_function_key, local_function_label, match_style, other_scope,
-    pair_label, panel, pressed, scope_caption, scope_name, tab_strip, typed_char,
-};
 
 mod appearance;
 mod bulk;
@@ -46,7 +43,6 @@ mod input;
 mod memory;
 mod render;
 mod value_editors;
-mod widgets;
 
 /// Bulk removal is limited to canonical leaf settings; section containers can hide siblings.
 pub fn resettable_path(path: &str) -> bool {
@@ -838,12 +834,9 @@ impl SettingsOverlay {
         if matches!(self.source(def.path), "env" | "CLI flag") {
             return crate::config::schema::get(&self.effective, def.path).cloned();
         }
-        crate::config::schema::get(
-            self.layer_ref(super::settings::other_scope(scope)),
-            def.path,
-        )
-        .cloned()
-        .or_else(|| def.default_value())
+        crate::config::schema::get(self.layer_ref(super::widgets::other_scope(scope)), def.path)
+            .cloned()
+            .or_else(|| def.default_value())
     }
 
     /// Explain persistence and precedence without exposing raw sensitive values.

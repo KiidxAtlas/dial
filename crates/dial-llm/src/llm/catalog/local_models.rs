@@ -111,11 +111,8 @@ pub(crate) fn chat_template(model: &Path) -> Option<String> {
         })
         .or_else(|| {
             let file = fs::File::open(model.join("chat_template.jinja")).ok()?;
-            let mut template = String::new();
-            file.take(MAX_RESPONSE + 1)
-                .read_to_string(&mut template)
-                .ok()?;
-            (template.len() as u64 <= MAX_RESPONSE).then_some(template)
+            let bytes = crate::llm::read_within(file, MAX_RESPONSE)?;
+            String::from_utf8(bytes).ok()
         })
 }
 /// Tool and reasoning support declared by a chat template. These are template declarations, not
@@ -221,16 +218,7 @@ pub(super) fn annotate_embedding_checkpoints(models: &mut [ModelEntry]) {
     }
 }
 pub(crate) fn read_json(path: &Path) -> Option<Value> {
-    let file = fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_RESPONSE {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RESPONSE + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_RESPONSE {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
+    crate::llm::read_json_within(path, MAX_RESPONSE)
 }
 /// A diffusion component layout is evidence of image weights, not of a serving transport.
 /// Krea stores its transformer at the root; FLUX conversions can omit a root config entirely.

@@ -35,6 +35,29 @@ const CONTENT_MODIFIED: i64 = -32801;
 const SERVER_CANCELLED: i64 = -32802;
 const RETRIES: u32 = 3;
 
+thread_local! {
+    /// The session issuing requests on this thread; see [`with_owner`].
+    static OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `work` with requests on this thread attributed to `owner`, so a server shared by several
+/// sessions cancels only the requests of the session that asked (see
+/// [`Client::cancel_pending_requests`]). Nested calls restore the outer owner.
+pub fn with_owner<R>(owner: u64, work: impl FnOnce() -> R) -> R {
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWNER.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(OWNER.with(|cell| cell.replace(owner)));
+    work()
+}
+
+fn current_owner() -> u64 {
+    OWNER.with(std::cell::Cell::get)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     /// The `initialize` handshake; servers may load the project first.
@@ -116,7 +139,8 @@ struct Outgoing {
 
 struct Shared {
     outgoing: Mutex<Option<Sender<Outgoing>>>,
-    pending: Mutex<HashMap<i64, Sender<Reply>>>,
+    /// Waiting requests with the session that issued them.
+    pending: Mutex<HashMap<i64, (u64, Sender<Reply>)>>,
     diagnostics: Mutex<Diagnostics>,
     registrations: Mutex<HashMap<String, Value>>,
     published: Condvar,
@@ -264,7 +288,8 @@ impl Shared {
             (Some("$/progress"), None) => self.track_progress(&message["params"]),
             (Some(_), None) => {}
             (None, Some(id)) => {
-                let Some(tx) = id.as_i64().and_then(|id| lock(&self.pending).remove(&id)) else {
+                let Some((_, tx)) = id.as_i64().and_then(|id| lock(&self.pending).remove(&id))
+                else {
                     return;
                 };
                 let reply = match message.get("error") {
@@ -430,8 +455,9 @@ pub struct Client {
     capabilities: Mutex<Value>,
     shared: std::sync::Arc<Shared>,
     next_id: AtomicI64,
-    /// Bumped by `cancel_pending_requests`, so a retry loop sleeping through a cancel stops.
-    cancellations: AtomicU64,
+    /// Per-session counters bumped by `cancel_pending_requests`, so a retry loop sleeping through
+    /// its own session's cancel stops while other sessions sharing the server keep going.
+    cancellations: Mutex<HashMap<u64, u64>>,
     docs: Mutex<HashMap<PathBuf, OpenDoc>>,
     clock: AtomicU64,
     child: Mutex<Option<ProcessGroup>>,
@@ -556,7 +582,7 @@ impl Client {
             capabilities: Mutex::new(Value::Null),
             shared,
             next_id: AtomicI64::new(1),
-            cancellations: AtomicU64::new(0),
+            cancellations: Mutex::new(HashMap::new()),
             docs: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
             child: Mutex::new(child.map(ProcessGroup::new)),
@@ -784,12 +810,23 @@ impl Client {
             .map_err(|e| anyhow!("{} is not accepting messages: {e}", self.name))
     }
 
-    /// Cancel only this session's currently pending requests, without taking the tool's
-    /// operation/workspace lock or tearing down a parent/sibling language server.
-    pub fn cancel_pending_requests(&self) {
-        self.cancellations.fetch_add(1, Ordering::AcqRel);
-        let pending = std::mem::take(&mut *lock(&self.shared.pending));
-        for (id, reply) in pending {
+    /// Cancel the pending requests of session `owner` (see [`with_owner`]), without taking the
+    /// tool's operation/workspace lock, tearing down the server, or touching the requests of other
+    /// sessions that share it.
+    pub fn cancel_pending_requests(&self, owner: u64) {
+        *lock(&self.cancellations).entry(owner).or_default() += 1;
+        let cancelled: Vec<(i64, Sender<Reply>)> = {
+            let mut pending = lock(&self.shared.pending);
+            let ids: Vec<i64> = pending
+                .iter()
+                .filter(|(_, (issuer, _))| *issuer == owner)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id).map(|(_, reply)| (id, reply)))
+                .collect()
+        };
+        for (id, reply) in cancelled {
             let _ = reply.send(Err(RequestFailure::Cancelled));
             self.shared.send_nowait(
                 &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
@@ -797,10 +834,15 @@ impl Client {
         }
     }
 
+    fn cancellation_generation(&self, owner: u64) -> u64 {
+        lock(&self.cancellations).get(&owner).copied().unwrap_or(0)
+    }
+
     /// A request, retried when the server answers `ContentModified`/`ServerCancelled`.
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
         let mut attempt = 0;
-        let generation = self.cancellations.load(Ordering::Acquire);
+        let owner = current_owner();
+        let generation = self.cancellation_generation(owner);
         loop {
             match self.request_within(method, params.clone(), self.timeouts.request) {
                 Err(error)
@@ -811,7 +853,7 @@ impl Client {
                 {
                     attempt += 1;
                     thread::sleep(Duration::from_millis(100 * u64::from(attempt)));
-                    if self.cancellations.load(Ordering::Acquire) != generation {
+                    if self.cancellation_generation(owner) != generation {
                         bail!("{} {method} cancelled", self.name);
                     }
                 }
@@ -838,7 +880,7 @@ impl Client {
             if !self.is_alive() {
                 bail!("{} has exited", self.name);
             }
-            pending.insert(id, tx);
+            pending.insert(id, (current_owner(), tx));
         }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(e) = self.shared.send_cancellable(&message, cancel) {

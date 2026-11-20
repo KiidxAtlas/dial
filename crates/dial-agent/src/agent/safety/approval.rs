@@ -6,6 +6,7 @@ pub(in crate::agent) use worker::{
 };
 
 use crate::agent::{Decision, Ui, workers::subagents};
+use crate::units::human_bytes;
 use crate::{config::types::Approval, llm::ToolCall, tools::integrations::ext::Registry};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -1229,13 +1230,6 @@ impl Denial {
 pub fn batch_call_line(call: &ToolCall) -> String {
     let args = &call.arguments;
     let text = |key: &str| args[key].as_str().unwrap_or("");
-    let size = |bytes: usize| {
-        if bytes < 1024 {
-            format!("{bytes} B")
-        } else {
-            format!("{:.1} KiB", bytes as f64 / 1024.0)
-        }
-    };
     let line = match call.name.as_str() {
         "write" if args["files"].is_array() => {
             let paths = crate::tools::declared_write_targets(args).unwrap_or_default();
@@ -1250,7 +1244,7 @@ pub fn batch_call_line(call: &ToolCall) -> String {
                 "write {} · {} lines, {}",
                 text("path"),
                 content.lines().count(),
-                size(content.len())
+                human_bytes(content.len() as u64)
             )
         }
         "edit" => {

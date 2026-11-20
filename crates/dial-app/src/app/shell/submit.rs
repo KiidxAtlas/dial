@@ -5,7 +5,7 @@ use crate::app::bridge::Bridge;
 use crate::app::core::App;
 use crate::app::drive::Step;
 use crate::app::overlay::Which;
-use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::app::shell::Shell;
 use crate::config::settings_store;
 use crate::runtime::tool_output::ToolOutput;
 use anyhow::{Context, Result};
@@ -114,16 +114,7 @@ impl Shell {
     ) -> Result<Step> {
         use crate::tools::{self, Workspace};
         let allowed = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, self);
             agent.approve_user_shell(command, &mut bridge)
         };
         if !allowed {
@@ -158,16 +149,7 @@ impl Shell {
             Ok(ws) => {
                 app.interrupt.store(false, Ordering::SeqCst);
                 self.composer.set_busy(true);
-                let mut bridge = Bridge {
-                    app,
-                    shell: self,
-                    interrupt: app.interrupt.clone(),
-                    started,
-                    last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                    failed: false,
-                    pending: Vec::new(),
-                    next_id: 0,
-                };
+                let mut bridge = Bridge::started_at(app, self, started);
                 bridge.tool_call("bash", command);
                 let output = std::thread::scope(|scope| {
                     let (tx, rx) = std::sync::mpsc::sync_channel(16);

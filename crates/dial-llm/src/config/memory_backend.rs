@@ -247,12 +247,7 @@ fn endpoint(value: &str, credential: &str, labels: &EndpointLabels) -> Result<()
             labels.url
         )
     })?;
-    let host = url.host_str().unwrap_or("");
-    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
-    let local = host == "localhost"
-        || bare_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    let local = crate::llm::is_loopback_url(value);
     ensure!(
         url.scheme() == "https" || (url.scheme() == "http" && local),
         "memory endpoints require HTTPS except explicit loopback HTTP"
@@ -266,11 +261,17 @@ fn endpoint(value: &str, credential: &str, labels: &EndpointLabels) -> Result<()
         labels.url
     );
     ensure!(
-        local || !credential.is_empty(),
+        !key_variable_missing(value, credential),
         "{} is not on this machine, so API key variable must name an environment variable that holds its key",
         labels.service
     );
     Ok(())
+}
+
+/// Whether a memory endpoint needs an API key variable and has none: every endpoint off this
+/// machine does. Validation and the settings rows both ask this, so they name the same gap.
+pub fn key_variable_missing(endpoint: &str, key_variable: &str) -> bool {
+    !crate::llm::is_loopback_url(endpoint) && key_variable.is_empty()
 }
 fn env_name(value: &str) -> Result<()> {
     ensure!(
@@ -342,21 +343,39 @@ pub fn auto_retain_uses_memory_role(config: &crate::config::types::MemoryConfig)
     config.enabled && config.backend == MemoryBackendId::Semantic && config.semantic.auto_retain
 }
 
-/// The explicit OpenAI-compatible embedding override is only usable as a pair: `Some(message)` when
-/// exactly one of `embedding_base_url` and `embedding_model` is set.
-pub fn half_embedding_override(semantic: &SemanticConfig) -> Option<&'static str> {
-    match (
-        semantic.embedding_base_url.trim().is_empty(),
-        semantic.embedding_model.trim().is_empty(),
-    ) {
-        (true, false) => Some(
-            "Embedding model override is set without Embedding service URL; set both or clear both (to use the embedding role, Alt+M, clear both)",
-        ),
-        (false, true) => Some(
-            "Embedding service URL is set without Embedding model override; set both or clear both (to use the embedding role, Alt+M, clear both)",
-        ),
+/// The field missing from the explicit OpenAI-compatible embedding override pair, when exactly
+/// one of its two fields is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingEmbeddingField {
+    /// The service URL is empty while the model override is set.
+    Url,
+    /// The model override is empty while the service URL is set.
+    Model,
+}
+
+/// The missing half of the embedding override pair, or `None` when both or neither are set. Blank
+/// values count as unset, as they do in validation and the runtime routes.
+pub fn missing_embedding_field(url: &str, model: &str) -> Option<MissingEmbeddingField> {
+    match (url.trim().is_empty(), model.trim().is_empty()) {
+        (true, false) => Some(MissingEmbeddingField::Url),
+        (false, true) => Some(MissingEmbeddingField::Model),
         _ => None,
     }
+}
+
+/// The explicit override is only usable as a pair: `Some(message)` when exactly one of
+/// `embedding_base_url` and `embedding_model` is set.
+pub fn half_embedding_override(semantic: &SemanticConfig) -> Option<&'static str> {
+    missing_embedding_field(&semantic.embedding_base_url, &semantic.embedding_model).map(
+        |field| match field {
+            MissingEmbeddingField::Url => {
+                "Embedding model override is set without Embedding service URL; set both or clear both (to use the embedding role, Alt+M, clear both)"
+            }
+            MissingEmbeddingField::Model => {
+                "Embedding service URL is set without Embedding model override; set both or clear both (to use the embedding role, Alt+M, clear both)"
+            }
+        },
+    )
 }
 
 pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {

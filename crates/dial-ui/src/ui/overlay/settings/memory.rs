@@ -1,5 +1,8 @@
 //! Memory backend rows: the summary, the role gaps and the loopback check that drive them.
 use super::{EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, SettingsOverlay};
+use crate::config::memory_backend::{
+    MissingEmbeddingField, key_variable_missing, missing_embedding_field,
+};
 use crate::config::schema::Kind;
 use toml::Value;
 
@@ -43,22 +46,8 @@ pub(super) fn memory_section(backend: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether `endpoint` names this machine, which may use plain HTTP and needs no API key.
-/// Mirrors the loopback rule in `memory_backend::config::endpoint`.
-pub(super) fn is_loopback_url(endpoint: &str) -> bool {
-    url::Url::parse(endpoint).is_ok_and(|url| {
-        url.host_str().is_some_and(|host| {
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
-    })
-}
-
 /// Required fields of `backend` that are still empty or half set, as setting paths, in the order to
-/// fill them. Mirrors `memory_backend::config::validate` and the runtime routes: Hindsight's URL and
+/// fill them. Mirrors `memory_backend::validate` and the runtime routes: Hindsight's URL and
 /// key, Sharpshooter's model when the memory role is unassigned, and for semantic the missing half of
 /// the URL/model override, or an embedding model when embeddings are `on` with no route.
 pub(super) fn memory_needs(
@@ -73,8 +62,7 @@ pub(super) fn memory_needs(
             let endpoint = text("memory.hindsight.endpoint");
             if endpoint.is_empty() {
                 needs.push("memory.hindsight.endpoint");
-            } else if text("memory.hindsight.api_key_env").is_empty() && !is_loopback_url(&endpoint)
-            {
+            } else if key_variable_missing(&endpoint, &text("memory.hindsight.api_key_env")) {
                 needs.push("memory.hindsight.api_key_env");
             }
         }
@@ -87,15 +75,17 @@ pub(super) fn memory_needs(
         }
         "semantic" => {
             let (url, model) = (text(EMBEDDING_URL_PATH), text(EMBEDDING_MODEL_PATH));
-            match (url.is_empty(), model.is_empty()) {
-                (false, true) => needs.push(EMBEDDING_MODEL_PATH),
-                (true, false) => needs.push(EMBEDDING_URL_PATH),
-                (true, true)
-                    if text("memory.semantic.embedding") == "on" && !has_role("embedding") =>
+            match missing_embedding_field(&url, &model) {
+                Some(MissingEmbeddingField::Url) => needs.push(EMBEDDING_URL_PATH),
+                Some(MissingEmbeddingField::Model) => needs.push(EMBEDDING_MODEL_PATH),
+                None if url.is_empty()
+                    && model.is_empty()
+                    && text("memory.semantic.embedding") == "on"
+                    && !has_role("embedding") =>
                 {
                     needs.push(EMBEDDING_MODEL_PATH)
                 }
-                _ => {}
+                None => {}
             }
         }
         _ => {}

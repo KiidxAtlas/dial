@@ -4,8 +4,10 @@
 use super::image;
 use super::model::*;
 use crate::git_panel::Repo;
+use crate::llm::images::sniff_mime;
 use crate::ui::images::{ImageProtocol, Thumbnail};
 use crate::ui::text;
+use dial_core::units::human_bytes;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Panes narrower than this stack the changes sheet under the diff.
@@ -171,7 +173,7 @@ pub(super) fn binary_rows(binary: &Binary) -> Vec<Row> {
     if let Some((w, h)) = binary.dims {
         lines.push(format!("{w} × {h} px"));
     }
-    lines.push(format!("Size: {}", human_size(binary.size)));
+    lines.push(format!("Size: {}", human_bytes(binary.size)));
     lines.push(String::new());
     lines.push(NO_PREVIEW.to_owned());
     lines
@@ -183,38 +185,17 @@ pub(super) fn binary_rows(binary: &Binary) -> Vec<Row> {
         .collect()
 }
 
-pub(super) fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
 /// Identifies a file from its leading bytes. Returns a label and the pixel size when it is parseable.
 pub(super) fn sniff(bytes: &[u8]) -> (&'static str, Option<(u32, u32)>) {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return ("PNG image", png_dims(bytes));
+    match sniff_mime(bytes) {
+        Some("image/png") => ("PNG image", png_dims(bytes)),
+        Some("image/gif") => ("GIF image", gif_dims(bytes)),
+        Some("image/jpeg") => ("JPEG image", jpeg_dims(bytes)),
+        Some("image/webp") => ("WebP image", webp_dims(bytes)),
+        // BMP is previewed by its header only; it is not an input format, so it is not sniffed.
+        _ if bytes.starts_with(b"BM") => ("BMP image", bmp_dims(bytes)),
+        _ => ("Binary file", None),
     }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return ("GIF image", gif_dims(bytes));
-    }
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return ("JPEG image", jpeg_dims(bytes));
-    }
-    if bytes.starts_with(b"BM") {
-        return ("BMP image", bmp_dims(bytes));
-    }
-    if bytes.starts_with(b"RIFF") && at::<4>(bytes, 8) == Some(*b"WEBP") {
-        return ("WebP image", webp_dims(bytes));
-    }
-    ("Binary file", None)
 }
 
 fn at<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {

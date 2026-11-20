@@ -39,7 +39,7 @@ pub fn menu_width(width: u16) -> u16 {
 
 fn centered(spans: Vec<Span<'static>>, width: usize, theme: &Theme) -> Line<'static> {
     let spans = truncate_spans(spans, width, theme.sym(Sym::Ellipsis));
-    let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+    let used: usize = text::spans_width(&spans);
     let mut out = vec![Span::raw(" ".repeat(width.saturating_sub(used) / 2))];
     out.extend(spans);
     Line::from(out)
@@ -90,7 +90,7 @@ fn tagline(info: &WelcomeInfo, theme: &Theme, sweep: f32) -> Vec<Span<'static>> 
             version
         };
         parts.push((version, theme.fg(Tok::Dim)));
-        parts.push((format!(" {} ", theme.sym(Sym::Dot)), theme.fg(Tok::Dim)));
+        parts.push((theme.dot_sep(), theme.fg(Tok::Dim)));
     }
     parts.push((TAGLINE.to_owned(), theme.fg(Tok::Muted)));
     let total: usize = parts.iter().map(|(s, _)| s.chars().count()).sum();
@@ -147,7 +147,7 @@ fn hero(info: &WelcomeInfo, width: usize, budget: usize, theme: &Theme, view: &V
     // The tagline sits under the mark when the window can spare the row and its whole width, with
     // a blank row of air between solid pixel art and text when there is room for that too.
     let line = tagline(info, theme, sweep);
-    let line_w: usize = line.iter().map(|s| text::width(&s.content)).sum();
+    let line_w: usize = text::spans_width(&line);
     if budget >= rows.len() + 2 && line_w <= width {
         if has_art && budget >= rows.len() + 3 {
             rows.push(Line::default());
@@ -184,15 +184,22 @@ pub fn frame(
             theme.fg(Tok::Warning),
         )]);
     }
+    let mut notice = |message: &str| {
+        let room = inner.saturating_sub(4).max(1); // The card's borders and padding.
+        notices.extend(
+            text::wrap_words(message, room)
+                .into_iter()
+                .map(|row| vec![Span::styled(row, theme.fg(Tok::Warning))]),
+        );
+    };
     if info.model.trim().is_empty() {
-        let hint = text::one_line(&info.setup_hint);
-        notices.push(vec![Span::styled(
-            format!("no model selected  {hint}"),
-            theme.fg(Tok::Warning),
-        )]);
+        notice(&format!(
+            "no model selected  {}",
+            text::one_line(&info.setup_hint)
+        ));
     }
     if let Some(warning) = safety_notice(&info.approval, &info.sandbox) {
-        notices.push(vec![Span::styled(warning, theme.fg(Tok::Warning))]);
+        notice(&warning);
     }
     let place = place(info, theme, inner);
     // Warnings keep room for their card's two edges, so a tall window never trades them away.
@@ -362,7 +369,7 @@ pub fn frame(
         .filter(|(key, _)| !key.is_empty())
         .map(|(key, label)| format!("{} {label}", text::one_line(key)))
         .collect::<Vec<_>>()
-        .join(&format!(" {} ", theme.sym(Sym::Dot)));
+        .join(&theme.dot_sep());
         let dismiss = if info.dismiss_key.is_empty() {
             String::new()
         } else {
@@ -443,13 +450,9 @@ pub fn frame(
 pub(super) fn safety_notice(approval: &str, sandbox: &str) -> Option<String> {
     let unsandboxed = sandbox.trim().eq_ignore_ascii_case("off");
     match (approval, unsandboxed) {
-        ("auto", true) => {
-            Some("Full auto, no sandbox: tools run unasked and unisolated".to_owned())
-        }
+        ("auto", true) => Some("Full auto, no sandbox: tools run without asking".to_owned()),
         ("auto", false) => Some("Full auto: tools run without asking".to_owned()),
-        ("write", true) => {
-            Some("No sandbox: commands that run unasked are not isolated".to_owned())
-        }
+        ("write", true) => Some("No sandbox: commands run without isolation".to_owned()),
         _ => None,
     }
 }
@@ -474,7 +477,7 @@ fn place(info: &WelcomeInfo, theme: &Theme, width: usize) -> Vec<Span<'static>> 
     let sep = if spans.is_empty() {
         String::new()
     } else {
-        format!(" {} ", theme.sym(Sym::Dot))
+        theme.dot_sep()
     };
     let branch = if branch.is_empty() {
         String::new()

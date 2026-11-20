@@ -11,7 +11,6 @@ use crate::llm::local_format::LocalFormat;
 use crate::llm::model_config::{ApiProtocol, ModelSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// What a model is for, taken from structured provider or checkpoint metadata, never from its
@@ -127,20 +126,47 @@ pub struct DeclaredReasoning {
     /// Declared levels as a bit set over [`DECLARABLE_EFFORTS`].
     efforts: u8,
 }
-/// Effort levels a listing can declare, weakest first.
-const DECLARABLE_EFFORTS: [crate::llm::profiles::ReasoningEffort; 5] = {
+/// Effort levels a listing can declare. The bit position of each is persisted in the catalog cache,
+/// so new levels are appended and never inserted.
+const DECLARABLE_EFFORTS: [crate::llm::profiles::ReasoningEffort; 7] = {
     use crate::llm::profiles::ReasoningEffort::*;
-    [Low, Medium, High, Xhigh, Max]
+    [
+        Low,
+        Medium,
+        High,
+        Xhigh,
+        Max,
+        Minimal,
+        crate::llm::profiles::ReasoningEffort::None,
+    ]
 };
 impl DeclaredReasoning {
     /// Declared effort levels, weakest first.
     pub fn efforts(self) -> Vec<crate::llm::profiles::ReasoningEffort> {
-        DECLARABLE_EFFORTS
+        let mut efforts: Vec<_> = DECLARABLE_EFFORTS
             .iter()
             .enumerate()
             .filter(|(bit, _)| self.efforts & (1 << bit) != 0)
             .map(|(_, effort)| *effort)
-            .collect()
+            .collect();
+        efforts.sort_unstable();
+        efforts
+    }
+
+    /// A `ModelVariant` declaration: each listed effort selects its own wire ID, so the levels
+    /// are the exact set the account's listing routes. Levels outside [`DECLARABLE_EFFORTS`] are
+    /// not representable and are dropped.
+    pub(super) fn model_variant(
+        efforts: impl IntoIterator<Item = crate::llm::profiles::ReasoningEffort>,
+    ) -> Self {
+        let bits = efforts
+            .into_iter()
+            .filter_map(|effort| DECLARABLE_EFFORTS.iter().position(|e| *e == effort))
+            .fold(0u8, |bits, bit| bits | (1 << bit));
+        Self {
+            mode: ThinkingMode::ModelVariant,
+            efforts: bits,
+        }
     }
 
     /// Anthropic `/v1/models` row: only capabilities reported as `{"supported": true}` count.
@@ -174,6 +200,29 @@ impl DeclaredReasoning {
             return None;
         };
         Some(Self { mode, efforts })
+    }
+}
+impl ModelEntry {
+    /// Whether this row answers `selection`: the same model on the same route, or, for a grouped
+    /// `ModelVariant` row, a wire ID one of its listed levels selects on that route. Catalog
+    /// dedupe, the UI and RPC all use this one membership rule.
+    pub fn represents_selection(&self, selection: &ModelSelection) -> bool {
+        if same_model(&self.selection, selection) {
+            return true;
+        }
+        let Some(declared) = self
+            .metadata
+            .declared_reasoning
+            .filter(|declared| declared.mode == ThinkingMode::ModelVariant)
+        else {
+            return false;
+        };
+        super::cache::same_route(&self.selection, selection)
+            && declared.efforts().into_iter().any(|effort| {
+                super::subscription::antigravity_effort_model(&self.selection.model, effort)
+                    .as_deref()
+                    == Some(selection.model.as_str())
+            })
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,8 +543,9 @@ pub fn declared_reasoning(
     user_dir: &Path,
     selection: &ModelSelection,
 ) -> Option<DeclaredReasoning> {
-    find_declared_reasoning(
-        &cached(user_dir),
+    let cache = cached(user_dir);
+    let exact = find_declared_reasoning(
+        cache.values().flatten(),
         &selection.provider,
         &selection.model,
         |entry| {
@@ -503,7 +553,16 @@ pub fn declared_reasoning(
             selection.base_url.is_none()
                 || trim(entry.base_url.as_deref()) == trim(selection.base_url.as_deref())
         },
-    )
+    );
+    if exact.is_some() || selection.provider != "google-antigravity" {
+        return exact;
+    }
+    // Antigravity variants: a level is a member of a saved grouped row on the same route. The
+    // saved listing is read only for this provider, and only while its account is the active one.
+    super::subscription::saved_antigravity_models(user_dir)
+        .iter()
+        .find(|entry| entry.represents_selection(selection))
+        .and_then(|entry| entry.metadata.declared_reasoning)
 }
 /// Like [`declared_reasoning`], from the listing this process last read. Request builders that
 /// know only the model id use it; backend construction reads the listing first.
@@ -513,17 +572,15 @@ pub fn remembered_declared_reasoning(provider: &str, model: &str) -> Option<Decl
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|(_, parsed)| parsed.clone())?;
-    find_declared_reasoning(&parsed, provider, model, |_| true)
+    find_declared_reasoning(parsed.values().flatten(), provider, model, |_| true)
 }
-fn find_declared_reasoning(
-    cache: &BTreeMap<String, Vec<ModelEntry>>,
+fn find_declared_reasoning<'a>(
+    entries: impl Iterator<Item = &'a ModelEntry>,
     provider: &str,
     model: &str,
     endpoint: impl Fn(&ModelSelection) -> bool,
 ) -> Option<DeclaredReasoning> {
-    cache
-        .values()
-        .flatten()
+    entries
         .filter(|entry| {
             entry.selection.provider == provider
                 && entry.selection.model == model
@@ -539,6 +596,10 @@ pub(super) fn documented_context_window(selection: &ModelSelection) -> Option<u3
             .is_none_or(|url| url.trim_end_matches('/') == crate::llm::anthropic::BASE_URL)
     {
         crate::llm::anthropic::documented_context_window(&selection.model)
+    } else if selection.provider == "google-antigravity"
+        && bundled::selection_catalog_provider(selection) == Some("google-antigravity")
+    {
+        bundled::antigravity_context_window(&selection.model)
     } else if selection.provider != crate::llm::chatgpt::PROVIDER {
         bundled::selection_model(selection).and_then(|model| model.context_window)
     } else {
@@ -576,6 +637,11 @@ pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) 
                     selection.account_id.as_deref(),
                     &selection.model,
                 )
+            } else if selection.provider == "google-antigravity" {
+                super::subscription::saved_antigravity_models(user_dir)
+                    .iter()
+                    .find(|entry| entry.represents_selection(selection))
+                    .and_then(|entry| entry.selection.context_window)
             } else if selection.provider == crate::llm::apple::PROVIDER {
                 crate::llm::apple::supported_build()
                     .then(|| crate::llm::apple::availability().context_size)

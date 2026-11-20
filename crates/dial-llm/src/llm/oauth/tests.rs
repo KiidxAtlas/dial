@@ -1,4 +1,47 @@
 use super::*;
+use crate::llm::fake;
+use parking_lot::Mutex as TestMutex;
+use std::collections::VecDeque;
+
+/// Scripted interaction shared by provider sign-in tests.
+pub(super) struct Ui {
+    answers: TestMutex<VecDeque<String>>,
+    pub(super) auths: TestMutex<Vec<(String, Option<String>)>>,
+}
+
+impl Ui {
+    pub(super) fn new(answers: &[&str]) -> Self {
+        Self {
+            answers: TestMutex::new(answers.iter().map(|a| (*a).to_owned()).collect()),
+            auths: TestMutex::default(),
+        }
+    }
+}
+
+impl Interaction for Ui {
+    fn auth(&self, url: &str, instructions: Option<&str>) {
+        self.auths
+            .lock()
+            .push((url.into(), instructions.map(str::to_owned)));
+    }
+    fn progress(&self, _: &str) {}
+    fn prompt(&self, _: &str, _: Option<&str>, _: bool) -> Result<String> {
+        Ok(self.answers.lock().pop_front().unwrap_or_default())
+    }
+}
+
+pub(super) fn idle() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+pub(super) fn endpoint(status: u16, body: serde_json::Value) -> (String, fake::Fake) {
+    let server = fake::serve(vec![fake::json(status, &body)]);
+    (format!("{}/v1", server.url), server)
+}
+
+pub(super) fn request(server: &fake::Fake) -> String {
+    String::from_utf8(server.requests().pop().expect("expected a request")).unwrap()
+}
 
 #[test]
 fn reset_provider_removes_saved_oauth_grants() {

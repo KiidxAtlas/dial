@@ -449,10 +449,11 @@ fn validate_key(key: Option<&Path>) -> Result<(), String> {
 }
 
 pub(super) fn ssh_available() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("ssh").is_file())
+    crate::platform::fs::find_program(
+        std::path::Path::new("ssh"),
+        std::env::var_os("PATH").as_deref(),
+    )
+    .is_some()
 }
 fn run_helper(args: Vec<String>, cancel: &AtomicBool) -> Result<Finished, String> {
     process::run(

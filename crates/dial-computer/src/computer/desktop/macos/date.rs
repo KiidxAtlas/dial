@@ -4,21 +4,17 @@
 //! is resolved through `offset_at`, the local zone's UTC offset in seconds at
 //! an absolute time, so the arithmetic here stays independent of the host.
 
+use crate::platform::time::calendar::{
+    CivilDate, SECONDS_PER_DAY, civil_from_days, days_from_civil, is_valid_date,
+};
+
 /// Named by every refusal so a caller can correct its value in one step.
 pub(super) const ACCEPTED_FORMS: &str = "YYYY-MM-DD (keeps the control's time of day), \
                                          YYYY-MM-DDTHH:MM[:SS] (local time), or a date-time \
                                          followed by Z or ±HH:MM (that exact instant)";
 
-const SECONDS_PER_DAY: i64 = 86_400;
 /// Days from 1970-01-01 to 2001-01-01, the `CFAbsoluteTime` epoch.
 const CF_EPOCH_DAYS: i64 = 11_323;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CivilDate {
-    year: i64,
-    month: i64,
-    day: i64,
-}
 
 /// A value accepted for a date control.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,7 +53,7 @@ pub(super) fn parse(text: &str) -> Option<DateRequest> {
     let seconds = parse_clock(clock)?;
     Some(match offset {
         None => DateRequest::Local { date, seconds },
-        Some(offset) => DateRequest::Instant(civil_seconds(date, seconds) - offset as f64),
+        Some(offset) => DateRequest::Instant(civil_seconds(date, seconds)? - offset as f64),
     })
 }
 
@@ -77,10 +73,14 @@ impl DateRequest {
             Self::Day(date) => {
                 let local = current + offset_at(current) as f64;
                 let time_of_day = local.rem_euclid(SECONDS_PER_DAY as f64);
-                local_to_absolute(civil_seconds(date, time_of_day), offset_at)
+                let base = civil_seconds(date, time_of_day)
+                    .ok_or_else(|| format!("{date} is outside the supported calendar"))?;
+                local_to_absolute(base, offset_at)
             }
             Self::Local { date, seconds } => {
-                local_to_absolute(civil_seconds(date, seconds), offset_at)
+                let base = civil_seconds(date, seconds)
+                    .ok_or_else(|| format!("{date} is outside the supported calendar"))?;
+                local_to_absolute(base, offset_at)
             }
             Self::Instant(at) => Ok(at),
         }
@@ -129,10 +129,7 @@ fn format_civil(local: f64) -> String {
     let date = civil_from_days(local.div_euclid(SECONDS_PER_DAY) + CF_EPOCH_DAYS);
     let clock = local.rem_euclid(SECONDS_PER_DAY);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        date.year,
-        date.month,
-        date.day,
+        "{date}T{:02}:{:02}:{:02}",
         clock / 3600,
         clock / 60 % 60,
         clock % 60,
@@ -146,8 +143,9 @@ fn format_offset(offset: i64) -> String {
     format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-fn civil_seconds(date: CivilDate, seconds: f64) -> f64 {
-    ((days_from_civil(date) - CF_EPOCH_DAYS) * SECONDS_PER_DAY) as f64 + seconds
+fn civil_seconds(date: CivilDate, seconds: f64) -> Option<f64> {
+    let days = days_from_civil(date.year, date.month, date.day)?;
+    Some(((days - CF_EPOCH_DAYS) * SECONDS_PER_DAY) as f64 + seconds)
 }
 
 fn parse_date(text: &str) -> Option<CivilDate> {
@@ -160,10 +158,7 @@ fn parse_date(text: &str) -> Option<CivilDate> {
         month: digits(&text[5..7])?,
         day: digits(&text[8..])?,
     };
-    (1..=12)
-        .contains(&date.month)
-        .then_some(date)
-        .filter(|date| (1..=days_in_month(date.year, date.month)).contains(&date.day))
+    is_valid_date(date.year, date.month, date.day).then_some(date)
 }
 
 /// `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fraction`, as seconds since midnight.
@@ -222,49 +217,6 @@ fn digits(text: &str) -> Option<i64> {
 
 fn two_digits(text: &str) -> Option<i64> {
     if text.len() == 2 { digits(text) } else { None }
-}
-
-const fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Days since 1970-01-01 in the proleptic Gregorian calendar.
-const fn days_from_civil(date: CivilDate) -> i64 {
-    let year = if date.month <= 2 {
-        date.year - 1
-    } else {
-        date.year
-    };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_index = (date.month + 9) % 12;
-    let day_of_year = (153 * month_index + 2) / 5 + date.day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-/// Inverse of [`days_from_civil`].
-const fn civil_from_days(days: i64) -> CivilDate {
-    let days = days + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
-    CivilDate { year, month, day }
 }
 
 #[cfg(test)]

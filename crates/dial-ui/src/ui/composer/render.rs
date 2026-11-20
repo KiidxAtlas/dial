@@ -254,7 +254,7 @@ pub(super) fn bottom_border(
 ) -> Line<'static> {
     let frame = text::width(left) + text::width(right) + 2 * text::width(bar);
     let room = w.saturating_sub(frame + 2);
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     let joined = |items: &[Hint]| items.iter().map(Hint::text).collect::<Vec<_>>().join(&sep);
     let mut keep = hints.len();
     while keep > 0 && text::width(&joined(&hints[..keep])) > room {
@@ -303,20 +303,6 @@ pub(super) fn list_rows(ui: &UiConfig) -> usize {
     ui.autocomplete_items.max(1)
 }
 
-/// First visible item for a window of `rows` over `total` items that keeps `selected` in view,
-/// moving from the previous `scroll` as little as possible.
-pub(super) fn window(selected: usize, scroll: usize, rows: usize, total: usize) -> usize {
-    let rows = rows.max(1).min(total.max(1));
-    let max_start = total.saturating_sub(rows);
-    let mut start = scroll.min(max_start);
-    if selected < start {
-        start = selected;
-    } else if selected >= start + rows {
-        start = selected + 1 - rows;
-    }
-    start.min(max_start)
-}
-
 /// Render `rows` list rows starting at item `start`: selected row on `SelectedBg`, a scrollbar in
 /// the last column and an `n/m` counter on the last row when the list scrolls. `build` produces a
 /// row's spans for an item given its cell budget; the result is clipped to that budget.
@@ -355,9 +341,9 @@ pub(super) fn render_list(
                 0
             };
             let budget = usable.saturating_sub(reserve);
-            let mut spans = clip_spans(build(index, budget, is_selected), budget);
+            let mut spans = text::truncate_spans(build(index, budget, is_selected), budget, "");
             if scrolls || is_selected {
-                let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+                let used = text::spans_width(&spans);
                 spans.push(Span::raw(" ".repeat(budget - used)));
                 if reserve > 0 {
                     spans.push(Span::raw(" "));
@@ -381,7 +367,7 @@ pub(super) fn render_list(
 }
 
 pub(super) fn finish_row(spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
-    Line::from(clip_spans(spans, w))
+    Line::from(text::truncate_spans(spans, w, ""))
 }
 
 /// Cells before the input in the band: the prompt mark one cell in, then the text column the
@@ -390,14 +376,14 @@ pub(super) const BAND_LEAD: usize = 3;
 
 /// One row of the composer band: `spans` on the band's tint, padded to exactly `w` cells.
 pub(super) fn band_row(spans: Vec<Span<'static>>, w: usize, tint: Style) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = clip_spans(spans, w)
+    let mut spans: Vec<Span<'static>> = text::truncate_spans(spans, w, "")
         .into_iter()
         .map(|mut span| {
             span.style = tint.patch(span.style);
             span
         })
         .collect();
-    let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+    let used = text::spans_width(&spans);
     if used < w {
         spans.push(Span::styled(" ".repeat(w - used), tint));
     }
@@ -410,52 +396,6 @@ pub(super) fn prepend_rows(view: &mut ComposerView, rows: Rows) {
     let mut below = std::mem::take(&mut view.rows);
     view.rows = rows;
     view.rows.append(&mut below);
-}
-
-pub(super) fn clip_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
-    let mut left = max;
-    let mut out = Vec::with_capacity(spans.len());
-    for span in spans {
-        let cells = text::width(&span.content);
-        if cells <= left {
-            left -= cells;
-            out.push(span);
-            continue;
-        }
-        let kept = text::clip(&span.content, left);
-        if !kept.is_empty() {
-            out.push(Span::styled(kept, span.style));
-        }
-        break;
-    }
-    out
-}
-
-/// `value` as spans with the characters at `hits` (char indexes) emphasized.
-pub(super) fn highlighted(
-    value: &str,
-    hits: &[usize],
-    normal: Style,
-    hit: Style,
-) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut run_hit = false;
-    for (index, ch) in value.chars().enumerate() {
-        let is_hit = hits.contains(&index);
-        if is_hit != run_hit && !run.is_empty() {
-            spans.push(Span::styled(
-                std::mem::take(&mut run),
-                if run_hit { hit } else { normal },
-            ));
-        }
-        run_hit = is_hit;
-        run.push(ch);
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, if run_hit { hit } else { normal }));
-    }
-    spans
 }
 
 /// Char indexes of the first case-insensitive occurrence of `query_lower` in `value`.
@@ -941,11 +881,7 @@ impl Composer {
             }
             footer.push("/queue manage".to_owned());
             queued.push(Line::from(Span::styled(
-                text::ellipsize(
-                    &footer.join(&format!(" {} ", theme.sym(Sym::Dot))),
-                    w,
-                    theme.ascii(),
-                ),
+                text::ellipsize(&footer.join(&theme.dot_sep()), w, theme.ascii()),
                 theme.fg(Tok::Dim),
             )));
             cursor.0 += queued.len() as u16;

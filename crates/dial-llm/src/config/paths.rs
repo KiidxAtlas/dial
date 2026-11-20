@@ -138,6 +138,10 @@ pub(crate) fn record_lock_anchor(path: &Path) -> PathBuf {
 pub fn model_catalog_file(user_dir: &Path) -> PathBuf {
     cache_file(user_dir, "model-catalog.json")
 }
+/// The last Antigravity account listing, saved with the account and project scope it was fetched under.
+pub fn antigravity_listing_file(user_dir: &Path) -> PathBuf {
+    cache_file(user_dir, "antigravity-listing.json")
+}
 pub fn learned_words_file(user_dir: &Path) -> PathBuf {
     state_file(user_dir, "learned-words.json")
 }

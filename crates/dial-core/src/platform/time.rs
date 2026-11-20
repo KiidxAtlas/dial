@@ -1,3 +1,7 @@
+pub mod calendar;
+
+use calendar::{days_from_civil, is_valid_date};
+
 /// Seconds since the Unix epoch for an exact `YYYY-MM-DDTHH:MM:SS` UTC timestamp.
 pub fn parse_utc(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
@@ -18,35 +22,10 @@ pub fn parse_utc(text: &str) -> Option<i64> {
     };
     let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
     let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if !is_valid_date(year, month, day) || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    Some(days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Format the current local time. Supports `%Y %m %d %H %M %S %%`, the subset Dial uses; any

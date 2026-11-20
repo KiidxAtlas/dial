@@ -204,6 +204,8 @@ pub struct Config {
     pub git: crate::config::tools::git::GitConfig,
     /// `[worktree]`: what `/wt` does to the source checkout after moving the session into a worktree.
     pub worktree: WorktreeConfig,
+    /// `[plan]`: optional project copy of approved plans.
+    pub plan: PlanConfig,
     /// `[commit]`: persistent reply cache for `/commit` and `dial commit`.
     pub commit: CommitConfig,
     /// `[context_files]`: extra instruction file names read beside each project `AGENTS.md`.
@@ -332,6 +334,7 @@ impl Default for Config {
             ida: crate::config::tools::ida::IdaConfig::default(),
             git: Default::default(),
             worktree: Default::default(),
+            plan: PlanConfig::default(),
             commit: CommitConfig::default(),
             context_files: ContextFilesConfig::default(),
             web: WebConfig::default(),

@@ -832,6 +832,57 @@ fn chatgpt_reasoning_controls_create_and_persist_an_exact_model_profile() {
 }
 
 #[test]
+fn antigravity_picker_effort_survives_reload_and_uses_listed_levels() {
+    use crate::app::selection::assignment_thinking_changes;
+    use crate::llm::profiles::{ReasoningApi, ReasoningEffort};
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    settings_store::write_private(
+        &layout.user_dir.join("oauth-google-antigravity.json"),
+        br#"{"access":"test","account_id":"fixture-user","project_id":"fixture","expires_at_ms":18446744073709551615}"#,
+    ).unwrap();
+    catalog::test_antigravity_listing(
+        &layout.user_dir,
+        &serde_json::json!({"models":{
+            "gemini-4-neon-low": {}, "gemini-4-neon-medium": {}, "gemini-4-neon-high": {}
+        }}),
+    )
+    .unwrap();
+    let entries = catalog::saved_listing_models(&layout.user_dir);
+    assert_eq!(entries.len(), 1);
+    let mut pick = entries[0].selection.clone();
+    assert_eq!(entries[0].label, "gemini-4-neon");
+    assert_eq!(pick.model, "gemini-4-neon-medium");
+    let config = Config::load(&layout, None).unwrap();
+    pick.thinking = Some("high".into());
+    let mut changes = selection_changes(&config, &pick, "main").unwrap();
+    changes.extend(assignment_thinking_changes(&config, "main", &pick).unwrap());
+    settings_store::save_config(&layout, Scope::Project, &changes).unwrap();
+    let saved = Config::load(&layout, None).unwrap();
+    let backend = crate::agent::make_backend(&saved).unwrap();
+    let profile = backend.model_profile().unwrap();
+    assert_eq!(
+        profile.capabilities.reasoning,
+        ReasoningApi::AntigravityModelVariant
+    );
+    assert_eq!(profile.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(reasoning_changes(&saved, "low").unwrap().1, "low");
+    assert!(reasoning_changes(&saved, "xhigh").is_err());
+    // A refresh can withdraw a variant without withdrawing the family. The saved choice must
+    // not authorize the old wire ID, and /effort must still let the user pick a listed one.
+    catalog::test_antigravity_listing(
+        &layout.user_dir,
+        &serde_json::json!({"models": {
+            "gemini-4-neon-low": {}, "gemini-4-neon-medium": {}
+        }}),
+    )
+    .unwrap();
+    assert!(reasoning_changes(&saved, "high").is_err());
+    assert!(reasoning_changes(&saved, "low").is_ok());
+}
+
+#[test]
 fn role_thinking_is_saved_per_role_and_applied_only_to_that_role() {
     use crate::app::selection::role_thinking_changes;
     use crate::llm::profiles::ReasoningEffort;

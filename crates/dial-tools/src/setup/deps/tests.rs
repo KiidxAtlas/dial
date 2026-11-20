@@ -11,6 +11,26 @@ fn fake_bin(dir: &Path, name: &str) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_find_returns_only_executables_on_the_search_path() {
+    let dir = tempfile::tempdir().unwrap();
+    fake_bin(dir.path(), "tool-a");
+    std::fs::write(dir.path().join("tool-b"), "data").unwrap();
+    let env = Env {
+        path: vec![dir.path().to_path_buf()],
+        user_dir: dir.path().to_path_buf(),
+    };
+    assert_eq!(env.find("tool-a"), Some(dir.path().join("tool-a")));
+    assert_eq!(
+        env.find("tool-b"),
+        None,
+        "a non-executable file is not a program"
+    );
+    assert_eq!(env.find("missing"), None);
+    assert_eq!(env.find(""), None);
+}
+
 #[test]
 fn registry_ids_are_unique_and_requirements_resolve() {
     let mut ids = std::collections::BTreeSet::new();

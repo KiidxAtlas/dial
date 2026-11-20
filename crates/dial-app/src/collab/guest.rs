@@ -125,6 +125,8 @@ pub struct Guest {
     replica: Replica,
     /// Replica entries already shown in the terminal, so each one is projected exactly once.
     projected: usize,
+    /// The host question open to this guest, as the host sent it (`id`, `title`, `body`, `options`).
+    question: Option<Value>,
 }
 
 impl Guest {
@@ -142,6 +144,7 @@ impl Guest {
             request_sequence: std::cell::Cell::new(0),
             replica: Replica::default(),
             projected: 0,
+            question: None,
         };
         for frame in frames {
             guest.on_frame(frame, &mut Vec::new());
@@ -169,6 +172,7 @@ impl Guest {
             ended: false,
             replica: Replica::default(),
             projected: 0,
+            question: None,
         })
     }
 
@@ -199,6 +203,32 @@ impl Guest {
     /// Ask the host to abort its running turn. Refused unless the host granted write access.
     pub fn send_abort(&self) -> Result<(), &'static str> {
         self.send_request(json!({"t": "abort"}))
+    }
+
+    /// The open host question this guest may answer, without transport fields.
+    pub fn open_question(&self) -> Option<Value> {
+        let question = self.question.as_ref()?;
+        Some(json!({
+            "id": question["id"],
+            "title": question["title"],
+            "body": question["body"],
+            "options": question["options"],
+        }))
+    }
+
+    /// Answer the host's open question with a 1-based option number. The authorization proof
+    /// binds the question id and the choice, so a relay cannot redirect the answer.
+    pub fn send_answer(&self, option: usize) -> Result<(), &'static str> {
+        let question = self
+            .question
+            .as_ref()
+            .ok_or("The host has no open question for guests")?;
+        let id = question["id"].as_u64().unwrap_or_default();
+        let options = question["options"].as_array().map_or(0, Vec::len);
+        if option == 0 || option > options {
+            return Err("No such option; answer with one of the listed numbers");
+        }
+        self.send_request(json!({"t": "answer", "text": format!("{id}:{}", option - 1)}))
     }
 
     fn send_request(&self, mut request: Value) -> Result<(), &'static str> {
@@ -314,6 +344,36 @@ impl Guest {
                     "Host ended the session: {}",
                     msg["reason"].as_str().unwrap_or_default()
                 ));
+            }
+            Some("question") => {
+                let (Some(_), Some(options)) = (msg["id"].as_u64(), msg["options"].as_array())
+                else {
+                    return;
+                };
+                let mut text = format!(
+                    "The host asks: {}\n{}",
+                    msg["title"].as_str().unwrap_or_default(),
+                    msg["body"].as_str().unwrap_or_default().trim_end()
+                );
+                for (index, option) in options.iter().enumerate() {
+                    text.push_str(&format!(
+                        "\n  {}. {}",
+                        index + 1,
+                        option.as_str().unwrap_or_default()
+                    ));
+                }
+                text.push_str("\nAnswer with /collab answer <number>; the host may also answer.");
+                notes.push(text);
+                self.question = Some(msg.clone());
+            }
+            Some("question-closed")
+                if self
+                    .question
+                    .as_ref()
+                    .is_some_and(|open| open["id"].as_u64() == msg["id"].as_u64()) =>
+            {
+                self.question = None;
+                notes.push("The host's question was settled".to_owned());
             }
             _ => {}
         }

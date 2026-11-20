@@ -183,6 +183,33 @@ fn profile_context_size_overrides_shared_caps_and_respects_capacity() {
 }
 
 #[test]
+fn antigravity_neon_context_resolves_for_effort_ids_without_overriding_caps() {
+    use crate::llm::model_config::ModelSelection;
+    for model in [
+        "gemini-4-neon",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-xhigh",
+    ] {
+        let config = resolve(&format!("provider='google-antigravity'\nmodel='{model}'")).unwrap();
+        assert_eq!(config.context_window, 524_288, "{model} on load");
+        let mut pick = ModelSelection::new("google-antigravity", model);
+        pick.context_window = Some(32_768);
+        assert_eq!(
+            config.with_selection(&pick).context_window,
+            32_768,
+            "explicit cap"
+        );
+        pick.context_window = None;
+        pick.base_url = Some("https://proxy.example/v1".into());
+        assert_eq!(
+            config.with_selection(&pick).context_window,
+            32_768,
+            "custom route"
+        );
+    }
+}
+
+#[test]
 fn claude_context_resolves_on_load_and_selection_without_overriding_user_limits() {
     for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
         let config = resolve(&format!("provider='anthropic'\nmodel='{model}'\n")).unwrap();

@@ -3,10 +3,7 @@
 //! regional clusters in a fixed order; the cluster that accepts the key becomes the base URL
 //! stored with the credential, because the key only works on that cluster.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
@@ -106,9 +103,7 @@ fn validate(key: &str, bases: &[String], cancel: &Arc<AtomicBool>) -> Result<Str
                 "Xiaomi MiMo API key validation failed ({})",
                 response.status
             ),
-            Err(_) => {
-                ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
-            }
+            Err(_) => util::check_cancelled(cancel)?,
         }
     }
     match last_status {

@@ -1,13 +1,8 @@
 use super::super::{Transcript, TranscriptCtx, TurnOutcome, TurnStats};
 use super::*;
 use crate::llm::model_config::UiConfig;
+use crate::ui::testkit::plain;
 use crate::ui::theme::{Glyphs, Theme};
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
-}
 
 fn stats(outcome: Option<TurnOutcome>) -> TurnStats {
     TurnStats {

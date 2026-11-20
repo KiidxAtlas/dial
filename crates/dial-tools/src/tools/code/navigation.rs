@@ -164,10 +164,7 @@ impl Tool for Find {
                 );
             }
             let available = MAX_OUTPUT.saturating_sub(text.len());
-            let mut end = metadata.text.len().min(available);
-            while !metadata.text.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = metadata.text.floor_char_boundary(available);
             text.push_str(&metadata.text[..end]);
             if end < metadata.text.len() {
                 text.push_str("\n[language-server metadata clipped]\n");

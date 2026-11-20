@@ -76,10 +76,7 @@ pub fn tag_of(lf: &str) -> String {
 
 /// Lines of LF content. A final newline does not start another line.
 pub fn split_lines(lf: &str) -> Vec<&str> {
-    if lf.is_empty() {
-        return Vec::new();
-    }
-    lf.strip_suffix('\n').unwrap_or(lf).split('\n').collect()
+    lf.split_terminator('\n').collect()
 }
 
 fn join_lines(lines: &[String], trailing_newline: bool) -> String {
@@ -94,10 +91,7 @@ pub(crate) fn truncate_chars(text: &str, cap: usize) -> (&str, bool) {
     if text.len() <= cap {
         return (text, false);
     }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(cap);
     (&text[..end], true)
 }
 
@@ -3065,8 +3059,8 @@ fn read_impl(
         .record_version(&abs, lf, source.raw_revision, &witnessed);
     let mut text = format!(
         "[{rel}#{tag}]\n[Source raw SHA256:{}]\n{}",
-        super::edit_source::hex_revision(
-            source
+        crate::hex(
+            &source
                 .raw_revision
                 .unwrap_or_else(|| super::edit_source::revision(&raw_text))
         ),

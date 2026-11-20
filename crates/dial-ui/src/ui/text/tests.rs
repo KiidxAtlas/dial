@@ -176,6 +176,28 @@ fn formatters_use_one_compact_form() {
     for (n, want) in counts {
         assert_eq!(compact_count(*n), *want, "{n}");
     }
+    // Counted nouns: the suffix follows the count's own singular/plural, never the caller's guess.
+    assert_eq!(counted(1, "file"), "1 file");
+    assert_eq!(counted(0, "file"), "0 files");
+    assert_eq!(counted(2, "session"), "2 sessions");
+    assert_eq!(
+        counted(u64::MAX, "request"),
+        "18446744073709551615 requests"
+    );
+    assert_eq!(count_with(1, "role", "roles"), "1 role");
+    assert_eq!(count_with(3, "child", "children"), "3 children");
+    for (secs, want) in [
+        (0_u64, "0s"),
+        (59, "59s"),
+        (60, "1m"),
+        (125, "2m"),
+        (3_599, "59m"),
+        (3_600, "1h"),
+        (86_399, "23h"),
+        (86_400, "1d"),
+    ] {
+        assert_eq!(age_compact(secs), want, "{secs}");
+    }
     let amounts: &[(f64, &str)] = &[
         (0.0, "$0.00"),
         (f64::NAN, "$0.00"),
@@ -244,5 +266,54 @@ fn ellipsize_words_cuts_between_words() {
                 true
             )) <= max
         );
+    }
+}
+
+#[test]
+fn truncate_spans_clips_by_cells_keeps_each_style_and_marks_the_cut() {
+    use ratatui::style::Color;
+    let red = Style::default().fg(Color::Red);
+    let blue = Style::default().fg(Color::Blue);
+    // (spans, max cells, ellipsis, expected spans): a cut row ends with the mark in the style of the
+    // last span that kept text, and a grapheme that does not fit is never split.
+    let cases = vec![
+        (
+            vec![("ab", red), ("cd", blue)],
+            4,
+            "…",
+            vec![("ab", red), ("cd", blue)],
+        ),
+        (
+            vec![("ab", red), ("cde", blue)],
+            4,
+            "…",
+            vec![("ab", red), ("c", blue), ("…", blue)],
+        ),
+        (vec![("界界", red)], 3, "…", vec![("界", red), ("…", red)]),
+        (
+            vec![("abcdef", red)],
+            5,
+            "...",
+            vec![("ab", red), ("...", red)],
+        ),
+        (vec![("abc", red)], 0, "…", vec![]),
+        (vec![("abcdef", red)], 3, "", vec![("abc", red)]),
+        (vec![("e\u{301}x", red)], 1, "", vec![("e\u{301}", red)]),
+    ];
+    for (spans, max, mark, expected) in cases {
+        let input = spans
+            .iter()
+            .map(|(text, style)| Span::styled(*text, *style))
+            .collect();
+        let out: Vec<(String, Style)> = truncate_spans(input, max, mark)
+            .into_iter()
+            .map(|span| (span.content.into_owned(), span.style))
+            .collect();
+        let want: Vec<(String, Style)> = expected
+            .into_iter()
+            .map(|(text, style)| (text.to_owned(), style))
+            .collect();
+        assert_eq!(out, want, "max {max} mark {mark:?}");
+        assert!(out.iter().map(|(text, _)| width(text)).sum::<usize>() <= max);
     }
 }

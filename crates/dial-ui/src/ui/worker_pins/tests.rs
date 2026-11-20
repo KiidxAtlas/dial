@@ -185,6 +185,27 @@ fn rows_hide_when_off_idle_or_narrow() {
     assert!(!rows(&busy, 80, 6, PinnedWorkers::Full, true, 0, &theme).is_empty());
 }
 
+/// Pinned rows take their glyph and tone from the shared state mark, so the block and the hub draw
+/// one worker status the same way: a blocked or interrupted worker is not a plain warning.
+#[test]
+fn pinned_rows_draw_each_status_from_the_shared_state_mark() {
+    let theme = Theme::dark();
+    for status in [
+        AgentStatus::Failed,
+        AgentStatus::Blocked,
+        AgentStatus::Interrupted,
+    ] {
+        let mut board = board(vec![agent("a", status)]);
+        // Only a worker this board saw running stays pinned after it finishes.
+        board.seen_live.insert("a".to_owned());
+        let mark = status.state_mark();
+        let lines = rows(&board, 80, 6, PinnedWorkers::Full, false, 0, &theme);
+        let head = &lines[1].spans[0];
+        assert_eq!(head.style, theme.fg(mark.tok()), "{status:?}");
+        assert!(head.content.contains(mark.glyph(&theme)), "{status:?}");
+    }
+}
+
 #[test]
 fn collapsed_block_lists_three_and_reports_overflow() {
     let theme = Theme::dark();

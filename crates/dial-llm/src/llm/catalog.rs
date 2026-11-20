@@ -60,8 +60,25 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 use subscription::{anthropic_subscription_catalog, oauth_catalog};
+pub use subscription::{antigravity_effort_model, antigravity_family};
 
-const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+/// Test fixture entry point: groups `listing` and saves it under the active grant's account and
+/// project, the same path a live fetch takes, so tests can exercise save, reload and backend use.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_antigravity_listing(
+    user_dir: &Path,
+    listing: &serde_json::Value,
+) -> anyhow::Result<Vec<ModelEntry>> {
+    use anyhow::Context;
+    const ID: &str = "google-antigravity";
+    let base = crate::llm::oauth::grant_route(user_dir, ID)
+        .or_else(|| builtin_provider(ID).map(|provider| provider.base_url.clone()))
+        .context("Antigravity has no route")?;
+    let identity = crate::llm::oauth::active_listing_identity(user_dir, ID);
+    subscription::save_antigravity_listing(user_dir, &base, identity, listing)
+}
+
+pub(super) const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 512;
 const MAX_PROVIDERS: usize = 64;
 const CONCURRENCY: usize = 8;
@@ -240,6 +257,66 @@ pub fn running_local_servers(timeout: Duration) -> Vec<&'static str> {
             .collect()
     })
 }
+fn selection_endpoints(
+    defaults: BTreeMap<String, ProviderSpec>,
+    selections: &mut [ModelSelection],
+) -> Vec<(String, ProviderSpec)> {
+    let mut extra = Vec::new();
+    for selection in selections {
+        if let Some(base) = &mut selection.base_url {
+            let default = defaults.get(&selection.provider);
+            if default.is_some_and(|spec| !spec.enabled) {
+                continue;
+            }
+            // Resolve against the same route we will probe, including built-ins, not against
+            // another saved selection. A different endpoint must not inherit its credentials.
+            if let Some(spec) =
+                default.filter(|s| s.base_url.trim_end_matches('/') == base.trim_end_matches('/'))
+            {
+                base.clone_from(&spec.base_url);
+                if selection.headers.is_none() {
+                    selection.headers.clone_from(&spec.headers);
+                }
+                if selection.api_key_env.is_none() {
+                    selection.api_key_env.clone_from(&spec.api_key_env);
+                }
+            }
+            if defaults
+                .get_key_value(&selection.provider)
+                .into_iter()
+                .chain(extra.iter().map(|(id, spec)| (id, spec)))
+                .any(|(id, spec)| {
+                    id == &selection.provider
+                        && &spec.base_url == base
+                        && spec.protocol.unwrap_or_else(|| ApiProtocol::builtin(id))
+                            == selection
+                                .protocol
+                                .unwrap_or_else(|| ApiProtocol::builtin(&selection.provider))
+                        && spec.headers.as_deref().unwrap_or_default()
+                            == selection.headers.as_deref().unwrap_or_default()
+                        && spec.api_key_env == selection.api_key_env
+                })
+            {
+                continue;
+            }
+            extra.push((
+                selection.provider.clone(),
+                ProviderSpec {
+                    label: selection.provider.clone(),
+                    base_url: base.clone(),
+                    api_key_env: selection.api_key_env.clone(),
+                    auth: default.map(|spec| spec.auth).unwrap_or_default(),
+                    allow_insecure: selection.allow_insecure,
+                    protocol: selection.protocol,
+                    headers: selection.headers.clone(),
+                    ..ProviderSpec::default()
+                },
+            ));
+        }
+    }
+    defaults.into_iter().chain(extra).collect()
+}
+
 pub fn discover(
     layout: &Layout,
     configured: &BTreeMap<String, ProviderSpec>,
@@ -317,57 +394,8 @@ pub fn discover(
         };
         endpoints.insert(id.clone(), endpoint);
     }
-    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
-    for selection in selections {
-        if let Some(base) = &selection.base_url {
-            if configured
-                .get(&selection.provider)
-                .is_some_and(|spec| !spec.enabled)
-            {
-                continue;
-            }
-            let inherited = configured
-                .get(&selection.provider)
-                .filter(|spec| spec.base_url.trim_end_matches('/') == base.trim_end_matches('/'));
-            let headers = selection
-                .headers
-                .as_ref()
-                .or_else(|| inherited.and_then(|spec| spec.headers.as_ref()));
-            let api_key_env = selection
-                .api_key_env
-                .as_ref()
-                .or_else(|| inherited.and_then(|spec| spec.api_key_env.as_ref()));
-            if endpoints.iter().any(|(id, spec)| {
-                id == &selection.provider
-                    && &spec.base_url == base
-                    && spec.protocol.unwrap_or_else(|| ApiProtocol::builtin(id))
-                        == selection
-                            .protocol
-                            .unwrap_or_else(|| ApiProtocol::builtin(&selection.provider))
-                    && spec.headers.as_deref().unwrap_or_default()
-                        == headers.map(Vec::as_slice).unwrap_or_default()
-                    && spec.api_key_env.as_ref() == api_key_env
-            }) {
-                continue;
-            }
-            endpoints.push((
-                selection.provider.clone(),
-                ProviderSpec {
-                    label: selection.provider.clone(),
-                    base_url: base.clone(),
-                    api_key_env: api_key_env.cloned(),
-                    auth: configured
-                        .get(&selection.provider)
-                        .map(|spec| spec.auth)
-                        .unwrap_or_default(),
-                    allow_insecure: selection.allow_insecure,
-                    protocol: selection.protocol,
-                    headers: headers.cloned(),
-                    ..ProviderSpec::default()
-                },
-            ));
-        }
-    }
+    let mut selections = selections.to_vec();
+    let mut endpoints = selection_endpoints(endpoints, &mut selections);
     // A signed-in subscription provider that is configured at its canonical endpoint with no API
     // key cannot be probed (the grant is attached only at inference). Leaving it in the probe
     // list reports it unavailable and hides its bundled models, so `oauth_catalog` serves it.
@@ -562,7 +590,7 @@ pub fn discover(
     }
     if storage_safe {
         let mut accounts = std::collections::BTreeSet::new();
-        for selection in selections {
+        for selection in &selections {
             if selection.provider == super::chatgpt::PROVIDER
                 && let Some(id) = selection.account_id.as_deref()
                 && accounts.insert(id)
@@ -580,27 +608,14 @@ pub fn discover(
             }
         }
     }
-    for selection in selections {
+    for mut selection in selections {
         if selection.model.trim().is_empty() {
             continue;
-        }
-        let mut selection = selection.clone();
-        if let Some(spec) = configured.get(&selection.provider).filter(|spec| {
-            selection.base_url.as_deref().is_some_and(|base| {
-                base.trim_end_matches('/') == spec.base_url.trim_end_matches('/')
-            })
-        }) {
-            if selection.headers.is_none() {
-                selection.headers = spec.headers.clone();
-            }
-            if selection.api_key_env.is_none() {
-                selection.api_key_env = spec.api_key_env.clone();
-            }
         }
         if discovery
             .models
             .iter()
-            .any(|m| same_model(&m.selection, &selection))
+            .any(|m| m.represents_selection(&selection))
         {
             continue;
         }

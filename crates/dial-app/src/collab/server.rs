@@ -225,10 +225,39 @@ impl tungstenite::handshake::server::Callback for HandshakeRecorder {
         }
     }
 }
-fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()> {
+/// Peek the request head and answer plain HTTP (the browser viewer) without consuming a
+/// WebSocket upgrade. Returns `true` when the connection was answered here.
+fn serve_http(stream: &mut TcpStream) -> Result<bool> {
+    use std::io::Write;
+    let mut head = vec![0u8; super::viewer::MAX_HEAD_BYTES];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let peeked = stream.peek(&mut head)?;
+        if peeked == 0 {
+            return Ok(true);
+        }
+        match super::viewer::classify(&head[..peeked]) {
+            super::viewer::Request::Relay => return Ok(false),
+            super::viewer::Request::Http(response) => {
+                stream.write_all(&response)?;
+                stream.flush()?;
+                return Ok(true);
+            }
+            super::viewer::Request::Incomplete => {
+                ensure!(Instant::now() < deadline, "request head timed out");
+                thread::sleep(POLL);
+            }
+        }
+    }
+}
+
+fn peer(mut stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    if serve_http(&mut stream)? {
+        return Ok(());
+    }
     let captured = Arc::new(Mutex::new(None::<(String, bool)>));
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_FRAME_BYTES);

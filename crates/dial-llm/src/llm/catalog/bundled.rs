@@ -131,6 +131,9 @@ pub enum ThinkingMode {
     AnthropicBudgetEffort,
     /// Gemini `thinkingLevel`.
     GoogleLevel,
+    /// Each reasoning level is its own listed wire ID (`<family>-<effort>`); the request carries
+    /// no effort parameter, so the model ID alone selects the level.
+    ModelVariant,
 }
 
 /// A documented request rule for one exact model, beyond its thinking mode. Only facts the
@@ -557,6 +560,17 @@ pub fn bundled_model(provider: &str, model: &str) -> Option<BundledModel> {
     find(provider, model).or_else(|| match catalog_id(provider) {
         "chatgpt" => find("openai", model),
         _ => None,
+    })
+}
+
+/// Antigravity effort IDs select the same family at different thinking levels. Inherit only the
+/// family's capacity when there is no exact capacity; this does not advertise a model or effort.
+pub(super) fn antigravity_context_window(model: &str) -> Option<u32> {
+    let capacity =
+        |id| bundled_model("google-antigravity", id).and_then(|card| card.context_window);
+    capacity(model).or_else(|| {
+        let family = super::subscription::antigravity_family(model);
+        (family != model).then(|| capacity(family)).flatten()
     })
 }
 

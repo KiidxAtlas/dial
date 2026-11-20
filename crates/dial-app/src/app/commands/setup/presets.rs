@@ -4,6 +4,7 @@ use super::*;
 use crate::config::settings_store;
 use crate::config::types::Approval;
 use crate::llm::model_config::ModelSelection;
+use crate::units::human_bytes;
 use anyhow::{Context, ensure};
 
 const TEXT_ROLES: &[&str] = &["small", "task", "coach", "tester", "memory", "decision"];
@@ -254,7 +255,7 @@ pub(super) fn command(
     let future = settings_store::preview_config(&app.layout, scope, &changes, &app.overlay)?;
     check(&future)?;
     let memory = crate::llm::local_fit::physical_memory_bytes()
-        .map(|bytes| format!("{:.1} GiB physical RAM", bytes as f64 / (1u64 << 30) as f64))
+        .map(|bytes| format!("{} physical RAM", human_bytes(bytes)))
         .unwrap_or_else(|| "Physical RAM unknown".into());
     let roles = TEXT_ROLES
         .iter()

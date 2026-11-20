@@ -2,7 +2,7 @@ use crate::{
     llm::model_config::UiConfig,
     ui::{keys::Keymap, status::StatusData, theme::Theme},
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer, style::Style, text::Line};
 
 pub fn key(code: KeyCode) -> Event {
@@ -14,8 +14,30 @@ pub fn ctrl(c: char) -> Event {
 pub fn ch(c: char) -> Event {
     key(KeyCode::Char(c))
 }
+/// The event a terminal reports when `event`'s key is released (kitty keyboard protocol).
+pub fn released(event: Event) -> Event {
+    match event {
+        Event::Key(mut key) => {
+            key.kind = KeyEventKind::Release;
+            Event::Key(key)
+        }
+        other => other,
+    }
+}
 pub fn typed(s: &str) -> Vec<Event> {
     s.chars().map(ch).collect()
+}
+
+/// The default keys with confirm, cancel and the page keys moved off their defaults.
+pub fn remapped_keys() -> Keymap {
+    let table: toml::Table = toml::from_str(
+        r#""tui.select.confirm" = "Ctrl+Y"
+"tui.select.cancel" = "Ctrl+G"
+"tui.select.pageDown" = "Ctrl+N"
+"tui.select.pageUp" = "Ctrl+P""#,
+    )
+    .unwrap();
+    Keymap::from_table(&table).0
 }
 
 pub fn status_preview(_: &UiConfig, _: u16) -> Line<'static> {

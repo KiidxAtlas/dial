@@ -1,101 +1,11 @@
+use super::super::tests::{Ui, endpoint, idle, request};
 use super::*;
-use parking_lot::Mutex;
-use std::{
-    collections::VecDeque,
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::mpsc,
-    thread,
-};
-
-/// Scripted interaction: answers prompts in order and records what the flow showed.
-#[derive(Default)]
-struct Ui {
-    answers: Mutex<VecDeque<String>>,
-    auths: Mutex<Vec<(String, Option<String>)>>,
-}
-
-impl Ui {
-    fn new(answers: &[&str]) -> Self {
-        Self {
-            answers: Mutex::new(answers.iter().map(|a| (*a).to_owned()).collect()),
-            auths: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl Interaction for Ui {
-    fn auth(&self, url: &str, instructions: Option<&str>) {
-        self.auths
-            .lock()
-            .push((url.to_owned(), instructions.map(str::to_owned)));
-    }
-    fn progress(&self, _message: &str) {}
-    fn prompt(
-        &self,
-        _message: &str,
-        _placeholder: Option<&str>,
-        _allow_empty: bool,
-    ) -> Result<String> {
-        Ok(self.answers.lock().pop_front().unwrap_or_default())
-    }
-}
-
-fn idle() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
 
 fn unused_endpoints() -> Endpoints<'static> {
     Endpoints {
         international: "http://127.0.0.1:1/v1",
         china: "http://127.0.0.1:1/v1",
     }
-}
-
-/// Loopback HTTP server answering one canned response per expected request; each raw request
-/// is sent back on the channel. Returns the base URL (`http://127.0.0.1:port/v1`).
-fn serve(responses: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}/v1", listener.local_addr().unwrap());
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        for (status, body) in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            tx.send(read_request(&mut stream)).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        }
-    });
-    (base, rx)
-}
-
-fn read_request(stream: &mut TcpStream) -> String {
-    let mut bytes = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        let n = stream.read(&mut buf).unwrap();
-        assert!(n > 0, "client closed before sending headers");
-        bytes.extend_from_slice(&buf[..n]);
-        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let head = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
-    let length = head
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length:"))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    while bytes.len() < header_end + length {
-        let n = stream.read(&mut buf).unwrap();
-        assert!(n > 0, "client closed before sending body");
-        bytes.extend_from_slice(&buf[..n]);
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[test]
@@ -113,7 +23,7 @@ fn flow_invariants() {
 
 #[test]
 fn international_login_validates_chat_probe_and_stores_endpoint() {
-    let (base, requests) = serve(vec![(200, r#"{"choices":[]}"#)]);
+    let (base, server) = endpoint(200, json!({"choices": []}));
     let ui = Ui::new(&["1", "  sk-test-123 "]);
     let endpoints = Endpoints {
         international: &base,
@@ -121,7 +31,7 @@ fn international_login_validates_chat_probe_and_stores_endpoint() {
     };
     let credentials = sign_in(&ui, &idle(), &|u, i| ui.auth(u, i), &endpoints).unwrap();
 
-    let request = requests.recv().unwrap().to_ascii_lowercase();
+    let request = request(&server).to_ascii_lowercase();
     assert!(request.starts_with("post /v1/chat/completions http/1.1"));
     assert!(request.contains("authorization: bearer sk-test-123"));
     assert!(request.contains("\"max_tokens\":1"));
@@ -145,31 +55,26 @@ fn international_login_validates_chat_probe_and_stores_endpoint() {
 
 #[test]
 fn china_login_opens_china_console_and_validates_its_endpoint() {
-    let (china, requests) = serve(vec![(200, "{}")]);
+    let (china, server) = endpoint(200, json!({}));
     let ui = Ui::new(&["2", "sk-cn"]);
     let endpoints = Endpoints {
         international: "http://127.0.0.1:1/v1",
         china: &china,
     };
     let credentials = sign_in(&ui, &idle(), &|u, i| ui.auth(u, i), &endpoints).unwrap();
-    assert!(
-        requests
-            .recv()
-            .unwrap()
-            .starts_with("POST /v1/chat/completions")
-    );
+    assert!(request(&server).starts_with("POST /v1/chat/completions"));
     assert_eq!(credentials.enterprise_url.as_deref(), Some(china.as_str()));
     assert_eq!(ui.auths.lock()[0].0, CHINA_AUTH_URL);
 }
 
 #[test]
 fn custom_endpoint_normalizes_url_and_validates_models() {
-    let (base, requests) = serve(vec![(200, r#"{"data":[]}"#)]);
+    let (base, server) = endpoint(200, json!({"data": []}));
     let custom = format!("{base}//");
     let ui = Ui::new(&["3", custom.as_str(), "sk-custom"]);
     let credentials = sign_in(&ui, &idle(), &|u, i| ui.auth(u, i), &unused_endpoints()).unwrap();
 
-    let request = requests.recv().unwrap().to_ascii_lowercase();
+    let request = request(&server).to_ascii_lowercase();
     assert!(request.starts_with("get /v1/models http/1.1"));
     assert!(request.contains("authorization: bearer sk-custom"));
     assert_eq!(credentials.enterprise_url.as_deref(), Some(base.as_str()));
@@ -179,7 +84,7 @@ fn custom_endpoint_normalizes_url_and_validates_models() {
 
 #[test]
 fn rejected_key_fails_without_echoing_the_key_or_body() {
-    let (base, _requests) = serve(vec![(401, r#"{"error":"bad sk-leaked"}"#)]);
+    let (base, _server) = endpoint(401, json!({"error": "bad sk-leaked"}));
     let ui = Ui::new(&["1", "sk-leaked"]);
     let endpoints = Endpoints {
         international: &base,

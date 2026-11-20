@@ -591,6 +591,29 @@ fn iso_and_range_parsing() {
 }
 
 #[test]
+fn rolling_range_includes_only_requests_in_the_selected_window() {
+    let home = tempfile::tempdir().unwrap();
+    let mut db = Db::open_default(home.path()).unwrap();
+    let now = 20_000 * DAY_MS;
+    for age in [1, 8] {
+        db.record_request(&request(now - age * DAY_MS, "example", 1, 1, 0, None, 1))
+            .unwrap();
+    }
+    let week = ReportRange::parse("7d")
+        .unwrap()
+        .report_at(&db, now)
+        .unwrap();
+    assert_eq!(week.since_ms, Some(now - 7 * DAY_MS));
+    assert_eq!(week.overall.requests, 1);
+    let all = ReportRange::parse("all")
+        .unwrap()
+        .report_at(&db, now)
+        .unwrap();
+    assert_eq!(all.since_ms, None);
+    assert_eq!(all.overall.requests, 2);
+}
+
+#[test]
 fn legacy_tools_gain_typed_facts_without_rewriting_old_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = db_path(dir.path());

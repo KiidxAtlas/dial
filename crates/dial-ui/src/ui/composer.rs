@@ -213,6 +213,36 @@ struct Choice {
     selected: usize,
 }
 
+/// What a shared Ctrl+C does while a turn runs. [`Composer::busy_interrupt`] decides it once: the key
+/// handler acts on it and the hint line names it, so the advertised action is the one taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusyInterrupt {
+    /// Closes the open history search and arms the stop.
+    CloseSearch,
+    /// Clears the draft and arms the stop; the next press stops the turn.
+    ClearDraft,
+    /// Stops the running turn.
+    Stop,
+}
+
+/// What Enter does with the draft while a turn runs. [`Composer::busy_enter`] decides it once: the
+/// submit path acts on it and the hint line names it, so the advertised action is the one taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusyEnter {
+    /// An empty draft with queued work and no queue edit open: asks whether to stop the turn.
+    StopChoice,
+    /// An empty draft with nothing to send: an empty queue, or an emptied queue edit.
+    Nothing,
+    /// A blank draft, which is ignored.
+    Blank,
+    /// A slash command runs now and bypasses both queues.
+    Command,
+    /// The queued message being edited is saved in place on its own route.
+    SaveEdit,
+    /// A new message, routed by the saved busy-send preference or the chooser.
+    Route,
+}
+
 /// Returns newest-first history entries matching a case-insensitive substring, up to a limit.
 type HistoryProvider = std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>;
 
@@ -545,6 +575,44 @@ impl Composer {
                 || self.ghost().is_some())
     }
 
+    /// What a shared Ctrl+C does while a turn runs, decided once: the key handler acts on it and the
+    /// hint line names it. `stop_armed` says the previous press already cleared or closed something.
+    fn busy_interrupt(&self, key: &KeyEvent, keys: &Keymap, stop_armed: bool) -> BusyInterrupt {
+        if self.search.is_some() {
+            return if keys.matches(Action::ClearDraft, key) {
+                BusyInterrupt::CloseSearch
+            } else {
+                BusyInterrupt::Stop
+            };
+        }
+        if !stop_armed && !self.editor.text.is_empty() && keys.matches(Action::ClearDraft, key) {
+            BusyInterrupt::ClearDraft
+        } else {
+            BusyInterrupt::Stop
+        }
+    }
+
+    /// What Enter does with the draft while busy. Decided here once: `submit` acts on it and the hint
+    /// line names it. An open queue edit is saved, never sent as a new message.
+    fn busy_enter(&self) -> BusyEnter {
+        if self.editor.text.is_empty() {
+            return if self.editing_queue.is_none() && !self.queued.is_empty() {
+                BusyEnter::StopChoice
+            } else {
+                BusyEnter::Nothing
+            };
+        }
+        if is_slash_command(&self.editor.text) {
+            BusyEnter::Command
+        } else if self.editor.text.trim().is_empty() {
+            BusyEnter::Blank
+        } else if self.editing_queue.is_some() {
+            BusyEnter::SaveEdit
+        } else {
+            BusyEnter::Route
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, ctx: &ComposerCtx) -> ComposerEvent {
         if key.kind == KeyEventKind::Release {
             return ComposerEvent::None;
@@ -553,10 +621,6 @@ impl Composer {
         if key.kind == KeyEventKind::Repeat
             && (ctx.keys.matches(Action::Submit, &key) || key.code == KeyCode::Enter)
         {
-            return ComposerEvent::None;
-        }
-        // A held Enter repeats: while busy, a repeat must not open, confirm or flush a choice by itself.
-        if self.busy && key.kind == KeyEventKind::Repeat && ctx.keys.matches(Action::Submit, &key) {
             return ComposerEvent::None;
         }
         // A press that only closed a search or cleared the draft arms the next one to stop.
@@ -573,29 +637,21 @@ impl Composer {
             && !self.dismisses_interrupt(&key, ctx.keys)
         {
             self.editor.cancel_jump();
-            if self.search.is_some() && ctx.keys.matches(Action::ClearDraft, &key) {
-                self.search = None;
-                self.stop_armed = true;
-                self.refresh();
-                return ComposerEvent::None;
-            }
-            // With a draft, the shared Ctrl+C clears it first (like idle); the next press stops.
-            if self.search.is_none()
-                && !stop_armed
-                && !self.editor.text.is_empty()
-                && ctx.keys.matches(Action::ClearDraft, &key)
-            {
-                if self.history_index.is_some() {
-                    self.leave_history();
+            match self.busy_interrupt(&key, ctx.keys, stop_armed) {
+                BusyInterrupt::Stop => return ComposerEvent::Interrupt,
+                BusyInterrupt::CloseSearch => self.search = None,
+                BusyInterrupt::ClearDraft => {
+                    if self.history_index.is_some() {
+                        self.leave_history();
+                    }
+                    if !self.editor.text.is_empty() {
+                        self.set_draft("");
+                    }
                 }
-                if !self.editor.text.is_empty() {
-                    self.set_draft("");
-                }
-                self.stop_armed = true;
-                self.refresh();
-                return ComposerEvent::None;
             }
-            return ComposerEvent::Interrupt;
+            self.stop_armed = true;
+            self.refresh();
+            return ComposerEvent::None;
         }
         // A pending Ctrl-] jump takes the next typed letter; any other key cancels it before dispatch.
         let plain = super::keys::typed_char(&key).is_some();
@@ -832,37 +888,35 @@ impl Composer {
             let trimmed = self.editor.text.trim_end().to_owned();
             self.editor.set(&trimmed);
         }
-        // A second Enter explicitly sends the oldest queued message now. Do not
-        // add it to history again: queuing already recorded the original draft.
-        // While busy that stops the turn, so an empty Enter asks first (the default keeps working).
-        // Editing a queued item never asks: the draft is saved on the route it was queued with.
-        if self.editor.text.is_empty() && !self.queued.is_empty() {
-            if !self.busy {
-                return self.send_oldest_queued();
-            }
-            if self.editing_queue.is_none() {
-                self.open_choice(QUEUE_CHOICES);
-            }
-            return ComposerEvent::None;
+        // Idle, an empty Enter sends the oldest queued message. While busy, every Enter is routed by
+        // `busy_enter`, the same decision the hint line names.
+        if !self.busy && self.editor.text.is_empty() && !self.queued.is_empty() {
+            return self.send_oldest_queued();
         }
-        if self.busy && !is_slash_command(&self.editor.text) {
-            if self.editing_queue.is_some() {
-                return self.submit_queued(false);
+        if self.busy {
+            match self.busy_enter() {
+                BusyEnter::StopChoice => {
+                    self.open_choice(QUEUE_CHOICES);
+                    return ComposerEvent::None;
+                }
+                BusyEnter::Nothing | BusyEnter::Blank => return ComposerEvent::None,
+                BusyEnter::SaveEdit => return self.submit_queued(false),
+                // The chooser is the safe default. Direct sending requires an explicitly saved preference.
+                BusyEnter::Route => {
+                    return match self.busy_send {
+                        BusySend::Choose => {
+                            self.open_choice(DRAFT_CHOICES);
+                            ComposerEvent::None
+                        }
+                        BusySend::Redirect => self.send_explicit(SteerKind::Steer),
+                        BusySend::AfterTurn => self.submit_queued(true),
+                        BusySend::Independent => self.send_explicit(SteerKind::Independent),
+                        BusySend::Auto => self.submit_queued(false),
+                    };
+                }
+                // A slash command runs now and bypasses both queues.
+                BusyEnter::Command => {}
             }
-            // The chooser is the safe default. Direct sending requires an explicitly saved preference.
-            if !self.editor.text.trim().is_empty() {
-                return match self.busy_send {
-                    BusySend::Choose => {
-                        self.open_choice(DRAFT_CHOICES);
-                        ComposerEvent::None
-                    }
-                    BusySend::Redirect => self.send_explicit(SteerKind::Steer),
-                    BusySend::AfterTurn => self.submit_queued(true),
-                    BusySend::Independent => self.send_explicit(SteerKind::Independent),
-                    BusySend::Auto => self.submit_queued(false),
-                };
-            }
-            return ComposerEvent::None;
         }
         if self.editor.text.trim().is_empty() {
             return ComposerEvent::None;

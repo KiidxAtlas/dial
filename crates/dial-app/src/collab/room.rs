@@ -103,6 +103,42 @@ pub fn send_guest_abort() -> Option<Result<(), &'static str>> {
     })
 }
 
+/// Answer the host's open question (1-based option). `None` unless this process is a joined guest.
+pub fn send_guest_answer(option: usize) -> Option<Result<(), &'static str>> {
+    with(|slot| match slot {
+        Some(Room::Guest(guest)) => Some(guest.send_answer(option)),
+        _ => None,
+    })
+}
+
+/// Offer a host question to writable guests. `None` unless hosting with guest answers enabled.
+pub fn offer_question(title: &str, body: &str, options: &[&str]) -> Option<u64> {
+    with(|slot| match slot {
+        Some(Room::Host(host)) => host.offer_question(title, body, options),
+        _ => None,
+    })
+}
+
+/// A guest's answer to offered question `id`, after processing queued relay frames. The pumped
+/// notices are returned with it so the caller can show them.
+pub fn take_question_answer(id: u64) -> (Option<(usize, String)>, Vec<String>) {
+    let notices = pump();
+    let answer = with(|slot| match slot {
+        Some(Room::Host(host)) => host.take_answer(id),
+        _ => None,
+    });
+    (answer, notices)
+}
+
+/// Withdraw offered question `id` from guests. No-op when the room has changed.
+pub fn close_question(id: u64) {
+    with(|slot| {
+        if let Some(Room::Host(host)) = slot {
+            host.close_question(id);
+        }
+    });
+}
+
 /// Join using the same socket and admission handshake as every frontend. Network setup never
 /// holds the room mutex; a concurrent leave invalidates the eventual installation.
 pub fn join(relay: &str, link: &str, name: &str, cancel: &AtomicBool) -> anyhow::Result<()> {
@@ -167,7 +203,7 @@ pub fn status() -> Value {
             json!({"role": "host", "read_only": host.is_read_only(), "peers": host.peers(), "notices": notices})
         }
         Some(Room::Guest(guest)) => {
-            json!({"role": "guest", "read_only": guest.is_read_only(), "admitted": guest.welcomed(), "ended": guest.ended(), "replicated_entries": guest.replicated_entries(), "notices": notices})
+            json!({"role": "guest", "read_only": guest.is_read_only(), "admitted": guest.welcomed(), "ended": guest.ended(), "replicated_entries": guest.replicated_entries(), "question": guest.open_question(), "notices": notices})
         }
     })
 }

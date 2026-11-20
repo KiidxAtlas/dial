@@ -200,22 +200,7 @@ fn first_line(bytes: &[u8]) -> Option<String> {
 /// An executable named `name` on `path` (a `PATH` value), without running it. On Windows each
 /// `PATHEXT` suffix is tried, so `git` finds `git.exe`.
 pub(crate) fn find_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
-    let suffixes: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-            .split(';')
-            .filter(|suffix| !suffix.is_empty())
-            .map(str::to_owned)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    std::env::split_paths(path).find_map(|dir| {
-        suffixes
-            .iter()
-            .map(|suffix| dir.join(format!("{name}{suffix}")))
-            .find(|candidate| dial_core::platform::fs::is_executable(candidate))
-    })
+    crate::platform::fs::find_program(Path::new(name), Some(path))
 }
 
 /// Outcome of one version probe.

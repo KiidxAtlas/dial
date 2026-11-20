@@ -96,10 +96,7 @@ pub(super) fn parse(
                     omitted = true;
                     break 'lines;
                 }
-                let mut end = (start + MAX_QUOTE).min(text.len());
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = text.floor_char_boundary(start + MAX_QUOTE);
                 add(
                     &mut hits,
                     reference,

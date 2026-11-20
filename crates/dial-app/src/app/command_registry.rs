@@ -16,6 +16,31 @@ pub(super) fn canonical_command(name: &str) -> &str {
     command_spec(name).map_or(name, |spec| spec.name)
 }
 
+/// Splits a typed line, given without its leading `/`, into the command name and its trimmed
+/// arguments. Idle, busy and live routing all split here; each caller keeps its own slash rule.
+pub(in crate::app) fn split_invocation(line: &str) -> (&str, &str) {
+    line.split_once(char::is_whitespace)
+        .map_or((line, ""), |(name, args)| (name, args.trim()))
+}
+
+/// The command a typed line runs, after hub, alias and compatibility spellings. Idle and busy
+/// routing both resolve here, so one spelling names one command whether or not a turn is running.
+pub(in crate::app) fn resolve_invocation<'a>(name: &'a str, args: &'a str) -> (&'a str, &'a str) {
+    let (name, args) = hubs::expand(canonical_command(name), args);
+    let name = canonical_command(name);
+    match (name, args) {
+        // `/accounts pin` is the clearer spelling of `/session pin`, which pins a ChatGPT account.
+        ("accounts", args) if args == "pin" || args.starts_with("pin ") => ("session", args),
+        ("help", "commands") => ("commands", ""),
+        ("review", args) if args == "files" || args.starts_with("files ") => (
+            "review-file",
+            args.strip_prefix("files").unwrap_or("").trim(),
+        ),
+        ("sessions", "fork") => ("fork", ""),
+        _ => (name, args),
+    }
+}
+
 #[cfg(test)]
 /// Historical RPC rows, projected once from the shared metadata (not a second declaration).
 pub(super) static BUILTIN_COMMANDS: std::sync::LazyLock<Vec<(&str, &str, &str)>> =
@@ -70,8 +95,7 @@ pub(super) fn turn_count(args: &str) -> Option<usize> {
 }
 
 pub(super) fn during_turn(name: &str, args: &str) -> DuringTurn {
-    let (name, args) = hubs::expand(canonical_command(name), args);
-    let name = canonical_command(name);
+    let (name, args) = resolve_invocation(name, args);
     if name == "activity" && args == "resume" {
         return DuringTurn::AfterTurn;
     }
@@ -115,8 +139,7 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
     if let Some(spec) = hubs::picker(name, args) {
         return Some(Which::Choice(Box::new(spec)));
     }
-    let (name, args) = hubs::expand(name, args);
-    let name = canonical_command(name);
+    let (name, args) = resolve_invocation(name, args);
     let args = args.trim();
     match (name, args) {
         ("model", "") => Some(Which::Models),

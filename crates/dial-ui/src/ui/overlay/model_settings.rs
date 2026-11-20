@@ -7,9 +7,10 @@
 //! the provider capabilities and saved immediately; unset values inherit Dial or provider defaults.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{
-        Axis, arrows, editor_spans, fit, hint, hint_line, other_scope, pair_label, panel, pressed,
-        scope_name,
+    widgets::{
+        ALREADY_DEFAULT, FormKey, SettingColumns, editor_spans, field_detail, fit, form_footer,
+        form_key, form_paste, form_status, is_reset_key, is_scope_key, panel, scope_name,
+        scope_switched, section_rows, section_rule, setting_value,
     },
 };
 use crate::{
@@ -23,7 +24,7 @@ use crate::{
     ui::{
         chrome::{self, Section},
         editor::Editor,
-        keys::{Action, Keymap},
+        keys::Keymap,
         text,
         theme::{Sym, Tok},
     },
@@ -289,7 +290,7 @@ static FIELDS: &[Field] = &[
         "Draft model",
         "Local runtime",
         Kind::Text,
-        "A smaller model with the same tokenizer that drafts tokens for speculative decoding. Enter types a model id or path. Any value on this page replaces the global local_runtime for this model; Dial restarts its MLX server to apply it.",
+        "A smaller model with the same tokenizer that drafts tokens for speculative decoding. Type a model id or path. Any value on this page replaces the global local_runtime for this model; Dial restarts its MLX server to apply it.",
     ),
     field(
         "local_runtime.num_draft_tokens",
@@ -339,7 +340,7 @@ static FIELDS: &[Field] = &[
         "Declared capabilities",
         "Advanced",
         Kind::Toml,
-        "What this exact model supports, one line per capability. Settings are validated against it. Enter opens the exact values as TOML.",
+        "What this exact model supports, one line per capability. Settings are validated against it. Opens the exact values as TOML.",
     ),
 ];
 
@@ -371,7 +372,7 @@ fn template_row(option: TemplateOption) -> Field {
     let (kind, what) = match option.kind {
         OptionKind::Flag => (Kind::Toggle, "an on/off switch"),
         OptionKind::Choice(options) => (Kind::Found(options), "one of the values it compares"),
-        OptionKind::Text => (Kind::Text, "a value; Enter types it"),
+        OptionKind::Text => (Kind::Text, "a value; type it"),
     };
     let default = option.default.map_or_else(
         || "Default lets the template decide.".to_owned(),
@@ -790,7 +791,7 @@ impl ModelSettingsOverlay {
         }
         lines.push(Line::from(fit(
             vec![Span::styled(
-                " Enter applies it. Nothing changes until you press Enter.",
+                " Nothing changes until you apply it.",
                 theme.fg(Tok::Muted),
             )],
             w,
@@ -801,53 +802,24 @@ impl ModelSettingsOverlay {
     fn suggestion_row(
         &self,
         index: usize,
-        w: usize,
         ctx: &DrawCtx,
-        label_w: usize,
+        columns: &SettingColumns,
     ) -> Line<'static> {
         let theme = ctx.theme;
         let suggestion = &self.suggestions[index];
         let selected = self.fields.len() + index == self.cursor;
-        let prefix_w = 5 + label_w + 2;
-        let spans = vec![
-            Span::styled(
-                format!(
-                    " {} ",
-                    if selected {
-                        theme.sym(Sym::Pointer)
-                    } else {
-                        " "
-                    }
-                ),
-                theme.fg(Tok::Accent),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!(
-                    "{:<label_w$}",
-                    text::ellipsize(&suggestion.title, label_w, theme.ascii())
-                ),
-                theme.fg(Tok::Text),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                text::ellipsize(
-                    &suggestion.evidence,
-                    w.saturating_sub(prefix_w + 1),
-                    theme.ascii(),
-                ),
-                if selected {
-                    theme.fg(Tok::Accent)
-                } else {
-                    theme.fg(Tok::Muted)
-                },
-            ),
-        ];
-        if selected {
-            crate::ui::chrome::selected_row(theme, spans, w)
-        } else {
-            Line::from(fit(spans, w))
-        }
+        let value = Span::styled(
+            text::ellipsize(&suggestion.evidence, columns.value_width(), theme.ascii()),
+            theme.fg(if selected { Tok::Accent } else { Tok::Muted }),
+        );
+        columns.row(
+            theme,
+            selected,
+            " ",
+            &suggestion.title,
+            theme.fg(Tok::Text),
+            [value],
+        )
     }
 
     pub fn banner(&mut self, text: String, error: bool) {
@@ -1003,28 +975,30 @@ impl ModelSettingsOverlay {
 
     pub fn event(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
         if let Event::Paste(pasted) = event {
-            if let Some(editor) = &mut self.editor {
-                editor.insert(pasted);
-            }
+            form_paste(&mut self.editor, pasted);
             return OverlayEvent::None;
         }
         let Event::Key(key) = event else {
             return OverlayEvent::None;
         };
-        if !pressed(key) {
-            return OverlayEvent::None;
-        }
-        if keys.matches(Action::SelectCancel, key) {
-            self.message = None;
-            return if self.editor.take().is_some() {
-                OverlayEvent::None
-            } else {
-                OverlayEvent::Close
-            };
-        }
-        if let Some(editor) = &mut self.editor {
-            if keys.matches(Action::SelectConfirm, key) {
-                let text = editor.text.clone();
+        let len = self.len();
+        match form_key(
+            &mut self.editor,
+            key,
+            keys,
+            &mut self.cursor,
+            len,
+            self.page,
+        ) {
+            FormKey::Ignored => {}
+            FormKey::Released => return OverlayEvent::None,
+            FormKey::Typed(changed) => {
+                if changed {
+                    self.message = None;
+                }
+                return OverlayEvent::None;
+            }
+            FormKey::Commit(text) => {
                 // Text rows take what was typed; save it as a TOML string unless it is blank (reset).
                 let plain = matches!(self.fields[self.cursor].kind, Kind::Text | Kind::Found(_));
                 if plain && !text.trim().is_empty() {
@@ -1032,22 +1006,23 @@ impl ModelSettingsOverlay {
                 }
                 return self.apply(&text);
             }
-            if editor.key_with(*key, keys) {
+            FormKey::Discarded | FormKey::Moved => {
                 self.message = None;
+                return OverlayEvent::None;
             }
-            return OverlayEvent::None;
+            FormKey::Close => {
+                self.message = None;
+                return OverlayEvent::Close;
+            }
+            FormKey::Confirm => {
+                if self.cursor >= self.fields.len() {
+                    return self.apply_suggestion(self.cursor - self.fields.len());
+                }
+                return self.begin_edit();
+            }
         }
-        let last = self.len() - 1;
         let section = self.section_at(self.cursor);
-        if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(last);
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(self.page);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + self.page).min(last);
-        } else if key.code == KeyCode::Tab {
+        if key.code == KeyCode::Tab {
             // Jump to the first row of the next section.
             if let Some(next) = self.fields.iter().position(|f| {
                 f.section != section && {
@@ -1080,37 +1055,21 @@ impl ModelSettingsOverlay {
                 .iter()
                 .position(|f| f.section == name)
                 .unwrap_or(0);
-        } else if keys.matches(Action::SelectConfirm, key) {
-            if self.cursor >= self.fields.len() {
-                return self.apply_suggestion(self.cursor - self.fields.len());
-            }
-            return self.begin_edit();
         } else {
             match key.code {
                 KeyCode::Left => return self.step(-1),
                 KeyCode::Right => return self.step(1),
-                KeyCode::Home => self.cursor = 0,
-                KeyCode::End => self.cursor = last,
-                KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('r') => {
+                _ if is_reset_key(key) => {
                     if self.cursor < self.fields.len()
                         && self.is_override(&self.fields[self.cursor])
                     {
                         return self.apply("");
                     }
-                    self.message = Some(("Already using the default".into(), false));
+                    self.message = Some((ALREADY_DEFAULT.into(), false));
                     return OverlayEvent::None;
                 }
-                KeyCode::Char('s') | KeyCode::Char('S')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        || key.code == KeyCode::Char('s') =>
-                {
-                    self.scope = other_scope(self.scope);
-                    self.message = Some((
-                        format!("Changes now save to {} settings", scope_name(self.scope)),
-                        false,
-                    ));
+                _ if is_scope_key(key) => {
+                    self.message = Some((scope_switched(&mut self.scope), false));
                     return OverlayEvent::None;
                 }
                 KeyCode::Char('c') => return OverlayEvent::Action("open:providers".into()),
@@ -1134,7 +1093,7 @@ impl ModelSettingsOverlay {
             .unwrap_or(&self.profile.model)
             .to_owned();
         let budget = usize::from(frame.area().width.saturating_sub(19));
-        let caption = super::settings::scope_caption(self.scope, &self.project_name, budget);
+        let caption = super::widgets::scope_caption(self.scope, &self.project_name, budget);
         let named = format!("{name} · {caption}");
         let name = if crate::ui::text::width(&named) <= budget {
             named
@@ -1175,26 +1134,12 @@ impl ModelSettingsOverlay {
             _ => "default".to_owned(),
         };
         let adjustable = !matches!(field.kind, Kind::Toml | Kind::Text);
-        let (left, right) = if theme.ascii() {
-            ("<", ">")
-        } else {
-            ("‹", "›")
-        };
-        let text = if selected && adjustable {
-            format!("{left} {shown} {right}")
-        } else {
-            shown
-        };
-        let style = if selected && adjustable {
-            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)
-        } else if custom {
-            theme.fg(Tok::Text).add_modifier(Modifier::BOLD)
-        } else {
-            theme.fg(Tok::Muted)
-        };
-        vec![Span::styled(
-            text::ellipsize(&text, width, theme.ascii()),
-            style,
+        vec![setting_value(
+            theme,
+            shown,
+            width,
+            selected && adjustable,
+            custom,
         )]
     }
 
@@ -1252,66 +1197,21 @@ impl ModelSettingsOverlay {
         let list_h = h.saturating_sub(2 + 1 + 1 + detail_h).max(1);
         self.page = list_h;
 
-        // Section headers interleaved with fields, scrolled so the selected field stays visible.
-        let mut rows: Vec<(Option<&'static str>, usize)> = Vec::new();
-        let mut last = "";
-        for (i, f) in self.fields.iter().enumerate() {
-            if f.section != last {
-                rows.push((Some(f.section), i));
-                last = f.section;
-            }
-            rows.push((None, i));
-        }
-        if !self.suggestions.is_empty() {
-            rows.push((Some("Suggestions"), self.fields.len()));
-            for k in 0..self.suggestions.len() {
-                rows.push((None, self.fields.len() + k));
-            }
-        }
-        let selected_row = rows
-            .iter()
-            .position(|(s, i)| s.is_none() && *i == self.cursor)
-            .unwrap_or(0);
-        if selected_row < self.scroll {
-            self.scroll = selected_row;
-        }
-        if selected_row >= self.scroll + list_h {
-            self.scroll = selected_row + 1 - list_h;
-        }
-        if list_h > 1
-            && selected_row > 0
-            && rows[selected_row - 1].0.is_some()
-            && self.scroll >= selected_row
-        {
-            self.scroll = selected_row - 1;
-        }
-        self.scroll = self.scroll.min(rows.len().saturating_sub(list_h));
-
-        let label_w = self
+        let sections = self
             .fields
             .iter()
-            .map(|f| text::width(&f.label))
-            .max()
-            .unwrap_or(10)
-            .min(w.saturating_sub(12).max(8));
+            .map(|f| f.section)
+            .chain(std::iter::repeat_n("Suggestions", self.suggestions.len()));
+        let rows = section_rows(sections, self.cursor, &mut self.scroll, list_h);
+
+        let columns = SettingColumns::new(w, self.fields.iter().map(|f| f.label.as_ref()));
         for (section, index) in rows.iter().skip(self.scroll).take(list_h) {
             if let Some(name) = section {
-                let rule = theme.sym(Sym::BoxH);
-                let head = format!(" {rule}{rule} ");
-                let title = chrome::label(theme, name);
-                let pad = w.saturating_sub(text::width(&head) + text::width(&title.content) + 1);
-                out.push(Line::from(fit(
-                    vec![
-                        Span::styled(head, theme.fg(Tok::BorderMuted)),
-                        title,
-                        Span::styled(format!(" {}", rule.repeat(pad)), theme.fg(Tok::BorderMuted)),
-                    ],
-                    w,
-                )));
+                out.push(section_rule(theme, name, w));
                 continue;
             }
             if *index >= self.fields.len() {
-                out.push(self.suggestion_row(*index - self.fields.len(), w, ctx, label_w));
+                out.push(self.suggestion_row(*index - self.fields.len(), ctx, &columns));
                 continue;
             }
             let field = &self.fields[*index];
@@ -1323,43 +1223,15 @@ impl ModelSettingsOverlay {
                 theme.fg(Tok::Text)
             };
             let marker = if self.is_override(field) {
-                theme.sym(Sym::Dot).to_owned()
+                theme.sym(Sym::Dot)
             } else {
-                " ".to_owned()
+                " "
             };
-            let prefix_w = 5 + label_w + 2;
-            let mut spans = vec![
-                Span::styled(
-                    format!(
-                        " {} ",
-                        if selected {
-                            theme.sym(Sym::Pointer)
-                        } else {
-                            " "
-                        }
-                    ),
-                    theme.fg(Tok::Accent),
-                ),
-                Span::styled(marker, theme.fg(Tok::Accent)),
-                Span::raw(" "),
-                Span::styled(
-                    format!(
-                        "{:<label_w$}",
-                        text::ellipsize(&field.label, label_w, theme.ascii())
-                    ),
-                    label_style,
-                ),
-                Span::raw("  "),
-            ];
-            spans.extend(self.value_spans(field, selected, w.saturating_sub(prefix_w + 1), ctx));
+            let mut value = self.value_spans(field, selected, columns.value_width(), ctx);
             if blocked && !selected {
-                spans.push(Span::styled(" (unsupported)", dim));
+                value.push(Span::styled(" (unsupported)", dim));
             }
-            out.push(if selected {
-                crate::ui::chrome::selected_row(theme, spans, w)
-            } else {
-                Line::from(fit(spans, w))
-            });
+            out.push(columns.row(theme, selected, marker, &field.label, label_style, value));
         }
         while out.len() < 2 + list_h {
             out.push(Line::default());
@@ -1374,26 +1246,6 @@ impl ModelSettingsOverlay {
             out.extend(lines);
         } else if detail_h > 0 {
             let field = &self.fields[self.cursor];
-            let mut lines: Vec<Line<'static>> = vec![Line::from(fit(
-                vec![chrome::label(theme, &format!(" {}", field.label))],
-                w,
-            ))];
-            // The title and the range (or the unsupported reason) always keep their rows; help gets the rest.
-            let help = text::wrap_words(&field.help, w.saturating_sub(2).max(8));
-            let help_rows = detail_h.saturating_sub(2);
-            for (index, row) in help.iter().take(help_rows).enumerate() {
-                let mut shown = format!(" {row}");
-                if index + 1 == help_rows && help.len() > help_rows {
-                    shown.push_str(&format!(" {}", theme.sym(Sym::Ellipsis)));
-                }
-                lines.push(Line::from(fit(
-                    vec![Span::styled(
-                        text::ellipsize(&shown, w, theme.ascii()),
-                        theme.fg(Tok::Muted),
-                    )],
-                    w,
-                )));
-            }
             let accepts = match field.kind {
                 Kind::Number { min, max, int, .. } => format!(
                     "Accepts {} to {}",
@@ -1412,80 +1264,52 @@ impl ModelSettingsOverlay {
                         }
                 ),
                 Kind::Found(_) => format!(
-                    "Choose: {} · default; Enter types another value",
+                    "Choose: {} · default; or type another value",
                     self.choices(field).join(" · ")
                 ),
                 Kind::Toggle => "Choose: on · off · default".to_owned(),
-                Kind::Text => "Enter types a value; blank resets to default".to_owned(),
-                Kind::Toml => "Enter edits a TOML value; blank resets to default".to_owned(),
+                Kind::Text => "Type a value; blank resets to default".to_owned(),
+                Kind::Toml => "Edit a TOML value; blank resets to default".to_owned(),
             };
-            match self.unsupported(field) {
-                Some(reason) => lines.push(Line::from(fit(
+            let footer = match self.unsupported(field) {
+                Some(reason) => Line::from(fit(
                     vec![Span::styled(
                         format!(" {} {reason}", theme.sym(Sym::Cross2)),
                         theme.fg(Tok::Warning),
                     )],
                     w,
-                ))),
-                None => lines.push(Line::from(fit(
-                    vec![Span::styled(format!(" {accepts}"), dim)],
-                    w,
-                ))),
-            }
-            lines.truncate(detail_h);
-            while lines.len() < detail_h {
-                lines.push(Line::default());
-            }
-            out.extend(lines);
+                )),
+                None => Line::from(fit(vec![Span::styled(format!(" {accepts}"), dim)], w)),
+            };
+            out.extend(field_detail(
+                theme,
+                &field.label,
+                &field.help,
+                footer,
+                detail_h,
+                w,
+            ));
         }
 
-        out.push(match &self.message {
-            Some((message, true)) => Line::from(fit(
-                vec![Span::styled(
-                    format!(" {} {message}", theme.sym(Sym::Cross2)),
-                    theme.fg(Tok::Error),
-                )],
-                w,
-            )),
-            Some((message, false)) => Line::from(fit(
-                vec![Span::styled(
-                    format!(" {} {message}", theme.sym(Sym::Check)),
-                    theme.fg(Tok::Success),
-                )],
-                w,
-            )),
-            None if self.editor.is_some() => Line::from(fit(
-                vec![Span::styled(" Type a value, then Enter to save", dim)],
-                w,
-            )),
-            None => Line::default(),
-        });
+        out.push(form_status(theme, self.message.as_ref(), w));
 
-        let keys = ctx.keys;
-        let segments: Vec<String> = if self.editor.is_some() {
-            vec![
-                hint(keys, Action::SelectConfirm, "save"),
-                hint(keys, Action::SelectCancel, "cancel"),
-            ]
+        let extra: Vec<String> = if self.editor.is_some() {
+            Vec::new()
         } else {
-            let mut segments = vec![
-                format!(
-                    "{} move",
-                    pair_label(keys, Action::SelectUp, Action::SelectDown)
-                ),
-                format!("{} change", arrows(theme, Axis::Horizontal)),
-                hint(keys, Action::SelectConfirm, "edit"),
-                "r reset".to_owned(),
-                format!("s save to {}", scope_name(other_scope(self.scope))),
+            vec![
                 "d context defaults".to_owned(),
                 "c connections / provider Headers".to_owned(),
                 "g all settings".to_owned(),
-                hint(keys, Action::SelectCancel, "close"),
-            ];
-            segments.retain(|s| !s.is_empty());
-            segments
+            ]
         };
-        out.push(hint_line(theme, &segments, w));
+        out.push(form_footer(
+            theme,
+            ctx.keys,
+            self.editor.is_some(),
+            w,
+            self.scope,
+            &extra,
+        ));
         out
     }
 }

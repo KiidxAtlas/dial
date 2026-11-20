@@ -8,9 +8,9 @@ use super::{
     WHISPER_MODEL_URL, is_ready, locate, recipe, report, settings_for, whisper_model_path,
 };
 use crate::config::voice::{SttBackendChoice, TtsBackendChoice};
+use crate::runtime::fingerprint::sha256_file;
 use anyhow::ensure;
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -355,7 +355,7 @@ pub(crate) fn standard_location(target: &Recipe, env: &Env) -> Result<Option<Pat
             target.program.to_owned()
         };
         let path = bin.join(program);
-        if super::is_executable(&path) {
+        if crate::platform::fs::is_executable(&path) {
             return Ok(Some(path));
         }
     }
@@ -499,20 +499,6 @@ pub(super) fn download_to(
     }
     crate::platform::fs::sync_file(&file)?;
     Ok(())
-}
-
-pub(super) fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// A mono 16 kHz 16-bit PCM WAV of silence, used as the whisper.cpp health-check clip.

@@ -74,7 +74,7 @@ fn capped_spool_keeps_head_marker_and_tail_and_hashes_stored_bytes() {
     let text = String::from_utf8_lossy(&stored);
     assert!(
         text.contains(
-            "[ARTIFACT TRUNCATED: kept first 16B + last 48B of 1000B; 936B elided from the middle]"
+            "[ARTIFACT TRUNCATED: kept first 16 B + last 48 B of 1000 B; 936 B elided from the middle]"
         ),
         "{text}"
     );
@@ -106,7 +106,7 @@ fn unbounded_and_head_only_limits() {
     let stored = String::from_utf8(fs::read(store.path(&uri).unwrap()).unwrap()).unwrap();
     assert!(
         stored.starts_with(
-            "0123456789\n[ARTIFACT TRUNCATED: kept first 10B + last 0B of 16B; 6B elided"
+            "0123456789\n[ARTIFACT TRUNCATED: kept first 10 B + last 0 B of 16 B; 6 B elided"
         ),
         "{stored}"
     );

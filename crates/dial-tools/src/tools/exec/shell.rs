@@ -1,6 +1,6 @@
 //! The `bash` tool: platform-native shell execution, process ownership, live output and artifacts.
 
-use super::sandbox::child_env_allowed;
+use super::sandbox::inherit_allowed_env;
 #[cfg(not(windows))]
 use super::sandbox::{Policy, Sandbox};
 use crate::config::types::ShellBackend;
@@ -1892,12 +1892,7 @@ fn shell_command_with_state(
             Runner::PowerShell => powershell_command(script)?,
         };
         let mut spawn = if ws.unsandboxed {
-            spawn.env_clear();
-            for (key, value) in std::env::vars_os() {
-                if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
-                    spawn.env(key, value);
-                }
-            }
+            inherit_allowed_env(&mut spawn);
             spawn
         } else {
             let args: Vec<String> = spawn
@@ -1973,12 +1968,8 @@ fn shell_command_with_state(
         let mut spawn;
         if ws.unsandboxed {
             spawn = std::process::Command::new(&program);
-            spawn.args(&args).env_clear();
-            for (key, value) in std::env::vars_os() {
-                if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
-                    spawn.env(key, value);
-                }
-            }
+            spawn.args(&args);
+            inherit_allowed_env(&mut spawn);
             spawn
                 .env("TMPDIR", &scratch_str)
                 .env("PAGER", "cat")

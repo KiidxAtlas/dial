@@ -4,6 +4,31 @@ use crate::llm::provider::{Backend, ProviderKind};
 use crate::ui::transcript::TranscriptCtx;
 
 #[test]
+fn hub_draft_fills_an_empty_composer_but_keeps_typed_text_idle_and_busy() {
+    for busy in [false, true] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        for (draft, expected) in [
+            ("", "/dirs add "),
+            ("unfinished thought", "unfinished thought"),
+        ] {
+            shell.composer.set_draft(draft);
+            let command = "/dirs\t add  ";
+            if busy {
+                assert!(!shell.route_busy_command(&app, command.into()));
+            } else {
+                assert!(matches!(
+                    shell.command(&app, &mut agent, command).unwrap(),
+                    Step::Done
+                ));
+            }
+            assert_eq!(shell.composer.draft(), expected);
+        }
+        assert!(transcript_text(&shell).contains("Your draft is kept"));
+    }
+}
+
+#[test]
 fn everyday_queue_refuses_trailing_input_without_removing_a_message() {
     let (_home, _project, app, mut shell) = shell();
     let mut agent = permission_agent(&app);

@@ -21,8 +21,9 @@ use super::migrate::{CURRENT_SCHEMA_VERSION, header_version};
 use super::{Session, artifact_root, read_bounded_line, transfers, valid_id};
 use crate::config::paths::Layout;
 use crate::platform::fs as platform_fs;
+use crate::runtime::fingerprint::sha256_file;
 use crate::storage::artifact::ArtifactStore;
-use crate::storage::artifact::transfer::{collect_references, file_sha256};
+use crate::storage::artifact::transfer::collect_references;
 use crate::storage::{side_thread, subagent};
 
 /// Archive format name recorded in the manifest.
@@ -200,7 +201,7 @@ fn pack_session_with(
                 source_root.display()
             );
             ensure!(
-                file_sha256(&blob)? == id,
+                sha256_file(&blob)? == id,
                 "referenced artifact {uri} has corrupt content"
             );
             sources.push(Source {

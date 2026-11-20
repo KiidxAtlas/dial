@@ -876,6 +876,8 @@ pub struct AssistanceOverrides {
     /// Pins `harness.tools` to the bash-only roster (`config::tools::BASH_ONLY`) when `true`, or to the
     /// shipped default roster when `false`. Absent in older reports.
     pub bash_only: Option<bool>,
+    /// Advisory bash redirections only. A configured block policy is never changed.
+    pub bash_hints: Option<bool>,
 }
 
 impl AssistanceOverrides {

@@ -58,6 +58,7 @@ impl Shell {
             side: Default::default(),
             live_pane: Default::default(),
             loop_mode: Default::default(),
+            last_turn_halted: false,
             runtime: Default::default(),
             pending_result: None,
             shared_prose: false,
@@ -441,17 +442,13 @@ impl Shell {
                         "\u{2193}"
                     }
                 ),
-                // `/setup` only picks optional capabilities; `dial setup -m` installs the MLX
-                // runtime, which exists only on Apple Silicon Macs.
-                setup_hint: format!(
-                    "{} to choose a model or /providers to sign in to a hosted one{}",
-                    self.keys.label(Action::ModelSelect),
-                    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                        "; `dial setup -m <mlx-model>` downloads a local one"
-                    } else {
-                        ""
-                    }
-                ),
+                setup_hint: {
+                    let key = self.keys.label(Action::ModelSelect);
+                    format!(
+                        "{} choose model",
+                        if key.is_empty() { "/model" } else { &key }
+                    )
+                },
                 branch,
                 approval: format!("{:?}", app.config.approval).to_lowercase(),
                 sandbox: format!("{:?}", app.config.sandbox.mode).to_lowercase(),

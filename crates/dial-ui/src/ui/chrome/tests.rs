@@ -127,7 +127,7 @@ fn state_marks_share_one_vocabulary_and_only_failure_is_an_error() {
         let want = match mark {
             StateMark::Failed => Tok::Error,
             StateMark::Running => Tok::Accent,
-            StateMark::Blocked => Tok::Warning,
+            StateMark::NeedsInput | StateMark::Blocked => Tok::Warning,
             StateMark::Done | StateMark::Answered => Tok::Success,
             _ => Tok::Muted,
         };

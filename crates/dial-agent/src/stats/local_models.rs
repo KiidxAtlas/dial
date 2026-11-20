@@ -13,6 +13,7 @@ use crate::llm::catalog;
 use crate::llm::local_fit::{self, Architecture, Estimate, Fit};
 use crate::llm::local_format::{self, LocalFormat};
 use crate::stats::{self, DecodeSpeed};
+use crate::units::human_bytes;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
@@ -20,7 +21,6 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const GIB: f64 = (1u64 << 30) as f64;
 /// Context used for the fit estimate when the configuration does not request one.
 pub const DEFAULT_CONTEXT: u64 = 32768;
 
@@ -504,12 +504,12 @@ pub fn memory_text(memory: &Memory) -> String {
     match (memory.resident_bytes, memory.context_tokens) {
         (Some(resident), Some(context)) => {
             format!(
-                "{fit} · {:.1} GiB resident at {context} tokens",
-                resident as f64 / GIB
+                "{fit} · {} resident at {context} tokens",
+                human_bytes(resident)
             )
         }
         _ => match memory.weights_bytes {
-            Some(weights) => format!("{fit} · weights {:.1} GiB", weights as f64 / GIB),
+            Some(weights) => format!("{fit} · weights {}", human_bytes(weights)),
             None => fit.to_string(),
         },
     }
@@ -577,7 +577,7 @@ pub fn render_text(dashboard: &Dashboard) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let memory = match dashboard.memory_bytes {
-        Some(bytes) => format!("{:.1} GiB {}", bytes as f64 / GIB, dashboard.memory_source),
+        Some(bytes) => format!("{} {}", human_bytes(bytes), dashboard.memory_source),
         None => "unknown".into(),
     };
     let _ = writeln!(

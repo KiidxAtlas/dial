@@ -131,7 +131,7 @@ fn find_npm(env: &Env) -> Option<PathBuf> {
     env.find("npm").or_else(|| {
         let node = locate(recipe("node")?, env)?;
         let npm = node.parent()?.join("npm");
-        super::is_executable(&npm).then_some(npm)
+        crate::platform::fs::is_executable(&npm).then_some(npm)
     })
 }
 

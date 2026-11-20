@@ -8,18 +8,18 @@
 //! controller reply, a configuration change or a rescan), so drawing never reads the store per row
 //! and per frame.
 use super::{
-    DrawCtx, OverlayEvent,
-    settings::{
+    DrawCtx, OverlayEvent, panel_keys,
+    widgets::{
         editor_spans, filled, fit, is_ctrl, other_scope, pair_label, pressed, scope_name,
-        scroll_cell, typed_char,
+        scroll_cell, selection_marker, typed_char,
     },
 };
 use crate::{
     config::settings_store::Scope,
-    llm::catalog::{Discovery, ProviderStatus, UNREACHABLE_DETAIL},
+    llm::catalog::{Discovery, ProviderStatus},
     llm::model_config::{AuthMethod, ProviderSpec},
     ui::{
-        chrome::{self, Section, Status},
+        chrome::{self, Section},
         editor::Editor,
         keys::{Action, Keymap},
         text,
@@ -29,7 +29,7 @@ use crate::{
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -213,27 +213,6 @@ struct Entry {
     spec: Option<ProviderSpec>,
 }
 
-/// Whether a base URL names this machine: a loopback address or `localhost`.
-fn is_loopback(base_url: &str) -> bool {
-    url::Url::parse(base_url).is_ok_and(|url| {
-        url.host_str().is_some_and(|host| {
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            bare.eq_ignore_ascii_case("localhost")
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
-    })
-}
-
-/// A local server that refused the connection is an expected absence, not a failure.
-/// Auth failures, HTTP errors and malformed replies stay red, including built-in providers.
-fn expected_absent(entry: &Entry) -> bool {
-    entry.state == "unavailable"
-        && entry.detail == UNREACHABLE_DETAIL
-        && entry.base_url.as_deref().is_some_and(is_loopback)
-}
-
 /// Where a provider's API key comes from: the saved key in credentials.json and/or an
 /// environment variable. The environment variable wins when it is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,8 +245,7 @@ pub struct ProviderOverlay {
     scroll: usize,
     page: usize,
     mode: Mode,
-    confirm_scroll: usize,
-    confirm_usable: bool,
+    review: panel_keys::RemovalReview,
     form_scroll: usize,
     form_page: usize,
     message: Option<(String, bool)>,
@@ -344,8 +322,7 @@ impl ProviderOverlay {
             scroll: 0,
             page: 8,
             mode: Mode::List,
-            confirm_scroll: 0,
-            confirm_usable: true,
+            review: Default::default(),
             form_scroll: 0,
             form_page: 1,
             message: None,
@@ -1175,24 +1152,12 @@ impl ProviderOverlay {
         let Mode::Confirm(entry, removal) = &self.mode else {
             return OverlayEvent::None;
         };
-        if keys.matches(Action::SelectDown, key) {
-            self.confirm_scroll = self.confirm_scroll.saturating_add(1);
-        } else if keys.matches(Action::SelectUp, key) {
-            self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.confirm_scroll = self.confirm_scroll.saturating_add(self.page);
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.confirm_scroll = self.confirm_scroll.saturating_sub(self.page);
-        } else if key.code == KeyCode::Home {
-            self.confirm_scroll = 0;
-        } else if key.code == KeyCode::End {
-            self.confirm_scroll = usize::MAX;
-        }
+        self.review.scroll(keys, key);
         if keys.matches(Action::SelectConfirm, key) {
-            if !self.confirm_usable {
+            if !self.review.can_confirm() {
                 return OverlayEvent::None;
             }
-            self.confirm_scroll = 0;
+            self.review.rewind();
             let (id, base_url, removal) = (entry.id.clone(), entry.base_url.clone(), *removal);
             self.mode = Mode::List;
             return match removal {
@@ -1211,7 +1176,7 @@ impl ProviderOverlay {
             };
         }
         if keys.matches(Action::SelectCancel, key) {
-            self.confirm_scroll = 0;
+            self.review.rewind();
             self.mode = Mode::List;
         }
         OverlayEvent::None
@@ -1336,16 +1301,20 @@ impl ProviderOverlay {
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
         self.hits.begin(frame.area());
-        self.panel_keys.set_footer(
-            self.footer(ctx.keys)
-                .into_iter()
-                .map(|(key, label)| format!("{key} {label}"))
-                .collect(),
-        );
-        if self.panel_keys.draw(frame, ctx, "Providers", "a adds a provider · k sets an API key · x or Delete removes (asks first) · Enter opens the provider menu.\nCtrl+B switches save scope.\nIn API-key and Add provider forms, PageUp/PageDown scroll all help, validation errors and endpoint details while the input stays pinned. Home/End and arrows retain editor navigation. Editing or validating returns to the start of the copy.", false, false) {
+        self.panel_keys.set_footer(self.footer_segments(ctx.keys));
+        if self.panel_keys.open() {
+            let mut notes = String::from(
+                "a adds a provider · k sets an API key · x or Delete removes (asks first) · Enter opens the provider menu.\nCtrl+B switches save scope.\nIn API-key and Add provider forms, PageUp/PageDown scroll all help, validation errors and endpoint details while the input stays pinned. Home/End and arrows retain editor navigation. Editing or validating returns to the start of the copy.",
+            );
+            if matches!(self.mode, Mode::List) {
+                notes.push('\n');
+                notes.push_str(&self.detail(self.selected().as_ref()));
+            }
+            self.panel_keys
+                .draw(frame, ctx, "Providers", &notes, false, false);
             return;
         }
-        let extra = super::settings::scope_caption(
+        let extra = super::widgets::scope_caption(
             self.scope,
             &self.project_name,
             usize::from(frame.area().width.saturating_sub(14)),
@@ -1368,70 +1337,59 @@ impl ProviderOverlay {
     fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(w), usize::from(h));
         let theme = ctx.theme;
-        // Forms and reviews own their body: list details and empty status rows must not hide input.
-        if matches!(
-            self.mode,
-            Mode::Key { .. } | Mode::Wizard(_) | Mode::Confirm(..)
-        ) {
+        if let Mode::Confirm(entry, removal) = &self.mode {
+            let body = self.confirm_body(theme, entry, *removal, w);
+            let mut hints = self.footer_segments(ctx.keys);
+            hints.insert(
+                1,
+                panel_keys::segment(
+                    &pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
+                    "scroll",
+                ),
+            );
+            return self.review.rows(
+                body,
+                w,
+                h,
+                panel_keys::sheet_footer(theme, hints, w),
+                "Enlarge to confirm; Esc cancels",
+            );
+        }
+        // A setup form pins its heading and input; only secondary copy scrolls.
+        if matches!(self.mode, Mode::Key { .. } | Mode::Wizard(_)) {
             let body_rows = h.saturating_sub(1);
-            let mut body = match &self.mode {
+            let mut out = match &self.mode {
                 Mode::Key {
                     entry,
                     secret,
                     error,
                 } => self.key_body(theme, entry, secret, error.as_deref(), w),
                 Mode::Wizard(wizard) => self.wizard_body(theme, wizard, w),
-                Mode::Confirm(entry, removal) => self.confirm_body(theme, entry, *removal, w),
                 _ => unreachable!(),
             };
-            // Forms begin with a compact heading and active input. Only secondary copy scrolls.
-            let mut pinned = Vec::new();
-            if !matches!(self.mode, Mode::Confirm(..)) {
-                let details = body.split_off(2.min(body.len()));
-                pinned = body;
-                pinned.truncate(body_rows);
-                body = details;
-                if body_rows >= 4 && body.len() > body_rows.saturating_sub(pinned.len()) {
-                    pinned.push(chrome::hint_line(
-                        theme,
-                        &[(
-                            &pair_label(ctx.keys, Action::SelectPageUp, Action::SelectPageDown),
-                            "details",
-                        )],
-                        w,
-                    ));
-                }
+            let body = out.split_off(2.min(out.len()));
+            out.truncate(body_rows);
+            if body_rows >= 4 && body.len() > body_rows.saturating_sub(out.len()) {
+                out.push(chrome::hint_line(
+                    theme,
+                    &[(
+                        &pair_label(ctx.keys, Action::SelectPageUp, Action::SelectPageDown),
+                        "details",
+                    )],
+                    w,
+                ));
             }
-            let detail_rows = body_rows.saturating_sub(pinned.len());
-            let review = matches!(self.mode, Mode::Confirm(..));
-            let start = if review {
-                self.confirm_usable = w >= 20 && h >= 3;
-                self.page = body_rows.max(1);
-                self.confirm_scroll = self
-                    .confirm_scroll
-                    .min(body.len().saturating_sub(body_rows));
-                self.confirm_scroll
-            } else {
-                self.form_page = detail_rows.max(1);
-                self.form_scroll = self.form_scroll.min(body.len().saturating_sub(detail_rows));
-                self.form_scroll
-            };
-            let mut out = pinned;
-            out.extend(body.into_iter().skip(start).take(detail_rows));
+            let detail_rows = body_rows.saturating_sub(out.len());
+            self.form_page = detail_rows.max(1);
+            self.form_scroll = self.form_scroll.min(body.len().saturating_sub(detail_rows));
+            out.extend(body.into_iter().skip(self.form_scroll).take(detail_rows));
             out.resize(body_rows, Line::default());
             if h > 0 {
-                if review && !self.confirm_usable {
-                    out.push(Line::from("Enlarge to confirm; Esc cancels"));
-                } else {
-                    let mut footer = self.footer(ctx.keys);
-                    if review {
-                        footer.insert(1, ("↑/↓".into(), "scroll".into()));
-                    }
-                    if !review {
-                        footer.insert(1, ("F1".into(), "keys".into()));
-                    }
-                    out.push(key_footer(theme, &footer, w));
-                }
+                out.push(panel_keys::sheet_footer(
+                    theme,
+                    self.footer_segments(ctx.keys),
+                    w,
+                ));
             }
             return out;
         }
@@ -1447,8 +1405,18 @@ impl ProviderOverlay {
         };
         let (show_footer, show_detail, show_message, show_header) =
             (grant(), grant(), grant(), grant());
-        let extra_detail = if show_detail && matches!(self.mode, Mode::List) && h >= 12 {
-            spare.min(2)
+        let entries = self.entries();
+        let details = if show_detail && matches!(self.mode, Mode::List) {
+            text::wrap_words(&self.detail(entries.get(self.cursor)), w)
+        } else {
+            Vec::new()
+        };
+        let extra_detail = if details.len() > 1 {
+            let unused = (body_min + spare).saturating_sub(entries.len() + 1);
+            unused
+                .max(if h >= 12 { 2 } else { 0 })
+                .min(spare)
+                .min(details.len() - 1)
         } else {
             0
         };
@@ -1476,7 +1444,6 @@ impl ProviderOverlay {
                 w,
             )));
         }
-        let entries = self.entries();
         let body: Vec<Line<'static>> = match &self.mode {
             Mode::List => self.list_body(theme, &entries, body_rows, w),
             Mode::Menu(menu) => self.menu_body(theme, menu, w, body_rows),
@@ -1514,10 +1481,14 @@ impl ProviderOverlay {
             });
         }
         if show_detail {
-            let details = text::wrap(vec![Line::from(self.detail(theme, &entries))], w.max(1));
-            out.extend(
-                (0..=extra_detail).map(|index| details.get(index).cloned().unwrap_or_default()),
-            );
+            for index in 0..=extra_detail {
+                let row = if index == extra_detail && details.len() > index + 1 {
+                    " F1 more details"
+                } else {
+                    details.get(index).map_or("", String::as_str)
+                };
+                out.push(Line::styled(row.to_owned(), theme.fg(Tok::Muted)));
+            }
         }
         if matches!(self.mode, Mode::List) {
             for y in 0..body_rows.min((entries.len() + 1).saturating_sub(self.scroll)) {
@@ -1526,23 +1497,13 @@ impl ProviderOverlay {
             }
         }
         if show_footer {
-            out.push(key_footer(theme, &self.footer(ctx.keys), w));
+            out.push(panel_keys::sheet_footer(
+                theme,
+                self.footer_segments(ctx.keys),
+                w,
+            ));
         }
         out
-    }
-
-    fn chip(&self, theme: &Theme, state: &str) -> Span<'static> {
-        let status = match state {
-            "reachable" => Status::Ready,
-            "cached" | "unknown" => Status::Missing,
-            // Not configured yet is a neutral state, not a warning.
-            "auth-required" | "not-set-up" => {
-                return chrome::status_chip(theme, Status::Missing, "not set up");
-            }
-            "disabled" => Status::Missing,
-            _ => Status::Error,
-        };
-        chrome::status_chip(theme, status, state)
     }
 
     fn list_body(
@@ -1555,13 +1516,7 @@ impl ProviderOverlay {
         let total = entries.len() + 1;
         self.cursor = self.cursor.min(total - 1);
         self.page = rows.saturating_sub(1).max(1);
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        }
-        if self.cursor >= self.scroll + rows {
-            self.scroll = self.cursor + 1 - rows.max(1);
-        }
-        self.scroll = self.scroll.min(total.saturating_sub(rows));
+        self.scroll = chrome::keep_in_view(self.cursor, self.scroll, rows, total);
         let overflow = total > rows;
         let list_w = w.saturating_sub(usize::from(overflow));
         // Narrow panes keep what needs attention: the state and the next step. The model count
@@ -1577,27 +1532,12 @@ impl ProviderOverlay {
         for y in 0..rows.min(total) {
             let index = self.scroll + y;
             let selected = index == self.cursor;
-            let fill = if selected {
-                theme.bg(Tok::SelectedBg)
-            } else {
-                Style::default()
-            };
-            let pointer = if selected {
-                theme.sym(Sym::Pointer)
-            } else {
-                " "
-            };
-            let mut spans = vec![Span::styled(
-                format!("{pointer} "),
-                theme.fg(Tok::Accent).patch(fill),
-            )];
+            let (pointer, fill) = selection_marker(theme, selected, "");
+            let mut spans = vec![pointer];
             if let Some(entry) = entries.get(index) {
-                // An unavailable row whose absence is expected is muted, not an error.
-                let chip = if expected_absent(entry) {
-                    chrome::status_chip(theme, Status::Missing, "not running")
-                } else {
-                    self.chip(theme, &entry.state)
-                };
+                let (status, label) =
+                    chrome::provider_status(&entry.state, &entry.detail, entry.base_url.as_deref());
+                let chip = chrome::status_chip(theme, status, label);
                 let label =
                     text::ellipsize(&text::one_line(&entry.label), label_w - 1, theme.ascii());
                 let style = theme.fg(Tok::Text).patch(fill);
@@ -1786,20 +1726,10 @@ impl ProviderOverlay {
         let start = menu.cursor.saturating_sub(visible - 1);
         for (i, (_, label)) in menu.items.iter().enumerate().skip(start).take(visible) {
             let selected = i == menu.cursor;
-            let fill = if selected {
-                theme.bg(Tok::SelectedBg)
-            } else {
-                Style::default()
-            };
-            // Actions run on Enter; a pointer marks the highlighted one (radio marks would read
-            // as a setting that is switched on).
-            let pointer = if selected {
-                theme.sym(Sym::Pointer)
-            } else {
-                " "
-            };
+            // Actions are highlighted, not toggled like a radio choice.
+            let (pointer, fill) = selection_marker(theme, selected, "   ");
             let mut spans = vec![
-                Span::styled(format!("   {pointer} "), theme.fg(Tok::Accent).patch(fill)),
+                pointer,
                 Span::styled(label.clone(), theme.fg(Tok::Text).patch(fill)),
             ];
             if selected {
@@ -1942,18 +1872,13 @@ impl ProviderOverlay {
             .collect()
     }
 
-    fn detail(&self, theme: &Theme, entries: &[Entry]) -> Vec<Span<'static>> {
-        if !matches!(self.mode, Mode::List) {
-            return Vec::new();
-        }
-        match entries.get(self.cursor) {
+    fn detail(&self, selected: Option<&Entry>) -> String {
+        match selected {
             Some(entry) => {
                 let summary = self.key_source_sentence(entry).unwrap_or_else(|| "source not reported".into());
-                let mut spans = vec![Span::styled(format!(" Endpoint: {} · Status: {} ({}) · Credential: {}", entry.base_url.as_deref().map(text::one_line).unwrap_or_else(|| "not HTTP / provider-managed".into()), text::one_line(&entry.state), text::one_line(&entry.detail), summary), theme.fg(Tok::Muted))];
-                spans.push(Span::styled(" · Metadata only; availability is not a text or tool test. /doctor shows session diagnostic evidence. Enter: actions", theme.fg(Tok::Dim)));
-                spans
+                format!(" Endpoint: {} · Status: {} ({}) · Credential: {summary}. Metadata only; /doctor shows session diagnostic evidence, not a text or tool test.", entry.base_url.as_deref().map(text::one_line).unwrap_or_else(|| "not HTTP / provider-managed".into()), text::one_line(&entry.state), text::one_line(&entry.detail))
             }
-            None => vec![Span::styled(" Add an OpenAI-compatible endpoint: id, name, base URL and an optional key variable.".to_owned(), theme.fg(Tok::Muted))],
+            None => " Add an OpenAI-compatible endpoint: id, name, base URL and an optional key variable.".to_owned(),
         }
     }
 
@@ -1976,6 +1901,14 @@ impl ProviderOverlay {
             (None, true) => "Key: saved in credentials.json".to_owned(),
             (None, false) => "Key: none saved".to_owned(),
         })
+    }
+
+    /// The footer as `key label` segments for [`panel_keys::sheet_footer`]; unbound keys drop out.
+    fn footer_segments(&self, keys: &Keymap) -> Vec<String> {
+        self.footer(keys)
+            .iter()
+            .map(|(key, label)| panel_keys::segment(key, label))
+            .collect()
     }
 
     fn footer(&self, keys: &Keymap) -> Vec<(String, String)> {
@@ -2038,28 +1971,6 @@ impl ProviderOverlay {
             ],
         }
     }
-}
-
-/// Footer key hints (`key label` pairs) on one line. When they do not fit, segments are dropped from
-/// the one before the last (the last is the close hint) until they do.
-pub(super) fn key_footer(theme: &Theme, hints: &[(String, String)], width: usize) -> Line<'static> {
-    let mut keep: Vec<(&str, &str)> = hints
-        .iter()
-        .filter(|(key, _)| !key.is_empty())
-        .map(|(key, label)| (key.as_str(), label.as_str()))
-        .collect();
-    let cells = |keep: &[(&str, &str)]| {
-        keep.iter()
-            .map(|(key, label)| text::width(key) + 1 + text::width(label))
-            .sum::<usize>()
-            + 3 * keep.len().saturating_sub(1)
-    };
-    while keep.len() > 1 && cells(&keep) + 1 > width {
-        keep.remove(keep.len() - 2);
-    }
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(chrome::key_hint_spans(theme, &keep));
-    Line::from(fit(spans, width))
 }
 
 #[cfg(test)]

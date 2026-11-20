@@ -4,8 +4,7 @@
 //! Enter first, then run the matching `/improve` command, which keeps its own checks.
 use super::{
     DrawCtx, OverlayEvent,
-    compute::tab_line,
-    settings::{filled, fit, list_row, panel},
+    widgets::{filled, fit, list_row, panel},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -384,7 +383,7 @@ impl ImproveOverlay {
                 let w = usize::from(width);
                 let h = usize::from(height);
                 let (rows, selected) = self.body(ctx.theme);
-                let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, &TABS, self.tab, w)];
+                let mut output = vec![super::widgets::panel_tabs(ctx.theme, &TABS, self.tab, w)];
                 let available = h.saturating_sub(output.len() + 2);
                 let scroll =
                     selected.map_or(0, |row| row.saturating_sub(available.saturating_sub(1)));

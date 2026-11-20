@@ -11,11 +11,7 @@
 //! Titles and hosts come from the tool's own numbered list (`1. Title` then the URL). Output in
 //! any other shape, a failure, or the expanded view keeps the ordinary card.
 use super::{Rows, Tool, ToolState, frame};
-use crate::ui::{
-    text,
-    theme::{Sym, Tok},
-    transcript::TranscriptCtx,
-};
+use crate::ui::{text, theme::Tok, transcript::TranscriptCtx};
 use ratatui::{
     style::Modifier,
     text::{Line, Span},
@@ -93,7 +89,7 @@ pub(super) fn sources_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Ro
     }
     let found = parse(&t.output)?;
     let theme = ctx.theme;
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let border = theme.fg(Tok::SectionConnect);
     let mut card = frame::Frame::new(
         vec![
@@ -141,7 +137,7 @@ pub(super) fn sources_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Ro
         )));
     }
     card.sections.push((None, body));
-    let mut facts = vec![super::plural(found.results.len(), "result")];
+    let mut facts = vec![text::counted(found.results.len(), "result")];
     if let Some(via) = &found.via {
         facts.push(format!("via {via}"));
     }

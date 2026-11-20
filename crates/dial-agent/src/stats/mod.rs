@@ -18,9 +18,10 @@ pub mod server;
 pub mod turns;
 pub mod user_metrics;
 
+pub use crate::storage::retention::now_ms;
 pub use turns::{FeedbackRecord, TurnRecord, TurnTotals};
 
-use crate::platform;
+use crate::platform::time::calendar::{civil_from_days, days_from_civil};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -30,7 +31,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 const HOUR_MS: i64 = 3_600_000;
@@ -389,11 +390,6 @@ CREATE TABLE IF NOT EXISTS turn_feedback(id INTEGER PRIMARY KEY, ts INTEGER NOT 
   project TEXT NOT NULL, kind TEXT NOT NULL, turns INTEGER NOT NULL);
 ";
 
-fn private_dir(dir: &Path) -> Result<()> {
-    platform::fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), dir)
-        .with_context(|| format!("creating private directory {}", dir.display()))
-}
-
 /// Columns added after the first release; NULL (or the default) on rows recorded before them.
 const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
     ("requests", "transport", "TEXT"),
@@ -442,13 +438,7 @@ fn sql_u64(value: u64) -> i64 {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            private_dir(parent)?;
-        }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        platform::fs::set_owner_only(path)
-            .with_context(|| format!("restricting {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let conn = crate::storage::sqlite::open_private_path(path, Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)
             .context("creating the stats schema")?;
         migrate(&conn).context("migrating the stats schema")?;
@@ -457,6 +447,13 @@ impl Db {
 
     pub fn open_default(user_dir: &Path) -> Result<Self> {
         Self::open(&db_path(user_dir))
+    }
+
+    /// Open the ledger and bring its transcript index up to date for an interactive report.
+    fn open_synced(user_dir: &Path) -> Result<Self> {
+        let mut db = Self::open_default(user_dir)?;
+        db.sync_sessions(user_dir)?;
+        Ok(db)
     }
 
     /// Opens an existing database read-only: it is never created, migrated or synced.
@@ -1289,16 +1286,6 @@ fn summarize_record(summary: &mut TranscriptSummary, value: &Value) {
     }
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 /// `YYYY-MM-DDTHH:MM:SS[.fff]Z` (the format Dial writes) -> Unix milliseconds.
 pub fn parse_iso_ms(text: &str) -> Option<i64> {
     let text = text.strip_suffix('Z')?;
@@ -1317,28 +1304,15 @@ pub fn parse_iso_ms(text: &str) -> Option<i64> {
         let digits: String = frac.chars().take(3).collect();
         digits.parse::<i64>().ok()? * 10_i64.pow(3 - digits.len() as u32)
     };
-    Some(days_from_civil(y, m, d) * DAY_MS + (h * 3600 + min * 60 + s) * 1000 + millis)
+    let clock = (h * 3600 + min * 60 + s) * 1000 + millis;
+    days_from_civil(y, m, d)?
+        .checked_mul(DAY_MS)?
+        .checked_add(clock)
 }
 
 /// Unix milliseconds -> `YYYY-MM-DD` (UTC).
 pub fn civil_day(ms: i64) -> String {
-    let z = ms.div_euclid(DAY_MS) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    civil_from_days(ms.div_euclid(DAY_MS)).to_string()
 }
 
 /// `24h`, `7d`, `30d`, `2w`, `all` -> a lookback window in milliseconds (None = all time).
@@ -1364,6 +1338,30 @@ pub fn parse_range(text: &str) -> Result<Option<i64>> {
         bail!("range {text:?} must be positive");
     }
     Ok(Some(count.saturating_mul(unit_ms)))
+}
+
+/// A relative report range, never an absolute database timestamp.
+#[derive(Clone, Copy)]
+pub struct ReportRange(Option<i64>);
+
+impl ReportRange {
+    pub fn parse(text: &str) -> Result<Self> {
+        parse_range(text).map(Self)
+    }
+
+    fn since(self, now: i64) -> Option<i64> {
+        self.0.map(|window| now.saturating_sub(window))
+    }
+
+    /// Synchronize recorded sessions and query the same cutoff on every frontend.
+    pub fn report(self, user_dir: &Path) -> Result<Report> {
+        let db = Db::open_synced(user_dir)?;
+        self.report_at(&db, now_ms())
+    }
+
+    fn report_at(self, db: &Db, now: i64) -> Result<Report> {
+        db.report(self.since(now), now)
+    }
 }
 
 // ---------------------------------------------------------------- text output
@@ -1588,11 +1586,7 @@ pub fn cli(
     if serve {
         return server::serve(user_dir.to_path_buf(), port.unwrap_or(config.port));
     }
-    let mut db = Db::open_default(user_dir)?;
-    db.sync_sessions(user_dir)?;
-    let now = now_ms();
-    let since = parse_range(range.unwrap_or("all"))?.map(|window| now - window);
-    let report = db.report(since, now)?;
+    let report = ReportRange::parse(range.unwrap_or("all"))?.report(user_dir)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

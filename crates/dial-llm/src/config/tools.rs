@@ -24,6 +24,13 @@ pub struct EditToggle {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditAutoRepair {
+    pub enabled: bool,
+    pub coach: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EditSettings {
@@ -36,7 +43,7 @@ pub struct EditSettings {
     pub block_auto_generated: bool,
     pub enforce_seen_lines: bool,
     pub blackbox: EditToggle,
-    pub auto_repair: EditToggle,
+    pub auto_repair: EditAutoRepair,
 }
 
 impl Default for EditSettings {
@@ -51,7 +58,7 @@ impl Default for EditSettings {
             block_auto_generated: true,
             enforce_seen_lines: true,
             blackbox: EditToggle::default(),
-            auto_repair: EditToggle::default(),
+            auto_repair: EditAutoRepair::default(),
         }
     }
 }

@@ -2,10 +2,6 @@
 use super::super::DrawCtx;
 use super::format::{input_hint, value_text};
 use super::memory::memory_summary;
-use super::widgets::{
-    editor_spans, filled, fit, highlighted, hint, hint_line, local_function_label, match_style,
-    pair_label, scope_name, scroll_cell, spans_width, tab_strip,
-};
 use super::{
     ChoiceAction, EMBEDDING_MODEL_PATH, Item, LINK_SECTION, LINKS, MAX_PICK_ROWS, Mode, PICK_ROWS,
     PROVIDERS_TAB, Row, SettingsOverlay, haystack, pick_matches, search_match,
@@ -13,6 +9,10 @@ use super::{
 use crate::config::schema::{Kind, Source};
 use crate::ui::chrome::{self, Status, status_chip};
 use crate::ui::keys::{Action, Keymap};
+use crate::ui::overlay::widgets::{
+    editor_spans, filled, fit, hint, local_function_label, match_style, pair_label, scope_name,
+    scroll_cell, tab_strip,
+};
 use crate::ui::text;
 use crate::ui::theme::{Sym, Theme, Tok};
 use ratatui::{
@@ -58,16 +58,13 @@ impl SettingsOverlay {
                 lines.resize(h.saturating_sub(1), Line::default());
                 if h > 0 {
                     lines.push(if self.setup_usable {
-                        super::super::providers::key_footer(
-                            ctx.theme,
-                            &[
-                                (ctx.keys.label(Action::SelectConfirm), "install".into()),
-                                ("Ctrl+L".into(), "install".into()),
-                                ("↑/↓".into(), "scroll".into()),
-                                (ctx.keys.label(Action::SelectCancel), "cancel".into()),
-                            ],
-                            w,
-                        )
+                        let segments = [
+                            hint(ctx.keys, Action::SelectConfirm, "install"),
+                            "Ctrl+L install".into(),
+                            "↑/↓ scroll".into(),
+                            hint(ctx.keys, Action::SelectCancel, "cancel"),
+                        ];
+                        super::super::widgets::hint_line(ctx.theme, &segments, w)
                     } else {
                         Line::from("Enlarge to confirm; Esc cancels")
                     });
@@ -136,23 +133,18 @@ impl SettingsOverlay {
             // The title already names where saves go and the Ctrl+B switch, so this row explains
             // what the tab numbers are and how to list just those overrides.
             let saved: usize = self.tab_counts().iter().map(|(_, count)| count).sum();
-            let legend = if saved == 0 {
-                " Nothing saved in this scope yet; tab numbers count saved overrides".to_owned()
+            let action = if self.changed_only {
+                "all settings"
             } else {
-                format!(" {saved} saved in this scope · tab numbers count them")
+                "saved only"
             };
+            let mut legend = format!(" Ctrl+O {action} · {saved} saved");
+            let explanation = " in this scope; tab numbers count overrides";
+            if text::width(&legend) + text::width(explanation) <= w {
+                legend.push_str(explanation);
+            }
             lines.push(Line::from(fit(
-                vec![Span::styled(
-                    format!(
-                        "{legend} · Ctrl+O {}",
-                        if self.changed_only {
-                            "all settings"
-                        } else {
-                            "only those"
-                        }
-                    ),
-                    theme.fg(Tok::Accent),
-                )],
+                vec![Span::styled(legend, theme.fg(Tok::Accent))],
                 w,
             )));
         }
@@ -459,7 +451,8 @@ impl SettingsOverlay {
                         format!("{shown} of {total}")
                     };
                     let mut spans = vec![Span::styled("      Filter: ", theme.fg(Tok::Muted))];
-                    let room = list_w.saturating_sub(spans_width(&spans) + text::width(&count) + 3);
+                    let used = text::spans_width(&spans);
+                    let room = list_w.saturating_sub(used + text::width(&count) + 3);
                     spans.extend(editor_spans(theme, editor, room, false));
                     spans.push(Span::styled(format!("   {count}"), theme.fg(Tok::Muted)));
                     filled(spans, list_w, Style::default())
@@ -469,7 +462,8 @@ impl SettingsOverlay {
                         format!("      {prompt}: "),
                         theme.fg(Tok::Muted),
                     )];
-                    let room = list_w.saturating_sub(spans_width(&spans) + 1);
+                    let used = text::spans_width(&spans);
+                    let room = list_w.saturating_sub(used + 1);
                     spans.extend(editor_spans(theme, editor, room, false));
                     filled(spans, list_w, Style::default())
                 }
@@ -592,9 +586,11 @@ impl SettingsOverlay {
             }
         }
         if show_footer {
-            let hints =
-                super::super::panel_keys::capped_footer(self.full_footer(ctx.keys), "F1 keys");
-            lines.push(hint_line(theme, &hints, w));
+            lines.push(super::super::panel_keys::sheet_footer(
+                theme,
+                self.full_footer(ctx.keys),
+                w,
+            ));
         }
         lines
     }
@@ -602,6 +598,9 @@ impl SettingsOverlay {
     /// Every hint for the current mode, the Appearance preview key included; the footer shows a
     /// capped selection and the F1 key sheet lists them all.
     pub(super) fn full_footer(&self, keys: &Keymap) -> Vec<String> {
+        if self.appearance_preview && self.appearance_selected() {
+            return self.preview_footer(keys);
+        }
         let mut hints = self.footer(keys);
         if self.appearance_selected() {
             let preview = local_function_label(keys, 4, Action::ProviderSetup);
@@ -656,21 +655,14 @@ impl SettingsOverlay {
     /// The search field reads as an input: a muted label, then the query with its caret, or a
     /// placeholder. It carries no selection marker; only the selected row does.
     pub(super) fn search_line(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let label = Span::styled(" Search: ", theme.fg(Tok::Muted));
-        let spans = if self.search.is_empty() {
-            vec![
-                label,
-                Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
-                Span::styled("type a setting name, path or keyword", theme.fg(Tok::Dim)),
-            ]
-        } else {
-            vec![
-                label,
-                Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
-                Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
-            ]
-        };
-        Line::from(fit(spans, w))
+        let query = text::one_line(&self.search);
+        Line::from(super::super::widgets::search_field(
+            theme,
+            &query,
+            query.len(),
+            "type a setting name, path or keyword",
+            w,
+        ))
     }
 
     pub(super) fn row_line(
@@ -786,7 +778,7 @@ impl SettingsOverlay {
         let mut label_spans = if positions.is_empty() {
             vec![Span::styled(shown.clone(), label_style)]
         } else {
-            highlighted(&shown, positions, label_style, hl)
+            chrome::highlighted(&shown, positions, label_style, hl)
         };
         spans.append(&mut label_spans);
         spans.push(Span::styled(
@@ -795,7 +787,7 @@ impl SettingsOverlay {
         ));
 
         let room = w.saturating_sub(2 + label_w);
-        let value_w = spans_width(&value_spans);
+        let value_w = text::spans_width(&value_spans);
         // In search mode the category replaces the tags: a muted tag at the right edge tells
         // where a hit lives without competing with its value.
         let mut tag_spans: Vec<Span<'static>> = Vec::new();
@@ -933,7 +925,7 @@ impl SettingsOverlay {
             ],
             Mode::List { editor, .. } => {
                 let mut hints = vec![
-                    hint(keys, Action::SelectConfirm, "save"),
+                    hint(keys, Action::SelectConfirm, "add/save"),
                     "Space check".to_owned(),
                 ];
                 if editor.ordered() {

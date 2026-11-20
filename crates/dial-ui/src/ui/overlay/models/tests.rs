@@ -1044,11 +1044,28 @@ fn left_column_shows_roles_all_models_and_providers_with_counts_and_state_glyphs
         line("LM Studio")
     );
     assert!(
-        line("OpenAI").contains('⚠'),
-        "auth-required warns: {}",
+        line("OpenAI").contains('○'),
+        "a provider not set up uses the same neutral mark as Providers: {}",
         line("OpenAI")
     );
     assert!(!shown.contains("llama.cpp"), "empty providers are hidden");
+}
+
+#[test]
+fn distinct_routes_for_one_provider_share_one_models_group() {
+    let mut o = overlay();
+    let mut d = discovery();
+    let mut second = provider("ollama", "Alternate route", "reachable", 1);
+    second.base_url = Some("http://localhost:11435/v1".into());
+    let mut model = entry("ollama", "other-model", "Alternate route", true, None);
+    model.selection.base_url = second.base_url.clone();
+    d.providers.push(second);
+    d.models.push(model);
+    o.set_discovery(d);
+    o.group = Group::Provider("ollama".into());
+    assert_eq!(o.groups().iter().filter(|g| **g == o.group).count(), 1);
+    assert_eq!(names(&o), ["llama3", "other-model"]);
+    assert!(!draw(&mut o, &Rig::new(), 120, 30).contains("Alternate route"));
 }
 
 #[test]
@@ -2352,6 +2369,24 @@ fn chatgpt_plan_models_are_image_role_candidates_unless_disabled() {
 }
 
 #[test]
+fn compact_roles_prioritize_assignments_and_keep_the_full_effect_in_details() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.show_roles();
+    let shown = draw(&mut o, &rig, 60, 20);
+    let row = shown
+        .lines()
+        .find(|line| line.contains("Conversation") && line.contains("ollama/llama3"));
+    assert!(
+        row.is_some() && shown.contains("Assign: session + user default"),
+        "{shown}"
+    );
+    assert!(shown.contains("details") && !shown.contains("Enter picks the model"));
+    send(&mut o, &rig, shifted_function(12));
+    assert!(draw(&mut o, &rig, 60, 20).contains("clears this project's overrides"));
+}
+
+#[test]
 fn selected_tuning_carries_identity_without_reassigning_conversation() {
     let rig = Rig::new();
     let mut o = overlay();
@@ -2831,6 +2866,20 @@ fn detail_focus_has_a_terminal_safe_key_and_never_navigates_or_assigns_models() 
             o.search.is_empty(),
             "detail focus must not accept list input"
         );
+        // Rebinding paging frees the original key and leaves navigation inside the detail pane.
+        rig.keys
+            .rebind(Action::SelectPageDown, &["Ctrl+G"])
+            .unwrap();
+        let scroll = o.detail_scroll;
+        send(&mut o, &rig, key(KeyCode::PageDown));
+        assert_eq!(o.detail_scroll, scroll);
+        send(&mut o, &rig, ctrl('g'));
+        assert_eq!(o.detail_scroll, scroll + o.detail_page);
+        assert!(
+            o.footer(&rig.keys)
+                .iter()
+                .any(|hint| hint.contains("Ctrl+G"))
+        );
         for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
             assert!(matches!(send(&mut o, &rig, key(code)), OverlayEvent::None));
             assert_eq!(o.cursor, 0, "detail navigation must retain the model");
@@ -3024,11 +3073,11 @@ fn picking_a_model_with_thinking_levels_asks_for_the_level_first() {
     let mut o = ModelOverlay::new(Some(discovery()), roles_with_main(), Scope::Global);
     o.show_roles();
     let haiku = ModelSelection::new("anthropic", "claude-haiku-5-5");
-    let levels = ModelOverlay::thinking_levels("task", &haiku);
+    let levels = ModelOverlay::thinking_levels("task", &haiku, None);
     assert_eq!(levels.first(), Some(&"default"));
     assert!(levels.len() > 1 && !levels.contains(&"auto"), "{levels:?}");
     assert!(matches!(
-        o.assign_with_thinking("task".into(), haiku, "Claude Haiku".into()),
+        o.assign_with_thinking("task".into(), haiku, "Claude Haiku".into(), None),
         OverlayEvent::None
     ));
     let shown = draw(&mut o, &rig, 130, 30);
@@ -3050,6 +3099,7 @@ fn picking_a_model_with_thinking_levels_asks_for_the_level_first() {
         "main".into(),
         ModelSelection::new("anthropic", "claude-haiku-5-5"),
         "Claude Haiku".into(),
+        None,
     );
     assert!(o.thinking.as_ref().unwrap().levels.contains(&"auto"));
     assert!(matches!(
@@ -3060,9 +3110,104 @@ fn picking_a_model_with_thinking_levels_asks_for_the_level_first() {
     // A model without documented levels is assigned straight away.
     let llama = discovery().models[0].selection.clone();
     assert!(matches!(
-        o.assign_with_thinking("task".into(), llama, "llama3".into()),
+        o.assign_with_thinking("task".into(), llama, "llama3".into(), None),
         OverlayEvent::AssignModel { selection, .. } if selection.thinking.is_none()
     ));
+}
+
+#[test]
+fn a_model_group_lists_its_family_and_offers_only_its_listed_efforts() {
+    let rig = Rig::new();
+    // A discovered Antigravity group: family label, representative wire id, and the efforts its
+    // listing declares (medium and high, bits 2 and 4; low is not one of its variants).
+    let declared: DeclaredReasoning =
+        serde_json::from_value(serde_json::json!({"mode": "model-variant", "efforts": 0b110}))
+            .unwrap();
+    let mut group = entry(
+        "google-antigravity",
+        "gemini-4-neon-medium",
+        "Google Antigravity account model list",
+        true,
+        None,
+    );
+    group.label = "gemini-4-neon".into();
+    group.metadata.declared_reasoning = Some(declared);
+    let selection = group.selection.clone();
+    let discovery = Discovery {
+        models: vec![group],
+        providers: Vec::new(),
+    };
+    assert_eq!(
+        ModelOverlay::thinking_levels("task", &selection, Some(declared)),
+        ["default", "medium", "high"]
+    );
+    assert_eq!(
+        ModelOverlay::thinking_levels("main", &selection, Some(declared)),
+        ["default", "medium", "high", "auto"]
+    );
+    assert!(ModelOverlay::thinking_levels("task", &selection, None).is_empty());
+    // The bundled row documents more levels than this group's listing reports: the listing wins.
+    let haiku = ModelSelection::new("anthropic", "claude-haiku-5-5");
+    let medium_only: DeclaredReasoning =
+        serde_json::from_value(serde_json::json!({"mode": "model-variant", "efforts": 0b10}))
+            .unwrap();
+    assert!(
+        crate::llm::catalog::documented_thinking_levels("anthropic", "claude-haiku-5-5", true)
+            .len()
+            > 1
+    );
+    assert_eq!(
+        ModelOverlay::thinking_levels("task", &haiku, Some(medium_only)),
+        ["default", "medium"]
+    );
+
+    let mut o = ModelOverlay::new(Some(discovery), roles_with_main(), Scope::Global);
+    let shown = draw(&mut o, &rig, 130, 30);
+    // The family row, not the representative id, is what the list shows: no `-medium`/`-high`
+    // suffix anywhere on the row, while the family label does appear.
+    let family_row = |screen: &str| {
+        screen
+            .lines()
+            .find(|line| line.contains("gemini-4-neon"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let row = family_row(&shown);
+    assert!(row.contains("google-antigravity/gemini-4-neon"), "{shown}");
+    assert!(!row.contains("gemini-4-neon-"), "{row}");
+    o.search = "neon".into();
+    let searched = draw(&mut o, &rig, 130, 30);
+    let row = family_row(&searched);
+    assert!(
+        row.contains("gemini-4-neon") && !row.contains("gemini-4-neon-"),
+        "{searched}"
+    );
+
+    // Picking the group asks only for its listed efforts before assigning.
+    o.show_roles();
+    assert!(matches!(
+        o.assign_with_thinking(
+            "task".into(),
+            selection,
+            "gemini-4-neon".into(),
+            Some(declared)
+        ),
+        OverlayEvent::None
+    ));
+    let pick = o.thinking.as_ref().unwrap();
+    assert_eq!(pick.levels, ["default", "medium", "high"]);
+    send(&mut o, &rig, key(KeyCode::Down));
+    send(&mut o, &rig, key(KeyCode::Down));
+    match send(&mut o, &rig, key(KeyCode::Enter)) {
+        OverlayEvent::AssignModel {
+            role, selection, ..
+        } => {
+            assert_eq!(role, "task");
+            assert_eq!(selection.model, "gemini-4-neon-medium");
+            assert_eq!(selection.thinking.as_deref(), Some("high"));
+        }
+        other => panic!("expected an assignment, got {other:?}"),
+    }
 }
 
 #[test]

@@ -16,12 +16,12 @@
 //! later text arrives (for example a list that turns loose after a spill) is guarded by comparing the
 //! spilled rows with the block's current rendering before spilling, but a change *after* the spill
 //! cannot be undone, so the remainder is taken by row count and may repeat or skip a row.
+use super::status::{rate_label, shown_rate};
 use super::{
     Rows,
     chrome::StateMark,
-    markdown,
-    markdown::truncate_spans,
-    text,
+    markdown, text,
+    text::truncate_spans,
     theme::{Sym, Theme, Tok},
     tool_cards::{
         AgentRow, Tool, ToolOutcome, ToolState, frame::WORK_MAX_W, lookup_group, lookup_tree,
@@ -29,6 +29,7 @@ use super::{
     },
 };
 use crate::llm::model_config::UiConfig;
+use crate::runtime::Phase;
 use ratatui::{
     style::Modifier,
     text::{Line, Span},
@@ -796,7 +797,7 @@ pub(super) fn ellipsis(theme: &Theme) -> String {
 }
 
 pub(super) fn fitted(spans: Vec<Span<'static>>, w: usize, theme: &Theme) -> Line<'static> {
-    Line::from(truncate_spans(spans, w, &ellipsis(theme)))
+    Line::from(truncate_spans(spans, w, theme.sym(Sym::Ellipsis)))
 }
 
 /// The assistant's answer: markdown laid out past the icon gutter, its first row marked with `●`.
@@ -904,7 +905,7 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx, toggle: Option<&str>) -
     let style = ctx.theme.fg(Tok::ThinkingText);
     if !ctx.ui.show_thinking {
         let n = body.lines().filter(|l| !l.trim().is_empty()).count();
-        let lines = format!("{n} line{}", if n == 1 { "" } else { "s" });
+        let lines = text::counted(n, "line");
         let hint = match toggle {
             Some(key) => format!("{lines} ({key} shows)"),
             None => format!("{lines} hidden"),
@@ -1013,7 +1014,12 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
 /// Open tasks are a problem only when the turn stopped short; after a delivered answer they are
 /// later work, so they stay quiet rather than amber.
 fn open_tasks_tok(status: &str) -> Tok {
-    if matches!(status, "blocked" | "needs_input" | "incomplete" | "failed") {
+    if crate::runtime::Phase::parse(status).is_some_and(|phase| {
+        matches!(
+            phase,
+            Phase::Blocked | Phase::NeedsInput | Phase::Incomplete | Phase::Failed
+        )
+    }) {
         Tok::Warning
     } else {
         Tok::Muted
@@ -1023,29 +1029,15 @@ fn open_tasks_tok(status: &str) -> Tok {
 /// How a turn's reported `status` reads: its color, mark and word. An outcome the agent did not
 /// name is reported as unknown, never as a failure or success; a delivered answer is neutral.
 fn outcome_mark(status: &str, theme: &Theme) -> (Tok, String, &'static str) {
-    let known = matches!(
-        status,
-        "running"
-            | "pending"
-            | "done"
-            | "completed"
-            | "answered"
-            | "blocked"
-            | "needs_input"
-            | "incomplete"
-            | "failed"
-            | "interrupted"
-            | "cancelled"
-            | "canceled"
-    );
-    let phase = crate::runtime::Phase::from_status(status);
+    let Some(phase) = Phase::parse(status) else {
+        return (Tok::Warning, theme.sym(Sym::Warn).to_owned(), "unknown");
+    };
     // The same state table as tool and worker rows.
     let mark = match status {
         "cancelled" | "canceled" => Some(StateMark::Cancelled),
         _ => state_mark(phase, None),
     };
     let (tok, glyph, word) = match mark {
-        _ if !known => (Tok::Warning, theme.sym(Sym::Warn), "unknown"),
         // A delivered answer is not acceptance that the work is complete: neutral, like a
         // settled tool row, never the success check.
         Some(StateMark::Answered) => (Tok::Muted, theme.sym(Sym::Dot), "answered"),
@@ -1064,7 +1056,7 @@ fn stats_rows(s: &TurnStats, recap: &recap::Recap, w: u16, ctx: &TranscriptCtx) 
     }
     let theme = ctx.theme;
     let w = w as usize;
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let gutter = |mark: &str, style: ratatui::style::Style| Span::styled(in_gutter(mark), style);
     let mut left: Vec<Span<'static>> = vec![gutter(theme.sym(Sym::Dot), theme.fg(Tok::Dim))];
     let push = |left: &mut Vec<Span<'static>>, text: String, style| {
@@ -1087,21 +1079,14 @@ fn stats_rows(s: &TurnStats, recap: &recap::Recap, w: u16, ctx: &TranscriptCtx) 
         if changed > 0 {
             push(
                 &mut left,
-                format!(
-                    "{changed} file{} changed",
-                    if changed == 1 { "" } else { "s" }
-                ),
+                format!("{} changed", text::counted(changed, "file")),
                 theme.fg(Tok::Text),
             );
         }
         if o.open_tasks > 0 {
             push(
                 &mut left,
-                format!(
-                    "{} open task{}",
-                    o.open_tasks,
-                    if o.open_tasks == 1 { "" } else { "s" }
-                ),
+                text::counted(o.open_tasks, "open task"),
                 theme.fg(open_tasks_tok(&o.status)),
             );
         }
@@ -1126,8 +1111,8 @@ fn stats_rows(s: &TurnStats, recap: &recap::Recap, w: u16, ctx: &TranscriptCtx) 
                 theme.fg(Tok::Muted),
             );
         }
-        if let Some(rate) = s.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
-            push(&mut left, format!("{rate:.1} tok/s"), theme.fg(Tok::Muted));
+        if let Some(rate) = shown_rate(s.tokens_per_second) {
+            push(&mut left, rate_label(rate, ""), theme.fg(Tok::Muted));
         }
     }
     let right: Vec<Span<'static>> = if changed > 0 {
@@ -1139,8 +1124,8 @@ fn stats_rows(s: &TurnStats, recap: &recap::Recap, w: u16, ctx: &TranscriptCtx) 
     } else {
         Vec::new()
     };
-    let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
-    let right_w: usize = right.iter().map(|s| text::width(&s.content)).sum();
+    let left_w: usize = text::spans_width(&left);
+    let right_w: usize = text::spans_width(&right);
     if right_w > 0 && left_w + right_w + 4 <= w {
         left.push(Span::raw(" ".repeat(w - left_w - right_w - 1)));
         left.extend(right);

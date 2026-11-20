@@ -2,6 +2,8 @@
 
 Benchmark suites, efficiency measurement, workflow regression checks, configuration comparisons and assistance ablation.
 
+For the proposed sequence of repair, advice and cache experiments and their rollout criteria, see the [coding harness roadmap](harness-roadmap.md).
+
 ## Interactive comparisons: `/benchmark`
 
 In a Dial session, run `/benchmark` (or `/benchmark open`) to open the **local browser workspace**.
@@ -862,6 +864,8 @@ shared across the matrix and are subject to benchmark isolation. Each variant ch
 from `dial`:
 
 - `ablate-compact_tools` disables the stable tool core; `enable-repair_hints` enables repair hints;
+- `ablate-bash_hints` disables the bash interceptor in `hint` mode only. A `block` policy is unchanged;
+  check `settings.assistance.bash_interceptor_mode` and `bash_interceptor_enabled` before interpreting a row.
 - `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate`,
   `ablate-lean_local` and `ablate-local_profile` turn off or change features that ship on.
   `ablate-local_profile` sets `assistance.local.enabled = false`; see the local profile in `agent-loop.md`.

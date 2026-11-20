@@ -1,0 +1,13 @@
+[package]
+name = "dial-client-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately independent: no workspace feature unification or engine dependencies.
+[workspace]
+
+[dependencies]
+dial-client = { path = "../../crates/dial-client" }
+serde_json = "1"
+tempfile = "3"

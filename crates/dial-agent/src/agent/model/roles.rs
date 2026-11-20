@@ -238,9 +238,10 @@ impl<'a> Agent<'a> {
                 main.output_budget(self.version.harness.max_tokens),
             )
         };
-        let mut chat = crate::agent::run::edit_runtime::repair_request(request, 1);
+        let mut repair = crate::agent::run::edit_runtime::repair_request(request, 1)
+            .map_err(anyhow::Error::msg)?;
         let estimate = crate::agent::compact::compaction::request_tokens_with_policy(
-            &chat,
+            &repair.chat,
             &role_config.compaction,
             crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
@@ -250,17 +251,17 @@ impl<'a> Agent<'a> {
         );
         ensure!(
             estimate < u64::from(window),
-            "complete source repair exceeds the coach model window; no partial repair was requested"
+            "edit repair span exceeds the coach model window; no repair was requested"
         );
-        chat.max_tokens = output_budget
+        repair.chat.max_tokens = output_budget
             .min(u32::try_from(u64::from(window) - estimate).unwrap_or(u32::MAX))
             .max(1);
-        let text = self.role_chat(main, "coach", llm::usage::Purpose::Repair, &chat, ui)?;
+        let text = self.role_chat(main, "coach", llm::usage::Purpose::Repair, &repair.chat, ui)?;
         ensure!(
             !self.interrupt.load(Ordering::SeqCst),
             "edit repair cancelled"
         );
-        crate::agent::run::edit_runtime::repair_response(&text).map_err(anyhow::Error::msg)
+        repair.complete(&text).map_err(anyhow::Error::msg)
     }
     /// Stats/OTLP row for an auxiliary model call (role, maintenance, summary, memory), emitted
     /// exactly as the main turn path does so the same session is not undercounted.

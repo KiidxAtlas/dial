@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::command_registry::{
     BUILTIN_COMMANDS, COMMANDS, DuringTurn, Surface, canonical_command, command_entries,
-    command_panel, command_spec, during_turn, during_turn_note, turn_help,
+    command_panel, command_spec, during_turn, during_turn_note, resolve_invocation, turn_help,
 };
 use crate::app::core::App;
 use crate::app::overlay::auth::{AuthJob, PreparedModel};
@@ -376,8 +376,9 @@ fn one_table_preserves_the_legacy_command_contract() {
     ];
     // Extensions gains tab arguments; /hooks becomes a hidden shortcut to its tab.
     const EXTENSIONS_STATS_MENU_CHANGES: &[&str] = &["extensions", "hooks"];
-    // Approved next-UX changes have exact replacement contracts below.
-    const UX_MENU_CHANGES: &[&str] = &["model", "search", "context", "modelpreset"];
+    // Approved next-UX changes have exact replacement contracts below. `autoresearch` gained
+    // `auto` (0.3.13, the self-driving loop).
+    const UX_MENU_CHANGES: &[&str] = &["model", "search", "context", "modelpreset", "autoresearch"];
     // The worker vocabulary rewords these descriptions; asserted exactly below.
     const WORKER_WORDING_CHANGES: &[&str] = &["message", "cancel", "cleanse"];
     // Descriptions that hid what the command does are reworded; asserted exactly below.
@@ -485,6 +486,18 @@ fn one_table_preserves_the_legacy_command_contract() {
         preset.description,
         "manage model presets (roles + thinking): list, new, update, rename, delete, apply"
     );
+    let autoresearch = command_entries(&[], &[])
+        .into_iter()
+        .find(|entry| entry.name == "autoresearch")
+        .unwrap();
+    assert_eq!(
+        autoresearch.args_hint.as_deref(),
+        Some("[status|init|run|auto|log|notes|resume|exit]")
+    );
+    assert_eq!(
+        autoresearch.description,
+        "manage branch-scoped benchmark experiments"
+    );
     let rpc = json!(super::command_registry::builtin_commands());
     let unchanged_rpc = |rows: &Value| {
         rows.as_array()
@@ -506,7 +519,8 @@ fn one_table_preserves_the_legacy_command_contract() {
     assert_eq!(unchanged_rpc(&rpc), unchanged_rpc(&baseline["rpc"]));
     assert_eq!(json!(turn_help(true)), baseline["stop"]);
     // Hidden compatibility spellings stay executable, but their top-level help rows are hidden.
-    let expected_now: Vec<_> = baseline["now"]
+    // `/collab answer` (0.3.13) is a new live form, appended after the frozen `/collab abort`.
+    let mut expected_now: Vec<_> = baseline["now"]
         .as_array()
         .unwrap()
         .iter()
@@ -516,6 +530,11 @@ fn one_table_preserves_the_legacy_command_contract() {
         })
         .cloned()
         .collect();
+    let abort = expected_now
+        .iter()
+        .position(|name| name == "collab abort")
+        .unwrap();
+    expected_now.insert(abort + 1, json!("collab answer"));
     assert_eq!(json!(turn_help(false)), json!(expected_now));
     let args = baseline["args"].as_array().unwrap();
     for row in baseline["policies"].as_array().unwrap() {
@@ -710,6 +729,30 @@ fn next_ux_commands_have_explicit_replacement_contracts_and_safe_busy_routes() {
     assert_eq!(during_turn("search", "back"), DuringTurn::Stop);
     assert_eq!(during_turn("search", "results"), DuringTurn::Now);
     assert_eq!(during_turn("attachments", ""), DuringTurn::Now);
+}
+
+#[test]
+fn alias_and_compatibility_spellings_resolve_once_for_idle_and_busy_routes() {
+    let cases = [
+        ("?", "", ("help", "")),
+        ("resume", "", ("sessions", "")),
+        ("accounts", "pin", ("session", "pin")),
+        ("accounts", "pin acct-1", ("session", "pin acct-1")),
+        ("help", "commands", ("commands", "")),
+        ("review", "files turn src", ("review-file", "turn src")),
+        ("sessions", "fork", ("fork", "")),
+    ];
+    for (name, args, expected) in cases {
+        assert_eq!(resolve_invocation(name, args), expected, "/{name} {args}");
+        // Busy routing classifies the resolved command, so both routes must agree on it.
+        assert_eq!(
+            during_turn(name, args),
+            during_turn(expected.0, expected.1),
+            "/{name} {args}"
+        );
+        // Resolving again changes nothing: the busy route re-resolves inside `during_turn`.
+        assert_eq!(resolve_invocation(expected.0, expected.1), expected);
+    }
 }
 
 #[test]

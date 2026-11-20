@@ -671,22 +671,14 @@ fn child_provider_request(
     request: &Chat,
     observer: &std::cell::RefCell<&mut (dyn Approver + '_)>,
 ) -> Result<Option<Chat>> {
-    let projected = crate::agent::run::dispatch::projected_request(
+    crate::agent::run::dispatch::prepare_provider_request(
         request,
-        crate::tools::surface::contracts::project_history(
-            &request.messages,
-            &request.tools,
-            env.ext,
-        )?,
-    );
-    let rewritten = crate::agent::safety::hooks::provider_request(
+        env.ext,
         &env.config.hooks,
         env.workspace.root(),
-        projected.as_ref().unwrap_or(request),
         env.interrupt,
         &mut |notice| observer.borrow_mut().notice(notice),
-    )?;
-    Ok(rewritten.or(projected))
+    )
 }
 
 /// Inputs of one side inference request made through `child_role_chat`.

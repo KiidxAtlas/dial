@@ -400,13 +400,7 @@ pub fn save(root: &Path, state: &State) -> Result<()> {
     fs::create_dir_all(&dir)?;
     let mut bytes = serde_json::to_vec_pretty(state)?;
     bytes.push(b'\n');
-    write_atomic(&dir.join(STATE_FILE), &bytes)
-}
-
-/// Writes via a synced, uniquely named temp file and rename, so a crash never leaves a truncated
-/// or torn state file and concurrent writers never share a temp path.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::config::settings_store::write_private(path, bytes)
+    crate::config::settings_store::write_private(&dir.join(STATE_FILE), &bytes)
 }
 
 // ---------- setup: init, plan, split ----------
@@ -1400,7 +1394,10 @@ fn save_snapshot(root: &Path, state: &State, variant: &str) -> Result<()> {
     let dir = flow_dir(root, &state.flow)?.join(variant);
     fs::create_dir_all(&dir)?;
     let snapshot = snapshot_paths(root, &state.change_paths)?;
-    write_atomic(&dir.join(BEFORE_FILE), &serde_json::to_vec(&snapshot)?)
+    crate::config::settings_store::write_private(
+        &dir.join(BEFORE_FILE),
+        &serde_json::to_vec(&snapshot)?,
+    )
 }
 
 /// Removes a variant's previous outputs so a new candidate is never scored on stale rows.

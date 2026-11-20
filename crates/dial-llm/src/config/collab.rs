@@ -10,4 +10,6 @@ pub struct Config {
     pub relay_url: String,
     pub web_url: String,
     pub allow_guest_steering: bool,
+    /// Offer the host's question prompts (never tool approvals) to writable guests to answer.
+    pub allow_guest_answers: bool,
 }

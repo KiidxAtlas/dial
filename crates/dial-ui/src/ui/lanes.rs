@@ -194,7 +194,7 @@ fn review_card(severity: &str, note: &str, w: usize, ctx: &TranscriptCtx) -> Row
     let theme = ctx.theme;
     let blocker = severity == "blocker";
     let tone = if blocker { Tok::Warning } else { Tok::Muted };
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let mut card = Frame::new(
         vec![
             Span::styled(icon(EventKind::Coach, theme), theme.fg(tone)),
@@ -295,7 +295,7 @@ fn check_problem(text: &str) -> Option<(String, String)> {
 /// give an answer (timed out, unavailable, cancelled).
 fn check_line(name: &str, status: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
-    let failed = status.contains("failed");
+    let failed = super::tool_cards::is_failure_word(status);
     let (glyph, tok) = if failed {
         (theme.sym(Sym::Cross2), Tok::Error)
     } else {
@@ -307,7 +307,7 @@ fn check_line(name: &str, status: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
         theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
-        format!(" {} {status}", theme.sym(Sym::Dot)),
+        format!("{}{status}", theme.dot_sep()),
         theme.fg(tok),
     ));
     vec![fitted(spans, w, theme)]

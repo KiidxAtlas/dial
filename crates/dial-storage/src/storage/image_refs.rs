@@ -6,6 +6,7 @@
 //! `IMAGE_TTL_HOURS` after its last registration. Registering the same bytes again, or finding them
 //! in a session transcript, re-arms the window, so images still in use survive `purge`.
 
+use crate::llm::images::{SNIFFED_MIMES, sniff_mime};
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -14,9 +15,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, DirBuilder, OpenOptions},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Serving window measured from the last registration (default 72 hours).
@@ -99,7 +99,13 @@ pub fn register(
     input: ImageInput<'_>,
     mime: Option<&str>,
 ) -> Result<ImageRef> {
-    register_at(user_dir, session_id, input, mime, now_secs())
+    register_at(
+        user_dir,
+        session_id,
+        input,
+        mime,
+        crate::runtime::clock::unix_secs(),
+    )
 }
 
 fn register_at(
@@ -169,7 +175,7 @@ pub fn resolve(user_dir: &Path, sha: &str) -> Result<PathBuf> {
 /// found in the `.jsonl` transcripts under `sessions_dir`. Returns the number of distinct images
 /// registered across all transcripts (one per session, after in-file dedupe).
 pub fn scan_sessions(user_dir: &Path, sessions_dir: &Path) -> Result<usize> {
-    scan_sessions_at(user_dir, sessions_dir, now_secs())
+    scan_sessions_at(user_dir, sessions_dir, crate::runtime::clock::unix_secs())
 }
 
 /// Scan the session directory of every project under `user_dir` (`projects/*/sessions`), including
@@ -301,7 +307,7 @@ fn collect_images(value: &Value, out: &mut Vec<(Option<String>, String)>) {
 /// Remove references whose window has lapsed (or every reference with `all`) and their blobs.
 /// Dry-run unless `apply`. Blob removal failures keep the index entry so the reference is not lost.
 pub fn purge(user_dir: &Path, all: bool, apply: bool) -> Result<PurgeReport> {
-    purge_at(user_dir, all, apply, now_secs())
+    purge_at(user_dir, all, apply, crate::runtime::clock::unix_secs())
 }
 
 fn purge_at(user_dir: &Path, all: bool, apply: bool, now: u64) -> Result<PurgeReport> {
@@ -397,33 +403,13 @@ pub fn verify(user_dir: &Path) -> Result<VerifyReport> {
     Ok(report)
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-const SNIFFED_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-
 /// Content type from magic bytes (authoritative), else the declared type if it is an image type.
 fn resolve_mime(bytes: &[u8], declared: Option<&str>) -> Result<String> {
-    let sniffed = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("image/webp")
-    } else {
-        None
-    };
-    if let Some(mime) = sniffed {
+    if let Some(mime) = sniff_mime(bytes) {
         return Ok(mime.to_owned());
     }
     match declared {
@@ -469,32 +455,7 @@ fn write_blob_if_needed(dir: &Path, sha: &str, bytes: &[u8]) -> Result<()> {
     if fs::read(&path).is_ok_and(|existing| sha256_hex(&existing) == sha) {
         return Ok(());
     }
-    write_atomic(&path, bytes)
-}
-
-/// Stage `data` in an owner-only temp file beside `target`, then rename it into place.
-fn write_atomic(target: &Path, data: &[u8]) -> Result<()> {
-    let name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("store path has no file name")?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = target.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
-    let mut file =
-        platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-    let written = file
-        .write_all(data)
-        .and_then(|()| platform_fs::sync_file(&file));
-    drop(file);
-    if let Err(e) = written.and_then(|()| fs::rename(&tmp, target)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("writing {}", target.display()));
-    }
-    Ok(())
+    crate::platform::atomic::write_owner_only_entry(&path, bytes)
 }
 
 fn load_index(dir: &Path) -> Result<Vec<ImageRef>> {
@@ -556,7 +517,7 @@ fn save_index(dir: &Path, refs: &[ImageRef]) -> Result<()> {
         })
         .collect();
     let text = serde_json::to_string_pretty(&json!({"version": 1, "images": images}))?;
-    write_atomic(&dir.join(INDEX_FILE), text.as_bytes())
+    crate::platform::atomic::write_owner_only_entry(&dir.join(INDEX_FILE), text.as_bytes())
 }
 
 #[cfg(test)]

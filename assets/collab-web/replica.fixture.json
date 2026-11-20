@@ -1,0 +1,10 @@
+[
+  {"frame":{"t":"welcome"},"log":[]},
+  {"frame":{"t":"snapshot-chunk","entries":[{"role":"user","content":"hi"}],"final":false},"log":[]},
+  {"frame":{"t":"snapshot-chunk","entries":[],"final":true},"log":[{"role":"user","content":"hi"}]},
+  {"frame":{"t":"entry","seq":1},"log":[{"role":"user","content":"hi"}]},
+  {"frame":{"t":"entry","seq":1,"entry":null},"log":[{"role":"user","content":"hi"},null]},
+  {"frame":{"t":"entry","seq":1,"entry":{"type":"duplicate"}},"log":[{"role":"user","content":"hi"},null]},
+  {"frame":{"t":"reset"},"log":[]},
+  {"frame":{"t":"entry","seq":0,"entry":{"type":"replayed"}},"log":[{"type":"replayed"}]}
+]

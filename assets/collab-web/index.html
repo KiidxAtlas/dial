@@ -1,7 +1,16 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dial collaboration viewer</title>
-<style>body{font:15px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;background:#101318;color:#e5e7eb}header{position:sticky;top:0;background:#101318;padding:1rem 0;border-bottom:1px solid #394150}#status{color:#9ca3af}#transcript{white-space:pre-wrap;overflow-wrap:anywhere}article{padding:.75rem;margin:.5rem 0;border-left:3px solid #5376b8;background:#1b2029;border-radius:4px}.error{color:#fca5a5}</style>
-<header><h1>Dial session</h1><div id="status">Connecting…</div></header><main id="transcript"></main>
+<!-- Inline copy of assets/viewer-chrome.css. Regenerate with node assets/sync-viewer-chrome.cjs. -->
+<style id="viewer-chrome">
+body { font: 15px system-ui; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #101318; color: #e5e7eb; }
+header { position: sticky; top: 0; background: inherit; padding-bottom: 1rem; border-bottom: 1px solid #394150; }
+h1 { margin: 0 0 .5rem; }
+[role="status"] { color: #9ca3af; }
+[role="status"].error { color: #fca5a5; }
+article, pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #1b2029; padding: 1rem; margin: .5rem 0; border-radius: 6px; }
+article { border-left: 3px solid #5376b8; }
+</style>
+<header><h1>Dial session</h1><div id="status" role="status">Connecting…</div></header><main id="transcript"></main>
 <script type="module">
 const status=document.querySelector('#status'), transcript=document.querySelector('#transcript');
 const PROTO=1004, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
@@ -49,7 +58,7 @@ try {
         break;
       case 'entry':{
         const log=replica.staging??(replica.live?replica.entries:null);
-        if(!log||!Number.isSafeInteger(frame.seq))break;
+        if(!log||!Number.isSafeInteger(frame.seq)||!Object.hasOwn(frame,'entry'))break;
         if(frame.seq<log.length)break;
         if(frame.seq>log.length){add('Notice',`missing host entries ${log.length} to ${frame.seq}; reconnect to resync`);break;}
         log.push(frame.entry);

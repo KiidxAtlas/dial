@@ -121,11 +121,7 @@ pub fn parameter_help(parameters: &Value) -> String {
     }
     let mut help = format!("Parameters:\n{}", lines.join("\n"));
     if help.len() > MAX_BYTES {
-        let mut cut = MAX_BYTES;
-        while !help.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        help.truncate(cut);
+        help.truncate(help.floor_char_boundary(MAX_BYTES));
         help.push_str("\n…");
     }
     help

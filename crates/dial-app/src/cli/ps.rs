@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::learn::processes;
+use crate::units::human_bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PsAction {
@@ -135,20 +136,7 @@ fn or_dash(value: &str) -> String {
 }
 
 fn format_bytes(bytes: Option<u64>) -> String {
-    const KIB: f64 = 1024.0;
-    let Some(bytes) = bytes else {
-        return "-".to_owned();
-    };
-    let value = bytes as f64;
-    if value >= KIB * KIB * KIB {
-        format!("{:.1} GiB", value / (KIB * KIB * KIB))
-    } else if value >= KIB * KIB {
-        format!("{:.1} MiB", value / (KIB * KIB))
-    } else if value >= KIB {
-        format!("{:.1} KiB", value / KIB)
-    } else {
-        format!("{bytes} B")
-    }
+    bytes.map_or_else(|| "-".to_owned(), human_bytes)
 }
 
 /// The most descriptive name for a row: the model when known, otherwise the project.

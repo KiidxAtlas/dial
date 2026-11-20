@@ -12,7 +12,7 @@ pub mod telemetry;
 pub mod weights;
 
 pub(crate) use dial_computer::computer;
-pub(crate) use dial_core::{hex, platform, runtime, workspace_copy};
+pub(crate) use dial_core::{hex, platform, runtime, units, workspace_copy};
 pub(crate) use dial_llm::{config, llm};
 pub(crate) use dial_storage::storage;
 pub(crate) use dial_tools::{security, setup, tools, voice};

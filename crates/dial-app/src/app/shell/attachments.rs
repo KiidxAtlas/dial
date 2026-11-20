@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::agent::window::context;
 use crate::ui::composer::{
     Composer,
-    attachments::{Preview, PreviewItem, Provider},
+    attachments::{Preview, PreviewItem, Provider, count_summary},
 };
 
 use super::Shell;
@@ -25,12 +25,31 @@ pub(super) fn install(composer: &mut Composer, root: &Path) {
                 }] += 1;
             }
             Preview {
-                summary: format!("Attachments: {} included · {} truncated · {} skipped · ~{} text tokens · {} image(s), image tokens vary", counts[0], counts[1], counts[2], prepared.attachments.iter().map(|item| item.text_bytes).sum::<usize>().div_ceil(4), prepared.attachments.iter().filter(|item| item.kind == context::AttachmentKind::Image && item.state != context::AttachmentState::Skipped).count()),
+                summary: format!(
+                    "{} · ~{} text tokens · {} image(s), image tokens vary",
+                    count_summary(counts[0], counts[1], counts[2]),
+                    prepared
+                        .attachments
+                        .iter()
+                        .map(|item| item.text_bytes)
+                        .sum::<usize>()
+                        .div_ceil(4),
+                    prepared
+                        .attachments
+                        .iter()
+                        .filter(|item| item.kind == context::AttachmentKind::Image
+                            && item.state != context::AttachmentState::Skipped)
+                        .count()
+                ),
                 issues: prepared.issues(),
-                items: prepared.attachments.iter().map(|item| PreviewItem {
-                    reference: item.reference.clone(),
-                    detail: format!("{:?} · {:?} · {}", item.kind, item.state, item.detail),
-                }).collect(),
+                items: prepared
+                    .attachments
+                    .iter()
+                    .map(|item| PreviewItem {
+                        reference: item.reference.clone(),
+                        detail: format!("{:?} · {:?} · {}", item.kind, item.state, item.detail),
+                    })
+                    .collect(),
             }
         }),
         remove: Arc::new(context::remove_attachment_reference),

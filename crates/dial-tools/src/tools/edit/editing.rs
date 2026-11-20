@@ -12,6 +12,9 @@ use std::{
     sync::Arc,
 };
 
+mod repair_span;
+pub use repair_span::RepairSpan;
+
 #[derive(Debug, Clone)]
 pub struct EditRepairRequest {
     pub path: String,
@@ -513,10 +516,7 @@ pub(crate) fn generated_guard(
     let mut comments = String::new();
     let mut block = false;
     let source = before.unwrap_or("");
-    let mut end = source.len().min(1024);
-    while !source.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = source.floor_char_boundary(1024);
     let html = ["html", "htm", "xml", "svg", "xhtml"].contains(&ext.as_str());
     let close = if html { "-->" } else { "*/" };
     for (i, line) in source[..end]
@@ -564,15 +564,8 @@ pub(crate) fn seen_guard(
 fn line_range(text: &str, start: usize, end: usize) -> (usize, usize) {
     // Offsets come from matchers over normalized text; clamp defensively so a
     // mid-character offset can never panic the slice below.
-    let floor = |mut at: usize| {
-        at = at.min(text.len());
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    };
-    let start = floor(start);
-    let end = floor(end).max(start);
+    let start = text.floor_char_boundary(start);
+    let end = text.floor_char_boundary(end).max(start);
     let first = text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
     let last = if start == end {
         first
@@ -1404,6 +1397,7 @@ fn finish_impl(
     }
     for change in &mut changes {
         execution.check_cancel()?;
+        let mut repaired = false;
         let before = change.before.as_ref().map(|x| x.text.as_str());
         generated_guard(ws, &change.path, before)?;
         if let Some(projected_before) = change
@@ -1445,6 +1439,7 @@ fn finish_impl(
                     ));
                 }
                 if source.text.as_str() != proposed.text.as_ref() {
+                    repaired = true;
                     let repaired = if source.text.contains("\r\n") {
                         source.text.replace("\r\n", "\n")
                     } else {
@@ -1535,7 +1530,7 @@ fn finish_impl(
                     }
                 )
             });
-        report.push(format!("{header}{summary}{}",if change.authored_whole{String::new()}else if kind_changed{"\nCarrier extension changed; raw bytes were retained. Read the destination before further edits.".into()}else{super::diff::preview(logical_before,logical_after)}));
+        report.push(format!("{header}{summary}{}",if change.authored_whole && !repaired {String::new()}else if kind_changed{"\nCarrier extension changed; raw bytes were retained. Read the destination before further edits.".into()}else{super::diff::preview(logical_before,logical_after)}));
     }
     if commit && !changes.is_empty() {
         let paths = if let Some((policies, _)) = write {

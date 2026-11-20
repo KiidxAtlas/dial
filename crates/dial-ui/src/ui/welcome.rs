@@ -12,9 +12,8 @@
 use super::{
     Rows,
     chrome::{key_hint_spans, label, selected_style},
-    fx,
-    markdown::truncate_spans,
-    text,
+    fx, text,
+    text::truncate_spans,
     theme::{Sym, Theme, Tok},
 };
 use ratatui::{
@@ -147,7 +146,7 @@ fn facts(
     room: usize,
 ) -> Vec<(&'static str, Vec<Span<'static>>)> {
     let ascii = theme.ascii();
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let muted = theme.fg(Tok::Muted);
     let mut out = Vec::new();
 
@@ -457,7 +456,7 @@ fn layout(
     let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
     let margin = if width >= 24 { 2 } else { 0 };
     let inner = width - margin;
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let dot_w = text::width(&dot);
     let muted = theme.fg(Tok::Muted);
     let pad = |n: usize| Span::raw(" ".repeat(n));
@@ -558,7 +557,7 @@ fn layout(
                 let used = match fact_rows.get(i) {
                     Some(line) => {
                         spans.extend(line.iter().cloned());
-                        line.iter().map(|s| text::width(&s.content)).sum()
+                        text::spans_width(line)
                     }
                     None => 0,
                 };
@@ -675,7 +674,7 @@ pub fn summary(info: &WelcomeInfo, width: u16, theme: &Theme) -> Rows {
     }
     let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
     let margin = if width >= 24 { 2 } else { 0 };
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let muted = theme.fg(Tok::Muted);
     let mark = if theme.ascii() { MARK_ASCII } else { MARK };
     let mut spans = vec![

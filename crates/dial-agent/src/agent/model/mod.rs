@@ -4,6 +4,7 @@ pub(in crate::agent) mod assistance;
 pub(in crate::agent) mod backend;
 pub(in crate::agent) mod cache_warm;
 pub(in crate::agent) mod constrained_repair;
+pub mod diagnostic_budget;
 pub mod laya;
 pub(in crate::agent) mod local_profile;
 pub(in crate::agent) mod preparation;

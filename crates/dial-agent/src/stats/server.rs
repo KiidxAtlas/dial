@@ -1,21 +1,30 @@
 //! Loopback-only statistics dashboard and per-session trace routes.
 //!
 //! Routes: `/` (HTML page; `#/traces?s=<session file>` renders one session), `/api/stats`
-//! (all-time report), `/api/version`, `/api/live`, `/api/models`, `/api/tools`, `/api/requests`,
+//! (aggregate report), `/api/version`, `/api/live`, `/api/models`, `/api/tools`, `/api/requests`,
 //! `/api/request/<id>`, `/api/frustration`, all with an optional `range` (`24h`, `7d`, `all`),
 //! and `/api/trace?session=<session file>` (one session; files outside
 //! `<user_dir>/projects/*/sessions/` are refused with 403).
-use super::{Db, now_ms, parse_range, session_file_in_tree};
+use super::{Db, ReportRange, now_ms, session_file_in_tree};
 use anyhow::{Context, Result, bail};
+use dial_llm::page_policy::{page_headers, page_policy};
+pub use dial_llm::url::{
+    decode_uri_component_lossy as percent_decode, encode_uri_component as percent_encode,
+};
 use serde::Serialize;
 use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 
-const PAGE: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Dial stats</title><style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;background:#111;color:#ddd}pre{white-space:pre-wrap;background:#222;padding:1rem;border-radius:8px}</style><h1 id=title>Dial usage</h1><p id=sub>Local session and model usage</p><pre id=data>Loading…</pre><script>const hash=location.hash,trace=hash.indexOf('#/traces')===0;const session=new URLSearchParams(hash.split('?')[1]||'').get('s')||'';if(trace){title.textContent='Dial session trace';sub.textContent=session||'No session selected'}const url=trace?(session?'/api/trace?session='+encodeURIComponent(session):null):'/api/stats';if(!url){data.textContent='No session selected. Open a trace with /trace.'}else{fetch(url).then(r=>{if(!r.ok)return r.text().then(t=>{throw Error(r.status+' '+t)});return r.json()}).then(x=>data.textContent=JSON.stringify(x,null,2)).catch(e=>data.textContent='Unable to load: '+e)}</script>"#;
+const PAGE: &str = concat!(
+    "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Dial stats</title><style>",
+    include_str!("../../../../assets/viewer-chrome.css"),
+    r#"</style><h1 id=title>Dial usage</h1><p id=sub>Local session and model usage</p><pre id=data>Loading…</pre><script>const hash=location.hash,trace=hash.indexOf('#/traces')===0;const session=new URLSearchParams(hash.split('?')[1]||'').get('s')||'';if(trace){title.textContent='Dial session trace';sub.textContent=session||'No session selected'}const url=trace?(session?'/api/trace?session='+encodeURIComponent(session):null):'/api/stats';if(!url){data.textContent='No session selected. Open a trace with /trace.'}else{fetch(url).then(r=>{if(!r.ok)return r.text().then(t=>{throw Error(r.status+' '+t)});return r.json()}).then(x=>data.textContent=JSON.stringify(x,null,2)).catch(e=>data.textContent='Unable to load: '+e)}</script>"#,
+);
 
 pub(crate) const TEXT: &str = "text/plain; charset=utf-8";
 pub(crate) const HTML: &str = "text/html; charset=utf-8";
@@ -97,13 +106,31 @@ pub(crate) fn serve_requests(
         } else {
             route(&line)
         };
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        let response = http_response(status, content_type, &body);
         let _ = stream.write_all(response.as_bytes());
     }
     bail!("{label} listener stopped")
+}
+
+/// Full HTTP/1.1 response for one answered request. Only the dashboard's own static page carries
+/// the policy that pins its inline script and style; other HTML (the weights dashboard) and JSON
+/// are answered without it. Every response is uncacheable and sniff-proof.
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    let policy_headers = if body == PAGE {
+        page_headers(stats_policy())
+    } else {
+        String::new()
+    };
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{policy_headers}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The dashboard page's policy, computed once from the page it serves.
+fn stats_policy() -> &'static str {
+    static POLICY: OnceLock<String> = OnceLock::new();
+    POLICY.get_or_init(|| page_policy(PAGE))
 }
 
 /// Only loopback host names reach the routes: a page on another origin whose DNS name rebinds
@@ -183,24 +210,20 @@ fn route(user_dir: &Path, target: &str) -> Response {
     match path {
         "/" => ("200 OK", HTML, PAGE.to_owned()),
         "/api/version" => json_response(Ok(dial_core::build_identity::report())),
-        "/api/stats" => json_response(with_db(user_dir, |db| db.report(None, now_ms()))),
+        "/api/stats" => match query_range(query) {
+            Ok(range) => json_response(range.report(user_dir)),
+            Err(error) => bad_request(error),
+        },
         "/api/live" => optional_json(
             with_db(user_dir, |db| db.live(user_dir, now_ms())),
             "no live session: the stats database has no session yet",
         ),
-        "/api/models" => match range_since(query, now_ms()) {
-            Ok(since) => json_response(with_db(user_dir, |db| db.models(since))),
-            Err(error) => bad_request(error),
-        },
-        "/api/tools" => match range_since(query, now_ms()) {
-            Ok(since) => json_response(with_db(user_dir, |db| db.tools(since))),
-            Err(error) => bad_request(error),
-        },
+        "/api/models" => ranged_json(user_dir, query, Db::models),
+        "/api/tools" => ranged_json(user_dir, query, Db::tools),
         "/api/requests" => api_requests(user_dir, query),
-        "/api/frustration" => match range_since(query, now_ms()) {
-            Ok(since) => json_response(with_db(user_dir, |db| db.frustration(user_dir, since))),
-            Err(error) => bad_request(error),
-        },
+        "/api/frustration" => {
+            ranged_json(user_dir, query, |db, since| db.frustration(user_dir, since))
+        }
         "/api/trace" => api_trace(user_dir, query),
         _ => ("404 Not Found", TEXT, "Not found".into()),
     }
@@ -233,15 +256,26 @@ pub(crate) fn optional_json<T: Serialize>(result: Result<Option<T>>, missing: &s
 
 /// Opens the stats database, folds in new transcript activity, then runs `read`.
 fn with_db<T>(user_dir: &Path, read: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
-    let mut db = Db::open_default(user_dir)?;
-    db.sync_sessions(user_dir)?;
-    read(&db)
+    read(&Db::open_synced(user_dir)?)
 }
 
-/// The `range` query value (`24h`, `7d`, `all`, ...) as a lookback start; absent means all time.
-fn range_since(query: &str, now: i64) -> Result<Option<i64>> {
-    let range = query_param(query, "range").unwrap_or_else(|| "all".to_owned());
-    Ok(parse_range(&range)?.map(|window| now - window))
+/// Validate the range before opening the database: bad input is a 400, a failed read a 500.
+fn ranged_json<T: Serialize>(
+    user_dir: &Path,
+    query: &str,
+    read: impl FnOnce(&Db, Option<i64>) -> Result<T>,
+) -> Response {
+    match query_range(query) {
+        Ok(range) => {
+            let since = range.since(now_ms());
+            json_response(with_db(user_dir, |db| read(db, since)))
+        }
+        Err(error) => bad_request(error),
+    }
+}
+
+fn query_range(query: &str) -> Result<ReportRange> {
+    ReportRange::parse(query_param(query, "range").as_deref().unwrap_or("all"))
 }
 
 fn api_requests(user_dir: &Path, query: &str) -> Response {
@@ -256,10 +290,9 @@ fn api_requests(user_dir: &Path, query: &str) -> Response {
             }
         },
     };
-    match range_since(query, now_ms()) {
-        Ok(since) => json_response(with_db(user_dir, |db| db.recent_requests(since, limit))),
-        Err(error) => bad_request(error),
-    }
+    ranged_json(user_dir, query, |db, since| {
+        db.recent_requests(since, limit)
+    })
 }
 
 fn api_request(user_dir: &Path, id: &str) -> Response {
@@ -280,23 +313,10 @@ fn api_trace(user_dir: &Path, query: &str) -> (&'static str, &'static str, Strin
             "session file is outside the stats sessions tree".into(),
         );
     };
-    let result = (|| -> Result<Option<String>> {
-        let mut db = Db::open_default(user_dir)?;
-        db.sync_sessions(user_dir)?;
-        match db.trace(user_dir, &project, &file)? {
-            Some(trace) => Ok(Some(serde_json::to_string(&trace)?)),
-            None => Ok(None),
-        }
-    })();
-    match result {
-        Ok(Some(body)) => ("200 OK", JSON, body),
-        Ok(None) => (
-            "404 Not Found",
-            TEXT,
-            "session has no stats record (its transcript has no session header)".into(),
-        ),
-        Err(error) => ("500 Internal Server Error", TEXT, format!("{error:#}")),
-    }
+    optional_json(
+        with_db(user_dir, |db| db.trace(user_dir, &project, &file)),
+        "session has no stats record (its transcript has no session header)",
+    )
 }
 
 /// First value of `key` in an `a=b&c=d` query string, percent-decoded.
@@ -305,51 +325,6 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         (percent_decode(k) == key).then(|| percent_decode(v))
     })
-}
-
-/// Percent-encodes exactly like JavaScript `encodeURIComponent`.
-pub fn percent_encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'!'
-            | b'~'
-            | b'*'
-            | b'\''
-            | b'('
-            | b')' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// Decodes `%XX` escapes; malformed escapes are kept verbatim. `+` is literal (as `encodeURIComponent` emits it).
-pub fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Some(value) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(value);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]

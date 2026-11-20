@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::testkit::plain;
 
 #[test]
 fn syntax_tokens_preserve_text_and_degrade() {
@@ -54,17 +55,6 @@ fn syntax_tokens_preserve_text_and_degrade() {
 
 fn theme() -> Theme {
     Theme::dark()
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect()
 }
 
 fn md(src: &str, width: u16) -> Rows {

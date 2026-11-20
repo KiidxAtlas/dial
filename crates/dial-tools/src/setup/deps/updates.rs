@@ -375,7 +375,7 @@ fn npm(
         .or_else(|| {
             let node = locate(super::recipe("node")?, env)?;
             let npm = node.parent()?.join("npm");
-            super::is_executable(&npm).then_some(npm)
+            crate::platform::fs::is_executable(&npm).then_some(npm)
         })
         .context("npm unavailable; cannot check private npm install")?;
     let mut changes = Vec::new();

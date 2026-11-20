@@ -349,7 +349,7 @@ const ASSIST_CASE_TIMEOUT_SECS: u64 = 600;
 /// ships off; `ablate-*` turns off or changes a feature that ships on. Either way exactly one
 /// lever differs from `dial`.
 type FeatureVariant = fn(&mut AssistanceOverrides, EditMode);
-const ASSIST_VARIANTS: [(&str, FeatureVariant); 9] = [
+const ASSIST_VARIANTS: [(&str, FeatureVariant); 10] = [
     // The stable compact tool offer ships on; the ablation offers the whole catalog.
     ("ablate-compact_tools", |o, _| o.compact_tools = Some(false)),
     ("enable-repair_hints", |o, _| o.repair_hints = Some(true)),
@@ -372,6 +372,7 @@ const ASSIST_VARIANTS: [(&str, FeatureVariant); 9] = [
         o.lean_local = Some(LeanLocal::Off)
     }),
     ("ablate-local_profile", |o, _| o.local_profile = Some(false)),
+    ("ablate-bash_hints", |o, _| o.bash_hints = Some(false)),
     // Removes the structured file and search tools; the shell edits and searches instead.
     ("ablate-structured_tools", |o, _| o.bash_only = Some(true)),
 ];
@@ -395,6 +396,7 @@ fn shipped_overrides(shipped: &Config) -> (AssistanceOverrides, EfficiencyOverri
             lean_local: Some(assistance.lean_local),
             local_profile: Some(assistance.local.enabled),
             bash_only: Some(false),
+            bash_hints: Some(shipped.bash_interceptor.enabled),
         },
         EfficiencyOverrides {
             tool_preview_bytes: Some(shipped.efficiency.tool_preview_bytes),
@@ -430,6 +432,7 @@ fn assist_configurations(
         lean_local: Some(LeanLocal::Off),
         local_profile: Some(false),
         bash_only: Some(false),
+        bash_hints: Some(false),
     };
     let machine = |name: String, assistance: AssistanceOverrides| MachineConfiguration {
         name,
@@ -858,6 +861,12 @@ fn apply_assistance(config: &mut Config, overrides: &AssistanceOverrides) {
     if let Some(value) = overrides.local_profile {
         config.assistance.local.enabled = value;
     }
+    if let Some(enabled) = overrides.bash_hints
+        && config.bash_interceptor.mode
+            == dial::config::tools::bash_interceptor::InterceptMode::Hint
+    {
+        config.bash_interceptor.enabled = enabled;
+    }
     if let Some(bash_only) = overrides.bash_only {
         config.harness.tools = if bash_only {
             dial::config::tools::BASH_ONLY
@@ -1016,6 +1025,9 @@ fn assistance_settings(config: &Config) -> serde_json::Value {
         "lean_local": config.assistance.lean_local,
         "local_profile": config.assistance.local.enabled,
         "bash_only": config.harness.tools == dial::config::tools::BASH_ONLY,
+        "bash_hints": config.bash_interceptor.enabled && config.bash_interceptor.mode == dial::config::tools::bash_interceptor::InterceptMode::Hint,
+        "bash_interceptor_mode": config.bash_interceptor.mode,
+        "bash_interceptor_enabled": config.bash_interceptor.enabled,
         "lean_local_within_auto_window": config.context_window <= LEAN_AUTO_MAX_WINDOW,
     })
 }

@@ -5,7 +5,7 @@ use crate::app::bridge::Bridge;
 use crate::app::core::App;
 use crate::app::display::short;
 use crate::app::replay::replay_session;
-use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::app::shell::Shell;
 use crate::config::paths::Layout;
 use crate::storage::session::Session;
 use crate::ui::input::{poll, read};
@@ -14,7 +14,7 @@ use crate::ui::transcript::Transcript;
 use anyhow::{Context, Result};
 use crossterm::event::Event;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The picker loads only the newest sessions; parsing every journal would block the UI thread.
 /// Older sessions remain reachable by id through the direct prefix lookup.
@@ -415,16 +415,7 @@ impl Shell {
         let (id, message) = payload.split_once('\n').unwrap_or((payload, ""));
         let args = serde_json::json!({"action": "resume", "id": id, "message": message});
         let (result, failed) = {
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started: Instant::now(),
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::new(app, self);
             let result = agent.start_subagents(&args, &mut bridge);
             (result, bridge.failed)
         };

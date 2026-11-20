@@ -7,6 +7,7 @@
 //! - **Splash**: LM Studio's bundle (`manifest.json` plus `target/` and `tokenizer/`); only LM Studio
 //!   can run it, so Dial recognises it to give an actionable error instead of a failed load.
 
+use crate::platform::fs as platform_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -197,27 +198,26 @@ fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> 
     if let Some(explicit) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(explicit));
     }
-    let name = if cfg!(windows) {
-        format!("{program}.exe")
-    } else {
-        program.to_owned()
-    };
+    let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let user_dir = crate::config::types::default_user_dir();
     if !user_dir.as_os_str().is_empty() {
         let managed = crate::config::paths::tools_dir(&user_dir)
             .join(install)
             .join(&name);
-        if managed.is_file() {
+        if platform_fs::is_executable(&managed) {
             return Some(managed);
         }
     }
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    dirs.into_iter()
-        .map(|dir| dir.join(&name))
-        .find(|candidate| candidate.is_file())
+    find_server_on_path(&name)
+}
+
+/// Search PATH first; graphical launches may omit the package-manager directories.
+pub(super) fn find_server_on_path(name: &str) -> Option<PathBuf> {
+    platform_fs::find_program(Path::new(name), std::env::var_os("PATH").as_deref()).or_else(|| {
+        ["/opt/homebrew/bin", "/usr/local/bin"]
+            .iter()
+            .find_map(|dir| platform_fs::executable_candidate(&Path::new(dir).join(name)))
+    })
 }
 
 /// Whether the local model `model` (a path) is served by a Dial-launched `llama-server`.
@@ -449,13 +449,7 @@ pub(crate) fn gguf_tokenizer_digest(path: &Path) -> Option<String> {
                 hasher.update(length.to_le_bytes());
                 hasher.update(&token);
             }
-            return Some(
-                hasher
-                    .finalize()
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect(),
-            );
+            return Some(crate::hex(&hasher.finalize()));
         }
         skip_gguf_value(&mut reader, kind).ok()?;
     }

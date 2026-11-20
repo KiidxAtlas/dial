@@ -10,6 +10,7 @@
 //!   signed `i64` (JavaScript `Date.parse` behavior for the shapes Google sends: Gemini,
 //!   Antigravity, Cursor).
 
+use crate::platform::time::calendar::{days_from_civil, is_valid_date};
 use serde_json::Value;
 
 use super::UsageStatus;
@@ -66,7 +67,7 @@ fn parse_iso(text: &str) -> Option<(i64, bool)> {
     let month = digits(bytes, &mut at, 2)?;
     eat(bytes, &mut at, b'-')?;
     let day = digits(bytes, &mut at, 2)?;
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+    if !is_valid_date(year, month, day) {
         return None;
     }
 
@@ -129,7 +130,7 @@ fn parse_iso(text: &str) -> Option<(i64, bool)> {
     if at != bytes.len() || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let days = i64::try_from(days_from_civil(year, month, day)).ok()?;
+    let days = days_from_civil(year, month, day)?;
     Some((
         (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000 + millis
             - offset_min * 60_000,
@@ -157,32 +158,6 @@ fn eat(bytes: &[u8], at: &mut usize, want: u8) -> Option<()> {
     } else {
         None
     }
-}
-
-fn is_leap(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if is_leap(year) => 29,
-        _ => 28,
-    }
-}
-
-/// Days since 1970-01-01 (proleptic Gregorian, Howard Hinnant's algorithm). `day` may overflow the
-/// month linearly. Wide arithmetic: callers pass arbitrary parsed fields, so intermediates must not
-/// overflow.
-pub(super) fn days_from_civil(year: i64, month: i64, day: i64) -> i128 {
-    let (year, month, day) = (i128::from(year), i128::from(month), i128::from(day));
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let year_of_era = y - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]

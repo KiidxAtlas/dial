@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use super::config::{EXCLUDED_FILES, GenerationConfig, LOW_PRIORITY_EXTENSIONS};
 use super::text::{cp_len, take_chars, truncate_bytes};
+use crate::units::human_bytes;
 
 /// Long-line threshold above which machine payloads are collapsed.
 pub(crate) const BLOB_LINE_THRESHOLD: usize = 512;
@@ -178,16 +179,6 @@ pub(crate) fn split_lines(text: &str) -> Vec<String> {
     lines
 }
 
-fn format_omitted_size(count: usize) -> String {
-    if count >= 1024 * 1024 {
-        format!("{:.1}MB", count as f64 / (1024.0 * 1024.0))
-    } else if count >= 1024 {
-        format!("{:.0}KB", count as f64 / 1024.0)
-    } else {
-        format!("{count}B")
-    }
-}
-
 /// Collapse blob-like diff lines while preserving recognizable head and tail text.
 pub(crate) fn collapse_blob_lines(diff: &str, threshold: usize) -> String {
     if cp_len(diff) <= threshold {
@@ -202,14 +193,10 @@ pub(crate) fn collapse_blob_lines(diff: &str, threshold: usize) -> String {
                 return line.to_owned();
             }
             changed = true;
-            let omitted = length.saturating_sub(120 + 24);
-            let tail: String = line.chars().skip(length.saturating_sub(24)).collect();
-            format!(
-                "{}[..omitted {}..]{}",
-                take_chars(line, 120),
-                format_omitted_size(omitted),
-                tail
-            )
+            let head = take_chars(line, 120);
+            let tail = &line[take_chars(line, length.saturating_sub(24)).len()..];
+            let omitted = line.len().saturating_sub(head.len() + tail.len());
+            format!("{head}[..omitted {}..]{tail}", human_bytes(omitted as u64))
         })
         .collect();
     if changed {

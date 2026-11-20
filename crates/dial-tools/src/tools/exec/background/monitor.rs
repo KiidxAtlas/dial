@@ -529,10 +529,7 @@ impl Watch {
             if let Some(found) = self.pattern.find(&text) {
                 let mut preceding = format!("{}{}", self.context, &text[..found.start()]);
                 if preceding.len() > 512 {
-                    let mut start = preceding.len() - 512;
-                    while !preceding.is_char_boundary(start) {
-                        start += 1;
-                    }
+                    let start = preceding.ceil_char_boundary(preceding.len() - 512);
                     preceding.drain(..start);
                 }
                 let matched = &text[found.start()..];
@@ -545,10 +542,7 @@ impl Watch {
             if segment.last() == Some(&b'\n') {
                 self.context.push_str(&text);
                 if self.context.len() > 512 {
-                    let mut start = self.context.len() - 512;
-                    while !self.context.is_char_boundary(start) {
-                        start += 1;
-                    }
+                    let start = self.context.ceil_char_boundary(self.context.len() - 512);
                     self.context.drain(..start);
                 }
                 self.pending.clear();
@@ -559,11 +553,7 @@ impl Watch {
 }
 
 fn clip(text: &str, cap: usize) -> String {
-    let mut end = text.len().min(cap);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
+    text[..text.floor_char_boundary(cap)].to_owned()
 }
 
 impl Tool for Monitor {

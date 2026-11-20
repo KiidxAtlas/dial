@@ -486,7 +486,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         ..CommandSpec::new(
             "autoresearch",
-            "[status|init|run|log|notes|resume]",
+            "[status|init|run|auto|log|notes|resume|exit]",
             "manage branch-scoped benchmark experiments",
             Category::Learning,
             Surface::Builtin,
@@ -880,7 +880,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         subcommands: &[
-            "start", "view", "join", "leave", "status", "stop", "list", "abort",
+            "start", "view", "join", "leave", "status", "stop", "list", "abort", "answer",
         ],
         live_forms: &[
             LiveForm {
@@ -899,10 +899,16 @@ pub const COMMANDS: &[CommandSpec] = &[
                 args: "abort",
                 order: 19,
             },
+            // Same order as `abort`: the stable sort keeps `answer` right after it, and the
+            // later global orders stay unchanged.
+            LiveForm {
+                args: "answer",
+                order: 19,
+            },
         ],
         ..CommandSpec::new(
             "collab",
-            "[start|view|join <link>|leave|status|stop|list|abort]",
+            "[start|view|join <link>|leave|status|stop|list|abort|answer <n>]",
             "choose how to host, join or manage a live room",
             Category::Integrations,
             Surface::Group,

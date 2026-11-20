@@ -1,6 +1,8 @@
 //! Routing commands typed while a turn is running, and the hotkey reference.
 
-use crate::app::command_registry::{DuringTurn, canonical_command, command_panel, during_turn};
+use crate::app::command_registry::{
+    DuringTurn, command_panel, during_turn, resolve_invocation, split_invocation,
+};
 use crate::app::core::App;
 use crate::app::display::app_home_hint;
 use crate::app::drive::Step;
@@ -22,22 +24,11 @@ impl Shell {
             return true;
         }
         let rest = text.trim().trim_start_matches('/');
-        let (name, args) = rest
-            .split_once(char::is_whitespace)
-            .map_or((rest, ""), |(name, args)| (name, args.trim()));
-        if let Some(draft) = crate::app::command_registry::hubs::draft(name, args) {
-            if self.composer.draft().trim().is_empty() {
-                self.composer.set_draft(draft);
-            } else {
-                self.note(
-                    "Command",
-                    format!("Your draft is kept. Enter {draft}<value> to continue."),
-                );
-            }
+        let (name, args) = split_invocation(rest);
+        if self.hub_draft(name, args) {
             return false;
         }
-        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
-        let name = canonical_command(name);
+        let (name, args) = resolve_invocation(name, args);
         if self.reject_syntax(name, args) {
             return false;
         }
@@ -195,11 +186,8 @@ impl Shell {
         let Some(rest) = line.trim().strip_prefix('/') else {
             return false;
         };
-        let (name, args) = rest
-            .split_once(char::is_whitespace)
-            .map_or((rest, ""), |(name, args)| (name, args.trim()));
-        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
-        let name = canonical_command(name);
+        let (name, args) = split_invocation(rest);
+        let (name, args) = resolve_invocation(name, args);
         match (name, args) {
             ("model", args) => {
                 let result = self.model_command(app, None, args);
@@ -223,7 +211,7 @@ impl Shell {
                     )),
                 );
             }
-            ("help" | "?", args) if args != "commands" => {
+            ("help" | "?", args) => {
                 self.note("Help", self.help_response(args));
             }
             ("hotkeys", "") => {
@@ -303,7 +291,7 @@ impl Shell {
             ("skills", "") => {
                 self.note("Skills", self.skills_listing.clone());
             }
-            ("commands", "") | ("help", "commands") => self.custom_commands_note(),
+            ("commands", "") => self.custom_commands_note(),
             ("context", "") => {
                 let used = self
                     .status
@@ -336,7 +324,6 @@ impl Shell {
                 self.adopt_live(app, "Laya", result);
             }
             _ => {
-                let name = canonical_command(name);
                 let result = match crate::app::commands::run_live(self, app, name, args) {
                     Some(result) => result,
                     None => match crate::app::commands::run_settings(self, app, None, name, args) {

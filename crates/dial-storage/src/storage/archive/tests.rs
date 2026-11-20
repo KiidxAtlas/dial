@@ -370,12 +370,6 @@ fn a_final_record_ending_exactly_at_the_window_boundary_is_observed() {
 }
 
 #[test]
-fn iso_formats_known_instants() {
-    assert_eq!(iso(0), "1970-01-01T00:00:00Z");
-    assert_eq!(iso(951_782_401), "2000-02-29T00:00:01Z");
-}
-
-#[test]
 fn session_failures_pair_errors_with_their_calls_and_strip_notices() {
     let call = |id: &str, name: &str, args: &str| {
         serde_json::json!({"type":"message","ts":"2026-01-02T03:04:10.000Z","message":{"role":"assistant","content":"",

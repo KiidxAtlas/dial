@@ -77,10 +77,7 @@ pub fn layer_id(messages: &[Value], source_text: &str) -> Result<String> {
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex(&Sha256::digest(bytes))
 }
 
 fn is_digest(text: &str) -> bool {

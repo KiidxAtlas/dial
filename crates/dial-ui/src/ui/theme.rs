@@ -455,7 +455,7 @@ impl Theme {
     pub fn is_dark(&self) -> bool {
         self.dark
     }
-    #[cfg(test)]
+    /// Active glyph preset, including the resolved value of `auto`.
     pub fn glyphs(&self) -> Glyphs {
         self.glyphs
     }
@@ -508,6 +508,12 @@ impl Theme {
             Some(custom) => custom,
             None => symbol(self.glyphs, s),
         }
+    }
+
+    /// The padded dot between a row's facts (` · `, or ` - ` in ASCII): one owner for the
+    /// `format!(" {} ", theme.sym(Sym::Dot))` join used across transcript and overlay rows.
+    pub fn dot_sep(&self) -> String {
+        format!(" {} ", self.sym(Sym::Dot))
     }
 
     /// One frame of the activity spinner for an animation `tick` (~12 fps). The default is a

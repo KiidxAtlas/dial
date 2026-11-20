@@ -10,7 +10,6 @@ use super::model_config::{RequestHeader, ResolvedHeaders, resolve_headers};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -439,13 +438,7 @@ fn tokenizer_digest(path: &Path, format: LocalFormat) -> Option<String> {
 fn mlx_tokenizer_digest(dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let file = std::fs::File::open(dir.join("tokenizer.json")).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_TOKENIZER_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_TOKENIZER_BYTES {
-        return None;
-    }
+    let bytes = crate::llm::read_within(file, MAX_TOKENIZER_BYTES)?;
     let tokenizer: Value = serde_json::from_slice(&bytes).ok()?;
     let model = &tokenizer["model"];
     let parts = json!([
@@ -454,7 +447,7 @@ fn mlx_tokenizer_digest(dir: &Path) -> Option<String> {
         tokenizer.get("added_tokens")
     ]);
     let digest = Sha256::digest(serde_json::to_vec(&parts).ok()?);
-    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+    Some(crate::hex(&digest))
 }
 
 type FactsKey = (String, String);

@@ -790,10 +790,7 @@ impl AxBackend for AtSpiAx {
                 .map_err(|err| DesktopError::ax_failed(format!("AT-SPI attributes: {err}")))?
                 .into_iter()
                 .map(|(key, value)| {
-                    let end = (0..=value.len().min(200))
-                        .rev()
-                        .find(|&index| value.is_char_boundary(index))
-                        .unwrap_or(0);
+                    let end = value.floor_char_boundary(200);
                     (key, value[..end].to_owned())
                 })
                 .collect();

@@ -11,6 +11,79 @@ fn ctx() -> Ctx<'static> {
     }
 }
 
+#[test]
+fn model_discovery_posts_project_and_reads_provider_ids() {
+    use crate::llm::fake;
+    // A catalog contains per-model metadata and can outgrow the OAuth token-response limit.
+    let response =
+        json!({"models": {"account-model": {"description": "x".repeat(util::MAX_BODY)}}});
+    let server = fake::serve(vec![fake::json(200, &response)]);
+    let mut access = oauth::bearer(&oauth::Credentials {
+        access: "fixture".into(),
+        project_id: Some("fixture-project".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    access.base_url = Some(server.url.clone());
+    let (_, listing) = model_listing(&access, &Arc::new(AtomicBool::new(false))).unwrap();
+    assert_eq!(listing, response);
+    let req = String::from_utf8(server.requests().pop().unwrap()).unwrap();
+    let (headers, body) = req.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("POST /v1internal:fetchAvailableModels "));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        json!({"project":"fixture-project"})
+    );
+}
+
+#[test]
+fn listing_error_reports_method_and_status_without_response_body() {
+    use crate::llm::fake;
+    let server = fake::serve(vec![fake::json(404, &json!({"error":"private fixture"}))]);
+    let mut access = oauth::bearer(&oauth::Credentials {
+        access: "fixture".into(),
+        project_id: Some("fixture-project".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    access.base_url = Some(server.url.clone());
+    let error = model_listing(&access, &Arc::new(AtomicBool::new(false))).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Antigravity fetchAvailableModels returned HTTP 404"
+    );
+}
+#[test]
+fn model_list_and_quota_enforce_their_own_response_limits() {
+    use crate::llm::fake;
+    for (path, limit) in [
+        (MODELS_PATH, crate::llm::catalog::MAX_RESPONSE as usize),
+        (SUMMARY_PATH, util::MAX_BODY),
+    ] {
+        let server = fake::serve(vec![fake::json(200, &json!("x".repeat(limit)))]);
+        let error = post_first_available(
+            std::slice::from_ref(&server.url),
+            path,
+            "project",
+            "Bearer fixture",
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .err()
+        .expect("oversized body must fail");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("size limit ({limit} bytes)")),
+            "{error}"
+        );
+    }
+}
+
 fn summary_fixture() -> Value {
     json!({
         "groups": [

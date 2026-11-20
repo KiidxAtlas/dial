@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Largest accepted OAuth/userinfo/discovery response body.
+/// Default limit for OAuth and userinfo responses; larger catalogs have a separate bound.
 pub const MAX_BODY: usize = 256 * 1024;
 /// Default whole-request bound for OAuth endpoints.
 pub const TIMEOUT_SECS: u64 = 30;
@@ -216,7 +216,27 @@ pub fn request_with_timeout(
     cancel: &Arc<AtomicBool>,
     timeout_secs: u64,
 ) -> Result<Response> {
-    ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
+    request_with_limits(
+        method,
+        url,
+        headers,
+        body,
+        cancel,
+        timeout_secs,
+        MAX_BODY as u64,
+    )
+}
+
+pub(in crate::llm) fn request_with_limits(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Body<'_>,
+    cancel: &Arc<AtomicBool>,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<Response> {
+    check_cancelled(cancel)?;
     let uri: ureq::http::Uri = url.parse().context("invalid OAuth endpoint URL")?;
     let scheme = uri.scheme_str().unwrap_or_default();
     let host = uri.host().unwrap_or_default();
@@ -228,7 +248,19 @@ pub fn request_with_timeout(
     );
     let agent = crate::llm::agent_with(timeout_secs, !local, Some(Arc::clone(cancel)), None);
     let display = crate::llm::display_url(url);
-    let failed = |_| anyhow::anyhow!("request to {display} failed");
+    let failed = |error: ureq::Error| {
+        // Do not format a transport error: it can contain request data.
+        let reason = match error {
+            ureq::Error::Timeout(_) => "timed out",
+            ureq::Error::HostNotFound => "host not found",
+            ureq::Error::ConnectionFailed => "connection failed",
+            ureq::Error::Io(ref io) => {
+                return anyhow::anyhow!("request to {display} failed: {}", io.kind());
+            }
+            _ => "transport error",
+        };
+        anyhow::anyhow!("request to {display} failed: {reason}")
+    };
     let mut response = match method {
         "GET" | "DELETE" => {
             let mut builder = if method == "GET" {
@@ -290,12 +322,12 @@ pub fn request_with_timeout(
     response
         .body_mut()
         .as_reader()
-        .take(MAX_BODY as u64 + 1)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("reading the response from {display} failed"))?;
+        .map_err(|e| anyhow::anyhow!("reading the response from {display} failed: {}", e.kind()))?;
     ensure!(
-        bytes.len() <= MAX_BODY,
-        "response from {display} exceeded the size limit"
+        bytes.len() as u64 <= max_bytes,
+        "response from {display} exceeded the size limit ({max_bytes} bytes)"
     );
     Ok(Response {
         status,
@@ -604,7 +636,7 @@ pub fn poll_device<T>(
         Duration::from_millis(interval_secs.unwrap_or(5).saturating_mul(1000).max(1000));
     let mut slow_downs = 0;
     loop {
-        ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
+        check_cancelled(cancel)?;
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
@@ -661,13 +693,59 @@ pub fn classify_device_response(response: &Response) -> Poll<Value> {
 pub fn sleep_cancellable(duration: Duration, cancel: &AtomicBool) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < duration {
-        ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
+        check_cancelled(cancel)?;
         std::thread::sleep(
             duration
                 .saturating_sub(start.elapsed())
                 .min(Duration::from_millis(50)),
         );
     }
+    Ok(())
+}
+
+/// Refuse to continue a sign-in the user cancelled.
+pub fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
+    Ok(())
+}
+
+/// Read the key without echoing it; cancel and missing input must not start a validation request.
+pub(super) fn prompt_api_key(
+    ui: &dyn super::Interaction,
+    cancel: &AtomicBool,
+    label: &str,
+    hint: &str,
+) -> Result<String> {
+    let answer = ui.prompt_secret(&format!("Paste your {label} API key"), Some(hint), false)?;
+    check_cancelled(cancel)?;
+    let key = answer.trim();
+    ensure!(!key.is_empty(), "{label} API key is required");
+    ui.progress("Validating API key...");
+    Ok(key.to_owned())
+}
+
+/// Verify a bearer API key by listing `{base_url}/models`; `label` names the provider in the refusal.
+pub fn validate_bearer_models(
+    label: &str,
+    key: &str,
+    base_url: &str,
+    cancel: &Arc<AtomicBool>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let bearer = format!("Bearer {key}");
+    let response = request_with_timeout(
+        "GET",
+        &format!("{base_url}/models"),
+        &[("Authorization", bearer.as_str())],
+        Body::Empty,
+        cancel,
+        timeout_secs,
+    )?;
+    ensure!(
+        response.ok(),
+        "{label} API key validation failed (HTTP {})",
+        response.status
+    );
     Ok(())
 }
 
