@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow's package metadata job no longer fails after a successful release because its pull request never receives the checks `main` requires. With the optional `RELEASE_PACKAGING_TOKEN` secret it waits for that pull request's CI and merges it; without the secret it opens the pull request and records a manual-merge warning instead of timing out. [Release and installation](docs/release-and-install.md).
+
 ## [0.3.12] - 2026-11-20
 
 ### Added

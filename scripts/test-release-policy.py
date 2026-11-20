@@ -519,18 +519,24 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() && needs.sign.result == 'success' }}", publish)
         self.assertIn('uses: ./.github/workflows/release-publish.yml', publish)
 
-    def test_packaging_pull_request_dispatches_ci_before_merging(self):
+    def test_packaging_pull_request_merges_only_after_its_required_checks(self):
         workflows = SCRIPT.parent.parent / '.github/workflows'
         packaging = (workflows / 'release-publish.yml').read_text().split('\n  packaging:\n', 1)[1].split('\n  container:\n', 1)[0]
         publish = (workflows / 'release.yml').read_text().split('\n  publish:\n', 1)[1]
-        ci = (workflows / 'ci.yml').read_text().split('\njobs:\n', 1)[0]
-        self.assertIn('workflow_dispatch:', ci)
-        self.assertIn('actions: write', packaging)
-        self.assertIn('actions: write', publish)
-        dispatch = packaging.index('gh workflow run ci.yml --ref "$branch"')
+        # A GITHUB_TOKEN pull request gets no CI run, and dispatched checks are not attached to it.
+        self.assertNotIn('gh workflow run ci.yml', packaging)
+        self.assertNotIn('actions: write', packaging)
+        self.assertIn('RELEASE_PACKAGING_TOKEN: ${{ secrets.RELEASE_PACKAGING_TOKEN }}', publish)
+        self.assertIn('token: ${{ secrets.RELEASE_PACKAGING_TOKEN || github.token }}', packaging)
+        self.assertIn('GH_TOKEN: ${{ secrets.RELEASE_PACKAGING_TOKEN || github.token }}', packaging)
+        create = packaging.index('gh pr create --base main --head "$branch"')
+        manual = packaging.index('if [ "$HAS_PACKAGING_TOKEN" != true ]; then')
+        warning = packaging.index('::warning title=Package metadata needs a manual merge::')
         watch = packaging.index('gh pr checks "$branch" --required --watch')
         merge = packaging.index('gh pr merge "$branch" --merge --delete-branch')
-        self.assertLess(dispatch, watch)
+        self.assertLess(create, manual)
+        self.assertLess(manual, warning)
+        self.assertLess(warning, watch)
         self.assertLess(watch, merge)
 
     def test_candidates_keep_artifact_checks_without_repeating_portable_installer_suite(self):
