@@ -2,6 +2,13 @@ name: Publish prepared release
 
 on:
   workflow_call:
+    secrets:
+      RELEASE_PACKAGING_TOKEN:
+        description: >-
+          Token (fine-grained PAT or GitHub App) with contents and pull-requests write on this
+          repository. A pull request opened with GITHUB_TOKEN gets no CI run, so without this
+          token the packaging pull request is opened but needs a manual merge.
+        required: false
 
 permissions:
   contents: read
@@ -74,10 +81,12 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      # A pull request pushed with GITHUB_TOKEN gets no CI run, so the job dispatches CI itself.
-      actions: write
     steps:
+      # Pushing and opening the pull request with RELEASE_PACKAGING_TOKEN starts its CI normally;
+      # GITHUB_TOKEN events start no workflow run that the required checks could come from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.RELEASE_PACKAGING_TOKEN || github.token }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signed-release-assets
@@ -96,7 +105,8 @@ jobs:
         timeout-minutes: 90
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PACKAGING_TOKEN || github.token }}
+          HAS_PACKAGING_TOKEN: ${{ secrets.RELEASE_PACKAGING_TOKEN != '' }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -123,9 +133,15 @@ jobs:
               --title "release: Dial $RELEASE_TAG package metadata" \
               --body "Automated Homebrew formula and AUR metadata update for $RELEASE_TAG, generated from the signed SHA256SUMS of the published release."
           fi
-          # main requires CI checks, and a GITHUB_TOKEN push starts no pull_request run (it shows
-          # as a failed run with no jobs), so dispatch CI on the branch head and merge once it passes.
-          gh workflow run ci.yml --ref "$branch"
+          url="$(gh pr view "$branch" --json url --jq .url)"
+          if [ "$HAS_PACKAGING_TOKEN" != true ]; then
+            # Neither a GITHUB_TOKEN pull request nor a dispatched CI run produces the checks main
+            # requires, so waiting here could only time out. Report the manual step instead.
+            message="RELEASE_PACKAGING_TOKEN is not configured, so CI on $url waits for approval and it cannot merge automatically. Approve its CI run and merge it once the checks pass."
+            echo "::warning title=Package metadata needs a manual merge::$message"
+            { echo "## Package metadata pull request needs a manual merge"; echo "$message"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           waited=0
           until gh pr checks "$branch" --required --json name --jq 'length > 0' 2>/dev/null | grep -qx true; do
             if [ "$waited" -ge 600 ]; then
