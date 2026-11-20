@@ -314,8 +314,9 @@ jobs:
     uses: ./.github/workflows/release-publish.yml
     permissions:
       contents: write
-      # The packaging job dispatches CI for its metadata pull request.
-      actions: write
       pull-requests: write
       packages: write
       id-token: write
+    secrets:
+      # Optional: lets the packaging pull request run CI and merge itself (release-publish.yml).
+      RELEASE_PACKAGING_TOKEN: ${{ secrets.RELEASE_PACKAGING_TOKEN }}

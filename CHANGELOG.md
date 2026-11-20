@@ -55,6 +55,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Build-time runtime payloads (`scripts/prepare-node.py`, `prepare-python.py`) are copied into a private snapshot, bounded and SHA-256 checked there, and extracted only from that verified copy, so a file that changes after hashing never reaches the extractor.
 - Private project databases are opened through one owner: plain file names inside the state directory only, created owner-only and never through a link, with WAL and a busy timeout.
 
+### Fixed
+
+- The release workflow's package metadata job no longer fails after a successful release because its pull request never receives the checks `main` requires. With the optional `RELEASE_PACKAGING_TOKEN` secret it waits for that pull request's CI and merges it; without the secret it opens the pull request and records a manual-merge warning instead of timing out. [Release and installation](docs/release-and-install.md).
+
 ## [0.3.12] - 2026-11-20
 
 ### Added
