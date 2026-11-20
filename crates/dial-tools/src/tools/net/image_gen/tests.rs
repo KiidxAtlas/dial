@@ -2064,7 +2064,7 @@ fn downloaded_checkpoint_role_runs_on_sd_cpp_with_settings_in_its_prompt_extensi
 }
 
 #[test]
-fn mlx_quantized_checkpoint_role_is_refused_before_any_server_starts() {
+fn mlx_quantized_packs_route_to_a_dial_launched_mlx_serve_where_it_runs() {
     let dir = tempfile::tempdir().unwrap();
     safetensors(
         &dir.path().join("transformer/0.safetensors"),
@@ -2072,11 +2072,49 @@ fn mlx_quantized_checkpoint_role_is_refused_before_any_server_starts() {
     );
     safetensors(&dir.path().join("vae/0.safetensors"), &["d"]);
     safetensors(&dir.path().join("text_encoder/0.safetensors"), &["e"]);
-    let error = resolve(&checkpoint_role_config(dir.path()))
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("MLX-quantized"), "{error}");
+    let config = checkpoint_role_config(dir.path());
+    if crate::llm::server::image::mlx_serve_supported() {
+        let target = resolve(&config).unwrap();
+        assert_eq!(target.wire, Wire::MlxServe);
+        assert!(super::launched_by_dial(&target));
+        assert_eq!(target.model, dir.path().to_str().unwrap());
+        let route = super::current_route(&config).unwrap();
+        assert_eq!(route.api, "MLX-Serve (started by Dial)");
+        assert!(route.settings.contains(&"steps") && route.settings.contains(&"loras"));
+    } else {
+        // Refused before any server starts: MLX-Serve exists only for macOS on Apple Silicon.
+        let error = resolve(&config).err().unwrap().to_string();
+        assert!(error.contains("Apple Silicon"), "{error}");
+    }
+}
+
+#[test]
+fn a_configured_mlx_serve_endpoint_is_not_launched_by_dial() {
+    let mut config = Config::default();
+    config.image.base_url = "http://127.0.0.1:11234/v1".into();
+    config.image.model = "flux2-klein-9b-4bit".into();
+    config.image.api = Some(crate::llm::profiles::ImageGenerationApi::MlxServe);
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.wire, Wire::MlxServe);
+    assert!(!super::launched_by_dial(&target));
+    assert_eq!(super::current_route(&config).unwrap().api, "MLX-Serve");
+}
+
+#[test]
+#[ignore = "installs MLX-Serve when missing, starts it on DIAL_TEST_MLX_IMAGE_PACK and generates one image"]
+fn generates_with_a_dial_launched_mlx_serve() {
+    let model = std::env::var("DIAL_TEST_MLX_IMAGE_PACK").expect("downloaded MLX image pack");
+    let (_dir, ws) = testkit::workspace();
+    let config = checkpoint_role_config(std::path::Path::new(&model));
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a red apple on a table", "output": "apple.png", "size": "1024x1024"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let bytes = std::fs::read(ws.root().join("apple.png")).unwrap();
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert!(decoded.width() >= 256 && decoded.height() >= 256);
 }
 
 #[test]

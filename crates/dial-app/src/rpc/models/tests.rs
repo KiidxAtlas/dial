@@ -1,5 +1,5 @@
 use super::*;
-use crate::llm::profiles::ModelProfile;
+use crate::llm::profiles::{ImageGenerationApi, ModelProfile};
 
 /// A configuration on an uncatalogued provider, so only configured selections are listed.
 fn config() -> Config {
@@ -73,6 +73,111 @@ fn list_merges_configured_sources_and_marks_the_current_model() {
     let filtered = list(&config, &selection("other", "x"), home.path(), Some("acme"));
     assert_eq!(filtered.len(), 2);
     assert!(filtered.iter().all(|row| row["provider"] == "acme"));
+}
+
+/// A saved `/models` listing in `home`, as a refresh writes it.
+fn save_listing(home: &Path, rows: &[(&str, catalog::ModelKind, Option<ImageGenerationApi>)]) {
+    let entries: Vec<catalog::ModelEntry> = rows
+        .iter()
+        .map(|(model, kind, image_generation)| catalog::ModelEntry {
+            selection: ModelSelection {
+                base_url: Some("https://acme.example/v1".into()),
+                ..selection("acme", model)
+            },
+            label: format!("{model} label"),
+            source: "listing".into(),
+            available: true,
+            metadata: catalog::ModelMetadata {
+                kind: *kind,
+                image_generation: *image_generation,
+                ..Default::default()
+            },
+        })
+        .collect();
+    let path = crate::config::paths::model_catalog_file(home);
+    let bytes = serde_json::to_vec(&BTreeMap::from([("acme", entries)])).unwrap();
+    crate::platform::atomic::write_private(&path, &bytes).unwrap();
+}
+
+#[test]
+fn image_listing_offers_models_whose_metadata_declares_image_output() {
+    use catalog::ModelKind::{Chat, Image};
+    let home = tempfile::tempdir().unwrap();
+    save_listing(
+        home.path(),
+        &[
+            ("painter", Image, None),
+            ("both", Chat, Some(ImageGenerationApi::ChatCompletions)),
+            ("talker", Chat, None),
+            ("refused", Image, Some(ImageGenerationApi::Disabled)),
+        ],
+    );
+    let mut config = config();
+    config.image.model = "both".into();
+    // Scoped to the fixture's provider: downloaded local models on this machine are listed too.
+    let images = list_for(&config, home.path(), Some("acme"), Purpose::Image);
+    let ids: Vec<&str> = images
+        .iter()
+        .map(|row| row["model_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["both", "painter"],
+        "declared output only; Disabled wins"
+    );
+    assert_eq!(images[0]["current"], true);
+    assert_eq!(images[0]["image_api"], "chat-completions");
+    assert_eq!(images[0]["base_url"], "https://acme.example/v1");
+    assert_eq!(images[1]["current"], false);
+    assert!(list_for(&config, home.path(), Some("other"), Purpose::Image).is_empty());
+
+    // The chat listing keeps chat models only and says which of them also make images.
+    let chat = list(&config, &config.selection(), home.path(), Some("acme"));
+    let row = |id: &str| chat.iter().find(|row| row["model_id"] == id);
+    assert!(
+        row("painter").is_none(),
+        "an image-only model is not a main model"
+    );
+    assert_eq!(row("both").unwrap()["image_output"], true);
+    assert_eq!(row("talker").unwrap()["image_output"], false);
+    assert!(
+        row("main").unwrap().get("image_output").is_none(),
+        "unknown is omitted"
+    );
+}
+
+#[test]
+fn embedding_listing_offers_declared_embedding_models_with_the_id_a_role_saves() {
+    use catalog::ModelKind::{Chat, Embedding, Unknown};
+    let home = tempfile::tempdir().unwrap();
+    save_listing(
+        home.path(),
+        &[
+            ("vectors", Embedding, None),
+            ("other-vectors", Embedding, None),
+            ("talker", Chat, None),
+            ("mystery", Unknown, None),
+        ],
+    );
+    let mut config = config();
+    config
+        .model_roles
+        .insert("embedding".into(), selection("acme", "vectors"));
+    let rows = list_for(&config, home.path(), Some("acme"), Purpose::Embedding);
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|row| row["model_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["other-vectors", "vectors"],
+        "declared embedding kind only"
+    );
+    assert_eq!(rows[1]["current"], true, "the assigned embedding role");
+    assert_eq!(rows[0]["current"], false);
+    assert_eq!(rows[1]["provider"], "acme");
+    assert_eq!(rows[1]["base_url"], "https://acme.example/v1");
+    assert!(rows[1].get("image_api").is_none());
 }
 
 #[test]

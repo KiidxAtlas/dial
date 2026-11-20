@@ -71,6 +71,21 @@ fn sd_cpp_pins_a_flat_archive_for_each_supported_platform() {
 }
 
 #[test]
+fn mlx_serve_pins_its_apple_silicon_archive_only() {
+    let asset = MLX_SERVE.asset("darwin-arm64").unwrap();
+    assert_eq!(asset.format, Format::TarGz);
+    assert_eq!(asset.sha256.len(), 64);
+    assert!(
+        asset
+            .url
+            .starts_with("https://github.com/ddalcu/mlx-serve/releases/download/v26.11.3/")
+    );
+    for platform in ["darwin-x64", "linux-x64", "linux-arm64", "win32-x64"] {
+        assert!(MLX_SERVE.asset(platform).is_none(), "{platform}");
+    }
+}
+
+#[test]
 fn symlinks_must_stay_inside_the_install_directory() {
     assert!(link_stays_inside(
         Path::new("bin/npm"),

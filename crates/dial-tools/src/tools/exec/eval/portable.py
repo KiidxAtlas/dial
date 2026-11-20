@@ -329,3 +329,19 @@ class _Dial:
 
 
 dial = _Dial()
+
+
+def _dial_register_module():
+    # Models sometimes write `import dial`; bind it to these helpers unless a real `dial` module exists.
+    import importlib.util, sys
+    if "dial" in sys.modules:
+        return
+    try:
+        if importlib.util.find_spec("dial") is not None:
+            return
+    except (ImportError, ValueError):
+        pass
+    sys.modules["dial"] = dial
+
+
+_dial_register_module()

@@ -292,7 +292,7 @@ fn ordinary_print_turn_keeps_disabled_learning_and_internal_policy_out_of_output
         frames.iter().all(|frame| {
             frame["type"] != "notice"
                 || frame["message"].as_str().is_some_and(|message| {
-                    message.starts_with("Could not prevent automatic sleep during this turn: ")
+                    message.starts_with("Could not prevent automatic sleep during this turn ")
                 })
         }),
         "unexpected coding notices: {frames:?}"

@@ -17,6 +17,22 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-11-20
+
+### Added
+
+- Dial runs downloaded MLX image packs itself on macOS with Apple Silicon. Assigning one (or a model in `~/.mlx-serve/models`) to the `image` role makes `image_gen` start MLX-Serve on loopback for the call and stop it afterwards; when MLX-Serve is missing, the call first installs its pinned, checksum-verified 26.11.3 release into Dial's `tools/mlx-serve` folder. `/setup mlx-serve` installs it ahead of time and `DIAL_MLX_SERVE` selects another build. Other systems still list MLX packs as unavailable, with the reason. [Image generation](docs/image-generation.md).
+- RPC `list_models` takes `purpose: "image"` to list the models that generate images (downloaded local models and saved provider listings that declare image output), with the `base_url` and `image_api` each needs, and `purpose: "embedding"` to list declared embedding models, so clients can offer `image.model` and the image and embedding roles as choices. RPC `image_settings` reports the image route `image_gen` would use (or why it fails) and the per-model generation settings for it, like `/image settings`. Chat rows also report `image_output` when the listing says. [RPC and ACP](docs/rpc-and-acp.md).
+
+### Fixed
+
+- Leaving first-run model setup with Esc or the new **Skip for now** choice (which replaces Quit setup) now opens Dial without a model instead of exiting; prompts then explain how to pick one with `/model` or `/providers`. [Setup](docs/setup.md#first-launch-and-model-readiness).
+- List Gemini 4 Neon under Google Antigravity so signed-in users can select it with an eligible Google AI subscription. [Provider setup](docs/provider-catalog.md).
+- Python `eval` cells can now `import dial` (or `from dial import readText`) and get the built-in helpers instead of `ModuleNotFoundError`; a real `dial` module in the environment still takes precedence. [Execution](docs/execution-and-web.md).
+- A refused write or read under a system temp directory (`/tmp`, `/var/tmp`, the OS temp dir) now suggests the workspace `.tmp/<name>` scratch path instead of only offering a directory-access request. [Directory access](docs/directory-access.md).
+- The "Could not prevent automatic sleep" notice now appears once per process instead of on every turn and worker, so headless and container runs without a system D-Bus are not flooded; each turn still tries to acquire the guard. [Agent loop](docs/agent-loop.md#automatic-sleep-prevention).
+- Harbor trial diagnostics flag `wall_clock_exceeds_agent_elapsed` when the harness wall clock far exceeds the agent's own elapsed time (for example, host sleep), so affected timings are not read as slow agent work. [Benchmarks](docs/benchmarks.md#harbor-pilot-diagnostic-records).
+
 ## [0.3.11] - 2026-11-19
 
 ### Added
@@ -3090,7 +3106,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.11...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.12...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3138,3 +3154,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.9]: https://github.com/KiidxAtlas/dial/tree/v0.3.9
 [0.3.10]: https://github.com/KiidxAtlas/dial/tree/v0.3.10
 [0.3.11]: https://github.com/KiidxAtlas/dial/tree/v0.3.11
+[0.3.12]: https://github.com/KiidxAtlas/dial/tree/v0.3.12

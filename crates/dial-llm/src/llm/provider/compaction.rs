@@ -232,7 +232,9 @@ impl Backend {
                     anthropic,
                 )
             }
-            ProviderKind::Local { .. } | ProviderKind::Apple => {
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => {
                 bail!("native history cannot be replayed through a local provider")
             }
         };
@@ -349,7 +351,9 @@ impl Backend {
                     _ => false,
                 }
             }
-            ProviderKind::Local { .. } | ProviderKind::Apple => false,
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => false,
         }
     }
     pub fn compact_native(
@@ -506,7 +510,9 @@ impl Backend {
                     anthropic,
                 )
             }
-            ProviderKind::Local { .. } | ProviderKind::Apple => {
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => {
                 bail!("local providers have no native compaction route")
             }
         };

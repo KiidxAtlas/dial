@@ -17,6 +17,8 @@ struct Row {
     label: String,
     sources: Vec<String>,
     local: Option<catalog::ModelMetadata>,
+    /// Whether the model generates images, when its listing or local metadata says.
+    image_output: Option<bool>,
 }
 
 fn key(selection: &ModelSelection) -> String {
@@ -46,6 +48,7 @@ pub(super) fn list(
             label: label.unwrap_or(&selection.model).to_owned(),
             sources: Vec::new(),
             local: None,
+            image_output: None,
         });
         if !row.sources.contains(&source) {
             row.sources.push(source);
@@ -104,6 +107,7 @@ pub(super) fn list(
         if let Some(row) = rows.get_mut(&key(&entry.selection))
             && row.local.is_none()
         {
+            row.image_output = Some(entry.supports_images());
             row.local = Some(entry.metadata);
         }
     }
@@ -114,6 +118,78 @@ pub(super) fn list(
             describe(config, row, is_current)
         })
         .collect()
+}
+
+/// What a non-chat `list_models` listing is for (`purpose` param).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Purpose {
+    /// Models that generate images: the `image.model` setting and the `image` role.
+    Image,
+    /// Embedding models: the `embedding` role (semantic memory recall).
+    Embedding,
+}
+
+impl Purpose {
+    fn accepts(self, entry: &catalog::ModelEntry) -> bool {
+        match self {
+            Self::Image => entry.supports_images(),
+            Self::Embedding => entry.is_embedding(),
+        }
+    }
+}
+
+/// RPC `list_models` with `purpose: "image"` or `"embedding"`: the models a non-chat role or
+/// setting can take. A model qualifies when its saved provider listing or local metadata declares
+/// it (image output via `ModelEntry::supports_images`, the test the terminal's image setting uses;
+/// the embedding kind via `ModelEntry::is_embedding`, the terminal's embedding role rule); names
+/// are never guessed. Offline like `list`: downloaded local models and every saved `/models`
+/// listing, no network request. `provider` is the id a role assignment saves and
+/// `provider_label` the name to show. `current` marks the configured `image.model` or the
+/// assigned `embedding` role; `base_url` is the endpoint the selection needs and `image_api`
+/// (image rows) what `image.api` needs.
+pub(super) fn list_for(
+    config: &Config,
+    user_dir: &Path,
+    provider: Option<&str>,
+    purpose: Purpose,
+) -> Vec<Value> {
+    let local = catalog::downloaded_local_models(user_dir)
+        .into_iter()
+        .map(|entry| (entry, "local"));
+    let listed = catalog::saved_listing_models(user_dir)
+        .into_iter()
+        .map(|entry| (entry, "listing"));
+    let embedding = config.model_roles.get("embedding");
+    let mut rows: BTreeMap<String, Value> = BTreeMap::new();
+    for (entry, source) in local.chain(listed) {
+        if !purpose.accepts(&entry)
+            || provider.is_some_and(|wanted| entry.selection.provider != wanted)
+        {
+            continue;
+        }
+        rows.entry(key(&entry.selection)).or_insert_with(|| {
+            let current = match purpose {
+                Purpose::Image => entry.selection.model == config.image.model,
+                Purpose::Embedding => embedding.is_some_and(|role| {
+                    role.provider == entry.selection.provider && role.model == entry.selection.model
+                }),
+            };
+            let mut row = json!({
+                "provider": entry.selection.provider,
+                "provider_label": entry.display_provider(),
+                "model_id": entry.selection.model,
+                "label": entry.label,
+                "sources": [source],
+                "current": current,
+                "base_url": entry.selection.base_url,
+            });
+            if purpose == Purpose::Image {
+                row["image_api"] = json!(entry.metadata.image_generation);
+            }
+            row
+        });
+    }
+    rows.into_values().collect()
 }
 
 fn describe(config: &Config, row: Row, current: bool) -> Value {
@@ -139,6 +215,9 @@ fn describe(config: &Config, row: Row, current: bool) -> Value {
         value["vision"] = json!(metadata.vision);
         value["reasoning"] = json!(metadata.reasoning);
         value["kind"] = json!(metadata.kind);
+    }
+    if let Some(images) = row.image_output {
+        value["image_output"] = json!(images);
     }
     value
 }

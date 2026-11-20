@@ -199,6 +199,17 @@ fn protected_session_transcripts_point_to_session_search() {
 }
 
 #[test]
+fn system_temp_refusals_suggest_the_workspace_scratch_directory() {
+    let (_dir, ws) = workspace();
+    for path in ["/tmp/test_escape.txt", "/var/tmp/x"] {
+        let error = ws.resolve(path).unwrap_err();
+        assert!(error.contains("`.tmp/<name>`"), "{path}: {error}");
+    }
+    let error = ws.resolve("/etc/hosts").unwrap_err();
+    assert!(!error.contains(".tmp/"), "{error}");
+}
+
+#[test]
 fn native_mutations_refuse_git_metadata_but_allow_inspection() {
     let (dir, ws) = workspace();
     let ws = ws.with_edit_mode(EditMode::Replace);

@@ -150,6 +150,9 @@ The records include:
 - Explicit missing/malformed/oversized-source, missing latency/result and aggregate-versus-trace
   reconciliation gaps. Incomplete tool/error coverage leaves the diagnostic error total unknown,
   not zero. This does not rewrite producer-reported aggregate counters.
+- `wall_clock_exceeds_agent_elapsed` when Harbor's agent-execution interval exceeds the agent's own
+  `elapsed_sec` by more than 30 seconds and half the elapsed time. Agent clocks such as Dial's are
+  monotonic and skip host sleep; a flagged trial's timing is unreliable, not slow.
 - A batch overview with a task/agent outcome matrix, failed official cases, excluded/missing/
   duplicate/unexpected trials, and job-level completion/error/retry counters—even jobs without
   trial results remain visible. Each attempt stays distinct; an empty selection is not a measured zero.

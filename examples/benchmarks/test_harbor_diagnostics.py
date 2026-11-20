@@ -136,6 +136,15 @@ class HarborDiagnosticsTests(unittest.TestCase):
         self.assertEqual(timing['agent_execution_ms'], 5000)
         self.assertIsNone(timing['verifier_ms'])
 
+    def test_wall_clock_far_beyond_agent_elapsed_is_flagged_not_hidden(self):
+        def kinds(wall_end, elapsed):
+            self.put('result.json', {'agent_execution': {'started_at': '2026-11-05T00:00:00Z',
+                                                         'finished_at': wall_end}})
+            self.put('agent/metrics.json', {'elapsed_sec': elapsed, 'usage': {}})
+            return {g['kind'] for g in summarize_trial(self.root)['coverage_gaps']}
+        self.assertIn('wall_clock_exceeds_agent_elapsed', kinds('2026-11-05T00:26:57Z', 44.9))
+        self.assertNotIn('wall_clock_exceeds_agent_elapsed', kinds('2026-11-05T00:00:33Z', 32.8))
+
     def test_symlink_outside_trial_is_not_read(self):
         with tempfile.TemporaryDirectory() as outside:
             private = Path(outside) / 'private.jsonl'

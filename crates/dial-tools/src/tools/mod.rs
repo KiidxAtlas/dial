@@ -1087,18 +1087,21 @@ impl Workspace {
                         .find(|dir| dir.join(".git").exists())
                         .or_else(|| path.parent())
                         .unwrap_or(path);
-                    let dep_hint = if path.to_string_lossy().contains("/.cargo/registry/")
-                        || path.to_string_lossy().contains("/.cargo/git/")
-                        || path.to_string_lossy().contains("/.rustup/toolchains/")
-                        || path.to_string_lossy().contains("/site-packages/")
-                        || path.to_string_lossy().contains("/pkg/mod/")
+                    let text = path.to_string_lossy();
+                    let hint = if text.contains("/.cargo/registry/")
+                        || text.contains("/.cargo/git/")
+                        || text.contains("/.rustup/toolchains/")
+                        || text.contains("/site-packages/")
+                        || text.contains("/pkg/mod/")
                     {
                         " For dependency source code, use the `dep_source` tool (discoverable via `tool_search`) instead."
+                    } else if Self::in_system_temp(path) {
+                        " For scratch files, use a workspace path such as `.tmp/<name>` instead of a system temp directory."
                     } else {
                         ""
                     };
                     io::Error::new(io::ErrorKind::PermissionDenied, format!(
-                        "path {input:?} is outside the workspace; call `ask` action=directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.{dep_hint}",
+                        "path {input:?} is outside the workspace; call `ask` action=directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.{hint}",
                         project.display()
                     ))
                 })?
@@ -1286,6 +1289,18 @@ impl Workspace {
             canonical.display()
         );
         Ok(canonical)
+    }
+
+    /// Whether `path` lies in a conventional system temp directory, where models put scratch files.
+    fn in_system_temp(path: &Path) -> bool {
+        let canonical = Self::canonical_prefix(path);
+        ["/tmp", "/var/tmp"]
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::iter::once(std::env::temp_dir()))
+            .any(|dir| {
+                path.starts_with(&dir) || canonical.starts_with(Self::canonical_prefix(&dir))
+            })
     }
 
     /// `path` with its deepest existing ancestor canonicalized and the missing tail re-appended, so an

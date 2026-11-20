@@ -60,25 +60,38 @@ pub(super) fn resolve(config: &Config) -> Result<Option<Target>> {
     resolve_current(&role_config)
 }
 
+/// A route to a server Dial starts for one call ([`super::LAUNCHED_BY_DIAL`]).
+fn launched(model: String, wire: Wire) -> Target {
+    Target {
+        base_url: super::LAUNCHED_BY_DIAL.into(),
+        model,
+        wire,
+        key: String::new(),
+        account_id: None,
+        headers: Vec::new(),
+        settings: Default::default(),
+    }
+}
+
 /// Resolve a concrete candidate without reapplying the image role.
 pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
     let selection = config.selection();
-    // A downloaded checkpoint (a path, no endpoint) runs on a Dial-launched sd-server per call.
-    if selection.provider == "mlx"
-        && selection.base_url.is_none()
-        && llm::server::image::is_checkpoint_path(Path::new(&selection.model))
-    {
-        llm::server::image::components(Path::new(&selection.model))?;
-        return Ok(Some(Target {
-            // Replaced by the launched server's address before any request.
-            base_url: "http://127.0.0.1".into(),
-            model: selection.model,
-            wire: Wire::SdCpp,
-            key: String::new(),
-            account_id: None,
-            headers: Vec::new(),
-            settings: Default::default(),
-        }));
+    // A downloaded model (a path, no endpoint) runs on a server Dial launches for each call: MLX
+    // image packs on MLX-Serve (Apple Silicon only), other checkpoints on stable-diffusion.cpp.
+    if selection.provider == "mlx" && selection.base_url.is_none() {
+        let model = Path::new(&selection.model);
+        if llm::server::image::runs_on_mlx_serve(model) {
+            ensure!(
+                llm::server::image::mlx_serve_supported(),
+                "{} is an MLX image pack: it runs on MLX-Serve, which needs macOS with Apple Silicon. Download the original safetensors of this model to run it on stable-diffusion.cpp",
+                model.display()
+            );
+            return Ok(Some(launched(selection.model, Wire::MlxServe)));
+        }
+        if llm::server::image::is_checkpoint_path(model) {
+            llm::server::image::components(model)?;
+            return Ok(Some(launched(selection.model, Wire::SdCpp)));
+        }
     }
     if !super::provider_enabled(config, &selection.provider) {
         ensure!(

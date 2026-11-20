@@ -79,11 +79,11 @@ impl<'a> Agent<'a> {
         let _idle_sleep = if self.hermetic {
             None
         } else {
-            match crate::platform::power::IdleSleepGuard::acquire() {
-                Ok(guard) => Some(guard),
+            match crate::platform::power::IdleSleepGuard::acquire_reporting_once() {
+                Ok(guard) => guard,
                 Err(error) => {
                     ui.notice(&format!(
-                        "Could not prevent automatic sleep during this turn: {error:#}"
+                        "Could not prevent automatic sleep during this turn (not repeated for later turns or workers): {error:#}"
                     ));
                     None
                 }

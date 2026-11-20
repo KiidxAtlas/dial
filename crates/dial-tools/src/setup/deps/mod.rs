@@ -429,6 +429,22 @@ pub const RECIPES: &[Recipe] = &[
             ),
         ],
     },
+    Recipe {
+        id: "mlx-serve",
+        title: "MLX-Serve (mlx-serve)",
+        requires: &[],
+        program: "mlx-serve",
+        base: Base::Install,
+        artifact: "mlx-serve",
+        // Runs MLX image packs on Apple Silicon. Its Homebrew formula needs a third-party tap, so
+        // Dial installs the pinned release archive (macOS arm64 only).
+        methods: &[
+            Method::Download(prebuilt::MLX_SERVE),
+            Method::Manual(
+                "install MLX-Serve from https://github.com/ddalcu/mlx-serve/releases (macOS on Apple Silicon) and set DIAL_MLX_SERVE to its mlx-serve",
+            ),
+        ],
+    },
 ];
 
 pub fn recipe(id: &str) -> Option<&'static Recipe> {

@@ -35,6 +35,8 @@ pub(super) struct App {
     pub(super) add_dirs: Vec<std::path::PathBuf>,
     /// `--plan` / `--prewalk` startup state; the startup arm runs once for the first agent.
     pub(super) mode_flags: crate::cli::mode_flags::ModeFlags,
+    /// The user skipped model setup: agents run without a model until one is picked.
+    pub(super) model_deferred: bool,
 }
 
 impl App {
@@ -71,6 +73,7 @@ impl App {
             compute: RefCell::new(None),
             launch,
             add_dirs,
+            model_deferred: false,
             mode_flags,
         };
         app.reopen_store();
@@ -93,7 +96,19 @@ impl App {
         if let Some(store) = &self.store {
             crate::learn::improve::apply_pinned_model(&mut serving, store)?;
         }
-        let backend = crate::agent::make_session_backend(&serving, &session)?;
+        let backend = match crate::agent::make_session_backend(&serving, &session) {
+            Ok(backend) => backend,
+            // Setup was skipped: run the shell without a model until one is picked.
+            Err(error) if self.model_deferred => {
+                let reason = if serving.model.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{error:#}")
+                };
+                crate::agent::unconfigured_backend(&serving, &reason)
+            }
+            Err(error) => return Err(error),
+        };
         let mut agent = Agent::interactive(
             &self.config,
             backend,

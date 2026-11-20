@@ -76,8 +76,9 @@ observation on growth; this is not a measured matching-speed improvement.
 ## Persistent kernels and evaluation
 
 The portable `dial` helpers work in Node, embedded JavaScript and Python. JavaScript calls use
-`await`; Python calls are synchronous. All I/O uses the normal admitted tools, approvals,
-confinement and execution records:
+`await`; Python calls are synchronous. In Python, `import dial` and `from dial import readText`
+resolve to the same helpers unless the environment already provides a real `dial` module. All I/O
+uses the normal admitted tools, approvals, confinement and execution records:
 
 - `read(path)` returns exact UTF-8 content, byte count and SHA-256. `readText`, `readJson` and
   `readBytes` return decoded values. Data reads require one literal local path, limited to 1 MiB.

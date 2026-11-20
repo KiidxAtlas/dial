@@ -220,6 +220,20 @@ pub const SD_CPP: Prebuilt = Prebuilt {
     ],
 };
 
+/// MLX-Serve 26.11.3 (`mlx-serve`), from its GitHub release: the command-line server with its MLX
+/// libraries in `lib/` under one top-level folder. Built for macOS on Apple Silicon only; the
+/// digest is the release's asset digest.
+pub const MLX_SERVE: Prebuilt = Prebuilt {
+    version: "26.11.3",
+    binary: "mlx-serve",
+    assets: &[Asset {
+        platform: "darwin-arm64",
+        url: "https://github.com/ddalcu/mlx-serve/releases/download/v26.11.3/mlx-serve-bin-macos-arm64.tar.gz",
+        sha256: "a45db31a0a670dc551ed2f220719dc991a2ca13aaae9ec7d2a857625da7f32e4",
+        format: Format::TarGz,
+    }],
+};
+
 /// Downloads `asset` into `dest` (the install directory). The archive goes to a `.download` file
 /// beside `dest`, is checked against its pinned digest, unpacked into `<dest>.part`, and only then
 /// replaces `dest`. Any failure leaves no partial install behind.

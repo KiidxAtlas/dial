@@ -185,6 +185,13 @@ pub fn sd_server() -> Option<PathBuf> {
     find_server("DIAL_SD_SERVER", "sd-cpp", "sd-server")
 }
 
+/// MLX-Serve's `mlx-serve`, which serves downloaded MLX image packs on Apple Silicon:
+/// `DIAL_MLX_SERVE`, else Dial's own install (`/setup mlx-serve`, at `tools/mlx-serve`), else `PATH`
+/// or a common package-manager location.
+pub fn mlx_serve() -> Option<PathBuf> {
+    find_server("DIAL_MLX_SERVE", "mlx-serve", "mlx-serve")
+}
+
 /// A server program: the explicit `variable`, Dial's install under `tools/<install>`, then `PATH`.
 fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(variable).filter(|v| !v.is_empty()) {

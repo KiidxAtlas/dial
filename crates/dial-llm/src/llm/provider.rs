@@ -46,6 +46,21 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Shown once per conversation when llama.cpp's `/props` `chat_template_caps` say the model's chat
 /// template cannot render tools natively; llama.cpp's own log warns its fallback may do badly.
 const LLAMA_TOOL_TEMPLATE_NOTICE: &str = "llama-server reports this model's chat template has no native tool support (/props chat_template_caps), so tool calls may be unreliable. Restart it with --jinja --chat-template-file <a tool-use template for this model>; see llama.cpp docs/function-calling.md.";
+/// Provider and model labels of a [`ProviderKind::Unconfigured`] route, shown in status lines.
+pub const UNCONFIGURED_PROVIDER: &str = "none";
+pub const UNCONFIGURED_MODEL: &str = "no model";
+
+/// Why a request on an unconfigured route fails, and how to fix it.
+pub fn unconfigured_message(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "No model is selected. Pick one with /model, or set up a provider in /providers.".to_owned()
+    } else {
+        format!(
+            "No usable model ({reason}). Pick one with /model, or set up a provider in /providers."
+        )
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -69,6 +84,9 @@ pub enum ProviderKind {
     AnthropicSubscription { model: String, user_dir: PathBuf },
     /// Apple's on-device system model through Dial's FoundationModels helper (`llm::apple`).
     Apple,
+    /// No usable model yet: the user skipped setup or the configured route could not be built.
+    /// The shell runs; every model request fails with `reason` and a pointer to `/model`.
+    Unconfigured { reason: String },
 }
 // Not derived: the key must never reach a log through `{:?}`.
 impl fmt::Debug for ProviderKind {
@@ -106,6 +124,7 @@ impl fmt::Debug for ProviderKind {
                 .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
                 .finish(),
             ProviderKind::Apple => f.write_str("Apple"),
+            ProviderKind::Unconfigured { .. } => f.write_str("Unconfigured"),
         }
     }
 }
@@ -245,7 +264,7 @@ pub fn validate(kind: &ProviderKind, allow_insecure: bool) -> Result<()> {
             }
             endpoint_url(base_url, allow_insecure).map(drop)
         }
-        ProviderKind::Apple => Ok(()),
+        ProviderKind::Apple | ProviderKind::Unconfigured { .. } => Ok(()),
     }
 }
 
@@ -260,6 +279,7 @@ pub fn context_window_hint(kind: &ProviderKind) -> Option<u32> {
         }
         ProviderKind::Local { model_dir } => local_context_window(Path::new(model_dir)),
         ProviderKind::Apple => Some(llm::apple::availability().context_size),
+        ProviderKind::Unconfigured { .. } => None,
     }
 }
 
@@ -668,6 +688,7 @@ impl Backend {
             ProviderKind::ChatGpt { .. } => "chatgpt",
             ProviderKind::Local { .. } => "mlx",
             ProviderKind::Apple => llm::apple::PROVIDER,
+            ProviderKind::Unconfigured { .. } => UNCONFIGURED_PROVIDER,
             ProviderKind::Endpoint { .. } => "openai-compatible",
             ProviderKind::AnthropicEndpoint { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 "anthropic"
@@ -812,7 +833,10 @@ impl Backend {
         config: &crate::config::secrets::Config,
         user_dir: &Path,
     ) -> Result<Self> {
-        self.secrets = if matches!(self.kind, ProviderKind::Local { .. } | ProviderKind::Apple) {
+        self.secrets = if matches!(
+            self.kind,
+            ProviderKind::Local { .. } | ProviderKind::Apple | ProviderKind::Unconfigured { .. }
+        ) {
             None
         } else {
             llm::secrets::Masker::from_config(config, user_dir)?.map(Arc::new)
@@ -838,7 +862,9 @@ impl Backend {
     pub fn response_timeout(&self, worker_timeout_secs: u64) -> u64 {
         let remote = match &self.kind {
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => true,
-            ProviderKind::Local { .. } | ProviderKind::Apple => false,
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => false,
             ProviderKind::Endpoint { base_url, .. }
             | ProviderKind::AnthropicEndpoint { base_url, .. } => {
                 !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
@@ -914,6 +940,7 @@ impl Backend {
             .unwrap_or_else(|| match &self.kind {
                 ProviderKind::Local { .. } => "mlx",
                 ProviderKind::Apple => llm::apple::PROVIDER,
+                ProviderKind::Unconfigured { .. } => UNCONFIGURED_PROVIDER,
                 ProviderKind::ChatGpt { .. } => "chatgpt",
                 ProviderKind::AnthropicSubscription { .. }
                 | ProviderKind::AnthropicEndpoint { .. } => "anthropic",
@@ -1030,6 +1057,7 @@ impl Backend {
     fn route_model(&self) -> &str {
         match &self.kind {
             ProviderKind::Apple => llm::apple::MODEL,
+            ProviderKind::Unconfigured { .. } => UNCONFIGURED_MODEL,
             ProviderKind::Local { model_dir } => model_dir.as_str(),
             ProviderKind::Endpoint { model, .. }
             | ProviderKind::AnthropicEndpoint { model, .. } => model.as_str(),
@@ -1204,7 +1232,9 @@ impl Backend {
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 return None;
             }
-            ProviderKind::Local { .. } | ProviderKind::Apple => false,
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => false,
             ProviderKind::Endpoint { base_url, .. }
             | ProviderKind::AnthropicEndpoint { base_url, .. } => {
                 !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
@@ -1226,7 +1256,11 @@ impl Backend {
             | ProviderKind::AnthropicEndpoint { model, .. }
             | ProviderKind::ChatGpt { model, .. }
             | ProviderKind::AnthropicSubscription { model, .. } => model,
-            ProviderKind::Local { .. } | ProviderKind::Apple => return None,
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => {
+                return None;
+            }
         };
         let bundled = llm::catalog::model_capabilities(model)?;
         let now_ms = std::time::SystemTime::now()
@@ -1264,6 +1298,7 @@ impl Backend {
                 format!("{model} via {}", llm::display_url(base_url))
             }
             ProviderKind::Apple => format!("{} via FoundationModels", llm::apple::LABEL),
+            ProviderKind::Unconfigured { .. } => "no model selected".to_owned(),
         }
     }
 
@@ -1328,6 +1363,7 @@ impl Backend {
             ProviderKind::AnthropicSubscription { model, .. } => model,
             ProviderKind::Local { .. } => SERVER_MODEL,
             ProviderKind::Apple => llm::apple::MODEL,
+            ProviderKind::Unconfigured { .. } => UNCONFIGURED_MODEL,
             ProviderKind::Endpoint { model, .. }
             | ProviderKind::AnthropicEndpoint { model, .. } => model,
         }
@@ -1422,7 +1458,7 @@ impl Backend {
                     llm::catalog::local_model_metadata(Path::new(model_dir)).vision == Some(true)
                 }
                 // The system model reads text only.
-                ProviderKind::Apple => false,
+                ProviderKind::Apple | ProviderKind::Unconfigured { .. } => false,
                 _ => true,
             }
     }
@@ -1436,11 +1472,16 @@ impl Backend {
         on_notice: &mut dyn FnMut(&str),
         on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
     ) -> Result<Reply> {
+        if let ProviderKind::Unconfigured { reason } = &self.kind {
+            bail!("{}", unconfigured_message(reason));
+        }
         let _wire = llm::wire::Scope::enter(self.wire.clone());
         #[cfg(any(test, feature = "test-support"))]
         let _idle_limit = llm::cancel::TestIdleLimitScope::enter(self.idle_limit);
         let billing = match &self.kind {
-            ProviderKind::Local { .. } | ProviderKind::Apple => llm::usage::Billing::Local,
+            ProviderKind::Local { .. }
+            | ProviderKind::Apple
+            | ProviderKind::Unconfigured { .. } => llm::usage::Billing::Local,
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 llm::usage::Billing::Subscription
             }
@@ -1688,7 +1729,9 @@ impl Backend {
         }
         self.tool_template_notice(req, on_notice);
         let (url, auth, model, wire, codex_account_id) = match &self.kind {
-            ProviderKind::Apple => unreachable!("handled above"),
+            ProviderKind::Apple | ProviderKind::Unconfigured { .. } => {
+                unreachable!("handled above")
+            }
             ProviderKind::ChatGpt { model, .. } => {
                 ensure!(
                     self.protocol.is_none_or(|p| p == ApiProtocol::Responses),

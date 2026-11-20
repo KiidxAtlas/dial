@@ -26,9 +26,7 @@ pub(super) fn drive(
     session: Option<Session>,
     restore: bool,
 ) -> Result<()> {
-    if !onboard(app, shell, session.as_ref())? {
-        return Ok(());
-    }
+    onboard(app, shell, session.as_ref())?;
     let resumed = session.is_some();
     // `--restore` runs once, for the first agent of the resumed session, before the user has control.
     let mut restore_pending = restore && resumed;
@@ -157,9 +155,7 @@ pub(super) fn drive(
                 shell.after_adopt(app);
                 // Removing a model/provider layer can leave a valid but unconfigured setup.
                 // Select a usable replacement without discarding the held session snapshots.
-                if !onboard(app, shell, Some(&session))? {
-                    break;
-                }
+                onboard(app, shell, Some(&session))?;
                 // Rebuilds reconnect MCP only when its configuration changed: `prefetch` keeps the
                 // handed-over servers for an equal configuration and replaces them otherwise. Do
                 // not freeze the composer for a reconnect's startup budget.
@@ -218,14 +214,14 @@ pub(super) fn onboarding_flow(outcome: &OverlayOutcome) -> OnboardingFlow {
     }
 }
 
-/// First-run choices, most likely first; Cancel last. Order matches [`onboarding_destination`].
+/// First-run choices, most likely first; skipping last. Order matches [`onboarding_destination`].
 const ONBOARDING_CHOICES: &[(&str, char)] = &[
     ("Local model", 'l'),
     ("Hosted provider", 'h'),
-    ("Quit setup", 'q'),
+    ("Skip for now", 's'),
 ];
 
-/// Escape or Quit is cancellation, never an implicit model selection.
+/// Escape or Skip opens dial without a model, never an implicit model selection.
 fn onboarding_destination(choice: Option<usize>) -> Option<Which> {
     match choice {
         Some(0) => Some(Which::Models),
@@ -233,6 +229,9 @@ fn onboarding_destination(choice: Option<usize>) -> Option<Which> {
         _ => None,
     }
 }
+
+/// Shown when setup is skipped: dial opens, and the first prompt explains how to pick a model.
+pub(super) const SKIPPED_SETUP_NOTICE: &str = "No model selected. Dial is open; pick a model with /model or set up a provider with /providers before sending a prompt.";
 
 /// What first launch can say about local models before the user picks a path.
 #[derive(Debug, Default)]
@@ -272,7 +271,7 @@ impl LocalHint {
 /// a local model this Mac can hold, so the local path is obvious. This is a hint only: the user
 /// still chooses, and nothing is selected or downloaded for them.
 pub(super) fn onboarding_prompt(hint: &LocalHint) -> String {
-    let base = "Nothing is downloaded or installed until you confirm. Esc cancels.";
+    let base = "Nothing is downloaded or installed until you confirm. Esc skips setup for now.";
     if !hint.running.is_empty() {
         format!(
             "Running on this machine: {}. Local model uses it with no API key.\n{base}",
@@ -325,8 +324,10 @@ pub(super) fn adopt_first_run_approval(app: &mut App) -> Option<String> {
     }
 }
 
-/// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
-fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Result<bool> {
+/// First run (or a provider that cannot be used): let the user pick a model before any agent
+/// exists. Skipping (Esc or "Skip for now") opens dial without a model; agents then run on an
+/// unconfigured backend until a model is picked, and later rebuilds do not prompt again.
+fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Result<()> {
     let mut auth_warned = false;
     let mut destination = None;
     let mut local: Option<LocalHint> = None;
@@ -336,13 +337,14 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
             None => make_backend(&app.config),
         };
         if backend.is_ok() && destination.is_none() {
+            app.model_deferred = false;
             // Only a real first run (the welcome prompt was shown) chooses a starting mode.
             if local.is_some()
                 && let Some(notice) = adopt_first_run_approval(app)
             {
                 shell.note("Approval", notice);
             }
-            return Ok(true);
+            return Ok(());
         }
         if !app.config.model.trim().is_empty() {
             let message = backend
@@ -353,6 +355,10 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
                     "Model configuration is ready; response verification is separate in /doctor.",
                 );
             shell.note("Model setup", message);
+        }
+        // Setup was already skipped this session: a rebuild keeps running without a model.
+        if app.model_deferred && destination.is_none() {
+            return Ok(());
         }
         let which = if let Some(which) = destination.take() {
             which
@@ -369,7 +375,12 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
                     if let Some(job) = shell.auth_job.take() {
                         job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    return Ok(false);
+                    app.model_deferred = true;
+                    if let Some(notice) = adopt_first_run_approval(app) {
+                        shell.note("Approval", notice);
+                    }
+                    shell.note("Model setup", SKIPPED_SETUP_NOTICE);
+                    return Ok(());
                 }
             }
         };
@@ -407,14 +418,14 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
                 if shell.auth_job.is_some() {
                     if sign_in_still_pending(&mut auth_warned) {
                         let label = shell.auth_job.as_ref().map_or("Sign-in", |job| job.label);
-                        shell.note(label, format!("{label} is still waiting for your browser. Esc backs out to model-path choice; Cancel there quits and cancels sign-in. Select a model after sign-in completes."));
+                        shell.note(label, format!("{label} is still waiting for your browser. Esc backs out to model-path choice; Skip there opens dial without a model and cancels sign-in. Select a model after sign-in completes."));
                         continue;
                     }
                     if let Some(job) = shell.auth_job.take() {
                         job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                // Escape backs out of setup; choosing Cancel at the path picker exits.
+                // Escape backs out of a panel to the path picker; Skip there opens dial.
                 continue;
             }
         }

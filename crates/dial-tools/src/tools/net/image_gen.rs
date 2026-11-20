@@ -141,6 +141,7 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
         api: match target.wire {
             Wire::OpenAi => "OpenAI Images",
             Wire::Xai => "xAI Images",
+            Wire::MlxServe if launched_by_dial(&target) => "MLX-Serve (started by Dial)",
             Wire::MlxServe => "MLX-Serve",
             Wire::SdCpp => "stable-diffusion.cpp (started by Dial)",
             Wire::Responses => "Responses image tool",
@@ -304,6 +305,17 @@ fn host(url: &str) -> Option<String> {
         .ok()?
         .host()
         .map(str::to_ascii_lowercase)
+}
+
+/// The placeholder address of a route whose server Dial starts for the call (a downloaded
+/// checkpoint on stable-diffusion.cpp, or an MLX image pack on MLX-Serve). The started server's
+/// address replaces it before any request.
+const LAUNCHED_BY_DIAL: &str = "http://127.0.0.1";
+
+/// Whether Dial starts this route's server for each call.
+fn launched_by_dial(target: &Target) -> bool {
+    target.wire == Wire::SdCpp
+        || (target.wire == Wire::MlxServe && target.base_url == LAUNCHED_BY_DIAL)
 }
 
 /// The endpoint, model and key one generation uses. No `Debug`: it holds the key.
@@ -980,6 +992,29 @@ fn ensure_sd_server(ctx: &ToolContext, cancel: &std::sync::atomic::AtomicBool) -
     Ok(())
 }
 
+/// MLX image packs run on MLX-Serve. When none is installed, install the pinned,
+/// checksum-verified build into Dial's own folder (`/setup mlx-serve`) without asking: choosing an
+/// MLX image model is the request to run it, and the download stays inside Dial's tools folder.
+fn ensure_mlx_serve(ctx: &ToolContext, cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+    if crate::llm::local_format::mlx_serve().is_some() {
+        return Ok(());
+    }
+    ensure!(
+        crate::llm::server::image::mlx_serve_supported(),
+        "MLX image packs run on MLX-Serve, which needs macOS with Apple Silicon"
+    );
+    let layout = crate::config::paths::Layout::discover(ctx.workspace.root())
+        .context("finding Dial's folders to install MLX-Serve")?;
+    crate::setup::deps::run::install_and_save(&layout, "mlx-serve", cancel, &mut |_| {})
+        .context("installing MLX-Serve")?;
+    ensure!(
+        crate::llm::local_format::mlx_serve().is_some(),
+        "MLX-Serve was installed but its mlx-serve was not found; {}",
+        crate::llm::server::image::MISSING_MLX_SERVE
+    );
+    Ok(())
+}
+
 fn generate(
     ctx: &ToolContext,
     args: &Value,
@@ -1035,15 +1070,25 @@ fn generate(
             request.size = "auto";
         }
     }
-    // A local checkpoint runs on an sd-server started for this call; dropping it stops the server.
-    let _server = if target.wire == Wire::SdCpp {
-        ensure_sd_server(ctx, &cancel)?;
-        let server = crate::llm::server::image::ImageServer::start(
-            std::path::Path::new(&target.model),
-            ctx.config.image.timeout_secs,
-            Arc::clone(&cancel),
-        )?;
+    // A downloaded model runs on a server started for this call; dropping it stops the server.
+    let _server = if launched_by_dial(&target) {
+        let model = std::path::Path::new(&target.model);
+        let timeout = ctx.config.image.timeout_secs;
+        let server = if target.wire == Wire::MlxServe {
+            ensure_mlx_serve(ctx, &cancel)?;
+            crate::llm::server::image::ImageServer::start_mlx_serve(
+                model,
+                timeout,
+                Arc::clone(&cancel),
+            )?
+        } else {
+            ensure_sd_server(ctx, &cancel)?;
+            crate::llm::server::image::ImageServer::start(model, timeout, Arc::clone(&cancel))?
+        };
         target.base_url = server.base_url().to_owned();
+        if let Some(id) = server.model() {
+            target.model = id.to_owned();
+        }
         Some(server)
     } else {
         None

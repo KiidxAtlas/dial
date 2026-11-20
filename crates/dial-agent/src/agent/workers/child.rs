@@ -1811,11 +1811,11 @@ pub(in crate::agent) fn run(
 ) -> Outcome {
     // A background worker may outlive its parent's foreground turn. Its own guard
     // keeps the machine awake until this worker returns, including on cancellation.
-    let _idle_sleep = match crate::platform::power::IdleSleepGuard::acquire() {
-        Ok(guard) => Some(guard),
+    let _idle_sleep = match crate::platform::power::IdleSleepGuard::acquire_reporting_once() {
+        Ok(guard) => guard,
         Err(error) => {
             approver.notice(&format!(
-                "Could not prevent automatic sleep during this worker: {error:#}"
+                "Could not prevent automatic sleep during this worker (not repeated for later turns or workers): {error:#}"
             ));
             None
         }

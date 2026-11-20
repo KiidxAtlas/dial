@@ -2293,7 +2293,17 @@
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_models"},
-            "params": {"type": "object", "properties": {"provider": {"type": "string", "minLength": 1}}, "additionalProperties": false}
+            "params": {"type": "object", "properties": {"provider": {"type": "string", "minLength": 1}, "purpose": {"enum": ["chat", "image", "embedding"]}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "image_settings"},
+            "params": {"type": "object", "additionalProperties": false}
           },
           "required": ["method"],
           "additionalProperties": false

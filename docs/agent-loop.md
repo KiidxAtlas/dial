@@ -13,7 +13,8 @@ that manual sleep be blocked. OS policy, lid closure and critical-battery behavi
 macOS uses an IOKit idle-system-sleep assertion, Windows uses a system-required power request,
 and Linux uses systemd-logind's idle inhibitor. Linux requires a reachable system bus and logind
 permission; environments whose desktop power manager does not honor logind idle inhibitors may
-still sleep. If acquisition fails, Dial reports a notice and continues the work without claiming
+still sleep. If acquisition fails, Dial reports a notice once per process (later turns and
+workers still try again, silently) and continues the work without claiming
 sleep protection. Hermetic evaluations do not request host power changes. Standalone commands
 outside agent turns and background servers left running after a turn are not covered.
 

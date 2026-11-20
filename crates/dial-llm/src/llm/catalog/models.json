@@ -1391,6 +1391,7 @@
 {"id":"gemini-3.6-flash","c":1048576,"o":65536,"p":[0.75,3.75,0.075,0],"r":1,"v":1,"t":"google-level","e":["minimal","low","medium","high"]},
 {"id":"gemini-3.7-flash","c":1048576,"o":65536,"p":[0.75,3.75,0.075,0],"r":1,"v":1,"t":"google-level","e":["minimal","low","medium","high"]},
 {"id":"gemini-3.8-flash","c":1048576,"o":65536,"p":[0.75,3.75,0.075,0],"r":1,"v":1,"t":"google-level","e":["minimal","low","medium","high"]},
+{"id":"gemini-4-neon","c":524288,"o":null,"r":1,"v":1},
 {"id":"gpt-oss-120b","c":131072,"o":32768,"r":1,"t":"budget","e":["minimal","low","medium","high"]},
 {"id":"tab_flash_lite_preview","c":16384,"o":4096},
 {"id":"tab_jump_flash_lite_preview","c":16384,"o":4096}

@@ -292,6 +292,19 @@ pub fn make_session_backend(config: &Config, session: &Session) -> Result<Backen
     make_backend(&scoped).map(|backend| backend.with_session_id(session.id().to_owned()))
 }
 
+/// A backend with no usable model: the shell runs, and every model request fails with `reason`
+/// and a pointer to `/model`. Used when the user skips first-run setup or the configured model
+/// cannot be built.
+pub fn unconfigured_backend(config: &Config, reason: &str) -> Backend {
+    Backend::new(
+        ProviderKind::Unconfigured {
+            reason: reason.to_owned(),
+        },
+        config.python.clone(),
+        config.worker_timeout_secs.min(600),
+    )
+}
+
 pub(in crate::agent) fn session_auth_config(
     config: &Config,
     backend: &Backend,

@@ -57,3 +57,22 @@ fn summary_counts_missing_capabilities_on_one_line_and_the_full_list_names_each(
         "{summary}"
     );
 }
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[ignore = "downloads the pinned MLX-Serve release (about 100 MB) into a temporary user folder"]
+fn installs_the_pinned_mlx_serve_and_it_answers() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let env = Env {
+        path: Vec::new(),
+        user_dir: user_dir.path().to_path_buf(),
+    };
+    let location = install("mlx-serve", &env, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert!(
+        location.starts_with(user_dir.path()),
+        "{}",
+        location.display()
+    );
+    let version = probe(&location, &["--version"]).unwrap();
+    assert!(version.contains("mlx-serve 26.11.3"), "{version}");
+}
