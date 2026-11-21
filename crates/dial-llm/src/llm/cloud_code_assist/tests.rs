@@ -61,10 +61,25 @@ fn antigravity_envelope_replays_scoped_state_and_honors_loopback() {
         body["request"]["labels"]["model_enum"],
         "MODEL_PLACEHOLDER_M36"
     );
-    assert_eq!(
-        body["request"]["generationConfig"]["maxOutputTokens"],
-        65535
+    assert!(
+        body["request"]["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none()
     );
+    for (requested, expected) in [(100, 100), (100_000, 65_535)] {
+        let body = envelope(
+            &route,
+            route.model,
+            json!({"generationConfig":{"maxOutputTokens":requested}}),
+            &chat,
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            body["request"]["generationConfig"]["maxOutputTokens"],
+            expected
+        );
+    }
     assert_eq!(
         endpoint(&route).unwrap(),
         "http://127.0.0.1:9000/v1internal:streamGenerateContent?alt=sse"

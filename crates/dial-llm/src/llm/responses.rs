@@ -229,12 +229,14 @@ fn request_api(
     profile: Option<&super::profiles::ModelProfile>,
 ) -> Result<Value> {
     let mut body = request_flat(model, chat, profile, false)?;
-    body["max_output_tokens"] = json!(
-        profile
-            .and_then(|p| p.max_tokens)
-            .filter(|n| *n > 0)
-            .unwrap_or(chat.max_tokens)
-    );
+    if !profile.is_some_and(super::profiles::ModelProfile::inherits_output_limit) {
+        body["max_output_tokens"] = json!(
+            profile
+                .and_then(|p| p.max_tokens)
+                .filter(|n| *n > 0)
+                .unwrap_or(chat.max_tokens)
+        );
+    }
     if let Some(p) = profile {
         if p.capabilities.temperature {
             body["temperature"] = json!(p.temperature.unwrap_or(chat.temperature));

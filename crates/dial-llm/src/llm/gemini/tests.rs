@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn hosted_defaults_leave_neon_output_to_the_provider() {
+    let endpoint = Endpoint {
+        url: "https://example.test",
+        auth: None,
+        model: "gemini-4-neon-high",
+        headers: &[],
+    };
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hello"})],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 8192,
+        seed: None,
+    };
+    let mut profile = ModelProfile::minimal("google-antigravity", "gemini-4-neon");
+    profile.capabilities.temperature = false;
+    profile.inherit_output_limit = true;
+    let body = request_for_proxy(&endpoint, &chat, Some(&profile), "scope").unwrap();
+    let controls = &body["generationConfig"];
+    assert!(controls.get("maxOutputTokens").is_none(), "{controls}");
+    assert!(controls.get("temperature").is_none(), "{controls}");
+    profile.inherit_output_limit = false;
+    let bounded = request_for_proxy(&endpoint, &chat, Some(&profile), "scope").unwrap();
+    assert_eq!(bounded["generationConfig"]["maxOutputTokens"], 8192);
+}
+
+#[test]
 fn accumulator_streams_wrapped_cca_parts_and_retains_signature_and_execution_id() {
     let patience = super::super::Patience::for_stream(30, false);
     let mut accumulator = Accumulator::default();
@@ -29,6 +56,63 @@ fn accumulator_streams_wrapped_cca_parts_and_retains_signature_and_execution_id(
         reply.provider_content[0]["parts"][0]["thoughtSignature"],
         "signed-native-value"
     );
+}
+
+#[test]
+fn stream_regression_truncated_call_keeps_partial_text_without_replay() {
+    let patience = Patience::for_stream(30, false);
+    let parts = json!([{"text":"partial answer"}, {"functionCall":{}}]);
+    for reason in ["MAX_TOKENS", "STOP"] {
+        let mut stream = Accumulator::default();
+        stream.feed(r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}}}]}}]}"#, &patience, &mut None, &mut |_| true).unwrap();
+        let candidate = json!({"content":{"parts":parts}, "finishReason":reason});
+        let result = stream.feed(
+            &json!({"candidates":[candidate]}).to_string(),
+            &patience,
+            &mut None,
+            &mut |_| true,
+        );
+        if reason == "STOP" {
+            assert!(result.unwrap_err().to_string().contains("no name"));
+            continue;
+        }
+        result.unwrap();
+        let endpoint = Endpoint {
+            url: "https://example.test",
+            model: "gemini",
+            auth: None,
+            headers: &[],
+        };
+        let reply = stream.finish(&endpoint, "scope".into()).unwrap();
+        assert_eq!(
+            (reply.finish_reason.as_str(), reply.text.as_str()),
+            ("length", "partial answer")
+        );
+        assert!(reply.tool_calls.is_empty());
+        let carrier = &reply.provider_content[0];
+        assert_eq!(carrier["calls"], json!([]));
+        assert_eq!(carrier["parts"], json!([{"text":"partial answer"}]));
+    }
+}
+
+#[test]
+fn stream_regression_wrapped_provider_error_is_not_silently_ignored() {
+    let patience = Patience::for_stream(30, false);
+    let error =
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"model access denied"}});
+    for event in [error.clone(), json!({"response":error})] {
+        let failure = Accumulator::default()
+            .feed(&event.to_string(), &patience, &mut None, &mut |_| true)
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("PERMISSION_DENIED"),
+            "{failure}"
+        );
+        assert!(
+            failure.to_string().contains("model access denied"),
+            "{failure}"
+        );
+    }
 }
 
 #[test]

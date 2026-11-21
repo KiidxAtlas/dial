@@ -162,9 +162,10 @@ the model forever.
 Existing explicit settings are preserved; changing defaults does not rewrite saved overrides.
 
 `harness.max_tokens = 0` means no operator output cap, not a literal zero-token API request.
-Dial uses provider-advertised output capacity when available, otherwise the selected context capacity;
-model profiles and the provider's actual output/context limits still apply. Context-window settings
-remain `auto`, rather than pretending a model has infinite context. Sampling/training parameters,
+Dial uses provider-advertised output capacity or a context-derived estimate for planning. Ordinary
+hosted main and worker requests omit an optional output cap rather than sending that estimate;
+model profiles, required API fields and the provider's own output/context limits still apply.
+Context-window settings remain `auto`, rather than pretending a model has infinite context. Training parameters,
 approvals, sandboxing, host restrictions, protocol frame protections and loop-safety rules are unchanged.
 Unlimited calls can wait indefinitely or consume substantial memory and money; Esc/Ctrl-C still cancels
 interactive work. Configure positive limits where that is not acceptable.

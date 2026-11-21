@@ -190,6 +190,21 @@ impl<'a> Identity<'a> {
             .is_some_and(|codename| matches!(codename, "fable" | "mythos"))
     }
 
+    /// First-party catalog ID behind a gateway's qualified Claude name. Only normalize wire
+    /// decorations; capability decisions still require a matching catalog record.
+    pub(super) fn anthropic_catalog_id(self) -> Option<String> {
+        let leaf = self.leaf();
+        let id = claude_leaf(&leaf).split(['@', ':']).next()?;
+        if !id.starts_with("claude-") {
+            return None;
+        }
+        let id = id
+            .rsplit_once('-')
+            .filter(|(_, suffix)| matches!(*suffix, "low" | "medium" | "high" | "xhigh" | "max"))
+            .map_or(id, |(id, _)| id);
+        Some(id.replace('.', "-"))
+    }
+
     /// GPT-5.4 or later, including Codex models (`gpt-5.4`, `gpt-5-4-mini`, `codex-5.4`).
     pub fn gpt_5_4_or_later(self) -> bool {
         let leaf = self.leaf();
@@ -213,6 +228,7 @@ fn basename_of(lower: &str) -> &str {
 fn claude_leaf(leaf: &str) -> &str {
     [
         "anthropic.",
+        "us-gov.anthropic.",
         "us.anthropic.",
         "eu.anthropic.",
         "apac.anthropic.",

@@ -228,8 +228,8 @@ pub(in crate::agent) fn host_default_sampling(
 ) -> Option<&'static str> {
     let adaptive = &config.adaptive;
     if hermetic
-        || !auth_config.local_main_model()
-        || config.assistance.local.sampling != LocalSamplingSource::Model
+        || (auth_config.local_main_model()
+            && config.assistance.local.sampling != LocalSamplingSource::Model)
         || config.harness_temperature_pinned
         || config.harness.temperature != Harness::default().temperature
         || (adaptive.enabled && (adaptive.sampling || adaptive.pin_sampling))
@@ -265,21 +265,22 @@ pub(in crate::agent) fn host_default_sampling(
     let p =
         profile.get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
     p.capabilities.temperature = false;
-    Some("local server defaults")
+    Some(if auth_config.local_main_model() {
+        "local server defaults"
+    } else {
+        "hosted provider defaults"
+    })
 }
 
-/// Host-default output limit: a default/unlimited operator limit on an external local host
-/// leaves the host's own output setting intact. Callers skip this for recovery budgets.
+/// An external endpoint chooses its own output limit unless the operator requested one.
+/// Callers retain explicit budgets for recovery and other bounded work.
 pub(in crate::agent) fn host_default_output_limit(
     auth_config: &crate::config::types::Config,
     hermetic: bool,
     profile: &mut Option<ModelProfile>,
     harness_max_tokens: u32,
 ) {
-    let inherit = !hermetic
-        && auth_config.local_main_model()
-        && auth_config.endpoint.is_some()
-        && harness_max_tokens == 0;
+    let inherit = !hermetic && auth_config.endpoint.is_some() && harness_max_tokens == 0;
     if !inherit {
         if let Some(profile) = profile {
             profile.inherit_output_limit = false;
@@ -289,7 +290,7 @@ pub(in crate::agent) fn host_default_output_limit(
     let selection = auth_config.selection();
     let profile =
         profile.get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
-    profile.inherit_output_limit = profile.max_tokens.is_none();
+    profile.inherit_output_limit = profile.max_tokens.unwrap_or(0) == 0;
 }
 
 impl Agent<'_> {

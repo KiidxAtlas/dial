@@ -815,9 +815,8 @@ fn chat_at_controlled(
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
         openrouter::apply(&mut body, profile)?;
-    } else {
-        apply_openai_reasoning_limit(&mut body, url, model_label);
     }
+    apply_openai_reasoning_limit(&mut body, url, model_label);
     let mut response = send_with_headers(url, auth, &body, timeout_secs, None, interrupt, headers)?;
     let status = response.status().as_u16();
     let retry_after = retry::server_delay(response.headers());
@@ -909,9 +908,8 @@ fn chat_stream_at_controlled(
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
         openrouter::apply(&mut body, profile)?;
-    } else {
-        apply_openai_reasoning_limit(&mut body, url, model_label);
     }
+    apply_openai_reasoning_limit(&mut body, url, model_label);
     let mut response = send_with_headers(
         url,
         auth,

@@ -938,7 +938,11 @@ fn persisted_permission_rules_reach_the_project_store_and_leave_it_on_remove() {
                 }))
                 .unwrap();
             assert_eq!(removed["persisted"], json!(true));
-            assert!(crate::agent::safety::approval::load(&store).unwrap().is_empty());
+            assert!(
+                crate::agent::safety::approval::load(&store)
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(runtime.agent.permission_rules().is_empty());
         },
     );

@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-11-20
+
 ### Added
 
 - Approvals: manage allowed commands in **Settings → Common → Allowed commands** or `/permissions`, or choose **Always allow** for this session or project on an eligible prompt. A project grant no longer persists unrelated session-only grants. `/approval yolo` opts into running eligible calls recovered from model text; Full auto still asks. Explicit denies and sandbox limits apply to both. [Tools](docs/tools.md).
@@ -31,6 +33,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Changed
 
+- Hosted models: ordinary agent calls inherit the provider’s temperature and optional output limit instead of sending Dial’s planning defaults. Known no-sampling Claude models also drop sampling overrides on gateway routes. [LLM transport](docs/llm-transport.md#hosted-generation-defaults).
+- Gemini: a tool call cut off in the output-limit frame no longer aborts recovery or enters replay history. Proxied streams report wrapped provider errors instead of treating them as a dropped connection.
 - Terminal: process help no longer passes clicks to jobs behind it, and history previews page by the visible rows. Compact screens keep send choices, attachment warnings, process states and output titles readable.
 - Terminal: Appearance preview hints now match its controls. Home warnings, provider details, role assignments and the saved-settings filter stay readable in compact layouts. [Terminal shortcuts](docs/terminal-shortcuts.md).
 - Terminal: long searches keep the caret visible, compact settings lists keep the selected field in view, and Compute and Improve keep the active tab in view. Models and Providers agree on readiness marks; cached metadata is not a live success. [Terminal shortcuts](docs/terminal-shortcuts.md).
@@ -3155,7 +3159,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.12...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.13...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3204,3 +3208,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.10]: https://github.com/KiidxAtlas/dial/tree/v0.3.10
 [0.3.11]: https://github.com/KiidxAtlas/dial/tree/v0.3.11
 [0.3.12]: https://github.com/KiidxAtlas/dial/tree/v0.3.12
+[0.3.13]: https://github.com/KiidxAtlas/dial/tree/v0.3.13

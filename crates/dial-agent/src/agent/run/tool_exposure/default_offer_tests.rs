@@ -1111,7 +1111,7 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
 }
 
 /// `sampling = "model"` leaves a local server's own defaults in charge (no temperature is sent);
-/// a pinned temperature, `sampling = "harness"` and hosted routes keep Dial's temperature.
+/// A pinned temperature or local `sampling = "harness"` keeps Dial's temperature.
 #[test]
 fn local_sampling_defers_to_the_server_unless_pinned() {
     let local = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'";
@@ -1139,7 +1139,7 @@ fn local_sampling_defers_to_the_server_unless_pinned() {
     );
     assert_eq!(
         apply("[endpoint]\nbase_url='https://api.example.com/v1'", 0.2),
-        (None, None)
+        (Some("hosted provider defaults"), Some(false))
     );
 }
 

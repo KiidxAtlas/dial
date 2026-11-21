@@ -227,8 +227,12 @@ fn envelope(
         labels.insert("used_claude".into(), json!(used_claude));
         labels.insert("used_claude_conservative".into(), json!(used_claude));
         request["labels"] = Value::Object(labels);
-        if let Some(max_output_tokens) = max_output_tokens {
-            request["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
+        if let (Some(ceiling), Some(requested)) = (
+            max_output_tokens,
+            request["generationConfig"]["maxOutputTokens"].as_u64(),
+        ) {
+            request["generationConfig"]["maxOutputTokens"] =
+                json!(requested.min(u64::from(ceiling)));
         }
         Ok(json!({
             "model": model,

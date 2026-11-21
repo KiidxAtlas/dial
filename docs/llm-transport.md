@@ -34,6 +34,9 @@ budget instead of failing. Chat-completions finish reasons such as `max_tokens`,
 and `model_context_window_exceeded` map to `length`; `error` and `network_error` are incomplete
 streams and retried. A streamed Responses `context_length_exceeded` is a context overflow, which
 compacts instead of resending the same prompt.
+Gemini keeps partial answer text on an output-limit stop but drops unfinished calls from both
+the reply and its replay history. Proxied Gemini streams surface provider errors inside the
+response envelope just as direct streams do.
 On Responses, an unfinished function item is discarded on a token-limit stop even if its `output_item.done` arrived without arguments. A normal completion still rejects an unfinished call. An explicit refusal in a completed Responses message ends the turn without executing or replaying its tool calls. On local Chat Completions routes, text that looks like a tool call cannot override truncation or filtering. An explicit Chat Completions refusal or `content_filter` stop ends the turn instead of prompting for a missing answer or tool.
 
 While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
@@ -96,6 +99,16 @@ enable the model in GitHub Copilot settings (and, where applicable, the organiza
 or select an enabled model in `/models`. Dial never accepts model terms or enables billing
 policies automatically. A nearby background-compaction notice does not by itself identify
 compaction as the source of a foreground provider rejection.
+
+## Hosted generation defaults
+
+Ordinary interactive main and worker requests leave temperature and the output limit to the
+provider unless you set them. Dial still reserves output space when planning context; that
+estimate is not an optional wire cap. Explicit supported settings, bounded side requests and
+recovery budgets still apply. Anthropic Messages requires `max_tokens`, and budget-mode Bedrock
+thinking needs a paired allowance. A provider can still stop generation at its own limit.
+Known Claude models marked `no-sampling` do not receive temperature or top-p through a gateway
+even when a profile requests them.
 
 ## Local server request fields
 

@@ -271,7 +271,7 @@ fn request(
     let mut options = json!({});
     // num_predict:-1 explicitly means unlimited, rather than 0 (no generation). A host-inherited
     // allowance (`inherit_output_limit` with no profile max) sends no num_predict at all.
-    if !profile.is_some_and(|p| p.inherit_output_limit && p.max_tokens.is_none()) {
+    if !profile.is_some_and(ModelProfile::inherits_output_limit) {
         options["num_predict"] = if req.max_tokens == 0 {
             json!(-1)
         } else {

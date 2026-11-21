@@ -109,11 +109,11 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
         "relay" | "peers" => Terminal(COLLAB),
-        "compute" | "review" | "seance" | "tree" | "profile" | "todo"
-        | "understanding" | "accounts" | "share" | "dump" | "trace" | "security" | "graphify"
-        | "image" | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan"
-        | "debug" | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize"
-        | "images" | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
+        "compute" | "review" | "seance" | "tree" | "profile" | "todo" | "understanding"
+        | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
+        | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug"
+        | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize" | "images"
+        | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
         _ => return None,
     })
 }

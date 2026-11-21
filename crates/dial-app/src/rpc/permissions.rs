@@ -85,7 +85,11 @@ fn build_rule(params: AddRequest) -> Result<(PermissionRule, bool)> {
         ));
     }
     let command_prefix = if tool == "bash" {
-        if params.command_prefix.iter().any(|word| word.trim().is_empty()) {
+        if params
+            .command_prefix
+            .iter()
+            .any(|word| word.trim().is_empty())
+        {
             return Err(invalid("command_prefix words must not be empty"));
         }
         let words: Vec<String> = params

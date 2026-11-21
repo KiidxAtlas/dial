@@ -135,6 +135,27 @@ fn redacted_reasoning_chunks_replay_as_one_binary_value_and_reject_foreign_scope
 }
 
 #[test]
+fn hosted_bedrock_omits_inherited_cap_except_for_budget_thinking() {
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hi"})],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 4096,
+        seed: None,
+    };
+    let mut profile = ModelProfile::minimal("bedrock", "test");
+    profile.inherit_output_limit = true;
+    profile.capabilities.temperature = false;
+    let body = request("test", &chat, Some(&profile), "main").unwrap();
+    assert_eq!(body["inferenceConfig"], json!({}));
+    profile.capabilities.reasoning = ReasoningApi::AnthropicBudget;
+    profile.thinking = Some(true);
+    profile.thinking_budget = Some(1024);
+    let body = request("test", &chat, Some(&profile), "main").unwrap();
+    assert_eq!(body["inferenceConfig"], json!({"maxTokens":4096}));
+}
+
+#[test]
 fn reasoning_effort_wire_reaches_bedrock_output_config() {
     use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
     use std::collections::BTreeMap;

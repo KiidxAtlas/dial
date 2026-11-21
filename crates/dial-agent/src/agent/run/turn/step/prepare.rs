@@ -80,10 +80,20 @@ impl Agent<'_> {
         if let Some(source) =
             self.apply_local_sampling(&mut selection.profile, turn.harness.temperature)
         {
-            selection.sampling_source = format!("local profile: {source}");
+            selection.sampling_source = source.to_owned();
+            if selection
+                .profile
+                .as_ref()
+                .is_some_and(|p| !p.capabilities.temperature)
+            {
+                selection.temperature = None;
+            }
         }
         // Recovery budgets remain explicit; ordinary unlimited requests inherit the host's limit.
-        if !turn.recovering_output && turn.reasoning_budget.is_none() {
+        if !turn.recovering_output
+            && turn.reasoning_budget.is_none()
+            && !(selection.enabled && self.config.adaptive.output_limits)
+        {
             self.apply_local_output_limit(&mut selection.profile, turn.harness.max_tokens);
         }
         let mut request_control = self.session.control_state();

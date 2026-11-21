@@ -3166,6 +3166,29 @@ fn native_anthropic_post_response_failures_never_replay_and_cancel_is_typed() {
 }
 
 #[test]
+fn hosted_fable_gateway_drops_even_pinned_sampling_on_a_bounded_call() {
+    let server = fake::serve(vec![ok("done")]);
+    let model = "anthropic/claude-fable-5.1";
+    let mut profile = llm::profiles::ModelProfile::minimal("openrouter", model);
+    profile.capabilities.top_p = true;
+    profile.temperature = Some(0.7);
+    profile.top_p = Some(0.9);
+    let mut remote = backend(ProviderKind::Endpoint {
+        base_url: server.url.clone(),
+        model: model.to_owned(),
+        api_key: None,
+    })
+    .with_profile(profile);
+    remote.chat(None, &request(), 5, None).unwrap();
+    let body = fake::body(&server.requests()[0]);
+    assert!(
+        body.get("temperature").is_none() && body.get("top_p").is_none(),
+        "{body}"
+    );
+    assert_eq!(body["max_tokens"], 16);
+}
+
+#[test]
 fn request_profile_is_one_shot_and_error_restores_baseline() {
     use llm::profiles::*;
     let baseline = ModelProfile {
