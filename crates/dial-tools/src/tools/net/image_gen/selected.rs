@@ -36,6 +36,7 @@ fn refused(dir: &Path, account: &str) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(&(dir.to_path_buf(), account.to_owned()))
+        || llm::catalog::image_capabilities::account_refused(dir, llm::chatgpt::PROVIDER, account)
 }
 
 pub(super) fn record_refusal(dir: &Path, account: &str) {
@@ -43,6 +44,31 @@ pub(super) fn record_refusal(dir: &Path, account: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert((dir.to_path_buf(), account.to_owned()));
+    let _ = llm::catalog::image_capabilities::record_account_refused(
+        dir,
+        llm::chatgpt::PROVIDER,
+        account,
+        "ChatGPT account refused the hosted image_generation tool",
+    );
+}
+
+/// Clear both in-process and persisted hosted-image refusals so a user-requested re-check
+/// can evaluate accounts and models again.
+pub fn clear_refusals(user_dir: &Path) {
+    let auth_dir = crate::config::paths::subscription_auth_dir(user_dir).ok();
+    {
+        let mut guard = REFUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .retain(|(dir, _)| dir != user_dir && auth_dir.as_ref().is_none_or(|auth| dir != auth));
+    }
+    let _ = llm::catalog::image_capabilities::clear_refusals(user_dir);
+    if let Some(auth) = auth_dir
+        && auth != user_dir
+    {
+        let _ = llm::catalog::image_capabilities::clear_refusals(&auth);
+    }
 }
 
 /// The Responses API's 400 for a forced `tool_choice` whose hosted tool the account lacks:

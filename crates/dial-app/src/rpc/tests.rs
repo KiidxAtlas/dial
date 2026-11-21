@@ -421,6 +421,43 @@ fn hello_below_every_served_version_is_refused_with_a_code() {
 }
 
 #[test]
+fn hello_flags_default_when_absent_and_refuse_non_booleans() {
+    let params = json!({"protocol_version": 2, "tree_events": false, "interactive": null});
+    assert!(!hello_flag(&params, "tree_events", true).unwrap());
+    assert!(
+        !hello_flag(&params, "interactive", false).unwrap(),
+        "null is the default"
+    );
+    assert!(
+        hello_flag(&json!({}), "tree_events", true).unwrap(),
+        "tree events stay on by default"
+    );
+    let err = hello_flag(&json!({"tree_events": "no"}), "tree_events", true).unwrap_err();
+    let error = err.downcast_ref::<RequestError>().unwrap();
+    assert_eq!(error.code, ErrorCode::InvalidParams);
+    assert_eq!(error.message, "tree_events must be a boolean");
+}
+
+#[test]
+fn only_a_completed_top_level_inference_ends_a_model_request() {
+    let node = |kind: &str, parent: Option<&str>, phase: &str| -> crate::runtime::Node {
+        serde_json::from_value(json!({
+            "id": "n", "parent": parent, "kind": kind, "label": "",
+            "result": {"text": "", "phase": phase, "revision": 1}
+        }))
+        .unwrap()
+    };
+    assert!(ends_model_request(&node("inference", None, "completed")));
+    assert!(!ends_model_request(&node("inference", None, "running")));
+    assert!(!ends_model_request(&node("inference", None, "failed")));
+    assert!(
+        !ends_model_request(&node("inference", Some("worker-1"), "completed")),
+        "a child's request"
+    );
+    assert!(!ends_model_request(&node("tool", None, "completed")));
+}
+
+#[test]
 fn announced_request_limit_is_the_one_the_reader_enforces() {
     for acp in [false, true] {
         let limit = request_limit(acp);

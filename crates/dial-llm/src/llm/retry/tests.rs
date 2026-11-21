@@ -15,8 +15,29 @@ fn policy() -> Policy {
 }
 
 #[test]
+fn default_budget_allows_a_full_retry_after_remote_idle_timeout() {
+    let config = crate::config::types::Config::default();
+    let idle = Duration::from_secs(config.remote_model_idle_timeout_secs);
+    let policy = Policy::new(&config.retry, CONNECTION_RETRY);
+    let Decision::Retry { delay, .. } = decide(&ErrorClass::Transient, None, 1, false, &policy)
+    else {
+        panic!("the first transient stall should be retryable");
+    };
+    assert!(
+        policy
+            .remaining(idle + delay)
+            .is_some_and(|left| left >= idle),
+        "the default budget must cover a remote idle timeout, backoff and another idle window"
+    );
+}
+
+#[test]
 fn elapsed_retry_budget_is_shared_by_all_attempts_and_can_be_disabled() {
-    let policy = policy();
+    let config = crate::config::types::RetryConfig {
+        max_elapsed_secs: 60,
+        ..Default::default()
+    };
+    let policy = Policy::new(&config, Duration::ZERO);
     assert_eq!(
         policy.remaining(Duration::from_secs(0)),
         Some(Duration::from_secs(60))

@@ -60,9 +60,10 @@ pub enum ConfigAction {
 
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
-    /// `ls` (default), `list`, `find <pattern>`, `recommend` (RAM-aware fit of
-    /// downloaded local MLX models), or `status` (per-model speed, fit, adapter and gate; `--json`).
-    /// Any other first word is a provider/substring filter for `ls`.
+    /// `ls` (default), `list`, `find <pattern>`, `check` (check and cache capable image models
+    /// across providers), `recommend` (RAM-aware fit of downloaded local MLX models), or `status`
+    /// (per-model speed, fit, adapter and gate; `--json`). Any other first word is a
+    /// provider/substring filter for `ls`.
     pub words: Vec<String>,
     /// Emit JSON.
     #[arg(long)]
@@ -86,6 +87,7 @@ pub enum ModelsRoute {
     List(Option<String>),
     Find(String),
     Refresh,
+    Check(Option<String>),
     Recommend,
     Status,
 }
@@ -105,6 +107,7 @@ pub fn route(words: &[String]) -> Result<ModelsRoute> {
             ModelsRoute::Find(pattern.unwrap_or_default())
         }
         Some("refresh") => ModelsRoute::Refresh,
+        Some("check") => ModelsRoute::Check(rest(1)),
         Some("recommend") => ModelsRoute::Recommend,
         Some("status") => ModelsRoute::Status,
         Some(_) => ModelsRoute::List(rest(0)),
@@ -565,6 +568,98 @@ pub fn format_table(entries: &[ModelEntry]) -> String {
     super::table::render(HEADER, &rows)
 }
 
+/// Runs `dial models check`: discovers models across configured/signed-in providers, updates the
+/// persistent image-capability cache, and prints capable & candidate image models.
+fn run_check(
+    cwd: &Path,
+    needle: Option<&str>,
+    json_out: bool,
+    overlay: Option<toml::Table>,
+) -> Result<i32> {
+    let layout = Layout::discover(cwd)?;
+    let config = Config::load(&layout, overlay)?;
+    crate::tools::net::image_gen::clear_refusals(&layout.user_dir);
+    let discovery = catalog::discover(&layout, &config.providers, &selections(&config));
+    let providers_checked = discovery
+        .providers
+        .iter()
+        .filter(|p| !matches!(p.state.as_str(), "not-set-up" | "auth-required"))
+        .count();
+    let mut rows = Vec::new();
+    let mut capable = 0usize;
+    let mut candidates = 0usize;
+    for entry in &discovery.models {
+        if !entry.available
+            || !entry.accepts_image_role()
+            || needle.is_some_and(|n| !matches(entry, n))
+        {
+            continue;
+        }
+        let cached = catalog::image_capabilities::lookup(&layout.user_dir, &entry.selection);
+        let (status, source, checked_at) = match cached {
+            Some(rec) => (
+                rec.status.as_str(),
+                rec.source.as_str(),
+                (rec.checked_at > 0).then_some(rec.checked_at),
+            ),
+            None if entry.supports_images() => ("capable", "metadata", None),
+            None => ("candidate", "candidate", None),
+        };
+        if status == "capable" {
+            capable += 1;
+        } else {
+            candidates += 1;
+        }
+        rows.push(serde_json::json!({
+            "provider": entry.selection.provider,
+            "provider_label": entry.display_provider(),
+            "model_id": entry.selection.model,
+            "label": shown_model(entry),
+            "status": status,
+            "source": source,
+            "image_api": entry.metadata.image_generation,
+            "checked_at": checked_at,
+        }));
+    }
+    let checked_at = catalog::image_capabilities::last_updated_at(&layout.user_dir);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "checked_at": checked_at,
+                "providers_checked": providers_checked,
+                "capable": capable,
+                "candidates": candidates,
+                "models": rows,
+            }))?
+        );
+    } else if rows.is_empty() {
+        println!(
+            "no capable image models found across {} checked providers",
+            providers_checked
+        );
+    } else {
+        const HEADER: [&str; 5] = ["PROVIDER", "MODEL", "STATUS", "SOURCE", "API"];
+        let table_rows: Vec<[String; 5]> = rows
+            .iter()
+            .map(|r| {
+                [
+                    r["provider"].as_str().unwrap_or("-").to_owned(),
+                    r["label"].as_str().unwrap_or("-").to_owned(),
+                    r["status"].as_str().unwrap_or("-").to_owned(),
+                    r["source"].as_str().unwrap_or("-").to_owned(),
+                    r["image_api"].as_str().unwrap_or("-").to_owned(),
+                ]
+            })
+            .collect();
+        print!("{}", super::table::render(HEADER, &table_rows));
+        println!(
+            "Checked {} providers: {} capable, {} candidate image models cached.",
+            providers_checked, capable, candidates
+        );
+    }
+    Ok(0)
+}
 /// Runs `dial models`. `overlay` is the CLI config overlay (e.g. from `--model`).
 pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -> Result<i32> {
     let route = route(&args.words)?;
@@ -573,6 +668,9 @@ pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -
             bail!(
                 "there is nothing to refresh: `dial models` discovers models each time it runs; run it again for the current list"
             )
+        }
+        ModelsRoute::Check(filter) => {
+            return run_check(cwd, filter.as_deref(), args.json, overlay);
         }
         ModelsRoute::Status => {
             return crate::stats::local_models::run_status(cwd, args.json, overlay);

@@ -285,6 +285,7 @@ pub const EVENTS: &[&str] = &[
     "state_node",
     "state_delta",
     "state_reset",
+    "inference_done",
     "active_session",
     "replay_message",
     "live_error",

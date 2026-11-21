@@ -101,6 +101,7 @@ pub struct Launch {
     env: Vec<(OsString, OsString)>,
     diagnostics: Diagnostics,
     interactive: bool,
+    tree_events: bool,
 }
 
 impl Launch {
@@ -114,6 +115,7 @@ impl Launch {
             env: Vec::new(),
             diagnostics: Diagnostics::default(),
             interactive: false,
+            tree_events: true,
         }
     }
 
@@ -162,6 +164,17 @@ impl Launch {
     #[must_use]
     pub fn interactive(mut self, interactive: bool) -> Self {
         self.interactive = interactive;
+        self
+    }
+
+    /// Ask the engine for the execution-tree events (`state_reset`, `state_node`,
+    /// `state_delta`). A client that renders the legacy `text` and tool events, as
+    /// [`Conversation`] does, sets this to false so streamed text is not sent twice; the engine
+    /// then marks model-request boundaries with `inference_done`. Sent with `hello`; engines that
+    /// predate the option ignore it, and [`Client::tree_events`] reports what was agreed.
+    #[must_use]
+    pub fn tree_events(mut self, tree_events: bool) -> Self {
+        self.tree_events = tree_events;
         self
     }
 
@@ -623,6 +636,8 @@ pub struct Client {
     buffered: VecDeque<(Message, usize)>,
     ready: Ready,
     protocol: u32,
+    /// Whether the engine sends execution-tree events on this connection.
+    tree_events: bool,
     closed: bool,
     /// `seq` of the last event seen, and how many sequence numbers were skipped.
     last_seq: Option<u64>,
@@ -679,6 +694,7 @@ impl Client {
                 raw: Value::Null,
             },
             protocol: 1,
+            tree_events: true,
             closed: false,
             last_seq: None,
             lost_events: 0,
@@ -716,6 +732,9 @@ impl Client {
             if launch.interactive {
                 hello["interactive"] = json!(true);
             }
+            if !launch.tree_events {
+                hello["tree_events"] = json!(false);
+            }
             let reply = client.call("hello", hello, left.max(Duration::from_millis(1)))?;
             client.protocol = reply["protocol_version"]
                 .as_u64()
@@ -724,6 +743,8 @@ impl Client {
                 .ok_or_else(|| {
                     ClientError::Handshake(format!("unexpected hello reply: {reply}"))
                 })?;
+            // An engine without the option leaves it out of the reply and keeps sending them.
+            client.tree_events = reply["tree_events"] != false;
         }
         client.drop_grace = DROP_GRACE;
         Ok(client)
@@ -737,6 +758,12 @@ impl Client {
     /// Negotiated protocol version.
     pub fn protocol_version(&self) -> u32 {
         self.protocol
+    }
+
+    /// Whether the engine sends execution-tree events (`state_node`, `state_delta`) on this
+    /// connection. True unless [`Launch::tree_events`] turned them off and the engine agreed.
+    pub fn tree_events(&self) -> bool {
+        self.tree_events
     }
 
     /// Whether the engine serves `method` on this connection.

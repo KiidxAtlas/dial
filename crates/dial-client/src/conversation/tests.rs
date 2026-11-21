@@ -788,23 +788,33 @@ fn disconnect_invalidates_live_tools_with_unknown_outcomes() {
 
 #[test]
 fn completed_inference_keeps_earlier_rounds_out_of_later_retry_discard() {
-    let mut view = Conversation::new();
-    feed(
-        &mut view,
-        vec![
-            json!({"event":"text","delta":"earlier"}),
-            json!({"event":"state_node","node":{"kind":"inference","parent":null,"result":{"phase":"completed"}}}),
-            json!({"event":"text","delta":"partial"}),
-            json!({"event":"notice","kind":"retry","message":"retry"}),
-        ],
-    );
-    let answers: Vec<_> = view
-        .entries()
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Assistant(a) => Some((a.text.as_str(), a.abandoned)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(answers, [("earlier", false), ("partial", true)]);
+    // Both boundary forms: the tree node, and `inference_done` without tree events.
+    for boundary in [
+        json!({"event":"state_node","node":{"kind":"inference","parent":null,"result":{"phase":"completed"}}}),
+        json!({"event":"inference_done","id":"inference-1"}),
+    ] {
+        let mut view = Conversation::new();
+        feed(
+            &mut view,
+            vec![
+                json!({"event":"text","delta":"earlier"}),
+                boundary.clone(),
+                json!({"event":"text","delta":"partial"}),
+                json!({"event":"notice","kind":"retry","message":"retry"}),
+            ],
+        );
+        let answers: Vec<_> = view
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Assistant(a) => Some((a.text.as_str(), a.abandoned)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [("earlier", false), ("partial", true)],
+            "{boundary}"
+        );
+    }
 }

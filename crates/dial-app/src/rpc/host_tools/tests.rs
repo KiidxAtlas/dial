@@ -80,6 +80,109 @@ fn host_error_answer_is_an_error_output() {
     assert!(out.text.contains(&delivered), "{}", out.text);
 }
 
+const PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=";
+
+fn answer_with(params: Value) -> ToolOutput {
+    let bridge = HostBridge::default();
+    let interrupt = AtomicBool::new(false);
+    run_call(
+        &bridge,
+        &interrupt,
+        "host tool browser_screenshot",
+        Duration::from_secs(5),
+        |call_id| {
+            let mut params = params.clone();
+            params["call_id"] = json!(call_id);
+            let (id, result) = parse_result(&params).unwrap();
+            bridge.answer(id, result).unwrap();
+            true
+        },
+        || false,
+    )
+}
+
+#[test]
+fn an_image_answer_travels_as_the_shared_image_envelope() {
+    let out = answer_with(json!({"content": [
+        {"type": "text", "text": "Screenshot of https://example.com"},
+        {"type": "image", "data": PNG, "mimeType": "image/png"}
+    ]}));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text.starts_with("Screenshot of https://example.com"),
+        "{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("attached for models that accept images"),
+        "{}",
+        out.text
+    );
+    assert!(!out.text.contains(PNG), "pixels stay out of the text");
+    let artifact = &out.data.as_ref().unwrap()["artifact"];
+    assert_eq!(
+        artifact,
+        &json!({"data": PNG, "encoding": "base64", "media_type": "image/png"})
+    );
+}
+
+#[test]
+fn a_mislabelled_image_is_noted_not_attached_and_content_errors_name_the_call() {
+    let out =
+        answer_with(json!({"content": [{"type": "image", "data": PNG, "mimeType": "image/jpeg"}]}));
+    assert!(
+        out.data
+            .as_ref()
+            .is_none_or(|data| data.get("artifact").is_none())
+    );
+    let out = answer_with(
+        json!({"content": [{"type": "text", "text": "page closed"}], "is_error": true}),
+    );
+    assert!(out.is_error);
+    assert!(
+        out.text
+            .starts_with("page closed (host tool browser_screenshot, request host-1)"),
+        "{}",
+        out.text
+    );
+    assert_eq!(
+        out.execution.effects,
+        crate::runtime::execution::Effects::Unknown
+    );
+}
+
+#[test]
+fn a_result_takes_exactly_one_of_output_or_content() {
+    let (_, text) = parse_result(&json!({"call_id": "host-1", "output": "ok"})).unwrap();
+    assert!(matches!(text.body, HostBody::Text(ref t) if t == "ok"));
+    for (params, message) in [
+        (json!({"call_id": "host-1"}), "output or content required"),
+        (
+            json!({"call_id": "host-1", "output": "a", "content": [{"type": "text", "text": "b"}]}),
+            "give output or content, not both",
+        ),
+        (
+            json!({"call_id": "host-1", "output": 7}),
+            "output must be a string",
+        ),
+        (
+            json!({"call_id": "host-1", "content": []}),
+            "content must be a non-empty array of content blocks",
+        ),
+        (
+            json!({"call_id": "host-1", "content": [{"text": "untyped"}]}),
+            "each content block must be an object with a string type",
+        ),
+        (json!({"output": "a"}), "call_id required"),
+    ] {
+        let error = parse_result(&params)
+            .err()
+            .unwrap_or_else(|| panic!("accepted {params}"));
+        assert_eq!(error.to_string(), message, "{params}");
+    }
+}
+
 #[test]
 fn silent_host_times_out() {
     let bridge = HostBridge::default();

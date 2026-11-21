@@ -97,7 +97,8 @@ impl Default for RetryConfig {
         Self {
             max_attempts: 10,
             max_delay_secs: 300,
-            max_elapsed_secs: 60,
+            // Allow a full retry after the default 60 s remote idle limit and its backoff.
+            max_elapsed_secs: 150,
             wait_for_quota_reset: false,
             rotate_accounts: true,
             fallback_chains: std::collections::BTreeMap::new(),

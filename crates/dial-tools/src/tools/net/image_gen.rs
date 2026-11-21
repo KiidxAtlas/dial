@@ -43,7 +43,7 @@ mod loopback;
 mod native;
 mod queued;
 mod selected;
-
+pub use selected::clear_refusals;
 pub const TOOL: &str = "image_gen";
 const DEFAULT_SIZE: &str = "1024x1024";
 const MAX_PROMPT_BYTES: usize = 4_000;
@@ -296,6 +296,23 @@ impl Wire {
             Api::Fal => Self::Fal,
             Api::Replicate => Self::Replicate,
             Api::Disabled => bail!("image generation is explicitly disabled"),
+        })
+    }
+
+    fn image_api(self) -> Option<crate::llm::profiles::ImageGenerationApi> {
+        use crate::llm::profiles::ImageGenerationApi as Api;
+        Some(match self {
+            Self::OpenAi | Self::Xai => Api::Images,
+            Self::MlxServe => Api::MlxServe,
+            Self::SdCpp => return None,
+            Self::Responses => Api::Responses,
+            Self::ChatCompletions => Api::ChatCompletions,
+            Self::Gemini => Api::Gemini,
+            Self::Imagen => Api::Imagen,
+            Self::BlackForestLabs => Api::BlackForestLabs,
+            Self::ComfyUi => Api::ComfyUi,
+            Self::Fal => Api::Fal,
+            Self::Replicate => Api::Replicate,
         })
     }
 }
@@ -1105,6 +1122,19 @@ fn generate(
         "image API returned {} images; image_gen writes at most {MAX_IMAGES}",
         images.len()
     );
+    if let Some(api) = target.wire.image_api() {
+        let mut selection = ctx.config.for_role("image").selection();
+        if selection.model == target.model {
+            if selection.account_id.is_none() {
+                selection.account_id = target.account_id.clone();
+            }
+            let _ = crate::llm::catalog::image_capabilities::record_verified(
+                &ctx.config.user_dir,
+                &selection,
+                api,
+            );
+        }
+    }
     let extras = extra_outputs(ctx, request.output, &path, images.len() - 1)?;
     if !extras.is_empty() {
         let paths: Vec<PathBuf> = extras.iter().map(|(_, path)| path.clone()).collect();

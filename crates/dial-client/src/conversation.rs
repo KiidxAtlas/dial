@@ -436,17 +436,16 @@ impl Conversation {
                 self.session_id = body["session_id"].as_str().map(str::to_owned);
                 false
             }
+            // A successful top-level model request: `state_node` from a tree-event client,
+            // `inference_done` once the client turned tree events off (`Launch::tree_events`).
             "state_node"
                 if body["node"]["kind"] == "inference"
                     && body["node"]["parent"].is_null()
                     && body["node"]["result"]["phase"] == "completed" =>
             {
-                // A successful model request is an attempt boundary too. A retry in a later
-                // request must not abandon assistant fragments from earlier completed requests.
-                self.finish_streaming();
-                self.attempt_rows.clear();
-                true
+                self.end_model_request()
             }
+            "inference_done" => self.end_model_request(),
             "text" => {
                 self.turn_streamed = true;
                 self.assistant().text.push_str(text("delta"));
@@ -731,6 +730,14 @@ impl Conversation {
         self.approvals.clear();
         self.question = None;
         self.todo.clear();
+        true
+    }
+
+    /// A successful model request is an attempt boundary too. A retry in a later request must
+    /// not abandon assistant fragments from earlier completed requests.
+    fn end_model_request(&mut self) -> bool {
+        self.finish_streaming();
+        self.attempt_rows.clear();
         true
     }
 

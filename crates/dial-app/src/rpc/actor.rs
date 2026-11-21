@@ -212,6 +212,7 @@ impl Actor {
                     node_cursors: Default::default(),
                     node_revisions: Default::default(),
                     node_meta: Default::default(),
+                    requests_done: Default::default(),
                     projection_dirty: false,
                     tree: None,
                 });
@@ -1587,7 +1588,8 @@ impl ActorRuntime<'_> {
             .collect();
         self.agent.register_host_tools(tools)?;
         self.worker_host.mark_registered(names.clone());
-        Ok(json!({"tools": names}))
+        // `result_content`: `host_tool_result` takes MCP content blocks (images) as well as text.
+        Ok(json!({"tools": names, "result_content": true}))
     }
 
     fn set_host_uri_schemes(&mut self, params: &Value) -> Result<Value> {

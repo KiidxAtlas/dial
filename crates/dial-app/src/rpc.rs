@@ -197,6 +197,10 @@ struct Output {
     /// Set by `hello {interactive:true}`: a person answers approvals and questions, so the engine
     /// may ask (directory grants, recovery choices, draft review). Off by default for scripts.
     interactive: bool,
+    /// Cleared by `hello {tree_events:false}`: the client renders the legacy events alone, so the
+    /// execution-tree stream (`state_reset`, `state_node`, `state_delta`) is not sent and only
+    /// `inference_done` marks each successful top-level model request.
+    tree_events: bool,
     /// Envelope fields stamped on every plain-RPC event (ACP frames are mapped, not stamped).
     envelope: Envelope,
 }
@@ -259,6 +263,26 @@ pub(super) fn coded(code: ErrorCode, error: impl std::fmt::Display) -> anyhow::E
         code,
         message: format!("{error:#}"),
     })
+}
+
+/// An optional boolean `hello` parameter; absent or null means `default`.
+fn hello_flag(params: &Value, key: &str, default: bool) -> Result<bool> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(coded(
+            ErrorCode::InvalidParams,
+            format!("{key} must be a boolean"),
+        )),
+    }
+}
+
+/// A successful top-level model request: the boundary between model rounds that legacy-event
+/// clients need to keep earlier answers when a later request is retried.
+fn ends_model_request(node: &crate::runtime::Node) -> bool {
+    node.kind == "inference"
+        && node.parent.is_none()
+        && node.result.phase == crate::runtime::Phase::Completed
 }
 
 /// Validate the parameter object for methods that explicitly reject unknown fields.
@@ -447,11 +471,16 @@ impl Sender {
         self.mapping()
             .map_or(DEFAULT_PROTOCOL_VERSION, |output| output.protocol)
     }
-    fn negotiate(&self, version: u32, interactive: bool) -> Result<()> {
+    fn negotiate(&self, version: u32, interactive: bool, tree_events: bool) -> Result<()> {
         let mut output = self.mapping()?;
         output.protocol = version;
         output.interactive = interactive;
+        output.tree_events = tree_events;
         Ok(())
+    }
+    /// Whether this client takes the execution-tree events (see [`Output::tree_events`]).
+    fn tree_events(&self) -> bool {
+        self.mapping().map_or(true, |output| output.tree_events)
     }
     /// Attribute later events to `session_id` and to the request in flight (null when idle).
     fn attribute(&self, session_id: &str, request_id: Value) {
@@ -527,6 +556,8 @@ struct RpcUi {
     node_revisions: std::collections::BTreeMap<String, u64>,
     /// Last emitted metadata per node. Comparing it across revisions tells a text append from a metadata edit.
     node_meta: std::collections::BTreeMap<String, Value>,
+    /// Model requests already reported with `inference_done` to a client without tree events.
+    requests_done: std::collections::BTreeSet<String>,
     /// Set by runtime changes; the idle worker republishes the query projection when this is set.
     projection_dirty: bool,
     tree: Option<crate::runtime::Tree>,
@@ -611,9 +642,12 @@ impl Ui for RpcUi {
             self.node_cursors.clear();
             self.node_revisions.clear();
             self.node_meta.clear();
+            self.requests_done.clear();
             self.tree = Some(tree.clone());
             self.projection_dirty = true;
-            self.out.emit(json!({"event":"state_reset"}));
+            if self.out.tree_events() {
+                self.out.emit(json!({"event":"state_reset"}));
+            }
         }
     }
     fn heartbeat(&mut self) {
@@ -636,6 +670,12 @@ impl Ui for RpcUi {
             let previous = self.node_cursors.insert(node.id.clone(), len);
             // Only growth of a running, non-worker node's text is a delta; anything else sends the node.
             let text_only = !metadata_changed && node.kind != "worker" && node.result.phase.is_running();
+            if !self.out.tree_events() {
+                if ends_model_request(node) && self.requests_done.insert(node.id.clone()) {
+                    self.out.emit(json!({"event":"inference_done","id":node.id}));
+                }
+                return;
+            }
             match previous {
                 Some(bytes) if text_only && bytes <= len && node.result.text.is_char_boundary(bytes) => {
                     if bytes < len {
@@ -1111,14 +1151,31 @@ impl Admin {
                         }
                     },
                 };
-                let models = if let Some(purpose) = purpose {
-                    models::list_for(&config, &layout.user_dir, provider, purpose)
-                } else if model.provider.is_empty() {
-                    models::list(&config, &config.selection(), &layout.user_dir, provider)
-                } else {
-                    models::list(&config, &model, &layout.user_dir, provider)
+                let refresh = match params.get("refresh").filter(|value| !value.is_null()) {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        coded(ErrorCode::InvalidParams, "refresh must be a boolean")
+                    })?,
                 };
-                Ok(json!({"models":models}))
+                let list_with = |cfg: &Config| {
+                    if let Some(purpose) = purpose {
+                        models::list_for(cfg, &layout.user_dir, provider, purpose)
+                    } else if model.provider.is_empty() {
+                        models::list(cfg, &cfg.selection(), &layout.user_dir, provider)
+                    } else {
+                        models::list(cfg, &model, &layout.user_dir, provider)
+                    }
+                };
+                if refresh {
+                    let cloned = config.clone();
+                    drop(config);
+                    let checked = models::refresh_and_check(&layout, &cloned);
+                    let models = list_with(&cloned);
+                    Ok(json!({"models": models, "checked": checked}))
+                } else {
+                    let models = list_with(&config);
+                    Ok(json!({"models": models}))
+                }
             }
             "image_settings" => {
                 drop(config);
@@ -1345,6 +1402,7 @@ fn run_control(
             acp: acp.then(|| crate::acp::Adapter::new(layout.clone())),
             protocol: DEFAULT_PROTOCOL_VERSION,
             interactive: false,
+            tree_events: true,
             envelope: Envelope::default(),
         })),
         writer,
@@ -1885,14 +1943,11 @@ fn run_control(
                 }
                 "host_tool_result" => {
                     let result = (|| -> Result<Value> {
-                        let call_id = request["params"]["call_id"]
-                            .as_str()
-                            .context("call_id required")?;
-                        let output = request["params"]["output"]
-                            .as_str()
-                            .context("output must be a string")?;
-                        let is_error = request["params"]["is_error"].as_bool().unwrap_or(false);
-                        host_bridge.complete(call_id, output.to_owned(), is_error)?;
+                        let (call_id, answer) = host_tools::parse_result(&request["params"])
+                            .map_err(|error| {
+                                coded(ErrorCode::InvalidParams, format!("{error:#}"))
+                            })?;
+                        host_bridge.answer(call_id, answer)?;
                         Ok(json!({"received":true}))
                     })();
                     out.result(&id, result);
@@ -1905,20 +1960,12 @@ fn run_control(
                                 .ok_or_else(|| {
                                     coded(ErrorCode::InvalidParams, "protocol_version required")
                                 })?;
-                        let interactive = match request["params"].get("interactive") {
-                            None | Some(Value::Null) => false,
-                            Some(Value::Bool(flag)) => *flag,
-                            Some(_) => {
-                                return Err(coded(
-                                    ErrorCode::InvalidParams,
-                                    "interactive must be a boolean",
-                                ));
-                            }
-                        };
+                        let interactive = hello_flag(&request["params"], "interactive", false)?;
+                        let tree_events = hello_flag(&request["params"], "tree_events", true)?;
                         let version = negotiated_version(requested)?;
-                        out.negotiate(version, interactive && !acp)?;
+                        out.negotiate(version, interactive && !acp, tree_events)?;
                         Ok(
-                            json!({"protocol_version":version,"supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,"interactive":interactive && !acp}),
+                            json!({"protocol_version":version,"supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,"interactive":interactive && !acp,"tree_events":tree_events}),
                         )
                     })();
                     out.result(&id, result);

@@ -25,8 +25,46 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// The host's answer to one forwarded call.
 pub(super) struct HostResult {
-    pub(super) text: String,
+    pub(super) body: HostBody,
     pub(super) is_error: bool,
+}
+
+/// What the host answered with.
+pub(super) enum HostBody {
+    /// `output`: plain text.
+    Text(String),
+    /// `content`: MCP content blocks (text, image, ...), rendered as an MCP tool result is, so a
+    /// PNG, JPEG, GIF or WebP image reaches models that accept images.
+    Content(Value),
+}
+
+/// Reads `host_tool_result` params: `call_id` and exactly one of `output` (a string) or `content`
+/// (a non-empty array of content blocks, each an object with a string `type`).
+pub(super) fn parse_result(params: &Value) -> Result<(&str, HostResult)> {
+    let call_id = params["call_id"].as_str().context("call_id required")?;
+    let is_error = params["is_error"].as_bool().unwrap_or(false);
+    let body = match (params.get("output"), params.get("content")) {
+        (Some(output), None) => HostBody::Text(
+            output
+                .as_str()
+                .context("output must be a string")?
+                .to_owned(),
+        ),
+        (None, Some(content)) => {
+            let blocks = content
+                .as_array()
+                .filter(|blocks| !blocks.is_empty())
+                .context("content must be a non-empty array of content blocks")?;
+            ensure!(
+                blocks.iter().all(|block| block["type"].is_string()),
+                "each content block must be an object with a string type"
+            );
+            HostBody::Content(content.clone())
+        }
+        (Some(_), Some(_)) => anyhow::bail!("give output or content, not both"),
+        (None, None) => anyhow::bail!("output or content required"),
+    };
+    Ok((call_id, HostResult { body, is_error }))
 }
 
 type Pending = BTreeMap<String, mpsc::SyncSender<HostResult>>;
@@ -48,15 +86,27 @@ impl HostBridge {
             .map_err(|_| anyhow::anyhow!("host tool state unavailable"))
     }
 
+    /// Completes a pending call with a text answer (see [`HostBridge::answer`]); host URI and
+    /// client file requests answer this way too.
+    pub(super) fn complete(&self, call_id: &str, text: String, is_error: bool) -> Result<()> {
+        self.answer(
+            call_id,
+            HostResult {
+                body: HostBody::Text(text),
+                is_error,
+            },
+        )
+    }
+
     /// Completes a pending call. Unknown or already-finished call IDs are refused, so a late or
     /// repeated answer can never reach a different call.
-    pub(super) fn complete(&self, call_id: &str, text: String, is_error: bool) -> Result<()> {
+    pub(super) fn answer(&self, call_id: &str, result: HostResult) -> Result<()> {
         let sender = self
             .lock()?
             .remove(call_id)
             .context("no host tool call is pending with that call_id")?;
         // The waiting call may have just given up; a closed receiver is not an error for the host.
-        let _ = sender.send(HostResult { text, is_error });
+        let _ = sender.send(result);
         Ok(())
     }
 
@@ -159,15 +209,28 @@ pub(super) fn run_call(
     };
     bridge.close_call(&call_id);
     match outcome {
-        Ok(result) if result.is_error => {
-            ToolOutput::err(format!("{} ({label}, request {call_id})", result.text))
-                .with_effects(crate::runtime::execution::Effects::Unknown)
-        }
-        Ok(result) => ToolOutput::ok(result.text),
+        Ok(result) => answered(result, label, &call_id),
         Err(message) => {
             ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::Unknown)
         }
     }
+}
+
+/// The tool output for the host's answer. An error names the call, and its effects are unknown:
+/// the host may have acted before failing.
+fn answered(result: HostResult, label: &str, call_id: &str) -> ToolOutput {
+    let mut output = match result.body {
+        HostBody::Text(text) if result.is_error => ToolOutput::err(text),
+        HostBody::Text(text) => ToolOutput::ok(text),
+        HostBody::Content(content) => crate::tools::integrations::mcp::render_result(
+            &json!({"content": content, "isError": result.is_error}),
+        ),
+    };
+    if output.is_error {
+        output.text = format!("{} ({label}, request {call_id})", output.text);
+        output = output.with_effects(crate::runtime::execution::Effects::Unknown);
+    }
+    output
 }
 
 /// One host tool as declared in `set_host_tools`.

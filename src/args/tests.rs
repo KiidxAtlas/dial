@@ -20,6 +20,23 @@ fn slash_cli_hints_resolve_through_the_real_clap_tree() {
 }
 
 #[test]
+fn clients_can_append_to_the_system_prompt_after_rpc() {
+    // Dial Desktop starts `dial rpc <flags>`; the flag must parse after the subcommand too.
+    for argv in [
+        ["dial", "rpc", "--append-system-prompt", "Draw diagrams."],
+        ["dial", "--append-system-prompt", "Draw diagrams.", "rpc"],
+    ] {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(cli.command, Some(Command::Rpc)), "{argv:?}");
+        assert_eq!(
+            cli.tool_flags.append_system_prompt.as_deref(),
+            Some("Draw diagrams."),
+            "{argv:?}"
+        );
+    }
+}
+
+#[test]
 fn approval_choices_and_aliases_are_accepted_by_the_cli() {
     for &policy in dial::config::types::Approval::NAMES {
         let cli = Cli::try_parse_from(["dial", "--approval", policy]).unwrap();

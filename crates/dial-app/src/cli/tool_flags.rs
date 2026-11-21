@@ -39,7 +39,7 @@ pub struct ToolFlagArgs {
     #[arg(long, value_name = "FILE", conflicts_with = "system_prompt")]
     pub system_prompt_template: Option<String>,
     /// Text appended to the system prompt.
-    #[arg(long, value_name = "TEXT")]
+    #[arg(long, value_name = "TEXT", global = true)]
     pub append_system_prompt: Option<String>,
     /// Disable skills for this session.
     #[arg(long)]

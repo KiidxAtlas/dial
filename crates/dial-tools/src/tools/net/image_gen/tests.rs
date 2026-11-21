@@ -2133,3 +2133,46 @@ fn generates_with_a_dial_launched_sd_server() {
     let decoded = image::load_from_memory(&bytes).unwrap();
     assert!(decoded.width() >= 256 && decoded.height() >= 256);
 }
+
+#[test]
+fn successful_generation_caches_verified_capability_and_refusals_persist() {
+    use crate::llm::catalog::image_capabilities::{
+        self, ImageCapabilitySource, ImageCapabilityStatus,
+    };
+    use crate::llm::profiles::ImageGenerationApi;
+
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = tempfile::tempdir().unwrap();
+    let config = selected_config(&base, user.path(), ImageGenerationApi::MlxServe);
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a cedar tree", "output": "cedar.png"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let _ = server.join().unwrap();
+
+    let cached = image_capabilities::lookup(user.path(), &config.selection())
+        .expect("successful generation must cache verified capability");
+    assert_eq!(cached.status, ImageCapabilityStatus::Capable);
+    assert_eq!(cached.source, ImageCapabilitySource::Verified);
+    assert_eq!(cached.api, Some(ImageGenerationApi::MlxServe));
+
+    // Account refusals persist on disk and are cleared by clear_refusals.
+    let auth_dir = crate::config::paths::subscription_auth_dir(user.path()).unwrap();
+    super::selected::record_refusal(&auth_dir, "oaiapp_persist");
+    assert!(image_capabilities::account_refused(
+        &auth_dir,
+        crate::llm::chatgpt::PROVIDER,
+        "oaiapp_persist"
+    ));
+    super::clear_refusals(user.path());
+    assert!(!image_capabilities::account_refused(
+        &auth_dir,
+        crate::llm::chatgpt::PROVIDER,
+        "oaiapp_persist"
+    ));
+}

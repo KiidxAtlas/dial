@@ -151,6 +151,9 @@ pub fn tour_seen_file(user_dir: &Path) -> PathBuf {
 pub fn chatgpt_model_catalog_file(user_dir: &Path) -> PathBuf {
     cache_file(user_dir, "chatgpt-model-catalog.json")
 }
+pub fn image_capabilities_file(user_dir: &Path) -> PathBuf {
+    cache_file(user_dir, "image-capabilities.json")
+}
 
 // Large trees, editable resources, databases (including WAL sidecars) and live coordination
 // inodes deliberately stay in place. Only bounded private records use grouped_file above.

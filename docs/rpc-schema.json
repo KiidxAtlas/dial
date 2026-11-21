@@ -2048,7 +2048,7 @@
             "method": {"const": "hello"},
             "params": {
               "type": "object",
-              "properties": {"protocol_version": {"type": "integer", "minimum": 1}, "interactive": {"type": "boolean", "default": false, "description": "A person answers this client (native dial rpc only): the engine may then ask interactive questions such as directory-access grants. Scripts leave it false."}},
+              "properties": {"protocol_version": {"type": "integer", "minimum": 1}, "interactive": {"type": "boolean", "default": false, "description": "A person answers this client (native dial rpc only): the engine may then ask interactive questions such as directory-access grants. Scripts leave it false."}, "tree_events": {"type": "boolean", "default": true, "description": "Send the execution-tree events (state_reset, state_node, state_delta). A client that renders the legacy text and tool events sets it to false and receives inference_done at each successful top-level model request instead. Echoed in the reply; engines that omit it from the reply still send tree events."}},
               "required": ["protocol_version"],
               "additionalProperties": false
             }
@@ -2124,11 +2124,18 @@
               "type": "object",
               "properties": {
                 "call_id": {"type": "string", "minLength": 1},
-                "output": {"type": "string"},
+                "output": {"type": "string", "description": "Plain-text answer. Give this or content."},
+                "content": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {"type": "object", "properties": {"type": {"type": "string"}}, "required": ["type"]},
+                  "description": "MCP content blocks (text, image with base64 data and mimeType, ...), rendered as an MCP tool result: the first PNG, JPEG, GIF or WebP whose bytes match its mimeType is attached for models that accept images. Give this or output. Supported when set_host_tools replies result_content: true."
+                },
                 "is_error": {"type": "boolean"}
               },
               "additionalProperties": false,
-              "required": ["call_id", "output"]
+              "required": ["call_id"],
+              "oneOf": [{"required": ["output"]}, {"required": ["content"]}]
             }
           },
           "required": ["method", "params"],
@@ -2323,7 +2330,7 @@
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_models"},
-            "params": {"type": "object", "properties": {"provider": {"type": "string", "minLength": 1}, "purpose": {"enum": ["chat", "image", "embedding"]}}, "additionalProperties": false}
+            "params": {"type": "object", "properties": {"provider": {"type": "string", "minLength": 1}, "purpose": {"enum": ["chat", "image", "embedding"]}, "refresh": {"type": "boolean"}}, "additionalProperties": false}
           },
           "required": ["method"],
           "additionalProperties": false
@@ -4508,6 +4515,26 @@
             "id",
             "revision",
             "append"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "inference_done"
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "id": {
+              "type": "string",
+              "description": "Execution-tree id of the completed top-level inference node. Sent once per node, only after hello {tree_events:false}."
+            }
+          },
+          "required": [
+            "event",
+            "id"
           ],
           "additionalProperties": true
         },

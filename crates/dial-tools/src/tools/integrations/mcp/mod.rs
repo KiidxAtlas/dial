@@ -61,6 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
+pub use tool::render_result;
 
 #[derive(Clone, Debug)]
 pub enum Signal {
