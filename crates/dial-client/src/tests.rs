@@ -232,6 +232,41 @@ fn mcp_login_delivers_interaction_before_completion() {
 }
 
 #[cfg(unix)]
+#[test]
+fn tree_events_opt_out_is_sent_with_hello_and_reported_as_agreed() {
+    use std::os::unix::fs::PermissionsExt;
+    // Replies `tree_events:false` only to a hello that asked for it; `old` replies as an engine
+    // that predates the option.
+    let engine = |old: bool| {
+        let reply_off = if old {
+            r#"{"id":1,"result":{"protocol_version":2}}"#
+        } else {
+            r#"{"id":1,"result":{"protocol_version":2,"tree_events":false}}"#
+        };
+        format!(
+            "printf '%s\\n' '{{\"event\":\"ready\",\"protocol_version\":2,\"methods\":[\"hello\"]}}'\nIFS= read -r hello\ncase \"$hello\" in\n  *'\"tree_events\":false'*) printf '%s\\n' '{reply_off}' ;;\n  *'tree_events'*) printf '%s\\n' 'unexpected' ;;\n  *) printf '%s\\n' '{{\"id\":1,\"result\":{{\"protocol_version\":2}}}}' ;;\nesac\nexec sleep 10"
+        )
+    };
+    for (old, opt_out, expected) in [
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine");
+        std::fs::write(&path, format!("#!/bin/sh\n{}\n", engine(old))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = Launch::new(path).tree_events(!opt_out);
+        let client = Client::connect(&launch, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            client.tree_events(),
+            expected,
+            "old engine {old}, opt out {opt_out}"
+        );
+    }
+}
+
+#[cfg(unix)]
 fn nonreading_engine() -> (tempfile::TempDir, Client) {
     engine_script(
         "printf '%s\\n' '{\"event\":\"ready\",\"protocol_version\":1,\"methods\":[\"send\",\"shutdown\"]}'\nexec sleep 10",

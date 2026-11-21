@@ -148,10 +148,13 @@ pub(super) fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
     a.model == b.model && same_route(a, b)
 }
 /// Every model in the provider listings a `/models` refresh saved, across providers, plus the
-/// Antigravity listing when it belongs to the active account and project. No network access; a
-/// model that was never listed (or a listing that was never refreshed) is absent.
+/// Antigravity and ChatGPT subscription listings when they belong to the active account. No
+/// network access; a model that was never listed (or a listing that was never refreshed) is
+/// absent. Persisted verified image-capability observations are applied before returning.
 pub fn saved_listing_models(user_dir: &Path) -> Vec<ModelEntry> {
     let mut models: Vec<ModelEntry> = cached(user_dir).values().flatten().cloned().collect();
     models.extend(super::subscription::saved_antigravity_models(user_dir));
+    models.extend(crate::llm::chatgpt::saved_active_models(user_dir));
+    super::image_capabilities::apply_cached(user_dir, &mut models);
     models
 }

@@ -11,13 +11,13 @@ pub use bundled::{
 
 mod cache;
 mod credentials;
+pub mod image_capabilities;
 mod local_models;
 mod local_removal;
 mod local_servers;
 mod metadata;
 mod probe;
 mod subscription;
-
 use crate::config::paths::Layout;
 use crate::llm::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
 pub use cache::saved_listing_models;
@@ -676,6 +676,10 @@ pub fn discover(
         }
     }
     annotate_embedding_checkpoints(&mut discovery.models);
+    if storage_safe {
+        let _ = image_capabilities::update_from_discovery(&layout.user_dir, &discovery.models);
+        image_capabilities::apply_cached(&layout.user_dir, &mut discovery.models);
+    }
     discovery
 }
 #[cfg(test)]

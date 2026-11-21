@@ -86,7 +86,8 @@ state-2 -> replace the view with the latest available snapshot
 ```
 
 Allocate distinct outstanding IDs, correlate responses by ID rather than arrival order, and choose
-one rendering projection: legacy text/tool events **or** the execution tree, not both.
+one rendering projection: legacy text/tool events **or** the execution tree, not both. Legacy
+renderers send `hello {tree_events: false}` so the engine does not stream the tree at all.
 
 ## State, revisions and partial output
 
@@ -229,7 +230,8 @@ progress. Disconnect/reconnect marks unresolved tool outcomes and effects unknow
 An automatic retry notice (`kind: "retry"`) marks every assistant fragment from that failed model
 attempt `abandoned: true`. Argument-only tool drafts retire as skipped with no effects; dispatched
 or completed tools are preserved. Later text and reused draft call IDs create fresh rows. Successful
-foreground inference `state_node` events delimit model rounds, preserving earlier successful answers;
+foreground inference `state_node` events (or `inference_done` after `hello {tree_events: false}`)
+delimit model rounds, preserving earlier successful answers;
 older engines lacking those boundaries cannot provide that distinction. Response text remains the
 fallback when the successful turn has no streamed answer.
 Historical tool rows preserve explicit status, effects and structured data. Use

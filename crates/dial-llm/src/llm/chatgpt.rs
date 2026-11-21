@@ -107,6 +107,28 @@ pub(crate) fn scoped_cached_models(
     Ok(models)
 }
 
+/// Active signed-in ChatGPT account id, offline (no network, no refresh).
+pub(crate) fn active_account_id(dir: &Path) -> Option<String> {
+    let state = load(dir).ok()?;
+    state.active.filter(|id| {
+        state
+            .accounts
+            .get(id)
+            .is_some_and(|account| account.tokens.is_some() && account.client_id == CLIENT_ID)
+    })
+}
+
+/// Saved ChatGPT models for the active signed-in account, offline.
+pub(crate) fn saved_active_models(user_dir: &Path) -> Vec<super::catalog::ModelEntry> {
+    let Ok(dir) = crate::config::paths::subscription_auth_dir(user_dir) else {
+        return Vec::new();
+    };
+    let Some(id) = active_account_id(&dir) else {
+        return Vec::new();
+    };
+    scoped_cached_models(&dir, &id).unwrap_or_default()
+}
+
 pub(crate) fn scoped_model_context_window(
     dir: &Path,
     account_id: Option<&str>,

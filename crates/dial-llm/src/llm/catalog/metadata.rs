@@ -372,7 +372,9 @@ pub(super) fn documented_image_generation(
             | "gpt-image-2.5-flare"
             | "gpt-image-2.5-sunburst"
             | "gpt-image-2.6-flare"
-            | "gpt-image-2.6-sunburst",
+            | "gpt-image-2.6-sunburst"
+            | "dall-e-3"
+            | "dall-e-2",
         ) => Some(ImageGenerationApi::Images),
         // xAI Grok Imagine on `/v1/images/generations` (OpenAI-compatible request shape).
         ("xai", "grok-imagine-image-2.0") => Some(ImageGenerationApi::Images),

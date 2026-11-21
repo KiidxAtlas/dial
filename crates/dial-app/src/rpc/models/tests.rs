@@ -270,3 +270,125 @@ fn delete_local_model_refuses_malformed_requests_and_unknown_models_without_dele
     );
     assert!(outside.is_dir());
 }
+
+#[test]
+fn image_listing_includes_cached_chatgpt_candidates_and_reflects_verified_and_refused_states() {
+    use crate::llm::catalog::image_capabilities;
+    let home = tempfile::tempdir().unwrap();
+    let auth_dir = crate::config::paths::subscription_auth_dir(home.path()).unwrap();
+    crate::llm::chatgpt::test_account(&auth_dir, false);
+    crate::llm::chatgpt::test_catalog(
+        &auth_dir,
+        &json!({"models": [{"slug": "gpt-6.2-astra", "display_name": "GPT-6.2 Astra"}]}),
+    );
+
+    let config = Config {
+        user_dir: home.path().to_path_buf(),
+        ..Config::default()
+    };
+    // Cached ChatGPT model appears as an image candidate offline without guessing from names.
+    let images = list_for(&config, home.path(), Some("chatgpt"), Purpose::Image);
+    let astra = images
+        .iter()
+        .find(|row| row["model_id"] == "gpt-6.2-astra")
+        .expect("cached ChatGPT model listed");
+    assert_eq!(astra["image_capability"], "candidate");
+    assert_eq!(astra["image_capability_source"], "candidate");
+    assert!(astra["image_api"].is_null());
+
+    // Once verified by a live generation, the cached capability upgrades to capable/verified.
+    let selection = ModelSelection {
+        provider: "chatgpt".into(),
+        model: "gpt-6.2-astra".into(),
+        base_url: Some(crate::llm::chatgpt::BASE_URL.into()),
+        account_id: Some("oaiapp_test".into()),
+        ..Default::default()
+    };
+    image_capabilities::record_verified(home.path(), &selection, ImageGenerationApi::Responses)
+        .unwrap();
+    let upgraded = list_for(&config, home.path(), Some("chatgpt"), Purpose::Image);
+    let astra = upgraded
+        .iter()
+        .find(|row| row["model_id"] == "gpt-6.2-astra")
+        .expect("verified ChatGPT model listed");
+    assert_eq!(astra["image_capability"], "capable");
+    assert_eq!(astra["image_capability_source"], "verified");
+    assert_eq!(astra["image_api"], "responses");
+    assert!(astra["image_checked_at"].as_u64().unwrap_or(0) > 0);
+
+    // Persisted account refusal withdraws ChatGPT models from Purpose::Image until cleared.
+    image_capabilities::record_account_refused(home.path(), "chatgpt", "oaiapp_test", "free plan")
+        .unwrap();
+    assert!(list_for(&config, home.path(), Some("chatgpt"), Purpose::Image).is_empty());
+
+    image_capabilities::clear_refusals(home.path()).unwrap();
+    assert!(
+        list_for(&config, home.path(), Some("chatgpt"), Purpose::Image)
+            .iter()
+            .any(|row| row["model_id"] == "gpt-6.2-astra")
+    );
+}
+
+#[test]
+fn list_skips_disabled_providers_stale_catalogs_and_account_scoped_bundled_ids() {
+    use crate::llm::model_config::ProviderSpec;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = config();
+    // Disabled provider must not flood the chat listing with bundled models.
+    config.providers.insert(
+        "copilot".into(),
+        ProviderSpec {
+            enabled: false,
+            ..ProviderSpec::default()
+        },
+    );
+    // Account-scoped provider with no live listing must not dump static bundled IDs.
+    config.providers.insert(
+        "google-antigravity".into(),
+        ProviderSpec {
+            enabled: true,
+            base_url: "https://daily-cloudcode-pa.googleapis.com".into(),
+            ..ProviderSpec::default()
+        },
+    );
+    // Enabled provider with a saved live listing must not pile stale bundled models on top.
+    config.providers.insert(
+        "anthropic".into(),
+        ProviderSpec {
+            enabled: true,
+            base_url: "https://api.anthropic.com/v1".into(),
+            ..ProviderSpec::default()
+        },
+    );
+    let live = catalog::ModelEntry {
+        selection: selection("anthropic", "claude-live-only"),
+        label: "Claude Live Only".into(),
+        source: "listing".into(),
+        available: true,
+        metadata: catalog::ModelMetadata::default(),
+    };
+    let path = crate::config::paths::model_catalog_file(home.path());
+    let bytes = serde_json::to_vec(&BTreeMap::from([("anthropic", vec![live])])).unwrap();
+    crate::platform::atomic::write_private(&path, &bytes).unwrap();
+
+    let rows = list(&config, &config.selection(), home.path(), None);
+    assert!(
+        rows.iter().all(|row| row["provider"] != "copilot"),
+        "disabled provider must be omitted"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["provider"] != "google-antigravity"),
+        "account-scoped provider without live listing must not dump bundled IDs"
+    );
+    let anthropic_ids: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["provider"] == "anthropic")
+        .map(|row| row["model_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        anthropic_ids,
+        ["claude-live-only"],
+        "live listing suppresses stale bundled catalog rows"
+    );
+}

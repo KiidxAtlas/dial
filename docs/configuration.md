@@ -521,9 +521,11 @@ unlisted filesystem metadata are not tracked; do not opt in checks whose results
 12 KiB core-schema ceiling as well as `initial_tool_limit`; only explicit `tool_load` adds specialists.
 Setting it to `false` retains legacy automatic discovery/routing. Lean local count limits remain.
 
-`retry.max_elapsed_secs` defaults to 60 (0 disables this limit, maximum 3600). After a failed
-provider attempt, retry waits are bounded by the remaining allowance before stopping; a pending
-manual retry can skip the wait while time remains;
+`retry.max_elapsed_secs` defaults to 150 (0 disables this limit, maximum 3600). The clock starts
+with the first attempt. The default leaves room for a retry after the default 60-second remote
+idle timeout and backoff. If you raise `remote_model_idle_timeout_secs`, allow time for both
+attempts and the wait if you want the retry to have a full idle window. Retry waits are bounded
+by the remaining allowance; a pending manual retry can skip the wait while time remains, and
 retry transport timeouts use the remaining allowance. It does not cancel an otherwise healthy
 first stream or replace the task deadline, silence watchdog or attempt limit.
 

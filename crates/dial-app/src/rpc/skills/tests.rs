@@ -149,6 +149,7 @@ fn sender() -> Sender {
             acp: None,
             protocol: dial_protocol::DEFAULT_PROTOCOL_VERSION,
             interactive: false,
+            tree_events: true,
             envelope: super::super::Envelope::default(),
         })),
         writer: crate::output::StdoutWriter::new().unwrap(),

@@ -25,6 +25,17 @@ fn key(selection: &ModelSelection) -> String {
     format!("{}/{}", selection.provider, selection.model)
 }
 
+fn provider_disabled(config: &Config, provider: &str) -> bool {
+    config
+        .providers
+        .get(provider)
+        .is_some_and(|spec| !spec.enabled || spec.is_reset())
+}
+
+fn is_account_scoped_provider(provider: &str) -> bool {
+    matches!(provider, "chatgpt" | "google-antigravity")
+}
+
 /// Every model `set_model` accepts offline, sorted by `provider/model`. `current` is the model in
 /// force (the session's `set_model` choice when there is one; it is listed even when the launched
 /// configuration does not name it). `provider` narrows the listing to one provider and also lists
@@ -54,15 +65,25 @@ pub(super) fn list(
             row.sources.push(source);
         }
     }
-    add(&mut rows, &config.selection(), None, "main".into());
+    let main = config.selection();
+    if !provider_disabled(config, &main.provider) {
+        add(&mut rows, &main, None, "main".into());
+    }
     add(&mut rows, current, None, "current".into());
     for (role, selection) in &config.model_roles {
-        add(&mut rows, selection, None, format!("role:{role}"));
+        if !provider_disabled(config, &selection.provider) {
+            add(&mut rows, selection, None, format!("role:{role}"));
+        }
     }
     for selection in &config.model_favorites {
-        add(&mut rows, selection, None, "favorite".into());
+        if !provider_disabled(config, &selection.provider) {
+            add(&mut rows, selection, None, "favorite".into());
+        }
     }
     for (name, profile) in &config.model_profiles {
+        if provider_disabled(config, &profile.provider) {
+            continue;
+        }
         let selection = ModelSelection {
             provider: profile.provider.clone(),
             model: profile.model.clone(),
@@ -70,27 +91,32 @@ pub(super) fn list(
         };
         add(&mut rows, &selection, None, format!("profile:{name}"));
     }
-    let mut providers: BTreeSet<String> = rows.values().map(|row| row.provider.clone()).collect();
-    providers.extend(config.providers.keys().cloned());
+    let mut providers: BTreeSet<String> = rows
+        .values()
+        .filter(|row| !provider_disabled(config, &row.provider))
+        .map(|row| row.provider.clone())
+        .collect();
+    providers.extend(
+        config
+            .providers
+            .iter()
+            .filter(|(_, spec)| spec.enabled && !spec.is_reset())
+            .map(|(name, _)| name.clone()),
+    );
     if let Some(provider) = provider {
         providers.insert(provider.to_owned());
     }
-    for provider in &providers {
-        for model in catalog::bundled_models(provider) {
-            let selection = ModelSelection {
-                provider: provider.clone(),
-                model: model.id.clone(),
-                ..Default::default()
-            };
-            add(&mut rows, &selection, None, "catalog".into());
-        }
-    }
-    // Downloaded local models and the saved listings of the providers named above. Models whose
+    // Downloaded local models and the saved listings of enabled providers. Models whose
     // metadata declares a non-chat kind (embedding, rerank, image, audio) cannot be the main model.
-    let listed = catalog::saved_listing_models(user_dir)
+    let mut listed_providers: BTreeSet<String> = BTreeSet::new();
+    let listed: Vec<_> = catalog::saved_listing_models(user_dir)
         .into_iter()
         .filter(|entry| providers.contains(&entry.selection.provider))
-        .map(|entry| (entry, "listing"));
+        .inspect(|entry| {
+            listed_providers.insert(entry.selection.provider.clone());
+        })
+        .map(|entry| (entry, "listing"))
+        .collect();
     let local = catalog::downloaded_local_models(user_dir)
         .into_iter()
         .map(|entry| (entry, "local"));
@@ -109,6 +135,22 @@ pub(super) fn list(
         {
             row.image_output = Some(entry.supports_images());
             row.local = Some(entry.metadata);
+        }
+    }
+    // Fall back to static bundled catalog entries only when an enabled provider has no saved live
+    // listing yet and is not strictly account-scoped (ChatGPT/Antigravity listings come from the
+    // signed-in account, never static bundled IDs).
+    for provider in &providers {
+        if listed_providers.contains(provider) || is_account_scoped_provider(provider) {
+            continue;
+        }
+        for model in catalog::bundled_models(provider) {
+            let selection = ModelSelection {
+                provider: provider.clone(),
+                model: model.id.clone(),
+                ..Default::default()
+            };
+            add(&mut rows, &selection, None, "catalog".into());
         }
     }
     rows.into_values()
@@ -132,21 +174,21 @@ pub(super) enum Purpose {
 impl Purpose {
     fn accepts(self, entry: &catalog::ModelEntry) -> bool {
         match self {
-            Self::Image => entry.supports_images(),
+            Self::Image => entry.accepts_image_role(),
             Self::Embedding => entry.is_embedding(),
         }
     }
 }
 
 /// RPC `list_models` with `purpose: "image"` or `"embedding"`: the models a non-chat role or
-/// setting can take. A model qualifies when its saved provider listing or local metadata declares
-/// it (image output via `ModelEntry::supports_images`, the test the terminal's image setting uses;
-/// the embedding kind via `ModelEntry::is_embedding`, the terminal's embedding role rule); names
-/// are never guessed. Offline like `list`: downloaded local models and every saved `/models`
-/// listing, no network request. `provider` is the id a role assignment saves and
-/// `provider_label` the name to show. `current` marks the configured `image.model` or the
-/// assigned `embedding` role; `base_url` is the endpoint the selection needs and `image_api`
-/// (image rows) what `image.api` needs.
+/// setting can take. A model qualifies when its saved provider listing, persisted capability cache,
+/// or local metadata admits it (`ModelEntry::accepts_image_role` for images, matching the terminal's
+/// image role picker; `ModelEntry::is_embedding` for embeddings); names are never guessed. Offline
+/// like `list`: downloaded local models and every saved `/models` listing, no network request.
+/// `provider` is the id a role assignment saves and `provider_label` the name to show. `current`
+/// marks the assigned `image` role (or `image.model` when unset) or the assigned `embedding` role;
+/// `base_url` is the endpoint the selection needs and `image_api` (image rows) what `image.api`
+/// needs.
 pub(super) fn list_for(
     config: &Config,
     user_dir: &Path,
@@ -159,9 +201,13 @@ pub(super) fn list_for(
     let listed = catalog::saved_listing_models(user_dir)
         .into_iter()
         .map(|entry| (entry, "listing"));
+    let image_role = config.model_roles.get("image");
     let embedding = config.model_roles.get("embedding");
     let mut rows: BTreeMap<String, Value> = BTreeMap::new();
     for (entry, source) in local.chain(listed) {
+        if provider_disabled(config, &entry.selection.provider) {
+            continue;
+        }
         if !purpose.accepts(&entry)
             || provider.is_some_and(|wanted| entry.selection.provider != wanted)
         {
@@ -169,7 +215,13 @@ pub(super) fn list_for(
         }
         rows.entry(key(&entry.selection)).or_insert_with(|| {
             let current = match purpose {
-                Purpose::Image => entry.selection.model == config.image.model,
+                Purpose::Image => image_role.map_or_else(
+                    || entry.selection.model == config.image.model,
+                    |role| {
+                        role.provider == entry.selection.provider
+                            && role.model == entry.selection.model
+                    },
+                ),
                 Purpose::Embedding => embedding.is_some_and(|role| {
                     role.provider == entry.selection.provider && role.model == entry.selection.model
                 }),
@@ -185,11 +237,61 @@ pub(super) fn list_for(
             });
             if purpose == Purpose::Image {
                 row["image_api"] = json!(entry.metadata.image_generation);
+                let cached = catalog::image_capabilities::lookup(user_dir, &entry.selection);
+                let (status, cap_source, checked_at) = match cached {
+                    Some(rec) => (
+                        rec.status.as_str(),
+                        rec.source.as_str(),
+                        (rec.checked_at > 0).then_some(rec.checked_at),
+                    ),
+                    None if entry.supports_images() => ("capable", "metadata", None),
+                    None => ("candidate", "candidate", None),
+                };
+                row["image_capability"] = json!(status);
+                row["image_capability_source"] = json!(cap_source);
+                if let Some(ts) = checked_at {
+                    row["image_checked_at"] = json!(ts);
+                }
             }
             row
         });
     }
     rows.into_values().collect()
+}
+
+/// Probe configured/signed-in providers via `catalog::discover` and refresh the persistent
+/// provider listing caches and image-capability cache (`image-capabilities.json`).
+/// Clears stale hosted-image refusals so upgraded accounts or updated endpoints are re-evaluated.
+pub(super) fn refresh_and_check(layout: &crate::config::paths::Layout, config: &Config) -> Value {
+    crate::tools::net::image_gen::clear_refusals(&layout.user_dir);
+    let selections: Vec<ModelSelection> = std::iter::once(config.selection())
+        .chain(config.model_favorites.iter().cloned())
+        .chain(config.model_roles.values().cloned())
+        .collect();
+    let discovery = catalog::discover(layout, &config.providers, &selections);
+    let checked_providers = discovery
+        .providers
+        .iter()
+        .filter(|p| !matches!(p.state.as_str(), "not-set-up" | "auth-required"))
+        .count();
+    let mut capable = 0usize;
+    let mut candidates = 0usize;
+    for entry in &discovery.models {
+        if !entry.available {
+            continue;
+        }
+        if entry.supports_images() {
+            capable += 1;
+        } else if entry.accepts_image_role() {
+            candidates += 1;
+        }
+    }
+    json!({
+        "providers": checked_providers,
+        "capable": capable,
+        "candidates": candidates,
+        "checked_at": catalog::image_capabilities::last_updated_at(&layout.user_dir),
+    })
 }
 
 fn describe(config: &Config, row: Row, current: bool) -> Value {

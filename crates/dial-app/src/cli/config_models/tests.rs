@@ -22,6 +22,11 @@ fn routes_like_omp_models() {
     );
     assert!(route(&words(&["find"])).is_err());
     assert_eq!(route(&words(&["refresh"])).unwrap(), ModelsRoute::Refresh);
+    assert_eq!(route(&words(&["check"])).unwrap(), ModelsRoute::Check(None));
+    assert_eq!(
+        route(&words(&["check", "openrouter"])).unwrap(),
+        ModelsRoute::Check(Some("openrouter".into()))
+    );
     assert_eq!(
         route(&words(&["recommend"])).unwrap(),
         ModelsRoute::Recommend

@@ -110,6 +110,7 @@ pub(super) fn with_runtime(
             acp: None,
             protocol: DEFAULT_PROTOCOL_VERSION,
             interactive: false,
+            tree_events: true,
             envelope: Envelope::default(),
         })),
         writer: crate::output::StdoutWriter::new().unwrap(),
@@ -133,6 +134,7 @@ pub(super) fn with_runtime(
         node_cursors: Default::default(),
         node_revisions: Default::default(),
         node_meta: Default::default(),
+        requests_done: Default::default(),
         projection_dirty: false,
         tree: None,
     };
@@ -1471,7 +1473,7 @@ fn recovery_publication_fence_orders_controller_events_and_closes_abandoned_tick
                 |_| {},
                 |runtime| {
                     runtime.acp = false;
-                    runtime.worker_out.negotiate(2, false).unwrap();
+                    runtime.worker_out.negotiate(2, false, true).unwrap();
                     let request = json!({"id":case,"method":"recovery_snapshot","params":{}});
                     let snapshot = runtime.handle_request(&request).unwrap();
                     // Deliberately publish a controller event after capture, before settlement.

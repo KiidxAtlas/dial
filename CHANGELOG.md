@@ -17,6 +17,18 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-11-21
+
+### Added
+
+- RPC clients that render the legacy text and tool events can send `hello {tree_events: false}` so the engine stops streaming the execution tree (`state_reset`, `state_node`, `state_delta`) and each streamed token is no longer sent twice. Successful top-level model requests are then marked with `inference_done`; `dial-client` gains `Launch::tree_events` and `Client::tree_events`, and its `Conversation` accepts either boundary ([docs/rpc-and-acp.md](docs/rpc-and-acp.md)).
+- `host_tool_result` accepts `content`, MCP content blocks, instead of `output`, so a host tool can return an image: the first PNG, JPEG, GIF or WebP whose bytes match its type is attached for models that accept images, as MCP tool images are. `set_host_tools` replies `result_content: true` where this is supported; malformed results are refused with `invalid_params` ([docs/rpc-and-acp.md](docs/rpc-and-acp.md)).
+
+### Changed
+
+- `--append-system-prompt` is now a global flag, so it may follow `rpc` and `acp`. Clients that start `dial rpc` (Dial Desktop) can add standing guidance for their surface ([docs/rpc-and-acp.md](docs/rpc-and-acp.md)).
+- The default provider retry budget is now 150 seconds: a first remote request that goes silent for the default 60 seconds no longer uses up the entire budget before a retry can start. Explicit retry budgets are unchanged ([configuration](docs/configuration.md#request-and-persistence-economy)).
+
 ## [0.3.13] - 2026-11-20
 
 ### Added
@@ -3159,7 +3171,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.13...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.14...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3209,3 +3221,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.11]: https://github.com/KiidxAtlas/dial/tree/v0.3.11
 [0.3.12]: https://github.com/KiidxAtlas/dial/tree/v0.3.12
 [0.3.13]: https://github.com/KiidxAtlas/dial/tree/v0.3.13
+[0.3.14]: https://github.com/KiidxAtlas/dial/tree/v0.3.14
