@@ -1,25 +1,25 @@
 class Dial < Formula
   desc "Local-first coding agent harness"
   homepage "https://github.com/KiidxAtlas/dial"
-  version "0.3.12"
+  version "0.3.14"
   on_macos do
     on_arm do
       url "https://github.com/KiidxAtlas/dial/releases/download/v#{version}/dial-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "8e2fadad2ba27090e919d0d6d4f783145e8549d14ee4bd845af4def1104c94c1"
+      sha256 "8f2dfa2e0bac264de751c5daa104157cccd94d27eb4039b2b82ae7748505d989"
     end
     on_intel do
       url "https://github.com/KiidxAtlas/dial/releases/download/v#{version}/dial-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "9a707ff8e4d93edb284cab79f0b3ddee7feac77d35e07a651fa78937f6d03f15"
+      sha256 "0104ce3da4be0bfa3d8c435faf8a32468a03de44a01f818e79feb7f7ec37720a"
     end
   end
   on_linux do
     on_arm do
       url "https://github.com/KiidxAtlas/dial/releases/download/v#{version}/dial-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "f4f4aaa14772d9b6d5e60516538983809c4a8c7900e7d1c6b1484677b8fccd83"
+      sha256 "e885f6f466e8daef0e5cddf879ebfddab1e6780a146160999fb4f8ae120db70e"
     end
     on_intel do
       url "https://github.com/KiidxAtlas/dial/releases/download/v#{version}/dial-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "63229decb7ff9c9f4c494c2619a7461eed7ec4835e5929957095fe60d594d587"
+      sha256 "2f424d4108eb8a0baed57546eff59c47b3d3ea4a20d14a6c9547d1b45453ec2b"
     end
   end
 
