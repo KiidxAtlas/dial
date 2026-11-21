@@ -133,9 +133,11 @@ Extensions (native `dial rpc` only, `extensions` group): `list_extensions` retur
 
 Session control (native `dial rpc` only, `session_control` group; actor methods, refused while a turn runs):
 
-- `set_approval` (`mode`: `ask`, `write`, `auto` or `readonly`): sets the session's approval mode, as `/approval` does. Returns `{approval, description}`. `state.approval` reports the current mode.
+- `set_approval` (`mode`: `ask`, `write`, `auto`, `readonly` or `yolo`): sets the session's approval mode, as `/approval` does. Unlike `auto`, `yolo` also permits eligible tool calls recovered from model text without a one-time prompt. Returns `{approval, description}`. `state.approval` reports the current mode.
 - `retry`: rewinds the unanswered last prompt (a failed or interrupted turn) and sends it again, as `/retry` does. The reply has the shape of `send`. Fails with `invalid_params` when the last message is not an unanswered prompt.
 - `restart_model`: unloads this session's Dial-managed local model; it reloads on the next request. External endpoints are never restarted (`invalid_params`).
+
+Permission rules (native RPC): `list_permission_rules` returns the active `rules` with zero-based `index`, `effect`, `tool`, `command_prefix`, `paths` and a readable `scope`. `add_permission_rule` takes `effect` (`allow` or `deny`), `tool`, optional `command_prefix` (shell words) or `paths` (path globs), and optional `persist`. `remove_permission_rule` takes a returned `index` and optional `persist`. A change is session-only unless `persist: true` is requested. Re-list before removing a rule, since indices change after removal.
 
 Workspace directories (native `dial rpc` only, `workspace` group): `list_dirs` (controller method, answers during a turn) returns `{root, dirs}`, also reported as `state.workspace`. `add_dir` and `remove_dir` (`path`: absolute, `~`, or relative to the primary root; actor methods) change the workspace as `/add-dir` and `/remove-dir` do, persist it, and return `{changed, path, dirs}`.
 

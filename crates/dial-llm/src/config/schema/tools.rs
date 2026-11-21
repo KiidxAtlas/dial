@@ -6,7 +6,7 @@ pub(super) static APPROVAL_POLICY: &[SettingDef] = &[field!(
     IN,
     "Approvals",
     "Approval mode",
-    "Write: workspace edits and non-destructive shell commands run without a prompt; destructive or privileged commands and tools that leave the workspace still ask. Ask: prompt before every write, edit and shell command. Auto: never prompt. Read-only: only read tools run.",
+    "Write: edits and non-destructive commands run; destructive and outside-project actions ask. Ask: prompt before edits and commands. Auto: ordinary tool calls run; calls recovered from model text still ask. YOLO: also runs eligible calls recovered from text, including unintended ones. Explicit denials and sandbox limits still apply. Read-only: only read tools run.",
     Kind::Enum(APPROVAL),
 )];
 

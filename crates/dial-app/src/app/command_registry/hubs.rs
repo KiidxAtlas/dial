@@ -28,6 +28,8 @@ pub(in crate::app) fn draft(name: &str, args: &str) -> Option<&'static str> {
         ("dirs", "remove") => Some("/dirs remove "),
         ("collab", "join") => Some("/collab join "),
         ("collab", "answer") => Some("/collab answer "),
+        ("permissions", "allow") => Some("/permissions allow bash "),
+        ("permissions", "allow --persist") => Some("/permissions allow --persist bash "),
         _ => None,
     }
 }
@@ -49,7 +51,7 @@ pub(in crate::app) fn picker(name: &str, args: &str) -> Option<ChoiceSpec> {
                 (
                     "approval",
                     "Tool approval policy",
-                    "Choose ask, write, auto or readonly.",
+                    "Choose ask, write, auto, readonly or yolo.",
                 ),
                 (
                     "vibe on",

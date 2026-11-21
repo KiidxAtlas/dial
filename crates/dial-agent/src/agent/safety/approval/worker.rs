@@ -24,8 +24,8 @@ impl CallProvenance {
     }
 }
 
-/// Recovered text is never covered by automatic modes, reusable grants or batch tickets.
-/// The human decision applies once, even when the UI offers a reusable choice.
+/// Recovered text never consumes a grant or batch ticket. Only explicit YOLO can skip
+/// its exact-call prompt; it must not skip a watch's separate one-shot consent.
 pub(in crate::agent) fn authorize_recovered_call(
     policy: &WorkerPolicy<'_>,
     call: &ToolCall,
@@ -49,6 +49,10 @@ pub(in crate::agent) fn authorize_recovered_call(
     if policy.approval == Approval::Readonly {
         super::explain(ui, call, PolicyReason::ReadOnly);
         return Err(Denial::ReadOnly);
+    }
+    if policy.approval == Approval::Yolo && !super::starts_watch(call) {
+        super::explain(ui, call, PolicyReason::AutomaticMode);
+        return Ok(());
     }
     super::explain(ui, call, PolicyReason::PromptRequired);
     let summary = format!(

@@ -152,8 +152,12 @@ of being replaced. Updates do not silently downgrade a newer runtime to a bundle
 Private npm packages are checked against their published stable versions; Homebrew tools
 are checked against formula metadata only after ownership of the active binary is verified.
 Private release-archive runtimes report newer upstream releases for manual review rather
-than downloading unreviewed archives. MLX stays on Dial's embedded compatibility pins,
-not arbitrary latest PyPI versions. Browser helpers use their owner's tested manifest;
+than downloading unreviewed archives. MLX setup and approved updates use the `uv.lock` bundled
+with the Dial binary, not the latest packages available at startup. The repository checks `/python`
+weekly for dependency updates via Dependabot. Inkling-2-Mini needs the bundled MLX-LM revision
+from [PR #2086](https://github.com/ml-explore/mlx-lm/pull/2086), not the stock MLX-VLM loader.
+After upgrading Dial, use `/setup update mlx-runtime` to review changes to your private environment,
+then `/setup update mlx-runtime yes` to apply them. Browser helpers use their owner's tested manifest;
 independent Playwright/Chromium upgrades are not supported. Other custom/uv/Go/rustup
 installations report manual guidance, not a guarantee that they are current.
 Restart Dial after updating an active runtime so the next process uses the new version.

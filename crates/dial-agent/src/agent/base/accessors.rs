@@ -873,60 +873,67 @@ impl<'a> Agent<'a> {
     ) {
         self.always = rules;
     }
+    /// Adds `rule` to the session. With `persist`, the saved project file also gains exactly this
+    /// rule; the session's other grants are not written. A failed save changes nothing.
     pub fn add_permission_rule(
         &mut self,
         rule: crate::agent::safety::approval::PermissionRule,
         persist: bool,
     ) -> Result<()> {
         rule.validate()?;
-        let mut rules = self.always.clone();
-        rules.push(rule);
         if persist {
-            let layout = self
-                .layout
-                .as_ref()
-                .context("persistent permissions unavailable here")?;
-            layout.ensure_project_outside_storage()?;
-            crate::agent::safety::approval::save(
-                &layout.state_dir.join("permissions.toml"),
-                &rules,
-            )?;
+            self.edit_project_permissions(|saved| {
+                if !saved.contains(&rule) {
+                    saved.push(rule.clone());
+                }
+            })?;
         }
-        self.always = rules;
+        self.always.push(rule);
         Ok(())
     }
-    /// Save the session's permission rules with the project state ("Always allow in this project").
-    pub(in crate::agent) fn persist_permissions(&self) -> Result<()> {
-        let layout = self
-            .layout
-            .as_ref()
-            .context("persistent permissions unavailable here")?;
-        layout.ensure_project_outside_storage()?;
-        crate::agent::safety::approval::save(
-            &layout.state_dir.join("permissions.toml"),
-            &self.always,
-        )
+    /// Persists the rule that the latest approval appended to the session list, for "Always allow
+    /// in this project". Approval appends that rule last whenever it asks to persist.
+    pub(in crate::agent) fn persist_latest_permission_rule(&self) -> Result<()> {
+        let Some(rule) = self.always.last() else {
+            return Ok(());
+        };
+        self.edit_project_permissions(|saved| {
+            if !saved.contains(rule) {
+                saved.push(rule.clone());
+            }
+        })
     }
+    /// Removes the session rule at `index`. With `persist`, only the matching rule is removed from
+    /// the saved project file; other saved rules, including deny rules, stay as they are.
     pub fn remove_permission_rule(&mut self, index: usize, persist: bool) -> Result<()> {
         ensure!(
             index < self.always.len(),
             "permission rule index out of range"
         );
-        let mut rules = self.always.clone();
-        rules.remove(index);
         if persist {
-            let layout = self
-                .layout
-                .as_ref()
-                .context("persistent permissions unavailable here")?;
-            layout.ensure_project_outside_storage()?;
-            crate::agent::safety::approval::save(
-                &layout.state_dir.join("permissions.toml"),
-                &rules,
-            )?;
+            let rule = &self.always[index];
+            self.edit_project_permissions(|saved| {
+                if let Some(position) = saved.iter().position(|saved| saved == rule) {
+                    saved.remove(position);
+                }
+            })?;
         }
-        self.always = rules;
+        self.always.remove(index);
         Ok(())
+    }
+    /// Applies `edit` to the saved project rules under the permissions lock, so concurrent
+    /// sessions' edits are not lost. Nothing is written when loading or the edit fails, so a bad
+    /// file never widens permissions.
+    fn edit_project_permissions(
+        &self,
+        edit: impl FnOnce(&mut Vec<crate::agent::safety::approval::PermissionRule>),
+    ) -> Result<()> {
+        let layout = self
+            .layout
+            .as_ref()
+            .context("persistent permissions unavailable here")?;
+        layout.ensure_project_outside_storage()?;
+        crate::agent::safety::approval::update(&layout.state_dir.join("permissions.toml"), edit)
     }
     pub fn approve_user_shell(&mut self, command: &str, ui: &mut dyn Ui) -> bool {
         let call = ToolCall {

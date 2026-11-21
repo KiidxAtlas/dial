@@ -378,7 +378,14 @@ fn one_table_preserves_the_legacy_command_contract() {
     const EXTENSIONS_STATS_MENU_CHANGES: &[&str] = &["extensions", "hooks"];
     // Approved next-UX changes have exact replacement contracts below. `autoresearch` gained
     // `auto` (0.3.13, the self-driving loop).
-    const UX_MENU_CHANGES: &[&str] = &["model", "search", "context", "modelpreset", "autoresearch"];
+    const UX_MENU_CHANGES: &[&str] = &[
+        "model",
+        "search",
+        "context",
+        "modelpreset",
+        "autoresearch",
+        "approval",
+    ];
     // The worker vocabulary rewords these descriptions; asserted exactly below.
     const WORKER_WORDING_CHANGES: &[&str] = &["message", "cancel", "cleanse"];
     // Descriptions that hid what the command does are reworded; asserted exactly below.
@@ -498,6 +505,16 @@ fn one_table_preserves_the_legacy_command_contract() {
         autoresearch.description,
         "manage branch-scoped benchmark experiments"
     );
+    // `/approval` gained the explicit YOLO mode; its description is unchanged.
+    let approval = command_entries(&[], &[])
+        .into_iter()
+        .find(|entry| entry.name == "approval")
+        .unwrap();
+    assert_eq!(
+        approval.args_hint.as_deref(),
+        Some("[ask|write|auto|readonly|yolo]")
+    );
+    assert_eq!(approval.description, "choose when tool calls need approval");
     let rpc = json!(super::command_registry::builtin_commands());
     let unchanged_rpc = |rows: &Value| {
         rows.as_array()

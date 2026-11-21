@@ -747,7 +747,7 @@ impl Agent<'_> {
                     !approval::denied_by_rule(&self.always, &call, self.workspace.root()),
                     "memory clear denied by forget policy"
                 );
-                if self.approval != crate::config::types::Approval::Auto {
+                if !self.approval.is_automatic() {
                     ensure!(
                         matches!(
                             ui.approve_with_cancel("memory", input, self.interrupt.as_ref()),
@@ -824,7 +824,7 @@ impl Agent<'_> {
                     && runner.agent.approval != crate::config::types::Approval::Readonly),
             "memory command denied by read-only execution policy"
         );
-        if mutating && runner.agent.approval != crate::config::types::Approval::Auto {
+        if mutating && !runner.agent.approval.is_automatic() {
             ensure!(
                 matches!(
                     runner

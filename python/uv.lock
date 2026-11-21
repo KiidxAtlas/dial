@@ -399,7 +399,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mlx-lm", extras = ["train"], specifier = "==0.32.0" },
+    { name = "mlx-lm", extras = ["train"], git = "https://github.com/ml-explore/mlx-lm?rev=0c4c99192230f1943dd468d297f0b8a64ae7b7c2" },
     { name = "mlx-vlm", specifier = "==0.7.6" },
     { name = "rich", specifier = ">=14,<15" },
 ]
@@ -800,21 +800,18 @@ wheels = [
 
 [[package]]
 name = "mlx-lm"
-version = "0.32.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.32.3.dev26+g0c4c99192"
+source = { git = "https://github.com/ml-explore/mlx-lm?rev=0c4c99192230f1943dd468d297f0b8a64ae7b7c2#0c4c99192230f1943dd468d297f0b8a64ae7b7c2" }
 dependencies = [
     { name = "jinja2" },
     { name = "mlx", marker = "sys_platform == 'darwin'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pillow" },
     { name = "protobuf" },
     { name = "pyyaml" },
     { name = "sentencepiece" },
     { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/96/6f/c87a4e092194c77b39e65de7979147314e4486d9451e873b4124ba2d6dcd/mlx_lm-0.32.0.tar.gz", hash = "sha256:035ca44b08c3476630a205d2c9bdea26825a6a8359f974944d4985230e41859f", size = 412082, upload-time = "2026-10-01T04:44:42.681Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/ed/99cd7d36a1671851b41df06b59b73825bb95b8ab8b388ac871ddf9ae1523/mlx_lm-0.32.0-py3-none-any.whl", hash = "sha256:9a0f3843135fd88d36ad791f0d82210cdc4130c5c1cb5416f5f0c4b56a135778", size = 513667, upload-time = "2026-10-01T04:44:40.74Z" },
 ]
 
 [package.optional-dependencies]

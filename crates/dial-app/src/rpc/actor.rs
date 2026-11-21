@@ -1153,13 +1153,16 @@ impl ActorRuntime<'_> {
                 ));
                 Ok(json!({"commands":commands}))
             }
+            "list_permission_rules" => permissions::list(&self.agent, params),
+            "add_permission_rule" => permissions::add(&mut self.agent, params),
+            "remove_permission_rule" => permissions::remove(&mut self.agent, params),
             "set_approval" => {
                 // The config's own serde names (`ask`, `write`, `auto`, `readonly`).
                 let approval: crate::config::types::Approval =
                     serde_json::from_value(params["mode"].clone()).map_err(|_| {
                         coded(
                             ErrorCode::InvalidParams,
-                            "set_approval requires params.mode: ask, write, auto or readonly",
+                            "set_approval requires params.mode: ask, write, auto, readonly or yolo",
                         )
                     })?;
                 self.agent.set_approval(approval);

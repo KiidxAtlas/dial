@@ -34,6 +34,7 @@ mod live_snapshot;
 mod maintenance;
 mod models;
 mod parity;
+mod permissions;
 mod read_jobs;
 mod reports;
 mod research;

@@ -298,7 +298,8 @@ pub(super) fn reasoning_changes(config: &Config, args: &str) -> Result<(Vec<Chan
         })?;
         profile.reasoning_effort = Some(effort);
         // A model-variant family selects thinking through its wire ID; a stale switch must not survive.
-        profile.thinking = (profile.capabilities.reasoning != ReasoningApi::AntigravityModelVariant)
+        profile.thinking = (profile.capabilities.reasoning
+            != ReasoningApi::AntigravityModelVariant)
             .then_some(effort != ReasoningEffort::None);
         effort.as_str().to_owned()
     };

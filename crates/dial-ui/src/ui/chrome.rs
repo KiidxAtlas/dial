@@ -243,12 +243,14 @@ pub fn approval_spans(theme: &Theme, mode: &str) -> Vec<Span<'static>> {
 }
 
 /// Safety color of an approval mode: modes that ask before changing anything (`ask`, `readonly`)
-/// are success, `write` is the accent, `auto` (no questions asked) is a warning, unknown is muted.
+/// are success, `write` is the accent, `auto` is a warning, `yolo` (also runs calls recovered from
+/// model text unasked) is an error, unknown is muted.
 pub fn approval_tok(mode: &str) -> Tok {
     match mode.trim() {
         "ask" | "readonly" => Tok::Success,
         "write" => Tok::Accent,
         "auto" => Tok::Warning,
+        "yolo" => Tok::Error,
         _ => Tok::Muted,
     }
 }

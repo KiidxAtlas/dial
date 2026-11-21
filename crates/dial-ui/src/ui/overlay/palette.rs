@@ -174,6 +174,8 @@ pub struct ChoiceSpec {
     /// Filtering still uses the standard no-match message.
     pub empty_message: String,
     pub current_tag: Option<String>,
+    /// Values that name actions rather than items. Delete and `x` never remove them.
+    pub fixed: &'static [&'static str],
 }
 
 impl ChoiceSpec {
@@ -818,6 +820,10 @@ impl PaletteOverlay {
                 let Some(&index) = self.entry_rows().get(self.cursor) else {
                     return OverlayEvent::None;
                 };
+                if spec.fixed.contains(&spec.items[index].value.as_str()) {
+                    self.notice = Some("That row is an action and cannot be removed.".into());
+                    return OverlayEvent::None;
+                }
                 if armed == Some(index) {
                     return choice_action(spec, &spec.items[index].value, verb);
                 }

@@ -143,6 +143,7 @@ pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpe
         prompt: "Filter steps:".into(),
         summary: plan_summary(todo),
         empty_message: String::new(),
+        fixed: &[],
         // Each label already names its status, so the working step needs no extra tag.
         current_tag: Some(String::new()),
         items: ordered

@@ -31,6 +31,7 @@ pub fn approval_label(value: &str) -> &str {
         "ask" => "Ask first",
         "write" => "Edit freely",
         "auto" => "Full auto",
+        "yolo" => "YOLO",
         "readonly" => "Read-only",
         other => other,
     }

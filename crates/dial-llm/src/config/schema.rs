@@ -260,6 +260,7 @@ const APPROVAL: EnumValues = &[
     ("write", "Edit freely"),
     ("auto", "Full auto"),
     ("readonly", "Read-only"),
+    ("yolo", "YOLO"),
 ];
 const SANDBOX: EnumValues = &[("off", "Off"), ("dev", "Dev"), ("strict", "Strict")];
 const ISOLATION_BACKENDS: EnumValues = &[

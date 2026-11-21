@@ -19,6 +19,7 @@ const INPUTS: &[&str] = &[
     "python/dial_worker.py",
     "python/laya-requirements.txt",
     "python/pyproject.toml",
+    "python/uv.lock",
 ];
 
 fn main() {

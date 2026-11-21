@@ -370,22 +370,39 @@ fn recovered_safe_reads_require_human_approval_in_the_main_owner() {
         }
         assert_eq!(view.0, 2, "recovered approval never becomes reusable");
         assert!(agent.always.is_empty());
+        agent.approval = Approval::Yolo;
+        assert!(
+            agent
+                .authorize_call_from(&call, CallProvenance::RecoveredText, &mut view)
+                .is_ok()
+        );
+        assert_eq!(
+            view.0, 2,
+            "YOLO must not prompt on an eligible recovered call"
+        );
+        assert!(agent.always.is_empty(), "YOLO must not create grants");
         agent.always.push(PermissionRule {
             effect: Effect::Deny,
             tool: "read".into(),
             command_prefix: vec![],
             paths: vec![],
         });
-        assert!(matches!(
-            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
-            Err(Denial::Rule)
-        ));
+        for mode in [Approval::Auto, Approval::Yolo] {
+            agent.approval = mode;
+            assert!(matches!(
+                agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+                Err(Denial::Rule)
+            ));
+        }
         agent.always.clear();
         agent.interrupt.store(true, Ordering::SeqCst);
-        assert!(matches!(
-            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
-            Err(Denial::User)
-        ));
+        for mode in [Approval::Auto, Approval::Yolo] {
+            agent.approval = mode;
+            assert!(matches!(
+                agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+                Err(Denial::User)
+            ));
+        }
         assert_eq!(view.0, 2, "denied and cancelled calls must not prompt");
     });
 }

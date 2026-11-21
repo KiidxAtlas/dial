@@ -252,13 +252,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true, help_heading = section::MODEL)]
     pub(crate) api_key_env: Option<String>,
     /// Tool approval: ask (before every edit and command), write (destructive or
-    /// outside-the-project actions ask), auto (default: never asks) or readonly.
+    /// outside-the-project actions ask), auto (never asks), readonly, or yolo (also runs tool
+    /// calls recovered from model text unasked; explicit only, never reached by Shift+Tab).
     #[arg(long, global = true, help_heading = section::SAFETY, value_parser = clap::builder::PossibleValuesParser::new(dial::config::types::Approval::NAMES.iter().copied()))]
     pub(crate) approval: Option<String>,
     /// Approve every tool call (same as --approval auto; also accepted as --yolo / --auto-approve).
     #[arg(short = 'y', long, global = true, aliases = ["auto-approve", "yolo"], help_heading = section::SAFETY)]
     pub(crate) yes: bool,
-    /// Compatibility alias for --approval.
+    /// Compatibility alias for --approval (`yolo` here means auto, as it always has).
     #[arg(long = "approval-mode", global = true, value_name = "MODE", help_heading = section::SAFETY, value_parser = clap::builder::PossibleValuesParser::new(dial::cli::cli_modes::APPROVAL_ALIASES.iter().map(|&(alias, _)| alias)))]
     pub(crate) approval_mode: Option<String>,
     /// Print mode (text): also write the model's reasoning to stdout before the answer.

@@ -156,7 +156,7 @@ fn cancelled_prompt_cannot_leave_a_session_grant() {
 }
 
 #[test]
-fn recovered_text_requires_human_once_despite_modes_and_grants() {
+fn recovered_text_uses_explicit_yolo_or_one_time_consent_but_never_a_grant() {
     struct View {
         decision: Decision,
         prompts: usize,
@@ -178,6 +178,7 @@ fn recovered_text_requires_human_once_despite_modes_and_grants() {
         Approval::Write,
         Approval::Auto,
         Approval::Readonly,
+        Approval::Yolo,
     ] {
         for decision in [
             Decision::Allow,
@@ -212,12 +213,13 @@ fn recovered_text_requires_human_once_despite_modes_and_grants() {
             );
             assert_eq!(
                 result.is_ok(),
-                mode != Approval::Readonly && decision != Decision::Deny,
+                mode == Approval::Yolo
+                    || (mode != Approval::Readonly && decision != Decision::Deny),
                 "{mode:?} {decision:?}"
             );
             assert_eq!(
                 view.prompts,
-                usize::from(mode != Approval::Readonly),
+                usize::from(!matches!(mode, Approval::Readonly | Approval::Yolo)),
                 "{mode:?} {decision:?}"
             );
             assert_eq!(
@@ -227,4 +229,40 @@ fn recovered_text_requires_human_once_despite_modes_and_grants() {
             );
         }
     }
+}
+
+#[test]
+fn yolo_cannot_arm_a_recovered_application_watch_without_consent() {
+    struct Refuse(usize);
+    impl Ui for Refuse {
+        fn approve(&mut self, _: &str, _: &str) -> Decision {
+            self.0 += 1;
+            Decision::Deny
+        }
+    }
+    let mut view = Refuse(0);
+    let mut rules = vec![];
+    let result = authorize_worker_call(
+        WorkerPolicy {
+            approval: Approval::Yolo,
+            rules: &mut rules,
+            root: Path::new("/project"),
+            read_only: false,
+            cancel: None,
+            interrupt: None,
+        },
+        &ToolCall {
+            id: "watch".into(),
+            name: "bg".into(),
+            arguments: json!({"action":"watch","path":"test.log"}),
+            malformed_arguments: false,
+        },
+        "Watch test.log",
+        true,
+        CallProvenance::RecoveredText,
+        &mut view,
+    );
+    assert!(matches!(result, Err(Denial::User)));
+    assert_eq!(view.0, 1);
+    assert!(rules.is_empty());
 }

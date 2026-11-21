@@ -80,6 +80,63 @@ fn sees_images_and_streams_tools_from_the_real_vlm_server() {
 }
 
 #[test]
+#[ignore = "loads the downloaded Inkling-2-Mini-4bit checkpoint on Apple Silicon"]
+fn inkling_mini_serves_text_and_images_with_mlx_lm() {
+    let model_dir =
+        snapshot("models--mlx-community--Inkling-2-Mini-4bit").expect("Inkling snapshot");
+    let mut backend = Backend::new(ProviderKind::Local { model_dir }, python(), 180);
+    assert!(backend.accepts_image_input());
+    let reply = backend
+        .chat(None, &ask("Say hello.", vec![], 256), 120, None)
+        .unwrap();
+    assert!(!reply.text.trim().is_empty(), "no text response: {reply:?}");
+
+    let root = tempfile::tempdir().unwrap();
+    let image = root.path().join("sample.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([0, 0, 255]))
+        .save(&image)
+        .unwrap();
+    let mut req = ask(
+        "What color is this image? Answer with one word.",
+        vec![],
+        256,
+    );
+    req.messages[0]["dial_images"] =
+        json!([llm::images::user_attachment(root.path(), &image).unwrap()]);
+    let reply = backend.chat(None, &req, 120, Some(&mut |_| true)).unwrap();
+    assert!(reply.text.to_lowercase().contains("blue"), "{reply:?}");
+}
+
+#[test]
+#[ignore = "loads the downloaded Inkling-2-Mini-4bit checkpoint on Apple Silicon"]
+fn inkling_mini_returns_an_offered_tool_call() {
+    let model_dir =
+        snapshot("models--mlx-community--Inkling-2-Mini-4bit").expect("Inkling snapshot");
+    let mut backend = Backend::new(ProviderKind::Local { model_dir }, python(), 180);
+    let mut req = ask(
+        "Record the code word now.",
+        vec![
+            json!({"type":"function","function":{"name":"record_word","description":"Record one word.","parameters":{"type":"object","properties":{"word":{"type":"string"}},"required":["word"]}}}),
+        ],
+        1024,
+    );
+    req.messages.insert(0, json!({"role":"system","content":"The code word is juniper. Use record_word to record the code word when asked."}));
+    let reply = backend.chat(None, &req, 120, Some(&mut |_| true)).unwrap();
+    assert_eq!(
+        reply.tool_calls.len(),
+        1,
+        "expected one call instead of an answer"
+    );
+    assert_eq!(reply.tool_calls[0].name, "record_word");
+    assert_eq!(reply.tool_calls[0].arguments, json!({"word":"juniper"}));
+    assert!(
+        !reply.text_calls_lifted,
+        "a native tool frame must not require recovered-text approval"
+    );
+    assert!(!reply.tool_calls[0].malformed_arguments);
+}
+
+#[test]
 #[ignore = "starts the real mlx_lm.server; needs the SmolLM2 snapshot"]
 fn streams_text_from_the_real_server() {
     let dir =

@@ -11,8 +11,9 @@ are a one-row tab strip at the top that scrolls to keep the active one visible. 
 `Up`/`Down` move through settings, and `Tab`/`Shift-Tab` jump sections within a category. The
 first category, **Common**, also shows the model, approval mode, sandbox mode, Enter-while-working
 and notification rows under one heading; they stay in their own categories too, and editing either
-copy edits the same setting. Type to search labels, descriptions, paths and goal-oriented synonyms
-across categories. An exact path or label ranks first, whole-word matches rank above scattered
+copy edits the same setting. **Allowed commands** in Common opens `/permissions`, where you can add or revoke a shell command prefix for this session or project. Opening the list does not grant anything.
+
+Type to search labels, descriptions, paths and goal-oriented synonyms across categories. An exact path or label ranks first, whole-word matches rank above scattered
 letters, weak scattered matches are dropped, and each result names its category at the right edge.
 Tab counts show saved overrides in the edited scope, not running tasks; the row under the tabs says so and
 **Ctrl-O** lists only those overrides. Tabs that do not fit are summarized as `+N more`.

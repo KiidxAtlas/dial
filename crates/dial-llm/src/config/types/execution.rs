@@ -110,16 +110,23 @@ pub enum Approval {
     /// destructive commands (recursive deletes, history-rewriting git, privilege escalation,
     /// piping downloads into a shell) and tools that leave the workspace still ask.
     Write,
-    /// Runs everything without asking; explicit deny rules still apply.
+    /// Runs ordinary structured calls without prompting; explicit deny rules still apply.
     #[default]
     Auto,
     /// Read-only tools only.
     Readonly,
+    /// Also accepts eligible calls recovered from model text. Does not expand the sandbox.
+    Yolo,
 }
 
 impl Approval {
     /// Canonical policy names for command-line choices, completion and settings views.
-    pub const NAMES: &'static [&'static str] = &["ask", "write", "auto", "readonly"];
+    pub const NAMES: &'static [&'static str] = &["ask", "write", "auto", "readonly", "yolo"];
+
+    /// Whether ordinary structured calls run without approval prompts.
+    pub const fn is_automatic(self) -> bool {
+        matches!(self, Self::Auto | Self::Yolo)
+    }
 
     pub const fn description(self) -> &'static str {
         match self {
@@ -127,7 +134,10 @@ impl Approval {
             Self::Write => {
                 "edits and safe commands run; destructive or outside-the-project actions ask"
             }
-            Self::Auto => "runs everything without asking",
+            Self::Auto => "runs ordinary tools; calls recovered from text still ask",
+            Self::Yolo => {
+                "also runs tool calls recovered from text without asking; examples can become actions"
+            }
             Self::Readonly => "read-only tools only",
         }
     }

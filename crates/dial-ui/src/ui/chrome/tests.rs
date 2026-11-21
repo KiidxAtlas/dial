@@ -146,6 +146,7 @@ fn approval_modes_use_their_friendly_name_and_safety_color() {
         ("readonly", "Read-only", Tok::Success),
         ("write", "Edit freely", Tok::Accent),
         ("auto", "Full auto", Tok::Warning),
+        ("yolo", "YOLO", Tok::Error),
         ("custom", "custom", Tok::Muted),
     ] {
         let spans = approval_spans(&theme, mode);

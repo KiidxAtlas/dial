@@ -518,6 +518,7 @@ impl Shell {
                     "write" => agent.set_approval(Approval::Write),
                     "auto" => agent.set_approval(Approval::Auto),
                     "readonly" => agent.set_approval(Approval::Readonly),
+                    "yolo" => agent.set_approval(Approval::Yolo),
                     _ => {}
                 }
                 let mode = format!("{:?}", agent.approval()).to_lowercase();
@@ -525,7 +526,7 @@ impl Shell {
                 let meaning = agent.approval().description();
                 self.note(
                     "Approval",
-                    format!("{label} ({mode}) · {meaning}\nChange it with /approval ask|write|auto|readonly or Shift+Tab."),
+                    format!("{label} ({mode}) · {meaning}\nChange it with /approval ask|write|auto|readonly|yolo or Shift+Tab."),
                 );
             }
             "outcome" => self.outcome_command(app, args),
@@ -734,6 +735,19 @@ impl Shell {
     }
 
     fn permissions_command(&mut self, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let rule_line = |index: usize, rule: &crate::agent::safety::approval::PermissionRule| {
+            format!(
+                "{}: {:?} {} {}{}",
+                index + 1,
+                rule.effect,
+                rule.tool,
+                rule.command_prefix.join(" "),
+                rule.paths
+                    .iter()
+                    .map(|p| format!(" --path {p}"))
+                    .collect::<String>()
+            )
+        };
         if args == "why" {
             let text = if self.policy_log.is_empty() {
                 "No tool call has passed the approval policy in this session yet.".to_owned()
@@ -816,24 +830,33 @@ impl Shell {
                 }
                 Err(error) => self.note("Permissions", error),
             }
+        } else if let Some(number) = args
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.parse::<usize>().ok())
+            && args.split_whitespace().skip(1).all(|w| w == "--persist")
+        {
+            // Enter on a picker row sends the rule's number; showing it changes nothing.
+            let rule = number.checked_sub(1).and_then(|index| {
+                agent
+                    .permission_rules()
+                    .get(index)
+                    .map(|rule| (index, rule))
+            });
+            let text = match rule {
+                Some((index, rule)) => format!(
+                    "Rule {}. Delete or x twice in /permissions removes it.",
+                    rule_line(index, rule)
+                ),
+                None => format!("No rule {number}. /permissions lists the saved rules."),
+            };
+            self.note("Permissions", text);
         } else if args.is_empty() {
             let rules = agent
                 .permission_rules()
                 .iter()
                 .enumerate()
-                .map(|(i, rule)| {
-                    format!(
-                        "{}: {:?} {} {}{}",
-                        i + 1,
-                        rule.effect,
-                        rule.tool,
-                        rule.command_prefix.join(" "),
-                        rule.paths
-                            .iter()
-                            .map(|p| format!(" --path {p}"))
-                            .collect::<String>()
-                    )
-                })
+                .map(|(i, rule)| rule_line(i, rule))
                 .collect::<Vec<_>>();
             self.note(
                 "Permissions",

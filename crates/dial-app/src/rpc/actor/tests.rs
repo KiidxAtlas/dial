@@ -802,13 +802,144 @@ fn set_approval_changes_the_mode_and_refuses_unknown_modes() {
                 crate::config::types::Approval::Readonly
             );
             let error = runtime
-                .handle_request(&json!({"method":"set_approval","params":{"mode":"yolo"}}))
+                .handle_request(&json!({"method":"set_approval","params":{"mode":"nope"}}))
                 .unwrap_err();
             assert_eq!(code(&error), ErrorCode::InvalidParams);
             assert_eq!(
                 runtime.agent.approval(),
                 crate::config::types::Approval::Readonly
             );
+            // YOLO is chosen explicitly over RPC too, and reported with its own name.
+            let result = runtime
+                .handle_request(&json!({"method":"set_approval","params":{"mode":"yolo"}}))
+                .unwrap();
+            assert_eq!(result["approval"], json!("yolo"));
+            assert_eq!(
+                runtime.agent.approval(),
+                crate::config::types::Approval::Yolo
+            );
+        },
+    );
+}
+
+#[test]
+fn permission_rules_list_add_and_remove_through_the_session_owner() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let listed = runtime
+                .handle_request(&json!({"method":"list_permission_rules"}))
+                .unwrap();
+            assert_eq!(listed, json!({"rules":[]}));
+            let error = runtime
+                .handle_request(&json!({"method":"list_permission_rules","params":{"all":true}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+
+            // Bash prefixes are parsed like `/permissions allow`: quotes and spacing normalise to argv.
+            let added = runtime
+                .handle_request(&json!({"method":"add_permission_rule","params":{
+                    "effect":"allow","tool":"bash","command_prefix":["git"," status "]
+                }}))
+                .unwrap();
+            assert_eq!(added["rule"]["index"], json!(0));
+            assert_eq!(added["rule"]["effect"], json!("allow"));
+            assert_eq!(added["rule"]["command_prefix"], json!(["git", "status"]));
+            assert_eq!(added["persisted"], json!(false));
+            assert_eq!(added["count"], json!(1));
+
+            let added = runtime
+                .handle_request(&json!({"method":"add_permission_rule","params":{
+                    "effect":"deny","tool":"read","paths":["*.pem"]
+                }}))
+                .unwrap();
+            assert_eq!(added["rule"]["index"], json!(1));
+            assert_eq!(added["rule"]["effect"], json!("deny"));
+            assert_eq!(added["rule"]["paths"], json!(["*.pem"]));
+            assert_eq!(runtime.agent.permission_rules().len(), 2);
+
+            let listed = runtime
+                .handle_request(&json!({"method":"list_permission_rules"}))
+                .unwrap();
+            assert_eq!(listed["rules"][1]["index"], json!(1));
+            assert_eq!(listed["rules"][1]["tool"], json!("read"));
+            assert_eq!(listed["rules"][1]["scope"], json!("deny read on *.pem"));
+
+            let removed = runtime
+                .handle_request(&json!({"method":"remove_permission_rule","params":{"index":0}}))
+                .unwrap();
+            assert_eq!(removed["removed"]["tool"], json!("bash"));
+            assert_eq!(removed["count"], json!(1));
+            assert_eq!(runtime.agent.permission_rules()[0].tool, "read");
+
+            let error = runtime
+                .handle_request(&json!({"method":"remove_permission_rule","params":{"index":1}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::NotFound);
+            assert_eq!(runtime.agent.permission_rules().len(), 1);
+        },
+    );
+}
+
+#[test]
+fn permission_rule_requests_refuse_invalid_rules_without_changing_them() {
+    let cases = [
+        json!({"effect":"ask","tool":"read"}),
+        json!({"effect":"allow","tool":""}),
+        json!({"effect":"allow","tool":"read worker"}),
+        json!({"effect":"allow","tool":"bash"}),
+        json!({"effect":"allow","tool":"bash","command_prefix":["git",""]}),
+        json!({"effect":"allow","tool":"bash","command_prefix":["git","push","--force","origin"]}),
+        json!({"effect":"allow","tool":"bash","command_prefix":["git","status","&&","rm","x"]}),
+        json!({"effect":"allow","tool":"read","command_prefix":["git"]}),
+        json!({"effect":"allow","tool":"bash","command_prefix":["git"],"paths":["*.rs"]}),
+        json!({"effect":"allow","tool":"read","paths":[""]}),
+        json!({"effect":"allow","tool":"read","unknown":true}),
+    ];
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            for params in cases {
+                let error = runtime
+                    .handle_request(&json!({"method":"add_permission_rule","params":params}))
+                    .unwrap_err();
+                assert_eq!(code(&error), ErrorCode::InvalidParams, "{params}");
+            }
+            assert!(runtime.agent.permission_rules().is_empty());
+            let error = runtime
+                .handle_request(&json!({"method":"remove_permission_rule","params":{"index":"0"}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+        },
+    );
+}
+
+#[test]
+fn persisted_permission_rules_reach_the_project_store_and_leave_it_on_remove() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let store = runtime.layout.state_dir.join("permissions.toml");
+            runtime
+                .handle_request(&json!({"method":"add_permission_rule","params":{
+                    "effect":"allow","tool":"bash","command_prefix":["cargo","test"],"persist":true
+                }}))
+                .unwrap();
+            let saved = crate::agent::safety::approval::load(&store).unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].command_prefix, ["cargo", "test"]);
+            let removed = runtime
+                .handle_request(&json!({
+                    "method":"remove_permission_rule",
+                    "params":{"index":0,"persist":true}
+                }))
+                .unwrap();
+            assert_eq!(removed["persisted"], json!(true));
+            assert!(crate::agent::safety::approval::load(&store).unwrap().is_empty());
+            assert!(runtime.agent.permission_rules().is_empty());
         },
     );
 }

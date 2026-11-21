@@ -663,7 +663,7 @@ impl<'a> Agent<'a> {
         );
         match gate {
             Ok(persist) => {
-                if persist && let Err(error) = self.persist_permissions() {
+                if persist && let Err(error) = self.persist_latest_permission_rule() {
                     ui.notice(&format!(
                         "The rule applies to this session but could not be saved: {error:#}"
                     ));
@@ -1087,7 +1087,7 @@ impl<'a> Agent<'a> {
                     continue;
                 }
                 Ok(persist) => {
-                    if persist && let Err(error) = self.persist_permissions() {
+                    if persist && let Err(error) = self.persist_latest_permission_rule() {
                         ui.notice(&format!(
                             "The rule applies to this session but could not be saved: {error:#}"
                         ));

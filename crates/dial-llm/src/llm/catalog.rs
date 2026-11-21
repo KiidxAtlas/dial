@@ -29,7 +29,9 @@ pub use credentials::{
 };
 use credentials::{bundled_endpoints, saved_credential_urls, validated_url};
 use local_models::{annotate_embedding_checkpoints, lora_support, mlx_architectures, snapshot};
-pub(crate) use local_models::{chat_template, hf_cache, local_model_entries, read_json};
+pub(crate) use local_models::{
+    chat_template, hf_cache, local_model_entries, read_json, uses_mlx_vlm,
+};
 pub use local_models::{
     downloaded_local_models, is_embedding_checkpoint, local_lora_support, local_model_metadata,
     resolve_local_model,

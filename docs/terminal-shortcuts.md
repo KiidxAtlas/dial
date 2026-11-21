@@ -27,7 +27,7 @@ Find the active keys, edit bindings and handle terminal-specific keyboard differ
 | Close a panel or chooser / stop the turn | `Esc` / `Ctrl-C` (while busy with a draft, the first `Ctrl-C` clears the draft and a second stops; the hint then offers `Ctrl+-` to restore the draft. In any panel, idle or busy, `Esc` steps back one level and `Ctrl-C` closes the panels without stopping the turn; the worker viewer keeps `Ctrl-C` for cancelling its worker. During a turn the panel's bottom row says so) |
 | Quit from an empty composer | `Ctrl-D` twice (the first press shows "again to exit"), `/exit` |
 | Expand the status line | `Alt-S` (`F11`) |
-| Cycle approval mode | `Shift-Tab` cycles ask → write → read-only; full auto is chosen only with `/approval auto` (from auto, `Shift-Tab` returns to ask) |
+| Cycle approval mode | `Shift-Tab` cycles ask → write → read-only. Choose Full auto or YOLO explicitly in `/approval`; `Shift-Tab` leaves either for ask. |
 | Show or hide reasoning | `Ctrl-T` |
 | Switch the work panel tab (plan, mode) | `Ctrl-X`, `Alt-W` or `F12` |
 | Focus session controls | `F10` |

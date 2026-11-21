@@ -62,6 +62,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "memory" => Method("memory"),
         "commands" => Method("get_available_commands"),
         "approval" => Method("set_approval"),
+        "permissions" => Method("list_permission_rules"),
         "add-dir" => Method("add_dir"),
         "remove-dir" => Method("remove_dir"),
         "dirs" => Method("list_dirs"),
@@ -108,7 +109,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
         "relay" | "peers" => Terminal(COLLAB),
-        "compute" | "review" | "seance" | "tree" | "profile" | "permissions" | "todo"
+        "compute" | "review" | "seance" | "tree" | "profile" | "todo"
         | "understanding" | "accounts" | "share" | "dump" | "trace" | "security" | "graphify"
         | "image" | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan"
         | "debug" | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize"

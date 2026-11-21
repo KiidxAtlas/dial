@@ -596,29 +596,29 @@ impl Shell {
 }
 
 /// What the transcript says after Shift+Tab: the mode's own name (as the status line shows it), and,
-/// when the cycle has just left Full auto, how to get back, since the cycle never returns to it.
+/// when the cycle has just left Full auto or YOLO, how to get back, since the cycle never returns to
+/// them.
 pub(super) fn cycled_approval_note(previous: Approval, next: Approval) -> String {
     let name = |mode: Approval| {
         crate::ui::status::approval_label(&format!("{mode:?}").to_lowercase()).to_owned()
     };
-    if previous == Approval::Auto {
+    if matches!(previous, Approval::Auto | Approval::Yolo) {
         format!(
-            "{} for this session. Shift+Tab cycles Ask first, Edit freely and Read-only; /approval auto returns to Full auto.",
-            name(next)
+            "{} for this session. Shift+Tab cycles Ask first, Edit freely and Read-only; /approval {} returns to {}.",
+            name(next),
+            format!("{previous:?}").to_lowercase(),
+            name(previous)
         )
     } else {
         format!("{} for this session", name(next))
     }
 }
 
-/// The approval mode Shift+Tab moves to; never `Auto`.
+/// The approval mode Shift+Tab moves to; never `Auto` or `Yolo`, which are chosen explicitly.
 pub(super) fn next_cycled_approval(current: Approval) -> Approval {
     match current {
         Approval::Ask => Approval::Write,
         Approval::Write => Approval::Readonly,
-        Approval::Readonly | Approval::Auto => Approval::Ask,
+        Approval::Readonly | Approval::Auto | Approval::Yolo => Approval::Ask,
     }
 }
-
-#[cfg(test)]
-mod tests;

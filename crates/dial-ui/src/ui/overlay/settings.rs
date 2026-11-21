@@ -134,7 +134,15 @@ const LINKS: &[(&str, &str, &str)] = &[
         "Choose the embedding model in its existing role picker; this does not enable semantic memory.",
         "open:role:embedding",
     ),
+    (
+        "Allowed commands",
+        "Shell commands Dial may run without asking, and ones it refuses. Add or remove rules in the permissions picker.",
+        "command:/permissions",
+    ),
 ];
+
+/// Index in [`LINKS`] of the Common launcher that opens the `/permissions` picker.
+const ALLOWED_COMMANDS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
@@ -1073,6 +1081,8 @@ impl SettingsOverlay {
                             })
                             .map(Row::Setting)
                     }));
+                    // The permissions launcher closes the list: it opens a picker, not a setting.
+                    rows.push(Row::Link(ALLOWED_COMMANDS));
                 }
                 rows
             }
@@ -1080,20 +1090,22 @@ impl SettingsOverlay {
         }
     }
 
-    /// The heading a row sits under. In the Common tab every row is grouped as Common, mirrors
-    /// included, so the tab reads as one short list rather than a heading per borrowed row.
+    /// Common lists its rows under one heading, unless a search or changed-only filter lists them
+    /// by home tab.
+    fn common_grouped(&self) -> bool {
+        self.search.is_empty()
+            && !self.changed_only
+            && self
+                .tabs
+                .get(self.tab)
+                .is_some_and(|(t, _)| *t == COMMON_TAB)
+    }
+
+    /// The heading a row sits under. In the Common tab every row is grouped as Common, mirrors and
+    /// launchers included, so the tab reads as one short list rather than a heading per borrowed row.
     fn section_of(&self, row: Row) -> &'static str {
         match row {
-            Row::Setting(_)
-                if self.search.is_empty()
-                    && !self.changed_only
-                    && self
-                        .tabs
-                        .get(self.tab)
-                        .is_some_and(|(t, _)| *t == COMMON_TAB) =>
-            {
-                COMMON_TAB
-            }
+            Row::Setting(_) | Row::Link(_) if self.common_grouped() => COMMON_TAB,
             Row::Setting(i) => crate::config::schema::registry()[i].section,
             Row::Link(_) => LINK_SECTION,
             Row::Advanced(_, section, _) => section,

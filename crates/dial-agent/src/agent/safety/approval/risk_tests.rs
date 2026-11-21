@@ -168,7 +168,12 @@ fn downloaded_code_reaching_an_interpreter_is_classified_structurally() {
 fn deny_rules_hold_for_generated_and_configured_checks_in_every_prompting_mode() {
     let root = Path::new("/p");
     let mut rules = vec![prefix_rule(Effect::Deny, &["cargo", "test"])];
-    for approval in [Approval::Auto, Approval::Write, Approval::Ask] {
+    for approval in [
+        Approval::Auto,
+        Approval::Yolo,
+        Approval::Write,
+        Approval::Ask,
+    ] {
         for configured in [false, true] {
             let mut ui = Prompt {
                 decision: Decision::Allow,
@@ -200,7 +205,12 @@ fn generated_checks_run_without_a_prompt_except_under_readonly() {
         command: "cargo check",
         configured: false,
     };
-    for approval in [Approval::Auto, Approval::Write, Approval::Ask] {
+    for approval in [
+        Approval::Auto,
+        Approval::Yolo,
+        Approval::Write,
+        Approval::Ask,
+    ] {
         let mut ui = Prompt {
             decision: Decision::Deny,
             asked: 0,

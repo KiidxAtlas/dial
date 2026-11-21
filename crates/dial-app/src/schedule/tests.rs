@@ -13,6 +13,17 @@ fn entry(every: Option<u64>, watch: &[&str]) -> Entry {
 }
 
 #[test]
+fn scheduled_runs_never_take_the_yolo_mode() {
+    // Scheduled runs are unattended: only the read-only and Full auto policies are valid for them.
+    let mut scheduled = entry(Some(3600), &[]);
+    assert!(scheduled.validate().is_ok());
+    scheduled.approval = "auto".into();
+    assert!(scheduled.validate().is_ok());
+    scheduled.approval = "yolo".into();
+    assert!(scheduled.validate().is_err());
+}
+
+#[test]
 fn creation_normalizes_allow_lists_without_broadening_permissions() {
     let create = |allow: Vec<String>, yes| {
         Entry::new(

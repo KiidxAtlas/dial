@@ -450,6 +450,12 @@ pub fn frame(
 pub(super) fn safety_notice(approval: &str, sandbox: &str) -> Option<String> {
     let unsandboxed = sandbox.trim().eq_ignore_ascii_case("off");
     match (approval, unsandboxed) {
+        ("yolo", true) => Some(
+            "YOLO, no sandbox: tool calls recovered from model text run without asking".to_owned(),
+        ),
+        ("yolo", false) => {
+            Some("YOLO: tool calls recovered from model text run without asking".to_owned())
+        }
         ("auto", true) => Some("Full auto, no sandbox: tools run without asking".to_owned()),
         ("auto", false) => Some("Full auto: tools run without asking".to_owned()),
         ("write", true) => Some("No sandbox: commands run without isolation".to_owned()),

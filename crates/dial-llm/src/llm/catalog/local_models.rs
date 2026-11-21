@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
     lora_support(mlx_architectures(user_dir).as_deref(), model)
 }
+/// Inkling-2-Mini's vision processor ships in MLX-LM rather than MLX-VLM.
+/// Select the server from checkpoint metadata, independently of image-input capability.
+pub(crate) fn uses_mlx_vlm(model: &Path) -> bool {
+    read_json(&model.join("config.json")).is_some_and(|config| {
+        config["model_type"] != "inkling2_loop" && metadata(&config).vision == Some(true)
+    })
+}
+
 /// Read local capabilities without importing Python or loading model weights. GGUF models are read
 /// from their header (chat template) and a sibling `mmproj` projector, which `llama-server` loads.
 pub fn local_model_metadata(model: &Path) -> ModelMetadata {

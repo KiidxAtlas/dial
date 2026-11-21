@@ -1078,7 +1078,7 @@ impl Client {
         self.call("apply_settings", json!({}), timeout)
     }
 
-    /// Set the session's approval mode: `ask`, `write`, `auto` or `readonly`.
+    /// Set the session's approval mode: `ask`, `write`, `auto`, `readonly` or `yolo`.
     ///
     /// # Errors
     /// As [`Client::call`]; another mode fails with code `invalid_params`.

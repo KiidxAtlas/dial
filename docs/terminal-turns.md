@@ -194,9 +194,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   on a Dial-managed server retires its process before retry so abandoned work cannot block the next request.
 - `/plan [on|off]` enforces read-only planning. The model's `exit_plan` request asks for approval
   before enabling edits; an approved plan is saved with the session and survives compaction, and
-  `[plan] autosave` also writes it to the workspace ([Plan mode](extensibility.md)). `/permissions` lists scoped rules; for example,
-  `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
-  Deny rules take precedence, including in automatic approval mode.
+  `[plan] autosave` also writes it to the workspace ([Plan mode](extensibility.md)).
+- Open `/permissions` to manage command rules. For example, `/permissions allow bash cargo test` allows that prefix for the session; `/permissions allow --persist bash cargo test` saves it for the project. `/permissions remove 1 --persist` revokes the first listed rule for this session and the project. Explicit deny rules win even in Full auto and YOLO.
   `/permissions why` lists the 20 most recent approval-policy decisions of this session, newest
   first: the rule that decided each call (mode, saved rule, hook, your answer) and the control
   that would change it. It covers approval policy only, not model routing or completion checks.

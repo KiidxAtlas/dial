@@ -318,10 +318,13 @@ fn mlx_checks_use_embedded_compatibility_pins_and_retain_newer_packages() {
         }
     }
     compatible.insert("rich".into(), json!("14.1.0"));
-    for (version, status) in [
-        (None, Status::Current),
-        (Some("0.0.0"), Status::Available),
-        (Some("999.0.0"), Status::Manual),
+    for (version, old_lock, uv_status, status) in [
+        (None, false, 0, Status::Current),
+        (None, false, 1, Status::Available),
+        (None, true, 0, Status::Available),
+        (Some("0.32.0"), true, 0, Status::Available),
+        (Some("999.0.0"), true, 0, Status::Manual),
+        (Some("0.32.3.dev1"), true, 0, Status::Manual),
     ] {
         let root = tempfile::tempdir().unwrap();
         let env = env(root.path());
@@ -334,17 +337,23 @@ fn mlx_checks_use_embedded_compatibility_pins_and_retain_newer_packages() {
         .unwrap();
         executable(&env.path[0].join("uv"), "#!/bin/sh\nexit 99\n");
         let private_manifest = env.user_dir.join("python/pyproject.toml");
-        fs::write(
-            &private_manifest,
-            "# old manifest retained until approval\n",
-        )
-        .unwrap();
-        let before = fs::read(&private_manifest).unwrap();
+        fs::write(&private_manifest, PYPROJECT).unwrap();
+        let lock = private_manifest.with_file_name("uv.lock");
+        let before = if old_lock { b"old".as_slice() } else { UV_LOCK };
+        fs::write(&lock, before).unwrap();
         let mut packages = compatible.clone();
         if let Some(version) = version {
             packages.insert("mlx-lm".into(), json!(version));
         }
         let candidate = inspect(recipe("mlx-runtime").unwrap(), &path, &env, &mut |step| {
+            if step.program == env.path[0].join("uv").to_string_lossy() {
+                assert!(step.args.ends_with(&["--offline".into(), "--check".into()]));
+                return Ok(Query {
+                    code: uv_status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
             assert_eq!(step.program, path.to_string_lossy());
             assert_eq!(&step.args[..3], ["-I", "-B", "-c"]);
             assert!(step.args[3].contains("importlib.metadata"));
@@ -352,7 +361,8 @@ fn mlx_checks_use_embedded_compatibility_pins_and_retain_newer_packages() {
         })
         .unwrap();
         assert_eq!(candidate.row.status, status);
-        assert_eq!(fs::read(&private_manifest).unwrap(), before);
+        assert_eq!(fs::read(&lock).unwrap(), before);
+        assert_eq!(fs::read_to_string(&private_manifest).unwrap(), PYPROJECT);
         assert_eq!(candidate.plan.is_some(), status == Status::Available);
         if let Some(plan) = candidate.plan {
             assert_eq!(plan.destination, env.user_dir.join("python"));
@@ -362,7 +372,8 @@ fn mlx_checks_use_embedded_compatibility_pins_and_retain_newer_packages() {
                     "sync",
                     "--project",
                     plan.destination.to_str().unwrap(),
-                    "--no-dev"
+                    "--no-dev",
+                    "--locked"
                 ]
             );
         }

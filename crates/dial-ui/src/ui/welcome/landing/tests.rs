@@ -529,6 +529,8 @@ fn safety_warnings_name_the_risk_only_when_commands_run_unasked() {
             .unwrap()
             .starts_with("Full auto")
     );
+    assert!(safety_notice("yolo", "dev").unwrap().starts_with("YOLO"));
+    assert!(safety_notice("yolo", "off").unwrap().contains("no sandbox"));
     assert!(
         safety_notice("write", "off")
             .unwrap()

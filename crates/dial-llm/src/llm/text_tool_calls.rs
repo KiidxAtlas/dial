@@ -13,6 +13,7 @@
 //! cannot be read becomes a call with `malformed_arguments`, so the engine can
 //! tell the model its call was unreadable instead of dropping it silently.
 
+pub(super) mod inkling;
 mod pythonic;
 
 use super::{Reply, ToolCall, normalize_arguments};
@@ -26,6 +27,12 @@ const FENCE: &str = "```";
 /// such call, so this is true only for text that never went through it (a route that does not run
 /// it) or an opener it could not lift. Section markers alone are not calls.
 pub fn mentions_call_markup(text: &str) -> bool {
+    if matches!(
+        inkling::header(text.trim_start()),
+        inkling::Header::Call { .. }
+    ) {
+        return true;
+    }
     HIDE_OPENERS
         .iter()
         .filter(|marker| !SECTION_MARKERS.contains(marker))
@@ -93,6 +100,9 @@ pub(super) fn apply_from_reasoning(reply: &mut Reply) {
 
 /// The remaining text and the calls found, or `None` when there are none.
 pub(super) fn extract(text: &str) -> Option<(String, Vec<ToolCall>)> {
+    if let inkling::Header::Call { name, body, end } = inkling::header(text.trim_start()) {
+        return Some((String::new(), vec![inkling::parse(name, body, end)?]));
+    }
     let (segments, calls) = extract_markup(text);
     let (segments, calls) = if calls.is_empty() {
         let (segments, calls) = extract_fenced(text);
@@ -703,6 +713,7 @@ pub(super) struct Hider<'a> {
     hidden: &'a mut dyn FnMut(&str) -> bool,
     held: String,
     hiding: bool,
+    at_message_start: bool,
     /// False passes every delta through untouched.
     hide_tags: bool,
 }
@@ -718,6 +729,7 @@ impl<'a> Hider<'a> {
             hidden,
             held: String::new(),
             hiding: false,
+            at_message_start: true,
             hide_tags,
         }
     }
@@ -731,6 +743,24 @@ impl<'a> Hider<'a> {
             return delta.is_empty() || (self.hidden)(delta);
         }
         self.held.push_str(delta);
+        if self.at_message_start {
+            let text = self.held.trim_start();
+            match inkling::header(text) {
+                inkling::Header::Incomplete if !text.is_empty() => return true,
+                inkling::Header::Incomplete => {
+                    let keep_going = self.held.is_empty() || (self.out)(&self.held);
+                    self.held.clear();
+                    return keep_going;
+                }
+                inkling::Header::Call { .. } => {
+                    self.hiding = true;
+                    let keep_going = (self.hidden)(&self.held);
+                    self.held.clear();
+                    return keep_going;
+                }
+                inkling::Header::Other => self.at_message_start = false,
+            }
+        }
         if let Some((at, hide)) = self.decisive() {
             let keep_going = (at == 0 || (self.out)(&self.held[..at]))
                 && (!hide || (self.hidden)(&self.held[at..]));

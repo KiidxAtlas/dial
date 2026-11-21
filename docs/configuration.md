@@ -123,6 +123,7 @@ The built-in `approval` default remains `auto`, so non-interactive runs (`-p`, R
 keep their contract. An interactive first run that never chose a mode instead saves
 `approval = "write"` (Edit freely) to the global config and says so once; from then on it is an
 ordinary user setting that `/approval` or Settings can change.
+Choose `yolo` explicitly to also run eligible tool calls recovered from model text without asking. It does not turn off the sandbox, override permission denials or grant directory access.
 
 | Setting | Was | Now | Why |
 | --- | --- | --- | --- |

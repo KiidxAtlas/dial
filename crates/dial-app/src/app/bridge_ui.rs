@@ -142,21 +142,24 @@ fn approval_prompt(
             "\n\nAllowing for the session or project covers: {scope}"
         ));
     }
+    // Ineligible calls get no always-allow option at all, so say so instead of leaving it implied.
     if let Some(reason) = &preview.unavailable_reason {
-        body.push_str(&format!("\n\nNot reusable: {reason}"));
+        body.push_str(&format!(
+            "\n\nAllow once only; always allow is not offered: {reason}"
+        ));
     }
     body.push_str(&format!("\n\n{hint}"));
     let mut options = vec![("Allow once", 'y', Decision::Allow)];
     if preview.session.is_some() {
         options.push((
-            "Allow for this session (not saved)",
+            "Always allow this session (not saved)",
             'a',
             Decision::AllowAlways,
         ));
     }
     if preview.project.is_some() {
         options.push((
-            "Allow for this project (saved until revoked)",
+            "Always allow this project (saved until revoked)",
             'p',
             Decision::AllowProject,
         ));

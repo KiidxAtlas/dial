@@ -450,12 +450,13 @@ fn shift_tab_never_cycles_into_full_auto() {
     let mut mode = Approval::Ask;
     for _ in 0..6 {
         mode = next_cycled_approval(mode);
-        assert_ne!(mode, Approval::Auto);
+        assert!(!matches!(mode, Approval::Auto | Approval::Yolo), "{mode:?}");
     }
     assert_eq!(next_cycled_approval(Approval::Ask), Approval::Write);
     assert_eq!(next_cycled_approval(Approval::Write), Approval::Readonly);
     assert_eq!(next_cycled_approval(Approval::Readonly), Approval::Ask);
     assert_eq!(next_cycled_approval(Approval::Auto), Approval::Ask);
+    assert_eq!(next_cycled_approval(Approval::Yolo), Approval::Ask);
 }
 
 #[test]
@@ -463,6 +464,9 @@ fn shift_tab_notes_use_the_mode_names_and_say_how_to_return_to_full_auto() {
     let left_auto = cycled_approval_note(Approval::Auto, Approval::Ask);
     assert!(left_auto.starts_with("Ask first"), "{left_auto}");
     assert!(left_auto.contains("/approval auto"), "{left_auto}");
+    let left_yolo = cycled_approval_note(Approval::Yolo, Approval::Ask);
+    assert!(left_yolo.starts_with("Ask first"), "{left_yolo}");
+    assert!(left_yolo.contains("/approval yolo returns to YOLO"), "{left_yolo}");
     let note = cycled_approval_note(Approval::Ask, Approval::Write);
     assert_eq!(note, "Edit freely for this session");
     assert!(!cycled_approval_note(Approval::Write, Approval::Readonly).contains("readonly"));

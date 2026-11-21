@@ -79,8 +79,7 @@ Inside Dial:
 | `/review files`         | Review, keep or undo changes |
 | `/help`                 | Commands and shortcuts       |
 
-The approval mode sets how much Dial does without asking: `ask`, `write`, `auto` or
-`readonly`. An interactive first run starts in `write`; `-p` and protocol runs default to `auto`. See [configuration](docs/configuration.md).
+Use `/approval` to choose `ask`, `write`, `readonly`, `auto` (Full auto), or `yolo`. Unlike Full auto, YOLO can execute tool calls recovered from model text without asking. An interactive first run starts in `write`; `-p` and protocol runs default to `auto`. See [configuration](docs/configuration.md).
 
 ## Learn more
 

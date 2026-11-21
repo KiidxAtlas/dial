@@ -45,9 +45,102 @@ fn reusable_choices_lead_with_the_action_and_carry_lifetimes_in_labels() {
             ('y', Decision::Allow, false),
             ('a', Decision::AllowAlways, true),
             ('p', Decision::AllowProject, true),
-            ('n', Decision::Deny, false)
+            ('n', Decision::Deny, false),
         ]
     );
+    // The always-allow choices are named as such, so they are findable in the prompt.
+    let labels: Vec<&str> = prompt.options.iter().map(|(label, _, _)| *label).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Allow once",
+            "Always allow this session (not saved)",
+            "Always allow this project (saved until revoked)",
+            "Deny",
+        ]
+    );
+}
+
+#[test]
+fn ineligible_calls_say_allow_once_only_and_render_without_always_options() {
+    let preview = ApprovalPreview {
+        once: "Only this exact call".into(),
+        session: None,
+        project: None,
+        unavailable_reason: Some("Directory access changes require one-time approval.".into()),
+        undo: String::new(),
+    };
+    let prompt = approval_prompt("request_directory /etc", &preview, HINT);
+    assert!(prompt.body.contains(
+        "Allow once only; always allow is not offered: Directory access changes require one-time approval."
+    ));
+    let options: Vec<(&str, char)> = prompt
+        .options
+        .iter()
+        .map(|(label, key, _)| (*label, *key))
+        .collect();
+    let theme = crate::ui::theme::Theme::dark();
+    for width in [40u16, 100] {
+        let rows = crate::app::panel::panel_rows_window(
+            &theme,
+            width,
+            40,
+            crate::app::panel::PanelView {
+                title: "Allow request_directory?",
+                body: &prompt.body,
+                options: &options,
+                selected: 0,
+                offset: 0,
+            },
+        );
+        let text: Vec<String> = rows.iter().map(ToString::to_string).collect();
+        let text = text.join("\n");
+        assert!(text.contains("Allow once"), "{width}: {text}");
+        assert!(text.contains("Deny"), "{width}: {text}");
+        assert!(!text.contains("Always allow"), "{width}: {text}");
+    }
+}
+
+#[test]
+fn eligible_always_allow_choices_render_at_normal_and_narrow_widths() {
+    let preview = ApprovalPreview {
+        once: "Only this call, once".into(),
+        session: Some("bash normalized argv starts with [cargo, test].".into()),
+        project: Some("bash normalized argv starts with [cargo, test].".into()),
+        unavailable_reason: None,
+        undo: String::new(),
+    };
+    let prompt = approval_prompt("cargo test", &preview, HINT);
+    let options: Vec<(&str, char)> = prompt
+        .options
+        .iter()
+        .map(|(label, key, _)| (*label, *key))
+        .collect();
+    let theme = crate::ui::theme::Theme::dark();
+    for width in [60u16, 100] {
+        let rows = crate::app::panel::panel_rows_window(
+            &theme,
+            width,
+            40,
+            crate::app::panel::PanelView {
+                title: "Allow bash?",
+                body: &prompt.body,
+                options: &options,
+                selected: 0,
+                offset: 0,
+            },
+        );
+        let text: Vec<String> = rows.iter().map(ToString::to_string).collect();
+        let text = text.join("\n");
+        assert!(
+            text.contains("Always allow this session"),
+            "{width}: {text}"
+        );
+        assert!(
+            text.contains("Always allow this project"),
+            "{width}: {text}"
+        );
+    }
 }
 
 #[test]

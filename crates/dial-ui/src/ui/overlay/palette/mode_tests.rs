@@ -166,6 +166,39 @@ fn remove_needs_a_second_press_on_the_same_row_and_names_the_item() {
 }
 
 #[test]
+fn fixed_action_rows_cannot_be_removed_even_when_repeated() {
+    let keys = Keymap::defaults();
+    let spec = ChoiceSpec {
+        title: "Permission rules".into(),
+        command: "permissions".into(),
+        remove: Some("remove"),
+        items: vec![item("allow", false), item("1", false)],
+        fixed: &["allow"],
+        ..Default::default()
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    for _ in 0..2 {
+        assert!(matches!(
+            palette.handle(&plain(KeyCode::Delete), &keys),
+            OverlayEvent::None
+        ));
+    }
+    let shown = rendered(&mut palette, 100).join("\n");
+    assert!(shown.contains("cannot be removed"), "{shown}");
+    assert!(!shown.contains("Press Delete again"), "{shown}");
+    // A removable row beside it keeps the usual two presses.
+    palette.handle(&plain(KeyCode::Down), &keys);
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Delete), &keys),
+        OverlayEvent::None
+    ));
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Delete), &keys),
+        OverlayEvent::Action(action) if action == "command:/permissions remove 1"
+    ));
+}
+
+#[test]
 fn backspace_never_removes_and_any_other_key_disarms_a_pending_remove() {
     let keys = Keymap::defaults();
     let spec = ChoiceSpec {

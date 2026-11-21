@@ -1471,6 +1471,39 @@ fn providers_tab_opens_the_other_screens() {
 }
 
 #[test]
+fn common_lists_allowed_commands_and_hands_off_to_the_permissions_picker() {
+    // The Common launcher is the last row of that tab; see ALLOWED_COMMANDS.
+    const ALLOWED: Row = Row::Link(ALLOWED_COMMANDS);
+    let rig = Rig::new();
+    let mut o = overlay();
+    assert_eq!(o.tabs[o.tab].0, "Common");
+    assert_eq!(
+        o.visible().last(),
+        Some(&ALLOWED),
+        "launcher closes the Common list"
+    );
+    let shown = draw(&mut o, &rig, 120, 40);
+    assert!(shown.contains("Allowed commands"), "{shown}");
+    assert_eq!(
+        o.section_of(ALLOWED),
+        "Common",
+        "launcher sits under the Common heading"
+    );
+    o.cursor = o
+        .visible()
+        .iter()
+        .position(|row| *row == ALLOWED)
+        .expect("launcher row");
+    match send(&mut o, &rig.keys, key(KeyCode::Enter)) {
+        OverlayEvent::Action(action) => assert_eq!(action, "command:/permissions"),
+        other => panic!("{other:?}"),
+    }
+    // Search finds the same launcher from the Common tab, by its label.
+    send_all(&mut o, &rig.keys, typed("allowed commands"));
+    assert!(o.visible().contains(&ALLOWED));
+}
+
+#[test]
 fn restart_required_rows_are_marked() {
     let rig = Rig::new();
     let mut o = overlay();

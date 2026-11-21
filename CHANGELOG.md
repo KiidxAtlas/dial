@@ -19,6 +19,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Added
 
+- Approvals: manage allowed commands in **Settings → Common → Allowed commands** or `/permissions`, or choose **Always allow** for this session or project on an eligible prompt. A project grant no longer persists unrelated session-only grants. `/approval yolo` opts into running eligible calls recovered from model text; Full auto still asks. Explicit denies and sandbox limits apply to both. [Tools](docs/tools.md).
+- Local models: Inkling-2-Mini uses MLX-LM for both text and images. A native tool call can follow a visible answer frame without printing its tool markup. MLX setup and approved updates now sync to Dial's bundled Python lockfile. [Setup and updates](docs/setup.md#keeping-external-runtimes-and-tools-current).
 - Debugger: `dap` reads memory (`readMemory`, a hex/ASCII dump) and disassembles (`disassemble`) when the adapter advertises support, and `sessions` lists every open debug session in the Dial session, including subagents'. [Tools](docs/tools.md).
 - Plan mode: approved plans are saved with the session, optionally autosaved to `.dial/plans` (`[plan] autosave`), and carried word for word through compaction. [Extensions](docs/extensibility.md).
 - Collaboration: with `[collab] allow_guest_answers`, writable guests can answer the host's `ask_user` choice questions (`/collab answer <n>`, RPC `collaboration_answer`); tool approvals and permission prompts stay host-only. The relay now serves the browser viewer at `/` under a hash-pinned content security policy, and `/collab start` prints the viewer link. [Collaboration](docs/collab.md).
@@ -57,6 +59,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Local models: Inkling’s framed replies separate thinking from answer text. On managed MLX, native tool calls use the normal approval policy instead of prompting as calls recovered from text. [LLM transport](docs/llm-transport.md).
 - The release workflow's package metadata job no longer fails after a successful release because its pull request never receives the checks `main` requires. With the optional `RELEASE_PACKAGING_TOKEN` secret it waits for that pull request's CI and merges it; without the secret it opens the pull request and records a manual-merge warning instead of timing out. [Release and installation](docs/release-and-install.md).
 
 ## [0.3.12] - 2026-11-20

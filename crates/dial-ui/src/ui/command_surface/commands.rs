@@ -169,7 +169,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         subcommands: &["plan", "approval", "vibe", "skillful"],
         ..CommandSpec::new(
             "mode",
-            "[plan [on|off]|approval [ask|write|auto|readonly]|vibe [on|off|status]|skillful [on|off|status]]",
+            "[plan [on|off]|approval [ask|write|auto|readonly|yolo]|vibe [on|off|status]|skillful [on|off|status]]",
             "choose session working modes and tool approval",
             Category::Modes,
             Surface::Group,
@@ -805,7 +805,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         ..CommandSpec::new(
             "approval",
-            "[ask|write|auto|readonly]",
+            "[ask|write|auto|readonly|yolo]",
             "choose when tool calls need approval",
             Category::Settings,
             Surface::Builtin,

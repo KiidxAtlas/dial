@@ -74,8 +74,8 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   elapsed time (**running bash · 1m 15s**). When you switch away, the
   [terminal tab title](terminal-integration.md#terminal-integration) tells you whether Dial needs your input.
 - The default status line leads with the approval mode as a colored dot and plain label
-  (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`): green for ask and read-only, orange for
-  full auto. Config, CLI and `/approval` values stay `ask`, `write`, `auto` and `readonly`.
+  (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`, `YOLO`). Choose YOLO explicitly with
+  `/approval yolo`; Shift+Tab never enters it. Use `/permissions` to manage saved command rules.
 - **Work panel.** The plan lives above the composer, not in repeated transcript cards. Successful
   plan calls are hidden from the transcript; failures remain visible and session history retains the calls.
   While a plan has open steps on a terminal at least 90 columns wide, one compact rounded card

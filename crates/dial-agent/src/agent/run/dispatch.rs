@@ -881,7 +881,7 @@ impl<'a> Agent<'a> {
                 self.interrupt.as_ref(),
             )
             .map(|persist| {
-                if persist && let Err(error) = self.persist_permissions() {
+                if persist && let Err(error) = self.persist_latest_permission_rule() {
                     ui.notice(&format!(
                         "The rule applies to this session but could not be saved: {error:#}"
                     ));
