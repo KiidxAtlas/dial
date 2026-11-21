@@ -3,7 +3,7 @@
 
 use super::extensions::{spawn_job, spawn_job_streaming};
 use crate::agent::{Agent, Ui};
-use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
+use crate::app::{App, Bridge, Shell, Step};
 use crate::config::settings_store::Scope;
 use crate::llm::oauth::util::open_browser;
 use crate::tools::integrations::mcp::smithery::{self, SearchResult};
@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 /// Picker labels longer than this are cut with `...` so the list stays readable.
 const LABEL_MAX: usize = 120;
@@ -70,16 +69,7 @@ fn scope_label(scope: &Scope) -> &'static str {
 
 /// Runs `f` against a `Ui` bridge over the live shell, the same way `/cleanse` drives its prompts.
 fn with_ui<T>(shell: &mut Shell, app: &App, f: impl FnOnce(&mut Bridge<'_>) -> T) -> T {
-    let mut bridge = Bridge {
-        app,
-        shell: &mut *shell,
-        interrupt: app.interrupt.clone(),
-        started: Instant::now(),
-        last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-        failed: false,
-        pending: Vec::new(),
-        next_id: 0,
-    };
+    let mut bridge = Bridge::new(app, &mut *shell);
     bridge.repaint(true);
     f(&mut bridge)
 }

@@ -738,10 +738,7 @@ fn spawn_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<String>>, stopped: Abor
                     let mut text = tail.lock();
                     text.push_str(&String::from_utf8_lossy(&bytes[..n]));
                     if text.len() > STDERR_TAIL_BYTES {
-                        let mut cut = text.len() - STDERR_TAIL_BYTES;
-                        while !text.is_char_boundary(cut) {
-                            cut += 1;
-                        }
+                        let cut = text.ceil_char_boundary(text.len() - STDERR_TAIL_BYTES);
                         text.replace_range(..cut, "");
                     }
                 }

@@ -41,17 +41,23 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub fn from_status(status: &str) -> Self {
-        match status {
+    /// The phase a reported status word names, or `None` for a word the engine does not use.
+    pub fn parse(status: &str) -> Option<Self> {
+        Some(match status {
             "running" | "pending" => Self::Running,
             "done" | "completed" => Self::Completed,
             "answered" => Self::Answered,
             "blocked" => Self::Blocked,
             "needs_input" => Self::NeedsInput,
             "incomplete" => Self::Incomplete,
+            "failed" => Self::Failed,
             "interrupted" | "cancelled" | "canceled" => Self::Interrupted,
-            _ => Self::Failed,
-        }
+            _ => return None,
+        })
+    }
+    /// [`Phase::parse`], where an unrecognised status counts as a failure.
+    pub fn from_status(status: &str) -> Self {
+        Self::parse(status).unwrap_or(Self::Failed)
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -161,10 +167,7 @@ fn shrink_for_journal(node: &mut Node) {
 
 /// Drop complete leading characters until at most `limit` bytes remain.
 fn tail(text: &str, limit: usize) -> &str {
-    let mut cut = text.len().saturating_sub(limit);
-    while !text.is_char_boundary(cut) {
-        cut += 1;
-    }
+    let cut = text.ceil_char_boundary(text.len().saturating_sub(limit));
     &text[cut..]
 }
 

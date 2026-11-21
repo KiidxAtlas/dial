@@ -47,10 +47,3 @@ fn lenient_contract_defaults_to_utc_and_allows_negative() {
     );
     assert_eq!(parse_iso_ms_lenient("1970-01-01T00:00:00Zjunk"), None);
 }
-
-#[test]
-fn days_from_civil_matches_known_dates() {
-    assert_eq!(days_from_civil(1970, 1, 1), 0);
-    assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-    assert_eq!(days_from_civil(1969, 12, 31), -1);
-}

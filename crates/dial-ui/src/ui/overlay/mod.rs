@@ -24,6 +24,7 @@ pub mod shortcuts;
 pub mod stats;
 pub mod subagent_viewer;
 pub mod subagents;
+pub mod widgets;
 
 use crate::{
     config::settings_store::Scope,

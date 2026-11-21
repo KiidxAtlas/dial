@@ -308,3 +308,100 @@ fn spelling_collisions_and_unknown_actions_are_not_guessed() {
         assert!(crate::agent::run::calls::validate(&schema, &args).is_err());
     }
 }
+
+#[test]
+fn nullable_scalar_repair_requires_one_unambiguous_non_string_type() {
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{
+        "items":{"type":"array","items":{"type":["integer","null"],"minimum":1}},
+        "flag":{"type":["null","boolean"]}, "ratio":{"type":["number","null"]},
+        "nullable":{"type":["integer","null"]},"text":{"type":["integer","string"]},
+        "ambiguous":{"type":["integer","number","null"]}
+    }});
+    let mut args =
+        json!({"items":["2",null],"flag":"false","ratio":"1.5","nullable":null,"text":"2"});
+    normalize("my_extension", &schema, &mut args);
+    assert_eq!(
+        args,
+        json!({"items":[2,null],"flag":false,"ratio":1.5,"nullable":null,"text":"2"})
+    );
+    assert!(crate::agent::run::calls::validate(&schema, &args).is_ok());
+    for (bad, expected) in [
+        (json!({"flag":"yes"}), json!({"flag":"yes"})),
+        (json!({"ambiguous":"4"}), json!({"ambiguous":"4"})),
+        (json!({"items":["0"]}), json!({"items":[0]})),
+    ] {
+        let mut args = bad;
+        normalize("my_extension", &schema, &mut args);
+        assert_eq!(args, expected);
+        assert!(crate::agent::run::calls::validate(&schema, &args).is_err());
+    }
+}
+
+#[test]
+fn quoted_keys_are_data_in_open_maps_and_must_not_break_ties_in_closed_records() {
+    for closed in [true, false] {
+        let schema = json!({"type":"object","additionalProperties":!closed,"properties":{"max_count":{"type":"integer"}}});
+        let mut single = json!({"\"max_count\"":3});
+        normalize("custom", &schema, &mut single);
+        assert_eq!(
+            single,
+            if closed {
+                json!({"max_count":3})
+            } else {
+                json!({"\"max_count\"":3})
+            }
+        );
+        let mut optional_null = json!({"\"max_count\"":null});
+        normalize("custom", &schema, &mut optional_null);
+        assert_eq!(
+            optional_null,
+            if closed {
+                json!({})
+            } else {
+                json!({"\"max_count\"":null})
+            }
+        );
+        let both = json!({"maxCount":2,"\"max_count\"":3});
+        let mut actual = both.clone();
+        normalize("custom", &schema, &mut actual);
+        assert_eq!(actual, both);
+    }
+}
+
+#[test]
+#[ignore = "local normalization timing experiment, not a CI latency threshold"]
+fn ordinary_call_normalization_timing() {
+    use std::{hint::black_box, time::Instant};
+    let cases = [
+        (
+            "read",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),
+            json!({"path":"src/main.rs"}),
+        ),
+        (
+            "custom",
+            json!({"type":"object","properties":{"rows":{"type":"array","items":{"type":"object","properties":{"count":{"type":"integer"},"text":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false}),
+            json!({"rows":[{"count":2,"text":"007"},{"count":3,"text":"src"}]}),
+        ),
+    ];
+    for (name, schema, original) in cases {
+        let mut args = original.clone();
+        let mut samples = Vec::new();
+        for batch in 0..25 {
+            let started = Instant::now();
+            for _ in 0..2000 {
+                normalize(name, black_box(&schema), black_box(&mut args));
+            }
+            let elapsed = started.elapsed().as_nanos() / 2000;
+            assert_eq!(args, original);
+            if batch >= 4 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "{name}: median {} ns/call, p95 batch {} ns/call",
+            samples[10], samples[19]
+        );
+    }
+}

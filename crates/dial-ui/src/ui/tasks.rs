@@ -1,8 +1,8 @@
 //! Work is presented in two layers: a small live focus summary and a searchable full plan.
 //! The plan inspector exposes recorded reasons, findings and evidence without changing task state.
-use super::markdown::truncate_spans;
 use super::text;
 use super::theme::{Sym, Theme, Tok};
+use super::transcript::fitted;
 use super::{Rows, chrome};
 use crate::agent::workflow::todo::{Status, Task, TodoList};
 use ratatui::style::Modifier;
@@ -23,8 +23,7 @@ pub fn rows(
     if !todo.has_open() || width < 12 || max_rows < MIN_ROWS {
         return Vec::new();
     }
-    let mark = theme.sym(Sym::Ellipsis);
-    let fit = |spans| Line::from(truncate_spans(spans, width, mark));
+    let fit = |spans| fitted(spans, width, theme);
     let mut out = vec![fit(header(todo, theme))];
     let tasks = todo.tasks();
     let focus = tasks.iter().find(|t| t.status == Status::InProgress);
@@ -144,6 +143,7 @@ pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpe
         prompt: "Filter steps:".into(),
         summary: plan_summary(todo),
         empty_message: String::new(),
+        fixed: &[],
         // Each label already names its status, so the working step needs no extra tag.
         current_tag: Some(String::new()),
         items: ordered
@@ -265,6 +265,23 @@ pub(super) fn task_spans(
     spans
 }
 
+/// Cells in the plan's progress bar, shared by the work panel and the transcript's plan card.
+const PROGRESS_CELLS: usize = 8;
+
+/// The plan's progress bar as its filled and empty cells: `closed` of `total` steps, rounded up so
+/// any closed step shows. `▰▱`, or `#-` under ASCII.
+pub(super) fn progress_bar(closed: usize, total: usize, theme: &Theme) -> (String, String) {
+    let filled = (closed * PROGRESS_CELLS)
+        .div_ceil(total.max(1))
+        .min(PROGRESS_CELLS);
+    let (full, empty) = if theme.ascii() {
+        ("#", "-")
+    } else {
+        ("▰", "▱")
+    };
+    (full.repeat(filled), empty.repeat(PROGRESS_CELLS - filled))
+}
+
 /// Lists longer than this collapse to the rows around what changed (Ctrl-O shows them all).
 const CARD_COLLAPSE_OVER: usize = 12;
 
@@ -291,7 +308,7 @@ pub fn card_rows(tasks: &[(Task, bool)], width: usize, theme: &Theme, expanded: 
             .collect()
     };
     let mark = theme.sym(Sym::Ellipsis).to_owned();
-    let fit = |spans: Vec<Span<'static>>| Line::from(truncate_spans(spans, width, &mark));
+    let fit = |spans: Vec<Span<'static>>| fitted(spans, width, theme);
     let more = |n: usize| {
         fit(vec![Span::styled(
             format!("    {mark} {n} more"),

@@ -478,16 +478,7 @@ fn program(name: &str) -> Result<OsString, String> {
     if let Some(program) = tests::program_override(name) {
         return Ok(program);
     }
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir: PathBuf| dir.join(&exe))
-        .find(|candidate| candidate.is_file())
+    crate::platform::fs::find_program(std::path::Path::new(name), std::env::var_os("PATH").as_deref())
         .map(PathBuf::into_os_string)
         .ok_or_else(|| format!("{name} is not installed or not on PATH; db_query runs the engine's own command-line client"))
 }

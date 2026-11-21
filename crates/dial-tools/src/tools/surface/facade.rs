@@ -326,18 +326,16 @@ impl Facade {
 
 /// Widen `existing` so it also accepts every value `other` accepts: enum values are united, and
 /// differing bounds are dropped (each owner still enforces its own on call).
-pub fn widen(existing: &mut Value, other: &Value) {
+fn widen(existing: &mut Value, other: &Value) {
     if let (Some(left), Some(right)) = (
-        existing.get("enum").and_then(Value::as_array).cloned(),
+        existing.get_mut("enum").and_then(Value::as_array_mut),
         other.get("enum").and_then(Value::as_array),
     ) {
-        let mut values = left;
         for value in right {
-            if !values.contains(value) {
-                values.push(value.clone());
+            if !left.contains(value) {
+                left.push(value.clone());
             }
         }
-        existing["enum"] = Value::Array(values);
         return;
     }
     let unbounded = |value: &Value| {
@@ -380,7 +378,7 @@ pub fn widen(existing: &mut Value, other: &Value) {
 }
 
 /// Add `added`'s properties to `properties`, skipping `skip`, widening shared names.
-fn merge_properties(properties: &mut Map<String, Value>, added: &Value, skip: &[&str]) {
+pub(crate) fn merge_properties(properties: &mut Map<String, Value>, added: &Value, skip: &[&str]) {
     let Some(added) = added
         .pointer("/function/parameters/properties")
         .and_then(Value::as_object)

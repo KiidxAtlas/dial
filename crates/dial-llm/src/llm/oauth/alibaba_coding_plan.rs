@@ -8,10 +8,7 @@ use super::super::model_config::ApiProtocol;
 use super::{Access, Credentials, Flow, Interaction, Login, util};
 use anyhow::{Result, ensure};
 use serde_json::json;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 const DEFAULT_AUTH_URL: &str = "https://modelstudio.console.alibabacloud.com/";
 const CHINA_AUTH_URL: &str = "https://bailian.console.aliyun.com/?tab=model#/api-key";
@@ -62,7 +59,7 @@ fn sign_in(
         Some("1"),
         false,
     )?;
-    check_cancelled(cancel)?;
+    util::check_cancelled(cancel)?;
     let (base_url, auth_url, instructions, custom) = match choice.trim() {
         "2" => (
             endpoints.china.to_owned(),
@@ -94,25 +91,15 @@ fn sign_in(
     };
 
     open(auth_url, Some(instructions));
-    let answer = ui.prompt_secret(
-        "Paste your Alibaba Coding Plan API key",
-        Some("sk-..."),
-        false,
-    )?;
-    check_cancelled(cancel)?;
-    let key = answer.trim();
-    ensure!(!key.is_empty(), "Alibaba Coding Plan API key is required");
-
-    ui.progress("Validating API key...");
+    let key = util::prompt_api_key(ui, cancel, FLOW.name, "sk-...")?;
     if custom {
-        validate_models(key, &base_url, cancel)?;
+        util::validate_bearer_models(FLOW.name, &key, &base_url, cancel, VALIDATION_TIMEOUT_SECS)?;
     } else {
-        validate_chat_completions(key, &base_url, cancel)?;
+        validate_chat_completions(&key, &base_url, cancel)?;
     }
 
     Ok(Credentials {
-        access: key.to_owned(),
-        refresh: String::new(),
+        access: key,
         expires_at_ms: util::NEVER_EXPIRES,
         enterprise_url: Some(base_url),
         ..Credentials::default()
@@ -140,30 +127,6 @@ fn validate_chat_completions(key: &str, base_url: &str, cancel: &Arc<AtomicBool>
         "Alibaba Coding Plan API key validation failed (HTTP {})",
         response.status
     );
-    Ok(())
-}
-
-/// Model-list probe for custom endpoints, where only `/models` is known to exist.
-fn validate_models(key: &str, base_url: &str, cancel: &Arc<AtomicBool>) -> Result<()> {
-    let bearer = format!("Bearer {key}");
-    let response = util::request_with_timeout(
-        "GET",
-        &format!("{base_url}/models"),
-        &[("Authorization", bearer.as_str())],
-        util::Body::Empty,
-        cancel,
-        VALIDATION_TIMEOUT_SECS,
-    )?;
-    ensure!(
-        response.ok(),
-        "Alibaba Coding Plan API key validation failed (HTTP {})",
-        response.status
-    );
-    Ok(())
-}
-
-fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
     Ok(())
 }
 

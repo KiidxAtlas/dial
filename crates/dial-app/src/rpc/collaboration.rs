@@ -117,6 +117,27 @@ pub(super) fn abort() -> Option<Result<Value>> {
     })
 }
 
+/// Answer the host's open question as a joined guest. `option` is 1-based, as listed in
+/// `collaboration_status` `room.question.options`. The host decides whether guests may answer.
+pub(super) fn answer(params: &Value) -> Result<Value> {
+    let option = params
+        .as_object()
+        .filter(|fields| fields.keys().all(|key| key == "option"))
+        .and_then(|fields| fields.get("option")?.as_u64())
+        .and_then(|option| usize::try_from(option).ok())
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidParams,
+                "collaboration_answer takes only params.option, a 1-based option number",
+            )
+        })?;
+    match room::send_guest_answer(option) {
+        None => Err(coded(ErrorCode::NotPending, "not joined as a guest")),
+        Some(Ok(())) => Ok(json!({"routed": "collaboration_host", "option": option})),
+        Some(Err(reason)) => Err(coded(ErrorCode::Refused, reason)),
+    }
+}
+
 fn refusal(error: anyhow::Error) -> anyhow::Error {
     match error.downcast_ref::<room::Refused>() {
         Some(room::Refused::Busy) => coded(ErrorCode::Busy, error),

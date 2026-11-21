@@ -1,5 +1,5 @@
 //! One bounded mailbox per browser. Filesystem calls never run on the input/render thread.
-use super::{Entry, MAX_ENTRIES, is_executable};
+use super::{Entry, MAX_ENTRIES};
 use crate::config::schema::PathKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -207,7 +207,7 @@ fn listing(
                 entries.push(Entry {
                     name,
                     dir,
-                    executable: !dir && is_executable(&meta),
+                    executable: !dir && crate::platform::fs::is_executable(&entry.path()),
                 });
             }
         }

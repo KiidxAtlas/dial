@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
+use super::forge_policy::{OpPolicy, op_of};
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext, ToolEvent};
 use crate::tools::vcs::gh_common::clip;
@@ -20,6 +21,7 @@ use crate::tools::{ToolOutput, Workspace, opt_bool, opt_str, opt_u64, req_str, t
 use runner::{Project, check_token_host_env, glab_in, glab_json, parse_project};
 
 const READ_OPS: &[&str] = &["mr_list", "mr_view", "mr_diff"];
+const ACCESS: OpPolicy = OpPolicy::new(READ_OPS);
 const OPS: &[&str] = &[
     "mr_list",
     "mr_view",
@@ -41,14 +43,6 @@ pub struct GlabMr;
 /// Registry entry point: the `glab_mr` tool, gated by name through `config.integrations`.
 pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(GlabMr)]
-}
-
-fn op_of(args: &Value) -> Option<&str> {
-    args["op"].as_str()
-}
-
-fn is_read_op(args: &Value) -> bool {
-    op_of(args).is_some_and(|op| READ_OPS.contains(&op))
 }
 
 fn execute(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> ToolOutput {
@@ -102,7 +96,7 @@ impl Tool for GlabMr {
 
     /// Only the read ops run without approval; a missing or unknown op needs it too.
     fn needs_approval(&self, args: &Value) -> bool {
-        !is_read_op(args)
+        ACCESS.needs_approval(args)
     }
 
     /// Only `mr_checkout` changes the local checkout (it adds a worktree).
@@ -111,11 +105,7 @@ impl Tool for GlabMr {
     }
 
     fn concurrency(&self, args: &Value) -> Concurrency {
-        if is_read_op(args) {
-            Concurrency::Shared
-        } else {
-            Concurrency::Exclusive
-        }
+        ACCESS.concurrency(args)
     }
 
     /// Read operations query GitLab and the checkout's Git metadata, never source files.
@@ -124,7 +114,7 @@ impl Tool for GlabMr {
         _workspace: &Workspace,
         args: &Value,
     ) -> Option<crate::tools::surface::resources::Access> {
-        is_read_op(args).then(Default::default)
+        ACCESS.resources(args)
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {

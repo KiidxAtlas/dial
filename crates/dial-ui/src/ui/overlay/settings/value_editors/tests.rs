@@ -120,6 +120,27 @@ fn list_add_row_takes_typed_values_and_esc_discards_the_edit() {
 }
 
 #[test]
+fn add_row_uses_the_configured_confirm_key() {
+    let table = toml::from_str(r#""tui.select.confirm" = "Ctrl+Y""#).unwrap();
+    let keys = Keymap::from_table(&table).0;
+    let mut list = ListEditor::new(
+        &strings(&[]),
+        Vec::new(),
+        false,
+        AddBy::Text,
+        Path::new("."),
+    );
+    let confirm = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+    list.key(&key(KeyCode::Enter), &keys);
+    assert!(!list.is_adding());
+    list.key(&confirm, &keys);
+    assert!(list.is_adding());
+    list.paste("mine");
+    list.key(&confirm, &keys);
+    assert_eq!(list.key(&confirm, &keys), Step::Save(strings(&["mine"])));
+}
+
+#[test]
 fn folder_lists_add_through_the_browser() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("out")).unwrap();

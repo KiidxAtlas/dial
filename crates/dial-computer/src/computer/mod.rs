@@ -514,19 +514,13 @@ fn cap_inline(text: String, save: impl FnOnce(&str) -> Option<String>) -> String
     }
     let head_budget = INLINE_BYTE_CAP * 60 / 100;
     let tail_budget = INLINE_BYTE_CAP / 4;
-    let mut head_end = head_budget;
-    while !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
+    let head_end = text.floor_char_boundary(head_budget);
     let head_full = &text[..head_end];
     let head = match head_full.rfind('\n') {
         Some(index) => &head_full[..index],
         None => head_full,
     };
-    let mut tail_start = text.len() - tail_budget;
-    while !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let tail_start = text.ceil_char_boundary(text.len() - tail_budget);
     let tail_full = &text[tail_start..];
     let tail = match tail_full.find('\n') {
         Some(index) => &tail_full[index + 1..],

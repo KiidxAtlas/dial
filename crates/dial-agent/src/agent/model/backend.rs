@@ -254,7 +254,17 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     if let Some(id) = account_id {
         backend = backend.with_account(id);
     }
-    if let Some(profile) = config.active_model_profile() {
+    if signed_route && provider == "google-antigravity" {
+        // Auto effort is judged against the backend profile. A grouped model needs the account's
+        // listed levels here even before a user has saved a fixed effort in a named profile.
+        if let Some(profile) = crate::config::thinking::reasoning_profile(config)?
+            && (config.active_model_profile().is_some()
+                || profile.capabilities.reasoning
+                    == llm::profiles::ReasoningApi::AntigravityModelVariant)
+        {
+            backend = backend.with_profile(profile);
+        }
+    } else if let Some(profile) = config.active_model_profile() {
         backend = backend.with_profile(profile.clone());
     } else if config.provider.as_deref() == Some(llm::chatgpt::PROVIDER)
         && let Some(profile) = llm::chatgpt::scoped_model_profile(

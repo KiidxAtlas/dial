@@ -190,7 +190,7 @@ pub fn shape_output(driver: &Value, cap: usize) -> Value {
         .unwrap_or(false);
     let over_cap = total_bytes > cap;
     if over_cap {
-        text = truncate_at_char_boundary(&text, cap).to_string();
+        text.truncate(text.floor_char_boundary(cap));
         text.push_str(&format!(
             "\n[output truncated: first {cap} bytes shown of {total_bytes} bytes; inline cap is {cap} bytes]"
         ));
@@ -296,17 +296,6 @@ fn parse_step(index: usize, step: &Value) -> Result<CallStep, String> {
         method: method.to_string(),
         args,
     })
-}
-
-fn truncate_at_char_boundary(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 #[cfg(test)]

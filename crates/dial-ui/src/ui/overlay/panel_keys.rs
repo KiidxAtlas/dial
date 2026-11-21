@@ -3,7 +3,7 @@
 //! [`PanelKeys`] owns the `?`/F1 key sheet every panel offers, and [`sheet`] draws any panel's key
 //! reference in the one look (the git panel's richer sheet uses it too).
 use super::DrawCtx;
-use super::settings::{pair_label, panel};
+use super::widgets::{pair_label, panel};
 use crate::ui::{
     chrome::{self, Section},
     keys::{Action, Keymap},
@@ -156,6 +156,134 @@ pub fn capped_footer(hints: Vec<String>, sheet: &str) -> Vec<String> {
     ]
 }
 
+/// One `key label` segment for a footer or key sheet. Omit unbound keys.
+pub(crate) fn segment(key: &str, label: &str) -> String {
+    match (key.is_empty(), label.is_empty()) {
+        (true, _) => String::new(),
+        (false, true) => key.to_owned(),
+        (false, false) => format!("{key} {label}"),
+    }
+}
+
+/// Summarize a panel's bindings; F1 exposes the complete list. Surfaces that display
+/// every applicable action use `widgets::hint_line` directly.
+pub(crate) fn sheet_footer(theme: &Theme, segments: Vec<String>, width: usize) -> Line<'static> {
+    super::widgets::hint_line(theme, &capped_footer(segments, "F1 keys"), width)
+}
+
+/// The row a list cursor moves to for the shared Up/Down/PageUp/PageDown keys over `len` rows;
+/// `None` when the key is not list movement. `Edge` decides what Up and Down do at either end.
+/// `page` is the paging step as the list measured it: zero pages nothing, so a list with no room
+/// keeps its existing paging. Home and End stay with each list, since not every list takes them.
+pub(crate) fn list_move(
+    keys: &Keymap,
+    key: &KeyEvent,
+    cursor: usize,
+    len: usize,
+    page: usize,
+    edge: Edge,
+) -> Option<usize> {
+    let last = len.saturating_sub(1);
+    if keys.matches(Action::SelectUp, key) {
+        Some(match (edge, cursor) {
+            (Edge::Wrap, 0) => last,
+            _ => cursor.saturating_sub(1),
+        })
+    } else if keys.matches(Action::SelectDown, key) {
+        Some(match edge {
+            Edge::Wrap if cursor >= last => 0,
+            _ => cursor.saturating_add(1).min(last),
+        })
+    } else if keys.matches(Action::SelectPageUp, key) {
+        Some(cursor.saturating_sub(page))
+    } else if keys.matches(Action::SelectPageDown, key) {
+        Some(cursor.saturating_add(page).min(last))
+    } else {
+        None
+    }
+}
+
+/// Scroll a text pane before its next draw measures and clamps the offset.
+pub(crate) fn scroll_text(
+    keys: &Keymap,
+    key: &KeyEvent,
+    offset: usize,
+    page: usize,
+) -> Option<usize> {
+    match key.code {
+        KeyCode::Home => Some(0),
+        KeyCode::End => Some(usize::MAX),
+        _ => list_move(keys, key, offset, usize::MAX, page, Edge::Stop),
+    }
+}
+
+/// Shared viewport for a destructive review. The caller owns the consequences and
+/// which keys confirm; this only scrolls the copy and gates confirmation on space.
+#[derive(Default)]
+pub(super) struct RemovalReview {
+    offset: usize,
+    page: usize,
+    too_small: bool,
+}
+
+impl RemovalReview {
+    pub(super) fn rewind(&mut self) {
+        self.offset = 0;
+    }
+
+    pub(super) fn can_confirm(&self) -> bool {
+        !self.too_small
+    }
+
+    pub(super) fn scroll(&mut self, keys: &Keymap, key: &KeyEvent) {
+        if let Some(next) = scroll_text(keys, key, self.offset, self.page) {
+            self.offset = next;
+        }
+    }
+
+    pub(super) fn rows(
+        &mut self,
+        body: Vec<Line<'static>>,
+        width: usize,
+        height: usize,
+        footer: Line<'static>,
+        resize_hint: &'static str,
+    ) -> Vec<Line<'static>> {
+        self.too_small = width < 20 || height < 3;
+        let room = height.saturating_sub(1);
+        self.page = room.max(1);
+        self.offset = self.offset.min(body.len().saturating_sub(room));
+        let mut out: Vec<_> = body.into_iter().skip(self.offset).take(room).collect();
+        out.resize(room, Line::default());
+        if height > 0 {
+            out.push(if self.too_small {
+                Line::from(resize_hint)
+            } else {
+                footer
+            });
+        }
+        out
+    }
+}
+
+/// What Up and Down do at the first and last row of a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edge {
+    /// Stop at the ends.
+    Stop,
+    /// Continue from the other end.
+    Wrap,
+}
+
+/// The first key bound to `action` as its footer and sheet label, or `fallback` when nothing is
+/// bound; the keymap decides the spelling, so remapped bindings show as the user set them.
+pub(crate) fn label_or(keys: &Keymap, action: Action, fallback: &'static str) -> String {
+    match keys.label(action) {
+        label if label.is_empty() => fallback.to_owned(),
+        label => label,
+    }
+}
+
 impl PanelKeys {
     /// Returns true when the help layer consumed the event. F1 always toggles the key sheet; `?`
     /// does too unless a text field has focus (then it is typed). Every other key, `/` included,
@@ -232,10 +360,61 @@ impl PanelKeys {
         self.help
     }
 
-    /// The common rows of the key sheet: list movement, the main action, tabs when the panel has
-    /// them, `/` when it opens a search, this sheet and the way back.
-    fn rows(keys: &Keymap, tabs: bool, search: bool) -> Vec<(String, String)> {
-        let mut rows = vec![
+    /// Before drawing a picker body, handle empty/tiny terminals or its open help sheet.
+    /// Screen-specific bindings are built only when the sheet is visible.
+    pub(crate) fn picker_sheet(
+        &self,
+        theme: &Theme,
+        keys: &Keymap,
+        size: (usize, usize),
+        title: &str,
+        resize_hint: &str,
+        actions: impl FnOnce() -> Vec<(String, String)>,
+    ) -> Option<Vec<Line<'static>>> {
+        let (cols, height) = size;
+        if height == 0 || cols == 0 {
+            return Some(Vec::new());
+        }
+        if height < 5 || cols < 12 {
+            return Some(vec![Line::from(Span::styled(
+                text::ellipsize(resize_hint, cols, theme.ascii()),
+                theme.fg(Tok::Muted),
+            ))]);
+        }
+        if !self.open() {
+            return None;
+        }
+        let mut rows = Self::movement_rows(keys);
+        rows.extend(actions());
+        rows.extend([
+            ("Ctrl+U".into(), "clear the search".into()),
+            ("F1".into(), "show or hide these keys".into()),
+            ("Esc".into(), "clear the search, then close".into()),
+        ]);
+        let inner = cols.saturating_sub(4);
+        let body = sheet(
+            theme,
+            &[SheetGroup {
+                title: "Keys",
+                rows,
+            }],
+            "",
+            "F1/Esc",
+            inner,
+        );
+        let body = self.viewport(body, inner, height.saturating_sub(2), theme);
+        Some(chrome::framed_lines(
+            theme,
+            Section::Dial,
+            &format!("{title} · keys"),
+            "",
+            body,
+            cols,
+        ))
+    }
+
+    fn movement_rows(keys: &Keymap) -> Vec<(String, String)> {
+        vec![
             (
                 pair_label(keys, Action::SelectUp, Action::SelectDown),
                 "move the selection".to_owned(),
@@ -244,11 +423,17 @@ impl PanelKeys {
                 pair_label(keys, Action::SelectPageUp, Action::SelectPageDown),
                 "move a page".to_owned(),
             ),
-            (
-                keys.label(Action::SelectConfirm),
-                "open or apply the selected row".to_owned(),
-            ),
-        ];
+        ]
+    }
+
+    /// The common rows of the key sheet: list movement, the main action, tabs when the panel has
+    /// them, `/` when it opens a search, this sheet and the way back.
+    fn rows(keys: &Keymap, tabs: bool, search: bool) -> Vec<(String, String)> {
+        let mut rows = Self::movement_rows(keys);
+        rows.push((
+            keys.label(Action::SelectConfirm),
+            "open or apply the selected row".to_owned(),
+        ));
         if tabs {
             rows.push(("Tab/Shift+Tab".into(), "switch tabs".into()));
         }

@@ -10,6 +10,18 @@ fn push_eta(label: &mut String, eta: Option<f64>) {
     }
 }
 
+/// A tokens-per-second reading worth showing: finite and above zero. Every surface that prints a
+/// rate filters through this, so an unknown or invalid reading is absent everywhere.
+pub fn shown_rate(rate: Option<f64>) -> Option<f64> {
+    rate.filter(|r| r.is_finite() && *r > 0.0)
+}
+
+/// `{prefix}{rate:.1} tok/s`, the rate spelling shared by the status line, its activity text and the
+/// turn recap. `prefix` is `~` for an estimated rate and empty otherwise.
+pub fn rate_label(rate: f64, prefix: &str) -> String {
+    format!("{prefix}{rate:.1} tok/s")
+}
+
 /// A running tool shows its elapsed time once it has run this long.
 const TOOL_ELAPSED_AFTER_SECS: f64 = 10.0;
 
@@ -19,6 +31,7 @@ pub fn approval_label(value: &str) -> &str {
         "ask" => "Ask first",
         "write" => "Edit freely",
         "auto" => "Full auto",
+        "yolo" => "YOLO",
         "readonly" => "Read-only",
         other => other,
     }
@@ -306,8 +319,8 @@ impl StatusData {
                     || "generating tokens".into(),
                     |n| format!("generating {prefix}{n} tokens"),
                 );
-                if let Some(rate) = p.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
-                    label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
+                if let Some(rate) = shown_rate(p.tokens_per_second) {
+                    label.push_str(&format!(" · {}", rate_label(rate, prefix)));
                 }
                 push_eta(&mut label, p.eta_secs);
                 if self.activity == "reasoning"

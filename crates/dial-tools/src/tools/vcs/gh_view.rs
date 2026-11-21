@@ -1,10 +1,11 @@
 //! `repo_view` and `file_read` ops of the `github` tool.
 
-use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::atomic::AtomicBool;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use dial_core::units::human_bytes;
+use dial_llm::url::encode_uri_component;
 use serde_json::Value;
 
 use super::gh_common::*;
@@ -207,7 +208,7 @@ fn file_read(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOu
         _ => {
             let size = response["size"]
                 .as_u64()
-                .map_or_else(|| "unknown size".to_owned(), format_bytes);
+                .map_or_else(|| "unknown size".to_owned(), human_bytes);
             return Ok(ToolOutput::ok(format!(
                 "[GitHub did not return file bytes for '{path}' ({size}). Open {source_url} to view it.]"
             )));
@@ -233,7 +234,7 @@ fn file_read(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOu
             ws,
             format!(
                 "Image file: {path}\nMIME: {mime}\nSize: {}{dimensions}\n{tail}",
-                format_bytes(bytes.len() as u64)
+                human_bytes(bytes.len() as u64)
             ),
         );
         let data = (mime == "image/png").then(|| {
@@ -256,7 +257,7 @@ fn file_read(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOu
     }
     Ok(ToolOutput::ok(format!(
         "[Cannot read binary file '{path}' ({}); not valid UTF-8 text. Open {source_url} to view it.]",
-        format_bytes(bytes.len() as u64)
+        human_bytes(bytes.len() as u64)
     )))
 }
 
@@ -275,34 +276,6 @@ fn image_info(bytes: &[u8]) -> Option<(&'static str, Option<(u32, u32)>)> {
         .ok()
         .and_then(|reader| reader.into_dimensions().ok());
     Some((mime, dimensions))
-}
-
-/// Formats a byte count with human-readable units.
-fn format_bytes(size: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    let size_f = size as f64;
-    if size < 1024 {
-        format!("{size}B")
-    } else if size_f < MB {
-        format!("{:.1}KB", size_f / KB)
-    } else {
-        format!("{:.1}MB", size_f / MB)
-    }
-}
-
-/// JavaScript `encodeURIComponent`: unreserved characters pass through, everything else is
-/// percent-encoded as UTF-8 bytes.
-fn encode_uri_component(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            let _ = write!(out, "%{byte:02X}");
-        }
-    }
-    out
 }
 
 /// Trims; empty becomes absent.

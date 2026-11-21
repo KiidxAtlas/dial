@@ -4,6 +4,7 @@ pub mod output;
 pub mod platform;
 pub mod prose;
 pub mod runtime;
+pub mod units;
 pub mod workspace_copy;
 
 /// Waits (bounded) until buffered stdout has been written. Binaries call this on every exit path.

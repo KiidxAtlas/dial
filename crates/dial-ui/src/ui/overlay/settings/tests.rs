@@ -1,6 +1,29 @@
 use super::testkit::*;
 use super::*;
 use std::cell::RefCell;
+
+#[test]
+fn long_search_keeps_the_query_tail_and_caret_visible() {
+    let mut page = overlay();
+    page.search = "search far enough to reach END".into();
+    let row = page.search_line(&Rig::new().theme, 18);
+    assert!(row.to_string().ends_with("END "), "{row}");
+}
+
+#[test]
+fn compact_legend_keeps_the_filter_action_and_override_count() {
+    let rig = Rig::new();
+    let mut o = SettingsOverlay::new(table(""), table(""), table(""), Scope::Global, vec![]);
+    for (filtered, action) in [(false, "saved only"), (true, "all settings")] {
+        o.changed_only = filtered;
+        let shown = draw(&mut o, &rig, 38, 16);
+        assert!(
+            shown.contains(&format!("Ctrl+O {action} · 0 saved")),
+            "{shown}"
+        );
+    }
+}
+
 #[test]
 fn setup_plan_is_a_scrollable_review_not_setting_navigation() {
     let rig = Rig::new();
@@ -1143,6 +1166,38 @@ fn short_panels_prioritize_search_and_non_appearance_settings_have_no_preview() 
 }
 
 #[test]
+fn setup_review_footer_names_its_keys_and_offers_no_f1_sheet() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.set_setup_offers(BTreeMap::from([(
+        "voice.tts.backend".to_owned(),
+        SetupOffer {
+            id: "piper".into(),
+            title: "Piper".into(),
+            preview: "Piper: uv tool install piper-tts".into(),
+        },
+    )]));
+    goto(&mut o, &rig.keys, "voice.tts.backend");
+    send(&mut o, &rig.keys, ctrl('l'));
+    assert!(o.setup_armed.is_some());
+    let shown = draw(&mut o, &rig, 120, 30);
+    let footer = shown
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    assert!(
+        footer.contains("Enter install") && footer.contains("Esc cancel"),
+        "{shown}"
+    );
+    assert!(!footer.contains("F1"), "{shown}");
+    // The review swallows keys, F1 included: the sheet does not open and the review stays.
+    send(&mut o, &rig.keys, key(KeyCode::F(1)));
+    assert!(!o.panel_keys.open());
+    assert!(o.setup_armed.is_some());
+}
+
+#[test]
 fn compact_choice_picker_keeps_the_highlighted_option_visible() {
     let rig = Rig::new();
     let mut o = overlay();
@@ -1413,6 +1468,39 @@ fn providers_tab_opens_the_other_screens() {
         OverlayEvent::Action(a) => assert_eq!(a, "open:shortcuts"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn common_lists_allowed_commands_and_hands_off_to_the_permissions_picker() {
+    // The Common launcher is the last row of that tab; see ALLOWED_COMMANDS.
+    const ALLOWED: Row = Row::Link(ALLOWED_COMMANDS);
+    let rig = Rig::new();
+    let mut o = overlay();
+    assert_eq!(o.tabs[o.tab].0, "Common");
+    assert_eq!(
+        o.visible().last(),
+        Some(&ALLOWED),
+        "launcher closes the Common list"
+    );
+    let shown = draw(&mut o, &rig, 120, 40);
+    assert!(shown.contains("Allowed commands"), "{shown}");
+    assert_eq!(
+        o.section_of(ALLOWED),
+        "Common",
+        "launcher sits under the Common heading"
+    );
+    o.cursor = o
+        .visible()
+        .iter()
+        .position(|row| *row == ALLOWED)
+        .expect("launcher row");
+    match send(&mut o, &rig.keys, key(KeyCode::Enter)) {
+        OverlayEvent::Action(action) => assert_eq!(action, "command:/permissions"),
+        other => panic!("{other:?}"),
+    }
+    // Search finds the same launcher from the Common tab, by its label.
+    send_all(&mut o, &rig.keys, typed("allowed commands"));
+    assert!(o.visible().contains(&ALLOWED));
 }
 
 #[test]
@@ -2599,4 +2687,102 @@ fn mouse_switches_visible_category_tabs() {
     o.click(x, y);
     assert_eq!(o.tab, 1);
     assert_eq!(o.cursor, 0);
+}
+
+#[test]
+fn browse_moves_by_keymap_rows_and_pages_and_stops_at_the_ends() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.page = 3;
+    o.cursor = 0;
+    send(&mut o, &rig.keys, ctrl('n'));
+    assert_eq!(o.cursor, 1, "Ctrl+N is the default Down");
+    send(&mut o, &rig.keys, ctrl('p'));
+    assert_eq!(o.cursor, 0, "Ctrl+P is the default Up");
+    send(&mut o, &rig.keys, key(KeyCode::Up));
+    assert_eq!(o.cursor, 0, "stops at the top");
+    send(&mut o, &rig.keys, key(KeyCode::PageDown));
+    assert_eq!(o.cursor, 3, "PageDown moves a page");
+    send(&mut o, &rig.keys, key(KeyCode::End));
+    let last = o.visible().len() - 1;
+    assert_eq!(o.cursor, last);
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    assert_eq!(o.cursor, last, "stops at the bottom");
+
+    let mut remapped = Keymap::defaults();
+    remapped.rebind(Action::SelectDown, &["Ctrl+J"]).unwrap();
+    remapped
+        .rebind(Action::SelectPageDown, &["Ctrl+G"])
+        .unwrap();
+    let mut o = overlay();
+    o.page = 3;
+    o.cursor = 0;
+    send(&mut o, &remapped, ctrl('n'));
+    assert_eq!(o.cursor, 0, "the old Down no longer moves");
+    send(&mut o, &remapped, ctrl('j'));
+    assert_eq!(o.cursor, 1);
+    send(&mut o, &remapped, key(KeyCode::PageDown));
+    assert_eq!(o.cursor, 1, "the old page key no longer pages");
+    send(&mut o, &remapped, ctrl('g'));
+    assert_eq!(o.cursor, 4, "the bound page key moves a page");
+}
+
+#[test]
+fn pickers_wrap_rows_and_page_by_the_keymap() {
+    let rig = Rig::new();
+    let mut o = theme_overlay(&["dark", "light", "mono", "ember", "forest"]);
+    open_theme_picker(&mut o, &rig.keys);
+    o.page = 2;
+    let len = match &o.mode {
+        Mode::Pick { choices, .. } => choices.len(),
+        _ => panic!("picker should be open"),
+    };
+    let cursor = |o: &SettingsOverlay| match &o.mode {
+        Mode::Pick { cursor, .. } => *cursor,
+        _ => panic!("picker should be open"),
+    };
+    if let Mode::Pick { cursor, .. } = &mut o.mode {
+        *cursor = 0;
+    }
+    send(&mut o, &rig.keys, key(KeyCode::Up));
+    assert_eq!(cursor(&o), len - 1, "Up wraps to the last row");
+    send(&mut o, &rig.keys, ctrl('n'));
+    assert_eq!(cursor(&o), 0, "Ctrl+N wraps to the first row");
+    send(&mut o, &rig.keys, key(KeyCode::PageDown));
+    assert_eq!(cursor(&o), 2, "PageDown moves a page");
+    for _ in 0..len.div_ceil(o.page) {
+        send(&mut o, &rig.keys, key(KeyCode::PageDown));
+    }
+    assert_eq!(cursor(&o), len - 1, "paging stops at the last row");
+}
+
+#[test]
+fn esc_and_enter_stay_fixed_when_cancel_and_confirm_are_remapped() {
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::SelectCancel, &["Ctrl+G"]).unwrap();
+    keys.rebind(Action::SelectConfirm, &["Ctrl+Y"]).unwrap();
+    let mut o = theme_overlay(&["dark", "light"]);
+    open_theme_picker(&mut o, &keys);
+    send(&mut o, &keys, key(KeyCode::Esc));
+    assert!(matches!(o.mode, Mode::Browse), "Esc closes the picker");
+    open_theme_picker(&mut o, &keys);
+    send(&mut o, &keys, ctrl('g'));
+    assert!(
+        matches!(o.mode, Mode::Browse),
+        "the bound cancel closes it too"
+    );
+    goto(&mut o, &keys, "harness.max_steps");
+    send(&mut o, &keys, key(KeyCode::Enter));
+    assert!(
+        matches!(o.mode, Mode::Edit { .. }),
+        "Enter opens the editor"
+    );
+    send(&mut o, &keys, key(KeyCode::Esc));
+    assert!(matches!(o.mode, Mode::Browse), "Esc cancels the editor");
+    open_theme_picker(&mut o, &keys);
+    send(&mut o, &keys, ctrl('y'));
+    assert!(
+        matches!(o.mode, Mode::Browse),
+        "the bound confirm saves and closes"
+    );
 }

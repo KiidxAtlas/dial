@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
+use super::forge_policy::{OpPolicy, op_of};
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, Workspace, tool_schema};
@@ -25,6 +26,8 @@ pub(super) const READ_OPS: &[&str] = &[
     "run_watch",
     "pr_diff",
 ];
+
+const ACCESS: OpPolicy = OpPolicy::new(READ_OPS);
 
 /// Every operation the `op` field accepts.
 const OPS: &[&str] = &[
@@ -68,14 +71,6 @@ pub struct GitHub;
 /// Registry entry point: the `github` tool, gated by name through `config.integrations`.
 pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(GitHub)]
-}
-
-fn op_of(args: &Value) -> Option<&str> {
-    args["op"].as_str()
-}
-
-fn is_read_op(args: &Value) -> bool {
-    op_of(args).is_some_and(|op| READ_OPS.contains(&op))
 }
 
 /// Run one `github` call and return its output, reporting `run_watch` snapshots through `progress`.
@@ -169,7 +164,7 @@ impl Tool for GitHub {
 
     /// Only operations outside `READ_OPS` need approval; a missing or unknown op does too.
     fn needs_approval(&self, args: &Value) -> bool {
-        !is_read_op(args)
+        ACCESS.needs_approval(args)
     }
 
     /// Only `pr_checkout` changes the local checkout (it creates worktrees).
@@ -178,11 +173,7 @@ impl Tool for GitHub {
     }
 
     fn concurrency(&self, args: &Value) -> Concurrency {
-        if is_read_op(args) {
-            Concurrency::Shared
-        } else {
-            Concurrency::Exclusive
-        }
+        ACCESS.concurrency(args)
     }
 
     /// Read operations query the GitHub API and the checkout's Git metadata, never source files.
@@ -191,7 +182,7 @@ impl Tool for GitHub {
         _workspace: &Workspace,
         args: &Value,
     ) -> Option<crate::tools::surface::resources::Access> {
-        is_read_op(args).then(Default::default)
+        ACCESS.resources(args)
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {

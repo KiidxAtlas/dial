@@ -843,17 +843,21 @@ fn profile_thinking_does_not_block_host_sampling_defaults() {
     });
 }
 
-/// Hosted routes and hermetic runs keep Dial's own sampling and limits, and the local profile's
-/// master switch does not decide host defaults: a disabled profile still defers to the host.
+/// Hosted endpoints inherit ordinary controls too; hermetic runs keep reproducible settings.
 #[test]
-fn hosted_and_hermetic_routes_are_unchanged_and_disabled_profile_keeps_host_defaults() {
+fn hosted_defaults_apply_independently_of_the_local_profile() {
     with_agent(
         "[endpoint]\nbase_url='https://api.example.com/v1'",
         |agent| {
             let mut profile = None;
-            assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+            assert_eq!(
+                agent.apply_local_sampling(&mut profile, 0.2),
+                Some("hosted provider defaults")
+            );
             agent.apply_local_output_limit(&mut profile, 0);
-            assert!(profile.is_none());
+            let profile = profile.unwrap();
+            assert!(profile.inherit_output_limit);
+            assert!(!profile.capabilities.temperature);
         },
     );
     with_agent(LOCAL_HOST, |agent| {

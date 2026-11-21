@@ -289,6 +289,14 @@ pub fn identity(user_dir: &Path, id: &str) -> Option<String> {
     load(&path(user_dir, id)).ok()?.active().and_then(label)
 }
 
+/// Account and project of the active grant, read without any network request. A saved Antigravity
+/// listing is usable only while this identity still matches the one it was fetched under.
+pub fn active_listing_identity(user_dir: &Path, id: &str) -> Option<(String, String)> {
+    let grant = load(&path(user_dir, id)).ok()?;
+    let active = grant.active()?;
+    Some((active.account_id.clone()?, active.project_id.clone()?))
+}
+
 /// Enterprise host recorded at login (Copilot GitHub Enterprise), when the active grant has one.
 pub fn enterprise_url(user_dir: &Path, id: &str) -> Option<String> {
     load(&path(user_dir, id))

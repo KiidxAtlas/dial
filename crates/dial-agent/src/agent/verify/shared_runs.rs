@@ -108,11 +108,7 @@ pub(in crate::agent) fn tree_fingerprint(root: &Path, command: &str, cwd: &str) 
     Some(format!("{:x}", digest.finalize()))
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
+use crate::runtime::clock::unix_secs as now;
 
 /// Exit code from a `bg` completion label (`exited (exit code N)`); `None` for signals or errors.
 fn completion_exit_code(text: &str) -> Option<i32> {

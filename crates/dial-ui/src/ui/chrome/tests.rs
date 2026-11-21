@@ -127,7 +127,7 @@ fn state_marks_share_one_vocabulary_and_only_failure_is_an_error() {
         let want = match mark {
             StateMark::Failed => Tok::Error,
             StateMark::Running => Tok::Accent,
-            StateMark::Blocked => Tok::Warning,
+            StateMark::NeedsInput | StateMark::Blocked => Tok::Warning,
             StateMark::Done | StateMark::Answered => Tok::Success,
             _ => Tok::Muted,
         };
@@ -146,6 +146,7 @@ fn approval_modes_use_their_friendly_name_and_safety_color() {
         ("readonly", "Read-only", Tok::Success),
         ("write", "Edit freely", Tok::Accent),
         ("auto", "Full auto", Tok::Warning),
+        ("yolo", "YOLO", Tok::Error),
         ("custom", "custom", Tok::Muted),
     ] {
         let spans = approval_spans(&theme, mode);

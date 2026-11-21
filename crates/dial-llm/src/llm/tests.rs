@@ -3,6 +3,17 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::thread::JoinHandle;
 
+#[test]
+fn local_json_accepts_exact_limit_but_never_parses_a_truncated_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    assert!(read_json_within(&path, 4).is_none());
+    for (bytes, expected) in [("null", Some(Value::Null)), ("null ", None), ("nope", None)] {
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_json_within(&path, 4), expected);
+    }
+}
+
 /// Serve exactly one HTTP request with a canned response; returns the base
 /// URL and a handle yielding the raw request bytes the client sent.
 fn serve_once(status: u16, body: Vec<u8>) -> (String, JoinHandle<Vec<u8>>) {

@@ -158,3 +158,115 @@ fn help_scrolls_to_last_note_with_back_pinned_even_on_short_panels() {
     assert_eq!(tiny.len(), 1);
     assert!(tiny[0].contains("Esc"));
 }
+
+#[test]
+fn list_movement_stops_or_wraps_at_the_ends_and_pages_by_the_given_step() {
+    let keys = Keymap::defaults();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    // (key, cursor, len, page, edge, expected)
+    let cases = [
+        (KeyCode::Up, 0, 5, 2, Edge::Stop, Some(0)),
+        (KeyCode::Up, 0, 5, 2, Edge::Wrap, Some(4)),
+        (KeyCode::Down, 4, 5, 2, Edge::Stop, Some(4)),
+        (KeyCode::Down, 4, 5, 2, Edge::Wrap, Some(0)),
+        (KeyCode::PageDown, 1, 5, 2, Edge::Stop, Some(3)),
+        (KeyCode::PageDown, 4, 5, 2, Edge::Wrap, Some(4)),
+        (KeyCode::PageUp, 1, 5, 2, Edge::Wrap, Some(0)),
+        (KeyCode::Char('x'), 1, 5, 2, Edge::Wrap, None),
+        // A list with no measured page does not page.
+        (KeyCode::PageDown, 1, 5, 0, Edge::Stop, Some(1)),
+        (KeyCode::PageUp, 3, 5, 0, Edge::Wrap, Some(3)),
+    ];
+    for (code, cursor, len, page, edge, expected) in cases {
+        assert_eq!(
+            list_move(&keys, &key(code), cursor, len, page, edge),
+            expected,
+            "{code:?} at {cursor} of {len}"
+        );
+    }
+}
+
+#[test]
+fn keep_in_view_moves_the_window_only_as_far_as_the_selection_needs() {
+    // (selected, scroll, height, total, expected first row)
+    let cases = [
+        (0, 0, 4, 10, 0),
+        (5, 0, 4, 10, 2),
+        (2, 4, 4, 10, 2),
+        (9, 0, 4, 10, 6),
+        (9, 8, 4, 10, 6),
+        (1, 3, 4, 3, 0),
+    ];
+    for (selected, scroll, height, total, expected) in cases {
+        assert_eq!(
+            crate::ui::chrome::keep_in_view(selected, scroll, height, total),
+            expected,
+            "selected {selected}, scroll {scroll}, height {height}, total {total}"
+        );
+    }
+}
+
+#[test]
+fn an_unbound_key_leaves_no_footer_segment() {
+    let theme = Theme::dark();
+    assert_eq!(segment("", "move"), "");
+    assert_eq!(segment("Esc", ""), "Esc");
+    assert_eq!(segment("Enter", "open"), "Enter open");
+    let shown = plain(&[super::super::widgets::hint_line(
+        &theme,
+        &[segment("", "move"), "Esc close".to_owned()],
+        40,
+    )])
+    .concat();
+    assert!(
+        shown.contains("Esc close") && !shown.contains("move"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn help_panels_bound_their_footer_to_the_key_sheet_and_keep_the_way_out() {
+    let theme = Theme::dark();
+    let hints: Vec<String> = [
+        "Enter open",
+        "↑/↓ move",
+        "a add",
+        "k key",
+        "x remove",
+        "Esc close",
+    ]
+    .map(String::from)
+    .to_vec();
+    // (F1 handled by the panel, width, key sheet hint shown, a middle hint shown)
+    let cases = [
+        (true, 120, true, false),
+        (false, 120, false, true),
+        (true, 30, false, false),
+    ];
+    for (help, width, sheet, middle) in cases {
+        let line = if help {
+            sheet_footer(&theme, hints.clone(), width)
+        } else {
+            super::super::widgets::hint_line(&theme, &hints, width)
+        };
+        let shown = line.to_string();
+        assert!(
+            shown.contains("Esc close"),
+            "help {help} width {width}: {shown}"
+        );
+        assert_eq!(
+            shown.contains("F1 keys"),
+            sheet,
+            "help {help} width {width}: {shown}"
+        );
+        assert_eq!(
+            shown.contains("a add"),
+            middle,
+            "help {help} width {width}: {shown}"
+        );
+        assert!(
+            text::width(&shown) <= width,
+            "help {help} width {width}: {shown}"
+        );
+    }
+}

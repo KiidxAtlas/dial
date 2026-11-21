@@ -1,4 +1,4 @@
-use super::settings::{
+use super::widgets::{
     Axis, arrows, editor_spans, fit, hint_line, is_ctrl, list_row, scroll_cell, typed_char,
 };
 use crate::{

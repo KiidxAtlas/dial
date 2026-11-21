@@ -22,6 +22,7 @@ use serde_json::Value;
 use crate::config::paths::Layout;
 use crate::config::settings_store;
 use crate::storage::retention::{self, ArchiveRecord, Candidate, RetentionPolicy, Store, Verdict};
+use crate::units::human_bytes;
 
 pub const DEFAULT_COLD_ARCHIVE_AFTER_DAYS: u64 = 30;
 pub const DEFAULT_RETAIN_NEWEST_GLOBAL: usize = 20;
@@ -1110,21 +1111,6 @@ fn sweep_orphaned_projects(
 // Text rendering
 // ---------------------------------------------------------------------------------------------
 
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 pub fn render_text(report: &GcReport) -> String {
     let mode = if report.apply { "apply" } else { "dry-run" };
     let mut out = format!("dial gc ({mode}) state: {}\n", report.state_dir);
@@ -1143,7 +1129,7 @@ pub fn render_text(report: &GcReport) -> String {
             } else {
                 s.would_delete
             },
-            format_bytes(s.bytes),
+            human_bytes(s.bytes),
         ));
     }
     if let Some(b) = &report.blobs {
@@ -1161,7 +1147,7 @@ pub fn render_text(report: &GcReport) -> String {
             } else {
                 b.would_delete
             },
-            format_bytes(b.bytes),
+            human_bytes(b.bytes),
         ));
     }
     if let Some(a) = &report.archive {
@@ -1188,7 +1174,7 @@ pub fn render_text(report: &GcReport) -> String {
         out.push_str(&format!(
             "wal: {} database(s), {} in WAL{}\n",
             w.databases.len(),
-            format_bytes(w.wal_bytes),
+            human_bytes(w.wal_bytes),
             if report.apply { ", checkpointed" } else { "" },
         ));
     }
@@ -1211,7 +1197,7 @@ pub fn render_text(report: &GcReport) -> String {
                 } else {
                     p.would_delete
                 },
-                format_bytes(p.bytes),
+                human_bytes(p.bytes),
             ));
         }
     }

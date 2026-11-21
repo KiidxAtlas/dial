@@ -131,9 +131,10 @@ pub(super) fn persist_cache(
     }
     write_private(&path, &serde_json::to_vec(&cache)?)
 }
-pub(super) fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
+/// Same provider endpoint, protocol, account, headers and key source: the route a selection is
+/// sent on, independent of the model ID.
+pub(super) fn same_route(a: &ModelSelection, b: &ModelSelection) -> bool {
     a.provider == b.provider
-        && a.model == b.model
         && a.base_url == b.base_url
         && a.protocol
             .unwrap_or_else(|| ApiProtocol::builtin(&a.provider))
@@ -143,8 +144,14 @@ pub(super) fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
         && a.headers.as_deref().unwrap_or_default() == b.headers.as_deref().unwrap_or_default()
         && a.api_key_env == b.api_key_env
 }
-/// Every model in the provider listings a `/models` refresh saved, across providers. No network
-/// access; a model that was never listed (or a listing that was never refreshed) is absent.
+pub(super) fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
+    a.model == b.model && same_route(a, b)
+}
+/// Every model in the provider listings a `/models` refresh saved, across providers, plus the
+/// Antigravity listing when it belongs to the active account and project. No network access; a
+/// model that was never listed (or a listing that was never refreshed) is absent.
 pub fn saved_listing_models(user_dir: &Path) -> Vec<ModelEntry> {
-    cached(user_dir).values().flatten().cloned().collect()
+    let mut models: Vec<ModelEntry> = cached(user_dir).values().flatten().cloned().collect();
+    models.extend(super::subscription::saved_antigravity_models(user_dir));
+    models
 }

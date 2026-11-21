@@ -7,7 +7,7 @@
 //! The grant's access key is sent raw in `Authorization` (no Bearer prefix). The last week of model
 //! usage is fetched best-effort and kept as a JSON string in `metadata["model_usage"]`.
 
-use super::common::usage_status;
+use super::common::{to_number, usage_status};
 use super::types::{UsageAmount, UsageLimit, UsageReport, UsageScope, UsageUnit, UsageWindow};
 use crate::llm::oauth::{self, util};
 use anyhow::{Context, Result, bail, ensure};
@@ -211,12 +211,7 @@ fn parse_limit_item(value: &Value) -> Option<LimitItem> {
 
 /// A finite number from a JSON number or numeric string.
 fn number(value: Option<&Value>) -> Option<f64> {
-    let parsed = match value? {
-        Value::Number(number) => number.as_f64()?,
-        Value::String(text) => text.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    parsed.is_finite().then_some(parsed)
+    value.and_then(to_number)
 }
 
 /// Epoch milliseconds from a value that may be seconds or milliseconds (values above 1e12 are ms).

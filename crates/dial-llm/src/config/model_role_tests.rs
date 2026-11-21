@@ -22,6 +22,36 @@ fn resolve(text: &str) -> Result<Config> {
 }
 
 #[test]
+fn antigravity_pro_repairs_only_the_legacy_generated_effort_profile() {
+    use crate::llm::profiles::{ReasoningApi, ReasoningEffort};
+    for (name, expected) in [
+        ("reasoning_3d11abc2a71adcb1", ReasoningApi::GeminiLevel),
+        ("my_profile", ReasoningApi::OpenaiEffort),
+    ] {
+        let config = resolve(&format!(
+            r#"
+            provider = "google-antigravity"
+            model = "gemini-3.1-pro"
+            model_profile = "{name}"
+            [model_profiles.{name}]
+            provider = "google-antigravity"
+            model = "gemini-3.1-pro"
+            reasoning_effort = "low"
+            thinking = true
+            [model_profiles.{name}.capabilities]
+            reasoning = "openai-effort"
+            reasoning_efforts = ["low", "high"]
+        "#
+        ))
+        .unwrap();
+        let profile = config.active_model_profile().unwrap();
+        assert_eq!(profile.capabilities.reasoning, expected, "{name}");
+        assert_eq!(profile.reasoning_effort, Some(ReasoningEffort::Low));
+        profile.validate().unwrap();
+    }
+}
+
+#[test]
 fn legacy_role_keys_map_to_current_roles() {
     let table = migrated(
         "[model_roles.smol]\nprovider='mlx'\nmodel='small-a'\n\

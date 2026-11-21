@@ -195,7 +195,7 @@ fn extract() -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let digest = Sha256::digest(HELPER);
-    let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let tag = crate::hex(&digest[..8]);
     // SAFETY: getuid has no pointer arguments or caller preconditions and only returns the
     // calling process's real user ID; no Rust memory or process credentials are mutated.
     let uid = unsafe { libc::getuid() };

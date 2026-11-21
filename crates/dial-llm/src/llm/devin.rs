@@ -69,7 +69,7 @@ pub(super) fn exchange(
     timeout: u64,
     on_text: OnText<'_, '_>,
     interrupt: Arc<AtomicBool>,
-    _profile: Option<&ModelProfile>,
+    profile: Option<&ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     let api_key = route
@@ -81,7 +81,18 @@ pub(super) fn exchange(
     let session = cached_session(&key, || {
         authenticate(route, base, api_key, timeout, &interrupt)
     })?;
-    let result = exchange_in(route, req, timeout, on_text, interrupt, on_event, &session);
+    let result = exchange_in(
+        route,
+        req,
+        super::Limits {
+            timeout_secs: timeout,
+            interrupt,
+        },
+        on_text,
+        on_event,
+        &session,
+        profile,
+    );
     // A rejected credential may be the cached user JWT: the next attempt authenticates afresh.
     if let Err(error) = &result
         && super::errors::classify(error) == ErrorClass::Auth
@@ -94,11 +105,14 @@ pub(super) fn exchange(
 fn exchange_in(
     route: &Route<'_>,
     req: &Chat,
-    timeout: u64,
+    super::Limits {
+        timeout_secs: timeout,
+        interrupt,
+    }: super::Limits,
     on_text: OnText<'_, '_>,
-    interrupt: Arc<AtomicBool>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
     session: &Session,
+    profile: Option<&ModelProfile>,
 ) -> Result<Reply> {
     let cascade = route
         .session_id
@@ -126,8 +140,8 @@ fn exchange_in(
         session,
         &cascade,
         &scope,
-        &chat_model_uid,
-        assignment_jwt.as_deref(),
+        (&chat_model_uid, assignment_jwt.as_deref()),
+        profile,
     )?;
     let body = frame(FLAG_COMPRESSED, &gzip(&request.0)?)?;
     let url = format!("{}{CHAT_PATH}", session.base);
@@ -522,8 +536,8 @@ fn chat_request(
     session: &Session,
     cascade: &str,
     scope: &str,
-    chat_model_uid: &str,
-    assignment_jwt: Option<&str>,
+    (chat_model_uid, assignment_jwt): (&str, Option<&str>),
+    profile: Option<&ModelProfile>,
 ) -> Result<Enc> {
     let gemini = Identity::new(route_model)
         .with_uid(chat_model_uid)
@@ -539,12 +553,21 @@ fn chat_request(
     request.uint(7, REQUEST_TYPE_CASCADE);
     let mut config = Enc::default();
     config.uint(1, 1); // numCompletions
-    config.uint(2, u64::from(req.max_tokens));
+    if !profile.is_some_and(ModelProfile::inherits_output_limit) {
+        config.uint(2, u64::from(req.max_tokens));
+    }
     config.uint(3, 200); // maxNewlines
-    config.double(5, req.temperature);
-    config.double(6, req.temperature); // firstTemperature
-    config.uint(7, 50); // topK
-    config.double(8, 1.0); // topP
+    if profile.is_none_or(|p| p.capabilities.temperature) {
+        let temperature = profile
+            .and_then(|p| p.temperature)
+            .unwrap_or(req.temperature);
+        config.double(5, temperature);
+        config.double(6, temperature); // firstTemperature
+        config.uint(7, 50); // topK
+        config.double(8, profile.and_then(|p| p.top_p).unwrap_or(1.0)); // topP
+    } else if let Some(top_p) = profile.and_then(|p| p.top_p) {
+        config.double(8, top_p);
+    }
     for pattern in STOP_PATTERNS {
         config.string(9, pattern);
     }

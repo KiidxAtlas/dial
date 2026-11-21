@@ -83,6 +83,34 @@ fn projected_history_replaces_only_messages() {
 }
 
 #[test]
+fn a_wire_only_read_tool_cannot_authorize_a_history_migration() {
+    use crate::llm::tool_offer::{self, Mark};
+    let mut original = request(vec![json!({"role":"assistant", "dial_tool_contracts":{
+        "call": {"name":"artifact_read","revision":1,"schema_sha256":"legacy"}}})]);
+    tool_offer::mark(
+        &mut original.tools[0],
+        Mark {
+            callable: false,
+            deferred: false,
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let error = prepare_provider_request(
+        &original,
+        &Registry::new(),
+        &[],
+        dir.path(),
+        &AtomicBool::new(false),
+        &mut |_| panic!("projection must precede hooks"),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("read, which is unavailable"),
+        "{error}"
+    );
+}
+
+#[test]
 fn parallel_completion_reaches_the_view_before_a_slow_sibling_and_keeps_call_order() {
     use crate::tools::integrations::ext::{Concurrency, Tool};
     use std::sync::{
@@ -342,22 +370,39 @@ fn recovered_safe_reads_require_human_approval_in_the_main_owner() {
         }
         assert_eq!(view.0, 2, "recovered approval never becomes reusable");
         assert!(agent.always.is_empty());
+        agent.approval = Approval::Yolo;
+        assert!(
+            agent
+                .authorize_call_from(&call, CallProvenance::RecoveredText, &mut view)
+                .is_ok()
+        );
+        assert_eq!(
+            view.0, 2,
+            "YOLO must not prompt on an eligible recovered call"
+        );
+        assert!(agent.always.is_empty(), "YOLO must not create grants");
         agent.always.push(PermissionRule {
             effect: Effect::Deny,
             tool: "read".into(),
             command_prefix: vec![],
             paths: vec![],
         });
-        assert!(matches!(
-            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
-            Err(Denial::Rule)
-        ));
+        for mode in [Approval::Auto, Approval::Yolo] {
+            agent.approval = mode;
+            assert!(matches!(
+                agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+                Err(Denial::Rule)
+            ));
+        }
         agent.always.clear();
         agent.interrupt.store(true, Ordering::SeqCst);
-        assert!(matches!(
-            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
-            Err(Denial::User)
-        ));
+        for mode in [Approval::Auto, Approval::Yolo] {
+            agent.approval = mode;
+            assert!(matches!(
+                agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+                Err(Denial::User)
+            ));
+        }
         assert_eq!(view.0, 2, "denied and cancelled calls must not prompt");
     });
 }

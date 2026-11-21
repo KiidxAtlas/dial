@@ -6,12 +6,15 @@
 //! broadcasts each new log entry as a sequence-numbered `entry` frame. Guest `prompt`/`abort`
 //! frames are queued for the host agent, and only from writable guests while `allow_guest_steering`
 //! is on. That queue is bounded: excess prompts get an explicit `error` reply, and aborts coalesce.
+//! With `allow_guest_answers`, an open host question is sent to writable guests as a `question`
+//! frame; the first authorized `answer` (its proof binds `"<id>:<choice>"`) settles it, and
+//! `question-closed` withdraws it. Tool approvals are never offered to guests.
 use super::crypto::{
     RoomKey, WRITE_TOKEN_BYTES, generate_room_key, generate_write_token, random_bytes,
     request_proof, secrets_equal, write_proof,
 };
 use super::protocol::{
-    COLLAB_PROTO, Control, bounded_json, format_link, frame, generate_room_id,
+    COLLAB_PROTO, Control, bounded_json, clip_middle, format_link, frame, generate_room_id,
     normalize_relay_origin, snapshot_chunks,
 };
 use super::registry::{self, HostRecord};
@@ -31,6 +34,18 @@ const MAX_QUEUED_PROMPTS: usize = 8;
 const MAX_QUEUED_PROMPT_BYTES: usize = 256 * 1024;
 /// Largest single guest prompt.
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+/// Question text shown to guests; longer titles and bodies keep their head and tail.
+const QUESTION_TITLE_BYTES: usize = 256;
+const QUESTION_BODY_BYTES: usize = 16 * 1024;
+
+/// A host question currently offered to writable guests.
+struct OpenQuestion {
+    id: u64,
+    frame: Value,
+    options: usize,
+    /// The first authorized answer: option index and the answering guest's name.
+    answer: Option<(usize, String)>,
+}
 
 /// Why a guest request was not queued. The host replies to the guest with [`Refusal::message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +181,9 @@ pub struct Host {
     steering: Vec<Steer>,
     /// Local collab-directory record (user dir, record), kept current with the guest count.
     published: Option<(PathBuf, HostRecord)>,
+    allow_answers: bool,
+    question: Option<OpenQuestion>,
+    next_question: u64,
 }
 
 /// Validate a challenge-bound proof without disclosing the write token.
@@ -231,7 +249,75 @@ impl Host {
             challenges: BTreeMap::new(),
             steering: Vec::new(),
             published: None,
+            allow_answers: false,
+            question: None,
+            next_question: 0,
         })
+    }
+
+    /// Offer this host's question prompts to writable guests (`[collab].allow_guest_answers`).
+    /// A read-only room has no writable guests, so it never offers a question.
+    #[must_use]
+    pub fn with_guest_answers(mut self, allow: bool) -> Self {
+        self.allow_answers = allow;
+        self
+    }
+
+    /// Open a question for writable guests to answer. Returns its id, or `None` when guest
+    /// answers are off. The caller polls [`Self::take_answer`] and must call
+    /// [`Self::close_question`] however the prompt ends.
+    pub fn offer_question(&mut self, title: &str, body: &str, options: &[&str]) -> Option<u64> {
+        if !self.allow_answers || self.write_token.is_none() || options.is_empty() {
+            return None;
+        }
+        self.next_question += 1;
+        let id = self.next_question;
+        let frame = json!({
+            "t": "question",
+            "id": id,
+            "title": clip_middle(title, QUESTION_TITLE_BYTES),
+            "body": clip_middle(body, QUESTION_BODY_BYTES),
+            "options": options,
+        });
+        for (peer, guest) in &self.guests {
+            if guest.writable {
+                self.socket.send(&frame, *peer);
+            }
+        }
+        self.question = Some(OpenQuestion {
+            id,
+            frame,
+            options: options.len(),
+            answer: None,
+        });
+        Some(id)
+    }
+
+    /// The guest answer to question `id`, if one arrived: option index and guest name.
+    pub fn take_answer(&mut self, id: u64) -> Option<(usize, String)> {
+        self.question
+            .as_mut()
+            .filter(|question| question.id == id)?
+            .answer
+            .take()
+    }
+
+    /// Withdraw question `id` from guests, whether it was answered locally, remotely or cancelled.
+    pub fn close_question(&mut self, id: u64) {
+        if self
+            .question
+            .as_ref()
+            .is_none_or(|question| question.id != id)
+        {
+            return;
+        }
+        self.question = None;
+        let closed = json!({"t": "question-closed", "id": id});
+        for (peer, guest) in &self.guests {
+            if guest.writable {
+                self.socket.send(&closed, *peer);
+            }
+        }
     }
 
     pub(crate) fn room_id(&self) -> &str {
@@ -432,6 +518,14 @@ impl Host {
             {
                 self.steer(peer, Steer::Abort);
             }
+            Some("answer")
+                if self
+                    .guests
+                    .get_mut(&peer)
+                    .is_some_and(|guest| guest.authorize(self.write_token.as_ref(), msg)) =>
+            {
+                self.answer(peer, msg["text"].as_str().unwrap_or(""), notes);
+            }
             _ => {}
         }
     }
@@ -487,6 +581,41 @@ impl Host {
                 request_sequence: 0,
             },
         );
+        if writable
+            && let Some(question) = &self.question
+            && question.answer.is_none()
+        {
+            self.socket.send(&question.frame, peer);
+        }
+    }
+
+    /// Record the first in-range answer to the open question; refuse stale or invalid ones.
+    fn answer(&mut self, peer: u32, text: &str, notes: &mut Vec<String>) {
+        let Some(name) = self.guests.get(&peer).map(|guest| guest.name.clone()) else {
+            return;
+        };
+        let parsed = text.split_once(':').and_then(|(id, choice)| {
+            Some((id.parse::<u64>().ok()?, choice.parse::<usize>().ok()?))
+        });
+        let refusal = match (&mut self.question, parsed) {
+            _ if !self.allow_answers => Some("guest answers are disabled on this host"),
+            (Some(question), Some((id, choice)))
+                if question.id == id && question.answer.is_none() && choice < question.options =>
+            {
+                question.answer = Some((choice, name.clone()));
+                notes.push(format!("{name} answered the open question"));
+                None
+            }
+            (Some(question), Some((id, choice)))
+                if question.id == id && choice >= question.options =>
+            {
+                Some("that option does not exist")
+            }
+            _ => Some("that question is no longer open"),
+        };
+        if let Some(refusal) = refusal {
+            self.socket.send(&frame::error(refusal), peer);
+        }
     }
 
     fn steer(&mut self, peer: u32, action: Steer) {

@@ -53,3 +53,56 @@ fn newer_database_is_refused_without_mutation_including_readonly_open() {
     assert_eq!(value, "keep");
     assert_eq!(check_version(&conn, 9).unwrap(), 9);
 }
+
+#[test]
+fn private_writable_database_is_owner_only_wal_and_refuses_newer_schema() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+    let path = layout.state_dir.join("sample.sqlite3");
+    let conn = open_private_writable(&layout, "sample.sqlite3", Duration::from_secs(1), 1).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    assert!(platform_fs::is_owner_only(&std::fs::File::open(&path).unwrap()).unwrap());
+    conn.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(conn);
+    assert!(open_private_writable(&layout, "sample.sqlite3", Duration::from_secs(1), 1).is_err());
+    assert!(open_private_writable(&layout, "sample.sqlite3", Duration::from_secs(1), 2).is_ok());
+}
+
+#[test]
+fn private_writable_database_name_must_be_a_plain_file_name() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+    for name in [
+        "",
+        ".",
+        "..",
+        "../escape.sqlite3",
+        "nested/x.sqlite3",
+        "/tmp/absolute.sqlite3",
+    ] {
+        assert!(
+            open_private_writable(&layout, name, Duration::from_secs(1), 1).is_err(),
+            "{name:?} must be refused"
+        );
+    }
+    let parent = layout.state_dir.parent().unwrap();
+    assert!(!parent.join("escape.sqlite3").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_writable_database_never_follows_a_planted_link() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+    crate::platform::atomic::private_dir(&layout.state_dir).unwrap();
+    let victim = home.path().join("victim.sqlite3");
+    std::fs::write(&victim, b"").unwrap();
+    std::os::unix::fs::symlink(&victim, layout.state_dir.join("sample.sqlite3")).unwrap();
+    assert!(open_private_writable(&layout, "sample.sqlite3", Duration::from_secs(1), 1).is_err());
+}

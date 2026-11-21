@@ -76,6 +76,30 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
 }
 
 #[test]
+fn viewer_links_default_to_the_relay_page_and_round_trip_through_the_fragment() {
+    let id = "AAAAAAAAAAAAAAAAAAAAAA";
+    let full = format_link(
+        "wss://relay.example.com",
+        id,
+        &[5; 32],
+        &[6; 32],
+        Some(&[9; 16]),
+    )
+    .unwrap();
+    let page = viewer_link("", "wss://relay.example.com", &full).unwrap();
+    assert_eq!(page, format!("https://relay.example.com/#{full}"));
+    assert_eq!(
+        parse_link(&page, "").unwrap(),
+        parse_link(&full, "").unwrap()
+    );
+    let local = viewer_link("", "ws://127.0.0.1:7466", "x").unwrap();
+    assert_eq!(local, "http://127.0.0.1:7466/#x");
+    let hosted = viewer_link("https://view.example/#old", "wss://relay.example.com", "x").unwrap();
+    assert_eq!(hosted, "https://view.example/#x");
+    assert!(viewer_link("http://view.example/", "wss://relay.example.com", "x").is_err());
+}
+
+#[test]
 fn links_refuse_insecure_remote_and_malformed_keys() {
     let key = [1u8; 32];
     assert!(

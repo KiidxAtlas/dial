@@ -1175,10 +1175,7 @@ fn output_integrity(
     tail: Option<usize>,
 ) -> OutputIntegrity {
     let body = tail.map_or(body, |lines| last_lines(body, lines));
-    let mut cut = body.len().saturating_sub(MAX_OUTPUT);
-    while !body.is_char_boundary(cut) {
-        cut += 1;
-    }
+    let cut = body.ceil_char_boundary(body.len().saturating_sub(MAX_OUTPUT));
     let presented = (body.len() - cut) as u64;
     let ring = lock(&snap.ring);
     let retained = if ring.artifact.is_some() {
@@ -1303,10 +1300,7 @@ fn render_body(snap: &Snapshot, mut body: String, lost: u64, tail: Option<usize>
     }
     let mut omitted = lost;
     if body.len() > MAX_OUTPUT {
-        let mut cut = body.len() - MAX_OUTPUT;
-        while !body.is_char_boundary(cut) {
-            cut += 1;
-        }
+        let cut = body.ceil_char_boundary(body.len() - MAX_OUTPUT);
         omitted += cut as u64;
         body.drain(..cut);
     }

@@ -349,8 +349,7 @@ impl GitOverlay {
                 return;
             }
         }
-        let plural = if picks.len() == 1 { "" } else { "s" };
-        let message = format!("{verb} {} line{plural}", picks.len());
+        let message = format!("{verb} {}", crate::ui::text::counted(picks.len(), "line"));
         self.start_mutation(move |repo| {
             repo.apply_lines(&doc, hunk, &picks, reverse, cached)
                 .ok_or_else(|| "Selection contains no changes".to_owned())??;

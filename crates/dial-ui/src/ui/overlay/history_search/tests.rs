@@ -61,6 +61,37 @@ fn preview_displays_stable_identity_and_context_at_bounded_sizes() {
 }
 
 #[test]
+fn compact_audit_history_page_keys_do_not_skip_wrapped_rows_after_resize() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let words: Vec<_> = (0..60).map(|i| format!("paragraph-line-{i:05}")).collect();
+    let mut item = hit("one", "first");
+    item.preview = words.join(" ");
+    let mut panel = HistorySearchOverlay::new("needle".into(), vec![item], false);
+    for height in [10, 16] {
+        let first = screen(&render(38, height, |f| panel.draw(f, &ctx)));
+        let count = words
+            .iter()
+            .take_while(|w| first.contains(w.as_str()))
+            .count();
+        assert!(count > 0 && count < words.len());
+        panel.handle(&key(KeyCode::PageDown), &rig.keys);
+        let next = screen(&render(38, height, |f| panel.draw(f, &ctx)));
+        assert!(
+            !next.contains(&words[count - 1]) && next.contains(&words[count]),
+            "{next}"
+        );
+        panel.handle(&key(KeyCode::PageUp), &rig.keys);
+        assert_eq!(screen(&render(38, height, |f| panel.draw(f, &ctx))), first);
+    }
+}
+
+#[test]
 fn narrow_history_keeps_open_close_and_return_controls_visible() {
     let rig = Rig::new();
     let ctx = DrawCtx {

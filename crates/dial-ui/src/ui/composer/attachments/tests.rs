@@ -21,6 +21,23 @@ fn ready() -> Composer {
 }
 
 #[test]
+fn compact_attachment_preview_prioritizes_nonzero_problems_before_estimates() {
+    for (truncated, skipped, expected) in [
+        (1, 1, "1 skipped, 1 truncated, 1 included"),
+        (1, 0, "1 truncated, 1 included"),
+        (0, 1, "1 skipped, 1 included"),
+        (0, 0, "Attachments: 1 included"),
+    ] {
+        let summary = format!(
+            "{} · estimated 2400 tokens",
+            count_summary(1, truncated, skipped)
+        );
+        let visible = crate::ui::text::ellipsize(&summary, 38, true);
+        assert!(visible.starts_with(expected), "{visible}");
+    }
+}
+
+#[test]
 fn material_issues_preserve_draft_for_every_send_route() {
     let routes: [fn(&mut Composer) -> ComposerEvent; 3] = [
         Composer::submit,

@@ -11,9 +11,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import runtime_payload
+
 spec = importlib.util.spec_from_file_location("prepare_python", Path(__file__).with_name("prepare-python.py"))
 prep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prep)
+
 TARGET = "aarch64-unknown-linux-gnu"
 VERSION = "3.13.18"
 BINARY = "bin/python3.13"
@@ -53,7 +56,8 @@ class PythonPayloadTests(unittest.TestCase):
 
     def test_offline_regular_files_metadata_and_licenses(self):
         for windows in (True, False):
-            with self.subTest(windows=windows), patch.object(prep, "download", side_effect=AssertionError("network")):
+            with self.subTest(windows=windows), \
+                    patch.object(runtime_payload, "download", side_effect=AssertionError("network")):
                 target = self.fixture(windows=windows)
                 output = self.root / target
                 prep.prepare(target, output, self.archive, self.manifest)

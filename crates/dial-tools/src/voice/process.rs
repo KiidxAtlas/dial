@@ -47,43 +47,9 @@ impl CommandSpec {
 
 /// Resolve a program name on `PATH`; a name with a separator must name an executable file.
 pub fn which(program: &Path) -> Option<PathBuf> {
-    if program.as_os_str().is_empty() {
-        return None;
-    }
-    if program.components().count() > 1 {
-        return executable_candidate(program);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .filter_map(|dir| executable_candidate(&dir.join(program)))
-        .next()
+    crate::platform::fs::find_program(program, std::env::var_os("PATH").as_deref())
 }
 
-fn executable_candidate(path: &Path) -> Option<PathBuf> {
-    if executable(path) {
-        return Some(path.to_path_buf());
-    }
-    #[cfg(windows)]
-    if path.extension().is_none() {
-        let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.COM;.BAT;.CMD".into());
-        for extension in extensions
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-        {
-            let candidate = path.with_extension(extension.trim_start_matches('.'));
-            if executable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn executable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && crate::platform::fs::is_executable(path)
-}
-/// Captured result of [`run`].
 pub struct Finished {
     pub stdout: Vec<u8>,
     pub stderr: String,

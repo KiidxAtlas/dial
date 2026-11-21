@@ -44,9 +44,6 @@ pub fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(max);
     format!("{} [truncated]", &text[..end])
 }

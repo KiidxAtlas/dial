@@ -189,10 +189,7 @@ pub(super) fn clip_with_hint(ws: &Workspace, text: String, hint: &str) -> String
     if text.len() <= MAX_OUTPUT {
         return text;
     }
-    let end = (0..=MAX_OUTPUT)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
+    let end = text.floor_char_boundary(MAX_OUTPUT);
     let full = match ws.artifacts().map(|store| store.retain(&text)) {
         Some(Ok(uri)) => format!("full output ({} bytes): {uri}", text.len()),
         Some(Err(error)) => format!("full output could not be retained: {error:#}"),

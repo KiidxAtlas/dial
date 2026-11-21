@@ -111,7 +111,7 @@ fn file_read_reports_binary_content_without_dumping_it() {
     .unwrap();
     assert_eq!(
         out.text,
-        "[Cannot read binary file 'bin.dat' (3B); not valid UTF-8 text. Open https://github.com/acme/widgets/blob/HEAD/bin.dat to view it.]"
+        "[Cannot read binary file 'bin.dat' (3 B); not valid UTF-8 text. Open https://github.com/acme/widgets/blob/HEAD/bin.dat to view it.]"
     );
 }
 
@@ -149,7 +149,7 @@ fn file_read_explains_missing_bytes() {
     .unwrap();
     assert_eq!(
         out.text,
-        "[GitHub did not return file bytes for 'big.bin' (1.9MB). Open https://github.com/acme/widgets/blob/HEAD/big.bin to view it.]"
+        "[GitHub did not return file bytes for 'big.bin' (1.9 MiB). Open https://github.com/acme/widgets/blob/HEAD/big.bin to view it.]"
     );
 }
 
@@ -201,12 +201,4 @@ fn encode_uri_component_matches_javascript() {
     assert_eq!(encode_uri_component("a b.txt"), "a%20b.txt");
     assert_eq!(encode_uri_component("x_y-z!~*'()"), "x_y-z!~*'()");
     assert_eq!(encode_uri_component("é"), "%C3%A9");
-}
-
-#[test]
-fn format_bytes_units() {
-    assert_eq!(format_bytes(0), "0B");
-    assert_eq!(format_bytes(1023), "1023B");
-    assert_eq!(format_bytes(1536), "1.5KB");
-    assert_eq!(format_bytes(2_000_000), "1.9MB");
 }

@@ -1,0 +1,7 @@
+body { font: 15px system-ui; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #101318; color: #e5e7eb; }
+header { position: sticky; top: 0; background: inherit; padding-bottom: 1rem; border-bottom: 1px solid #394150; }
+h1 { margin: 0 0 .5rem; }
+[role="status"] { color: #9ca3af; }
+[role="status"].error { color: #fca5a5; }
+article, pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #1b2029; padding: 1rem; margin: .5rem 0; border-radius: 6px; }
+article { border-left: 3px solid #5376b8; }

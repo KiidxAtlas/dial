@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
     lora_support(mlx_architectures(user_dir).as_deref(), model)
 }
+/// Inkling-2-Mini's vision processor ships in MLX-LM rather than MLX-VLM.
+/// Select the server from checkpoint metadata, independently of image-input capability.
+pub(crate) fn uses_mlx_vlm(model: &Path) -> bool {
+    read_json(&model.join("config.json")).is_some_and(|config| {
+        config["model_type"] != "inkling2_loop" && metadata(&config).vision == Some(true)
+    })
+}
+
 /// Read local capabilities without importing Python or loading model weights. GGUF models are read
 /// from their header (chat template) and a sibling `mmproj` projector, which `llama-server` loads.
 pub fn local_model_metadata(model: &Path) -> ModelMetadata {
@@ -111,11 +119,8 @@ pub(crate) fn chat_template(model: &Path) -> Option<String> {
         })
         .or_else(|| {
             let file = fs::File::open(model.join("chat_template.jinja")).ok()?;
-            let mut template = String::new();
-            file.take(MAX_RESPONSE + 1)
-                .read_to_string(&mut template)
-                .ok()?;
-            (template.len() as u64 <= MAX_RESPONSE).then_some(template)
+            let bytes = crate::llm::read_within(file, MAX_RESPONSE)?;
+            String::from_utf8(bytes).ok()
         })
 }
 /// Tool and reasoning support declared by a chat template. These are template declarations, not
@@ -221,16 +226,7 @@ pub(super) fn annotate_embedding_checkpoints(models: &mut [ModelEntry]) {
     }
 }
 pub(crate) fn read_json(path: &Path) -> Option<Value> {
-    let file = fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_RESPONSE {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RESPONSE + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_RESPONSE {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
+    crate::llm::read_json_within(path, MAX_RESPONSE)
 }
 /// A diffusion component layout is evidence of image weights, not of a serving transport.
 /// Krea stores its transformer at the root; FLUX conversions can omit a root config entirely.

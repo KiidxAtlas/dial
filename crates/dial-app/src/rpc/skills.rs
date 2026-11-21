@@ -4,7 +4,7 @@
 //! `storage::skills::management::command`, on a worker thread, one at a time. Each typed field
 //! becomes one argument word for that owner; no shell line is parsed. Changes that write files,
 //! download a package or remove or disable something need `confirm: true`, as `extension_action`.
-use super::{Sender, coded};
+use super::{Sender, check_keys, coded};
 use crate::config::paths::Layout;
 use crate::storage::skills::management;
 use anyhow::Result;
@@ -166,21 +166,7 @@ fn confirm_gate(change: &Change, params: &Value) -> Result<()> {
 
 /// The owner words and confirmation rule for one `skill_action`.
 fn change_request(params: &Value) -> Result<Change> {
-    let Some(fields) = params.as_object() else {
-        return Err(coded(
-            ErrorCode::InvalidParams,
-            "skill_action requires params",
-        ));
-    };
-    if let Some(unknown) = fields
-        .keys()
-        .find(|key| !ACTION_KEYS.contains(&key.as_str()))
-    {
-        return Err(coded(
-            ErrorCode::InvalidParams,
-            format!("skill_action does not accept params.{unknown}"),
-        ));
-    }
+    check_keys(params, ACTION_KEYS, "skill_action")?;
     let action = string_field(params, "action")?.ok_or_else(|| {
         coded(
             ErrorCode::InvalidParams,

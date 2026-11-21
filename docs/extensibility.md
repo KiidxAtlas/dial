@@ -118,7 +118,19 @@ Repository files are never read as configuration. Settings come from the user's 
 
 ## Plan mode
 
-Plans are stored locally under Dial's state directory and exposed as `local://` artifacts. Plan mode uses the launch-only `--plan <model>` override, otherwise an explicitly assigned `coach` model, otherwise main, and restores the model in force before plan mode when leaving it. An approved plan is supplied as context when handing work to subagents.
+Each approved plan is saved privately under Dial's state directory (`plans/<session>/<title>.md`), and the implementation turn is told that path. Plan mode uses the launch-only `--plan <model>` override, otherwise an explicitly assigned `coach` model, otherwise main, and restores the model in force before plan mode when leaving it. An approved plan is supplied as context when handing work to subagents.
+
+The most recently approved plan is also recorded in session control state and carried word for word in compaction's exact carry, so a long implementation keeps the approved steps rather than a summary's paraphrase. Plans larger than 16 KiB carry their first 16 KiB, marked truncated, with the path of the full file.
+
+To keep plans with the project, enable `plan.autosave`:
+
+```toml
+[plan]
+autosave = true
+autosave_dir = ""   # empty: .dial/plans in the workspace; relative paths stay inside it; absolute paths are used as given
+```
+
+Each approval then also writes `<title>-plan.md` there. An existing file is never replaced: a taken name becomes `<title>-plan-2.md`, and so on, using an exclusive create so concurrent sessions cannot overwrite each other. A failed autosave is reported and does not block the approval.
 
 ## Durable tool contracts
 
@@ -194,6 +206,8 @@ write custom tools and lifecycle hooks as decorated Python functions in one file
 runtime: a plugin compiles to ordinary `[tools.<name>]` and `[[hooks]]` entries, so everything in
 [Custom tools](#custom-tools) and the hooks section below applies unchanged, including trust (plugins run
 unsandboxed with your privileges), timeouts, approval and `pre_tool_use` gating.
+Registration rejects non-integer or out-of-range `timeout_secs` before emitting TOML (tools: 0–3600,
+hooks: 0–600; zero means no timeout). The engine still validates generated configuration.
 
 - `@plugin.tool` turns a function into a tool. Its parameters become the JSON Schema `parameters`
   (`str`, `int`, `float`, `bool`, `List[T]`, `Dict`, `Optional[T]`, `Literal[...]`;

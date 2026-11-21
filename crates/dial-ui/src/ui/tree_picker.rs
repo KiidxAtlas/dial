@@ -10,7 +10,10 @@ use ratatui::{
 use super::{
     Rows, chrome,
     keys::{Action as Key, Keymap},
-    overlay::settings::scroll_cell,
+    overlay::{
+        panel_keys::{Edge, PanelKeys, label_or, list_move},
+        widgets::scroll_cell,
+    },
     text,
     theme::{Sym, Theme, Tok},
 };
@@ -33,7 +36,7 @@ pub struct Picker {
     /// List movement, confirm and cancel follow the user's keymap.
     keys: Keymap,
     /// F1 shows the key sheet instead of the list.
-    help: bool,
+    help: PanelKeys,
 }
 
 /// The conversation to the selected node, rendered by the transcript the main view uses at the
@@ -62,7 +65,7 @@ impl Picker {
             found: Vec::new(),
             selected: 0,
             keys: Keymap::defaults(),
-            help: false,
+            help: PanelKeys::default(),
         };
         picker.refilter();
         picker.selected = picker
@@ -195,20 +198,13 @@ impl Picker {
     }
 
     pub fn handle(&mut self, event: &Event, height: usize) -> Action {
+        if self.help.handle_key(event, true) {
+            return Action::None;
+        }
         let page = Self::layout(height).0;
         let last = self.found.len().saturating_sub(1);
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                // F1 toggles the key sheet; while it shows, Esc or Enter closes it too.
-                if key.code == KeyCode::F(1)
-                    || (self.help && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
-                {
-                    self.help = !self.help;
-                    return Action::None;
-                }
-                if self.help {
-                    return Action::None;
-                }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 // Ctrl+arrows step by turn or to the parent before the keymap's plain moves.
                 match key.code {
@@ -235,20 +231,10 @@ impl Picker {
                     self.refilter();
                     return Action::None;
                 }
-                if keys.matches(Key::SelectUp, key) {
-                    self.selected = self.selected.saturating_sub(1);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectDown, key) {
-                    self.selected = (self.selected + 1).min(last);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectPageUp, key) {
-                    self.selected = self.selected.saturating_sub(page);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectPageDown, key) {
-                    self.selected = (self.selected + page).min(last);
+                if let Some(next) =
+                    list_move(keys, key, self.selected, self.found.len(), page, Edge::Stop)
+                {
+                    self.selected = next;
                     return Action::None;
                 }
                 if keys.matches(Key::SelectConfirm, key) || key.code == KeyCode::Enter {
@@ -289,55 +275,28 @@ impl Picker {
     /// Renders the picker. `preview` is the conversation to the selected node, already rendered
     /// by the caller at [`Picker::preview_width`]; the picker only lays it out.
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme, preview: &Preview) -> Rows {
-        if self.help && height >= 5 && cols >= 12 {
-            let groups = [crate::ui::overlay::panel_keys::SheetGroup {
-                title: "Keys",
-                rows: vec![
-                    (
-                        "Up/Down".into(),
-                        "move (the list keys follow your keymap)".into(),
-                    ),
-                    ("PgUp/PgDn".into(), "move a page".into()),
+        if let Some(rows) = self.help.picker_sheet(
+            theme,
+            &self.keys,
+            (cols, height),
+            "Session tree",
+            "Resize to browse the tree · Esc cancel",
+            || {
+                vec![
                     (
                         "Left/Right".into(),
                         "other branch from the same message".into(),
                     ),
                     ("Ctrl+Up/Down".into(), "previous or next turn".into()),
                     ("Ctrl+Left".into(), "parent message".into()),
-                    ("Enter".into(), "move the conversation here".into()),
-                    ("Ctrl+U".into(), "clear the search".into()),
-                    ("F1".into(), "show or hide these keys".into()),
-                    ("Esc".into(), "clear the search, then close".into()),
-                ],
-            }];
-            let sheet = crate::ui::overlay::panel_keys::sheet(
-                theme,
-                &groups,
-                "",
-                "F1/Esc",
-                cols.saturating_sub(4),
-            );
-            return chrome::framed_lines(
-                theme,
-                chrome::Section::Dial,
-                "Session tree · keys",
-                "",
-                sheet,
-                cols,
-            );
-        }
-        if height == 0 || cols == 0 {
-            return Vec::new();
-        }
-        if height < 5 || cols < 12 {
-            return vec![Line::from(Span::styled(
-                text::ellipsize(
-                    "Resize to browse the tree · Esc cancel",
-                    cols,
-                    theme.ascii(),
-                ),
-                theme.fg(Tok::Muted),
-            ))];
+                    (
+                        label_or(&self.keys, Key::SelectConfirm, "Enter"),
+                        "move the conversation here".into(),
+                    ),
+                ]
+            },
+        ) {
+            return rows;
         }
         let width = cols.saturating_sub(4);
         let (list_rows, context_rows) = Self::layout(height);
@@ -414,19 +373,16 @@ impl Picker {
         } else {
             format!("{}/{}", self.selected + 1, self.found.len())
         };
+        let confirm = label_or(&self.keys, Key::SelectConfirm, "Enter");
         let hints = [
             (arrows, "move"),
             (sides, "branch"),
-            ("Enter", "go here"),
+            (confirm.as_str(), "go here"),
             ("F1", "keys"),
             ("Esc", esc),
         ];
         body.push(chrome::hint_line_after(theme, &position, &hints, width));
-        let extra = format!(
-            "{} node{}",
-            self.nodes.len(),
-            if self.nodes.len() == 1 { "" } else { "s" }
-        );
+        let extra = super::text::counted(self.nodes.len(), "node");
         chrome::framed_lines(
             theme,
             chrome::Section::Dial,
@@ -443,8 +399,8 @@ impl Picker {
             "No node selected".to_owned()
         } else {
             format!(
-                "Conversation to here · {messages} message{}",
-                if messages == 1 { "" } else { "s" }
+                "Conversation to here · {}",
+                super::text::counted(messages, "message")
             )
         };
         if let Some((at, total)) = self.sibling_slot().filter(|&(_, total)| total > 1) {

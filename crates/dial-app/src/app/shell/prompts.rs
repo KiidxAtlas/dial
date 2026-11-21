@@ -139,21 +139,7 @@ impl Shell {
             .background_control
             .as_ref()
             .and_then(|control| control.jobs_view(None))
-            .map(|view| {
-                view.jobs
-                    .into_iter()
-                    .map(|job| crate::ui::overlay::jobs::JobRow {
-                        name: job.name,
-                        command: job.command,
-                        status: job.status,
-                        process_outcome: job.process_outcome,
-                        running: job.running,
-                        stop_requested: job.stop_requested,
-                        terminal: job.terminal,
-                        mode: "session".into(),
-                    })
-                    .collect::<Vec<_>>()
-            });
+            .map(|view| crate::app::overlay::job_rows(view.jobs));
         let failure = self
             .model_downloads
             .as_ref()
@@ -347,7 +333,17 @@ impl Shell {
         }
         // The terminal tab shows that Dial waits for an answer while the panel is up.
         let was_waiting = self.awaiting_user.replace(prompt);
-        let answer = self.ask_loop(title, body, options, cancel, selected);
+        // Writable collab guests may answer questions when the host allows it; approvals never.
+        let remote = if prompt == Prompt::Question {
+            let labels: Vec<&str> = options.iter().map(|(label, _)| *label).collect();
+            crate::collab::room::offer_question(title, body, &labels)
+        } else {
+            None
+        };
+        let answer = self.ask_loop(title, body, options, cancel, selected, remote);
+        if let Some(id) = remote {
+            crate::collab::room::close_question(id);
+        }
         self.awaiting_user = was_waiting;
         answer
     }
@@ -359,6 +355,7 @@ impl Shell {
         options: &[(&str, char)],
         cancel: Option<&std::sync::atomic::AtomicBool>,
         selected: usize,
+        remote: Option<u64>,
     ) -> Option<usize> {
         let mut body_offset = 0usize;
         let mut selected = selected.min(options.len().saturating_sub(1));
@@ -413,6 +410,24 @@ impl Shell {
             }
             guard.painted(Instant::now());
             if !poll(TICK).ok()? {
+                if let Some(id) = remote {
+                    let (answer, notices) = crate::collab::room::take_question_answer(id);
+                    for notice in notices {
+                        self.notify(
+                            crate::ui::overlay::inbox::Category::General,
+                            "Collab",
+                            notice,
+                        );
+                    }
+                    if let Some((index, guest)) = answer.filter(|(index, _)| *index < options.len())
+                    {
+                        self.note(
+                            "Collab",
+                            format!("{guest} answered “{}”: {}", title, options[index].0),
+                        );
+                        return Some(index);
+                    }
+                }
                 continue;
             }
             match read() {

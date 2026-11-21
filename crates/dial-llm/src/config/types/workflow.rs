@@ -47,6 +47,17 @@ pub struct WorktreeConfig {
     pub clean_source: bool,
 }
 
+/// `[plan]`: what happens to an approved plan besides starting implementation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlanConfig {
+    /// Copy each approved plan into the project as `<title>-plan.md`, never overwriting a file.
+    pub autosave: bool,
+    /// Autosave directory: empty is `.dial/plans` in the workspace; relative paths are
+    /// workspace-relative and may not contain `..`; absolute paths are used as given.
+    pub autosave_dir: String,
+}
+
 /// `[commit]`: persistent reply cache for `/commit` and `dial commit`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

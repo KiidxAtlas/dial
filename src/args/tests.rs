@@ -33,6 +33,46 @@ fn approval_choices_and_aliases_are_accepted_by_the_cli() {
 }
 
 #[test]
+fn yolo_is_explicit_and_the_legacy_yolo_spellings_keep_full_auto() {
+    let approval_of = |argv: &[&str]| {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        crate::overlay::overlay(&cli).map(|table| {
+            table
+                .get("approval")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+    };
+    assert_eq!(
+        approval_of(&["dial", "--approval", "yolo"])
+            .unwrap()
+            .as_deref(),
+        Some("yolo")
+    );
+    for argv in [
+        &["dial", "-y"][..],
+        &["dial", "--yolo"],
+        &["dial", "--auto-approve"],
+        &["dial", "--approval-mode", "yolo"],
+    ] {
+        assert_eq!(
+            approval_of(argv).unwrap().as_deref(),
+            Some("auto"),
+            "{argv:?}"
+        );
+    }
+    // Case and typos never elevate: clap refuses them before any mode is applied.
+    for argv in [
+        &["dial", "--approval", "YOLO"][..],
+        &["dial", "--approval", "yol"],
+    ] {
+        assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+    }
+    // Two approval spellings at once stay refused rather than picking one silently.
+    assert!(approval_of(&["dial", "--approval", "yolo", "--approval-mode", "yolo"]).is_err());
+}
+
+#[test]
 fn schedule_cli_accepts_comma_and_repeated_allow_lists() {
     let cli = Cli::try_parse_from([
         "dial",

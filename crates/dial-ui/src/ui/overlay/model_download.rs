@@ -9,7 +9,7 @@
 //! [`Step`] for the panel to turn into the same assignment or setup event as `/models`.
 //! Ctrl+D on an installed model returns [`Step::Delete`]; the models panel asks to confirm and then
 //! calls [`ModelDownloads::delete`], which refuses models the configuration selects.
-use super::settings::{filled, fit, hint, list_row, pair_label, typed_char};
+use super::widgets::{filled, fit, hint, list_row, pair_label, typed_char};
 use crate::config::paths::Layout;
 use crate::llm::catalog::{LocalRemoval, ModelEntry};
 use crate::llm::download::{self, Choice, Family, Hit, Quant, image::Original};
@@ -24,6 +24,7 @@ use crate::ui::{
     theme::{Theme, Tok},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dial_core::units::human_bytes;
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -1343,21 +1344,34 @@ impl ModelDownloads {
             return;
         };
         let query = self.query.trim().to_owned();
+        let images = self.shelf == Shelf::Images;
+        let status = format!("loading {} catalog from Hugging Face…", family.label());
+        self.spawn_search(status, move || {
+            if images {
+                download::image::search(&query)
+            } else {
+                download::search(family, &query)
+            }
+        });
+    }
+
+    /// Runs one catalog search on a worker thread and makes its result the pending one, while
+    /// `status` shows. Every Hugging Face browse and search starts here. Network only; no weights
+    /// are fetched.
+    fn spawn_search<E: std::fmt::Display>(
+        &mut self,
+        status: String,
+        search: impl FnOnce() -> Result<Vec<Hit>, E> + Send + 'static,
+    ) {
         self.browse_attempted = true;
         self.metadata = None;
         self.metadata_attempted.clear();
         let (tx, rx) = mpsc::channel();
-        let images = self.shelf == Shelf::Images;
         std::thread::spawn(move || {
-            let result = if images {
-                download::image::search(&query)
-            } else {
-                download::search(family, &query)
-            };
-            let _ = tx.send(result.map_err(|error| format!("{error:#}")));
+            let _ = tx.send(search().map_err(|error| format!("{error:#}")));
         });
         self.search = Some(rx);
-        self.status = format!("loading {} catalog from Hugging Face…", family.label());
+        self.status = status;
     }
 
     /// Starts a Hugging Face search for embedding models (pipeline tag `feature-extraction`).
@@ -1365,16 +1379,10 @@ impl ModelDownloads {
     /// what `llama-server` serves. Network only; no weights are fetched here.
     fn start_embedding_search(&mut self) {
         let query = self.query.trim().to_owned();
-        self.browse_attempted = true;
-        self.metadata = None;
-        self.metadata_attempted.clear();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ =
-                tx.send(download::search_embedding(&query).map_err(|error| format!("{error:#}")));
-        });
-        self.search = Some(rx);
-        self.status = "loading embedding models from Hugging Face…".into();
+        self.spawn_search(
+            "loading embedding models from Hugging Face…".into(),
+            move || download::search_embedding(&query),
+        );
     }
 
     /// Runs the embedding search for the current query. Empty query browses popular embedders; a
@@ -1987,9 +1995,9 @@ fn quant_line(quant: &Quant, theme: &Theme, width: usize, selected: bool) -> Lin
         theme,
         vec![Span::styled(
             format!(
-                " {label} {:>9}  {files} file{}",
+                " {label} {:>9}  {}",
                 human_bytes(quant.bytes),
-                if files == 1 { "" } else { "s" }
+                text::counted(files, "file")
             ),
             theme.fg(Tok::Text),
         )],
@@ -2016,22 +2024,6 @@ fn same_model(listed: &str, downloaded: &str) -> bool {
 /// The canonical form of `path`, or `path` itself when it does not resolve (a hosted model id).
 fn canonical_path(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
-}
-
-/// `1.5 GiB`, `312 MiB`, `8 KiB` or `12 B`.
-pub(super) fn human_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.0} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.0} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Hugging Face counts as `1.2M`, `34.5k` or `812`; unknown counts show as `n/a`.

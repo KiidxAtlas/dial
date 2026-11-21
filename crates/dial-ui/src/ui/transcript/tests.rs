@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::testkit::plain;
 use crate::ui::theme::Glyphs;
 use ratatui::style::Modifier;
 #[test]
@@ -440,17 +441,6 @@ impl Env {
             expand_key: "Ctrl+O",
         }
     }
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect()
 }
 
 fn text_of(rows: &Rows) -> String {

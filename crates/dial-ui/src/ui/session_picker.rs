@@ -11,7 +11,10 @@ use ratatui::{
 use super::{
     Rows, chrome,
     keys::{Action as Key, Keymap},
-    overlay::settings::scroll_cell,
+    overlay::{
+        panel_keys::{Edge, label_or, list_move},
+        widgets::scroll_cell,
+    },
     text,
     theme::{Sym, Theme, Tok},
 };
@@ -353,20 +356,10 @@ impl Picker {
                     self.refilter_keeping_selection();
                     return Action::None;
                 }
-                if keys.matches(Key::SelectUp, key) {
-                    self.selected = self.selected.saturating_sub(1);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectDown, key) {
-                    self.selected = (self.selected + 1).min(last);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectPageUp, key) {
-                    self.selected = self.selected.saturating_sub(page);
-                    return Action::None;
-                }
-                if keys.matches(Key::SelectPageDown, key) {
-                    self.selected = (self.selected + page).min(last);
+                if let Some(next) =
+                    list_move(keys, key, self.selected, self.found.len(), page, Edge::Stop)
+                {
+                    self.selected = next;
                     return Action::None;
                 }
                 if keys.matches(Key::SelectConfirm, key) || key.code == KeyCode::Enter {
@@ -519,16 +512,18 @@ impl Picker {
     }
 
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme) -> Rows {
-        if self.help.open() && height >= 5 && cols >= 12 {
-            let groups = [crate::ui::overlay::panel_keys::SheetGroup {
-                title: "Keys",
-                rows: vec![
+        if let Some(rows) = self.help.picker_sheet(
+            theme,
+            &self.keys,
+            (cols, height),
+            "Resume",
+            "Resize to browse sessions · Esc cancel",
+            || {
+                vec![
                     (
-                        "Up/Down".into(),
-                        "move (the list keys follow your keymap)".into(),
+                        label_or(&self.keys, Key::SelectConfirm, "Enter"),
+                        "resume the session".into(),
                     ),
-                    ("PgUp/PgDn".into(), "move a page".into()),
-                    ("Enter".into(), "resume the session".into()),
                     ("Ctrl+B".into(), "pin or unpin".into()),
                     ("Ctrl+R".into(), "rename".into()),
                     ("Ctrl+F".into(), "fork".into()),
@@ -537,45 +532,10 @@ impl Picker {
                     ("Ctrl+A".into(), "load every session".into()),
                     ("Tab".into(), "show or hide empty sessions".into()),
                     ("Ctrl+T".into(), "browse this session".into()),
-                    ("Ctrl+U".into(), "clear the search".into()),
-                    ("F1".into(), "show or hide these keys".into()),
-                    ("Esc".into(), "clear the search, then close".into()),
-                ],
-            }];
-            let sheet = crate::ui::overlay::panel_keys::sheet(
-                theme,
-                &groups,
-                "",
-                "F1/Esc",
-                cols.saturating_sub(4),
-            );
-            let sheet = self.help.viewport(
-                sheet,
-                cols.saturating_sub(4),
-                height.saturating_sub(2),
-                theme,
-            );
-            return chrome::framed_lines(
-                theme,
-                chrome::Section::Dial,
-                "Resume · keys",
-                "",
-                sheet,
-                cols,
-            );
-        }
-        if height == 0 || cols == 0 {
-            return Vec::new();
-        }
-        if height < 5 || cols < 12 {
-            return vec![Line::from(Span::styled(
-                text::ellipsize(
-                    "Resize to browse sessions · Esc cancel",
-                    cols,
-                    theme.ascii(),
-                ),
-                theme.fg(Tok::Muted),
-            ))];
+                ]
+            },
+        ) {
+            return rows;
         }
         // Nothing to preview: the message and hints get the full width instead of a split.
         let wide = wide(cols, height) && !self.found.is_empty();
@@ -660,13 +620,13 @@ impl Picker {
                 "No matches. Ctrl+U clears the search; Tab includes empty sessions.".into()
             } else if empty > 0 && !self.show_empty {
                 format!(
-                    "No conversations {} yet. Tab shows the {empty} empty session{}.",
+                    "No conversations {} yet. Tab shows the {}.",
                     if self.all_projects {
                         "in any project"
                     } else {
                         "in this project"
                     },
-                    if empty == 1 { "" } else { "s" }
+                    text::counted(empty, "empty session")
                 )
             } else if !self.all_projects {
                 match self.elsewhere {
@@ -719,7 +679,7 @@ impl Picker {
             }
             if overflow {
                 for (n, line) in body[first..].iter_mut().enumerate() {
-                    let used: usize = line.spans.iter().map(|s| text::width(&s.content)).sum();
+                    let used: usize = text::spans_width(&line.spans);
                     line.spans
                         .push(Span::raw(" ".repeat(row_w.saturating_sub(used))));
                     line.spans.push(if n == 0 {
@@ -745,11 +705,9 @@ impl Picker {
             };
             body.push(line(
                 format!(
-                    "{} request{} · {} message{} · {} · {}{}{}",
-                    s.user_messages,
-                    if s.user_messages == 1 { "" } else { "s" },
-                    s.messages,
-                    if s.messages == 1 { "" } else { "s" },
+                    "{} · {} · {} · {}{}{}",
+                    text::counted(s.user_messages, "request"),
+                    text::counted(s.messages, "message"),
                     s.model.rsplit('/').next().unwrap_or(&s.model),
                     short(&s.id),
                     branch,
@@ -841,10 +799,15 @@ impl Picker {
             hints.push(("Esc", esc));
             body.push(chrome::hint_line_after(theme, "", &hints, width));
         } else if compact {
+            let confirm = label_or(&self.keys, Key::SelectConfirm, "Enter");
             body.push(chrome::hint_line_after(
                 theme,
                 &position,
-                &[("Enter", "resume"), ("Ctrl+B", "pin"), ("Esc", esc)],
+                &[
+                    (confirm.as_str(), "resume"),
+                    ("Ctrl+B", "pin"),
+                    ("Esc", esc),
+                ],
                 width,
             ));
         } else {
@@ -854,9 +817,13 @@ impl Picker {
                 .found
                 .get(self.selected)
                 .is_some_and(|&index| self.sessions[index].id == self.current);
+            let confirm = label_or(&self.keys, Key::SelectConfirm, "Enter");
             let mut primary = vec![
                 (arrows, "move"),
-                ("Enter", if here { "return to it" } else { "resume" }),
+                (
+                    confirm.as_str(),
+                    if here { "return to it" } else { "resume" },
+                ),
             ];
             if loaded < self.total {
                 primary.push(("Ctrl+A", "load all"));
@@ -902,7 +869,7 @@ impl Picker {
                 format!("showing {loaded} of {}", self.total)
             } else {
                 let n = self.found.len();
-                format!("{n} session{}", if n == 1 { "" } else { "s" })
+                text::counted(n, "session")
             }
         } else if loaded < self.total {
             format!("{} found in {loaded} of {}", self.found.len(), self.total)
@@ -1104,7 +1071,7 @@ fn beside(
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
-    let used: usize = left.spans.iter().map(|s| text::width(&s.content)).sum();
+    let used: usize = text::spans_width(&left.spans);
     let mut spans = left.spans;
     spans.push(Span::styled(
         " ".repeat(width.saturating_sub(used)),
@@ -1236,9 +1203,7 @@ pub fn age(stamp: &str) -> String {
     };
     match now_secs().saturating_sub(then).max(0) {
         0..=59 => "now".into(),
-        s @ 60..=3599 => format!("{}m ago", s / 60),
-        s @ 3600..=86399 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86400),
+        s => format!("{} ago", text::age_compact(s as u64)),
     }
 }
 

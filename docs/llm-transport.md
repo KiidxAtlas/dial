@@ -34,6 +34,9 @@ budget instead of failing. Chat-completions finish reasons such as `max_tokens`,
 and `model_context_window_exceeded` map to `length`; `error` and `network_error` are incomplete
 streams and retried. A streamed Responses `context_length_exceeded` is a context overflow, which
 compacts instead of resending the same prompt.
+Gemini keeps partial answer text on an output-limit stop but drops unfinished calls from both
+the reply and its replay history. Proxied Gemini streams surface provider errors inside the
+response envelope just as direct streams do.
 On Responses, an unfinished function item is discarded on a token-limit stop even if its `output_item.done` arrived without arguments. A normal completion still rejects an unfinished call. An explicit refusal in a completed Responses message ends the turn without executing or replaying its tool calls. On local Chat Completions routes, text that looks like a tool call cannot override truncation or filtering. An explicit Chat Completions refusal or `content_filter` stop ends the turn instead of prompting for a missing answer or tool.
 
 While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
@@ -45,6 +48,10 @@ failed, unanswered turn.
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
 
+When a local Inkling reply starts with a model message frame, Dial routes its thinking frame to reasoning and its text frame to the answer. The channel markers are not shown or replayed as answer text.
+Dial's managed MLX-LM server recognizes an Inkling tool call from the checkpoint's generated control-token IDs, matching the recipient and JSON `name` against an offered tool. A complete native call uses the selected approval policy. If a server returns the call as ordinary answer text instead, the text-recovery rules below apply. System-prompt instructions cannot grant tool permissions.
+A complete thinking or text frame may precede a native tool call. Text in that frame stays in its original channel; quoted examples and incomplete frames do not qualify as native calls.
+
 Native first-party Anthropic client-tool definitions set `eager_input_streaming: true` so
 large code arguments can arrive incrementally rather than waiting for server-side JSON buffering.
 Nonstreaming and cache-warm requests keep the same definitions; proxies keep their existing wire
@@ -54,11 +61,12 @@ inactivity, and fine-grained delivery alone does not reduce generated tokens or 
 
 Text/reasoning recovery of tool calls is limited to local/private endpoints and names offered
 in that request. A fenced JSON example embedded in prose is not executable. Recovered calls
-carry runtime provenance into the parent and delegated approval paths: they require actual
-one-shot confirmation, cannot consume saved grants or speculative/parallel/batch shortcuts,
-and never save a reusable permission. Denials and cancellation still win; read-only approval
-mode conservatively refuses recovered calls, including recovered reads. Structured tool calls
-retain their ordinary approval policy.
+keep their text origin in both the main session and delegated work. Full auto, Ask first and
+Edit freely require one-time confirmation; Read-only refuses them, including recovered reads.
+Only an explicitly selected `yolo` mode accepts eligible recovered calls without that prompt:
+text that resembles an intended call can then cause a real action. Recovered calls never save
+or consume reusable grants or take speculative or batch approval shortcuts. Explicit denials,
+cancellation, plan restrictions and separate human-only approvals still apply.
 
 Logical-request recovery preserves one-shot model profiles, local hints and reasoning controls
 across rejected attempts, without making them defaults for later requests. Codex WebSocket streams
@@ -91,6 +99,16 @@ enable the model in GitHub Copilot settings (and, where applicable, the organiza
 or select an enabled model in `/models`. Dial never accepts model terms or enables billing
 policies automatically. A nearby background-compaction notice does not by itself identify
 compaction as the source of a foreground provider rejection.
+
+## Hosted generation defaults
+
+Ordinary interactive main and worker requests leave temperature and the output limit to the
+provider unless you set them. Dial still reserves output space when planning context; that
+estimate is not an optional wire cap. Explicit supported settings, bounded side requests and
+recovery budgets still apply. Anthropic Messages requires `max_tokens`, and budget-mode Bedrock
+thinking needs a paired allowance. A provider can still stop generation at its own limit.
+Known Claude models marked `no-sampling` do not receive temperature or top-p through a gateway
+even when a profile requests them.
 
 ## Local server request fields
 
@@ -139,8 +157,8 @@ name them:
   `--opt=value`.
 - Dial's MLX runtime (`mlx_lm.server`): `chat_template_kwargs.enable_thinking` (when the model's chat
   template reads it), `presence_penalty` and `repetition_penalty`. Source: `mlx_lm/server.py` in
-  [mlx-lm v0.32.0](https://github.com/ml-explore/mlx-lm/blob/v0.32.0/mlx_lm/server.py).
-- Dial's MLX vision runtime (`mlx_vlm.server`, selected from the checkpoint's vision metadata):
+  [Dial's pinned MLX-LM revision](https://github.com/ml-explore/mlx-lm/blob/0c4c99192230f1943dd468d297f0b8a64ae7b7c2/mlx_lm/server.py).
+- Dial's MLX vision runtime (`mlx_vlm.server` for vision checkpoints except `inkling2_loop`, which uses MLX-LM):
   top-level `enable_thinking`. Dial translates a boolean profile
   `local_sampling.chat_template_kwargs.enable_thinking` to that wire field; MLX-LM keeps the nested
   field. Explicit profile reasoning controls and an existing native request field retain priority.

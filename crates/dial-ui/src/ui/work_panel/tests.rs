@@ -1,11 +1,6 @@
 use super::*;
+use crate::ui::testkit::plain;
 use serde_json::json;
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
-}
 
 fn plan() -> TodoList {
     let mut todo = TodoList::new();
@@ -160,5 +155,26 @@ fn medium_width_card_only_shows_current_and_next_steps() {
             assert!(!joined.contains("next tab"));
             assert!(view.iter().all(|row| text::line_width(row) == width));
         }
+    }
+}
+
+#[test]
+fn ascii_card_keeps_ascii_edges_bar_and_hint_at_every_width() {
+    let theme = Theme::builtin("dial-dark")
+        .unwrap()
+        .with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    for width in [COLLAPSED_MIN_WIDTH, MIN_WIDTH, 120] {
+        let view = rows(&plan(), &facts(), Tab::Plan, width, 12, &theme, None);
+        let text = plain(&view);
+        assert!(text.iter().all(|row| row.is_ascii()), "{width}: {text:?}");
+        assert!(
+            view.iter()
+                .all(|row| text::line_width(row) == width.min(MAX_WIDTH))
+        );
+        assert!(
+            text[0].starts_with("+-") && text[0].ends_with('+'),
+            "{text:?}"
+        );
+        assert!(text[0].contains("Plan ###----- 1/3 done"), "{text:?}");
     }
 }

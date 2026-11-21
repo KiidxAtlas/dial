@@ -48,6 +48,24 @@ fn ruff_json_becomes_located_warnings_with_fix_hints() {
 }
 
 #[test]
+fn swiftlint_json_keeps_rule_severity_and_optional_column() {
+    let root = Path::new("/repo");
+    let out = r#"[{"file":"/repo/Sources/App.swift","line":10,"character":5,"rule_id":"force_cast","severity":"Error","reason":"Force casts should be avoided","type":"Force Cast"},{"file":"/repo/Sources/App.swift","line":12,"character":null,"rule_id":"line_length","severity":"Warning","reason":"Line should be 120 characters or less"},{"file":"/elsewhere/X.swift","line":1,"rule_id":"x","severity":"Warning","reason":"outside"}]"#;
+    let diagnostics = parse(Kind::Swiftlint, &ctx(root), out, "");
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0].file.as_deref(), Some("Sources/App.swift"));
+    assert_eq!(
+        (diagnostics[0].line, diagnostics[0].column),
+        (Some(10), Some(5))
+    );
+    assert_eq!(diagnostics[0].code.as_deref(), Some("force_cast"));
+    assert_eq!(diagnostics[0].severity, Severity::Error);
+    assert_eq!(diagnostics[1].column, None);
+    assert_eq!(diagnostics[1].severity, Severity::Warning);
+    assert_eq!(Kind::from_id("swiftlint"), Some(Kind::Swiftlint));
+}
+
+#[test]
 fn ansi_and_whitespace_are_cleaned_from_messages() {
     let root = Path::new("/proj");
     let out = "a.py:1:1: E999 \u{1b}[31mbad\u{1b}[0m   syntax";

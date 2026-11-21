@@ -1,6 +1,7 @@
 //! Executables, shared libraries, object files and static archives (ELF, Mach-O, PE/COFF, ar)
 //! summarized from their headers and symbol tables. Nothing is loaded, linked or executed.
 
+use crate::hex;
 use object::{
     Endianness, FileKind, Object, ObjectSection, ObjectSymbol, SectionKind,
     elf::{DT_NEEDED, DT_RPATH, DT_RUNPATH, DT_SONAME},
@@ -206,10 +207,6 @@ fn kind(kind: SectionKind) -> &'static str {
         SectionKind::Linker | SectionKind::Metadata => "metadata",
         _ => "other",
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Interpreter, soname, run paths and needed libraries from an ELF dynamic section.

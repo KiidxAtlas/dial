@@ -4,6 +4,31 @@ use crate::llm::provider::{Backend, ProviderKind};
 use crate::ui::transcript::TranscriptCtx;
 
 #[test]
+fn hub_draft_fills_an_empty_composer_but_keeps_typed_text_idle_and_busy() {
+    for busy in [false, true] {
+        let (_home, _project, app, mut shell) = shell();
+        let mut agent = permission_agent(&app);
+        for (draft, expected) in [
+            ("", "/dirs add "),
+            ("unfinished thought", "unfinished thought"),
+        ] {
+            shell.composer.set_draft(draft);
+            let command = "/dirs\t add  ";
+            if busy {
+                assert!(!shell.route_busy_command(&app, command.into()));
+            } else {
+                assert!(matches!(
+                    shell.command(&app, &mut agent, command).unwrap(),
+                    Step::Done
+                ));
+            }
+            assert_eq!(shell.composer.draft(), expected);
+        }
+        assert!(transcript_text(&shell).contains("Your draft is kept"));
+    }
+}
+
+#[test]
 fn everyday_queue_refuses_trailing_input_without_removing_a_message() {
     let (_home, _project, app, mut shell) = shell();
     let mut agent = permission_agent(&app);
@@ -68,7 +93,6 @@ fn everyday_help_delivers_the_advertised_guide_and_command_idle_and_busy() {
 fn permissions_explain_native_path_scope_on_add_list_remove_and_usage() {
     for command in [
         "/permissions deny read --path '*.pem'",
-        "/permissions",
         "/permissions remove 1",
         "/permissions unknown",
     ] {
@@ -124,6 +148,62 @@ fn permission_removal_picker_shows_rule_paths_and_scope_limitation() {
             .contains("does not block bash cat, grep, glob")
     );
     assert!(picker.summary.contains("filesystem confinement"));
+}
+
+#[test]
+fn permissions_panel_adds_and_numbers_shell_rules_without_leaving_the_panel() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    let shown = |shell: &mut Shell| {
+        let ctx = TranscriptCtx {
+            theme: shell.themes.current(),
+            ui: &shell.ui,
+            tick: 0,
+            tools_expanded: false,
+            expand_key: "Ctrl+O",
+        };
+        shell
+            .transcript
+            .document(400, &ctx)
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // With no rules the panel still opens with both add rows; they are actions, never removable.
+    let empty = shell.picker(&app, &agent, "permissions", "").unwrap();
+    assert_eq!(empty.items.len(), 2);
+    assert_eq!(empty.items[0].value, "allow");
+    assert_eq!(empty.items[1].value, "allow --persist");
+    assert_eq!(empty.fixed, ["allow", "allow --persist"]);
+    shell
+        .command(&app, &mut agent, "/permissions allow --persist")
+        .unwrap();
+    assert_eq!(shell.composer.draft(), "/permissions allow --persist bash ");
+    shell.composer.set_draft("");
+    shell
+        .command(&app, &mut agent, "/permissions allow")
+        .unwrap();
+    assert_eq!(shell.composer.draft(), "/permissions allow bash ");
+    assert!(agent.permission_rules().is_empty(), "prefill adds nothing");
+    // The typed command goes through the same validated add; its row and number then show it.
+    shell.composer.set_draft("");
+    shell
+        .command(&app, &mut agent, "/permissions allow bash cargo test")
+        .unwrap();
+    let rules = shell.picker(&app, &agent, "permissions", "").unwrap();
+    assert_eq!(rules.items[2].value, "1");
+    assert!(rules.items[2].label.contains("bash cargo test"));
+    assert!(rules.items[2].detail.contains("This session only"));
+    shell.command(&app, &mut agent, "/permissions 1").unwrap();
+    assert!(shown(&mut shell).contains("Rule 1: Allow bash cargo test"));
+    shell.command(&app, &mut agent, "/permissions 9").unwrap();
+    assert!(shown(&mut shell).contains("No rule 9"));
+    shell
+        .command(&app, &mut agent, "/permissions remove 1")
+        .unwrap();
+    assert!(agent.permission_rules().is_empty());
 }
 
 fn permission_agent(app: &App) -> Agent<'_> {
@@ -465,7 +545,7 @@ fn malformed_closed_grammar_commands_answer_at_once_idle_and_busy() {
         ("/mode plan maybe", "Usage: /plan [on|off]"),
         (
             "/approval nope",
-            "Usage: /approval [ask|write|auto|readonly]",
+            "Usage: /approval [ask|write|auto|readonly|yolo]",
         ),
         ("/laya nope", "Usage: /laya [status|check|start|on|off]"),
         ("/tree x", "Usage: /tree"),

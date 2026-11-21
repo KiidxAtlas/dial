@@ -5,8 +5,14 @@
 //!
 //! This file also holds the small drawing helpers shared by the model and provider panels.
 use super::path_browser::PathBrowser;
+use super::widgets::{
+    Axis, arrows, fit, hint_line, is_ctrl, local_function_key, local_function_label, other_scope,
+    panel, pressed, scope_name,
+};
 use super::{DrawCtx, OverlayEvent};
-use crate::config::schema::{Kind, PathKind, SettingDef, Source};
+use crate::config::schema::{
+    EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, Kind, PathKind, SettingDef, Source, memory_needs,
+};
 use crate::config::settings_store::Scope;
 use crate::llm::model_config::{ModelSelection, UiConfig};
 use crate::ui::chrome::Section;
@@ -20,7 +26,7 @@ use crossterm::event::{KeyEvent, KeyModifiers};
 #[cfg(test)]
 use format::{adjust, blank_meaning, edit_text};
 use format::{choice_value, parse_input, setting_edit_text, value_text};
-use memory::{label_for_choice, memory_needs, memory_section};
+use memory::{label_for_choice, memory_section};
 use ratatui::{
     Frame,
     text::{Line, Span},
@@ -28,14 +34,7 @@ use ratatui::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use toml::{Table, Value};
-use unicode_segmentation::UnicodeSegmentation;
 use value_editors::{AddBy, EntriesEditor, ListEditor};
-pub(crate) use widgets::scroll_cell;
-pub(super) use widgets::{
-    Axis, arrows, editor_spans, filled, fit, highlighted, hint, hint_line, hint_line_after,
-    is_ctrl, list_row, local_function_key, local_function_label, match_style, other_scope,
-    pair_label, panel, pressed, scope_caption, scope_name, tab_strip, typed_char,
-};
 
 mod appearance;
 mod bulk;
@@ -46,7 +45,6 @@ mod input;
 mod memory;
 mod render;
 mod value_editors;
-mod widgets;
 
 /// Bulk removal is limited to canonical leaf settings; section containers can hide siblings.
 pub fn resettable_path(path: &str) -> bool {
@@ -138,7 +136,15 @@ const LINKS: &[(&str, &str, &str)] = &[
         "Choose the embedding model in its existing role picker; this does not enable semantic memory.",
         "open:role:embedding",
     ),
+    (
+        "Allowed commands",
+        "Shell commands Dial may run without asking, and ones it refuses. Add or remove rules in the permissions picker.",
+        "command:/permissions",
+    ),
 ];
+
+/// Index in [`LINKS`] of the Common launcher that opens the `/permissions` picker.
+const ALLOWED_COMMANDS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
@@ -254,9 +260,6 @@ pub struct EmbeddingModel {
     pub classified: bool,
 }
 
-/// The settings row that picks the `embedding` role (and holds the advanced model override).
-const EMBEDDING_MODEL_PATH: &str = crate::setup::embeddings::EMBEDDING_MODEL_PATH;
-const EMBEDDING_URL_PATH: &str = "memory.semantic.embedding_base_url";
 /// Override rows kept behind "Show advanced" while no override URL is set.
 const EMBEDDING_OVERRIDE_ROWS: [&str; 2] =
     [EMBEDDING_URL_PATH, "memory.semantic.embedding_api_key_env"];
@@ -838,12 +841,9 @@ impl SettingsOverlay {
         if matches!(self.source(def.path), "env" | "CLI flag") {
             return crate::config::schema::get(&self.effective, def.path).cloned();
         }
-        crate::config::schema::get(
-            self.layer_ref(super::settings::other_scope(scope)),
-            def.path,
-        )
-        .cloned()
-        .or_else(|| def.default_value())
+        crate::config::schema::get(self.layer_ref(super::widgets::other_scope(scope)), def.path)
+            .cloned()
+            .or_else(|| def.default_value())
     }
 
     /// Explain persistence and precedence without exposing raw sensitive values.
@@ -1080,6 +1080,8 @@ impl SettingsOverlay {
                             })
                             .map(Row::Setting)
                     }));
+                    // The permissions launcher closes the list: it opens a picker, not a setting.
+                    rows.push(Row::Link(ALLOWED_COMMANDS));
                 }
                 rows
             }
@@ -1087,20 +1089,22 @@ impl SettingsOverlay {
         }
     }
 
-    /// The heading a row sits under. In the Common tab every row is grouped as Common, mirrors
-    /// included, so the tab reads as one short list rather than a heading per borrowed row.
+    /// Common lists its rows under one heading, unless a search or changed-only filter lists them
+    /// by home tab.
+    fn common_grouped(&self) -> bool {
+        self.search.is_empty()
+            && !self.changed_only
+            && self
+                .tabs
+                .get(self.tab)
+                .is_some_and(|(t, _)| *t == COMMON_TAB)
+    }
+
+    /// The heading a row sits under. In the Common tab every row is grouped as Common, mirrors and
+    /// launchers included, so the tab reads as one short list rather than a heading per borrowed row.
     fn section_of(&self, row: Row) -> &'static str {
         match row {
-            Row::Setting(_)
-                if self.search.is_empty()
-                    && !self.changed_only
-                    && self
-                        .tabs
-                        .get(self.tab)
-                        .is_some_and(|(t, _)| *t == COMMON_TAB) =>
-            {
-                COMMON_TAB
-            }
+            Row::Setting(_) | Row::Link(_) if self.common_grouped() => COMMON_TAB,
             Row::Setting(i) => crate::config::schema::registry()[i].section,
             Row::Link(_) => LINK_SECTION,
             Row::Advanced(_, section, _) => section,

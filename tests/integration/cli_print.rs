@@ -391,6 +391,35 @@ fn named_approval_controls_mutations_and_reports_denial_exit_code() {
 }
 
 #[test]
+fn only_explicit_yolo_executes_a_tool_call_recovered_from_text_without_consent() {
+    for (mode, allowed) in [("auto", false), ("yolo", true)] {
+        let env = Env::new();
+        let server = Server::new(vec![
+            text(
+                r#"<tool_call>{"name":"write","arguments":{"path":"out.txt","content":"approved"}}</tool_call>"#,
+            ),
+            text("finished"),
+        ]);
+        let out = env.run(
+            &server,
+            &["--tools", "write", "--approval", mode, "write out.txt"],
+            "",
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(if allowed { 0 } else { 3 }),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            env.project.path().join("out.txt").exists(),
+            allowed,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
 fn stdin_is_prompt_or_fenced_context_and_resume_reuses_conversation() {
     let e = Env::new();
     let server = Server::new(vec![text("first"), text("second"), text("third")]);

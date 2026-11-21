@@ -1,8 +1,10 @@
 //! Appearance previews are projections of the open editor, never another settings store.
 use super::super::DrawCtx;
+use super::super::panel_keys;
+use super::super::widgets::pair_label;
 use super::{
-    Mode, Row, SettingsOverlay, choice_value, fit, hint_line, local_function_key,
-    local_function_label, parse_input, pressed,
+    Mode, Row, SettingsOverlay, choice_value, fit, local_function_key, local_function_label,
+    parse_input, pressed,
 };
 use crate::config::schema::SettingDef;
 use crate::llm::model_config::PinnedWorkers;
@@ -11,7 +13,7 @@ use crate::ui::{
     text,
     theme::Tok,
 };
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::Event;
 use ratatui::text::{Line, Span};
 use toml::Value;
 
@@ -44,22 +46,14 @@ impl SettingsOverlay {
         if !self.appearance_preview {
             return false;
         }
-        if keys.matches(Action::SelectConfirm, key) || keys.matches(Action::SelectCancel, key) {
+        if panel_keys::matches(keys, Action::SelectConfirm, key)
+            || panel_keys::matches(keys, Action::SelectCancel, key)
+        {
             self.appearance_preview = false;
             return false;
         }
-        match key.code {
-            KeyCode::Down => self.appearance_scroll = self.appearance_scroll.saturating_add(1),
-            KeyCode::Up => self.appearance_scroll = self.appearance_scroll.saturating_sub(1),
-            KeyCode::PageDown => {
-                self.appearance_scroll = self.appearance_scroll.saturating_add(self.page)
-            }
-            KeyCode::PageUp => {
-                self.appearance_scroll = self.appearance_scroll.saturating_sub(self.page)
-            }
-            KeyCode::Home => self.appearance_scroll = 0,
-            KeyCode::End => self.appearance_scroll = usize::MAX,
-            _ => {}
+        if let Some(next) = panel_keys::scroll_text(keys, key, self.appearance_scroll, self.page) {
+            self.appearance_scroll = next;
         }
         true
     }
@@ -91,6 +85,7 @@ impl SettingsOverlay {
             );
         }
         let room = h.saturating_sub(2);
+        let overflow = content.len() > room;
         self.page = room.max(1);
         self.appearance_scroll = self
             .appearance_scroll
@@ -110,11 +105,38 @@ impl SettingsOverlay {
             lines.push(Line::default());
         }
         if h > 1 {
-            let mut hints = self.footer(ctx.keys);
-            hints.insert(1.min(hints.len()), "PgUp/PgDn scroll".into());
-            lines.push(hint_line(ctx.theme, &hints, w));
+            let mut hints = self.preview_footer(ctx.keys);
+            if overflow {
+                hints.insert(
+                    1.min(hints.len()),
+                    panel_keys::segment(
+                        &pair_label(ctx.keys, Action::SelectPageUp, Action::SelectPageDown),
+                        "scroll",
+                    ),
+                );
+            }
+            lines.push(panel_keys::sheet_footer(ctx.theme, hints, w));
         }
         lines
+    }
+
+    /// Confirm and cancel fall through to the open editor; its other keys do not.
+    pub(super) fn preview_footer(&self, keys: &Keymap) -> Vec<String> {
+        let confirm = keys.label(Action::SelectConfirm);
+        let cancel = keys.label(Action::SelectCancel);
+        let mut hints = self.footer(keys);
+        hints.retain(|hint| {
+            hint.split_once(' ')
+                .is_some_and(|(key, _)| key == confirm || key == cancel)
+        });
+        hints.insert(
+            1.min(hints.len()),
+            format!(
+                "{} controls",
+                local_function_label(keys, 4, Action::ProviderSetup)
+            ),
+        );
+        hints
     }
 
     /// A valid, unconfirmed value is visible only to the sample renderer.

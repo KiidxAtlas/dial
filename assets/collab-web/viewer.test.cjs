@@ -7,6 +7,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync(require('node:path').join(__dirname, 'index.html'), 'utf8').match(/<script type="module">([\s\S]*?)<\/script>/)[1];
+test('both standalone viewers embed the dashboard stylesheet', () => {
+  for (const file of ['collab-web/index.html', 'share-viewer/index.html']) {
+    const html = fs.readFileSync(require('node:path').join(__dirname, '..', file), 'utf8');
+    assert.equal(html, require('../sync-viewer-chrome.cjs').syncedViewer(file));
+  }
+});
 const secret = new Uint8Array(32).fill(7);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function harness({full=false,legacy=false}={}) {
@@ -56,6 +62,14 @@ async function harness({full=false,legacy=false}={}) {
     retry(){assert(timers.length);timers.shift().fn();},
   };
 }
+test('shared replica fixture projects each visible log exactly once', async () => {
+  const h = await harness();
+  for (const [i, {frame, log}] of require('./replica.fixture.json').entries()) {
+    await h.send({...frame, role:'host', epoch:'host', transportSeq:i+1});
+    const payloads = h.transcript.children.map(({textContent}) => textContent.slice(textContent.indexOf(': ') + 2));
+    assert.deepEqual(payloads, log.map(entry => JSON.stringify(entry)), `after frame ${i}: ${frame.t}`);
+  }
+});
 test('room teardown retries through missing room and accepts a recreated host snapshot', async () => {
   const h=await harness();
   await h.snapshot('old',10,[{type:'old'}]);

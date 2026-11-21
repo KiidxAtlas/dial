@@ -30,6 +30,7 @@ fn malformed_retry_timing_or_attempts_never_create_a_countdown() {
         "-1s (attempt 1/2)",
         "infs (attempt 1/2)",
         "1s (attempt 0/2)",
+        "1s (attempt 1/10)",
         "1s (attempt 3/2)",
         "1s (attempt 1/0)",
         "1s (attempt unknown/2)",
@@ -44,11 +45,12 @@ fn malformed_retry_timing_or_attempts_never_create_a_countdown() {
 #[test]
 fn retry_notes_explain_the_first_failure_and_only_later_changes_of_cause() {
     let first = RetryNotice::parse(
-        "transient provider failure: Responses error (code: server_error) (after 1.0s); retrying in 2.0s (attempt 1/10)",
+        "transient provider failure: HTTP 503 (after 0.3s); retrying in 2.0s (attempt 2/10)",
     )
     .unwrap();
-    assert_eq!(first.cause_key(), "Responses error (code: server_error)");
+    assert_eq!(first.cause_key(), "HTTP 503");
     let text = first.note_text(None, "Ctrl+C").unwrap();
+    assert!(text.contains("10 total attempts"), "{text}");
     assert!(
         text.contains("/retry skips the wait, Ctrl+C stops."),
         "{text}"
@@ -64,14 +66,14 @@ fn retry_notes_explain_the_first_failure_and_only_later_changes_of_cause() {
 
     // Same cause, different timing: nothing new to say.
     let same = RetryNotice::parse(
-        "transient provider failure: Responses error (code: server_error) (after 7.3s); retrying in 4.0s (attempt 2/10)",
+        "transient provider failure: HTTP 503 (after 7.3s); retrying in 4.0s (attempt 3/10)",
     )
     .unwrap();
     assert_eq!(same.note_text(Some(first.cause_key()), "Ctrl+C"), None);
 
     // A new cause is noted with its attempt number.
     let changed = RetryNotice::parse(
-        "rate limited: HTTP 429 Too Many Requests (after 0.2s); retrying in 15.0s (attempt 3/10)",
+        "rate limited: HTTP 429 Too Many Requests (after 0.2s); retrying in 15.0s (attempt 4/10)",
     )
     .unwrap();
     let text = changed

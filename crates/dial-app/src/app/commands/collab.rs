@@ -47,6 +47,10 @@ pub(super) fn run_live(
         ("collab", "list") => Some(list(shell, app)),
         ("collab", "stop") => Some(stop(shell)),
         ("collab", "abort") => Some(guest_abort(shell)),
+        ("collab", args) if args.split_whitespace().next() == Some("answer") => Some(guest_answer(
+            shell,
+            args.trim_start_matches("answer").trim(),
+        )),
         ("leave", _) => Some(leave(shell)),
         _ => None,
     }
@@ -57,6 +61,7 @@ pub(super) fn completions(_config: &crate::config::types::Config) -> Vec<String>
         "/collab join",
         "/collab view",
         "/collab status",
+        "/collab answer",
         "/collab stop",
         "/share gist",
         "/share whole-journal",
@@ -71,7 +76,10 @@ fn collab(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result
         "" | "start" => start(shell, app, agent, false),
         "view" => start(shell, app, agent, true),
         _ => {
-            shell.note("Collab", "Usage: /collab [view|status|stop|list|abort]");
+            shell.note(
+                "Collab",
+                "Usage: /collab [view|status|stop|list|abort|answer <number>]",
+            );
             Ok(Step::Done)
         }
     }
@@ -95,18 +103,26 @@ fn start(shell: &mut Shell, app: &App, agent: &Agent<'_>, read_only: bool) -> Re
     let config = &app.config.collab;
     let relay = config.relay_url.clone();
     let allow_steering = config.allow_guest_steering;
+    let allow_answers = config.allow_guest_answers;
+    let web_url = config.web_url.clone();
     let messages = agent.session().archived_messages();
     let user_dir = layout.user_dir.clone();
     let cwd = layout.project_root.display().to_string();
     let session_id = agent.session().id().to_owned();
     let model = agent.model().to_owned();
     super::extensions::spawn_job(shell, "Collab", move |_cancel| {
-        let mut host = Host::start(&relay, allow_steering, !read_only, messages)?;
+        let mut host = Host::start(&relay, allow_steering, !read_only, messages)?
+            .with_guest_answers(allow_answers);
         if let Err(error) = host.publish(&user_dir, &cwd, &session_id, &model) {
             host.stop();
             return Err(error);
         }
         let link = host.link().to_owned();
+        // A viewer URL that cannot be formed (bad web_url) is reported, not fatal to hosting.
+        let viewer = match crate::collab::protocol::viewer_link(&web_url, &relay, &link) {
+            Ok(url) => format!("\nBrowser viewer: {url}"),
+            Err(error) => format!("\nBrowser viewer unavailable: {error:#}"),
+        };
         // Re-check under the lock: a guest or host may have claimed the room while this opened.
         let claimed = room::with(|slot| {
             if slot.is_some() {
@@ -121,11 +137,11 @@ fn start(shell: &mut Shell, app: &App, agent: &Agent<'_>, read_only: bool) -> Re
         }
         Ok(if read_only {
             format!(
-                "Read-only collab session active. Anyone with the link can read the session but cannot prompt the agent:\n{link}"
+                "Read-only collab session active. Anyone with the link can read the session but cannot prompt the agent:\n{link}{viewer}"
             )
         } else {
             format!(
-                "Collab session started!\nAnyone with the link can read the session and prompt the agent. Read-only link: /collab view\n{link}"
+                "Collab session started!\nAnyone with the link can read the session and prompt the agent. Read-only link: /collab view\n{link}{viewer}"
             )
         })
     });
@@ -245,6 +261,20 @@ fn guest_abort(shell: &mut Shell) -> Result<Step> {
         None => "Not joined to a collab session as a guest".to_owned(),
         Some(Ok(())) => "Abort sent to the host".to_owned(),
         Some(Err(message)) => message.to_owned(),
+    };
+    shell.note("Collab", text);
+    Ok(Step::Done)
+}
+
+/// Answer the host's open question with a listed option number (`/collab answer N`, guests only).
+fn guest_answer(shell: &mut Shell, args: &str) -> Result<Step> {
+    let text = match args.parse::<usize>() {
+        Err(_) => "Usage: /collab answer <number>".to_owned(),
+        Ok(option) => match room::send_guest_answer(option) {
+            None => "Not joined to a collab session as a guest".to_owned(),
+            Some(Ok(())) => format!("Answer {option} sent to the host"),
+            Some(Err(message)) => message.to_owned(),
+        },
     };
     shell.note("Collab", text);
     Ok(Step::Done)

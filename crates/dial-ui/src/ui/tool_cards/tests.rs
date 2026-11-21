@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm::model_config::UiConfig;
+use crate::ui::testkit::plain;
 
 fn tool(name: &str, state: ToolState) -> Tool {
     Tool {
@@ -141,12 +142,6 @@ fn ascii_theme() -> Theme {
     Theme::builtin("dial-dark")
         .unwrap()
         .with_glyphs(super::super::theme::Glyphs::Ascii)
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
 }
 
 /// A framed body row's content, without its sides.

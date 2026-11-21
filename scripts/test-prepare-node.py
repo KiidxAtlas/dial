@@ -163,7 +163,7 @@ class PrepareNodeTest(unittest.TestCase):
             Path(destination).write_bytes(self.tar.read_bytes())
             return destination.stat().st_size
 
-        with unittest.mock.patch.object(prepare_node, "download", side_effect=fake_download), \
+        with unittest.mock.patch.object(runtime_payload, "download", side_effect=fake_download), \
                 unittest.mock.patch.object(prepare_node, "extract_members") as extract:
             self.assert_refused("download SHA-256 mismatch")
         extract.assert_not_called()
@@ -173,12 +173,29 @@ class PrepareNodeTest(unittest.TestCase):
             Path(destination).write_bytes(self.tar.read_bytes())
             return destination.stat().st_size
 
-        with unittest.mock.patch.object(prepare_node, "download", side_effect=fake_download):
+        with unittest.mock.patch.object(runtime_payload, "download", side_effect=fake_download):
             out = self.run_prepare()
         self.assertEqual(gzip.decompress((out / "node.gz").read_bytes()), ELF_BODY)
 
     def test_missing_archive_file_refuses(self):
         self.assert_refused("archive not found", archive=self.root / "absent.tar.gz")
+
+    def test_local_archive_is_bounded_like_downloads(self):
+        with unittest.mock.patch.object(runtime_payload, "DOWNLOAD_LIMIT", 64):
+            self.assert_refused("archive exceeds the 64 byte limit", archive=self.tar)
+
+    def test_extraction_reads_only_the_verified_snapshot(self):
+        seen = []
+        real_build = prepare_node.build_payload
+
+        def spy(archive_path, *args):
+            seen.append(Path(archive_path))
+            return real_build(archive_path, *args)
+
+        with unittest.mock.patch.object(prepare_node, "build_payload", side_effect=spy):
+            self.run_prepare(archive=self.tar)
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(seen[0].resolve(), self.tar.resolve())
 
     # Member selection and hostile archives --------------------------------
 
@@ -268,7 +285,7 @@ class PrepareNodeTest(unittest.TestCase):
             return Empty(b"")
 
         with unittest.mock.patch.object(runtime_payload.urllib.request, "urlopen", side_effect=fake_urlopen):
-            prepare_node.download("https://nodejs.org/dist/x.tar.gz", self.root / "e.bin")
+            runtime_payload.download("https://nodejs.org/dist/x.tar.gz", self.root / "e.bin")
         self.assertGreater(seen["timeout"], 0)
 
     # Payload validation ----------------------------------------------------

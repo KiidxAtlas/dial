@@ -14,6 +14,30 @@ fn delivered_answer_roundtrips_without_claiming_completed_work() {
     assert_eq!(restored.result.phase, Phase::Answered);
     assert_ne!(restored.result.phase, Phase::Completed);
 }
+
+#[test]
+fn status_words_parse_to_one_phase_and_unknown_words_are_not_recognised() {
+    let known = [
+        ("running", Phase::Running),
+        ("pending", Phase::Running),
+        ("done", Phase::Completed),
+        ("completed", Phase::Completed),
+        ("answered", Phase::Answered),
+        ("blocked", Phase::Blocked),
+        ("needs_input", Phase::NeedsInput),
+        ("incomplete", Phase::Incomplete),
+        ("failed", Phase::Failed),
+        ("interrupted", Phase::Interrupted),
+        ("cancelled", Phase::Interrupted),
+        ("canceled", Phase::Interrupted),
+    ];
+    for (word, phase) in known {
+        assert_eq!(Phase::parse(word), Some(phase), "{word}");
+        assert_eq!(Phase::from_status(word), phase, "{word}");
+    }
+    assert_eq!(Phase::parse("exploded"), None);
+    assert_eq!(Phase::from_status("exploded"), Phase::Failed);
+}
 #[test]
 fn coherent_runtime_legacy_phases_and_late_cancellation_results() {
     assert_eq!(

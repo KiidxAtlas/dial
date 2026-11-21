@@ -188,11 +188,7 @@ fn collect(ws: &Workspace, start: &std::path::Path) -> (Vec<Window>, usize, bool
             let body = lines[first - 1..last].join("\n");
             let mut window_text = format!("{rel}\n{body}");
             if window_text.len() > MAX_WINDOW_BYTES {
-                let mut cut = MAX_WINDOW_BYTES;
-                while !window_text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                window_text.truncate(cut);
+                window_text.truncate(window_text.floor_char_boundary(MAX_WINDOW_BYTES));
             }
             let snippet: String = lines[first - 1..last]
                 .iter()

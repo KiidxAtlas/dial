@@ -291,8 +291,9 @@ fn request(
     }
     let max_tokens = profile
         .and_then(|p| p.max_tokens)
+        .filter(|n| *n > 0)
         .unwrap_or(chat.max_tokens);
-    let mut body = json!({"messages":messages,"inferenceConfig":{"maxTokens":max_tokens}});
+    let mut body = json!({"messages":messages,"inferenceConfig":{}});
     // Claude thinks by default when the profile leaves `thinking` unset; see the native builder.
     let default_thinking = profile
         .is_none_or(|p| p.thinking.is_none() && p.top_p.is_none())
@@ -337,6 +338,13 @@ fn request(
             body["additionalModelRequestFields"]["output_config"] =
                 json!({"effort":p.reasoning_effort_wire(effort)});
         }
+    }
+    // Budget-mode thinking needs a larger, paired output allowance. Other requests can
+    // leave maxTokens unset without losing their planning budget.
+    if !profile.is_some_and(ModelProfile::inherits_output_limit)
+        || body["additionalModelRequestFields"]["thinking"]["type"] == "enabled"
+    {
+        body["inferenceConfig"]["maxTokens"] = json!(max_tokens);
     }
     if !chat.tools.is_empty() {
         let mut tools = Vec::with_capacity(chat.tools.len());

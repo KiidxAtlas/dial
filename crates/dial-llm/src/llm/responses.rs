@@ -229,12 +229,14 @@ fn request_api(
     profile: Option<&super::profiles::ModelProfile>,
 ) -> Result<Value> {
     let mut body = request_flat(model, chat, profile, false)?;
-    body["max_output_tokens"] = json!(
-        profile
-            .and_then(|p| p.max_tokens)
-            .filter(|n| *n > 0)
-            .unwrap_or(chat.max_tokens)
-    );
+    if !profile.is_some_and(super::profiles::ModelProfile::inherits_output_limit) {
+        body["max_output_tokens"] = json!(
+            profile
+                .and_then(|p| p.max_tokens)
+                .filter(|n| *n > 0)
+                .unwrap_or(chat.max_tokens)
+        );
+    }
     if let Some(p) = profile {
         if p.capabilities.temperature {
             body["temperature"] = json!(p.temperature.unwrap_or(chat.temperature));
@@ -252,38 +254,25 @@ fn request_api(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+pub use super::TestFirstParty;
+
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_FIRST_PARTY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Restores the first-party host check when dropped ([`test_first_party`]).
-#[cfg(any(test, feature = "test-support"))]
-pub struct TestFirstParty(());
-
-#[cfg(any(test, feature = "test-support"))]
-impl Drop for TestFirstParty {
-    fn drop(&mut self) {
-        TEST_FIRST_PARTY.with(|cell| cell.borrow_mut().take());
-    }
 }
 
 /// Treat `origin` (`scheme://host:port`) as the OpenAI API host on this thread, so a fake server
 /// can exercise wire behaviour gated on `api.openai.com`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_first_party(origin: &str) -> TestFirstParty {
-    TEST_FIRST_PARTY.with(|cell| *cell.borrow_mut() = Some(origin.to_owned()));
-    TestFirstParty(())
+    super::override_first_party(&TEST_FIRST_PARTY, origin)
 }
 
 /// Whether `url` is the OpenAI API's own host (exactly `api.openai.com`).
 pub(super) fn first_party(url: &str) -> bool {
     #[cfg(any(test, feature = "test-support"))]
-    if TEST_FIRST_PARTY.with(|cell| {
-        cell.borrow()
-            .as_deref()
-            .is_some_and(|origin| super::same_origin(url, origin))
-    }) {
+    if super::test_origin_matches(&TEST_FIRST_PARTY, url) {
         return true;
     }
     super::host_of(url).as_deref() == Some("api.openai.com")

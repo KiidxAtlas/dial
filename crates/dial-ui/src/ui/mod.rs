@@ -36,6 +36,8 @@ pub mod term;
 pub mod term_links;
 pub mod term_state;
 pub mod termcaps;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod text;
 pub mod theme;
 pub mod tool_cards;

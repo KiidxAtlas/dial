@@ -217,6 +217,8 @@ sandbox.network_deny
 sandbox.serial_ports
 shell.backend
 worktree.clean_source
+plan.autosave
+plan.autosave_dir
 commit.cache_enabled
 commit.cache_ttl_days
 ask.enabled
@@ -271,6 +273,7 @@ compaction.summary_instructions
 compaction.promotion.enabled
 compaction.promotion.targets
 edit.auto_repair.enabled
+edit.auto_repair.coach
 subagent_max_live_jobs
 isolation.backend
 portable_rules.enabled

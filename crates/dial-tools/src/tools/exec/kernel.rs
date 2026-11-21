@@ -24,7 +24,7 @@ mod env;
 pub(crate) const PYTHON_DRIVER: &str = include_str!("kernel/driver.py");
 pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadline};
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(not(windows))]
 const FORK_FENCE: &str = "(version 1)(allow default)(deny process-fork)";
 const PYTHON_PREFLIGHT: &str = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'executable':sys.executable,'version':list(sys.version_info[:2])}}),flush=True)";
 
@@ -40,20 +40,55 @@ impl Drop for ActiveGuard<'_> {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
-/// Owner-local Python runtime: one persistent namespace session plus the cancellation and deadline
-/// state shared with the in-flight cell.
-pub(crate) struct PythonRuntime {
-    config: KernelConfig,
-    session: Arc<Mutex<Option<NativeProcess>>>,
-    busy: Arc<Mutex<Option<String>>>,
-    pid: Arc<AtomicI32>,
-    interrupt: AtomicBool,
+/// Language-neutral state and lifecycle of one persistent eval runtime. JavaScript and Python
+/// share this admission path: one namespace slot, one background owner, deadline and cancellation
+/// accounting, containment before any cell, and discard-on-failure. A language supplies only its
+/// kernel launch through [`CellRuntime::run`].
+pub(crate) struct CellRuntime {
+    // Visible to the language runtimes' tests under `exec`; production code uses `run`/`cancel`.
+    pub(super) session: Arc<Mutex<Option<NativeProcess>>>,
+    pub(super) busy: Arc<Mutex<Option<String>>>,
+    pub(super) pid: Arc<AtomicI32>,
+    pub(super) interrupt: AtomicBool,
     active: AtomicUsize,
 }
-impl PythonRuntime {
-    pub(super) fn new(config: KernelConfig) -> Self {
+
+/// How a cancellation reaches the running cell.
+#[derive(Clone, Copy)]
+pub(crate) enum CancelDelivery {
+    /// SIGINT first, so the driver raises `KeyboardInterrupt`; the guard kills the group after
+    /// [`INTERRUPT_GRACE`] if the cell does not unwind.
+    Interrupt,
+    /// The kernel's process group is killed at once and the namespace is discarded.
+    KillGroup,
+}
+
+/// The per-language facts of a cell: the tag used in job labels and status payloads, the name used
+/// in refusals, and the configured timeout.
+pub(crate) struct CellSpec {
+    pub code: &'static str,
+    pub name: &'static str,
+    pub timeout_secs: u64,
+}
+
+/// What a language's kernel launch may use while the namespace slot is held.
+pub(crate) struct Attempt<'a> {
+    pub end: &'a Deadline,
+    pub pid: &'a Arc<AtomicI32>,
+    pub interrupt: &'a AtomicBool,
+    pub cancel: &'a AtomicBool,
+}
+
+impl Attempt<'_> {
+    /// Fails once the cell's deadline has passed or cancellation has been requested.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        check_operation(self.end, self.interrupt, self.cancel)
+    }
+}
+
+impl CellRuntime {
+    pub(crate) fn new() -> Self {
         Self {
-            config,
             session: Arc::new(Mutex::new(None)),
             busy: Arc::new(Mutex::new(None)),
             pid: Arc::new(AtomicI32::new(0)),
@@ -61,33 +96,43 @@ impl PythonRuntime {
             active: AtomicUsize::new(0),
         }
     }
-    pub(super) fn fork(&self) -> Self {
-        Self::new(self.config.clone())
-    }
-    /// Requests cancellation of the in-flight cell; a flag left behind would reject the next cell.
-    pub(super) fn cancel(&self) -> bool {
-        let requested = self.active.load(Ordering::Acquire) > 0;
-        if requested {
-            self.interrupt.store(true, Ordering::Release);
+
+    /// Cancels the in-flight cell and reports whether one was running. A flag left behind would
+    /// reject the next cell, so nothing is recorded when idle.
+    pub(crate) fn cancel(&self, delivery: CancelDelivery) -> bool {
+        if self.active.load(Ordering::Acquire) == 0 {
+            return false;
         }
-        requested
+        self.interrupt.store(true, Ordering::Release);
+        if matches!(delivery, CancelDelivery::KillGroup) {
+            let pid = self.pid.load(Ordering::Acquire);
+            if pid > 0 {
+                let _ = crate::platform::process::kill_group(pid as u32);
+            }
+        }
+        true
     }
+
+    /// Runs one cell through the shared lifecycle. `start` launches the kernel into an empty slot;
+    /// it runs only while the slot is held, after the namespace was found dead or absent.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run(
         &self,
         ctx: &ToolContext,
+        spec: CellSpec,
         action: CellAction<'_>,
         args: &Value,
         cancel: &AtomicBool,
         adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
         effect_started: &AtomicBool,
+        start: impl FnOnce(&mut Option<NativeProcess>, &Attempt<'_>) -> Result<(), String>,
     ) -> Result<CellOutcome, String> {
         // Counts the whole operation, including lock wait, so cancel reaches it before startup.
         let _active = ActiveGuard::new(&self.active);
         let cell = Arc::new(Deadline::new(execution_deadline(deadline(
             args,
-            self.config.timeout_secs,
+            spec.timeout_secs,
         )?)));
         let end = &cell;
         // A pending execution cancellation must never admit another cell. Explicit control
@@ -96,11 +141,11 @@ impl PythonRuntime {
         if cancel.load(Ordering::Acquire)
             || (pending_cancel && matches!(action, CellAction::Eval(_)))
         {
-            return Err("python execution cancelled before startup".into());
+            return Err(format!("{} execution cancelled before startup", spec.name));
         }
         let policy = BackgroundPolicy::from_args(args, ctx.config.shell.auto_background_secs)?;
         let handoff = Handoff {
-            label: cell_label(args, "py")?,
+            label: cell_label(args, spec.code)?,
             policy: &policy,
             adopt,
             session: self.session.clone(),
@@ -116,10 +161,11 @@ impl PythonRuntime {
             &callback_wait,
             || {
                 let mut slot = lock_session(&self.session, end, &self.interrupt, cancel)?;
-                if let Some(job) = busy_job(&self.busy) {
+                let busy_job = self.busy.lock().clone();
+                if let Some(job) = busy_job {
                     if matches!(action, CellAction::Status) {
                         return Ok(CellOutcome::Value(json!({"running":true,"background":job,
-                            "language":"py",
+                            "language":spec.code,
                             "platform":crate::tools::surface::catalog::execution_platform("eval")})));
                     }
                     return Err(format!("runtime busy in background job {job}"));
@@ -131,117 +177,29 @@ impl PythonRuntime {
                     }
                     CellAction::Status => {
                         return Ok(CellOutcome::Value(json!({
-                        "running":slot.as_mut().is_some_and(NativeProcess::alive),
-                        "language":"py",
-                        "platform":crate::tools::surface::catalog::execution_platform("eval")})));
+                            "running":slot.as_mut().is_some_and(NativeProcess::alive),
+                            "language":spec.code,
+                            "platform":crate::tools::surface::catalog::execution_platform("eval")})));
                     }
                     CellAction::Eval(code) => code,
                 };
+                // Containment is a precondition of every cell, including one that reuses a live
+                // namespace; the probe result is cached, so this costs nothing after the first.
                 require_fork_containment("eval")?;
+                let attempt = Attempt {
+                    end,
+                    pid: &self.pid,
+                    interrupt: &self.interrupt,
+                    cancel,
+                };
                 let result = (|| {
-                    if slot.as_mut().is_some_and(|s| !s.alive()) {
+                    if slot.as_mut().is_some_and(|process| !process.alive()) {
                         slot.take();
                     }
                     if slot.is_none() {
-                        let root = ctx.workspace.root();
-                        let timeout = remaining_timeout(end.at())?;
-                        let environment =
-                            env::detect(root, &self.config.venv, &self.config.python, &|key| {
-                                std::env::var(key).ok()
-                            })?;
-                        let launch = match environment {
-                            None if use_bundled_python(&self.config.python) => {
-                                Launch::bundled(ctx.workspace)?
-                            }
-                            None => {
-                                let (python, _) = resolve_python(
-                                    root,
-                                    &self.config.python,
-                                    timeout,
-                                    self.pid.clone(),
-                                    &self.interrupt,
-                                )?;
-                                Launch {
-                                    python,
-                                    site: None,
-                                    bundle: None,
-                                    isolate_site: false,
-                                }
-                            }
-                            Some(environment) => resolve_environment(
-                                root,
-                                &environment,
-                                timeout,
-                                &self.pid,
-                                &self.interrupt,
-                            )?,
-                        };
-                        check_operation(end, &self.interrupt, cancel)?;
-                        #[cfg(windows)]
-                        let mut command = {
-                            let python = launch
-                                .python
-                                .to_str()
-                                .ok_or("Python executable path is not UTF-8")?;
-                            let mut args: Vec<String> = ["-I", "-S", "-u", "-c", PYTHON_DRIVER]
-                                .map(String::from)
-                                .into();
-                            for site in launch.site.iter() {
-                                args.push(
-                                    site.to_str()
-                                        .ok_or("kernel site-packages path is not UTF-8")?
-                                        .to_owned(),
-                                );
-                            }
-                            windows_kernel_command(ctx.workspace, python, &args)?
-                        };
-                        #[cfg(not(windows))]
-                        let mut command = {
-                            let flags = if launch.bundle.is_some() {
-                                "-I -S -B -u -c"
-                            } else if launch.isolate_site {
-                                "-I -S -u -c"
-                            } else {
-                                "-I -u -c"
-                            };
-                            let sites = match &launch.site {
-                                Some(site) => format!(
-                                    " {}",
-                                    shell_quote(
-                                        site.to_str()
-                                            .ok_or("kernel site-packages path is not UTF-8")?
-                                    )
-                                ),
-                                None => String::new(),
-                            };
-                            let script = format!(
-                                "{} {} {flags} {} {sites}",
-                                fork_fence_prefix(ctx.workspace),
-                                shell_quote(
-                                    launch
-                                        .python
-                                        .to_str()
-                                        .ok_or("Python executable path is not UTF-8")?
-                                ),
-                                shell_quote(PYTHON_DRIVER),
-                            );
-                            super::shell::shell_command_fenced(
-                                ctx.workspace,
-                                &script,
-                                ctx.workspace.root(),
-                                launch.bundle.as_ref(),
-                            )?
-                        };
-                        strip_runtime_injection(&mut command);
-                        require_fork_containment("eval")?;
-                        check_operation(end, &self.interrupt, cancel)?;
-                        let mut process = NativeProcess::start(command, self.pid.clone())
-                            .map_err(|e| format!("starting Python kernel: {e}"))?;
-                        process.python_bundle = launch.bundle;
-                        process.backend = Some(preludes::EvalBackend::Python);
-                        *slot = Some(process);
+                        start(&mut slot, &attempt)?;
                     }
-                    check_operation(end, &self.interrupt, cancel)?;
+                    attempt.check()?;
                     let scope = CellScope {
                         workspace: ctx.workspace,
                         prelude_mode: if ctx.config.eval.portable_helpers {
@@ -274,6 +232,153 @@ impl PythonRuntime {
         // An interrupt raised during this operation must not reject the next cell.
         self.interrupt.store(false, Ordering::Release);
         result
+    }
+}
+
+/// Owner-local Python runtime: the shared cell lifecycle plus the interpreter launch.
+pub(crate) struct PythonRuntime {
+    config: KernelConfig,
+    cell: CellRuntime,
+}
+impl PythonRuntime {
+    pub(super) fn new(config: KernelConfig) -> Self {
+        Self {
+            config,
+            cell: CellRuntime::new(),
+        }
+    }
+    pub(super) fn fork(&self) -> Self {
+        Self::new(self.config.clone())
+    }
+    /// Requests cancellation of the in-flight cell; a flag left behind would reject the next cell.
+    pub(super) fn cancel(&self) -> bool {
+        self.cell.cancel(CancelDelivery::Interrupt)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run(
+        &self,
+        ctx: &ToolContext,
+        action: CellAction<'_>,
+        args: &Value,
+        cancel: &AtomicBool,
+        adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
+        dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
+        effect_started: &AtomicBool,
+    ) -> Result<CellOutcome, String> {
+        let spec = CellSpec {
+            code: "py",
+            name: "python",
+            timeout_secs: self.config.timeout_secs,
+        };
+        self.cell.run(
+            ctx,
+            spec,
+            action,
+            args,
+            cancel,
+            adopt,
+            dispatch,
+            effect_started,
+            |slot, attempt| {
+                let root = ctx.workspace.root();
+                let timeout = remaining_timeout(attempt.end.at())?;
+                let environment =
+                    env::detect(root, &self.config.venv, &self.config.python, &|key| {
+                        std::env::var(key).ok()
+                    })?;
+                let launch = match environment {
+                    None if use_bundled_python(&self.config.python) => {
+                        Launch::bundled(ctx.workspace)?
+                    }
+                    None => {
+                        let (python, _) = resolve_python(
+                            root,
+                            &self.config.python,
+                            timeout,
+                            attempt.pid.clone(),
+                            attempt.interrupt,
+                        )?;
+                        Launch {
+                            python,
+                            site: None,
+                            bundle: None,
+                            isolate_site: false,
+                        }
+                    }
+                    Some(environment) => resolve_environment(
+                        root,
+                        &environment,
+                        timeout,
+                        attempt.pid,
+                        attempt.interrupt,
+                    )?,
+                };
+                attempt.check()?;
+                #[cfg(windows)]
+                let mut command = {
+                    let python = launch
+                        .python
+                        .to_str()
+                        .ok_or("Python executable path is not UTF-8")?;
+                    let mut args: Vec<String> = ["-I", "-S", "-u", "-c", PYTHON_DRIVER]
+                        .map(String::from)
+                        .into();
+                    for site in launch.site.iter() {
+                        args.push(
+                            site.to_str()
+                                .ok_or("kernel site-packages path is not UTF-8")?
+                                .to_owned(),
+                        );
+                    }
+                    windows_kernel_command(ctx.workspace, python, &args)?
+                };
+                #[cfg(not(windows))]
+                let mut command = {
+                    let flags = if launch.bundle.is_some() {
+                        "-I -S -B -u -c"
+                    } else if launch.isolate_site {
+                        "-I -S -u -c"
+                    } else {
+                        "-I -u -c"
+                    };
+                    let sites = match &launch.site {
+                        Some(site) => format!(
+                            " {}",
+                            shell_quote(
+                                site.to_str()
+                                    .ok_or("kernel site-packages path is not UTF-8")?
+                            )
+                        ),
+                        None => String::new(),
+                    };
+                    let script = format!(
+                        "{} {} {flags} {} {sites}",
+                        fork_fence_prefix(ctx.workspace),
+                        shell_quote(
+                            launch
+                                .python
+                                .to_str()
+                                .ok_or("Python executable path is not UTF-8")?
+                        ),
+                        shell_quote(PYTHON_DRIVER),
+                    );
+                    super::shell::shell_command_fenced(
+                        ctx.workspace,
+                        &script,
+                        ctx.workspace.root(),
+                        launch.bundle.as_ref(),
+                    )?
+                };
+                strip_runtime_injection(&mut command);
+                attempt.check()?;
+                let mut process = NativeProcess::start(command, attempt.pid.clone())
+                    .map_err(|e| format!("starting Python kernel: {e}"))?;
+                process.python_bundle = launch.bundle;
+                process.backend = Some(preludes::EvalBackend::Python);
+                *slot = Some(process);
+                Ok(())
+            },
+        )
     }
 }
 pub(crate) fn resolve_operator_executable(
@@ -419,13 +524,8 @@ fn resolve_python(
     command
         .args(["-I", "-S", "-u", "-c"])
         .arg(PYTHON_PREFLIGHT)
-        .env_clear()
         .current_dir(scratch.path());
-    for (key, value) in std::env::vars_os() {
-        if super::sandbox::child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
-            command.env(key, value);
-        }
-    }
+    super::sandbox::inherit_allowed_env(&mut command);
     strip_runtime_injection(&mut command);
     command
         .env("PWD", scratch.path())
@@ -671,17 +771,10 @@ fn probe_fork_containment(label: &str) -> Result<(), String> {
 /// command gets the fence as its own `sandbox-exec` profile.
 #[cfg(not(windows))]
 pub(super) fn fork_fence_prefix(workspace: &Workspace) -> String {
-    #[cfg(target_os = "linux")]
-    let nested = {
-        let _ = workspace;
-        false
-    };
-    #[cfg(target_os = "macos")]
-    let nested = workspace.unsandboxed;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let nested = {
-        let _ = workspace;
-        true
+    let nested = if cfg!(target_os = "macos") {
+        workspace.unsandboxed
+    } else {
+        !cfg!(target_os = "linux")
     };
     if nested {
         format!("exec /usr/bin/sandbox-exec -p {}", shell_quote(FORK_FENCE))
@@ -710,16 +803,8 @@ pub(super) fn windows_kernel_command(
     let mut command = if workspace.unsandboxed {
         let exe = std::env::current_exe().map_err(|e| format!("locating Dial: {e}"))?;
         let mut command = Command::new(exe);
-        command
-            .arg(CHILD_FENCE_ARG)
-            .arg(program)
-            .args(args)
-            .env_clear();
-        for (key, value) in std::env::vars_os() {
-            if super::sandbox::child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
-                command.env(key, value);
-            }
-        }
+        command.arg(CHILD_FENCE_ARG).arg(program).args(args);
+        super::sandbox::inherit_allowed_env(&mut command);
         command
     } else {
         // The sandboxed launcher runs `LAUNCH_ARG CHILD_FENCE_ARG program args…`: Low integrity
@@ -1010,11 +1095,6 @@ pub(crate) enum CellOutcome {
 /// Host-tool refusal for callbacks issued by a cell that already runs in the background.
 pub(crate) const MOVED_CALLBACK_REFUSAL: &str = "this cell was moved to the background; host tool calls are unavailable there — rerun with background:false to keep it in the foreground";
 
-/// Job id of the background owner, if the runtime is busy.
-pub(crate) fn busy_job(busy: &Mutex<Option<String>>) -> Option<String> {
-    busy.lock().clone()
-}
-
 /// Label of a backgrounded cell: the optional `title` argument, else the runtime name.
 pub(crate) fn cell_label(args: &Value, language: &str) -> Result<String, String> {
     match args.get("title") {
@@ -1130,7 +1210,6 @@ pub(crate) fn native_cell(
         process.ready = true;
     }
     started.store(true, Ordering::Release);
-    let never = || false;
     if let Some(backend) = process.backend {
         let generation = preludes::generation();
         if process.prelude_generation != generation {

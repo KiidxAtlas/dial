@@ -52,6 +52,34 @@ pub(in crate::agent) fn projected_request(
     })
 }
 
+/// Common parent/worker request boundary: compatibility is checked against callable tools,
+/// not the (possibly wider) cache-stable wire surface, before either lifecycle hook runs.
+pub(in crate::agent) fn prepare_provider_request(
+    request: &Chat,
+    ext: &Registry,
+    hooks: &[crate::config::types::HookConfig],
+    root: &Path,
+    interrupt: &AtomicBool,
+    notice: &mut dyn FnMut(&str),
+) -> Result<Option<Chat>> {
+    let projected = projected_request(
+        request,
+        crate::tools::surface::contracts::project_history(
+            &request.messages,
+            &crate::llm::tool_offer::callable(&request.tools),
+            ext,
+        )?,
+    );
+    let rewritten = crate::agent::safety::hooks::provider_request(
+        hooks,
+        root,
+        projected.as_ref().unwrap_or(request),
+        interrupt,
+        notice,
+    )?;
+    Ok(rewritten.or(projected))
+}
+
 /// Zero-based page size of the eligible-tool listing that `tool_search` serves for query `*`
 /// (page 0) and `*:N` (page N). Listing only reports descriptions and status; it enables nothing.
 const TOOL_LIST_PAGE: usize = 16;
@@ -853,7 +881,7 @@ impl<'a> Agent<'a> {
                 self.interrupt.as_ref(),
             )
             .map(|persist| {
-                if persist && let Err(error) = self.persist_permissions() {
+                if persist && let Err(error) = self.persist_latest_permission_rule() {
                     ui.notice(&format!(
                         "The rule applies to this session but could not be saved: {error:#}"
                     ));
@@ -937,28 +965,14 @@ impl<'a> Agent<'a> {
         request: &Chat,
         ui: &mut dyn Ui,
     ) -> Result<Option<Chat>> {
-        let projected = projected_request(
+        prepare_provider_request(
             request,
-            // Recorded contracts are checked against the callable set only: a cache-stable
-            // surface (`llm::tool_offer`) also sends tools this request does not offer.
-            crate::tools::surface::contracts::project_history(
-                &request.messages,
-                &crate::llm::tool_offer::callable(&request.tools),
-                &self.ext,
-            )?,
-        );
-        let mut notices = Vec::new();
-        let rewritten = crate::agent::safety::hooks::provider_request(
+            &self.ext,
             self.tool_hooks(),
             self.workspace.root(),
-            projected.as_ref().unwrap_or(request),
             self.interrupt.as_ref(),
-            &mut |notice| notices.push(notice.to_owned()),
-        )?;
-        for notice in &notices {
-            ui.notice(notice);
-        }
-        Ok(rewritten.or(projected))
+            &mut |notice| ui.notice(notice),
+        )
     }
 
     pub(in crate::agent) fn dispatch(

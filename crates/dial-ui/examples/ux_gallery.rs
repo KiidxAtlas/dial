@@ -777,8 +777,8 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             &format!("Short question selection / {name}"),
             &rows_buffer(
-                dial_ui::ui::questions::framed(
-                    dialog.rows(width as usize, 6),
+                dial_ui::ui::questions::framed_with_roles(
+                    dialog.rows_with_roles(width as usize, 6, theme.glyphs()),
                     width as usize,
                     6,
                     &theme,
@@ -852,9 +852,10 @@ fn main() -> anyhow::Result<()> {
             dial_ui::ui::composer::attachments::Provider {
                 candidates: std::sync::Arc::new(|text| text.contains('@')),
                 preview: std::sync::Arc::new(|_, _| dial_ui::ui::composer::attachments::Preview {
-                    summary:
-                        "Attachments: 1 included · 1 truncated · 1 skipped · estimated 2400 tokens"
-                            .into(),
+                    summary: format!(
+                        "{} · estimated 2400 tokens",
+                        dial_ui::ui::composer::attachments::count_summary(1, 1, 1)
+                    ),
                     issues: vec!["large.txt truncated; missing.txt unavailable".into()],
                     items: vec![dial_ui::ui::composer::attachments::PreviewItem {
                         reference: "@missing.txt".into(),
@@ -992,7 +993,7 @@ fn main() -> anyhow::Result<()> {
             appearance.handle(
                 &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::F(4),
-                    crossterm::event::KeyModifiers::NONE,
+                    crossterm::event::KeyModifiers::SHIFT,
                 )),
                 &keys,
             );
@@ -1687,7 +1688,12 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             title,
             &rows_buffer(
-                dial_ui::ui::questions::framed(dialog.rows(38, 10), 38, 10, &theme),
+                dial_ui::ui::questions::framed_with_roles(
+                    dialog.rows_with_roles(38, 10, theme.glyphs()),
+                    38,
+                    10,
+                    &theme,
+                ),
                 38,
                 10,
             ),
@@ -1732,7 +1738,12 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             title,
             &rows_buffer(
-                dial_ui::ui::questions::framed(dialog.rows(70, 18), 70, 18, &theme),
+                dial_ui::ui::questions::framed_with_roles(
+                    dialog.rows_with_roles(70, 18, theme.glyphs()),
+                    70,
+                    18,
+                    &theme,
+                ),
                 70,
                 18,
             ),

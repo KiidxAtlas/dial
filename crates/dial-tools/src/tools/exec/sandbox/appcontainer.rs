@@ -90,10 +90,7 @@ pub(super) fn profile_name(workspace: &Path) -> String {
     use sha2::{Digest, Sha256};
     let key = workspace.to_string_lossy().to_lowercase();
     let digest = Sha256::digest(key.as_bytes());
-    let hex: String = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hex = crate::hex(&digest[..8]);
     format!("{PROFILE_PREFIX}{hex}")
 }
 

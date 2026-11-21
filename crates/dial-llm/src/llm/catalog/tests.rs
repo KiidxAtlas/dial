@@ -62,6 +62,59 @@ fn bundled_providers_are_listed_without_a_key_and_probed_with_one() {
     );
 }
 #[test]
+fn saved_anthropic_route_reuses_builtin_probe_but_keeps_overrides() {
+    let base = crate::llm::anthropic::BASE_URL;
+    let builtin = ProviderSpec {
+        label: "Anthropic".into(),
+        base_url: base.into(),
+        api_key_env: Some("ANTHROPIC_API_KEY".into()),
+        protocol: Some(ApiProtocol::Anthropic),
+        ..Default::default()
+    };
+    let saved = ModelSelection {
+        provider: "anthropic".into(),
+        model: "claude-opus-5-5".into(),
+        base_url: Some(base.into()),
+        ..Default::default()
+    };
+    let mut selections = vec![
+        saved.clone(),
+        ModelSelection {
+            api_key_env: Some("OTHER_KEY".into()),
+            ..saved.clone()
+        },
+        ModelSelection {
+            base_url: Some("https://example.test/v1".into()),
+            ..saved
+        },
+    ];
+    let routes = selection_endpoints(
+        BTreeMap::from([("anthropic".into(), builtin)]),
+        &mut selections,
+    );
+    assert_eq!(
+        selections[0].api_key_env.as_deref(),
+        Some("ANTHROPIC_API_KEY")
+    );
+    assert_eq!(
+        routes.len(),
+        3,
+        "an implicit built-in key is not a second route"
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|(_, spec)| spec.api_key_env.as_deref() == Some("OTHER_KEY"))
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|(_, spec)| spec.base_url == "https://example.test/v1"
+                && spec.api_key_env.is_none())
+    );
+}
+
+#[test]
 fn token_pricing_splits_cache_writes_by_ttl() {
     let pricing = TokenPricing {
         prompt: 1e-6,
@@ -489,6 +542,291 @@ fn claude_auth_fixture(dir: &Path) {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn antigravity_lists_only_account_wire_ids_including_unknown_models() {
+    use super::subscription::antigravity_models;
+    use serde_json::json;
+    let base = "https://daily-cloudcode-pa.googleapis.com";
+    let result = antigravity_models(
+        base,
+        &json!({"models": {
+            "neon-account-id": {"displayName": "Gemini 4 Neon"},
+            "hidden": {"isInternal": true},
+            "bad\nname": {},
+            "gemini-3.1-pro": {}
+        }}),
+    )
+    .unwrap();
+    let ids: BTreeSet<_> = result.iter().map(|m| m.selection.model.as_str()).collect();
+    assert_eq!(ids, BTreeSet::from(["neon-account-id", "gemini-3.1-pro"]));
+    assert!(result.iter().all(|m| m.available
+        && m.selection.protocol == Some(ApiProtocol::Antigravity)
+        && m.selection.base_url.as_deref() == Some(base)));
+    assert!(
+        antigravity_models(base, &json!({"models": {}}))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(antigravity_models(base, &json!({"models": []})).is_err());
+}
+
+#[test]
+fn antigravity_groups_listed_effort_suffixes_into_model_variant_rows() {
+    use super::subscription::antigravity_models;
+    use crate::llm::profiles::ReasoningEffort;
+    use crate::llm::profiles::ReasoningEffort::{High, Low, Medium, Minimal, Xhigh};
+    use serde_json::json;
+    let base = "https://daily-cloudcode-pa.googleapis.com";
+    let result = antigravity_models(
+        base,
+        &json!({"models": {
+            "gemini-4-neon-low": {}, "gemini-4-neon-medium": {}, "gemini-4-neon-disabled": {},
+            "gemini-4-neon-high": {}, "gemini-4-neon-xhigh": {},
+            "gemini-4-hydrogen": {},
+            "gemini-4-hydrogen-tiered-high": {}, "gemini-4-hydrogen-tiered-xhigh": {},
+            "gemini-3.5-flash-extra-low": {},
+            "gemini-3.5-flash-lite": {},
+            "gpt-oss-120b-medium": {},
+            "gemini-4-carbon-disabled": {},
+            "disabled-preview": {},
+            "explicit-off": {"disabled": true},
+            "internal-only": {"isInternal": true}
+        }}),
+    )
+    .unwrap();
+    // (wire ID, family label, declared levels; None for a plain row).
+    let expected: [(&str, &str, Option<Vec<_>>); 8] = [
+        (
+            "gemini-4-neon-medium",
+            "gemini-4-neon",
+            Some(vec![ReasoningEffort::None, Low, Medium, High, Xhigh]),
+        ),
+        ("gemini-4-hydrogen", "gemini-4-hydrogen", None),
+        (
+            "gemini-4-hydrogen-tiered-high",
+            "gemini-4-hydrogen-tiered",
+            Some(vec![High, Xhigh]),
+        ),
+        (
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash",
+            Some(vec![Minimal]),
+        ),
+        ("gemini-3.5-flash-lite", "gemini-3.5-flash-lite", None),
+        ("gpt-oss-120b-medium", "gpt-oss-120b", Some(vec![Medium])),
+        ("disabled-preview", "disabled-preview", None),
+        (
+            "gemini-4-carbon-disabled",
+            "gemini-4-carbon",
+            Some(vec![ReasoningEffort::None]),
+        ),
+    ];
+    let mut rows: Vec<_> = result
+        .iter()
+        .map(|m| {
+            (
+                m.selection.model.as_str(),
+                m.label.as_str(),
+                m.metadata.declared_reasoning,
+            )
+        })
+        .collect();
+    rows.sort_by_key(|row| row.0);
+    let mut want: Vec<_> = expected.iter().collect();
+    want.sort_by_key(|row| row.0);
+    assert_eq!(rows.len(), want.len(), "{rows:?}");
+    for ((model, label, declared), (wire, family, levels)) in rows.iter().zip(want) {
+        assert_eq!((model, label), (wire, family));
+        let efforts = declared.map(|d| {
+            assert_eq!(d.mode, ThinkingMode::ModelVariant);
+            d.efforts()
+        });
+        assert_eq!(efforts, levels.clone(), "{wire}");
+    }
+}
+
+#[test]
+fn antigravity_base_row_represents_group_and_family_helpers_round_trip() {
+    use super::{antigravity_effort_model, antigravity_family, subscription::antigravity_models};
+    use crate::llm::profiles::ReasoningEffort::{High, Low, Max, Medium, Minimal, Xhigh};
+    use serde_json::json;
+    let result = antigravity_models(
+        "https://example.test",
+        &json!({"models": {"gemini-3.1-pro": {}, "gemini-3.1-pro-low": {}}}),
+    )
+    .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].selection.model, "gemini-3.1-pro");
+    assert_eq!(
+        result[0].metadata.declared_reasoning.map(|d| d.efforts()),
+        Some(vec![Low])
+    );
+    // (input ID, family, effort, wire ID that effort selects in that family).
+    let cases = [
+        (
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash",
+            Minimal,
+            "gemini-3.5-flash-extra-low",
+        ),
+        (
+            "gemini-4-hydrogen-tiered-high",
+            "gemini-4-hydrogen-tiered",
+            High,
+            "gemini-4-hydrogen-tiered-high",
+        ),
+        (
+            "gemini-4-hydrogen",
+            "gemini-4-hydrogen",
+            Low,
+            "gemini-4-hydrogen-low",
+        ),
+        (
+            "gemini-4-neon-medium",
+            "gemini-4-neon",
+            Xhigh,
+            "gemini-4-neon-xhigh",
+        ),
+        (
+            "gemini-4-neon-medium",
+            "gemini-4-neon",
+            Medium,
+            "gemini-4-neon-medium",
+        ),
+        (
+            "gemini-4-neon-disabled",
+            "gemini-4-neon",
+            crate::llm::profiles::ReasoningEffort::None,
+            "gemini-4-neon-disabled",
+        ),
+    ];
+    for (input, family, effort, wire) in cases {
+        assert_eq!(antigravity_family(input), family);
+        assert_eq!(
+            antigravity_effort_model(input, effort).as_deref(),
+            Some(wire)
+        );
+        // Round trip: the produced wire ID parses back to the same family and level.
+        assert_eq!(antigravity_family(wire), family);
+        assert_eq!(
+            antigravity_effort_model(wire, effort).as_deref(),
+            Some(wire)
+        );
+    }
+    assert_eq!(antigravity_effort_model("gemini-4-neon-low", Max), None);
+}
+
+#[test]
+fn antigravity_group_membership_is_per_listed_level_and_route() {
+    use super::subscription::antigravity_models;
+    use crate::llm::model_config::{ApiProtocol, ModelSelection};
+    use serde_json::json;
+    let base = "https://daily-cloudcode-pa.googleapis.com";
+    let entries = antigravity_models(
+        base,
+        &json!({"models": {"gemini-4-neon-low": {}, "gemini-4-neon-medium": {}, "gemini-4-neon-disabled": {}, "gemini-4-hydrogen": {}}}),
+    )
+    .unwrap();
+    let selection = |model: &str, route: &str, account: Option<&str>| ModelSelection {
+        provider: "google-antigravity".into(),
+        model: model.into(),
+        base_url: Some(route.into()),
+        protocol: Some(ApiProtocol::Antigravity),
+        account_id: account.map(str::to_owned),
+        ..Default::default()
+    };
+    // (selection, expected membership). The bare family is unlisted here, so it is not a member.
+    let cases = [
+        (selection("gemini-4-neon-low", base, None), true),
+        (selection("gemini-4-neon-medium", base, None), true),
+        (selection("gemini-4-neon-high", base, None), false),
+        (selection("gemini-4-neon", base, None), false),
+        (selection("gemini-4-hydrogen", base, None), true),
+        (selection("gemini-4-neon-disabled", base, None), true),
+        (
+            selection("gemini-4-neon-low", "https://other.test", None),
+            false,
+        ),
+        (selection("gemini-4-neon-low", base, Some("acct-2")), false),
+    ];
+    for (candidate, member) in cases {
+        let covered = entries
+            .iter()
+            .any(|entry| entry.represents_selection(&candidate));
+        assert_eq!(covered, member, "{}", candidate.model);
+    }
+}
+
+#[test]
+fn antigravity_saved_listing_is_visible_only_under_the_account_that_fetched_it() {
+    use crate::llm::model_config::{ApiProtocol, ModelSelection};
+    use serde_json::json;
+    let home = tempfile::tempdir().unwrap();
+    let file = crate::llm::credential_store::oauth_path(home.path(), "google-antigravity");
+    let grant = |active: &str| {
+        json!({"active": active, "accounts": {
+            "acct-a": {"access": "a", "expires_at_ms": u64::MAX, "account_id": "acct-a", "project_id": "proj-a"},
+            "acct-b": {"access": "b", "expires_at_ms": u64::MAX, "account_id": "acct-b", "project_id": "proj-b"},
+        }})
+    };
+    write_private(&file, &serde_json::to_vec(&grant("acct-a")).unwrap()).unwrap();
+    let saved = test_antigravity_listing(
+        home.path(),
+        &json!({"models": {
+            "gemini-4-neon-low": {"inputTokenLimit": 200_000, "outputTokenLimit": 8192},
+            "gemini-4-neon-medium": {}
+        }}),
+    )
+    .unwrap();
+    assert_eq!(saved[0].selection.context_window, Some(200_000));
+    let selection = ModelSelection {
+        provider: "google-antigravity".into(),
+        model: "gemini-4-neon-low".into(),
+        base_url: saved[0].selection.base_url.clone(),
+        protocol: Some(ApiProtocol::Antigravity),
+        ..Default::default()
+    };
+    // (active account, whether its saved listing is visible). A switch back restores the row.
+    let cases = [("acct-a", true), ("acct-b", false), ("acct-a", true)];
+    for (active, visible) in cases {
+        write_private(&file, &serde_json::to_vec(&grant(active)).unwrap()).unwrap();
+        let listed = saved_listing_models(home.path())
+            .iter()
+            .any(|m| m.selection.provider == "google-antigravity");
+        assert_eq!(listed, visible, "listing under {active}");
+        assert_eq!(
+            super::model_context_window(home.path(), &selection),
+            Some(if visible { 200_000 } else { 524_288 }),
+            "a listed input limit applies only to its account"
+        );
+        assert_eq!(
+            declared_reasoning(home.path(), &selection).is_some(),
+            visible,
+            "declared levels under {active}"
+        );
+    }
+}
+
+#[test]
+fn antigravity_discovery_does_not_advertise_bundled_ids_as_available() {
+    let home = tempfile::tempdir().unwrap();
+    let id = "google-antigravity";
+    // Signed in but missing a project: discovery cannot verify a single model.
+    let file = crate::llm::credential_store::oauth_path(home.path(), id);
+    write_private(
+        &file,
+        br#"{"access":"fixture","expires_at_ms":18446744073709551615}"#,
+    )
+    .unwrap();
+    let (status, models) = oauth_catalog(home.path(), &[])
+        .into_iter()
+        .find(|(status, _)| status.id == id)
+        .unwrap();
+    assert_eq!(status.state, "unavailable");
+    assert!(status.detail.contains("no project ID"), "{}", status.detail);
+    assert!(models.is_empty());
 }
 
 #[test]

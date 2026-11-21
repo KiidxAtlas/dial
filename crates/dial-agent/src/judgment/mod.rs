@@ -8,7 +8,6 @@ pub mod resources;
 pub mod typesafe;
 
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
@@ -512,11 +511,7 @@ fn bounded(text: &str) -> &str {
 
 /// Current unix time in seconds, the clock judgments are cached against.
 pub fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        })
+    i64::try_from(crate::runtime::clock::unix_secs()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

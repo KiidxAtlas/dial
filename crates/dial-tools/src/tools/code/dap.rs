@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     thread,
@@ -27,6 +27,7 @@ use std::{
 };
 
 mod breakpoints;
+mod memory;
 mod select;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -37,11 +38,14 @@ const EVENT_BYTES: usize = 256 * 1024;
 const POLL: Duration = Duration::from_millis(25);
 const REVERSE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCRIPTION: &str = "Approved event-aware DAP control for an operator-installed adapter. Runtime probes use setBreakpoints with logMessage (interpolate {expression}) for non-stopping logpoints; optional condition/hitCondition are adapter-dependent, not automatic capture limits. Check status capabilities and breakpoint verification, read output, then removeBreakpoint to disarm. Expressions may have side effects. launch/attach return when initialized, possibly before their response: setBreakpoints then configurationDone completes configuration. setBreakpoints and removeBreakpoint (source + line) merge into the per-source list; setFunctionBreakpoints and removeFunctionBreakpoint (name) merge into the function list; an empty list clears its scope. Each sends the full merged list and records adapter verification in status.breakpoints. setExceptionBreakpoints replaces the exception set: filters must be advertised by the adapter's exceptionBreakpointFilters (an empty array clears), with optional filterOptions [{filterId, condition?}] (supportsExceptionFilterOptions) and exceptionOptions [{breakMode, path?}] (supportsExceptionOptions); it is a configuration action like breakpoints. exceptionInfo explains the stopped exception when supportsExceptionInfoRequest is advertised; threadId defaults to the stopped thread. restart re-runs the original launch when supportsRestartRequest is advertised and takes no arguments; it returns once the adapter reports initialized or answers the request successfully. A successful answer without initialized completes configuration, so no configurationDone is sent. initialized reopens configuration: breakpoints, exception filters and configurationDone must be sent again (status shows them as unconfigured), and a delayed answer is collected at configurationDone. Execution actions also complete configuration. status exposes capabilities/state; output drains bounded events, debuggee output and adapter stderr with loss counters. Positive timeout_secs covers writes and waits; zero is unlimited until cancellation/adapter exit. Reverse runInTerminal/startDebugging requests are refused, never host-launched. Each call requires approval; launch program/cwd remain inside the workspace. Disconnect/terminate/cancellation destroy the owned adapter process group.";
+/// Help for the memory and session actions, appended to [`DESCRIPTION`].
+const MEMORY_HELP: &str = "readMemory reads count (1-4096) bytes at memoryReference (+offset) when supportsReadMemoryRequest is advertised and returns an addressed hex/ASCII dump; disassemble returns instructionCount (1-256) instructions at memoryReference (+offset, instructionOffset, resolveSymbols) when supportsDisassembleRequest is advertised. Memory references come from evaluate, variables or stackTrace instructionPointerReference. sessions lists every open debug session of this session's DAP tools (tool, adapter, target, state, stopped reason) without starting an adapter.";
 
 /// Creates one lazy, single-session tool per catalogued adapter, plus a `dap` tool that selects an
 /// adapter from its `adapter` argument, the launch program's extension, or project root markers.
 pub fn tools(adapters: &BTreeMap<String, DapAdapterConfig>) -> Vec<Arc<dyn Tool>> {
     let all = Arc::new(catalogue(adapters));
+    let registry = Arc::new(Registry::default());
     let mut tools: Vec<Arc<dyn Tool>> = all
         .keys()
         .map(|id| {
@@ -49,11 +53,57 @@ pub fn tools(adapters: &BTreeMap<String, DapAdapterConfig>) -> Vec<Arc<dyn Tool>
                 format!("dap_{id}"),
                 Some(id.clone()),
                 Arc::clone(&all),
+                Arc::clone(&registry),
             )) as Arc<dyn Tool>
         })
         .collect();
-    tools.push(Arc::new(DapTool::new("dap".to_owned(), None, all)));
+    tools.push(Arc::new(DapTool::new(
+        "dap".to_owned(),
+        None,
+        all,
+        registry,
+    )));
     tools
+}
+
+/// The session slots of every DAP tool built together, for the `sessions` action. Forked
+/// (subagent) tools share their parent's registry, so a listing covers the whole Dial session.
+/// One tool's session slot, shared by the tool and its forks.
+type Slot = Mutex<Option<Session>>;
+
+#[derive(Default)]
+struct Registry(Mutex<Vec<(String, Weak<Slot>)>>);
+
+impl Registry {
+    fn register(&self, tool: &str, slot: &Arc<Mutex<Option<Session>>>) {
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(_, slot)| slot.strong_count() > 0);
+        entries.push((tool.to_owned(), Arc::downgrade(slot)));
+    }
+
+    /// Open sessions by tool. A slot held by a running operation is reported as busy rather than
+    /// waited for, so listing never blocks behind a long step or launch.
+    fn list(&self) -> Value {
+        let entries = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut sessions = Vec::new();
+        for (tool, slot) in entries {
+            let Some(slot) = slot.upgrade() else {
+                continue;
+            };
+            let guard = match slot.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    sessions.push(json!({"tool":tool,"busy":true}));
+                    continue;
+                }
+            };
+            if let Some(session) = guard.as_ref() {
+                sessions.push(session.overview(&tool));
+            }
+        }
+        json!({"count":sessions.len(),"sessions":sessions})
+    }
 }
 
 struct DapTool {
@@ -61,7 +111,8 @@ struct DapTool {
     /// Adapter pinned by a `dap_<id>` tool; `None` for the `dap` tool, which selects per session.
     requested: Option<String>,
     catalogue: Arc<BTreeMap<String, DapAdapterConfig>>,
-    session: Mutex<Option<Session>>,
+    session: Arc<Mutex<Option<Session>>>,
+    registry: Arc<Registry>,
     active: Mutex<Option<Arc<AdapterProcess>>>,
     cancellation: AtomicU64,
     interrupted: AtomicBool,
@@ -76,7 +127,7 @@ impl Tool for DapTool {
 
     fn schema(&self) -> Value {
         let mut properties = json!({
-            "action": {"type":"string","enum":["initialize","launch","attach","setBreakpoints","removeBreakpoint","setFunctionBreakpoints","removeFunctionBreakpoint","setExceptionBreakpoints","exceptionInfo","restart","configurationDone","threads","pause","status","output","continue","next","stepIn","stepOut","stackTrace","scopes","variables","evaluate","disconnect","terminate"]},
+            "action": {"type":"string","enum":["initialize","launch","attach","setBreakpoints","removeBreakpoint","setFunctionBreakpoints","removeFunctionBreakpoint","setExceptionBreakpoints","exceptionInfo","restart","configurationDone","threads","pause","status","output","continue","next","stepIn","stepOut","stackTrace","scopes","variables","evaluate","disconnect","terminate","readMemory","disassemble","sessions"]},
             "program": {"type":"string","description":"launch: program path inside the workspace"},
             "cwd": {"type":"string","description":"launch: working directory inside the workspace (defaults to workspace root)"},
             "args": {"type":"array","items":{"type":"string"},"description":"launch: program arguments"},
@@ -90,12 +141,23 @@ impl Tool for DapTool {
             "terminateDebuggee": {"type":"boolean"},
             "filters": {"type":"array","items":{"type":"string"},"description":"setExceptionBreakpoints: exception filter ids from the adapter's exceptionBreakpointFilters; an empty array clears them"},
             "filterOptions": {"type":"array","items":{"type":"object"},"description":"setExceptionBreakpoints: [{filterId, condition?}]; needs supportsExceptionFilterOptions, and condition needs the filter's supportsCondition"},
-            "exceptionOptions": {"type":"array","items":{"type":"object"},"description":"setExceptionBreakpoints: [{breakMode: never|always|unhandled|userUnhandled, path?: [{names, negate?}]}]; needs supportsExceptionOptions"}
+            "exceptionOptions": {"type":"array","items":{"type":"object"},"description":"setExceptionBreakpoints: [{breakMode: never|always|unhandled|userUnhandled, path?: [{names, negate?}]}]; needs supportsExceptionOptions"},
+            "memoryReference": {"type":"string","description":"readMemory/disassemble: memory reference from evaluate, variables or stackTrace instructionPointerReference"},
+            "count": {"type":"integer","description":"readMemory: bytes to read, 1-4096"},
+            "offset": {"type":"integer","description":"readMemory/disassemble: byte offset from memoryReference (may be negative)"},
+            "instructionOffset": {"type":"integer","description":"disassemble: instruction offset from memoryReference+offset (may be negative)"},
+            "instructionCount": {"type":"integer","description":"disassemble: instructions to return, 1-256"},
+            "resolveSymbols": {"type":"boolean","description":"disassemble: ask the adapter to include symbol names"}
         });
         if self.requested.is_none() {
             properties["adapter"] = json!({"type":"string","description":"Adapter id from the catalogue (gdb, lldb-dap, debugpy, dlv, ...); omitted selects by launch program extension and project root markers"});
         }
-        tool_schema(&self.name, DESCRIPTION, properties, &["action"])
+        tool_schema(
+            &self.name,
+            &format!("{DESCRIPTION} {MEMORY_HELP}"),
+            properties,
+            &["action"],
+        )
     }
 
     fn needs_approval(&self, _args: &Value) -> bool {
@@ -107,6 +169,7 @@ impl Tool for DapTool {
             self.name.clone(),
             self.requested.clone(),
             Arc::clone(&self.catalogue),
+            Arc::clone(&self.registry),
         )))
     }
 
@@ -143,12 +206,16 @@ impl DapTool {
         name: String,
         requested: Option<String>,
         catalogue: Arc<BTreeMap<String, DapAdapterConfig>>,
+        registry: Arc<Registry>,
     ) -> Self {
+        let session = Arc::new(Mutex::new(None));
+        registry.register(&name, &session);
         Self {
             name,
             requested,
             catalogue,
-            session: Mutex::new(None),
+            session,
+            registry,
             active: Mutex::new(None),
             cancellation: AtomicU64::new(0),
             interrupted: AtomicBool::new(false),
@@ -329,6 +396,10 @@ impl DapTool {
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| DapError::user("action must be a string"))?;
+        // Listing reads other tools' slots without taking this one, and never starts an adapter.
+        if action == "sessions" {
+            return Ok(self.registry.list());
+        }
         // Validate before acquiring or modifying a healthy session.
         let arguments = match action {
             "launch" => launch_arguments(workspace, args).map_err(DapError::user)?,
@@ -344,6 +415,8 @@ impl DapTool {
                 exception_breakpoint_arguments(args).map_err(DapError::user)?
             }
             "restart" => restart_arguments(args).map_err(DapError::user)?,
+            "readMemory" => memory::read_memory_arguments(args).map_err(DapError::user)?,
+            "disassemble" => memory::disassemble_arguments(args).map_err(DapError::user)?,
             "initialize" | "configurationDone" | "status" | "output" | "terminate" => json!({}),
             "attach" | "threads" | "pause" | "continue" | "next" | "stepIn" | "stepOut"
             | "stackTrace" | "scopes" | "variables" | "evaluate" | "exceptionInfo" => {
@@ -1077,6 +1150,10 @@ struct Session {
     timeout_secs: u64,
     book: breakpoints::Book,
     exceptions: Value,
+    /// Catalogue id the session was initialized with, for `sessions`.
+    adapter: String,
+    /// What the launch or attach debugs, for `sessions`; `None` before either succeeds.
+    target: Option<Value>,
     _socket_dir: Option<tempfile::TempDir>,
 }
 impl Drop for Session {
@@ -1378,11 +1455,14 @@ impl Session {
             timeout_secs: config.timeout_secs,
             book: breakpoints::Book::default(),
             exceptions: Value::Null,
+            adapter: String::new(),
+            target: None,
             // The path is only needed while connecting; `_socket_dir` owns its cleanup.
             _socket_dir: cleanup.0.take(),
         })
     }
     fn initialize(&mut self, id: &str, op: &Operation<'_>) -> DapResult<()> {
+        self.adapter = id.to_owned();
         self.initialized = self.request(
             "initialize",
             json!({
@@ -1729,6 +1809,21 @@ impl Session {
         }
         summary
     }
+    /// One `sessions` entry: identity, target and run state, without capabilities or events.
+    fn overview(&self, tool: &str) -> Value {
+        let state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+        let stopped = state.stopped.as_ref().map(|body| {
+            json!({"reason":body.get("reason"),"threadId":body.get("threadId"),
+                "description":body.get("description")})
+        });
+        json!({
+            "tool":tool,"adapter":self.adapter,"target":self.target,"state":state.status,
+            "active":state.failure.is_none() && state.status != "terminated",
+            "configurationDone":self.configured,"stopped":stopped,"failure":state.failure,
+            "breakpoints":self.book.sources.values().map(Vec::len).sum::<usize>(),
+            "functionBreakpoints":self.book.functions.len(),
+        })
+    }
     fn failure_evidence(&self) -> String {
         let state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
         let events: Vec<&Value> = state
@@ -1856,6 +1951,16 @@ impl Session {
         if action == "exceptionInfo" && !self.supports("supportsExceptionInfoRequest") {
             return Err(DapError::user("adapter does not support exceptionInfo"));
         }
+        for (request, capability) in [
+            ("readMemory", "supportsReadMemoryRequest"),
+            ("disassemble", "supportsDisassembleRequest"),
+        ] {
+            if action == request && !self.supports(capability) {
+                return Err(DapError::user(format!(
+                    "adapter does not support {request} ({capability} is not advertised)"
+                )));
+            }
+        }
         if action == "setExceptionBreakpoints" {
             self.check_exception_request(&arguments)?;
         }
@@ -1884,9 +1989,11 @@ impl Session {
                     "already launched/attached; disconnect before starting another debuggee",
                 ));
             }
+            let target = start_target(action, &arguments);
             let seq = self.send(action, arguments, op)?;
             self.start_request = Some(seq);
             self.launched = true;
+            self.target = Some(target);
             {
                 let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.stopped.is_none() {
@@ -1919,6 +2026,7 @@ impl Session {
                     Ok(body) => body,
                     Err(error) => {
                         self.launched = false;
+                        self.target = None;
                         return Err(error);
                     }
                 }
@@ -1999,6 +2107,9 @@ impl Session {
             return self.breakpoint_action(action, arguments, op);
         }
         let body = self.request(action, arguments, op)?;
+        if action == "readMemory" {
+            return memory::render_memory(body).map_err(DapError::user);
+        }
         if action == "threads"
             && let Some(threads) = body.get("threads").and_then(Value::as_array)
         {
@@ -2012,6 +2123,24 @@ impl Session {
         }
         Ok(body)
     }
+}
+
+/// What a launch or attach debugs, for `sessions`: the request kind plus the program and
+/// arguments of a launch, or the process or address fields of an attach.
+fn start_target(action: &str, arguments: &Value) -> Value {
+    let keys: &[&str] = if action == "launch" {
+        &["program", "args"]
+    } else {
+        &["processId", "pid", "host", "port", "address"]
+    };
+    let mut target = serde_json::Map::new();
+    target.insert("request".into(), json!(action));
+    for key in keys {
+        if let Some(value) = arguments.get(*key).filter(|value| !value.is_null()) {
+            target.insert((*key).into(), value.clone());
+        }
+    }
+    Value::Object(target)
 }
 
 fn read_messages(output: impl Read, wire: Arc<Wire>) {

@@ -25,6 +25,13 @@ updates:
     groups:
       pip:
         update-types: [minor, patch]
+  - package-ecosystem: uv
+    directory: /python
+    schedule:
+      interval: weekly
+    groups:
+      mlx-runtime:
+        update-types: [minor, patch]
   - package-ecosystem: docker
     directory: /
     schedule:

@@ -221,10 +221,7 @@ pub fn bound_text(raw: &str, max_bytes: usize) -> (String, bool) {
     if cleaned.len() <= max_bytes {
         return (cleaned, false);
     }
-    let mut end = max_bytes;
-    while !cleaned.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = cleaned.floor_char_boundary(max_bytes);
     (cleaned[..end].to_owned(), true)
 }
 

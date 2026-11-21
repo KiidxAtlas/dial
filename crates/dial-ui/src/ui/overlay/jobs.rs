@@ -4,7 +4,9 @@
 //! this panel never touches a process itself.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{filled, hint, hint_line, list_row, panel, pressed, scroll_cell},
+    widgets::{
+        filled, hint, hint_line, list_row, panel, pressed, roster_cell, roster_lead, scroll_cell,
+    },
 };
 use crate::ui::{
     chrome::Section,
@@ -35,28 +37,62 @@ pub struct JobRow {
     pub mode: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobLifecycle {
+    Running,
+    StopRequested,
+    Cancelled,
+    Failed,
+    Stopped,
+    Completed,
+    Unknown,
+}
+
+impl JobLifecycle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::StopRequested => "Stop requested",
+            Self::Cancelled => "Cancelled",
+            Self::Failed => "Failed",
+            Self::Stopped => "Stopped",
+            Self::Completed => "Completed",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
 impl JobRow {
-    /// Shared lifecycle wording from owner evidence only; no status-string interpretation.
-    pub fn lifecycle_label(&self) -> &'static str {
+    /// Lifecycle from owner evidence only; the label and the attention check both read this mapping.
+    pub fn lifecycle(&self) -> JobLifecycle {
         if self.running {
             return if self.stop_requested {
-                "Stop requested"
+                JobLifecycle::StopRequested
             } else {
-                "Running"
+                JobLifecycle::Running
             };
         }
         match self.process_outcome.as_ref() {
-            Some(outcome) if outcome.cancelled => "Cancelled",
-            Some(outcome) if outcome.timed_out => "Failed",
-            Some(outcome) if self.stop_requested && outcome.signal.is_some() => "Stopped",
-            Some(outcome) if outcome.exit_code == Some(0) => "Completed",
-            Some(outcome) if outcome.exit_code.is_some() || outcome.signal.is_some() => "Failed",
-            _ => "Unknown",
+            Some(outcome) if outcome.cancelled => JobLifecycle::Cancelled,
+            Some(outcome) if outcome.timed_out => JobLifecycle::Failed,
+            Some(outcome) if self.stop_requested && outcome.signal.is_some() => {
+                JobLifecycle::Stopped
+            }
+            Some(outcome) if outcome.exit_code == Some(0) => JobLifecycle::Completed,
+            Some(outcome) if outcome.exit_code.is_some() || outcome.signal.is_some() => {
+                JobLifecycle::Failed
+            }
+            _ => JobLifecycle::Unknown,
         }
     }
 
+    /// Shared lifecycle wording from owner evidence only; no status-string interpretation.
+    pub fn lifecycle_label(&self) -> &'static str {
+        self.lifecycle().label()
+    }
+
     pub fn needs_attention(&self) -> bool {
-        !self.running && self.lifecycle_label() == "Failed"
+        self.lifecycle() == JobLifecycle::Failed
     }
 }
 
@@ -275,7 +311,7 @@ impl JobsOverlay {
     /// A left click on screen `row` of the list: selects the job drawn there; clicking the selected
     /// job attaches to it, like Enter. The list starts below the panel border.
     pub fn click(&mut self, row: u16) -> OverlayEvent {
-        if self.attached.is_some() || self.jobs.is_empty() {
+        if self.panel_keys.open() || self.attached.is_some() || self.jobs.is_empty() {
             return OverlayEvent::None;
         }
         let list_h = self.list_h.get().max(1);
@@ -317,30 +353,34 @@ impl JobsOverlay {
         if self.panel_keys.draw(frame, ctx, "Processes", "Enter attaches or views output · Ctrl+] detaches without stopping the process · while attached, Ctrl+C goes only to that process terminal (the program decides how to respond). Other processes and workers continue.", false, false) {
             return;
         }
-        let extra = match &self.attached {
-            Some(name) => format!("viewing {name}"),
+        let (title, extra) = match &self.attached {
+            Some(name) => ("Output", text::one_line(name)),
             None => {
                 let running = self.jobs.iter().filter(|job| job.running).count();
                 let exited = self.jobs.len() - running;
-                match (running, exited) {
+                let counts = match (running, exited) {
                     (0, 0) => "none yet".to_owned(),
                     (r, 0) => format!("{r} running"),
-                    (0, e) => format!("{e} finished (see outcomes)"),
-                    (r, e) => format!(
-                        "{r} running {} {e} finished (see outcomes)",
-                        ctx.theme.sym(Sym::Dot)
-                    ),
-                }
+                    (0, e) => format!("{e} finished"),
+                    (r, e) => format!("{r} running {} {e} finished", ctx.theme.sym(Sym::Dot)),
+                };
+                let wide = "Background processes";
+                let title = if text::width(wide) + text::width(&counts) + 3
+                    <= usize::from(frame.area().width)
+                {
+                    wide
+                } else {
+                    "Processes"
+                };
+                (title, counts)
             }
         };
-        panel(
-            frame,
-            ctx.theme,
-            Section::Sandbox,
-            "Background processes",
-            &extra,
-            |w, h| self.compose(w, h, ctx),
-        );
+        // Both titles share the top row, with an outer margin and a cell between them.
+        let room = usize::from(frame.area().width).saturating_sub(text::width(title) + 3);
+        let extra = text::ellipsize(&extra, room, ctx.theme.ascii());
+        panel(frame, ctx.theme, Section::Sandbox, title, &extra, |w, h| {
+            self.compose(w, h, ctx)
+        });
     }
 
     fn compose(&self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
@@ -427,7 +467,7 @@ impl JobsOverlay {
             }
             // State words lead, muted; key hints follow with the way out last, so narrow footers
             // drop the middle hints, never the exit.
-            let arrows = super::settings::arrows(theme, super::settings::Axis::Vertical);
+            let arrows = super::widgets::arrows(theme, super::widgets::Axis::Vertical);
             let (lead, segments) = if interactive {
                 (
                     String::new(),
@@ -455,7 +495,7 @@ impl JobsOverlay {
                 )
             };
             out.truncate(h.saturating_sub(1));
-            out.push(super::settings::hint_line_after(theme, &lead, &segments, w));
+            out.push(super::widgets::hint_line_after(theme, &lead, &segments, w));
             return out;
         }
         if self.jobs.is_empty() {
@@ -477,24 +517,22 @@ impl JobsOverlay {
         // Columns shrink on narrow panels; the command takes what is left and ends in an ellipsis.
         let name_w = (w / 4).clamp(8, 20);
         let mode_w = if w >= 60 { 10 } else { 0 };
-        let status_w = (w / 6).clamp(7, 14);
+        let status_w = (w / 6).clamp(10, 15); // Longest compact state plus a gap.
         for (index, job) in self.jobs.iter().enumerate().skip(scroll).take(list_h) {
             let selected = index == self.cursor;
-            let (dot, tok) = if job.running {
-                (theme.sym(Sym::Working), Tok::Success)
-            } else {
-                (theme.sym(Sym::Dot), Tok::Muted)
-            };
-            let pointer = if selected {
-                theme.sym(Sym::Pointer)
-            } else {
-                " "
-            };
+            let [pointer, dot] = roster_lead(theme, selected, job.running);
             let mut meta = String::new();
             if mode_w > 0 {
-                meta.push_str(&pad(&job.mode, mode_w, ascii));
+                meta.push_str(&roster_cell(&job.mode, mode_w, ascii));
             }
-            meta.push_str(&pad(job.lifecycle_label(), status_w, ascii));
+            let state = job.lifecycle();
+            let status =
+                if state == JobLifecycle::StopRequested && status_w <= "Stop requested".len() {
+                    "Stopping"
+                } else {
+                    state.label()
+                };
+            meta.push_str(&roster_cell(status, status_w, ascii));
             if job.terminal && w >= 60 {
                 meta.push_str("pty ");
             }
@@ -502,9 +540,9 @@ impl JobsOverlay {
             out.push(list_row(
                 theme,
                 vec![
-                    Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent)),
-                    Span::styled(format!("{dot} "), theme.fg(tok)),
-                    Span::styled(pad(&job.name, name_w, ascii), theme.fg(Tok::Text)),
+                    pointer,
+                    dot,
+                    Span::styled(roster_cell(&job.name, name_w, ascii), theme.fg(Tok::Text)),
                     Span::styled(meta, theme.fg(Tok::Muted)),
                     Span::styled(
                         text::ellipsize(
@@ -552,20 +590,13 @@ impl JobsOverlay {
             }
             segments.push(format!(
                 "{} select",
-                super::settings::arrows(theme, super::settings::Axis::Vertical)
+                super::widgets::arrows(theme, super::widgets::Axis::Vertical)
             ));
         }
         segments.push(hint(ctx.keys, Action::SelectCancel, "close"));
         out.push(hint_line(theme, &segments, w));
         out
     }
-}
-
-/// `value` clipped with an ellipsis to `n - 1` cells, then padded to `n` (one cell of gap).
-fn pad(value: &str, n: usize, ascii: bool) -> String {
-    let clipped = text::ellipsize(value, n.saturating_sub(1), ascii);
-    let gap = n.saturating_sub(text::width(&clipped));
-    format!("{clipped}{}", " ".repeat(gap))
 }
 
 /// One emulated terminal row, with the job's cursor drawn as a reversed cell.

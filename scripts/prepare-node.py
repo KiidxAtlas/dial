@@ -15,7 +15,6 @@ place, so a failed run never leaves a partial payload behind.
 import argparse
 import gzip
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -27,7 +26,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from runtime_payload import PrepareError, download, sha256_file
+from runtime_payload import PrepareError, snapshot_archive
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "runtimes" / "node" / "manifest.json"
@@ -250,22 +249,11 @@ def prepare(target, output, manifest_path=DEFAULT_MANIFEST, archive=None):
     version = manifest["version"]
     name_source = archive if archive is not None else entry["url"].rsplit("/", 1)[-1]
     kind = archive_kind(str(name_source))
-    if archive is not None:
-        archive_path = Path(archive)
-        if not archive_path.is_file():
-            raise PrepareError(f"archive not found: {archive}")
-        actual = sha256_file(archive_path)
-        if not hmac.compare_digest(actual, entry["sha256"]):
-            raise PrepareError(f"archive SHA-256 mismatch for {archive}: expected {entry['sha256']}, got {actual}")
-        gz, metadata, license_text = build_payload(archive_path, kind, entry, target, version)
-    else:
-        with tempfile.TemporaryDirectory(prefix="prepare-node-") as scratch:
-            archive_path = Path(scratch) / "archive"
-            download(entry["url"], archive_path)
-            actual = sha256_file(archive_path)
-            if not hmac.compare_digest(actual, entry["sha256"]):
-                raise PrepareError(f"download SHA-256 mismatch for {entry['url']}: expected {entry['sha256']}, got {actual}")
-            gz, metadata, license_text = build_payload(archive_path, kind, entry, target, version)
+    # The verified snapshot is the only archive the extractor ever reads.
+    with tempfile.TemporaryDirectory(prefix="prepare-node-") as scratch:
+        snapshot = snapshot_archive(Path(scratch) / "archive", entry["sha256"],
+                                    url=None if archive is not None else entry["url"], local=archive)
+        gz, metadata, license_text = build_payload(snapshot, kind, entry, target, version)
     write_output(output, gz, metadata, license_text, target, version)
     return Path(output)
 

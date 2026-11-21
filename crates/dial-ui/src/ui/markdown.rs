@@ -318,55 +318,13 @@ fn highlight(
     spans
 }
 
-/// Clip styled spans to `max` cells. When something is cut the last cell(s) become `ellipsis`
-/// (pass `""` for a plain clip). Never splits a grapheme.
-pub fn truncate_spans(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'static>> {
-    let total: usize = spans.iter().map(|s| text::width(&s.content)).sum();
-    if total <= max {
-        return spans;
-    }
-    let mark_w = text::width(ellipsis);
-    let (room, mark) = if mark_w <= max {
-        (max - mark_w, ellipsis)
-    } else {
-        (max, "")
-    };
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut used = 0;
-    let mut last_style = Style::default();
-    'outer: for span in spans {
-        let mut kept = String::new();
-        for g in span.content.graphemes(true) {
-            let w = text::width(g);
-            if used + w > room {
-                if !kept.is_empty() {
-                    out.push(Span::styled(kept, span.style));
-                    last_style = span.style;
-                }
-                break 'outer;
-            }
-            kept.push_str(g);
-            used += w;
-        }
-        if !kept.is_empty() {
-            out.push(Span::styled(kept, span.style));
-        }
-        last_style = span.style;
-    }
-    if !mark.is_empty() {
-        out.push(Span::styled(mark.to_owned(), last_style));
-    }
-    out
-}
+/// Styled-span clipping lives with the other text primitives; re-exported under its old path.
+pub use super::text::truncate_spans;
 
 fn clip_line(line: Line<'static>, max: usize) -> Line<'static> {
-    if text::line_width(&line) <= max {
-        return line;
-    }
     Line {
-        style: line.style,
-        alignment: line.alignment,
         spans: truncate_spans(line.spans, max, ""),
+        ..line
     }
 }
 
@@ -1360,7 +1318,7 @@ fn diagram_rows(theme: &Theme, title: &str, body: &str, avail: usize) -> Rows {
         if text::width(line) > inner {
             content = truncate_spans(content, inner, ellipsis);
         }
-        let used: usize = content.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&content);
         let mut spans = vec![Span::styled(v.to_owned(), border), Span::styled(" ", fill)];
         spans.extend(content.into_iter().map(|mut s| {
             s.style = s.style.patch(fill);

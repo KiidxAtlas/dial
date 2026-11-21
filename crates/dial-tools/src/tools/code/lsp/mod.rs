@@ -52,6 +52,64 @@ type WriteThroughOwners = Vec<(Weak<AtomicBool>, Weak<LspTool>)>;
 static WRITE_THROUGH: LazyLock<Mutex<WriteThroughOwners>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+/// The process-wide pool every production session draws from (see [`ServerPool`]).
+static SHARED_SERVERS: LazyLock<Arc<ServerPool>> = LazyLock::new(Arc::default);
+
+/// Language servers shared by the sessions of one process: forks, subagents and parallel RPC
+/// sessions that need the same server for the same root reuse one process instead of each
+/// indexing the project again. Entries are weak: a server lives while any session holds it and
+/// shuts down when the last one lets go. The key is the full launch, so a session with different
+/// settings or another root never receives a server configured for someone else.
+#[derive(Default)]
+struct ServerPool {
+    clients: Mutex<HashMap<String, Weak<Client>>>,
+}
+
+impl ServerPool {
+    fn key(server: &Resolved, root: &Path) -> String {
+        json!([
+            server.language,
+            server.program,
+            server.args,
+            server.settings,
+            server.init_options,
+            root
+        ])
+        .to_string()
+    }
+
+    /// The live shared server for this launch, if any session started one. Strong references
+    /// are dropped only after the lock is released, since dropping a client shuts its server down.
+    fn get(&self, key: &str) -> Option<Arc<Client>> {
+        let found = {
+            let mut clients = lock(&self.clients);
+            clients.retain(|_, client| client.strong_count() > 0);
+            clients.get(key).and_then(Weak::upgrade)
+        };
+        found.filter(|client| client.is_alive())
+    }
+
+    /// Publish a freshly started server. When another session published a live one meanwhile,
+    /// returns `Err((existing, started))`; the caller uses `existing` and discards `started`.
+    #[allow(clippy::type_complexity)]
+    fn publish(
+        &self,
+        key: String,
+        started: Arc<Client>,
+    ) -> Result<Arc<Client>, (Arc<Client>, Arc<Client>)> {
+        let mut clients = lock(&self.clients);
+        let existing = clients.get(&key).and_then(Weak::upgrade);
+        match existing {
+            Some(existing) if existing.is_alive() => Err((existing, started)),
+            stale => {
+                clients.insert(key, Arc::downgrade(&started));
+                drop(clients);
+                drop(stale);
+                Ok(started)
+            }
+        }
+    }
+}
 
 /// The `lsp` tool, ready to register. Only this instance (and its forks) publishes write-through;
 /// the internal copy `find` builds for its metadata does not.
@@ -86,6 +144,16 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)], origin: WriteOrigin
     let Some(tool) = write_owner(ws) else {
         return String::new();
     };
+    let owner = tool.session_id;
+    client::with_owner(owner, || writethrough_with(tool, ws, paths, origin))
+}
+
+fn writethrough_with(
+    tool: Arc<LspTool>,
+    ws: &Workspace,
+    paths: &[(PathBuf, u8)],
+    origin: WriteOrigin,
+) -> String {
     let mut clients: Vec<Arc<Client>> = lock(&tool.running)
         .values()
         .filter(|client| client.root() == ws.root() && client.is_alive())
@@ -509,6 +577,8 @@ pub struct LspTool {
     launch: Launcher,
     /// One live client per language, started on first use.
     running: Mutex<HashMap<String, Arc<Client>>>,
+    /// Servers shared with the other sessions of this process (see [`ServerPool`]).
+    pool: Arc<ServerPool>,
     starting: Mutex<Option<Arc<AtomicBool>>>,
     actions: Mutex<HashMap<String, CachedAction>>,
     next_action: AtomicU64,
@@ -669,6 +739,7 @@ impl LspTool {
         );
         tool.diagnostics_on_write = config.diagnostics_on_write;
         tool.format_on_write = config.format_on_write;
+        tool.pool = Arc::clone(&SHARED_SERVERS);
         tool
     }
 
@@ -678,6 +749,8 @@ impl LspTool {
             discovered_bins: Mutex::new(Vec::new()),
             launch: Arc::from(launch),
             running: Mutex::new(HashMap::new()),
+            // Each injected launcher gets its own pool, so test doubles never meet real servers.
+            pool: Arc::default(),
             starting: Mutex::new(None),
             actions: Mutex::new(HashMap::new()),
             next_action: AtomicU64::new(1),
@@ -713,6 +786,13 @@ impl LspTool {
             }
             lock(&self.running).remove(&server.language);
         }
+        // Another session of this process may already run this exact server for this root.
+        // Joining it starts nothing, so it needs no new approval.
+        let key = ServerPool::key(server, ws.root());
+        if let Some(client) = self.pool.get(&key) {
+            lock(&self.running).insert(server.language.clone(), Arc::clone(&client));
+            return Ok(client);
+        }
         // A formerly live server can die after needs_approval was evaluated. Gate the actual
         // lazy spawn, not just the caller's initially predicted action.
         ctx.authorize_mutation("lsp", &[], true)?;
@@ -740,7 +820,14 @@ impl LspTool {
             client.terminate();
             return Err("LSP startup cancelled".into());
         }
-        let client = Arc::new(client);
+        let client = match self.pool.publish(key, Arc::new(client)) {
+            Ok(client) => client,
+            // A concurrent session won the race: use its server and discard this one.
+            Err((existing, discarded)) => {
+                discarded.terminate();
+                existing
+            }
+        };
         lock(&self.running).insert(server.language.clone(), Arc::clone(&client));
         Ok(client)
     }
@@ -1848,7 +1935,7 @@ impl Tool for LspTool {
         }
         let clients: Vec<Arc<Client>> = lock(&self.running).values().cloned().collect();
         for client in clients {
-            client.cancel_pending_requests();
+            client.cancel_pending_requests(self.session_id);
         }
     }
 
@@ -1858,6 +1945,7 @@ impl Tool for LspTool {
             discovered_bins: Mutex::new(lock(&self.discovered_bins).clone()),
             launch: Arc::clone(&self.launch),
             running: Mutex::new(HashMap::new()),
+            pool: Arc::clone(&self.pool),
             starting: Mutex::new(None),
             actions: Mutex::new(HashMap::new()),
             next_action: AtomicU64::new(1),
@@ -1882,7 +1970,9 @@ impl Tool for LspTool {
         cancel: &AtomicBool,
     ) -> ToolOutput {
         let mut effects = Effects::Known;
-        let output = match self.run(ctx, args, cancel, &mut effects) {
+        let output = match client::with_owner(self.session_id, || {
+            self.run(ctx, args, cancel, &mut effects)
+        }) {
             Ok(text) => ToolOutput::ok(text),
             Err(message) => ToolOutput::err(message),
         };

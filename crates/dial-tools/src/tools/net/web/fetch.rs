@@ -11,7 +11,7 @@ use crate::config::types::DEFAULT_WEB_TIMEOUT_SECS;
 #[cfg(test)]
 use dial_llm::url::MAX_URL_LEN;
 use dial_llm::url::has_scheme;
-pub use dial_llm::url::parse_url;
+pub use dial_llm::url::{parse_url, percent_encode};
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -524,19 +524,6 @@ fn normalize_path(path: &str) -> String {
         out.insert(0, "");
     }
     out.join("/")
-}
-
-pub fn percent_encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 pub fn percent_decode(text: &str) -> String {

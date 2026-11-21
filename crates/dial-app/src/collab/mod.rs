@@ -8,3 +8,4 @@ pub mod registry;
 pub mod room;
 pub mod server;
 pub mod socket;
+mod viewer;

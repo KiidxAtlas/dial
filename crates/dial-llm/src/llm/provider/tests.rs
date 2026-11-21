@@ -1200,6 +1200,45 @@ fn codex_rotation_success() -> Script {
 }
 
 #[test]
+fn responses_upstream_503_retries_the_same_route_body_and_account() {
+    for subscription in [false, true] {
+        let server = fake::serve(vec![
+            Script::HttpHeaders {
+                status: 503,
+                headers: vec![],
+                body: b"upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure".to_vec(),
+            },
+            codex_rotation_success(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let _first_party = llm::responses::test_first_party(&server.url);
+        let mut remote = if subscription {
+            rotation_backend(dir.path(), &format!("{}/codex/responses", server.url))
+        } else {
+            backend(endpoint(&format!("{}/v1", server.url)))
+                .with_protocol(Some(ApiProtocol::Responses))
+        };
+        let reply = remote.chat(None, &request(), 5, None).unwrap();
+        assert_eq!(reply.text, "rotated");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let path = if subscription {
+            "/codex/responses"
+        } else {
+            "/v1/responses"
+        };
+        for raw in &requests {
+            assert_eq!(request_line(raw), format!("POST {path} HTTP/1.1"));
+            assert_eq!(
+                header(raw, "chatgpt-account-id").as_deref(),
+                subscription.then_some("oaiapp_test")
+            );
+        }
+        assert_eq!(fake::body(&requests[0]), fake::body(&requests[1]));
+    }
+}
+
+#[test]
 fn chatgpt_portable_failover_pins_backend_and_replays_next_request() {
     let dir = tempfile::tempdir().unwrap();
     let server = fake::serve(vec![
@@ -3124,6 +3163,29 @@ fn native_anthropic_post_response_failures_never_replay_and_cancel_is_typed() {
         .unwrap_err();
     assert!(error.downcast_ref::<llm::Interrupted>().is_some());
     assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn hosted_fable_gateway_drops_even_pinned_sampling_on_a_bounded_call() {
+    let server = fake::serve(vec![ok("done")]);
+    let model = "anthropic/claude-fable-5.1";
+    let mut profile = llm::profiles::ModelProfile::minimal("openrouter", model);
+    profile.capabilities.top_p = true;
+    profile.temperature = Some(0.7);
+    profile.top_p = Some(0.9);
+    let mut remote = backend(ProviderKind::Endpoint {
+        base_url: server.url.clone(),
+        model: model.to_owned(),
+        api_key: None,
+    })
+    .with_profile(profile);
+    remote.chat(None, &request(), 5, None).unwrap();
+    let body = fake::body(&server.requests()[0]);
+    assert!(
+        body.get("temperature").is_none() && body.get("top_p").is_none(),
+        "{body}"
+    );
+    assert_eq!(body["max_tokens"], 16);
 }
 
 #[test]

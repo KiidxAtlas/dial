@@ -6,10 +6,9 @@
 //! or without the rows for it. Every value comes from the todo list and status the shell already
 //! holds; the panel never changes task state.
 use super::{
-    Rows, chrome,
-    markdown::truncate_spans,
-    tasks, text,
-    theme::{Sym, Theme, Tok},
+    Rows, chrome, tasks, text,
+    theme::{Theme, Tok},
+    tool_cards::frame::Frame,
     welcome,
 };
 use crate::agent::workflow::todo::{Status, Task, TodoList};
@@ -28,8 +27,6 @@ pub const MAX_WIDTH: usize = 100;
 pub const MIN_ROWS: usize = 4;
 /// Recorded reason or finding lines shown under the steps.
 const DETAIL_LINES: usize = 3;
-/// Fixed-width progress indicator in the live card header.
-const PROGRESS_CELLS: usize = 8;
 
 /// The card's view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,19 +94,21 @@ pub fn rows(
                 .take(2.min(max_rows - 3))
                 .map(|task| tasks::task_spans(task, "", theme, spinner, false)),
         );
-        let inner = body.len();
-        return card(
-            theme,
-            card_w,
-            Some(&plan_title(todo, theme)),
-            None,
-            body,
-            inner,
-        );
+        let top = plan_title(todo, theme);
+        return card(theme, card_w, &top, None, body, max_rows - 2);
     }
     // The top and bottom borders and the tab strip take three rows; the detail gets the rest.
     let detail_rows = max_rows - 3;
-    let mut body = vec![tab_strip(theme, tab)];
+    let mut body = vec![
+        super::overlay::widgets::tab_strip(
+            theme,
+            &Tab::ALL.map(Tab::label),
+            tab as usize,
+            true,
+            content_w,
+        )
+        .spans,
+    ];
     body.extend(detail(
         todo,
         facts,
@@ -119,36 +118,24 @@ pub fn rows(
         theme,
         spinner,
     ));
-    // Content-sized: the card is as tall as its rows, within the space the caller allows.
-    let inner = body.len().min(max_rows - 2);
+    // Content-sized: the frame is as tall as its rows, within the space the caller allows.
     let top = plan_title(todo, theme);
     let hint = format!("{} next tab", facts.tab_key);
     card(
         theme,
         card_w,
-        Some(&top),
+        &top,
         (!facts.tab_key.is_empty()).then_some(hint.as_str()),
         body,
-        inner,
+        max_rows - 2,
     )
 }
 
 /// The live plan uses the same compact progress language as the transcript cards.
 fn plan_title(todo: &TodoList, theme: &Theme) -> String {
     let (closed, total) = todo.progress();
-    let filled = (closed * PROGRESS_CELLS)
-        .div_ceil(total.max(1))
-        .min(PROGRESS_CELLS);
-    let (full, empty) = if theme.ascii() {
-        ("#", "-")
-    } else {
-        ("▰", "▱")
-    };
-    format!(
-        "Plan {}{} {closed}/{total} done",
-        full.repeat(filled),
-        empty.repeat(PROGRESS_CELLS - filled)
-    )
+    let (full, empty) = tasks::progress_bar(closed, total, theme);
+    format!("Plan {full}{empty} {closed}/{total} done")
 }
 
 /// The step the panel follows: in progress, else blocked, else the next pending one.
@@ -156,20 +143,6 @@ fn focus_index(tasks: &[Task]) -> Option<usize> {
     [Status::InProgress, Status::Blocked, Status::Pending]
         .into_iter()
         .find_map(|status| tasks.iter().position(|t| t.status == status))
-}
-
-fn tab_strip(theme: &Theme, active: Tab) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (i, tab) in Tab::ALL.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!(" {} ", tab.label()),
-            chrome::tab_style(theme, tab == active),
-        ));
-    }
-    spans
 }
 
 /// The tab's rows, at most `avail` of them. The plan tab shows the focused step inside the
@@ -245,69 +218,28 @@ fn detail(
     }
 }
 
-/// A rounded card of exactly `width` cells and `inner + 2` rows, with optional labels set into
-/// the top and bottom edges. Body rows past `inner` are dropped; wide rows are truncated.
+/// A framed card `width` cells wide, its title on the top edge and an optional key hint on the
+/// bottom. The body is cut to `max_body` rows and the frame primitive owns the edges and clipping.
 fn card(
     theme: &Theme,
     width: usize,
-    top: Option<&str>,
+    top: &str,
     bottom: Option<&str>,
-    body: Vec<Vec<Span<'static>>>,
-    inner: usize,
+    mut body: Vec<Vec<Span<'static>>>,
+    max_body: usize,
 ) -> Rows {
-    let border = theme.fg(Tok::Border);
-    let h = theme.sym(Sym::BoxH).to_owned();
-    let v = theme.sym(Sym::BoxV).to_owned();
-    let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
-    // The top label is a title; the bottom one is a key hint and stays as quiet as the frame.
-    let edge = |left: &str, right: &str, label: Option<&str>, tok: Tok| -> Line<'static> {
-        let label = label
-            .map(|label| {
-                format!(
-                    " {} ",
-                    text::clip(&text::one_line(label), width.saturating_sub(7))
-                )
-            })
-            .filter(|label| text::width(label) + 3 <= width);
-        match label {
-            Some(label) => {
-                let fill = width - 3 - text::width(&label);
-                Line::from(vec![
-                    Span::styled(format!("{left}{h}"), border),
-                    Span::styled(label, theme.fg(tok)),
-                    Span::styled(format!("{}{right}", h.repeat(fill)), border),
-                ])
-            }
-            None => Line::from(Span::styled(
-                format!("{left}{}{right}", h.repeat(width.saturating_sub(2))),
-                border,
-            )),
-        }
-    };
-    let content_w = width.saturating_sub(4);
-    let mut body = body.into_iter();
-    let mut rows = vec![edge(
-        theme.sym(Sym::BoxTl),
-        theme.sym(Sym::BoxTr),
-        top,
-        Tok::Text,
-    )];
-    for _ in 0..inner {
-        let spans = truncate_spans(body.next().unwrap_or_default(), content_w, &ellipsis);
-        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
-        let mut line = vec![Span::styled(format!("{v} "), border)];
-        line.extend(spans);
-        line.push(Span::raw(" ".repeat(content_w.saturating_sub(used))));
-        line.push(Span::styled(format!(" {v}"), border));
-        rows.push(Line::from(line));
+    body.truncate(max_body);
+    let mut frame = Frame::new(
+        vec![Span::styled(top.to_owned(), theme.fg(Tok::Text))],
+        theme.fg(Tok::Border),
+    );
+    frame
+        .sections
+        .push((None, body.into_iter().map(Line::from).collect()));
+    if let Some(hint) = bottom {
+        frame.foot = vec![Span::styled(hint.to_owned(), theme.fg(Tok::Dim))];
     }
-    rows.push(edge(
-        theme.sym(Sym::BoxBl),
-        theme.sym(Sym::BoxBr),
-        bottom,
-        Tok::Dim,
-    ));
-    rows
+    frame.rows(theme, width)
 }
 
 #[cfg(test)]

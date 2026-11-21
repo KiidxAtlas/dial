@@ -26,19 +26,10 @@ const ORDER: &[&str] = &[
 
 /// Resolve a bare command on PATH; paths with separators resolve against `root`, the adapter's spawn cwd.
 pub fn which(program: &Path, root: &Path) -> Option<PathBuf> {
-    if program.as_os_str().is_empty() {
-        return None;
-    }
     if program.components().count() > 1 {
-        return resolve_program(&root.join(program));
+        return crate::platform::fs::find_program(&root.join(program), None);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| resolve_program(&dir.join(program)))
-}
-
-/// Appends (never substitutes) a `PATHEXT` suffix on Windows, so `node.v2` finds `node.v2.cmd`.
-fn resolve_program(candidate: &Path) -> Option<PathBuf> {
-    crate::platform::fs::executable_candidate(candidate)
+    crate::platform::fs::find_program(program, std::env::var_os("PATH").as_deref())
 }
 
 fn available(config: &DapAdapterConfig, root: &Path) -> bool {

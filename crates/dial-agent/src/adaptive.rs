@@ -367,7 +367,7 @@ pub fn local_request_settings(
     });
     // An output allowance left to the serving host is not sent (the same condition the wire
     // builders use), so it is not a Dial value.
-    let max_tokens = if profile.is_some_and(|p| p.inherit_output_limit && p.max_tokens.is_none()) {
+    let max_tokens = if profile.is_some_and(ModelProfile::inherits_output_limit) {
         Value::Null
     } else {
         json!(request.max_tokens)

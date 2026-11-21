@@ -956,6 +956,21 @@ impl Config {
                 .and_then(|id| config.providers.get(id))
                 .and_then(|p| p.protocol);
         }
+        // 0.3.12 saved /effort for this exact Antigravity model with the OpenAI API.
+        // Repair only Dial's generated profile key, in memory; preserve operator profiles.
+        if config.provider.as_deref() == Some("google-antigravity")
+            && config
+                .endpoint
+                .as_ref()
+                .and_then(|e| e.protocol)
+                .is_none_or(|p| p == crate::llm::model_config::ApiProtocol::Antigravity)
+            && let Some(profile) = config.model_profiles.get_mut("reasoning_3d11abc2a71adcb1")
+            && profile.provider == "google-antigravity"
+            && profile.model == "gemini-3.1-pro"
+            && profile.capabilities.reasoning == crate::llm::profiles::ReasoningApi::OpenaiEffort
+        {
+            profile.capabilities.reasoning = crate::llm::profiles::ReasoningApi::GeminiLevel;
+        }
         if let Some(endpoint) = &mut config.endpoint {
             endpoint.api_key_env = endpoint
                 .api_key_env

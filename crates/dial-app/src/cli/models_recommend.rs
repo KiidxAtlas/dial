@@ -7,6 +7,7 @@ use crate::config::paths::Layout;
 use crate::config::types::Config;
 use crate::llm::catalog;
 use crate::llm::local_fit::{self, Architecture, Estimate, Fit};
+use crate::units::human_bytes;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
@@ -366,10 +367,6 @@ fn fit_label(fit: Fit) -> &'static str {
     }
 }
 
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / GIB as f64)
-}
-
 fn reliability_cell(recorded: Option<&Recorded>) -> String {
     match recorded {
         None => "not measured".to_owned(),
@@ -386,7 +383,7 @@ fn reliability_cell(recorded: Option<&Recorded>) -> String {
 fn format_report(report: &Report) -> String {
     let mut out = String::new();
     let memory = match report.memory_bytes {
-        Some(bytes) => format!("{} ({})", gib(bytes), report.memory_source),
+        Some(bytes) => format!("{} ({})", human_bytes(bytes), report.memory_source),
         None => "unknown (pass --memory-gb)".to_owned(),
     };
     let kv = report
@@ -436,9 +433,9 @@ fn format_report(report: &Report) -> String {
                     } else {
                         row.label.clone()
                     },
-                    row.weights_bytes.map_or("-".to_owned(), gib),
-                    estimate.map_or("-".to_owned(), |e| gib(e.kv_bytes)),
-                    estimate.map_or("-".to_owned(), |e| gib(e.resident_bytes)),
+                    row.weights_bytes.map_or("-".to_owned(), human_bytes),
+                    estimate.map_or("-".to_owned(), |e| human_bytes(e.kv_bytes)),
+                    estimate.map_or("-".to_owned(), |e| human_bytes(e.resident_bytes)),
                     max_ctx,
                     reliability_cell(row.recorded.as_ref()),
                 ]

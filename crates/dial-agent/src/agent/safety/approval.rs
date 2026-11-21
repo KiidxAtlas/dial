@@ -6,6 +6,7 @@ pub(in crate::agent) use worker::{
 };
 
 use crate::agent::{Decision, Ui, workers::subagents};
+use crate::units::human_bytes;
 use crate::{config::types::Approval, llm::ToolCall, tools::integrations::ext::Registry};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -1107,6 +1108,25 @@ pub fn save(path: &Path, rules: &[PermissionRule]) -> Result<()> {
     Ok(())
 }
 
+/// Read-modify-write of the saved rules under an exclusive advisory lock on `<file>.lock`, so
+/// concurrent Dial sessions cannot lose each other's edits. Readers take no lock: `save` replaces
+/// the file atomically, so `load` always sees a complete file.
+pub fn update(path: &Path, edit: impl FnOnce(&mut Vec<PermissionRule>)) -> Result<()> {
+    let parent = path.parent().context("permissions path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("toml.lock"))
+        .context("opening project permissions lock")?;
+    lock.lock().context("locking project permissions")?;
+    let mut rules = load(path)?;
+    edit(&mut rules);
+    save(path, &rules)
+}
+
 /// Observational provenance, never an authorization token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1229,13 +1249,6 @@ impl Denial {
 pub fn batch_call_line(call: &ToolCall) -> String {
     let args = &call.arguments;
     let text = |key: &str| args[key].as_str().unwrap_or("");
-    let size = |bytes: usize| {
-        if bytes < 1024 {
-            format!("{bytes} B")
-        } else {
-            format!("{:.1} KiB", bytes as f64 / 1024.0)
-        }
-    };
     let line = match call.name.as_str() {
         "write" if args["files"].is_array() => {
             let paths = crate::tools::declared_write_targets(args).unwrap_or_default();
@@ -1250,7 +1263,7 @@ pub fn batch_call_line(call: &ToolCall) -> String {
                 "write {} · {} lines, {}",
                 text("path"),
                 content.lines().count(),
-                size(content.len())
+                human_bytes(content.len() as u64)
             )
         }
         "edit" => {
@@ -1759,7 +1772,7 @@ fn authorize_inner(
             explain(ui, call, PolicyReason::ReadOnly);
             Err(Denial::ReadOnly)
         }
-        Approval::Auto => {
+        Approval::Auto | Approval::Yolo => {
             explain(ui, call, PolicyReason::AutomaticMode);
             Ok(false)
         }

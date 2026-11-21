@@ -1,5 +1,6 @@
 //! Version control and GitHub CLI tools.
 
+pub(in crate::tools) mod forge_policy;
 pub mod gh;
 pub(in crate::tools) mod gh_cache;
 pub(in crate::tools) mod gh_common;
@@ -13,3 +14,5 @@ pub mod git;
 pub mod git_patch;
 pub mod glab;
 pub mod tea;
+#[cfg(test)]
+mod test_support;

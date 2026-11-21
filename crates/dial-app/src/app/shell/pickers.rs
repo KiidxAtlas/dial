@@ -7,6 +7,55 @@ use crate::app::shell::Shell;
 use crate::config::types::Approval;
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 
+/// Rules as picker rows, numbered the way `/permissions remove <number>` expects, with the count
+/// of saved rules. A rule the project file holds is saved: its row adds `--persist`, so removing
+/// it revokes it from the project. Any other rule is session-only: removing it only forgets it.
+fn rule_items(agent: &Agent<'_>) -> (usize, Vec<ChoiceItem>) {
+    let saved = agent
+        .layout()
+        .and_then(|layout| {
+            crate::agent::safety::approval::load(&layout.state_dir.join("permissions.toml")).ok()
+        })
+        .unwrap_or_default();
+    let mut saved_count = 0;
+    let items = agent
+        .permission_rules()
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let is_saved = saved.contains(rule);
+            saved_count += usize::from(is_saved);
+            let paths: String = rule
+                .paths
+                .iter()
+                .map(|path| format!(" --path {path}"))
+                .collect();
+            ChoiceItem {
+                value: format!("{}{}", index + 1, if is_saved { " --persist" } else { "" }),
+                label: format!(
+                    "{}. {} {}",
+                    index + 1,
+                    rule.tool,
+                    rule.command_prefix.join(" ")
+                )
+                .trim_end()
+                .to_owned(),
+                detail: format!(
+                    "{} · {:?}{paths}",
+                    if is_saved {
+                        "Saved in this project"
+                    } else {
+                        "This session only"
+                    },
+                    rule.effect
+                ),
+                current: false,
+            }
+        })
+        .collect();
+    (saved_count, items)
+}
+
 impl Shell {
     pub(in crate::app) fn side_thread_picker(&self) -> ChoiceSpec {
         let mut items: Vec<_> = self
@@ -113,7 +162,7 @@ impl Shell {
                             .expect("approval metadata");
                         ChoiceItem {
                             label: crate::ui::status::approval_label(value).to_owned(),
-                            detail: format!("{value} · {}", mode.description()),
+                            detail: approval_detail(value, mode),
                             ..pick(value, mode.description(), *value == current)
                         }
                     })
@@ -209,32 +258,43 @@ impl Shell {
                     ("Filter themes:", format!("Colors and glyphs; now {active}")),
                 ))
             }
-            ("permissions", "remove") => {
-                let items: Vec<ChoiceItem> = agent
-                    .permission_rules()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, rule)| ChoiceItem {
-                        value: (index + 1).to_string(),
-                        label: format!(
-                            "{}. {} {}",
-                            index + 1,
-                            rule.tool,
-                            rule.command_prefix.join(" ")
-                        )
-                        .trim_end()
-                        .to_owned(),
-                        detail: format!(
-                            "{:?}{}",
-                            rule.effect,
-                            rule.paths
-                                .iter()
-                                .map(|path| format!(" --path {path}"))
-                                .collect::<String>()
-                        ),
+            ("permissions", "") => {
+                let (saved, rules) = rule_items(agent);
+                let session = rules.len() - saved;
+                let mut items = vec![
+                    ChoiceItem {
+                        value: "allow".into(),
+                        label: "Allow for this session…".into(),
+                        detail: "Fills the composer with /permissions allow bash; type the command and send it.".into(),
                         current: false,
-                    })
-                    .collect();
+                    },
+                    ChoiceItem {
+                        value: "allow --persist".into(),
+                        label: "Always allow in this project…".into(),
+                        detail: "Fills the composer with /permissions allow --persist bash; saved to the project.".into(),
+                        current: false,
+                    },
+                ];
+                items.extend(rules);
+                let mut spec = picker(
+                    "Permission rules",
+                    "permissions",
+                    "",
+                    Some("remove"),
+                    items,
+                    (
+                        "Filter rules:",
+                        format!(
+                            "{saved} saved · {session} this session. Delete or x twice removes a rule: saved rules are revoked, session rules are forgotten."
+                        ),
+                    ),
+                );
+                // The two add rows are actions; Delete on them must not remove anything.
+                spec.fixed = &["allow", "allow --persist"];
+                Some(spec)
+            }
+            ("permissions", "remove") => {
+                let (_, items) = rule_items(agent);
                 let count = items.len();
                 (!items.is_empty()).then(|| {
                     picker(
@@ -323,3 +383,16 @@ impl Shell {
         plan
     }
 }
+
+/// A picker row for an approval mode: its name and what it does. YOLO's row is marked as a risk,
+/// since it is the mode that also runs calls recovered from model text unasked. The picker is the
+/// explicit way to choose it; Shift+Tab never reaches it.
+fn approval_detail(value: &str, mode: Approval) -> String {
+    match mode {
+        Approval::Yolo => format!("{value} · RISK: {}", mode.description()),
+        _ => format!("{value} · {}", mode.description()),
+    }
+}
+
+#[cfg(test)]
+mod tests;

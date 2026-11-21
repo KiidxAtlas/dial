@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::tools::Workspace;
@@ -13,7 +14,95 @@ use self::unix as imp;
 #[cfg(windows)]
 use self::windows as imp;
 
-pub(crate) use imp::{Change, MAX_BYTES, MAX_FILE, Original, inherit_permissions, open_read, read};
+pub(crate) use imp::open_read;
+
+/// A file's text and identity as read for an edit. The text is the editor buffer when the client
+/// bridges the file.
+#[derive(Clone, Debug)]
+pub(crate) struct Original {
+    pub text: String,
+    identity: imp::Identity,
+    permissions: fs::Permissions,
+}
+
+/// One file in a transaction: `before` is what was read, `after` the new text (`None` deletes it).
+#[derive(Clone, Debug)]
+pub(crate) struct Change {
+    pub path: PathBuf,
+    pub before: Option<Original>,
+    pub after: Option<String>,
+    pub report: Option<String>,
+    pub seen_after: Option<Vec<bool>>,
+    pub authored_whole: bool,
+    pub projection: Option<crate::tools::edit::edit_source::Projection>,
+    permissions: Option<fs::Permissions>,
+}
+
+pub(crate) fn inherit_permissions(change: &mut Change, original: &Original) {
+    change.permissions = Some(original.permissions.clone());
+}
+
+/// Current text and identity of `path`, or `None` when it does not exist.
+pub(crate) fn read(ws: &Workspace, path: &Path) -> Result<Option<Original>, String> {
+    match (imp::read_local(ws, path)?, read_bridge(ws, path)) {
+        (Some(mut original), Some(client)) => {
+            original.text = client.read_text(path)?;
+            Ok(Some(original))
+        }
+        (original, _) => Ok(original),
+    }
+}
+
+impl Change {
+    pub fn load(ws: &Workspace, path: PathBuf, after: Option<String>) -> Result<Self, String> {
+        let before = read(ws, &path)?;
+        Ok(Self::new(path, before, after))
+    }
+    pub fn require_text(&self) -> Result<&str, String> {
+        self.before
+            .as_ref()
+            .map(|x| x.text.as_str())
+            .ok_or_else(|| format!("{} does not exist", self.path.display()))
+    }
+    pub fn existing(path: PathBuf, before: Original, after: Option<String>) -> Self {
+        Self::new(path, Some(before), after)
+    }
+
+    fn new(path: PathBuf, before: Option<Original>, after: Option<String>) -> Self {
+        let permissions = before.as_ref().map(|original| original.permissions.clone());
+        Self {
+            path,
+            before,
+            after,
+            report: None,
+            seen_after: None,
+            authored_whole: false,
+            projection: None,
+            permissions,
+        }
+    }
+}
+
+/// Whether `current` is still `before`. `captured` compares only the identity that survives a
+/// rename, because installing an edit rewrites ctime.
+fn matches(current: &Option<Original>, before: &Option<Original>, captured: bool) -> bool {
+    match (current, before) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.text == b.text
+                && if captured {
+                    a.identity.same_captured(&b.identity)
+                } else {
+                    a.identity == b.identity
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Largest file one edit may read or produce, and the largest batch it may stage.
+pub(crate) const MAX_FILE: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// The editor-client target for `path`: a plain text file inside a workspace root. Rich documents,
 /// images, notebooks and paths outside the roots keep their local readers and writers.
@@ -177,6 +266,49 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
     commit_as(ws, changes, lsp::WriteOrigin::Edit)
 }
 
+/// Every precondition of a commit, checked before any mutation or editor-client publication:
+/// batch limits, unique targets, file size, physical alias, freshness against the captured
+/// `before`, and the checkpoint observer for each target. Both platform commits run after this
+/// check, so the rules cannot drift between them.
+fn preflight(ws: &Workspace, changes: &[Change]) -> Result<(), String> {
+    if changes.len() > 128
+        || changes
+            .iter()
+            .map(|x| {
+                x.before.as_ref().map_or(0, |b| b.text.len())
+                    + x.after.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>()
+            > MAX_BYTES
+    {
+        return Err("edit transaction exceeds 128 targets or 32 MiB".into());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for change in changes {
+        if !unique.insert(&change.path) {
+            return Err(format!("duplicate edit target {}", ws.rel(&change.path)));
+        }
+        if change.after.as_ref().is_some_and(|x| x.len() > MAX_FILE) {
+            return Err("edited file exceeds 4 MiB".into());
+        }
+        if ws.resolve(&ws.rel(&change.path))? != change.path {
+            return Err("edit target physical alias changed".into());
+        }
+        if !matches(&read(ws, &change.path)?, &change.before, false) {
+            return Err(format!(
+                "{} changed before commit; re-read it",
+                ws.rel(&change.path)
+            ));
+        }
+        if change.after.is_some() {
+            ws.observe_write(&change.path)?;
+        } else {
+            ws.observe_delete(&change.path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Commits like [`commit`]. `origin` says why the change is published: a format-on-write commit
 /// must not format again (see [`lsp::WriteOrigin`]). Checkpoint observation is the same for all.
 pub(crate) fn commit_as(
@@ -188,7 +320,15 @@ pub(crate) fn commit_as(
         changes.iter().map(|change| change.path.clone()),
     )?;
     crate::tools::exec::execution::before_commit()?;
-    let mut warnings = imp::commit(ws, changes)?;
+    preflight(ws, changes)?;
+    // Plain text in a workspace root goes to the editor client; otherwise the local transaction runs.
+    let mut warnings = if changes.is_empty() {
+        Vec::new()
+    } else if let Some(done) = client_commit(ws, changes) {
+        done?
+    } else {
+        imp::commit(ws, changes)?
+    };
     crate::tools::exec::execution::committed(
         changes
             .iter()

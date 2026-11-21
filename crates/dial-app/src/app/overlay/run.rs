@@ -2,10 +2,10 @@
 
 use crate::app::discovery::shared;
 use crate::app::improve_view::improve_view;
-use crate::app::overlay::ActiveOverlay;
 use crate::app::overlay::compute::ComputeMonitor;
 use crate::app::overlay::env::OverlayEnv;
 use crate::app::overlay::settings::settings_embedding_models;
+use crate::app::overlay::{ActiveOverlay, job_rows};
 use crate::app::shell::TICK;
 use crate::config::types::Config;
 use crate::llm::model_config::{ModelSelection, UiConfig};
@@ -48,21 +48,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
             let jobs = env
                 .background_control
                 .and_then(|control| control.jobs_view(None))
-                .map(|view| {
-                    view.jobs
-                        .into_iter()
-                        .map(|job| crate::ui::overlay::jobs::JobRow {
-                            name: job.name,
-                            command: job.command,
-                            status: job.status,
-                            process_outcome: job.process_outcome,
-                            running: job.running,
-                            stop_requested: job.stop_requested,
-                            terminal: job.terminal,
-                            mode: "session".into(),
-                        })
-                        .collect::<Vec<_>>()
-                });
+                .map(|view| job_rows(view.jobs));
             let download_failure = env.model_downloads.and_then(|downloads| {
                 let mut downloads = downloads.borrow_mut();
                 downloads.poll();
@@ -162,21 +148,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
     {
         let attached = panel.attached().map(str::to_owned);
         if let Some(view) = background.jobs_view(attached.as_deref()) {
-            panel.set_jobs(
-                view.jobs
-                    .into_iter()
-                    .map(|job| crate::ui::overlay::jobs::JobRow {
-                        name: job.name,
-                        command: job.command,
-                        status: job.status,
-                        process_outcome: job.process_outcome,
-                        running: job.running,
-                        stop_requested: job.stop_requested,
-                        terminal: job.terminal,
-                        mode: "session".into(),
-                    })
-                    .collect(),
-            );
+            panel.set_jobs(job_rows(view.jobs));
             panel.set_screen(view.screen, view.cursor);
             panel.set_terminal(view.terminal);
         }

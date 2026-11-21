@@ -1,5 +1,5 @@
 //! Read-only full-text history hits. Opening a conversation is a controller action, never rewind.
-use super::settings::{Axis, arrows, hint_line, list_row, panel, pressed, scroll_cell, typed_char};
+use super::widgets::{Axis, arrows, hint_line, list_row, panel, pressed, scroll_cell, typed_char};
 use super::{DrawCtx, OverlayEvent};
 use crate::storage::session::SearchHit;
 use crate::ui::{
@@ -31,6 +31,8 @@ pub struct HistorySearchOverlay {
     /// Position in `shown`.
     cursor: usize,
     preview_scroll: usize,
+    /// Rows available to the preview in the last rendered layout.
+    preview_height: usize,
     return_available: bool,
     has_more: bool,
     can_load_more: bool,
@@ -59,6 +61,7 @@ impl HistorySearchOverlay {
             shown,
             cursor: 0,
             preview_scroll: 0,
+            preview_height: 0,
             return_available,
             has_more: false,
             can_load_more: false,
@@ -150,9 +153,9 @@ impl HistorySearchOverlay {
             self.cursor = (self.cursor + 1).min(last);
             self.preview_scroll = 0;
         } else if keys.matches(Action::SelectPageUp, key) {
-            self.preview_scroll = self.preview_scroll.saturating_sub(8);
+            self.preview_scroll = self.preview_scroll.saturating_sub(self.preview_height);
         } else if keys.matches(Action::SelectPageDown, key) {
-            self.preview_scroll = self.preview_scroll.saturating_add(8);
+            self.preview_scroll = self.preview_scroll.saturating_add(self.preview_height);
         } else if keys.matches(Action::SelectConfirm, key) {
             if self.filtering {
                 // Enter keeps the filter and returns to the list.
@@ -227,10 +230,7 @@ impl HistorySearchOverlay {
                 .iter()
                 .map(|s| s.split_once(' ').unwrap_or((s, "")))
                 .collect();
-            chrome::key_hint_spans(theme, &pairs)
-                .iter()
-                .map(|s| text::width(&s.content))
-                .sum::<usize>()
+            text::spans_width(&chrome::key_hint_spans(theme, &pairs))
         };
         let room = w.saturating_sub(1);
         if cells(&hints) <= room || hints.len() < 2 {
@@ -250,6 +250,7 @@ impl HistorySearchOverlay {
 
     fn rows(&mut self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(width), usize::from(height));
+        self.preview_height = 0;
         let theme = ctx.theme;
         let muted = |value: String| Line::from(Span::styled(value, theme.fg(Tok::Muted)));
         let count = if self.filter.is_empty() {
@@ -337,6 +338,7 @@ impl HistorySearchOverlay {
             rows.push(muted(format!(" {}", detail.join(" · "))));
             let body = text::wrap_words(&text::one_line(&hit.preview), w.saturating_sub(2).max(1));
             let preview_h = h.saturating_sub(rows.len() + footer.len());
+            self.preview_height = preview_h;
             self.preview_scroll = self
                 .preview_scroll
                 .min(body.len().saturating_sub(preview_h.max(1)));

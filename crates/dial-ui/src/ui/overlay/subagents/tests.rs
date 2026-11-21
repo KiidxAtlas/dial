@@ -392,7 +392,7 @@ fn wide_layout_shows_roster_inspector_and_tabs() {
     assert!(text.contains("1 Workers"), "{text}");
     assert!(text.contains("2 Events"), "{text}");
     assert!(text.contains("task-1-name"), "{text}");
-    assert!(text.contains("Recent activity"), "{text}");
+    assert!(text.contains("RECENT ACTIVITY"), "{text}");
     assert!(text.contains("x stop worker"), "{text}");
 }
 
@@ -436,11 +436,11 @@ fn narrow_layout_shows_roster_until_tab_opens_the_inspector() {
     let narrow = render(60, 24, |frame| hub.draw(frame, &ctx));
     let text: String = narrow.content().iter().map(|cell| cell.symbol()).collect();
     assert!(text.contains("task-1-name"), "{text}");
-    assert!(!text.contains("Usage"), "{text}");
+    assert!(!text.contains("USAGE"), "{text}");
     hub.handle(&key(KeyCode::Tab), &keys);
     let opened = render(60, 60, |frame| hub.draw(frame, &ctx));
     let text: String = opened.content().iter().map(|cell| cell.symbol()).collect();
-    assert!(text.contains("Usage"), "{text}");
+    assert!(text.contains("USAGE"), "{text}");
 }
 
 #[test]
@@ -932,7 +932,7 @@ fn the_waiting_worker_is_first_and_its_card_says_what_it_needs() {
     assert_eq!(hub.selected.as_deref(), Some("task-5"));
     let shown = screen(&mut hub, &theme, 120, 40).join("\n");
     assert!(shown.contains("needs input:"), "{shown}");
-    assert!(shown.contains("Needs your input"), "{shown}");
+    assert!(shown.contains("NEEDS YOUR INPUT"), "{shown}");
 }
 
 #[test]
@@ -1012,7 +1012,7 @@ fn finished_worker_shows_its_result_and_message_count_without_fake_ages() {
         ..Default::default()
     });
     let text = screen(&mut hub, &theme, 140, 40).join("\n");
-    assert!(text.contains("Outcome"), "{text}");
+    assert!(text.contains("OUTCOME"), "{text}");
     assert!(text.contains("Found three call sites"), "{text}");
     assert!(text.contains("2 msgs"), "{text}");
     assert!(!text.contains(" ago"), "untimed events have no age: {text}");

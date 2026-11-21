@@ -40,38 +40,25 @@ pub fn defers_tools(model: &str) -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+pub use super::TestFirstParty;
+
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_FIRST_PARTY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Restores the first-party host check when dropped ([`test_first_party`]).
-#[cfg(any(test, feature = "test-support"))]
-pub struct TestFirstParty(());
-
-#[cfg(any(test, feature = "test-support"))]
-impl Drop for TestFirstParty {
-    fn drop(&mut self) {
-        TEST_FIRST_PARTY.with(|cell| cell.borrow_mut().take());
-    }
 }
 
 /// Treat `origin` (`scheme://host:port`) as Anthropic's first-party host on this thread, so a
 /// fake server can exercise wire behaviour gated on `api.anthropic.com`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_first_party(origin: &str) -> TestFirstParty {
-    TEST_FIRST_PARTY.with(|cell| *cell.borrow_mut() = Some(origin.to_owned()));
-    TestFirstParty(())
+    super::override_first_party(&TEST_FIRST_PARTY, origin)
 }
 
 /// Whether `url` is Anthropic's own Messages host (exactly `api.anthropic.com`), never a proxy.
 pub(super) fn first_party(url: &str) -> bool {
     #[cfg(any(test, feature = "test-support"))]
-    if TEST_FIRST_PARTY.with(|cell| {
-        cell.borrow()
-            .as_deref()
-            .is_some_and(|origin| super::same_origin(url, origin))
-    }) {
+    if super::test_origin_matches(&TEST_FIRST_PARTY, url) {
         return true;
     }
     super::host_of(url).as_deref() == Some("api.anthropic.com")

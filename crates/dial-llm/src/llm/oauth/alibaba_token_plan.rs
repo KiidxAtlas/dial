@@ -12,10 +12,7 @@
 use super::super::model_config::ApiProtocol;
 use super::{Access, Credentials, Flow, Interaction, Login, util};
 use anyhow::{Result, ensure};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 const INTERNATIONAL_AUTH_URL: &str =
     "https://home.qwencloud.com/billing/subscription/token-plan-individual";
@@ -69,7 +66,7 @@ fn sign_in(
         Some("1"),
         false,
     )?;
-    check_cancelled(cancel)?;
+    util::check_cancelled(cancel)?;
     let (base_url, auth_url, instructions) = match choice.trim() {
         "2" => (
             endpoints.china.to_owned(),
@@ -98,17 +95,8 @@ fn sign_in(
     };
 
     open(auth_url, Some(instructions));
-    let answer = ui.prompt_secret(
-        "Paste your QwenCloud Token Plan API key",
-        Some("sk-sp-..."),
-        false,
-    )?;
-    check_cancelled(cancel)?;
-    let key = answer.trim();
-    ensure!(!key.is_empty(), "QwenCloud Token Plan API key is required");
-
-    ui.progress("Validating API key...");
-    validate_models(key, &base_url, cancel)?;
+    let key = util::prompt_api_key(ui, cancel, FLOW.name, "sk-sp-...")?;
+    util::validate_bearer_models(FLOW.name, &key, &base_url, cancel, VALIDATION_TIMEOUT_SECS)?;
 
     let cookie = prompt_cookie(ui, cancel, &base_url, endpoints)?;
 
@@ -117,8 +105,7 @@ fn sign_in(
         extra.insert("cookie".to_owned(), cookie.into());
     }
     Ok(Credentials {
-        access: key.to_owned(),
-        refresh: String::new(),
+        access: key,
         expires_at_ms: util::NEVER_EXPIRES,
         api_endpoint: (base_url != endpoints.international).then_some(base_url),
         extra,
@@ -141,7 +128,7 @@ fn prompt_cookie(
         (INTERNATIONAL_COOKIE_PROMPT, INTERNATIONAL_COOKIE_HOST)
     };
     let answer = ui.prompt_secret(message, Some("name=value; name=value; ..."), true)?;
-    check_cancelled(cancel)?;
+    util::check_cancelled(cancel)?;
     let cookie = normalize_cookie(&answer);
     ensure!(
         cookie.is_empty() || is_cookie_header(&cookie),
@@ -168,29 +155,6 @@ fn is_cookie_header(cookie: &str) -> bool {
             .split_once('=')
             .is_some_and(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
     })
-}
-
-fn validate_models(key: &str, base_url: &str, cancel: &Arc<AtomicBool>) -> Result<()> {
-    let bearer = format!("Bearer {key}");
-    let response = util::request_with_timeout(
-        "GET",
-        &format!("{base_url}/models"),
-        &[("Authorization", bearer.as_str())],
-        util::Body::Empty,
-        cancel,
-        VALIDATION_TIMEOUT_SECS,
-    )?;
-    ensure!(
-        response.ok(),
-        "QwenCloud Token Plan API key validation failed (HTTP {})",
-        response.status
-    );
-    Ok(())
-}
-
-fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
-    Ok(())
 }
 
 fn access(credentials: &Credentials) -> Result<Access> {

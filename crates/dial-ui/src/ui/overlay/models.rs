@@ -11,16 +11,17 @@ use super::model_download::Step;
 pub use super::model_download::{DownloadFailure, ModelDownloads, SharedModelDownloads};
 use super::{
     DrawCtx, OverlayEvent, PresetAction,
-    settings::{
-        filled, fit, highlighted, hint, hint_line, is_ctrl, match_style, other_scope, pair_label,
-        panel, pressed, scope_name, scroll_cell, typed_char,
+    widgets::{
+        filled, fit, hint, is_ctrl, list_row, match_style, other_scope, pair_label, panel, pressed,
+        scope_name, scroll_cell, selection_marker, typed_char,
     },
 };
 use crate::{
     config::paths::Layout,
     config::settings_store::Scope,
     llm::catalog::{
-        Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus, documented_thinking_levels,
+        DeclaredReasoning, Discovery, LocalRemoval, ModelEntry, ModelKind, ProviderStatus,
+        documented_thinking_levels,
     },
     llm::model_config::{
         ModelPreset, ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label,
@@ -36,6 +37,7 @@ use crate::{
     },
 };
 use crossterm::event::{Event, KeyCode, KeyEvent};
+use dial_core::units::human_bytes;
 use ratatui::{
     Frame,
     style::{Modifier, Style},
@@ -43,7 +45,7 @@ use ratatui::{
 };
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -197,6 +199,7 @@ fn detail_binding(keys: &Keymap) -> Option<(&'static str, KeyEvent)> {
 struct Chooser {
     selection: ModelSelection,
     name: String,
+    declared: Option<DeclaredReasoning>,
     /// Roles this model can be assigned to (see `role_accepts`).
     roles: Vec<&'static str>,
     cursor: usize,
@@ -291,8 +294,7 @@ pub struct ModelOverlay {
     review: Option<AssignmentReview>,
     /// A downloaded local model Ctrl+D asked to delete, waiting for confirmation.
     deletion: Option<LocalRemoval>,
-    deletion_scroll: usize,
-    deletion_usable: bool,
+    deletion_review: super::panel_keys::RemovalReview,
     headers_editor: Option<(String, ModelSelection, super::headers::HeaderEditor)>,
     /// The groups column is hidden at this width (set while drawing), so it cannot take focus.
     narrow: bool,
@@ -397,19 +399,6 @@ fn source_label(source: RoleSource) -> &'static str {
         RoleSource::FollowsSmall => "follows small",
         RoleSource::NotSet => "not set",
     }
-}
-
-/// A list row of exactly `w` cells; the selected one gets the selection fill and its colors.
-fn selected_row(
-    theme: &Theme,
-    spans: Vec<Span<'static>>,
-    w: usize,
-    selected: bool,
-) -> Line<'static> {
-    if !selected {
-        return filled(spans, w, Style::default());
-    }
-    chrome::selected_row(theme, spans, w)
 }
 
 fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
@@ -919,15 +908,6 @@ fn fmt_context(tokens: u32) -> String {
     }
 }
 
-fn provider_glyph(theme: &Theme, state: &str) -> (String, Tok) {
-    match state {
-        "reachable" | "cached" => (theme.sym(Sym::RadioOn).to_owned(), Tok::Success),
-        "auth-required" => (theme.sym(Sym::Warn).to_owned(), Tok::Warning),
-        "disabled" => (theme.sym(Sym::RadioOff).to_owned(), Tok::Dim),
-        _ => (theme.sym(Sym::Cross2).to_owned(), Tok::Error),
-    }
-}
-
 /// A group count, blank when zero so empty groups do not read as a column of zeros.
 fn nonzero(count: usize) -> String {
     if count == 0 {
@@ -971,8 +951,7 @@ impl ModelOverlay {
             preset_prompt: None,
             review: None,
             deletion: None,
-            deletion_scroll: 0,
-            deletion_usable: true,
+            deletion_review: Default::default(),
             headers_editor: None,
             narrow: false,
             message: None,
@@ -1186,11 +1165,9 @@ impl ModelOverlay {
         self
     }
 
-    /// Reads the installed local models and enables downloads in the Get models group. Without it the
-    /// group lists nothing installed and downloads report unavailable.
-    pub fn with_downloads(mut self, layout: &Layout, settings: Settings, python: PathBuf) -> Self {
-        self.downloads = ModelDownloads::open(layout, settings, python).into_shared();
-        self.with_discovered_embeddings()
+    /// Open the download manager for the Get models group.
+    pub fn with_downloads(self, layout: &Layout, settings: Settings, python: PathBuf) -> Self {
+        self.with_shared_downloads(ModelDownloads::open(layout, settings, python).into_shared())
     }
 
     /// Attach the session's existing manager without replacing active work or its browse position.
@@ -1265,7 +1242,7 @@ impl ModelOverlay {
     /// The main model's LoRA state when `entry` is the main model.
     fn main_lora_for(&self, entry: &ModelEntry) -> Option<Lora> {
         self.role_selection("main")
-            .filter(|main| same_model(main, &entry.selection))
+            .filter(|main| entry.represents_selection(main))
             .map(|_| self.main_lora)
     }
 
@@ -1470,10 +1447,28 @@ impl ModelOverlay {
                 .all(|(role, _)| same(preset.roles.get(*role), self.role_selection(role)))
     }
 
-    /// Thinking levels to offer for `selection` in `role`: empty when the catalog documents none.
-    fn thinking_levels(role: &str, selection: &ModelSelection) -> Vec<&'static str> {
+    /// Thinking levels to offer for `selection` in `role`. A model group (`ModelVariant`) offers
+    /// only the efforts its listing declares; other models offer the catalog's documented levels,
+    /// else the levels a listing declares. Empty when neither gives any. `default` leads; `auto` is
+    /// main-only.
+    fn thinking_levels(
+        role: &str,
+        selection: &ModelSelection,
+        declared: Option<DeclaredReasoning>,
+    ) -> Vec<&'static str> {
         let main = role == "main";
-        let mut levels = documented_thinking_levels(&selection.provider, &selection.model, !main);
+        let documented = documented_thinking_levels(&selection.provider, &selection.model, !main);
+        // A model group's listed efforts are the levels its wire IDs accept, so they win over a
+        // bundled row for the same model id; other models keep the documented levels first.
+        let grouped =
+            declared.is_some_and(|d| d.mode == crate::llm::catalog::ThinkingMode::ModelVariant);
+        let mut levels: Vec<&'static str> = if grouped || documented.is_empty() {
+            declared
+                .map(|reasoning| reasoning.thinking_levels(role))
+                .unwrap_or_default()
+        } else {
+            documented
+        };
         if levels.is_empty() {
             return levels;
         }
@@ -1484,14 +1479,25 @@ impl ModelOverlay {
         levels
     }
 
+    /// The reasoning a live listing declares for `selection`: the discovered entry for this exact
+    /// model (the overlay's account-scoped discovery is the only listing it reads).
+    fn declared_for(&self, selection: &ModelSelection) -> Option<DeclaredReasoning> {
+        self.discovery
+            .iter()
+            .flat_map(|discovery| discovery.models.iter())
+            .find(|entry| same_model(&entry.selection, selection))
+            .and_then(|entry| entry.metadata.declared_reasoning)
+    }
+
     /// Assign `selection` to `role`, first asking for its thinking level when the model has levels.
     fn assign_with_thinking(
         &mut self,
         role: String,
         mut selection: ModelSelection,
         name: String,
+        declared: Option<DeclaredReasoning>,
     ) -> OverlayEvent {
-        let levels = Self::thinking_levels(&role, &selection);
+        let levels = Self::thinking_levels(&role, &selection, declared);
         if levels.is_empty() {
             selection.thinking = None;
             return OverlayEvent::AssignModel {
@@ -1541,7 +1547,7 @@ impl ModelOverlay {
             );
             return;
         };
-        let levels = Self::thinking_levels(role, &selection);
+        let levels = Self::thinking_levels(role, &selection, self.declared_for(&selection));
         if levels.is_empty() {
             self.set_status(
                 format!(
@@ -1721,13 +1727,14 @@ impl ModelOverlay {
         }
     }
 
-    fn roles_using(&self, selection: &ModelSelection) -> Vec<&str> {
+    /// Roles whose assigned model this row answers: the same model, or a member variant of a group.
+    fn roles_using(&self, entry: &ModelEntry) -> Vec<&str> {
         self.visible_roles()
             .iter()
             .map(|(name, _)| *name)
             .filter(|name| {
                 self.role_selection(name)
-                    .is_some_and(|s| same_model(s, selection))
+                    .is_some_and(|s| entry.represents_selection(s))
             })
             .collect()
     }
@@ -1889,10 +1896,12 @@ impl ModelOverlay {
     }
 
     fn providers(&self) -> impl Iterator<Item = &ProviderStatus> {
+        // Provider groups filter by ID, not by endpoint. Keep the first nonempty route's label.
+        let mut seen = BTreeSet::new();
         self.discovery
             .iter()
             .flat_map(|d| d.providers.iter())
-            .filter(|p| p.models > 0)
+            .filter(move |p| p.models > 0 && seen.insert(p.id.as_str()))
     }
 
     fn groups(&self) -> Vec<Group> {
@@ -1980,7 +1989,7 @@ impl ModelOverlay {
 
     /// Ctrl+D: plans deleting the local model at `path` and asks to confirm, or says why not.
     fn ask_delete(&mut self, path: &str) -> OverlayEvent {
-        self.deletion_scroll = 0;
+        self.deletion_review.rewind();
         let plan = self.downloads.borrow().plan_delete(path);
         match plan {
             Ok(removal) => self.deletion = Some(removal),
@@ -1996,22 +2005,10 @@ impl ModelOverlay {
         key: &KeyEvent,
         keys: &Keymap,
     ) -> OverlayEvent {
-        if keys.matches(Action::SelectDown, key) {
-            self.deletion_scroll = self.deletion_scroll.saturating_add(1);
-        } else if keys.matches(Action::SelectUp, key) {
-            self.deletion_scroll = self.deletion_scroll.saturating_sub(1);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.deletion_scroll = self.deletion_scroll.saturating_add(self.page);
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.deletion_scroll = self.deletion_scroll.saturating_sub(self.page);
-        } else if key.code == KeyCode::Home {
-            self.deletion_scroll = 0;
-        } else if key.code == KeyCode::End {
-            self.deletion_scroll = usize::MAX;
-        }
+        self.deletion_review.scroll(keys, key);
         let answer = typed_char(key).map(|c| c.to_ascii_lowercase());
         if keys.matches(Action::SelectConfirm, key) || answer == Some('y') {
-            if !self.deletion_usable {
+            if !self.deletion_review.can_confirm() {
                 self.deletion = Some(removal);
                 return OverlayEvent::None;
             }
@@ -2022,7 +2019,7 @@ impl ModelOverlay {
                         format!(
                             "Deleted {} and freed {}.",
                             removed.label,
-                            super::model_download::human_bytes(removed.bytes)
+                            human_bytes(removed.bytes)
                         ),
                         false,
                     );
@@ -2146,19 +2143,10 @@ impl ModelOverlay {
                     || super::panel_keys::matches(keys, Action::TabPrev, key)
                 {
                     self.detail_focus = false;
-                } else if key.code == KeyCode::Home {
-                    self.detail_scroll = 0;
-                } else if key.code == KeyCode::End {
-                    self.detail_scroll = usize::MAX;
-                } else if key.code == KeyCode::PageDown || keys.matches(Action::SelectPageDown, key)
+                } else if let Some(next) =
+                    super::panel_keys::scroll_text(keys, key, self.detail_scroll, self.detail_page)
                 {
-                    self.detail_scroll = self.detail_scroll.saturating_add(self.detail_page);
-                } else if key.code == KeyCode::PageUp || keys.matches(Action::SelectPageUp, key) {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(self.detail_page);
-                } else if key.code == KeyCode::Down || keys.matches(Action::SelectDown, key) {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
-                } else if key.code == KeyCode::Up || keys.matches(Action::SelectUp, key) {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    self.detail_scroll = next;
                 }
                 // Detail inspection never changes search, assignments, scope or model selection.
                 return OverlayEvent::None;
@@ -2624,6 +2612,7 @@ impl ModelOverlay {
         let target = target.to_owned();
         let selection = entry.selection.clone();
         let name = display_name(entry);
+        let declared = entry.metadata.declared_reasoning;
         let role = self.target_role.take();
         if let Some(role) = &role {
             self.show_roles();
@@ -2633,7 +2622,7 @@ impl ModelOverlay {
                 .position(|(name, _)| name == role)
                 .unwrap_or(0);
         }
-        self.assign_with_thinking(target, selection, name)
+        self.assign_with_thinking(target, selection, name, declared)
     }
 
     fn open_chooser(&mut self) -> OverlayEvent {
@@ -2660,6 +2649,7 @@ impl ModelOverlay {
         self.chooser = Some(Chooser {
             selection: entry.selection.clone(),
             name: display_name(entry),
+            declared: entry.metadata.declared_reasoning,
             roles,
             cursor: 0,
         });
@@ -2689,8 +2679,9 @@ impl ModelOverlay {
             let role = chooser.roles[chooser.cursor].to_owned();
             let selection = chooser.selection.clone();
             let name = chooser.name.clone();
+            let declared = chooser.declared;
             self.chooser = None;
-            return self.assign_with_thinking(role, selection, name);
+            return self.assign_with_thinking(role, selection, name, declared);
         }
         OverlayEvent::None
     }
@@ -2760,7 +2751,7 @@ impl ModelOverlay {
             format!(" {label} focuses details directly.")
         });
         let help = format!(
-            "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\n{tune} tunes the selected model; Ctrl+F marks a favorite; Ctrl+D deletes a downloaded local model; Ctrl+B switches save scope. Tab cycles list, groups and details (groups are skipped on narrow panels).{details} Up/Down, PageUp/PageDown and Home/End scroll details; Escape or Tab returns without assigning. Ctrl+↑/↓ also scrolls details directly, including assignment consequences, capabilities and pricing.\nRoles: Enter picks a model, then its thinking level; t changes a role's thinking level; n saves the current roles as a new preset. On a preset: Enter applies, e updates it from the current roles, r renames, x deletes. Home/End jump to the first role or last preset."
+            "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\n{tune} tunes the selected model; Ctrl+F marks a favorite; Ctrl+D deletes a downloaded local model; Ctrl+B switches save scope. Tab cycles list, groups and details (groups are skipped on narrow panels).{details} The movement and page keys scroll details; Home/End jump to either end. Escape or Tab returns without assigning. Ctrl+↑/↓ also scrolls details directly, including assignment consequences, capabilities and pricing.\nRoles: Enter picks a model, then its thinking level; t changes a role's thinking level; n saves the current roles as a new preset. On a preset: Enter applies, e updates it from the current roles, r renames, x deletes. Home/End jump to the first role or last preset."
         );
         if self
             .panel_keys
@@ -2768,7 +2759,7 @@ impl ModelOverlay {
         {
             return;
         }
-        let extra = super::settings::scope_caption(
+        let extra = super::widgets::scope_caption(
             self.scope,
             &self.project_name,
             usize::from(frame.area().width.saturating_sub(11)),
@@ -2823,38 +2814,23 @@ impl ModelOverlay {
             let rows = [
                 format!("Delete local model: {}", removal.label),
                 format!("From: {}", removal.source),
-                format!(
-                    "Frees: {}",
-                    super::model_download::human_bytes(removal.bytes)
-                ),
+                format!("Frees: {}", human_bytes(removal.bytes)),
                 format!("Removes the folder: {}", removal.folder.display()),
                 "Everything in that folder is deleted from disk; this cannot be undone.".into(),
             ];
             let rows: Vec<_> = rows
                 .iter()
                 .flat_map(|row| text::wrap_words(row, w.max(1)))
-                .collect();
-            self.deletion_usable = w >= 20 && h >= 3;
-            let body = h.saturating_sub(1);
-            self.page = body.max(1);
-            self.deletion_scroll = self.deletion_scroll.min(rows.len().saturating_sub(body));
-            let mut lines: Vec<_> = rows
-                .into_iter()
-                .skip(self.deletion_scroll)
-                .take(body)
                 .map(Line::from)
                 .collect();
-            lines.resize(body, Line::default());
-            lines.push(Line::from(format!(
+            let footer = Line::from(format!(
                 "{} · y delete · {} · n keep · ↑/↓ scroll",
                 hint(ctx.keys, Action::SelectConfirm, "delete"),
                 hint(ctx.keys, Action::SelectCancel, "keep")
-            )));
-            if !self.deletion_usable {
-                lines.pop();
-                lines.push(Line::from("Enlarge to confirm; Esc keeps"));
-            }
-            return lines;
+            ));
+            return self
+                .deletion_review
+                .rows(rows, w, h, footer, "Enlarge to confirm; Esc keeps");
         }
         self.downloads.borrow_mut().poll();
         if self.group == Group::Download {
@@ -2870,6 +2846,9 @@ impl ModelOverlay {
         // header rows of the list pane.
         let download_view = self.group == Group::Download;
         let roles_view = self.group == Group::Roles;
+        let left_w = if w >= 56 { (w / 3).min(28) } else { 0 };
+        let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
+        let compact_roles = roles_view && right_w < 54;
         // Facts use the full panel width rather than competing with provider navigation. Reserve a
         // bounded viewport and keep overflow independently scrollable, even on short terminals.
         let detail_entry = self.highlighted();
@@ -2878,6 +2857,16 @@ impl ModelOverlay {
         } else {
             let (first, second) = self.detail_lines(theme, detail_entry);
             let mut spans = vec![Span::styled(self.assignment_effect(), theme.fg(Tok::Muted))];
+            if compact_roles && !self.detail_focus {
+                let summary = match self.current_role_row() {
+                    RoleRow::Role(_) => match self.scope {
+                        Scope::Project => "Assign: session + project override",
+                        Scope::Global => "Assign: session + user default",
+                    },
+                    _ => "Presets: all projects",
+                };
+                spans.insert(0, Span::styled(summary, theme.fg(Tok::Muted)));
+            }
             spans.extend(first);
             spans.extend(second);
             if !roles_view {
@@ -2894,6 +2883,8 @@ impl ModelOverlay {
         };
         let detail_height = if download_view {
             0
+        } else if compact_roles && !self.detail_focus {
+            2.min(h.saturating_sub(4))
         } else {
             detail_lines
                 .len()
@@ -2918,8 +2909,8 @@ impl ModelOverlay {
         let show_active = grant(!download_view);
         let (show_footer, show_kind, show_search, show_detail, show_header, show_used) = (
             grant(true),
-            grant(!download_view),
-            grant(!download_view),
+            grant(!download_view && !roles_view),
+            grant(!download_view && (!compact_roles || self.preset_prompt.is_some())),
             grant(download_view),
             grant(!download_view),
             grant(download_view),
@@ -2935,13 +2926,11 @@ impl ModelOverlay {
         ];
         let body_rows = h.saturating_sub(flags.iter().filter(|f| **f).count() + detail_height);
 
-        let left_w = if w >= 56 { (w / 3).min(28) } else { 0 };
         // Below 56 columns the groups column is hidden; its focus must not be reachable then.
         self.narrow = left_w == 0;
         if self.narrow && self.focus == Focus::Groups {
             self.focus = Focus::List;
         }
-        let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
 
         let len = if roles_view {
             self.role_rows_len()
@@ -2950,13 +2939,7 @@ impl ModelOverlay {
         };
         self.cursor = self.cursor.min(len.saturating_sub(1));
         self.page = body_rows.saturating_sub(1).max(1);
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        }
-        if self.cursor >= self.scroll + body_rows {
-            self.scroll = self.cursor + 1 - body_rows.max(1);
-        }
-        self.scroll = self.scroll.min(len.saturating_sub(body_rows));
+        self.scroll = chrome::keep_in_view(self.cursor, self.scroll, body_rows, len);
         // Record targets before borrowing discovery entries for row rendering.
         if self.chooser.is_none() && self.thinking.is_none() && !download_view {
             let top = usize::from(show_active)
@@ -3016,8 +2999,6 @@ impl ModelOverlay {
         }
         if show_kind && !roles_view {
             right_top.push(self.kind_line(theme, right_w));
-        } else if show_kind {
-            right_top.push(Line::default());
         }
         if show_search {
             right_top.push(if let Some(prompt) = &self.preset_prompt {
@@ -3054,6 +3035,17 @@ impl ModelOverlay {
         }
         let top_rows = right_top.len();
         let list_rows = body_rows;
+        let mut empty = if rows.is_empty()
+            && !roles_view
+            && !download_view
+            && self.chooser.is_none()
+            && self.thinking.is_none()
+        {
+            super::widgets::empty_rows(theme, &self.empty_text(), list_w, list_rows)
+        } else {
+            Vec::new()
+        }
+        .into_iter();
 
         // The left column spans the full height of the pane area (top + list rows).
         let pane_rows = top_rows + list_rows;
@@ -3069,7 +3061,7 @@ impl ModelOverlay {
             let mut spans: Vec<Span<'static>> = Vec::new();
             if left_w > 0 {
                 let l = left.get(y).cloned().unwrap_or_default();
-                let used: usize = l.iter().map(|s| text::width(&s.content)).sum();
+                let used: usize = text::spans_width(&l);
                 spans.extend(l);
                 spans.push(Span::raw(" ".repeat(left_w.saturating_sub(used))));
                 spans.push(Span::styled(
@@ -3112,21 +3104,10 @@ impl ModelOverlay {
                         list_w,
                         columns,
                     )
-                } else if rows.is_empty() {
-                    let empty_rows =
-                        text::wrap_words(self.empty_text().trim(), list_w.saturating_sub(2).max(1));
-                    filled(
-                        empty_rows
-                            .get(i)
-                            .map(|line| {
-                                vec![Span::styled(format!(" {line}"), theme.fg(Tok::Muted))]
-                            })
-                            .unwrap_or_default(),
-                        list_w,
-                        Style::default(),
-                    )
                 } else {
-                    filled(vec![], list_w, Style::default())
+                    empty
+                        .next()
+                        .unwrap_or_else(|| filled(vec![], list_w, Style::default()))
                 };
                 spans.extend(line.spans);
                 if overflow && self.chooser.is_none() && self.thinking.is_none() {
@@ -3155,7 +3136,7 @@ impl ModelOverlay {
                     format!(
                         "{} · {}",
                         if self.detail_focus {
-                            "Details: ↑/↓ PgUp/Dn · Esc list".to_owned()
+                            "Details · Esc list".to_owned()
                         } else {
                             format!(
                                 "{} details · {}",
@@ -3174,8 +3155,11 @@ impl ModelOverlay {
             }
         }
         if show_footer {
-            let hints = super::panel_keys::capped_footer(self.footer(ctx.keys), "F1 keys");
-            out.push(hint_line(theme, &hints, w));
+            out.push(super::panel_keys::sheet_footer(
+                theme,
+                self.footer(ctx.keys),
+                w,
+            ));
         }
         for (row, index) in group_targets {
             self.group_hits.row(0, row, left_w, index);
@@ -3248,20 +3232,21 @@ impl ModelOverlay {
                 theme.fg(Tok::Muted),
             ));
         }
-        // A provider that is not ready says why next to its name, beside the ✗ or ⚠ in the column.
+        // Keep the discovery reason alongside the compact readiness mark.
         if let Group::Provider(id) = &self.group
             && let Some(status) = self.providers().find(|p| &p.id == id)
             && !matches!(status.state.as_str(), "reachable" | "cached")
         {
-            let (_, tok) = provider_glyph(theme, &status.state);
+            let (badge, label) =
+                chrome::provider_status(&status.state, &status.detail, status.base_url.as_deref());
             let detail = text::one_line(&status.detail);
             spans.push(Span::styled(
                 if detail.is_empty() {
-                    format!("  {} {}", theme.sym(Sym::Dot), status.state)
+                    format!("  {} {label}", theme.sym(Sym::Dot))
                 } else {
                     format!("  {} {}: {detail}", theme.sym(Sym::Dot), status.state)
                 },
-                theme.fg(tok),
+                theme.fg(badge.tok()),
             ));
         }
         if self.group == Group::Memory {
@@ -3320,7 +3305,7 @@ impl ModelOverlay {
             "? unknown".to_owned(),
         ];
         let dim = theme.fg(Tok::Muted);
-        let mut used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let mut used: usize = text::spans_width(&spans);
         // A divider keeps the symbol key from reading as more filter tabs.
         let divider = format!("  {} ", theme.sym(Sym::Dot));
         if used + text::width(&divider) + text::width(&legend[0]) + 2 <= w {
@@ -3347,25 +3332,16 @@ impl ModelOverlay {
         list_w: usize,
         columns: Columns,
     ) -> Line<'static> {
-        // A label, as in Settings, not a `›` that would read as a second selection marker.
-        let prompt = Span::styled(" Search: ".to_owned(), theme.fg(Tok::Muted));
-        let mut spans = if self.search.is_empty() {
-            vec![
-                prompt,
-                Span::styled("Type to search models".to_owned(), theme.fg(Tok::Dim)),
-            ]
-        } else {
-            vec![
-                prompt,
-                Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
-                Span::styled(
-                    " ".to_owned(),
-                    theme.fg(Tok::Text).add_modifier(Modifier::REVERSED),
-                ),
-            ]
-        };
+        let query = text::one_line(&self.search);
+        let mut spans = super::widgets::search_field(
+            theme,
+            &query,
+            query.len(),
+            "Type to search models",
+            w.min(list_w),
+        );
         let labels = columns.labels();
-        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&spans);
         let labels_w = text::width(&labels);
         if !labels.trim().is_empty() && used + 2 + labels_w <= list_w {
             spans.push(Span::raw(" ".repeat(list_w - labels_w - used)));
@@ -3509,7 +3485,8 @@ impl ModelOverlay {
         ));
         for p in self.providers() {
             let group = Group::Provider(p.id.clone());
-            let glyph = provider_glyph(theme, &p.state);
+            let (badge, _) = chrome::provider_status(&p.state, &p.detail, p.base_url.as_deref());
+            let glyph = (badge.mark(theme.ascii()).to_owned(), badge.tok());
             entries.push((
                 Some(group.clone()),
                 line(
@@ -3552,11 +3529,7 @@ impl ModelOverlay {
         w: usize,
         columns: Columns,
     ) -> Line<'static> {
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
-        } else {
-            Style::default()
-        };
+        let (pointer, fill) = selection_marker(theme, selected, "");
         let dim = !entry.available;
         let name_style = if dim {
             theme.fg(Tok::Dim)
@@ -3573,11 +3546,6 @@ impl ModelOverlay {
             theme.sym(Sym::RadioOn).to_owned()
         } else if self.is_favorite(&entry.selection) {
             "*".to_owned()
-        } else {
-            " ".to_owned()
-        };
-        let pointer = if selected {
-            theme.sym(Sym::Pointer).to_owned()
         } else {
             " ".to_owned()
         };
@@ -3598,7 +3566,7 @@ impl ModelOverlay {
             price_w,
             caps_w,
         } = columns;
-        let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
+        let prefix_w = pointer.width() + text::width(&marker) + 1;
         let name_w =
             w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w + speed_w + price_w);
         let (name, positions) = fit_model_name(
@@ -3610,13 +3578,13 @@ impl ModelOverlay {
         );
         let positions = positions.as_slice();
         let mut spans = vec![
-            Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
+            pointer,
             Span::styled(format!("{marker} "), theme.fg(Tok::Success).patch(fill)),
         ];
         spans.extend(if positions.is_empty() {
             vec![Span::styled(name.clone(), name_style)]
         } else {
-            highlighted(&name, positions, name_style, match_style(theme, name_style))
+            chrome::highlighted(&name, positions, name_style, match_style(theme, name_style))
         });
         spans.push(Span::styled(
             " ".repeat(name_w.saturating_sub(text::width(&name))),
@@ -3680,22 +3648,13 @@ impl ModelOverlay {
                 theme.fg(Tok::Muted).patch(fill),
             ));
         }
-        selected_row(theme, spans, w, selected)
+        list_row(theme, spans, w, selected)
     }
 
     fn role_line(&self, theme: &Theme, index: usize, w: usize) -> Line<'static> {
         let (role, description) = self.visible_roles()[index];
         let selected = index == self.cursor;
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
-        } else {
-            Style::default()
-        };
-        let pointer = if selected {
-            theme.sym(Sym::Pointer)
-        } else {
-            " "
-        };
+        let (pointer, fill) = selection_marker(theme, selected, "");
         let status = self.roles.iter().find(|status| status.role == role);
         let (value, tok) = self.role_value(role);
         let entry = status
@@ -3707,16 +3666,21 @@ impl ModelOverlay {
                     .iter()
                     .find(|entry| same_model(selection, &entry.selection))
             });
-        let caps_w = if entry.is_some() && w >= 40 { 8 } else { 0 };
-        let rest = w.saturating_sub(text::width(pointer) + 1 + 17 + caps_w);
-        let value_w = rest * 2 / 5;
+        let show_description = w >= 53; // Leave room for the assigned model before adding metadata.
+        let caps_w = if entry.is_some() && show_description {
+            8
+        } else {
+            0
+        };
+        let rest = w.saturating_sub(pointer.width() + 17 + caps_w);
+        let value_w = if show_description { rest * 2 / 5 } else { rest };
         let desc_w = rest.saturating_sub(value_w + 2);
         let value = text::ellipsize(&value, value_w, theme.ascii());
         let desc = text::ellipsize(description, desc_w, theme.ascii());
-        selected_row(
+        list_row(
             theme,
             vec![
-                Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
+                pointer,
                 Span::styled(
                     text::pad(role_label(role), 17),
                     theme
@@ -3785,16 +3749,7 @@ impl ModelOverlay {
         selected: bool,
         w: usize,
     ) -> Line<'static> {
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
-        } else {
-            Style::default()
-        };
-        let pointer = if selected {
-            theme.sym(Sym::Pointer)
-        } else {
-            " "
-        };
+        let (pointer, fill) = selection_marker(theme, selected, "");
         let (label, value, tok) = match row {
             RoleRow::Preset(name, preset) => {
                 let active = if self.preset_is_active(preset) {
@@ -3814,12 +3769,12 @@ impl ModelOverlay {
                 Tok::Accent,
             ),
         };
-        let rest = w.saturating_sub(text::width(pointer) + 1 + 17);
+        let rest = w.saturating_sub(pointer.width() + 17);
         let value = text::ellipsize(&value, rest, theme.ascii());
-        selected_row(
+        list_row(
             theme,
             vec![
-                Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
+                pointer,
                 Span::styled(
                     text::pad(&text::ellipsize(&label, 16, theme.ascii()), 17),
                     theme.fg(Tok::Text).patch(fill).add_modifier(if selected {
@@ -3860,29 +3815,7 @@ impl ModelOverlay {
             .find(|(name, _)| name == role)
             .map_or("", |(_, description)| description);
         let selected = row - 1 == chooser.cursor;
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
-        } else {
-            Style::default()
-        };
-        let radio = if selected {
-            theme.sym(Sym::RadioOn)
-        } else {
-            theme.sym(Sym::RadioOff)
-        };
-        selected_row(
-            theme,
-            vec![
-                Span::styled(format!("   {radio} "), theme.fg(Tok::Accent).patch(fill)),
-                Span::styled(
-                    text::pad(role_label(role), 17),
-                    theme.fg(Tok::Text).patch(fill),
-                ),
-                Span::styled(description.to_owned(), theme.fg(Tok::Muted).patch(fill)),
-            ],
-            w,
-            selected,
-        )
+        super::widgets::radio_row(theme, selected, role_label(role), 17, description, w)
     }
 
     fn detail_lines(
@@ -4009,7 +3942,7 @@ impl ModelOverlay {
                 if is_local(entry) { "local" } else { "cloud" }.to_owned(),
             ])
             .collect::<Vec<_>>()
-            .join(&format!(" {} ", theme.sym(Sym::Dot)));
+            .join(&theme.dot_sep());
         first.push(Span::styled(
             format!("  {} {facts}", theme.sym(Sym::Dot)),
             theme.fg(Tok::Muted),
@@ -4022,7 +3955,7 @@ impl ModelOverlay {
         } else if let Some(warning) = tool_warning(entry) {
             first.push(Span::styled(format!("  {warning}"), theme.fg(Tok::Warning)));
         }
-        let used = self.roles_using(&entry.selection);
+        let used = self.roles_using(entry);
         let used_text = if used.is_empty() {
             "no explicit role assignment".to_owned()
         } else {
@@ -4106,10 +4039,7 @@ impl ModelOverlay {
                     None => "avg cost -".to_owned(),
                 });
                 let requests = usage.totals.requests;
-                parts.push(format!(
-                    "{requests} request{}",
-                    if requests == 1 { "" } else { "s" }
-                ));
+                parts.push(text::counted(requests, "request"));
                 if let Some(ms) = usage.totals.avg_latency_ms {
                     parts.push(format!("{:.1}s avg latency", ms / 1000.0));
                 }
@@ -4166,8 +4096,14 @@ impl ModelOverlay {
     fn footer(&self, keys: &Keymap) -> Vec<String> {
         if self.detail_focus && self.group != Group::Download {
             return vec![
-                "↑/↓ scroll details".into(),
-                "PgUp/PgDn page".into(),
+                super::panel_keys::segment(
+                    &pair_label(keys, Action::SelectUp, Action::SelectDown),
+                    "scroll details",
+                ),
+                super::panel_keys::segment(
+                    &pair_label(keys, Action::SelectPageUp, Action::SelectPageDown),
+                    "page",
+                ),
                 "Home/End first/last detail".into(),
                 "Esc/Tab back to list (no assignment)".into(),
             ];
@@ -4389,7 +4325,7 @@ impl ModelOverlay {
     }
 }
 
-use super::settings::{local_function_key, local_function_label};
+use super::widgets::{local_function_key, local_function_label};
 
 /// One row of the thinking-level picker: a header naming the model, then one radio row per level.
 fn thinking_line(theme: &Theme, pick: &ThinkingPick, row: usize, w: usize) -> Line<'static> {
@@ -4414,32 +4350,13 @@ fn thinking_line(theme: &Theme, pick: &ThinkingPick, row: usize, w: usize) -> Li
         return filled(vec![], w, Style::default());
     };
     let selected = row - 1 == pick.cursor;
-    let fill = if selected {
-        theme.bg(Tok::SelectedBg)
-    } else {
-        Style::default()
-    };
-    let radio = theme.sym(if selected {
-        Sym::RadioOn
-    } else {
-        Sym::RadioOff
-    });
     let note = match *level {
         "default" => "the model's own default",
         "auto" => "judged per message from the prompt",
         "off" => "no reasoning",
         _ => "",
     };
-    selected_row(
-        theme,
-        vec![
-            Span::styled(format!("   {radio} "), theme.fg(Tok::Accent).patch(fill)),
-            Span::styled(text::pad(level, 10), theme.fg(Tok::Text).patch(fill)),
-            Span::styled(note.to_owned(), theme.fg(Tok::Muted).patch(fill)),
-        ],
-        w,
-        selected,
-    )
+    super::widgets::radio_row(theme, selected, level, 10, note, w)
 }
 
 /// Each role a preset sets, as `Label: model (level)`, main first.
@@ -4484,9 +4401,9 @@ fn preset_summary(preset: &ModelPreset) -> String {
     let roles = preset.roles.len();
     match (main, roles) {
         (Some(main), 0) => main,
-        (Some(main), n) => format!("{main} + {n} role{}", if n == 1 { "" } else { "s" }),
+        (Some(main), n) => format!("{main} + {}", text::counted(n, "role")),
         (None, 0) => preset_rows(preset).join(", "),
-        (None, n) => format!("{n} role{}", if n == 1 { "" } else { "s" }),
+        (None, n) => text::counted(n, "role"),
     }
 }
 

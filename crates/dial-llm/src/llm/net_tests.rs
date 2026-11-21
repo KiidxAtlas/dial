@@ -315,6 +315,73 @@ fn unstreamed_reply_routes_leaked_think_blocks_out_of_visible_text() {
 }
 
 #[test]
+fn inkling_local_channel_frames_stay_out_of_stream_and_replay() {
+    const CONTENT: &str = "<|message_model|><|content_thinking|>plan</think> privately<|end_message|><|message_model|><|content_text|>Hello!<|end_message|>";
+    let mut events: Vec<_> = CONTENT.chars().map(|c| delta(&c.to_string())).collect();
+    events.push(stop());
+    let body = json!({"choices": [{"finish_reason": "stop", "message": {"content": CONTENT}}]});
+    let server = fake::serve(vec![Script::Sse(sse(&events)), fake::json(200, &body)]);
+    let req = chat_request(vec![]);
+    let (reply, pieces) = collect(&server.url, None, &req, 10);
+    assert_eq!(pieces.concat(), "Hello!");
+    for reply in [
+        reply.unwrap(),
+        chat_at(&server.url, None, SERVER_MODEL, &req, 10).unwrap(),
+    ] {
+        assert_eq!(reply.text, "Hello!");
+        assert_eq!(reply.reasoning, "plan</think> privately");
+        assert_eq!(assistant_message(&reply)["content"], "Hello!");
+    }
+}
+
+#[test]
+fn inkling_tool_frame_is_hidden_and_becomes_an_offered_call() {
+    let req = chat_request(vec![json!({"type":"function","function":{"name":"bash"}})]);
+    for frame in [
+        r#"<|message_model|>bash<|content_invoke_tool_json|>{"name":"bash","args":{"command":"ls -la"}}<|end_message|>"#,
+        r#"◁message_model▷bash◁content_invoke_tool_json▷{"name":"bash","args":{"command":"ls -la"}}◁end_message▷"#,
+    ] {
+        let mut events: Vec<_> = frame.chars().map(|ch| delta(&ch.to_string())).collect();
+        events.push(stop());
+        let server = fake::serve(vec![Script::Sse(sse(&events))]);
+        let (reply, visible) = collect(&server.url, None, &req, 10);
+        let reply = reply.unwrap();
+        assert!(visible.concat().is_empty());
+        assert!(reply.text.is_empty());
+        assert!(reply.text_calls_lifted);
+        assert_eq!(reply.finish_reason, "tool_calls");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "bash");
+        assert_eq!(reply.tool_calls[0].arguments, json!({"command":"ls -la"}));
+        assert!(!reply.tool_calls[0].malformed_arguments);
+    }
+}
+
+#[test]
+fn inkling_call_preserves_marker_literals_in_arguments_after_a_thinking_frame() {
+    let text = r#"<|message_model|><|content_thinking|>plan<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{"name":"read_file","args":{"path":"<think>tag</think>"}}<|end_message|>"#;
+    let body = json!({"choices":[{"finish_reason":"stop","message":{"content":text}}]});
+    let server = fake::serve(vec![fake::json(200, &body)]);
+    let reply = chat_at(&server.url, None, SERVER_MODEL, &chat_request(a_tool()), 10).unwrap();
+    assert_eq!(reply.reasoning, "plan");
+    assert_eq!(
+        reply.tool_calls[0].arguments,
+        json!({"path":"<think>tag</think>"})
+    );
+}
+
+#[test]
+fn ordinary_text_mentioning_inkling_markers_is_literal() {
+    for text in [
+        "Use <|message_model|><|content_thinking|> here.",
+        "<|end_message|>",
+        "<|message_model|>",
+    ] {
+        assert_eq!(markup::rewrite(text), (text.to_owned(), String::new()));
+    }
+}
+
+#[test]
 fn llama_server_stream_keeps_think_blocks_out_of_text_and_replays_the_tool_call() {
     let body = sse(&[
         json!({"choices": [{"index": 0, "delta": {"reasoning_content": "Look"}, "finish_reason": null}]}),
@@ -776,6 +843,12 @@ fn text_recovery_rejects_unoffered_calls_and_quoted_json_without_erasing_text() 
     for text in [
         "<tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>",
         "Example:\n```json\n{\"name\":\"read_file\",\"arguments\":{}}\n```",
+        r#"◁message_model▷bash◁content_invoke_tool_json▷{"name":"bash","args":{}}◁end_message▷"#,
+        r#"Example: ◁message_model▷read_file◁content_invoke_tool_json▷{"name":"read_file","args":{}}◁end_message▷"#,
+        r#"◁message_model▷read_file◁content_invoke_tool_json▷{"name":"bash","args":{}}◁end_message▷"#,
+        r#"◁message_model▷read_file◁content_invoke_tool_json▷{"name":"read_file","args":[] }◁end_message▷"#,
+        r#"◁message_model▷read_file◁content_invoke_tool_json▷{"name":"read_file","args":{}}"#,
+        r#"◁message_model▷read_file◁content_invoke_tool_json▷{"name":"read_file","args":{}}◁end_message▷ is an example"#,
     ] {
         let mut reply = Reply {
             text: text.into(),

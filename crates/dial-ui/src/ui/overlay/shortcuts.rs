@@ -1,8 +1,9 @@
 //! Global keyboard shortcuts: browse/search the live keymap and edit textual chord tokens.
 //! Persistence and validation belong to the controller; an edit stays open until `settled` succeeds.
+use super::panel_keys::{Edge, list_move};
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{
+    widgets::{
         editor_spans, filled, hint, hint_line, pair_label, panel, pressed, scroll_cell, typed_char,
     },
 };
@@ -178,14 +179,8 @@ impl ShortcutOverlay {
         }
         let rows = self.rows(keys);
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
-        if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(rows.len().saturating_sub(1));
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(self.page);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + self.page).min(rows.len().saturating_sub(1));
+        if let Some(cursor) = list_move(keys, key, self.cursor, rows.len(), self.page, Edge::Stop) {
+            self.cursor = cursor;
         } else if self.search.text.is_empty() && key.code == KeyCode::Home {
             self.cursor = 0;
         } else if self.search.text.is_empty() && key.code == KeyCode::End {
@@ -294,32 +289,21 @@ impl ShortcutOverlay {
                 Tok::Muted,
             ));
         } else {
-            let mut spans = vec![Span::styled(" Search: ", theme.fg(Tok::Muted))];
-            spans.extend(editor_spans(
+            let spans = super::widgets::search_field(
                 theme,
-                &self.search,
-                w.saturating_sub(9),
-                false,
-            ));
-            if self.search.text.is_empty() {
-                spans.push(Span::styled(
-                    "type an action, key or group",
-                    theme.fg(Tok::Dim),
-                ));
-            }
+                &self.search.text,
+                self.search.cursor,
+                "type an action, key or group",
+                w,
+            );
             out.push(filled(spans, w, Style::default()));
             let rows = self.rows(ctx.keys);
             self.cursor = self.cursor.min(rows.len().saturating_sub(1));
             // Reserve details, feedback and footer on normal terminals. Tiny terminals keep a list row.
             let list_h = h.saturating_sub(7).max(1).min(h.saturating_sub(1));
             self.page = list_h.max(1);
-            if self.cursor < self.scroll {
-                self.scroll = self.cursor;
-            }
-            if self.cursor >= self.scroll + list_h {
-                self.scroll = (self.cursor + 1).saturating_sub(list_h.max(1));
-            }
-            self.scroll = self.scroll.min(rows.len().saturating_sub(list_h));
+            self.scroll =
+                crate::ui::chrome::keep_in_view(self.cursor, self.scroll, list_h, rows.len());
             for row in 0..list_h {
                 let index = self.scroll + row;
                 if let Some(&action) = rows.get(index) {

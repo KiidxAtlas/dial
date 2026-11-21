@@ -1609,6 +1609,22 @@ impl Backend {
         let offered = llm::tool_offer::normalize(req, self.tool_exposure());
         let req = offered.as_ref();
         let mut profile = self.next_profile.take().or_else(|| self.profile.clone());
+        // A gateway can serve the same model over another wire. Enforce the upstream
+        // sampling restriction even for bounded side requests and explicit profile pins.
+        let model = self.model_label();
+        if llm::identity::Identity::new(model)
+            .anthropic_catalog_id()
+            .is_some_and(|id| {
+                llm::catalog::bundled_model("anthropic", &id)
+                    .is_some_and(|record| record.has(llm::catalog::ModelFact::NoSampling))
+            })
+        {
+            let p = profile
+                .get_or_insert_with(|| llm::profiles::ModelProfile::minimal("anthropic", model));
+            p.capabilities.temperature = false;
+            p.temperature = None;
+            p.top_p = None;
+        }
         // The detected mechanism only matters to a constrained retry that offers tools; ordinary
         // requests are never probed.
         if let Some(profile) = profile.as_mut()

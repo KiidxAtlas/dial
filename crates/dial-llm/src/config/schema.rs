@@ -260,6 +260,7 @@ const APPROVAL: EnumValues = &[
     ("write", "Edit freely"),
     ("auto", "Full auto"),
     ("readonly", "Read-only"),
+    ("yolo", "YOLO"),
 ];
 const SANDBOX: EnumValues = &[("off", "Off"), ("dev", "Dev"), ("strict", "Strict")];
 const ISOLATION_BACKENDS: EnumValues = &[
@@ -437,6 +438,7 @@ mod image;
 mod improvement;
 mod management;
 mod memory;
+pub use memory::{EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, memory_needs};
 mod message_routing;
 mod model;
 mod preparation;
@@ -1070,6 +1072,7 @@ const LAYOUT: &[(&str, &[&str])] = &[
             "Session coordination",
             "Portable rules",
             "Worktree",
+            "Plan mode",
             "Commit",
             "Questions",
             "Investigation",
@@ -1244,6 +1247,7 @@ const ADVANCED: &[&str] = &[
     "edit.fuzzy_threshold",
     "edit.blackbox.enabled",
     "edit.auto_repair.enabled",
+    "edit.auto_repair.coach",
     "eval.timeout_secs",
     "subagent_max_live_jobs",
     "isolation.backend",

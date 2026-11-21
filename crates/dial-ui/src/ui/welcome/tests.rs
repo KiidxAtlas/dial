@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::testkit::plain;
 
 #[test]
 fn first_run_tour_dismissal_and_sending_persist_outside_the_project() {
@@ -46,17 +47,6 @@ fn info() -> WelcomeInfo {
         doctor_issues: 0,
         tour: false,
     }
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect()
 }
 
 #[test]

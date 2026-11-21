@@ -76,6 +76,10 @@ EVENTS = (
     "session_before_switch",
 )
 _ALIASES = {
+    "input": "user_prompt_submit",
+    "session_shutdown": "session_end",
+    "session_before_compact": "before_compact",
+    "session_stop": "stop",
     "tool_call": "pre_tool_use",
     "tool_result": "post_tool_use",
     "message_end": "assistant_message",
@@ -309,6 +313,7 @@ class Plugin:
         timeout_secs: int = 60,
     ) -> Any:
         """Register a tool. Usable bare (``@plugin.tool``) or with options."""
+        _timeout(timeout_secs, 3600, "tool")
 
         def register(function: Callable[..., Any]) -> Callable[..., Any]:
             tool_name = name or function.__name__
@@ -343,6 +348,7 @@ class Plugin:
         tool name for tool events. Return ``None`` to continue, a :class:`Block` to refuse, a
         :class:`Reply` (or a dict of Dial's reply keys) to change the action, or a string to
         show as a notice."""
+        _timeout(timeout_secs, 600, "hook")
         canonical = _ALIASES.get(event, event)
         if canonical not in EVENTS:
             raise ValueError(f"unknown hook event {event!r}; use one of {', '.join(EVENTS)}")
@@ -520,6 +526,12 @@ class Plugin:
             return BLOCK_EXIT
         json.dump(answer, sys.stdout)
         return 0
+
+
+def _timeout(seconds: int, maximum: int, kind: str) -> None:
+    # Match engine config validation before emitting TOML. Zero explicitly disables the timeout.
+    if type(seconds) is not int or not 0 <= seconds <= maximum:
+        raise ValueError(f"{kind} timeout_secs must be an integer in 0..={maximum}")
 
 
 def _render(result: Any) -> str:

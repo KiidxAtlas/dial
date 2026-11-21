@@ -1,7 +1,7 @@
 use super::*;
 use crate::llm::catalog::tests::routed;
 use crate::llm::local_format::gguf_fixtures::{header, string};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 

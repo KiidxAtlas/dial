@@ -458,7 +458,7 @@ pub(super) fn git_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
     }
     let theme = ctx.theme;
     let ascii = theme.ascii();
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let minus = if ascii { "-" } else { "−" };
     let mut rows = Vec::new();
     if let Some(s) = status {
@@ -471,7 +471,7 @@ pub(super) fn git_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
         let mut facts = Vec::new();
         if let Some(files) = c.files {
             facts.push(Fact {
-                text: super::plural(files as usize, "file"),
+                text: text::counted(files, "file"),
                 drop: 1,
             });
         }
@@ -625,7 +625,7 @@ fn diff_rows(files: &[DiffFile], dot: &str, w: usize, ctx: &TranscriptCtx) -> Ro
         }]
     };
     let target = vec![Span::styled(
-        super::plural(files.len(), "file"),
+        text::counted(files.len(), "file"),
         theme.fg(Tok::Muted),
     )];
     let mut rows = vec![row(glyph, "Diff", target, facts, dot, w, ctx)];
@@ -658,16 +658,16 @@ fn file_rows(
     let mut shown = 0;
     for (left, right) in listed {
         shown += 1;
-        let right_w: usize = right.iter().map(|s| text::width(&s.content)).sum();
+        let right_w: usize = text::spans_width(&right);
         let room = w.saturating_sub(indent + right_w + 1).max(1);
         let mut spans = vec![Span::raw(" ".repeat(indent))];
-        spans.extend(crate::ui::markdown::truncate_spans(
+        spans.extend(crate::ui::text::truncate_spans(
             left,
             room,
             &ellipsis(theme),
         ));
         if right_w > 0 {
-            let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+            let used: usize = text::spans_width(&spans);
             spans.push(Span::raw(
                 " ".repeat(w.saturating_sub(used + right_w).max(1)),
             ));
@@ -700,8 +700,8 @@ fn row(
 ) -> ratatui::text::Line<'static> {
     let theme = ctx.theme;
     let lead = gutter_span(glyph.to_owned(), theme.fg(glyph_tok));
-    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
-    let want: usize = target.iter().map(|s| text::width(&s.content)).sum();
+    let lead_w: usize = text::spans_width(&lead);
+    let want: usize = text::spans_width(&target);
     let (facts_text, room) = fit_facts(
         facts,
         w,
@@ -715,13 +715,13 @@ fn row(
         theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
     ));
     head.push(Span::raw(" "));
-    head.extend(crate::ui::markdown::truncate_spans(
+    head.extend(crate::ui::text::truncate_spans(
         target,
         room.max(1),
         &ellipsis(theme),
     ));
     if !facts_text.is_empty() {
-        let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&head);
         let right_w = text::width(&facts_text);
         head.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),

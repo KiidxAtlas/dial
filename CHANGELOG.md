@@ -17,8 +17,53 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-11-20
+
+### Added
+
+- Approvals: manage allowed commands in **Settings → Common → Allowed commands** or `/permissions`, or choose **Always allow** for this session or project on an eligible prompt. A project grant no longer persists unrelated session-only grants. `/approval yolo` opts into running eligible calls recovered from model text; Full auto still asks. Explicit denies and sandbox limits apply to both. [Tools](docs/tools.md).
+- Local models: Inkling-2-Mini uses MLX-LM for both text and images. A native tool call can follow a visible answer frame without printing its tool markup. MLX setup and approved updates now sync to Dial's bundled Python lockfile. [Setup and updates](docs/setup.md#keeping-external-runtimes-and-tools-current).
+- Debugger: `dap` reads memory (`readMemory`, a hex/ASCII dump) and disassembles (`disassemble`) when the adapter advertises support, and `sessions` lists every open debug session in the Dial session, including subagents'. [Tools](docs/tools.md).
+- Plan mode: approved plans are saved with the session, optionally autosaved to `.dial/plans` (`[plan] autosave`), and carried word for word through compaction. [Extensions](docs/extensibility.md).
+- Collaboration: with `[collab] allow_guest_answers`, writable guests can answer the host's `ask_user` choice questions (`/collab answer <n>`, RPC `collaboration_answer`); tool approvals and permission prompts stay host-only. The relay now serves the browser viewer at `/` under a hash-pinned content security policy, and `/collab start` prints the viewer link. [Collaboration](docs/collab.md).
+- Language servers: sessions and their forks that launch the same server for the same root share one process; cancelling one session's requests leaves the others running. `/cleanse` runs `swiftlint` at `.swiftlint.yml` or `Package.swift` roots. [Tools](docs/tools.md).
+- Autoresearch: `/autoresearch auto [iterations] [--patience N]` runs a self-driving loop. Each iteration asks the agent for one change; Dial commits it, benchmarks it, and keeps it only if it beats the best run, otherwise it resets the branch. The loop stops at the iteration cap, after `patience` iterations without improvement, or when a turn waits for you. [Autoresearch](docs/autoresearch-and-archive.md).
+- RPC client check: `sdk/client-smoke` is an independently built consumer that starts a supplied `dial` binary with a temporary project and home, expects negotiated protocol v2, an empty history page and a coded `invalid_params` refusal, and sends no prompt. [Client contracts](docs/client-contracts.md).
+- Docs: a [coding harness roadmap](docs/harness-roadmap.md) proposes the repair, advice and cache experiments and their rollout criteria; the edit-repair pilot's raw rows are in `docs/measurements/edit-repair-pilot.csv`.
+
+### Changed
+
+- Hosted models: ordinary agent calls inherit the provider’s temperature and optional output limit instead of sending Dial’s planning defaults. Known no-sampling Claude models also drop sampling overrides on gateway routes. [LLM transport](docs/llm-transport.md#hosted-generation-defaults).
+- Gemini: a tool call cut off in the output-limit frame no longer aborts recovery or enters replay history. Proxied streams report wrapped provider errors instead of treating them as a dropped connection.
+- Terminal: process help no longer passes clicks to jobs behind it, and history previews page by the visible rows. Compact screens keep send choices, attachment warnings, process states and output titles readable.
+- Terminal: Appearance preview hints now match its controls. Home warnings, provider details, role assignments and the saved-settings filter stay readable in compact layouts. [Terminal shortcuts](docs/terminal-shortcuts.md).
+- Terminal: long searches keep the caret visible, compact settings lists keep the selected field in view, and Compute and Improve keep the active tab in view. Models and Providers agree on readiness marks; cached metadata is not a live success. [Terminal shortcuts](docs/terminal-shortcuts.md).
+- Terminal: model and image settings no longer apply shortcuts again on key release. Appearance preview and the Peers board honor remapped navigation, panel footers prioritize the way out, and question hints respect the ASCII theme. [Terminal shortcuts](docs/terminal-shortcuts.md).
+- Collaboration: the browser viewer ignores a log entry missing its payload, matching terminal guests and leaving the index available for a valid entry. [Collaboration](docs/collab.md).
+- Tool-call compatibility handles string-encoded nullable numeric and boolean arguments locally, including extension arguments. Quoted field names in open maps are preserved. [Tool reliability](docs/tools.md#tool-reliability-and-measured-interfaces).
+- Provider retry notices count the original request toward the attempt limit and identify the attempt that actually failed when the cause changes. [Turn status](docs/terminal-turns.md).
+- Opt-in `edit.auto_repair.enabled` now tries one local delimiter restoration only on an existing syntax refusal. It reuses the edit's parse results, adds no repair message to ordinary tool output, and does not turn on syntax checking. Coach fallback requires `edit.auto_repair.coach`. [Editing](docs/tools.md).
+- The assistance benchmark can ablate shell hints without relaxing blocks. Codex WebSocket continuations avoid copying the old transcript into their outgoing delta. Neither change establishes a model-quality or latency improvement. [Harness roadmap](docs/harness-roadmap.md).
+- Python plugin registration accepts the engine’s lifecycle aliases and rejects invalid hook/tool timeouts before emitting configuration. [Extensions](docs/extensibility.md#python-plugin-sdk).
+- Fixed rolling statistics ranges in `/stats`, the Stats panel, RPC and the dashboard. All now use the CLI's cutoff and exclude older activity. [Statistics](docs/share-stats-telemetry.md).
+- The local stats dashboard and both standalone viewers share one stylesheet. The stats page pins its script and stylesheet by hash; a missing collaboration link is shown as an error rather than a neutral message. [Statistics](docs/share-stats-telemetry.md) · [Collaboration](docs/collab.md).
+- Model and image settings now honor the same page bindings. Worker details and lists agree on status marks, and a running job no longer uses the success color. [Terminal shortcuts](docs/terminal-shortcuts.md).
+- Human-readable file sizes use binary unit labels (`KiB`, `MiB`, `GiB`) across CLI and approval views. Machine-readable byte counts are unchanged.
+- Model diagnostics (the text response test and the coding/tool check) share one bound: a single attempt on the configured route with no account rotation, quota wait or fallback chain, a 20-second budget, and an output limit clamped to the request's own. Esc and the budget cancel the same way.
+- While a turn runs, the composer hints for Ctrl+C (close history search, clear the draft, or stop the turn) and Enter come from the same decision the key handlers act on, so the advertised action is the one taken.
+- Panel footers drop hints for unbound keys instead of showing a bare label, keep `F1 keys` reachable when space runs out, and use ASCII separators and `...` clipping under the ASCII glyph preset.
+- Forge tools (`github`, `gitea_pr`, `glab_mr`) share one access policy: only each tool's read-only operations skip approval and run in parallel; any other call, including a missing or unknown `op`, needs approval and runs alone.
+- API-key sign-in for the Alibaba coding and token plans uses one shared prompt that never starts a validation request after cancel or empty input. The local stats server validates the requested range before opening the database.
+- Internal: a codebase-wide consolidation moved duplicated logic to single owners: calendar arithmetic (`platform::time::calendar`), byte-size labels (`units`), the persistent eval lifecycle shared by JavaScript and Python, the edit transaction shared by Unix and Windows, and shared panel, footer, list-cursor and text-clipping helpers. Apart from the entries above, no behavior change is intended.
+
+### Security
+
+- Build-time runtime payloads (`scripts/prepare-node.py`, `prepare-python.py`) are copied into a private snapshot, bounded and SHA-256 checked there, and extracted only from that verified copy, so a file that changes after hashing never reaches the extractor.
+- Private project databases are opened through one owner: plain file names inside the state directory only, created owner-only and never through a link, with WAL and a busy timeout.
+
 ### Fixed
 
+- Local models: Inkling’s framed replies separate thinking from answer text. On managed MLX, native tool calls use the normal approval policy instead of prompting as calls recovered from text. [LLM transport](docs/llm-transport.md).
 - The release workflow's package metadata job no longer fails after a successful release because its pull request never receives the checks `main` requires. With the optional `RELEASE_PACKAGING_TOKEN` secret it waits for that pull request's CI and merges it; without the secret it opens the pull request and records a manual-merge warning instead of timing out. [Release and installation](docs/release-and-install.md).
 
 ## [0.3.12] - 2026-11-20
@@ -31,7 +76,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 ### Fixed
 
 - Leaving first-run model setup with Esc or the new **Skip for now** choice (which replaces Quit setup) now opens Dial without a model instead of exiting; prompts then explain how to pick one with `/model` or `/providers`. [Setup](docs/setup.md#first-launch-and-model-readiness).
-- List Gemini 4 Neon under Google Antigravity so signed-in users can select it with an eligible Google AI subscription. [Provider setup](docs/provider-catalog.md).
+- Fixed duplicate Anthropic listings in `/providers` and `/models` when a saved model inherited the built-in route's credentials. [Provider catalog](docs/provider-catalog.md#anthropic-subscription-sign-in).
+- Google Antigravity model discovery now lists the signed-in project's model IDs rather than marking bundled models available without checking. Listings larger than 256 KiB use the normal catalog size limit; `/providers` reports request failures. [Provider setup](docs/provider-catalog.md).
+- `/models` groups Google Antigravity effort variants into one row. Picking an effort there or with `/effort` selects the corresponding model ID from the project's listing (for example, `gemini-4-neon-high`).
+- Fixed Antigravity Neon's effort IDs falling back to a 32K context window instead of using the listed input capacity or the Neon family's 524,288-token catalog window.
+- Fixed `/effort low` and `/effort high` for Gemini 3.1 Pro on Google Antigravity, including the effort profile saved by Dial 0.3.12. [Provider setup](docs/provider-catalog.md).
 - Python `eval` cells can now `import dial` (or `from dial import readText`) and get the built-in helpers instead of `ModuleNotFoundError`; a real `dial` module in the environment still takes precedence. [Execution](docs/execution-and-web.md).
 - A refused write or read under a system temp directory (`/tmp`, `/var/tmp`, the OS temp dir) now suggests the workspace `.tmp/<name>` scratch path instead of only offering a directory-access request. [Directory access](docs/directory-access.md).
 - The "Could not prevent automatic sleep" notice now appears once per process instead of on every turn and worker, so headless and container runs without a system D-Bus are not flooded; each turn still tries to acquire the guard. [Agent loop](docs/agent-loop.md#automatic-sleep-prevention).
@@ -3110,7 +3159,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.12...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.13...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3159,3 +3208,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.10]: https://github.com/KiidxAtlas/dial/tree/v0.3.10
 [0.3.11]: https://github.com/KiidxAtlas/dial/tree/v0.3.11
 [0.3.12]: https://github.com/KiidxAtlas/dial/tree/v0.3.12
+[0.3.13]: https://github.com/KiidxAtlas/dial/tree/v0.3.13

@@ -6,7 +6,7 @@ pub(super) static APPROVAL_POLICY: &[SettingDef] = &[field!(
     IN,
     "Approvals",
     "Approval mode",
-    "Write: workspace edits and non-destructive shell commands run without a prompt; destructive or privileged commands and tools that leave the workspace still ask. Ask: prompt before every write, edit and shell command. Auto: never prompt. Read-only: only read tools run.",
+    "Write: edits and non-destructive commands run; destructive and outside-project actions ask. Ask: prompt before edits and commands. Auto: ordinary tool calls run; calls recovered from model text still ask. YOLO: also runs eligible calls recovered from text, including unintended ones. Explicit denials and sandbox limits still apply. Read-only: only read tools run.",
     Kind::Enum(APPROVAL),
 )];
 
@@ -89,6 +89,24 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         "Clean source checkout on /wt",
         "After /wt moves uncommitted changes into the new worktree, reset tracked files and remove untracked files from the original checkout.",
         Kind::Bool,
+    ),
+    field!(
+        "plan.autosave",
+        plan.autosave,
+        TO,
+        "Plan mode",
+        "Save approved plans to the project",
+        "Copy each approved plan into the autosave directory as <title>-plan.md. An existing file is never overwritten; a numbered name is used instead.",
+        Kind::Bool,
+    ),
+    field!(
+        "plan.autosave_dir",
+        plan.autosave_dir,
+        TO,
+        "Plan mode",
+        "Plan autosave directory",
+        "Where approved plans are saved. Empty uses .dial/plans in the workspace; relative paths are workspace-relative and may not contain ..; absolute paths are used as given.",
+        Kind::Text,
     ),
     field!(
         "commit.cache_enabled",
@@ -264,7 +282,16 @@ pub(super) static EXECUTION: &[SettingDef] = &[
         TO,
         "Editing",
         "Repair parse regressions",
-        "Ask the coach role for a source repair and reparse it before commit. Approval, source witnesses and cancellation remain authoritative.",
+        "Try one local delimiter restoration only before a syntax refusal. Does not enable syntax checking or require a model.",
+        Kind::Bool,
+    ),
+    field!(
+        "edit.auto_repair.coach",
+        edit.auto_repair.coach,
+        TO,
+        "Editing",
+        "Allow coach fallback for edit repair",
+        "When automatic repair is enabled but cannot restore a delimiter locally, allow the configured coach to propose a bounded repair.",
         Kind::Bool,
     ),
     field!(

@@ -179,7 +179,7 @@ fn control_operations_do_not_start_an_interpreter() {
             assert!(!output.is_error, "{language} {action}: {}", output.text);
         }
     }
-    assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
+    assert_eq!(tool.js.cell.pid.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn unknown_language_is_refused_before_any_runtime_starts() {
             .to_string()
             .contains("unsupported eval language")
     );
-    assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
+    assert_eq!(tool.js.cell.pid.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -370,7 +370,7 @@ fn idle_cancel_does_not_claim_to_discard_an_absent_namespace() {
         result,
         json!({"cancelled":false,"namespace_discarded":false})
     );
-    assert!(!tool.js.interrupt.load(Ordering::Acquire));
+    assert!(!tool.js.cell.interrupt.load(Ordering::Acquire));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -398,14 +398,14 @@ fn cancel_reports_and_preserves_idle_namespace_but_discards_active_namespace() {
         .unwrap()
     };
     assert!(run(json!({"code":"const kept = 42"}))["error"].is_null());
-    let pid = tool.js.pid.load(Ordering::Acquire);
+    let pid = tool.js.cell.pid.load(Ordering::Acquire);
     assert!(pid > 0);
     assert_eq!(
         run(json!({"action":"cancel","language":"js"})),
         json!({"cancelled":false,"namespace_discarded":false})
     );
     assert_eq!(run(json!({"code":"kept"}))["value"], "42");
-    assert_eq!(tool.js.pid.load(Ordering::Acquire), pid);
+    assert_eq!(tool.js.cell.pid.load(Ordering::Acquire), pid);
 
     let started = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -434,8 +434,8 @@ fn cancel_reports_and_preserves_idle_namespace_but_discards_active_namespace() {
         );
         assert!(running.join().unwrap().is_err());
     });
-    assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
-    assert!(tool.js.session.lock().is_none());
+    assert_eq!(tool.js.cell.pid.load(Ordering::Acquire), 0);
+    assert!(tool.js.cell.session.lock().is_none());
     let fresh = run(json!({"code":"typeof kept"}));
     assert_eq!(fresh["value"], "'undefined'");
 }

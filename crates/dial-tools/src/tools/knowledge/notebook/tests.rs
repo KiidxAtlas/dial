@@ -1,11 +1,5 @@
 use super::*;
 use crate::tools::testkit;
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
 fn source(ws: &Workspace, text: &str) -> String {
     let e = Evidence {
         source: "fixture".into(),
@@ -31,7 +25,7 @@ fn citation(out: &ToolOutput) -> String {
 }
 #[test]
 fn persisted_restart_resumes_prior_results_without_verification_or_reexecution() {
-    let (_work, state, ws) = fixture();
+    let (_work, state, ws) = testkit::workspace_with_artifacts();
     let a = source(&ws, "result output");
     let first=run(&ws,&json!({"action":"create","question":"Why?","entries":[{"kind":"result","summary":"Caller says test failed","references":[a]}],"competing_explanations":["cache","input"],"next_experiment":"Discriminate via investigate plan"})).unwrap();
     let predecessor = citation(&first);
@@ -58,14 +52,14 @@ fn persisted_restart_resumes_prior_results_without_verification_or_reexecution()
 }
 #[test]
 fn arbitrary_json_cannot_impersonate_notebook_and_missing_dependencies_fail() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let fake = source(&ws, r#"{"type":"research_notebook","revision":1}"#);
     assert!(run(&ws, &json!({"action":"resume","reference":fake})).is_err());
     assert!(run(&ws,&json!({"action":"create","question":"Why?","entries":[{"kind":"observation","summary":"missing","references":["artifact://unknown"]}]})).is_err());
 }
 #[test]
 fn bounded_history_and_entries_refuse_growth_without_changing_prior_snapshots() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let first = run(&ws, &json!({"action":"create","question":"Why?"})).unwrap();
     let mut reference = citation(&first);
     for _ in 1..MAX_HISTORY {
@@ -91,7 +85,7 @@ fn bounded_history_and_entries_refuse_growth_without_changing_prior_snapshots() 
 
 #[test]
 fn media_payloads_larger_than_snapshot_cap_authenticate_with_shared_budget() {
-    let (_w, _s, ws) = fixture();
+    let (_w, _s, ws) = testkit::workspace_with_artifacts();
     let bytes = vec![42; 256 * 1024];
     let item = Evidence {
         source: "screen".into(),

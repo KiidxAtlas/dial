@@ -3,8 +3,10 @@
 use crate::app::overlay::auth::AuthJob;
 use crate::config::types::Config;
 use crate::llm::model_config::ModelSelection;
+use crate::tools::ext::JobEntry;
 use crate::ui::keys::Keymap;
 use crate::ui::overlay::compute::ComputeOverlay;
+use crate::ui::overlay::jobs::JobRow;
 use crate::ui::overlay::models::ModelOverlay;
 use crate::ui::overlay::palette::{ChoiceSpec, PaletteOverlay};
 use crate::ui::overlay::providers::ProviderOverlay;
@@ -22,6 +24,24 @@ pub(in crate::app) mod compute;
 pub(in crate::app) mod env;
 pub(in crate::app) mod run;
 pub(in crate::app) mod settings;
+
+/// Panel rows for the background jobs one owner view lists. Every job panel (the activity attention
+/// projection, the overlay refresh and the frozen prompt snapshot) builds its rows here, so the
+/// fields and the session mode agree everywhere.
+pub(in crate::app) fn job_rows(jobs: Vec<JobEntry>) -> Vec<JobRow> {
+    jobs.into_iter()
+        .map(|job| JobRow {
+            name: job.name,
+            command: job.command,
+            status: job.status,
+            process_outcome: job.process_outcome,
+            running: job.running,
+            stop_requested: job.stop_requested,
+            terminal: job.terminal,
+            mode: "session".into(),
+        })
+        .collect()
+}
 
 /// A background cycle or training run this shell started. Its finish is noted once.
 pub(super) struct ImproveWatch {

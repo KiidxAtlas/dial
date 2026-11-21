@@ -11,7 +11,7 @@ use ratatui::{
 use crate::llm::model_config::{StatusPreset, StatusSeparator, UiConfig};
 
 use super::{
-    status::StatusData,
+    status::{StatusData, rate_label, shown_rate},
     text,
     theme::{Glyphs, Sym, Theme, Tok},
 };
@@ -317,11 +317,8 @@ pub fn activity_row(
                 if let Some(tokens) = progress.output_tokens {
                     label.push_str(&format!(" · {prefix}{} tok", text::compact_count(tokens)));
                 }
-                if let Some(rate) = progress
-                    .tokens_per_second
-                    .filter(|n| n.is_finite() && *n > 0.0)
-                {
-                    label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
+                if let Some(rate) = shown_rate(progress.tokens_per_second) {
+                    label.push_str(&format!(" · {}", rate_label(rate, prefix)));
                 }
                 label
             }
@@ -772,25 +769,18 @@ impl Env<'_> {
                 )
             }
             "rate" => {
-                let rate = data
-                    .live_tokens_per_second()
-                    .filter(|r| r.is_finite() && *r > 0.0)?;
+                let rate = shown_rate(data.live_tokens_per_second())?;
+                let prefix = if data.model_progress.as_ref().is_some_and(|p| p.estimated) {
+                    "~"
+                } else {
+                    ""
+                };
                 self.seg(
                     name,
                     importance,
                     vec![
                         self.icon(Sym::IconRate, Tok::StatusRate, ""),
-                        Some(self.part(
-                            format!(
-                                "{}{rate:.1} tok/s",
-                                if data.model_progress.as_ref().is_some_and(|p| p.estimated) {
-                                    "~"
-                                } else {
-                                    ""
-                                }
-                            ),
-                            Tok::StatusRate,
-                        )),
+                        Some(self.part(rate_label(rate, prefix), Tok::StatusRate)),
                     ],
                 )
             }
@@ -846,7 +836,7 @@ impl Env<'_> {
                 if pieces.is_empty() {
                     return None;
                 }
-                let joiner = format!(" {} ", self.theme.sym(Sym::Dot));
+                let joiner = self.theme.dot_sep();
                 self.seg(
                     name,
                     importance,

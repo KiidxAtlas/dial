@@ -4,6 +4,7 @@
 //! Unknown ownership/version formats fail closed. Scheduling and approval belong to the caller.
 use super::plan::{Plan, Step};
 use super::{Env, Method, RECIPES, Recipe, install_dir, locate, recipe};
+use crate::setup::{PYPROJECT, UV_LOCK, write_runtime_manifest};
 use anyhow::{Context, Result, bail, ensure};
 use std::cmp::Ordering as Cmp;
 use std::collections::BTreeMap;
@@ -15,7 +16,6 @@ use std::time::Duration;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECK_BUDGET: Duration = Duration::from_secs(120);
-const PYPROJECT: &str = include_str!("../../../../../python/pyproject.toml");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -134,10 +134,8 @@ pub fn preview(id: &str, env: &Env) -> Result<String> {
         text.push_str(&format!("\nDestination: {}\n", plan.destination.display()));
         if id == "mlx-runtime" {
             text.push_str(&format!(
-                "Write embedded compatibility manifest to {}:\n{}\n",
-                crate::config::paths::python_dir(&env.user_dir)
-                    .join("pyproject.toml")
-                    .display(),
+                "Write the bundled uv.lock and compatibility manifest to {}:\n{}\n",
+                crate::config::paths::python_dir(&env.user_dir).display(),
                 PYPROJECT
             ));
         }
@@ -184,10 +182,7 @@ pub fn update(
     let plan = fresh.plan.context("no supported update is available")?;
     ensure!(!cancel.load(Ordering::Acquire), "update cancelled");
     if id == "mlx-runtime" {
-        crate::config::settings_store::write_private(
-            &crate::config::paths::python_dir(&env.user_dir).join("pyproject.toml"),
-            PYPROJECT.as_bytes(),
-        )?;
+        write_runtime_manifest(&crate::config::paths::python_dir(&env.user_dir))?;
     }
     super::run::run_plan(&plan, cancel, progress)?;
     // Re-query instead of claiming a package manager's successful exit means everything is current.
@@ -375,7 +370,7 @@ fn npm(
         .or_else(|| {
             let node = locate(super::recipe("node")?, env)?;
             let npm = node.parent()?.join("npm");
-            super::is_executable(&npm).then_some(npm)
+            crate::platform::fs::is_executable(&npm).then_some(npm)
         })
         .context("npm unavailable; cannot check private npm install")?;
     let mut changes = Vec::new();
@@ -860,9 +855,17 @@ fn mlx(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> Resu
         let current = installed[package]
             .as_str()
             .context("MLX package version missing")?;
-        match compare_versions(package, current, target) {
-            Some(Cmp::Less) => change = true,
-            Some(Cmp::Equal) => {}
+        // A source pin has an exact development version. Only older stable releases may
+        // migrate automatically; an unknown fork or newer release stays manual.
+        let release = target
+            .split_once(".dev")
+            .map_or(target, |(release, _)| release);
+        match (
+            current == target,
+            compare_versions(package, current, release),
+        ) {
+            (true, _) => {}
+            (false, Some(Cmp::Less)) => change = true,
             _ => {
                 return candidate(
                     recipe,
@@ -893,24 +896,50 @@ fn mlx(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> Resu
             None,
         );
     }
+    let uv = locate(super::recipe("uv").context("uv recipe missing")?, env)
+        .context("uv unavailable for private runtime sync")?;
+    let dir = root;
+    ensure!(
+        !dir.join("pyproject.toml").is_symlink() && !dir.join("uv.lock").is_symlink(),
+        "MLX manifest or lockfile is a symlink; refusing to overwrite"
+    );
+    let mut sync = step(
+        &uv,
+        &[
+            "sync",
+            "--project",
+            &dir.to_string_lossy(),
+            "--no-dev",
+            "--locked",
+        ],
+        env,
+    );
+    sync.env.push((
+        "UV_PROJECT_ENVIRONMENT".into(),
+        dir.join(".venv").display().to_string(),
+    ));
+    sync.env.push(("UV_NO_CONFIG".into(), "1".into()));
+    if !change {
+        change = std::fs::read(dir.join("pyproject.toml")).ok().as_deref()
+            != Some(PYPROJECT.as_bytes())
+            || std::fs::read(dir.join("uv.lock")).ok().as_deref() != Some(UV_LOCK);
+    }
+    if !change {
+        // uv checks installed artifacts (including Git provenance and transitive packages)
+        // without modifying the project or contacting a registry.
+        let mut check = sync.clone();
+        check.args.extend(["--offline".into(), "--check".into()]);
+        let result = query(&check)?;
+        match result.code {
+            0 => {}
+            1 => change = true,
+            _ => bail!(
+                "uv could not check the locked MLX environment: {}",
+                result.stderr
+            ),
+        }
+    }
     let plan = if change {
-        let uv = locate(super::recipe("uv").context("uv recipe missing")?, env)
-            .context("uv unavailable for private runtime sync")?;
-        let dir = crate::config::paths::python_dir(&env.user_dir);
-        ensure!(
-            !dir.join("pyproject.toml").is_symlink(),
-            "MLX manifest is a symlink; refusing to overwrite"
-        );
-        let mut sync = step(
-            &uv,
-            &["sync", "--project", &dir.to_string_lossy(), "--no-dev"],
-            env,
-        );
-        sync.env.push((
-            "UV_PROJECT_ENVIRONMENT".into(),
-            dir.join(".venv").display().to_string(),
-        ));
-        sync.env.push(("UV_NO_CONFIG".into(), "1".into()));
         Some(Plan {
             id: recipe.id,
             method: "private MLX embedded compatibility pins".into(),
@@ -932,8 +961,13 @@ fn mlx(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> Resu
             Status::Current
         },
         format!(
-            "{}; rich {rich}. Compared with Dial's embedded compatibility pins, not unbounded PyPI latest.",
-            versions.join("; ")
+            "{}; rich {rich}. {}",
+            versions.join("; "),
+            if change {
+                "Sync to Dial's bundled runtime lockfile available."
+            } else {
+                "Matches Dial's bundled runtime lockfile."
+            }
         ),
         plan,
     )

@@ -23,6 +23,24 @@ fn entry_frame(seq: usize, message: &Value) -> Value {
 }
 
 #[test]
+fn shared_replica_fixture_projects_each_visible_log_exactly_once() {
+    #[derive(serde::Deserialize)]
+    struct Step {
+        frame: Value,
+        log: Vec<Value>,
+    }
+    let steps: Vec<Step> = serde_json::from_str(include_str!(
+        "../../../../../assets/collab-web/replica.fixture.json"
+    ))
+    .unwrap();
+    let mut replica = Replica::default();
+    for step in steps {
+        replica.apply(&step.frame);
+        assert_eq!(replica.entries(), step.log, "after {}", step.frame);
+    }
+}
+
+#[test]
 fn join_after_two_messages_projects_history_exactly_once() {
     let log = vec![message("user", "hi"), message("assistant", "hello")];
     let mut replica = Replica::default();
@@ -113,4 +131,36 @@ fn describe_collapses_text_and_bounds_length() {
     let long = json!({"role": "user", "content": "x".repeat(PREVIEW_CHARS + 5)});
     assert!(describe(&long).ends_with('…'));
     assert_eq!(describe(&json!({"role": "tool"})), "tool: (no text)");
+}
+
+#[test]
+fn host_questions_are_listed_validated_and_withdrawn() {
+    let question =
+        json!({"t":"question","id":7,"title":"Pick","body":"Which one?","options":["red","blue"]});
+    let mut guest = Guest::fixture(&[
+        json!({"t":"challenge","nonce":"n"}),
+        json!({"t":"welcome","readOnly":false}),
+    ]);
+    assert_eq!(
+        guest.send_answer(1),
+        Err("The host has no open question for guests")
+    );
+    let mut notes = Vec::new();
+    guest.on_frame(&question, &mut notes);
+    assert!(notes[0].contains("The host asks: Pick\nWhich one?\n  1. red\n  2. blue"));
+    assert_eq!(
+        guest.open_question(),
+        Some(json!({"id":7,"title":"Pick","body":"Which one?","options":["red","blue"]}))
+    );
+    for out_of_range in [0, 3] {
+        assert_eq!(
+            guest.send_answer(out_of_range),
+            Err("No such option; answer with one of the listed numbers")
+        );
+    }
+    // A different question's withdrawal leaves this one open.
+    guest.on_frame(&json!({"t":"question-closed","id":6}), &mut notes);
+    assert!(guest.open_question().is_some());
+    guest.on_frame(&json!({"t":"question-closed","id":7}), &mut notes);
+    assert_eq!(guest.open_question(), None);
 }

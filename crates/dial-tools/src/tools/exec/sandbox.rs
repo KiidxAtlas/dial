@@ -1062,6 +1062,15 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
     })
 }
 
+/// Build the child environment from scratch; never accidentally inherit an unlisted variable.
+pub(super) fn inherit_allowed_env(command: &mut std::process::Command) {
+    command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(key, value)| {
+            child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy())
+        }));
+}
+
 /// Whether an inherited variable belongs in a tool child environment. Unknown names are
 /// excluded, not guessed safe from their spelling. Explicit operator-configured environment
 /// entries (for example MCP `env`) are separate grants applied by the caller afterwards.

@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{editor_spans, filled, hint, hint_line, is_ctrl, panel, pressed},
     subagents::CANCEL_CONFIRM,
+    widgets::{editor_spans, filled, hint, hint_line, is_ctrl, panel, pressed},
 };
 use crate::{
     config::paths::Layout,
@@ -1104,15 +1104,10 @@ impl SubagentViewer {
                 theme.spinner(ctx.status.tick).to_owned(),
                 fx::pulse(theme, ctx.status.tick),
             ),
-            // A worker blocked on the operator must not look busy.
-            AgentStatus::Waiting
-            | AgentStatus::NeedsInput
-            | AgentStatus::Blocked
-            | AgentStatus::Interrupted => (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning)),
-            AgentStatus::Done => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
-            AgentStatus::Answered => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Muted)),
-            AgentStatus::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
-            AgentStatus::Cancelled => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Muted)),
+            status => {
+                let mark = status.state_mark();
+                (mark.glyph(theme).to_owned(), theme.fg(mark.tok()))
+            }
         };
         let mut spans = vec![
             Span::raw(" "),
@@ -1136,10 +1131,7 @@ impl SubagentViewer {
             facts.push(text::usd(cost));
         }
         for fact in facts.into_iter().filter(|fact| !fact.is_empty()) {
-            spans.push(Span::styled(
-                format!(" {} ", theme.sym(Sym::Dot)),
-                theme.fg(Tok::Dim),
-            ));
+            spans.push(Span::styled(theme.dot_sep(), theme.fg(Tok::Dim)));
             spans.push(Span::styled(fact, theme.fg(Tok::Muted)));
         }
         filled(spans, width, Style::default())
@@ -1220,7 +1212,7 @@ impl SubagentViewer {
         if self.draft.text.is_empty() {
             segments.push(format!(
                 "{} scroll",
-                super::settings::arrows(theme, super::settings::Axis::Vertical)
+                super::widgets::arrows(theme, super::widgets::Axis::Vertical)
             ));
             segments.push("PgUp/PgDn page".to_owned());
         }

@@ -229,14 +229,6 @@ fn program() -> Result<OsString, String> {
 /// The first file named `name` in the `path` search list. A missing program is reported with the
 /// install and login steps rather than a bare spawn error.
 pub(super) fn resolve_program(path: Option<&OsStr>, name: &str) -> Result<PathBuf, String> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    path.into_iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join(&exe))
-        .find(|candidate| candidate.is_file())
+    crate::platform::fs::find_program(std::path::Path::new(name), path)
         .ok_or_else(|| MISSING_GLAB.to_owned())
 }

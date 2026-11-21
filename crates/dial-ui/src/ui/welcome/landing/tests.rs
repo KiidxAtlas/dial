@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::testkit::plain;
 use crate::ui::{
     composer::{Composer, ComposerCtx},
     keys::Keymap,
@@ -19,12 +20,6 @@ fn info() -> WelcomeInfo {
         dismiss_key: "Esc".into(),
         ..Default::default()
     }
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
 }
 
 fn render_home(width: u16, height: u16, selected: Option<usize>, draft: &str) -> ComposerView {
@@ -500,6 +495,33 @@ fn the_home_names_the_approval_mode_and_the_key_that_changes_it() {
 }
 
 #[test]
+fn welcome_warning_and_model_shortcut_fit_the_launch_card() {
+    let mut info = info();
+    info.model.clear();
+    info.approval = "write".into();
+    info.sandbox = "off".into();
+    for width in [38, 80] {
+        let view = frame(
+            &info,
+            width,
+            24,
+            &Theme::dark(),
+            View::default(),
+            ComposerView {
+                rows: vec![Line::from("draft")],
+                cursor: (0, 0),
+            },
+            vec![],
+        );
+        let shown = plain(&view.rows).join("\n");
+        assert!(
+            shown.contains("Ctrl+K") && shown.contains("isolation") && !shown.contains("isola…"),
+            "{shown}"
+        );
+    }
+}
+
+#[test]
 fn safety_warnings_name_the_risk_only_when_commands_run_unasked() {
     assert!(safety_notice("auto", "off").unwrap().contains("no sandbox"));
     assert!(
@@ -507,6 +529,8 @@ fn safety_warnings_name_the_risk_only_when_commands_run_unasked() {
             .unwrap()
             .starts_with("Full auto")
     );
+    assert!(safety_notice("yolo", "dev").unwrap().starts_with("YOLO"));
+    assert!(safety_notice("yolo", "off").unwrap().contains("no sandbox"));
     assert!(
         safety_notice("write", "off")
             .unwrap()

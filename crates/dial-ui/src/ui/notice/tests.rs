@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm::model_config::UiConfig;
+use crate::ui::testkit::plain;
 
 #[test]
 fn native_option_shortcuts_are_highlighted_like_alt() {
@@ -35,12 +36,6 @@ impl Env {
             expand_key: "Ctrl+O",
         }
     }
-}
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
 }
 
 #[test]

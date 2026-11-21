@@ -69,7 +69,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "modelpreset",
     "outcome",
     "peers",
-    "permissions",
     "plan-review",
     "profile",
     "providers",

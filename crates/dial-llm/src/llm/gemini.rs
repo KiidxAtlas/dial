@@ -192,7 +192,10 @@ fn request(
         ensure!(
             matches!(
                 profile.capabilities.reasoning,
-                ReasoningApi::None | ReasoningApi::GeminiBudget | ReasoningApi::GeminiLevel
+                ReasoningApi::None
+                    | ReasoningApi::GeminiBudget
+                    | ReasoningApi::GeminiLevel
+                    | ReasoningApi::AntigravityModelVariant
             ),
             "profile reasoning API does not match Gemini"
         );
@@ -415,7 +418,7 @@ fn request(
     }
     ensure!(!contents.is_empty(), "Gemini requires conversation content");
     let mut generation = json!({"candidateCount":1});
-    if req.max_tokens > 0 {
+    if req.max_tokens > 0 && !profile.is_some_and(ModelProfile::inherits_output_limit) {
         generation["maxOutputTokens"] = json!(req.max_tokens);
     }
     if profile.is_none_or(|profile| profile.capabilities.temperature) {
@@ -561,7 +564,15 @@ impl Accumulator {
         let mut envelope: Value =
             serde_json::from_str(data).context("Gemini stream event is not valid JSON")?;
         ensure!(envelope.is_object(), "Gemini stream event is not an object");
-        if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
+        if let Some(error) = envelope
+            .get("error")
+            .filter(|error| !error.is_null())
+            .or_else(|| {
+                envelope
+                    .pointer("/response/error")
+                    .filter(|error| !error.is_null())
+            })
+        {
             let status = error["status"].as_str();
             let code = error["code"].as_u64();
             if matches!(
@@ -680,6 +691,7 @@ impl Accumulator {
                 .is_none_or(|role| role == "model"),
             "Gemini returned a non-model candidate"
         );
+        let truncated = candidate["finishReason"] == "MAX_TOKENS";
         let parts = candidate.pointer_mut("/content/parts").map(Value::take);
         if let Some(parts) = parts {
             let Value::Array(parts) = parts else {
@@ -723,6 +735,10 @@ impl Accumulator {
                     }
                 }
                 if let Some(function) = part.get("functionCall") {
+                    // This frame ended at the output limit. Even the name or ID may be incomplete.
+                    if truncated {
+                        continue;
+                    }
                     ensure!(
                         self.reply.tool_calls.len() < MAX_TOOL_CALLS,
                         "Gemini reply exceeds the tool-call limit"
@@ -791,6 +807,8 @@ impl Accumulator {
                     // Calls cut off by the output limit never run; `length` lets the agent raise
                     // the output budget and retry, as on the other transports.
                     self.reply.tool_calls.clear();
+                    self.native_calls.clear();
+                    self.native.retain(|part| part.get("functionCall").is_none());
                     "length"
                 }
                 "MALFORMED_FUNCTION_CALL" if self.reply.tool_calls.is_empty() => "tool_calls",

@@ -1,11 +1,12 @@
 """Dial's MLX server entry point, embedded by the Rust supervisor.
 
-MLX-LM 0.32.0 assumes tool-parser output always has arguments; malformed model output can raise
-KeyError and close the HTTP connection. Preserve such failures as invalid OpenAI tool calls so the
-Rust agent can diagnose/retry them. Never synthesize executable arguments for a malformed call.
+Preserve malformed tool-parser output as invalid OpenAI tool calls so the Rust agent can
+diagnose/retry them. Never synthesize executable arguments for a malformed call.
 """
+import copy
 import json
 import logging
+import re
 import uuid
 
 
@@ -176,7 +177,7 @@ def install_tool_grammar(server):
 
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
-        self._idx = 0
+        self.count = 0  # mlx_lm.server uses this to choose the completion finish reason.
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
@@ -198,8 +199,8 @@ class ToolCallFormatter:
             },
         }
         if self._streaming:
-            call["index"] = self._idx
-            self._idx += 1
+            call["index"] = self.count
+        self.count += 1
         return call
 
     def __call__(self, tool_calls):
@@ -214,6 +215,257 @@ class ToolCallFormatter:
             calls = parsed if isinstance(parsed, list) and parsed else [parsed]
             result.extend(self._format(call) for call in calls)
         return result
+
+
+# Inkling 2 writes a native tool call as reserved special tokens, which the text path cannot tell
+# from literal text. Promote only the exact token sequence: complete thinking or text frames, then
+# one message frame addressed to an offered tool, then the model's EOS with stop. Anything else keeps
+# its text, so the Rust text parser and approval path see exactly what the model wrote.
+_NATIVE_TOOL_TOKENS = {
+    "message": "<|message_model|>",
+    "thinking": "<|content_thinking|>",
+    "text": "<|content_text|>",
+    "invoke": "<|content_invoke_tool_json|>",
+    "end": "<|end_message|>",
+    "eos": "<|content_model_end_sampling|>",
+}
+# The Rust frame parser's name grammar; a name outside it is not a call Dial can recognise.
+_NATIVE_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,256}")
+# One undecided frame holds its tokens; beyond this bound the text is released as ordinary text.
+_NATIVE_TOOL_MAX_TOKENS = 8192
+
+
+class _NativeToolSpec:
+    """Reserved token IDs and offered tool names of one Inkling 2 request."""
+    def __init__(self, tokenizer, ids, names):
+        self.tokenizer = tokenizer
+        self.ids = ids
+        self.names = names
+        self.special = frozenset(tokenizer.all_special_ids)
+
+
+def _native_tool_spec(generator, tokenizer, request):
+    """Enable native tool frames only for Inkling 2 chat requests that offer tools and no upstream parser."""
+    model = getattr(generator.model_provider, "model", None)
+    if getattr(getattr(model, "args", None), "model_type", None) != "inkling2_loop":
+        return None
+    if getattr(request, "request_type", None) != "chat" or getattr(tokenizer, "tool_parser", None) is not None:
+        return None
+    import dial_tool_grammar as grammar
+    names = set(grammar.tool_schemas(getattr(request, "tools", None)))
+    if not names:
+        return None
+    special = set(tokenizer.all_special_ids)
+    ids = {}
+    for key, text in _NATIVE_TOOL_TOKENS.items():
+        token = tokenizer.convert_tokens_to_ids(text)
+        # Each reserved marker must be its own special token that round-trips to its text,
+        # not an unknown-token fallback shared with another marker.
+        if token is None or token not in special or tokenizer.decode([token]) != text:
+            return None
+        ids[key] = token
+    if len(set(ids.values())) != len(ids) or ids["eos"] not in tokenizer.eos_token_ids:
+        return None
+    return _NativeToolSpec(tokenizer, ids, names)
+
+
+def _unique_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate JSON key")
+    return result
+
+
+def _reject_constant(value):
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
+def _native_call(body, name):
+    """The call of one complete frame: exactly `name` and `args` keys, matching name, object args."""
+    try:
+        payload = json.loads(body, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):  # Deeply nested model output is malformed, not a crash.
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"name", "args"}:
+        return None
+    if payload["name"] != name or not isinstance(payload["args"], dict):
+        return None
+    return {"name": name, "arguments": payload["args"]}
+
+
+def _without_text(gen):
+    silent = copy.copy(gen)  # Keep the token, logprobs and finish reason; drop the markup text.
+    silent.text = ""
+    return silent
+
+
+class _NativeToolFrames:
+    """Decide each generated token before it reaches the text reader.
+
+    Text is held only while a candidate frame is undecided; any refusal releases it unchanged.
+    """
+    def __init__(self, spec, calls):
+        self.spec = spec
+        self.calls = calls  # Promoted calls, drained by the reader at the next text it reads.
+        self.state = "idle"
+        self.eligible = True  # Only complete assistant frames may precede the tool frame.
+        self.held = []
+        self.tokens = []
+        self.name = None
+        self.call = None
+
+    def push(self, gen):
+        if not self.eligible:
+            return [gen]
+        if self.held and len(self.held) >= _NATIVE_TOOL_MAX_TOKENS:
+            return self._refuse(gen)  # Bound the held text of one undecided frame.
+        token = gen.token
+        ids = self.spec.ids
+        ordinary = token not in self.spec.special
+        state = self.state
+        if state == "idle":
+            if token == ids["message"]:
+                self.state = "head"
+                self.held = [gen]
+                return []
+            self.eligible = False
+            return [gen]
+        if state == "content":
+            if token == ids["end"]:
+                self.state = "idle"
+            elif not ordinary:
+                self.eligible = False
+            return [gen]
+        if state == "head":
+            if token in (ids["thinking"], ids["text"]):
+                self.state = "content"
+                return self._release(gen)
+            if ordinary:
+                self.state = "recipient"
+                self.tokens = [token]
+                self.held.append(gen)
+                return []
+        elif state == "recipient":
+            if ordinary:
+                self.tokens.append(token)
+                self.held.append(gen)
+                return []
+            name = self.spec.tokenizer.decode(self.tokens)
+            if token == ids["invoke"] and name in self.spec.names and _NATIVE_TOOL_NAME.fullmatch(name):
+                self.state = "args"
+                self.name = name
+                self.tokens = []
+                self.held.append(gen)
+                return []
+        elif state == "args":
+            if ordinary:
+                self.tokens.append(token)
+                self.held.append(gen)
+                return []
+            if token == ids["end"]:
+                call = _native_call(self.spec.tokenizer.decode(self.tokens), self.name)
+                if call is not None:
+                    self.state = "eos"
+                    self.call = call
+                    self.held.append(gen)
+                    return []
+        elif state == "eos" and token == ids["eos"] and gen.finish_reason == "stop":
+            # The call reaches the reader before the first silent item is read.
+            self.calls.append(json.dumps(self.call, ensure_ascii=False))
+            logging.info("Promoted a native Inkling 2 tool frame to a tool call")
+            self.eligible = False
+            self.state = "done"
+            silent = [_without_text(item) for item in self.held + [gen]]
+            self.held = []
+            return silent
+        return self._refuse(gen)
+
+    def _refuse(self, gen):
+        self.eligible = False
+        return self._release(gen)
+
+    def _release(self, gen):
+        items = self.held + [gen]
+        self.held = []
+        return items
+
+    def finish(self):
+        """The response ended undecided: its held text is ordinary text."""
+        held, self.held = self.held, []
+        return held
+
+
+def _native_tool_responses(response, frames):
+    try:
+        for gen in response:
+            yield from frames.push(gen)
+        yield from frames.finish()
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
+
+
+def _native_tool_parser(text, tools):
+    """Our promoted calls are already parsed; the formatter only reads their JSON."""
+    return json.loads(text)
+
+
+class _NativeCallReader:
+    """Adds promoted calls to the text reader's delta, at the text that follows the frame."""
+    def __init__(self, reader, calls):
+        self._reader = reader
+        self._calls = calls
+
+    def feed(self, text):
+        return self._add(self._reader.feed(text))
+
+    def finish(self, text=""):
+        return self._add(self._reader.finish(text))
+
+    def _add(self, delta):
+        if not self._calls:
+            return delta
+        extra = tuple(self._calls)
+        self._calls.clear()
+        return delta + type(delta)(tool_calls=extra)
+
+
+class _NativeCallMachine:
+    def __init__(self, machine, calls):
+        self._machine = machine
+        self._calls = calls
+
+    def reader(self, *args, **kwargs):
+        return _NativeCallReader(self._machine.reader(*args, **kwargs), self._calls)
+
+
+def install_native_tools(server):
+    """Promote Inkling 2's reserved-token tool frames; every other token is unchanged."""
+    if getattr(server, "_dial_native_tools_installed", False):
+        return
+    original_tokenize = server.ResponseGenerator._tokenize
+    original_generate = server.ResponseGenerator.generate
+
+    def tokenize(generator, tokenizer, request, args):
+        result = original_tokenize(generator, tokenizer, request, args)
+        args._dial_native_tools = _native_tool_spec(generator, tokenizer, request)
+        return result
+
+    def generate(generator, request, args, progress_callback=None):
+        ctx, response = original_generate(generator, request, args, progress_callback=progress_callback)
+        spec = getattr(args, "_dial_native_tools", None)
+        if spec is None or getattr(ctx, "tool_parser", None) is not None:
+            return ctx, response  # Not Inkling 2 tools, or an upstream parser already owns them.
+        calls = []
+        ctx.tool_parser = _native_tool_parser
+        ctx.text_sm = _NativeCallMachine(ctx.text_sm, calls)
+        return ctx, _native_tool_responses(response, _NativeToolFrames(spec, calls))
+
+    server.ResponseGenerator._tokenize = tokenize
+    server.ResponseGenerator.generate = generate
+    server._dial_native_tools_installed = True
+
 
 def _progress_packet(phase, **values):
     return {"dial_progress": {"phase": phase, **{k: v for k, v in values.items() if v is not None}}}
@@ -591,7 +843,8 @@ def main():
     if tool_grammar_enabled(os.environ):
         install_tool_grammar(server)
     install_thinking_control(server)
-    install_text_progress(server)
+    install_text_progress(server)  # Inside the native wrapper: progress observes the raw model tokens.
+    install_native_tools(server)
     from dial_steering import install_server
     specification=os.environ.get("DIAL_STEERING_SPEC", "")
     install_server(server, json.loads(specification) if specification else None)

@@ -123,6 +123,8 @@ Dial stores access and refresh tokens in its private user directory, refreshes a
 requests, fingerprints harness requests with Claude Code's billing-header and body attestation,
 and sends subscription requests only to Anthropic's official API endpoint and protocol.
 Custom Anthropic endpoints use their own API keys; subscription tokens are not sent to them.
+Saving a model on the built-in Anthropic route reuses that route's listing in `/providers` and
+`/models`; a different endpoint or an explicit credential override remains separate.
 Discovery follows the selected authentication method. Unreadable subscription storage can be
 repaired by signing in again, or bypassed by explicitly selecting API key. Sign-out itself requires
 readable state; it does not discard corrupt files. Providers with zero discovered models remain
@@ -240,6 +242,7 @@ TypeSafe System One is a judgment-only backend, not a chat provider. Assign it t
 (`provider = "mlx"` in configuration), but `/models` names GGUF entries `gguf/…` and its detail line names the serving
 runtime; a GGUF entry's source notes when `llama-server` is not installed yet.
 - **MLX** (`config.json` + safetensors): served by `mlx_lm`/`mlx_vlm`; supports LoRA, steering and runtime tuning.
+  Inkling-2-Mini (`model_type: inkling2_loop`) uses MLX-LM for both text and image input. If upgrading an existing install, review `/setup update mlx-runtime` before selecting the model.
 - **GGUF** (a `.gguf` file, or a directory holding one; sharded files load from the first shard): served by llama.cpp's `llama-server` (found via `DIAL_LLAMA_SERVER`, `PATH`, `/opt/homebrew/bin` or `/usr/local/bin`) with `--jinja` and one slot. Tool and reasoning support come from the chat template in the GGUF header; a sibling `mmproj*.gguf` is passed as `--mmproj` and marks the model as vision-capable. `--ctx-size` is the configured context window, or else the largest window the memory estimate below allows (never the full native window by default). Constrained repair uses llama.cpp's JSON-schema grammar, and sampling names are translated (`repeat_penalty`, `repeat_last_n`). `[local_runtime]` maps `draft_model` (a local GGUF) and `num_draft_tokens` to `--model-draft`/`--spec-draft-n-max`, and `kv_bits` 8 or 4 to a `q8_0`/`q4_0` KV cache; the MLX-only `kv_group_size` and `quantized_kv_start` are rejected. An adapter must be a GGUF LoRA (`--lora`); steering and LoRA training need MLX weights.
 - **Splash** (`manifest.json` with `target/` and `tokenizer/`): only LM Studio can run these. Load the model in LM Studio and select it under the LM Studio provider; Dial's own launcher reports this instead of failing obscurely.
 
@@ -378,13 +381,26 @@ Remote routes use the declared protocol: OpenAI-compatible chat completions, Res
 Messages, Gemini or Ollama native streaming. Both **ChatGPT subscription** and **Claude subscription**
 have dedicated OAuth sign-in flows and use their respective official inference APIs.
 
-**Gemini 4 Neon on a Google AI subscription.** In `/providers`, sign in to **Google Antigravity**
-with the account that holds your subscription, then select `gemini-4-neon` in `/models`.
-For a one-shot request, use `dial -p --provider google-antigravity --model gemini-4-neon "Reply with OK."`.
-Google lists Neon for paid Pro and Ultra (and eligible device trials), not Free or Plus; a bundled
-model entry does not verify entitlement. See [Google's Antigravity model availability](https://antigravity.google/docs/models#gemini-4-neon).
+**Gemini on a Google AI subscription.** In `/providers`, sign in to **Google Antigravity** with
+the account that holds your subscription, then refresh `/models` (F5). When Google lists effort as
+part of a model ID, Dial shows one row for the family. For example, pick `gemini-4-neon`, then
+choose **high** to send `gemini-4-neon-high`. The picker offers only the variants in your project's
+listing. You can change the level later with `/effort` without picking the model again. Distinct
+models such as Flash and Flash Lite stay separate. The group uses the smallest known input window
+across its efforts. If Google does not report one, Neon uses Dial's catalog value of **524,288
+tokens**, not the 32,768-token fallback for unknown models. An explicit smaller cap still applies.
+
+If listing fails, Dial reports the provider as unavailable instead of offering bundled models as
+account models. Highlight **Google Antigravity** in `/providers` for the request error.
+Model lists use the catalog response limit (2 MiB), not the smaller OAuth token limit (256 KiB).
+A previously selected ID can still appear as **Configured (unverified)**. Seeing Neon in the Gemini web app, or quota in `/usage`,
+doesn't guarantee that Antigravity will accept `gemini-4-neon` for generation.
 The separate **Google Gemini CLI** sign-in no longer serves consumer Google AI subscriptions.
 The **Google Gemini** API-key route does not use Antigravity subscription quota.
+
+If the project lists only the plain `gemini-3.1-pro` ID, its low and high levels still use Gemini's
+`thinkingLevel` instead of changing the ID. A successful `/usage` quota lookup does not confirm
+access to a particular model.
 
 **Use your ChatGPT/Codex subscription.** Restart Dial, open `/providers`, select **ChatGPT
 subscription**, and choose **Continue with ChatGPT (add account)**. In the browser, authorize Dial

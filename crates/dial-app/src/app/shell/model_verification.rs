@@ -1,7 +1,8 @@
 //! Explicit, bounded model-response diagnostics; never invoked by catalog discovery.
 
-use super::{PAINT_EVERY, Shell};
-use crate::agent::{Ui, make_backend};
+use super::Shell;
+use crate::agent::Ui;
+use crate::agent::model::diagnostic_budget;
 use crate::app::bridge::Bridge;
 use crate::app::core::App;
 use crate::config::Config;
@@ -60,60 +61,30 @@ pub(in crate::app) fn failure_hint(error: &anyhow::Error) -> &'static str {
 }
 
 fn response_test(config: &Config, cancel: Arc<AtomicBool>, budget: Duration) -> Result<()> {
-    ensure!(!cancel.load(Ordering::SeqCst), "verification cancelled");
-    let mut config = config.clone();
-    config.retry.max_attempts = 1;
-    config.retry.rotate_accounts = false;
-    config.retry.wait_for_quota_reset = false;
-    config.retry.fallback_chains.clear();
-    config.worker_timeout_secs = 20;
-    let request = crate::llm::Chat {
-        messages: vec![serde_json::json!({"role":"user","content":"Reply with OK."})],
-        tools: vec![],
-        temperature: 0.,
-        max_tokens: 32,
-        seed: None,
-    };
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let result = std::thread::scope(|scope| {
-        let (done, rx) = std::sync::mpsc::channel::<()>();
-        let flag = cancel.clone();
-        let deadline = timed_out.clone();
-        scope.spawn(move || {
-            if matches!(
-                rx.recv_timeout(budget),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ) {
-                deadline.store(true, Ordering::SeqCst);
-                flag.store(true, Ordering::SeqCst);
-            }
-        });
-        let result = (|| {
-            let mut backend = make_backend(&config)?
-                .without_steering()
-                .with_retry(config.retry.clone());
-            let mut profile = backend.model_profile().cloned().unwrap_or_else(|| {
-                crate::llm::profiles::ModelProfile::minimal(
-                    &config.selection().provider,
-                    &config.model,
-                )
-            });
-            profile.max_tokens = Some(profile.max_tokens.filter(|n| *n > 0).unwrap_or(32).min(32));
-            profile.inherit_output_limit = false;
-            backend = backend.with_profile(profile);
-            ensure!(!cancel.load(Ordering::SeqCst), "verification cancelled");
-            backend.chat_with_control(None, &request, 20, None, &mut |_| {}, cancel.clone())
-        })();
-        drop(done);
-        result
-    });
-    ensure!(!timed_out.load(Ordering::SeqCst), "verification timed out");
-    ensure!(!cancel.load(Ordering::SeqCst), "verification cancelled");
-    ensure!(
-        !result?.text.trim().is_empty(),
-        "model returned no text response"
-    );
-    Ok(())
+    diagnostic_budget::within_budget(&cancel, budget, |cancel| {
+        let mut backend = diagnostic_budget::backend(config, 32)?;
+        let request = crate::llm::Chat {
+            messages: vec![serde_json::json!({"role":"user","content":"Reply with OK."})],
+            tools: vec![],
+            temperature: 0.,
+            max_tokens: 32,
+            seed: None,
+        };
+        ensure!(!cancel.load(Ordering::SeqCst), "verification cancelled");
+        let reply = backend.chat_with_control(
+            None,
+            &request,
+            diagnostic_budget::BUDGET_SECS,
+            None,
+            &mut |_| {},
+            cancel,
+        )?;
+        ensure!(
+            !reply.text.trim().is_empty(),
+            "model returned no text response"
+        );
+        Ok(())
+    })
 }
 
 impl Shell {
@@ -246,24 +217,15 @@ impl Shell {
             scope.spawn(move || {
                 let result = match diagnostic {
                     Diagnostic::Text => {
-                        response_test(&config, flag, Duration::from_secs(20)).map(|()| None)
+                        response_test(&config, flag, diagnostic_budget::BUDGET).map(|()| None)
                     }
                     Diagnostic::Coding => {
-                        coding::test(&config, flag, Duration::from_secs(20)).map(Some)
+                        coding::test(&config, flag, diagnostic_budget::BUDGET).map(Some)
                     }
                 };
                 let _ = tx.send(result);
             });
-            let mut bridge = Bridge {
-                app,
-                shell: self,
-                interrupt: app.interrupt.clone(),
-                started,
-                last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-                failed: false,
-                pending: Vec::new(),
-                next_id: 0,
-            };
+            let mut bridge = Bridge::started_at(app, self, started);
             loop {
                 bridge.heartbeat();
                 if app.interrupt.load(Ordering::SeqCst) {

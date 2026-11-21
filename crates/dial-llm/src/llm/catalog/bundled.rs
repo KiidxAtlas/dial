@@ -131,6 +131,9 @@ pub enum ThinkingMode {
     AnthropicBudgetEffort,
     /// Gemini `thinkingLevel`.
     GoogleLevel,
+    /// Each reasoning level is its own listed wire ID (`<family>-<effort>`); the request carries
+    /// no effort parameter, so the model ID alone selects the level.
+    ModelVariant,
 }
 
 /// A documented request rule for one exact model, beyond its thinking mode. Only facts the
@@ -560,12 +563,30 @@ pub fn bundled_model(provider: &str, model: &str) -> Option<BundledModel> {
     })
 }
 
+/// Antigravity effort IDs select the same family at different thinking levels. Inherit only the
+/// family's capacity when there is no exact capacity; this does not advertise a model or effort.
+pub(super) fn antigravity_context_window(model: &str) -> Option<u32> {
+    let capacity =
+        |id| bundled_model("google-antigravity", id).and_then(|card| card.context_window);
+    capacity(model).or_else(|| {
+        let family = super::subscription::antigravity_family(model);
+        (family != model).then(|| capacity(family)).flatten()
+    })
+}
+
 /// Thinking levels the bundled catalog documents for `provider/model`, weakest first, as level
 /// names. `role` drops levels a helper role cannot hold (`auto` is main-only and is never listed).
 pub fn documented_thinking_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
-    bundled_model(provider, model)
-        .map(|bundled| bundled.thinking_efforts)
-        .unwrap_or_default()
+    effort_names(
+        bundled_model(provider, model)
+            .map(|bundled| bundled.thinking_efforts)
+            .unwrap_or_default(),
+        role,
+    )
+}
+
+pub(super) fn effort_names(efforts: Vec<ReasoningEffort>, role: bool) -> Vec<&'static str> {
+    efforts
         .into_iter()
         .map(level_name)
         .filter(|level| !role || parse_thinking(level).is_ok())

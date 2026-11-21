@@ -3,9 +3,8 @@
 use super::{
     Rows,
     chrome::StateMark,
-    markdown,
-    markdown::truncate_spans,
-    text,
+    markdown, text,
+    text::truncate_spans,
     theme::{Sym, Theme, Tok},
     transcript::{TranscriptCtx, ellipsis, fitted},
 };
@@ -326,10 +325,6 @@ fn written_content(t: &Tool) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn plural(n: usize, one: &str) -> String {
-    format!("{n} {one}{}", if n == 1 { "" } else { "s" })
-}
-
 /// One fact at the header's right edge. `drop` ranks how readily it gives way to the target when
 /// the row is narrow: 0 never, higher first.
 struct Fact {
@@ -432,7 +427,7 @@ fn facts(t: &Tool, theme: &Theme) -> Vec<Fact> {
         out.push(keep(totals));
     }
     // Tool-owned facts may join parts with `·`; the ASCII preset keeps its own separator.
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     out.extend(
         t.presentation
             .facts
@@ -678,7 +673,7 @@ fn framed_card(
     // A divider is only worth its row when it separates the body from the full target above.
     let label = (!frame.sections.is_empty()).then_some(if failed { "Error" } else { "Output" });
     frame.sections.push((label.map(str::to_owned), body));
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     let mut facts = facts(t, theme)
         .into_iter()
         .map(|f| f.text)
@@ -711,9 +706,9 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
         theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     };
     let full_target = target(t);
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     let lead = gutter_span(glyph, glyph_style);
-    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
+    let lead_w: usize = text::spans_width(&lead);
     let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1;
     // Narrow rows give up timing, then a status the gutter glyph already shows, before the target.
     let want = text::width(&full_target).min(TARGET_MIN);
@@ -729,7 +724,7 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     head.push(Span::raw(" "));
     head.push(Span::styled(target_text, theme.fg(Tok::Muted)));
     if right_w > 0 {
-        let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&head);
         head.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),
         ));
@@ -885,7 +880,7 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
     ));
     let mut rows = vec![fitted(head, w, theme)];
     let (branch, last) = (theme.sym(Sym::TreeBranch), theme.sym(Sym::TreeLast));
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     for (i, t) in tools.iter().enumerate() {
         let rail = format!(
             "{}{} ",
@@ -900,7 +895,7 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
             Span::styled(fit_target(&full, room, theme.ascii()), theme.fg(Tok::Muted)),
         ];
         if !facts_text.is_empty() {
-            let used: usize = row.iter().map(|s| text::width(&s.content)).sum();
+            let used: usize = text::spans_width(&row);
             let right_w = text::width(&facts_text);
             row.push(Span::raw(
                 " ".repeat(w.saturating_sub(used + right_w).max(1)),
@@ -1035,10 +1030,7 @@ fn workers_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         foot.push(frame::chip(theme, &label, tok));
     }
     if let Some(secs) = t.elapsed.filter(|s| *s >= 0.05) {
-        foot.push(Span::styled(
-            format!(" {} ", theme.sym(Sym::Dot)),
-            theme.fg(Tok::Dim),
-        ));
+        foot.push(Span::styled(theme.dot_sep(), theme.fg(Tok::Dim)));
         foot.push(Span::styled(
             text::duration_label_precise(secs),
             theme.fg(Tok::Dim),
@@ -1074,14 +1066,14 @@ fn agent_tree(agents: &[AgentRow], live: bool, lead: &str, w: usize, ctx: &Trans
         let mut facts = Vec::new();
         // The explicit chip below carries phase; right-side facts are counts and time only.
         if a.tools > 0 {
-            facts.push(plural(a.tools as usize, "tool"));
+            facts.push(text::counted(a.tools, "tool"));
         } else if a.state == ToolState::Running && a.steps > 0 {
             facts.push(format!("step {}", a.steps));
         }
         if let Some(ms) = a.elapsed_ms {
             facts.push(text::duration_label(ms as f64 / 1000.0));
         }
-        let facts = facts.join(&format!(" {} ", theme.sym(Sym::Dot)));
+        let facts = facts.join(&theme.dot_sep());
         let mut left = vec![
             Span::styled(
                 format!("{lead}{} ", if is_last { last } else { branch }),
@@ -1127,7 +1119,7 @@ fn agent_tree(agents: &[AgentRow], live: bool, lead: &str, w: usize, ctx: &Trans
         }
         let right_w = text::width(&facts);
         let left = truncate_spans(left, w.saturating_sub(right_w + 2).max(1), &mark);
-        let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
+        let left_w: usize = text::spans_width(&left);
         let mut row = left;
         if right_w > 0 {
             row.push(Span::raw(
@@ -1180,8 +1172,6 @@ fn agent_tree(agents: &[AgentRow], live: bool, lead: &str, w: usize, ctx: &Trans
 
 /// Narrowest width that frames a plan; below it the list hangs off the gutter row.
 const PLAN_CARD_MIN: usize = 40;
-/// Cells of the plan's progress bar.
-const PLAN_BAR: usize = 8;
 
 /// A todo call: the list as it now stands with this call's changes emphasized. Wide enough, it is a
 /// card with a progress bar and the count on the top edge and blocked steps on the bottom edge;
@@ -1209,12 +1199,7 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
             .iter()
             .filter(|(task, _)| task.status == Status::Blocked)
             .count();
-        let filled = (closed * PLAN_BAR).div_ceil(tasks.len()).min(PLAN_BAR);
-        let (full, empty) = if theme.ascii() {
-            ("#", "-")
-        } else {
-            ("▰", "▱")
-        };
+        let (full, empty) = super::tasks::progress_bar(closed, tasks.len(), theme);
         let border = if blocked > 0 {
             Tok::Warning
         } else if closed == tasks.len() {
@@ -1228,8 +1213,8 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
                 Span::raw(" "),
                 Span::styled("Plan", verb_style),
                 Span::raw(" "),
-                Span::styled(full.repeat(filled), theme.fg(Tok::Success)),
-                Span::styled(empty.repeat(PLAN_BAR - filled), theme.fg(Tok::Dim)),
+                Span::styled(full, theme.fg(Tok::Success)),
+                Span::styled(empty, theme.fg(Tok::Dim)),
                 Span::raw(" "),
                 Span::styled(summary, theme.fg(Tok::Muted)),
             ],
@@ -1679,7 +1664,7 @@ fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Spa
         format!(
             "{} {hidden} {which} line{} ({expand_key} expands)",
             ellipsis(theme),
-            if hidden == 1 { "" } else { "s" }
+            text::plural_s(hidden)
         ),
         theme.fg(Tok::Dim),
     )
@@ -1687,7 +1672,7 @@ fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Spa
 
 mod check;
 pub use check::is_test_command;
-pub(in crate::ui) use check::{Verdict, verdict};
+pub(in crate::ui) use check::{Verdict, is_failure_word, verdict};
 pub(in crate::ui) mod frame;
 mod git;
 mod irc;

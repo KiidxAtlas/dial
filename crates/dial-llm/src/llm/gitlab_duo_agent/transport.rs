@@ -11,6 +11,7 @@ use tungstenite::Message;
 use tungstenite::client::IntoClientRequest;
 
 use crate::llm::{Interrupted, Patience, host_of, is_local_host, ws_setup};
+use crate::url::percent_encode as encode_component;
 
 use super::wire;
 
@@ -278,19 +279,6 @@ pub(super) fn connect(
 /// GraphQL group id form of a numeric namespace id, as the server expects.
 pub(super) fn root_namespace(namespace_id: &str) -> String {
     format!("gid://gitlab/Group/{namespace_id}")
-}
-
-/// Percent-encode one path segment. `/` becomes `%2F`, as GitLab expects for
-/// full project and group paths.
-fn encode_component(text: &str) -> String {
-    text.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                char::from(byte).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 /// Send one JSON message on the socket.

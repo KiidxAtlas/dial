@@ -256,6 +256,7 @@ pub fn discover(root: &Path, include_tests: bool) -> Suite {
     python(&mut suite, root, &files, include_tests);
     javascript(&mut suite, root, &files, include_tests);
     shell(&mut suite, root, &files);
+    swift(&mut suite, root, &files, include_tests);
     suite
 }
 
@@ -938,6 +939,55 @@ fn shell(suite: &mut Suite, root: &Path, files: &[String]) {
     }
 }
 
+/// SwiftLint runs where a `.swiftlint.yml` configures it (required then), otherwise at each
+/// `Package.swift` root when installed; `swift test` joins when tests are requested.
+fn swift(suite: &mut Suite, root: &Path, files: &[String], include_tests: bool) {
+    if !files.iter().any(|file| file.ends_with(".swift")) {
+        return;
+    }
+    let configured = roots_named(files, &[".swiftlint.yml"]);
+    let packages = roots_named(files, &["Package.swift"]);
+    let lint_roots = if configured.is_empty() {
+        &packages
+    } else {
+        &configured
+    };
+    for dir in lint_roots {
+        push(
+            suite,
+            root,
+            Spec {
+                id: format!("swiftlint:{dir}"),
+                label: format!("SwiftLint ({dir})"),
+                binaries: &["swiftlint"],
+                args: strings(&["lint", "--reporter", "json", "--quiet"]),
+                parser: Kind::Swiftlint,
+                dir: dir.clone(),
+                mutates: false,
+                optional: configured.is_empty(),
+            },
+        );
+    }
+    if include_tests {
+        for dir in packages {
+            push(
+                suite,
+                root,
+                Spec {
+                    id: format!("swift-test:{dir}"),
+                    label: format!("swift test ({dir})"),
+                    binaries: &["swift"],
+                    args: strings(&["test"]),
+                    parser: Kind::Generic,
+                    dir,
+                    mutates: false,
+                    optional: false,
+                },
+            );
+        }
+    }
+}
+
 /// Project files relative to the root, with `/` separators, excluding ignored directories.
 fn project_files(root: &Path) -> Vec<String> {
     let listed = crate::tools::vcs::git::run_checked(
@@ -1101,9 +1151,8 @@ fn local_binary(name: &str, cwd: &Path, root: &Path) -> Option<String> {
 }
 
 fn path_binary(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| crate::platform::fs::is_executable(&dir.join(name)))
-    })
+    crate::platform::fs::find_program(Path::new(name), std::env::var_os("PATH").as_deref())
+        .is_some()
 }
 
 /// Shell-quotes arguments that contain anything beyond a safe character set.

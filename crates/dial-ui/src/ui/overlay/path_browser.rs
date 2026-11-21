@@ -442,16 +442,5 @@ fn is_typed_path(filter: &str) -> bool {
         || (cfg!(windows) && (filter.contains('\\') || filter.as_bytes().get(1) == Some(&b':')))
 }
 
-#[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests;

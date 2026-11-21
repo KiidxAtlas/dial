@@ -5,11 +5,12 @@
 //! The panel is a pure view of a [`PeersView`] the controller builds from the agent's coordination
 //! state. Refreshing, clearing this session's claims and sending a message are requested through
 //! [`OverlayEvent::Action`] strings ([`PeerAction::encode`]); the panel never touches the registry.
+use super::panel_keys::{Edge, list_move};
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{
-        Axis, arrows, editor_spans, filled, fit, hint, hint_line, list_row, panel, pressed,
-        scroll_cell, typed_char,
+    widgets::{
+        Axis, arrows, editor_spans, filled, fit, hint, hint_line, list_row, live_tok, pair_label,
+        panel, pressed, roster_lead, scroll_cell, section_rule, typed_char,
     },
 };
 use crate::ui::{
@@ -103,10 +104,6 @@ impl PeerAction {
 /// The short form of an instance id shown in the panel.
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 pub struct PeersOverlay {
@@ -208,26 +205,25 @@ impl PeersOverlay {
         if !pressed(key) {
             return OverlayEvent::None;
         }
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             return OverlayEvent::Close;
         }
-        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        // Paging scrolls the board and never moves the recipient; the page keys come from the keymap.
+        if keys.matches(Action::SelectPageUp, key) || keys.matches(Action::SelectPageDown, key) {
             self.manual_scroll = true;
-            self.scroll = if key.code == KeyCode::PageDown {
-                self.scroll
-                    .saturating_add(self.page)
-                    .min(self.total.saturating_sub(self.page))
-            } else {
-                self.scroll.saturating_sub(self.page)
-            };
+            if let Some(scroll) =
+                list_move(keys, key, self.scroll, self.total, self.page, Edge::Stop)
+            {
+                self.scroll = scroll;
+            }
             return OverlayEvent::None;
         }
         let old_cursor = self.cursor;
         let last = self.view.peers.len().saturating_sub(1);
-        if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(last);
+        if let Some(cursor) =
+            list_move(keys, key, self.cursor, self.view.peers.len(), 0, Edge::Stop)
+        {
+            self.cursor = cursor;
         } else if key.code == KeyCode::Home && key.modifiers.is_empty() {
             self.cursor = 0;
         } else if key.code == KeyCode::End && key.modifiers.is_empty() {
@@ -263,7 +259,7 @@ impl PeersOverlay {
             // The field is one line; pasted line breaks become spaces.
             Event::Paste(value) => editor.insert(&value.replace("\r\n", " ").replace('\n', " ")),
             Event::Key(key) if pressed(key) => {
-                if keys.matches(Action::SelectCancel, key) {
+                if super::panel_keys::matches(keys, Action::SelectCancel, key) {
                     self.compose = None;
                 } else if key.code == KeyCode::Enter && key.modifiers.is_empty() {
                     let text = editor.text.trim().to_owned();
@@ -300,14 +296,19 @@ impl PeersOverlay {
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
         self.hits.begin(frame.area());
+        let paging = pair_label(ctx.keys, Action::SelectPageUp, Action::SelectPageDown);
         self.panel_keys.set_footer(vec![
-            "Enter message".into(),
+            hint(ctx.keys, Action::SelectConfirm, "message"),
             "r refresh".into(),
             "c clear my claims".into(),
-            "PgUp/PgDn scroll board".into(),
-            "Esc close".into(),
+            super::panel_keys::segment(&paging, "scroll board"),
+            hint(ctx.keys, Action::SelectCancel, "close"),
         ]);
-        if self.panel_keys.draw(frame, ctx, "Project peers", "Enter writes a message to the selected session; it reaches that session's model at its next request.\nClaims show which files each session is working on; overlapping claims are marked. PageUp/PageDown scroll the board without changing the message recipient.", false, false) {
+        let notes = "A message reaches the selected session's model at its next request.\nClaims show which files each session is working on; overlapping claims are marked. Paging scrolls the board without changing the message recipient.";
+        if self
+            .panel_keys
+            .draw(frame, ctx, "Project peers", notes, false, false)
+        {
             return;
         }
         let dot = ctx.theme.sym(Sym::Dot);
@@ -317,7 +318,7 @@ impl PeersOverlay {
             .iter()
             .filter(|peer| peer.claims.iter().any(|claim| claim.overlaps))
             .count();
-        let mut extra = vec![plural(self.view.peers.len(), "peer", "peers")];
+        let mut extra = vec![text::counted(self.view.peers.len(), "peer")];
         if overlapping > 0 {
             extra.push(format!("{overlapping} overlapping"));
         }
@@ -340,13 +341,13 @@ impl PeersOverlay {
             return Vec::new();
         }
         let theme = ctx.theme;
-        let mut lines = vec![heading(theme, "This session", w)];
+        let mut lines = vec![section_rule(theme, "This session", w)];
         lines.extend(session_lines(theme, &self.view.own, None, w));
         let (inbox, tok) = if self.view.queued > 0 {
             (
                 format!(
                     "inbox  {}, delivered to the model at its next request",
-                    plural(self.view.queued, "unread message", "unread messages")
+                    text::counted(self.view.queued, "unread message")
                 ),
                 Tok::Accent,
             )
@@ -355,7 +356,7 @@ impl PeersOverlay {
         };
         lines.push(indented(theme, &inbox, tok, w));
         lines.push(Line::default());
-        lines.push(heading(theme, "Other sessions in this checkout", w));
+        lines.push(section_rule(theme, "Other sessions in this checkout", w));
         let mut selected = (lines.len(), lines.len());
         if self.view.peers.is_empty() {
             for line in text::wrap_words(
@@ -399,7 +400,7 @@ impl PeersOverlay {
             .map(|(row, mut line)| {
                 if total > room {
                     line.spans = fit(line.spans, w.saturating_sub(1));
-                    let used: usize = line.spans.iter().map(|s| text::width(&s.content)).sum();
+                    let used: usize = text::spans_width(&line.spans);
                     line.spans.push(Span::raw(
                         " ".repeat(w.saturating_sub(1).saturating_sub(used)),
                     ));
@@ -458,17 +459,6 @@ impl PeersOverlay {
     }
 }
 
-fn heading(theme: &Theme, label: &str, w: usize) -> Line<'static> {
-    filled(
-        vec![Span::styled(
-            format!(" {label}"),
-            theme.fg(Tok::Muted).add_modifier(Modifier::BOLD),
-        )],
-        w,
-        Style::default(),
-    )
-}
-
 fn indented(theme: &Theme, value: &str, tok: Tok, w: usize) -> Line<'static> {
     filled(
         vec![Span::styled(format!("   {value}"), theme.fg(tok))],
@@ -491,16 +481,8 @@ fn session_lines(
     let ascii = theme.ascii();
     let is_selected = selected == Some(true);
     let working = row.phase == "working";
-    let (dot, tok) = if working {
-        (theme.sym(Sym::Working), Tok::Success)
-    } else {
-        (theme.sym(Sym::Dot), Tok::Muted)
-    };
-    let pointer = if is_selected {
-        theme.sym(Sym::Pointer)
-    } else {
-        " "
-    };
+    let tok = live_tok(working);
+    let [pointer, dot] = roster_lead(theme, is_selected, working);
     let phase = text::one_line(&row.phase);
     let phase = if phase.is_empty() {
         "unknown".to_owned()
@@ -508,15 +490,15 @@ fn session_lines(
         phase
     };
     let head = [
-        Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent)),
-        Span::styled(format!("{dot} "), theme.fg(tok)),
+        pointer,
+        dot,
         Span::styled(text::pad(short(&row.id), 10), theme.fg(Tok::Text)),
         Span::styled(
             text::pad(&text::ellipsize(&phase, 9, ascii), 10),
             theme.fg(tok),
         ),
     ];
-    let used: usize = head.iter().map(|span| text::width(&span.content)).sum();
+    let used: usize = text::spans_width(&head);
     let summary = text::one_line(&row.summary);
     let summary = if summary.trim().is_empty() {
         Span::styled("no task summary", theme.fg(Tok::Dim))

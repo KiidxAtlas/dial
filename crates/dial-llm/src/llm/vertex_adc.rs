@@ -1,4 +1,5 @@
 //! Application Default Credentials resolution for Vertex AI.
+use crate::platform::time::calendar::days_from_civil;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{
@@ -296,11 +297,6 @@ fn chrono_free_timestamp(s: &str) -> Option<u64> {
     let hour = n(11)? as i64;
     let min = n(14)? as i64;
     let sec = n(17)? as i64;
-    let y = year - if month <= 2 { 1 } else { 0 };
-    let era = y.div_euclid(400);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let days = era * 146097 + (y - era * 400) * 365 + (y - era * 400) / 4 - (y - era * 400) / 100
-        + doy
-        - 719468;
+    let days = days_from_civil(year, month, day)?;
     u64::try_from(days * 86400 + hour * 3600 + min * 60 + sec).ok()
 }

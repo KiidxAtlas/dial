@@ -29,6 +29,7 @@ use crate::agent::workers::child_transcript::{
 };
 use crate::config::paths::Layout;
 use crate::runtime::{Phase, Tree};
+use crate::ui::chrome::StateMark;
 
 /// Transcripts read for the activity feed; older workers keep their lifecycle events only.
 const ACTIVITY_TRANSCRIPTS: usize = 12;
@@ -60,16 +61,26 @@ pub enum AgentStatus {
 
 impl AgentStatus {
     pub fn label(self) -> &'static str {
+        if self == Self::Waiting {
+            StateMark::Waiting.word()
+        } else {
+            self.state_mark().word()
+        }
+    }
+
+    /// The shared state vocabulary for this status: glyph, tone and word come from [`StateMark`],
+    /// so every panel and the viewer draw one worker status the same way.
+    pub fn state_mark(self) -> StateMark {
         match self {
-            Self::Running => "running",
-            Self::Waiting => "waiting",
-            Self::Done => "completed",
-            Self::Answered => "answered",
-            Self::Failed => "failed",
-            Self::Cancelled => "stopped",
-            Self::Interrupted => "interrupted",
-            Self::NeedsInput => "needs input",
-            Self::Blocked => "blocked",
+            Self::Running => StateMark::Running,
+            // Unlike a queued task, both worker states ask the operator to act.
+            Self::Waiting | Self::NeedsInput => StateMark::NeedsInput,
+            Self::Done => StateMark::Done,
+            Self::Answered => StateMark::Answered,
+            Self::Failed => StateMark::Failed,
+            Self::Cancelled => StateMark::Cancelled,
+            Self::Interrupted => StateMark::Interrupted,
+            Self::Blocked => StateMark::Blocked,
         }
     }
 

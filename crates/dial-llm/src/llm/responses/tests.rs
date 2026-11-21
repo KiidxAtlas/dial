@@ -11,6 +11,18 @@ fn tool_free_requests_send_an_empty_tools_array() {
 }
 
 #[test]
+fn hosted_responses_omits_inherited_but_not_explicit_output_limits() {
+    let mut profile = crate::llm::profiles::ModelProfile::minimal("openai", "gpt");
+    profile.capabilities.temperature = false;
+    profile.inherit_output_limit = true;
+    let body = request_api("gpt", &chat(), Some(&profile)).unwrap();
+    assert!(body.get("max_output_tokens").is_none() && body.get("temperature").is_none());
+    profile.max_tokens = Some(128);
+    let body = request_api("gpt", &chat(), Some(&profile)).unwrap();
+    assert_eq!(body["max_output_tokens"], 128);
+}
+
+#[test]
 fn perplexity_search_results_are_skipped_not_rejected_or_replayed() {
     let hits = json!({"type":"search_results","queries":["q"],"results":[{"id":1,"url":"https://example.com"}]});
     let message = json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer [web:1]"}]});

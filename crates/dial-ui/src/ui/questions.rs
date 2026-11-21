@@ -3,6 +3,7 @@ use super::{
     editor::Editor,
     keys::{Action, Keymap},
     text,
+    theme::Glyphs,
 };
 use crate::agent::workflow::questions::{self, QuestionAnswer, QuestionOutcome, QuestionRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -33,7 +34,6 @@ fn edit_within(editor: &mut Editor, key: KeyEvent, limit: usize, keys: &Keymap) 
 }
 
 /// Key names for the dialog's hint rows, taken from the keymap so remapped keys are advertised.
-/// Arrow keys keep their arrow glyphs.
 struct Hints {
     select: String,
     confirm: String,
@@ -48,43 +48,40 @@ struct Hints {
 
 impl Hints {
     fn new(keys: &Keymap) -> Hints {
-        let name = |action: Action| match keys.label(action).as_str() {
-            "Up" => "↑".to_owned(),
-            "Down" => "↓".to_owned(),
-            "Left" => "←".to_owned(),
-            "Right" => "→".to_owned(),
-            other => other.to_owned(),
-        };
-        let (up, down) = (name(Action::SelectUp), name(Action::SelectDown));
+        let name = |action| keys.label(action);
+        let pair = |a, b| super::overlay::widgets::pair_label(keys, a, b);
         Hints {
-            select: if up == "↑" && down == "↓" {
-                "↑↓".to_owned()
-            } else {
-                [up, down]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            },
+            select: pair(Action::SelectUp, Action::SelectDown),
             confirm: name(Action::SelectConfirm),
             cancel: name(Action::SelectCancel),
             back: name(Action::TabPrev),
             next: name(Action::TabNext),
             newline: keys.reachable_label(Action::Newline, super::term::reports_key_releases()),
             attach: name(Action::PasteImage),
-            page: [name(Action::SelectPageUp), name(Action::SelectPageDown)]
-                .into_iter()
-                .filter(|label| !label.is_empty())
-                .collect::<Vec<_>>()
-                .join("/"),
+            page: pair(Action::SelectPageUp, Action::SelectPageDown),
             interrupt: name(Action::Interrupt),
         }
     }
 }
 
-/// `"Esc cancel"`, or nothing when the action is unbound.
-fn keyed(key: &str, what: &str) -> Option<String> {
-    (!key.is_empty()).then(|| format!("{key} {what}"))
+/// Compact arrow names only in key labels, before packing them to the viewport.
+fn hint_key(name: &str, glyphs: Glyphs) -> String {
+    if glyphs == Glyphs::Ascii {
+        return name.to_owned();
+    }
+    if name == "Up/Down" {
+        return "↑↓".into();
+    }
+    name.split('/')
+        .map(|part| match part {
+            "Up" => "↑",
+            "Down" => "↓",
+            "Left" => "←",
+            "Right" => "→",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[derive(Clone, Copy)]
@@ -450,7 +447,7 @@ impl<'a> Dialog<'a> {
     }
     /// Lay out within the final panel dimensions, including [`framed`]'s inset and fill row.
     /// Essential controls and the active choice/input take precedence over secondary hints.
-    pub fn rows(&self, width: usize, height: usize) -> Vec<String> {
+    pub fn rows_with_roles(&self, width: usize, height: usize, glyphs: Glyphs) -> Vec<Row> {
         if width == 0 || height == 0 {
             return Vec::new();
         }
@@ -475,6 +472,9 @@ impl<'a> Dialog<'a> {
         let mut context = text::wrap_words(&question.question, inner);
         let mut context_extent = context.len();
         let hints = &self.hints;
+        let keyed = |key: &str, what: &str| {
+            (!key.is_empty()).then(|| format!("{} {what}", hint_key(key, glyphs)))
+        };
         let mut extra_keys = Vec::new();
         let mut choices = Vec::new();
         let mut input = Vec::new();
@@ -505,6 +505,7 @@ impl<'a> Dialog<'a> {
                                 1 => "Add/edit note",
                                 2 => "Chat about this",
                                 _ if self.page + 1 == total => "Done selecting",
+                                _ if glyphs == Glyphs::Ascii => "Next ->",
                                 _ => "Next →",
                             }
                             .into()
@@ -681,26 +682,68 @@ impl<'a> Dialog<'a> {
             footer.splice(0..0, extras.into_iter().take(extras_count));
         }
         rows.extend(feedback.into_iter().take(feedback_count));
-        rows.extend(footer);
-        rows.truncate(capacity);
-        rows
+        let mut out: Vec<Row> = rows.into_iter().map(Row::Text).collect();
+        out.extend(footer);
+        out.truncate(capacity);
+        out
+    }
+
+    /// [`Dialog::rows_with_roles`] as plain strings, hint rows joined by the default Unicode
+    /// separator. Callers that render the rows should use the typed form.
+    pub fn rows(&self, width: usize, height: usize) -> Vec<String> {
+        let separator = super::chrome::UNICODE_SEPARATOR;
+        self.rows_with_roles(width, height, Glyphs::Unicode)
+            .iter()
+            .map(|row| row.text(separator))
+            .collect()
+    }
+}
+
+/// Terminal cells taken by the separator between hints. `chrome::separator` is three cells in
+/// both glyph presets, so packing does not depend on the theme.
+const HINT_SEPARATOR_CELLS: usize = 3;
+
+/// One dialog row with its role. Renderers style footers from the role, never from punctuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Row {
+    /// Panel content: title, context, choices, input and feedback.
+    Text(String),
+    /// Key hints packed into one footer row, joined by the theme's separator when drawn.
+    Hints(Vec<String>),
+}
+
+impl Row {
+    /// The row as plain text; hint rows join with `separator` (see `chrome::separator`).
+    pub fn text(&self, separator: &str) -> String {
+        match self {
+            Row::Text(text) => text.clone(),
+            Row::Hints(hints) => hints.join(separator),
+        }
     }
 }
 
 /// Keep each binding next to its action when packing narrow footer rows.
-fn hint_rows(hints: impl IntoIterator<Item = String>, width: usize) -> Vec<String> {
-    let mut rows: Vec<String> = Vec::new();
+fn hint_rows(hints: impl IntoIterator<Item = String>, width: usize) -> Vec<Row> {
+    let mut lines: Vec<Vec<String>> = Vec::new();
     for hint in hints {
-        if let Some(last) = rows.last_mut()
-            && text::width(last) + 3 + text::width(&hint) <= width
+        if let Some(last) = lines.last_mut()
+            && last
+                .iter()
+                .map(|shown| text::width(shown) + HINT_SEPARATOR_CELLS)
+                .sum::<usize>()
+                + text::width(&hint)
+                <= width
         {
-            last.push_str(" · ");
-            last.push_str(&hint);
+            last.push(hint);
         } else {
-            rows.extend(text::wrap_words(&hint, width));
+            lines.extend(
+                text::wrap_words(&hint, width)
+                    .into_iter()
+                    .map(|part| vec![part]),
+            );
         }
     }
-    rows
+    lines.into_iter().map(Row::Hints).collect()
 }
 
 /// Wrap both fields with the cursor as a distinct span, so pasted cursor glyphs and word
@@ -738,12 +781,12 @@ fn input_rows(editor: &Editor, width: usize) -> (Vec<String>, usize) {
     (wrapped.iter().map(ToString::to_string).collect(), cursor)
 }
 
-/// [`Dialog::rows`] as an inset panel on the panel surface: the first row becomes the bold
-/// `Question n/m` title, the highlighted choice gets the selection fill, check boxes become radio
-/// marks (unless ASCII), and the key-hint row is muted. At most `height` rows, each exactly
-/// `width` cells.
-pub fn framed(
-    rows: Vec<String>,
+/// [`Dialog::rows_with_roles`] as an inset panel on the panel surface: the first row becomes the
+/// bold `Question n/m` title, the highlighted choice gets the selection fill, check boxes become
+/// radio marks (unless ASCII), and each [`Row::Hints`] footer is muted and joined with the
+/// theme's separator. At most `height` rows, each exactly `width` cells.
+pub fn framed_with_roles(
+    rows: Vec<Row>,
     width: usize,
     height: usize,
     theme: &super::theme::Theme,
@@ -756,21 +799,27 @@ pub fn framed(
     if height == 0 || width == 0 || rows.is_empty() {
         return Vec::new();
     }
+    // Hint rows are the footer role; their separator follows the glyph preset.
+    let separator = super::chrome::separator(theme);
+    let rows: Vec<(String, bool)> = rows
+        .iter()
+        .map(|row| (row.text(separator), matches!(row, Row::Hints(_))))
+        .collect();
     // There is no room for a frame on one row. Never exceed the caller's viewport.
     if height == 1 {
-        return vec![Line::from(text::clip(&text::one_line(&rows[0]), width))];
+        return vec![Line::from(text::clip(&text::one_line(&rows[0].0), width))];
     }
     if width < 8 {
         return rows
             .into_iter()
-            .map(|row| Line::from(text::clip(&text::one_line(&row), width)))
+            .map(|(row, _)| Line::from(text::clip(&text::one_line(&row), width)))
             .take(height)
             .collect();
     }
     let ascii = theme.ascii();
     let inner = width - 4;
     let fill = super::chrome::surface(theme);
-    let title = text::clip(&text::one_line(&rows[0]), inner);
+    let title = text::clip(&text::one_line(&rows[0].0), inner);
     let mut out = vec![Line::from(super::chrome::on_surface(
         theme,
         vec![
@@ -782,9 +831,8 @@ pub fn framed(
             Span::raw(" ".repeat(width.saturating_sub(1 + text::width(&title)))),
         ],
     ))];
-    let selected_row = rows.iter().position(|row| row.starts_with("> "));
-    let last = rows.len() - 1;
-    for (index, row) in rows.into_iter().enumerate().skip(1) {
+    let selected_row = rows.iter().position(|(row, _)| row.starts_with("> "));
+    for (index, (row, footer)) in rows.into_iter().enumerate().skip(1) {
         let row = text::one_line(&row);
         // Input boundaries are emitted by rows(), including on cramped viewports where only
         // the side rails fit. Keep editable text at normal contrast, unlike explanatory copy.
@@ -817,7 +865,6 @@ pub fn framed(
             )));
             continue;
         }
-        let footer = index == last && row.contains(" · ") && !row.starts_with('>');
         let (selected, body) = match row.strip_prefix("> ") {
             Some(rest) => (true, rest.to_owned()),
             None => (
@@ -893,6 +940,34 @@ pub fn framed(
         out = visible;
     }
     out
+}
+
+/// [`framed_with_roles`] for plain-string rows. Compatibility only: the old classification is kept
+/// here, so the trailing row is a footer exactly when it is not the selected choice and carries
+/// the legacy Unicode separator. The typed path never guesses from punctuation.
+pub fn framed(
+    rows: Vec<String>,
+    width: usize,
+    height: usize,
+    theme: &super::theme::Theme,
+) -> Vec<ratatui::text::Line<'static>> {
+    let last = rows.len().saturating_sub(1);
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let footer = index > 0
+                && index == last
+                && !row.starts_with('>')
+                && row.contains(super::chrome::UNICODE_SEPARATOR);
+            if footer {
+                Row::Hints(vec![row])
+            } else {
+                Row::Text(row)
+            }
+        })
+        .collect();
+    framed_with_roles(rows, width, height, theme)
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@
 //! checkpoint before/after content with no model calls. Stored text is untrusted project data,
 //! never instructions, and may no longer match the files on disk.
 use crate::config::paths::Layout;
-use crate::platform::fs as platform_fs;
 use crate::runtime::tool_output::ToolOutput;
 use crate::storage::checkpoint::TurnVersion;
 use crate::storage::redact::redact_text;
@@ -16,7 +15,6 @@ use serde_json::{Value, json};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -130,10 +128,7 @@ fn bounded(mut text: String) -> (String, bool) {
     if text.len() <= MAX_DIFF_BYTES {
         return (text, false);
     }
-    let mut end = MAX_DIFF_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(MAX_DIFF_BYTES);
     let end = text[..end].rfind('\n').map_or(end, |at| at + 1);
     text.truncate(end);
     text.push_str("[diff truncated]\n");
@@ -168,31 +163,14 @@ pub fn current_branch(root: &Path) -> Option<String> {
 
 impl ChangeHistory {
     pub fn open(layout: &Layout) -> Result<Self> {
-        layout.ensure_project_outside_storage()?;
-        match platform_fs::create_dir_owner_only(
-            fs::DirBuilder::new().recursive(true),
-            &layout.state_dir,
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let state_meta = fs::symlink_metadata(&layout.state_dir)?;
-        ensure!(
-            state_meta.is_dir() && !state_meta.file_type().is_symlink(),
-            "state directory must be a regular directory"
-        );
-        let path = layout.state_dir.join("history.sqlite3");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
-        let _file = platform_fs::open_owner_only(&options, &path)?;
-        platform_fs::set_owner_only(&path)?;
-        let conn =
-            Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let conn = crate::storage::sqlite::open_private_writable(
+            layout,
+            "history.sqlite3",
+            Duration::from_secs(5),
+            0,
+        )?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS versions(
+            "CREATE TABLE IF NOT EXISTS versions(
                 id INTEGER PRIMARY KEY, session TEXT NOT NULL, turn INTEGER NOT NULL,
                 branch TEXT, label TEXT NOT NULL, path TEXT NOT NULL, change TEXT NOT NULL,
                 added INTEGER NOT NULL, removed INTEGER NOT NULL, binary INTEGER NOT NULL,

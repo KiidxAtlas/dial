@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from runtime_payload import CHUNK, DOWNLOAD_LIMIT, PrepareError, download, sha256_file
+from runtime_payload import CHUNK, PrepareError, copy_bounded, sha256_file, snapshot_archive
 
 ROOT = Path(__file__).resolve().parent.parent / "runtimes" / "python"
 LIMIT = 256 * 1024 * 1024
@@ -102,20 +102,12 @@ def prepare(target, output, archive=None, manifest=ROOT / "manifest.json"):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent, prefix=".prepare-python-") as tmp:
         tmp = Path(tmp)
-        if archive is None:
-            archive = tmp / "download.tar.gz"
-            download(entry["url"], archive)
-        # Snapshot even a local archive before verifying: do not reopen a caller-owned path for extraction.
-        else:
-            snapshot = tmp / "local.tar.gz"
-            with archive.open("rb") as src, snapshot.open("wb") as dst:
-                copy_bounded(src, dst, DOWNLOAD_LIMIT)
-            archive = snapshot
-        if sha256_file(archive) != entry["sha256"]:
-            raise PrepareError(f"Python archive SHA-256 mismatch for {target}")
+        # The verified snapshot is the only archive read below; a caller-owned local path is never reopened.
+        url = None if archive is not None else entry["url"]
+        snapshot = snapshot_archive(tmp / "archive.tar.gz", entry["sha256"], url=url, local=archive, prefix="Python ")
         source = tmp / "source.tar"
-        with gzip.open(archive, "rb") as src, source.open("wb") as dst:
-            copy_bounded(src, dst, LIMIT)
+        with gzip.open(snapshot, "rb") as src, source.open("wb") as dst:
+            copy_bounded(src, dst, LIMIT, f"Python archive exceeds the {LIMIT} byte limit")
         raw = tmp / "normalized.tar"
         licenses = normalize(source, raw, target, version, (ROOT / NOTICES).read_bytes())
         size = raw.stat().st_size
@@ -129,15 +121,6 @@ def prepare(target, output, archive=None, manifest=ROOT / "manifest.json"):
         (staging / "metadata.txt").write_bytes(f"{target}\n{version}\n{sha256_file(raw)}\n{size}\n".encode("ascii"))
         (staging / "LICENSE.python").write_bytes(licenses)
         staging.rename(output)
-
-
-def copy_bounded(src, dst, limit):
-    total = 0
-    while chunk := src.read(CHUNK):
-        total += len(chunk)
-        if total > limit:
-            raise PrepareError(f"Python archive exceeds the {limit} byte limit")
-        dst.write(chunk)
 
 
 def main():

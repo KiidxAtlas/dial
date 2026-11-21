@@ -120,6 +120,31 @@ pub fn format_link(
     Ok(format!("{compact}/r/{room_id}.{key_text}"))
 }
 
+/// Browser viewer URL for an application `link`: the page at `web_url` when configured, otherwise
+/// the page `dial relay` serves at the relay's own origin. The link rides in the fragment, which
+/// browsers never send to the server.
+pub fn viewer_link(web_url: &str, relay_url: &str, link: &str) -> Result<String> {
+    let web_url = web_url.trim();
+    let base = if web_url.is_empty() {
+        let origin = normalize_relay_origin(relay_url)?;
+        match origin.split_once("://") {
+            Some(("wss", rest)) => format!("https://{rest}/"),
+            Some((_, rest)) => format!("http://{rest}/"),
+            None => bail!("invalid relay origin"),
+        }
+    } else {
+        let url = url::Url::parse(web_url)
+            .map_err(|_| anyhow::anyhow!("invalid [collab].web_url: {web_url}"))?;
+        ensure!(
+            url.scheme() == "https"
+                || (url.scheme() == "http" && url.host_str().is_some_and(is_local_host)),
+            "[collab].web_url must be https:// (plain http:// only for localhost)"
+        );
+        web_url.split('#').next().unwrap_or(web_url).to_owned()
+    };
+    Ok(format!("{base}#{link}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLink {
     /// `wss://host[:port]/r/<roomId>`: no query, no fragment, no key.

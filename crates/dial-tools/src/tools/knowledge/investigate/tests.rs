@@ -2,12 +2,6 @@ use super::*;
 use crate::runtime::evidence::{Coverage, CoverageExtent};
 use crate::tools::testkit;
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace) {
-    let (work, ws) = testkit::workspace();
-    let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(ArtifactStore::new(state.path()).unwrap());
-    (work, state, ws)
-}
 fn source(ws: &Workspace, text: &str) -> String {
     let item = Evidence {
         source: "fixture.txt".into(),
@@ -47,7 +41,7 @@ fn hypotheses() -> Value {
 }
 #[test]
 fn compare_retains_inputs_and_interpret_checks_quotes_and_attribution() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let a = source(&ws, "timeout = 5\n");
     let b = source(&ws, "timeout = 10\n");
     let out = run(&ws, &json!({"action":"compare","reference":a,"other":b})).unwrap();
@@ -78,7 +72,7 @@ fn compare_retains_inputs_and_interpret_checks_quotes_and_attribution() {
 }
 #[test]
 fn plans_are_falsifiable_records_and_results_require_prior_id_and_observation_citations() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let plan = run(
         &ws,
         &json!({"action":"plan","question":"Why does the request fail?","hypotheses":hypotheses()}),
@@ -118,7 +112,7 @@ fn plans_are_falsifiable_records_and_results_require_prior_id_and_observation_ci
 }
 #[test]
 fn rejects_non_competing_duplicate_or_unfalsifiable_plans_and_oversized_comparison() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     let mut hs = hypotheses();
     hs[1]["id"] = json!("a");
     assert!(
@@ -143,6 +137,6 @@ fn rejects_non_competing_duplicate_or_unfalsifiable_plans_and_oversized_comparis
 }
 #[test]
 fn failed_citation_cannot_be_attached_to_an_experiment() {
-    let (_work, _state, ws) = fixture();
+    let (_work, _state, ws) = testkit::workspace_with_artifacts();
     assert!(run(&ws,&json!({"action":"plan","question":"q","hypotheses":hypotheses(),"parents":[format!("artifact://{}","0".repeat(64))]})).is_err());
 }

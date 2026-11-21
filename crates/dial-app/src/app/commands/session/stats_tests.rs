@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn stats_tabs_use_persisted_cross_session_counts_and_keep_the_legacy_report() {
     let home = tempfile::tempdir().unwrap();
-    let mut db = Db::open_default(home.path()).unwrap();
+    let mut db = stats::Db::open_default(home.path()).unwrap();
     db.record_request(&stats::RequestRecord {
         ts_ms: 1,
         session: "fixture".into(),

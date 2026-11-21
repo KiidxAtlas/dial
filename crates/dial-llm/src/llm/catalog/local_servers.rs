@@ -5,7 +5,6 @@ use super::metadata::{ModelEntry, ModelKind, ModelMetadata};
 use super::{CONCURRENCY, ENRICHMENT_BUDGET, MAX_ENRICHMENTS, MAX_MODELS, MAX_RESPONSE};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::time::{Duration, Instant};
 
 /// What LM Studio's native REST API knows that its OpenAI-compatible model list omits: whether a
@@ -263,16 +262,8 @@ fn local_request_outcome(
     if !response.status().is_success() {
         return Err(Some(response.status().as_u16()));
     }
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| None)?;
-    if bytes.len() as u64 > MAX_RESPONSE {
-        return Err(None);
-    }
+    let bytes =
+        crate::llm::read_within(response.body_mut().as_reader(), MAX_RESPONSE).ok_or(None)?;
     serde_json::from_slice(&bytes).map_err(|_| None)
 }
 /// A model name that is safe in a URL path segment or query value: non-empty, short, with no control
@@ -706,17 +697,7 @@ pub(super) fn ollama_show(
     if !response.status().is_success() {
         return None;
     }
-    let mut bytes = Vec::new();
-    if response
-        .body_mut()
-        .as_reader()
-        .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > MAX_RESPONSE
-    {
-        return None;
-    }
+    let bytes = crate::llm::read_within(response.body_mut().as_reader(), MAX_RESPONSE)?;
     serde_json::from_slice(&bytes).ok()
 }
 /// Purpose and capabilities from Ollama's `/api/show`. Its `capabilities` list is the server's own

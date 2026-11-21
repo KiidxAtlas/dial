@@ -1,17 +1,16 @@
 //! The `/` command menu: ranking, the hint line and the rows and detail under the box.
 use super::super::{
-    Rows,
+    Rows, chrome,
     keys::Action,
     status::InputMode,
     text,
     theme::{Sym, Theme, Tok},
 };
 use super::queue::queued_route;
-use super::render::{
-    Hint, MAX_NAME_COLUMN, finish_row, highlighted, list_rows, render_list, window,
-};
+use super::render::{Hint, MAX_NAME_COLUMN, finish_row, list_rows, render_list};
 use super::{
-    CommandEntry, CommandKind, Composer, ComposerCtx, Match, Menu, QueuedEdit, is_slash_command,
+    BusyEnter, BusyInterrupt, CommandEntry, CommandKind, Composer, ComposerCtx, Match, Menu,
+    QueuedEdit,
 };
 use crate::llm::model_config::ComposerShape;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -291,7 +290,7 @@ impl Composer {
         } else {
             next.clamp(0, total - 1)
         } as usize;
-        menu.scroll = window(menu.selected, menu.scroll, rows, menu.matches.len());
+        menu.scroll = chrome::keep_in_view(menu.selected, menu.scroll, rows, menu.matches.len());
     }
 
     /// Priority-ordered, indivisible hints; disabled or shadowed bindings are not advertised.
@@ -359,6 +358,14 @@ impl Composer {
             })
         };
         let mut pieces = Vec::new();
+        // The chooser owns the next decision; put its actions before the busy draft hints.
+        if self.choice.is_some() {
+            pieces.extend([
+                hint(Action::Submit, "confirm"),
+                hint(Action::Dismiss, "cancel"),
+                select(),
+            ]);
+        }
         if self.busy {
             // Esc is advertised only when it closes something no other hint names: an inline
             // suggestion. Menus, the chooser, search and queue edits carry their own Esc hint.
@@ -370,48 +377,34 @@ impl Composer {
             {
                 pieces.push(hint(Action::Dismiss, "close"));
             }
-            // Mirrors `handle_key`: a shared Ctrl+C clears a draft before it stops the turn,
-            // unless the previous press already armed the stop.
-            let clears = self.search.is_none()
-                && !self.stop_armed
-                && !self.editor.text.is_empty()
-                && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
-                    keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
-                });
+            // The shared Ctrl+C is decided once by `busy_interrupt`, the call the key handler makes.
+            // The hint names the first chord, the one the user is shown.
+            let shown = keys
+                .chords(Action::Interrupt)
+                .first()
+                .map(|chord| KeyEvent::new(chord.code, chord.mods));
+            let label = match shown.map_or(BusyInterrupt::Stop, |key| {
+                self.busy_interrupt(&key, keys, self.stop_armed)
+            }) {
+                BusyInterrupt::CloseSearch => "close search",
+                BusyInterrupt::ClearDraft => "clear draft",
+                BusyInterrupt::Stop if self.stop_armed => "again stops",
+                BusyInterrupt::Stop => "stop",
+            };
             // An armed stop leads in the warning color: the next press ends the turn.
-            let stop = hint(
-                Action::Interrupt,
-                if clears {
-                    "clear draft"
-                } else if self.search.is_some()
-                    && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
-                        keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
-                    })
-                {
-                    "close search"
-                } else if self.stop_armed {
-                    "again stops"
-                } else {
-                    "stop"
-                },
-            )
-            .map(|stop| Hint {
-                warn: self.stop_armed && !clears,
+            pieces.push(hint(Action::Interrupt, label).map(|stop| Hint {
+                warn: self.stop_armed,
                 ..stop
-            });
-            pieces.push(stop);
+            }));
             // The draft a busy Ctrl+C just cleared is one undo away.
-            if self.stop_armed && !clears && self.editor.text.is_empty() {
+            if self.stop_armed && self.editor.text.is_empty() {
                 pieces.push(hint(Action::EditorUndo, "restore draft"));
             }
         }
         if self.choice.is_some() {
-            pieces.extend([
-                hint(Action::Submit, "confirm"),
-                hint(Action::Dismiss, "cancel"),
-                select(),
-            ]);
-        } else if self.search.is_some() {
+            return pieces.into_iter().flatten().collect();
+        }
+        if self.search.is_some() {
             pieces.extend([
                 hint(Action::Submit, "accept"),
                 select(),
@@ -423,14 +416,19 @@ impl Composer {
                     "editing queued message ({})",
                     queued_route(follow_up)
                 )));
-                pieces.push(hint(
-                    Action::Submit,
-                    if self.busy {
-                        "save queued item"
-                    } else {
-                        "send"
-                    },
-                ));
+                // Enter names only its real action: save the edit, run a command, or send when idle.
+                let submit = if self.busy {
+                    match self.busy_enter() {
+                        BusyEnter::SaveEdit => Some("save queued item"),
+                        BusyEnter::Command => Some("run command"),
+                        _ => None,
+                    }
+                } else {
+                    (!self.editor.text.trim().is_empty()).then_some("send")
+                };
+                if let Some(what) = submit {
+                    pieces.push(hint(Action::Submit, what));
+                }
                 pieces.push(keyed("Esc", "cancel edit"));
             } else if self.exit_armed {
                 pieces.push(hint(Action::ClearDraft, "again to exit"));
@@ -455,17 +453,10 @@ impl Composer {
                     hint(Action::Dismiss, "dismiss"),
                 ]);
             } else if self.busy {
-                let command = is_slash_command(&self.editor.text);
-                let blank = self.editor.text.trim().is_empty();
-                // Mirrors `submit`: an empty Enter asks to stop (only with queued work); a blank draft
-                // is ignored; otherwise Enter asks whether to send now or after the turn.
-                if command {
-                    pieces.push(hint(Action::Submit, "run command"));
-                } else if self.editor.text.is_empty() {
-                    if !self.queued.is_empty() {
-                        pieces.push(hint(Action::Submit, "stop or keep"));
-                    }
-                    if self.queued.is_empty() {
+                let enter = self.busy_enter();
+                match enter {
+                    BusyEnter::StopChoice => pieces.push(hint(Action::Submit, "stop or keep")),
+                    BusyEnter::Nothing => {
                         let submit = keys.label(Action::Submit);
                         if !submit.is_empty() {
                             pieces.push(plain(format!(
@@ -474,11 +465,12 @@ impl Composer {
                             )));
                         }
                     }
-                } else if !blank {
-                    pieces.push(hint(Action::Submit, &self.busy_send_hint()));
+                    BusyEnter::Command => pieces.push(hint(Action::Submit, "run command")),
+                    BusyEnter::Route => pieces.push(hint(Action::Submit, &self.busy_send_hint())),
+                    BusyEnter::Blank | BusyEnter::SaveEdit => {}
                 }
-                // Alt-Enter only queues a non-blank draft.
-                if !command && !blank {
+                // Alt-Enter only queues a non-blank new draft.
+                if enter == BusyEnter::Route {
                     pieces.push(hint(Action::FollowUp, "send after turn"));
                 }
             } else if !self.editor.text.is_empty() {
@@ -549,7 +541,7 @@ impl Composer {
             )];
         }
         let rows = list_rows(ctx.ui).min(total);
-        let start = window(menu.selected, menu.scroll, rows, total);
+        let start = chrome::keep_in_view(menu.selected, menu.scroll, rows, total);
         let visible = &menu.matches[start..start + rows];
         let entries = self.menu_entries(menu);
         let name_col = visible
@@ -618,7 +610,7 @@ impl Composer {
                     })
                     .flatten()
                     .map(|effect| format!("{effect} · {}", command.description));
-                spans.extend(highlighted(
+                spans.extend(chrome::highlighted(
                     &name,
                     &found.name_hits,
                     theme.fg(if unavailable.is_some() {
@@ -666,7 +658,7 @@ impl Composer {
                 if room > 0 {
                     let description = text::ellipsize(full_description, room, theme.ascii());
                     let description_w = text::width(&description);
-                    spans.extend(highlighted(
+                    spans.extend(chrome::highlighted(
                         &description,
                         &found.desc_hits,
                         theme.fg(Tok::Muted),

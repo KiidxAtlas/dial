@@ -121,6 +121,18 @@ fn dashboard_json_routes_answer_on_an_empty_home() {
 }
 
 #[test]
+fn aggregate_route_respects_the_requested_range() {
+    let home = tempfile::tempdir().unwrap();
+    let (status, _, body) = route(home.path(), "/api/stats?range=24h");
+    assert_eq!(status, "200 OK");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["generated_ms"].as_i64().unwrap() - value["since_ms"].as_i64().unwrap(),
+        86_400_000
+    );
+}
+
+#[test]
 fn live_route_is_not_found_without_a_session() {
     let home = tempfile::tempdir().unwrap();
     assert_eq!(
@@ -150,6 +162,7 @@ fn list_routes_validate_limit_and_range() {
         "/api/requests?limit=501",
         "/api/requests?limit=many",
         "/api/models?range=bogus",
+        "/api/stats?range=bogus",
         "/api/frustration?range=bogus",
     ] {
         assert_eq!(
@@ -179,4 +192,29 @@ fn action_content_length_rejects_ambiguous_framing() {
         None
     );
     assert_eq!(content_length("GET / HTTP/1.1\r\nHost: localhost"), None);
+}
+
+#[test]
+fn only_the_dashboard_page_carries_the_policy_that_pins_it() {
+    let page = http_response("200 OK", HTML, PAGE);
+    let (head, body) = page.split_once("\r\n\r\n").unwrap();
+    assert_eq!(body, PAGE);
+    assert!(head.contains("Referrer-Policy: no-referrer"), "{head}");
+    assert!(
+        head.contains(&format!("Content-Security-Policy: {}", stats_policy())),
+        "{head}"
+    );
+    assert!(stats_policy().contains("connect-src 'self'"));
+    assert!(!stats_policy().contains("unsafe-inline"));
+    // Another HTML page on the same listener (the weights dashboard) keeps its own inline
+    // script and style and gets no stats policy.
+    let other = "<style>p{color:red}</style><script>run()</script>";
+    let other_page = http_response("200 OK", HTML, other);
+    assert!(
+        !other_page.contains("Content-Security-Policy"),
+        "{other_page}"
+    );
+    assert!(other_page.contains("Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"));
+    let json = http_response("200 OK", JSON, "{}");
+    assert!(!json.contains("Content-Security-Policy"), "{json}");
 }

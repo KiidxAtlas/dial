@@ -365,7 +365,12 @@ fn monitor_start_requires_fresh_confirmation_even_with_auto_or_reusable_grants()
             json!({"action":"watch", "name":"site", "path":"site.log"}),
         ),
     ] {
-        for mode in [Approval::Auto, Approval::Write, Approval::Ask] {
+        for mode in [
+            Approval::Auto,
+            Approval::Yolo,
+            Approval::Write,
+            Approval::Ask,
+        ] {
             let mut rules = vec![rule(Effect::Allow, "monitor", &[])];
             let mut ui = Confirm {
                 calls: 0,
@@ -677,6 +682,7 @@ fn policy_explanations_follow_winning_precedence_without_grants() {
         Approval::Write,
         Approval::Auto,
         Approval::Readonly,
+        Approval::Yolo,
     ] {
         for reverse in [false, true] {
             let mut rules = vec![rule(Effect::Allow), rule(Effect::Deny)];
@@ -696,6 +702,7 @@ fn policy_explanations_follow_winning_precedence_without_grants() {
     }
     for (mode, reason, allowed) in [
         (Approval::Auto, PolicyReason::AutomaticMode, true),
+        (Approval::Yolo, PolicyReason::AutomaticMode, true),
         (Approval::Readonly, PolicyReason::ReadOnly, false),
         (Approval::Write, PolicyReason::WorkspaceWrite, true),
         (Approval::Ask, PolicyReason::OperatorDeny, false),
@@ -993,4 +1000,37 @@ fn write_batches_check_every_destination_against_path_permissions() {
     );
     assert!(allowed.matches(&safe, root));
     assert!(batch_call_line(&batch).contains("secret/key"));
+}
+
+#[test]
+fn concurrent_project_updates_keep_every_saved_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    let deny = rule(Effect::Deny, "write", &["*.pem"]);
+    save(&path, std::slice::from_ref(&deny)).unwrap();
+    let sessions = 8;
+    std::thread::scope(|scope| {
+        for index in 0..sessions {
+            let path = path.clone();
+            scope.spawn(move || {
+                let grant = rule(Effect::Allow, "write", &[&format!("notes/{index}.md")]);
+                update(&path, |rules| {
+                    // Widen the read-modify-write window so an unlocked update would lose edits.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    rules.push(grant);
+                })
+                .unwrap();
+            });
+        }
+    });
+    let saved = load(&path).unwrap();
+    assert_eq!(saved.len(), sessions + 1);
+    assert_eq!(
+        saved[0], deny,
+        "an explicit deny must survive concurrent grants"
+    );
+    for index in 0..sessions {
+        let grant = rule(Effect::Allow, "write", &[&format!("notes/{index}.md")]);
+        assert!(saved.contains(&grant), "lost grant for session {index}");
+    }
 }

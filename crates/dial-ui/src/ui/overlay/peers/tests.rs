@@ -1,5 +1,5 @@
 use super::*;
-use crate::ui::overlay::settings::testkit::{Rig, ch, key, render, rows, style_of, typed};
+use crate::ui::overlay::settings::testkit::{Rig, ch, ctrl, key, render, rows, style_of, typed};
 use crate::ui::theme::{Glyphs, Theme};
 use ratatui::buffer::Buffer;
 
@@ -72,13 +72,13 @@ fn board_shows_sessions_phases_summaries_claims_and_inbox() {
         "2 peers",
         "1 overlapping",
         "2 unread",
-        "This session",
+        "THIS SESSION",
         "01234567",
         "refactor the parser",
         "src/parser",
         "docs",
         "inbox  2 unread messages",
-        "Other sessions in this checkout",
+        "OTHER SESSIONS IN THIS CHECKOUT",
         "aaaaaaaa",
         "update the client",
         "src/parser/lexer.rs",
@@ -352,4 +352,48 @@ fn mouse_selects_peer_without_composing() {
     assert!(matches!(o.click(x, y), OverlayEvent::None));
     assert_eq!(o.selected(), Some(PEER_B));
     assert!(o.compose.is_none());
+}
+
+#[test]
+fn default_ctrl_n_moves_the_recipient_and_the_bound_page_key_scrolls_the_board() {
+    let mut rig = Rig::new();
+    let mut overlay = PeersOverlay::new(board());
+    overlay.handle(&ctrl('n'), &rig.keys);
+    assert_eq!(
+        overlay.selected(),
+        Some(PEER_B),
+        "Ctrl+N is the default Down"
+    );
+    rig.keys
+        .rebind(Action::SelectPageDown, &["Ctrl+G"])
+        .unwrap();
+    let mut view = board();
+    view.peers[0].claims = (0..40)
+        .map(|i| claim(&format!("claim-{i:02}"), false))
+        .collect();
+    let mut overlay = PeersOverlay::new(view);
+    let first = shown(&mut overlay, &rig, 40, 12);
+    overlay.handle(&key(KeyCode::PageDown), &rig.keys);
+    assert_eq!(
+        shown(&mut overlay, &rig, 40, 12),
+        first,
+        "the old page key is unbound"
+    );
+    for _ in 0..8 {
+        overlay.handle(&ctrl('g'), &rig.keys);
+    }
+    let last = shown(&mut overlay, &rig, 40, 12);
+    assert_ne!(first, last);
+    assert_eq!(
+        overlay.selected(),
+        Some(PEER_A),
+        "paging keeps the recipient"
+    );
+    assert!(last.contains("bbbbbbbb"), "{last}");
+    overlay.handle(&ch('?'), &rig.keys);
+    let sheet = shown(&mut overlay, &rig, 90, 24);
+    assert!(
+        sheet.contains("Ctrl+G") && sheet.contains("scroll board"),
+        "{sheet}"
+    );
 }

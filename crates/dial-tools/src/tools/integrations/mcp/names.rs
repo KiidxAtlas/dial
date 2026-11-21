@@ -69,10 +69,7 @@ impl Namer {
 pub(super) fn identity_digest(server: &str, tool: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("{server}\0{tool}").as_bytes());
-    digest[..3]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex(&digest[..3])
 }
 
 fn truncate(text: &str, max: usize) -> String {

@@ -153,8 +153,8 @@ fn run_uses_layout_when_no_dir_given() {
 }
 
 #[test]
-fn format_bytes_units() {
-    assert_eq!(format_bytes(12), "12 B");
-    assert_eq!(format_bytes(2048), "2.0 KiB");
-    assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+fn image_sizes_use_the_shared_human_units() {
+    assert_eq!(human_bytes(12), "12 B");
+    assert_eq!(human_bytes(2048), "2.0 KiB");
+    assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
 }

@@ -353,15 +353,8 @@ fn write_new(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn is_executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_meta: &fs::Metadata) -> bool {
-    false
+    crate::platform::fs::mode(meta) & 0o111 != 0
 }
 
 /// Relative file path → `x`/`-` exec flag plus SHA-256 of contents. Sorted, so equal trees compare equal.

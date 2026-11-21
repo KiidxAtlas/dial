@@ -1,11 +1,6 @@
 use super::*;
+use crate::ui::testkit::plain;
 use serde_json::json;
-
-fn plain(rows: &Rows) -> Vec<String> {
-    rows.iter()
-        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
-}
 
 fn list(tasks: serde_json::Value) -> TodoList {
     let mut todo = TodoList::new();
@@ -319,4 +314,32 @@ fn in_progress_and_blocked_steps_have_distinct_state_colors() {
     assert_eq!(blocked[1].style, theme.fg(chrome::StateMark::Blocked.tok()));
     assert_eq!(blocked[1].content, chrome::StateMark::Blocked.glyph(&theme));
     assert_ne!(active[1].style, blocked[1].style);
+}
+
+#[test]
+fn progress_bar_rounds_a_closed_step_up_and_follows_the_glyph_preset() {
+    let unicode = Theme::builtin("dial-dark").unwrap();
+    let ascii = Theme::builtin("dial-dark")
+        .unwrap()
+        .with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let cases = [
+        (0, 3, 0),
+        (1, 3, 3),
+        (2, 3, 6),
+        (3, 3, 8),
+        (1, 20, 1),
+        (0, 0, 0),
+    ];
+    for (closed, total, filled) in cases {
+        assert_eq!(
+            progress_bar(closed, total, &unicode),
+            ("▰".repeat(filled), "▱".repeat(8 - filled)),
+            "{closed}/{total}"
+        );
+        assert_eq!(
+            progress_bar(closed, total, &ascii),
+            ("#".repeat(filled), "-".repeat(8 - filled)),
+            "{closed}/{total} ascii"
+        );
+    }
 }

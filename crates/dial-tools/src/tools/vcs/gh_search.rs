@@ -12,6 +12,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dial_core::platform::time::calendar::{CivilDate, civil_from_days, days_from_civil};
+use dial_core::runtime::clock::format_utc_seconds;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -300,17 +302,16 @@ fn relative_ms(count: u128, unit: &str, now: i64) -> Option<i128> {
     if let Some(ms) = fixed {
         return Some(now - count * ms);
     }
-    let days = now.div_euclid(DAY_MS) as i64;
-    let (year, month, day) = civil_from_days(days);
+    let date = civil_from_days(i64::try_from(now.div_euclid(DAY_MS)).ok()?);
     let count = count as i64;
     let (year, month) = if unit == "mo" {
-        let total = year * 12 + (month - 1) - count;
+        let total = date.year * 12 + (date.month - 1) - count;
         (total.div_euclid(12), total.rem_euclid(12) + 1)
     } else {
-        (year - count, month)
+        (date.year - count, date.month)
     };
-    let first = days_from_civil(year, month, 1);
-    Some(i128::from(first + day - 1) * DAY_MS + now.rem_euclid(DAY_MS))
+    let first = days_from_civil(year, month, 1)?;
+    Some((i128::from(first) + i128::from(date.day) - 1) * DAY_MS + now.rem_euclid(DAY_MS))
 }
 
 fn is_iso_date(text: &str) -> bool {
@@ -323,8 +324,7 @@ fn is_iso_date(text: &str) -> bool {
 }
 
 fn format_date(ms: i128) -> Option<String> {
-    let (year, month, day) = civil_from_ms(ms)?;
-    Some(format!("{year:04}-{month:02}-{day:02}"))
+    Some(civil_from_ms(ms)?.to_string())
 }
 
 /// Seconds precision, as GitHub search accepts (strips the `.sss` from `toISOString`).
@@ -332,23 +332,15 @@ fn format_datetime(ms: i128) -> Option<String> {
     if ms.abs() > DATE_RANGE_MS {
         return None;
     }
-    let seconds = ms.div_euclid(1000);
-    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400) as i64);
-    let second_of_day = seconds.rem_euclid(86_400) as i64;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3600,
-        second_of_day % 3600 / 60,
-        second_of_day % 60
-    ))
+    Some(format_utc_seconds(i64::try_from(ms.div_euclid(1000)).ok()?))
 }
 
-fn civil_from_ms(ms: i128) -> Option<(i64, i64, i64)> {
+fn civil_from_ms(ms: i128) -> Option<CivilDate> {
     if ms.abs() > DATE_RANGE_MS {
         return None;
     }
-    let (year, month, day) = civil_from_days(ms.div_euclid(DAY_MS) as i64);
-    (0..=9999).contains(&year).then_some((year, month, day))
+    let date = civil_from_days(i64::try_from(ms.div_euclid(DAY_MS)).ok()?);
+    (0..=9999).contains(&date.year).then_some(date)
 }
 
 /// ISO 8601 subset of JS `Date.parse`: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, optionally followed by `T`
@@ -405,7 +397,7 @@ fn parse_iso_datetime(text: &str) -> Option<i128> {
     if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let days = days_from_civil(year, month, 1) + day - 1;
+    let days = days_from_civil(year, month, day)?;
     let wall =
         i128::from(days) * DAY_MS + i128::from(hour * 3_600_000 + minute * 60_000 + second * 1000);
     Some(match offset_minutes {
@@ -457,36 +449,6 @@ fn eat(bytes: &[u8], pos: &mut usize, byte: u8) -> bool {
     } else {
         false
     }
-}
-
-/// Proleptic Gregorian date → days since 1970-01-01 (H. Hinnant). `day` may overflow the month.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let year_of_era = y - era * 400;
-    let month_index = (month + 9) % 12;
-    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-/// Days since 1970-01-01 → (year, month, day), inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
 }
 
 /// True when a query token already names a repo/org/user/owner scope.

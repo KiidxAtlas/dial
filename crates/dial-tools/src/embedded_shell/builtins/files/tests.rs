@@ -1,31 +1,6 @@
-use super::super::{Io, RunFn};
 use super::*;
+use crate::embedded_shell::builtins::tests::run;
 use tempfile::tempdir;
-
-fn run(f: RunFn, cwd: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
-    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-    let mut input = stdin.as_bytes();
-    let mut out: Vec<u8> = Vec::new();
-    let mut err: Vec<u8> = Vec::new();
-    let code = f(
-        &mut Io {
-            name: "cmd",
-            cwd,
-            env: &[],
-            synopsis: "",
-            stdin: &mut input,
-            stdout: &mut out,
-            stderr: &mut err,
-            declined: None,
-        },
-        &args,
-    );
-    (
-        code,
-        String::from_utf8(out).unwrap(),
-        String::from_utf8(err).unwrap(),
-    )
-}
 
 fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();

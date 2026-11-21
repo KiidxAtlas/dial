@@ -4,11 +4,10 @@
 use crate::agent::Agent;
 use crate::agent::Ui;
 use crate::agent::modes::cleanse::{LoopStatus, Suite, format_diagnostics};
-use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
+use crate::app::{App, Bridge, Shell, Step};
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 
 const CLEANSE_USAGE: &str =
     "Usage: /cleanse [request] [--all] [--tests] [-n <agents>] [-m <model>]";
@@ -46,16 +45,7 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
     shell.composer.set_busy(true);
     let interrupt = app.interrupt.clone();
     let result = {
-        let mut bridge = Bridge {
-            app,
-            shell: &mut *shell,
-            interrupt: interrupt.clone(),
-            started: Instant::now(),
-            last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-            failed: false,
-            pending: Vec::new(),
-            next_id: 0,
-        };
+        let mut bridge = Bridge::new(app, &mut *shell);
         bridge.repaint(true);
         cleanse(agent, &mut bridge, &interrupt, &args)
     };

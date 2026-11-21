@@ -1,4 +1,5 @@
 use super::*;
+thread_local! { pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[test]
 fn invalid_source_has_advisory_diagnostics_not_a_write_veto() {
     assert!(advisory(Path::new("a.rs"), "fn a() {}", "fn a( {").is_some());
@@ -78,4 +79,77 @@ fn python_short_strings_reject_literal_newlines_but_not_valid_multiline_forms() 
             "{source:?}"
         );
     }
+}
+
+#[test]
+fn local_repair_respects_witness_and_leaves_advisory_proposals_intact_on_abstention() {
+    let (_dir, mut ws) = crate::tools::testkit::workspace();
+    ws.edit_settings.auto_repair.enabled = true;
+    let path = ws.root().join("values.py");
+    let no_coach = |_: &crate::tools::EditRepairRequest| -> Result<String, String> {
+        panic!("unexpected coach")
+    };
+    for (before, proposed, flags) in [
+        ("v = f(1)", "v = f(2", &[false][..]),
+        ("v = f(1", "v = f(2", &[true]),
+        ("v = f(1)", "v = f(\n    2\n)", &[true, true, true]),
+        ("# )\nv = f(1)", "# ]\nv = f(2", &[true, true]),
+    ] {
+        let source = prepare_edit(
+            &ws,
+            &path,
+            before,
+            proposed,
+            Some(flags),
+            Some(&no_coach),
+            false,
+        )
+        .unwrap();
+        assert_eq!(source.text, proposed);
+    }
+}
+
+#[test]
+fn only_would_refuse_edits_pay_for_a_repair_candidate() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let path = ws.root().join("values.py");
+    for enabled in [false, true] {
+        for (guard, block, src, count, expected, advisory) in [
+            (false, false, "v = f(2", 0, Some("v = f(2"), false),
+            (true, false, "v = f(2", 2, Some("v = f(2"), true),
+            (true, true, "v = f(2)", 1, Some("v = f(2)"), false),
+            (
+                true,
+                true,
+                "v = f(2",
+                if enabled { 3 } else { 2 },
+                enabled.then_some("v = f(2)"),
+                false,
+            ),
+        ] {
+            let mut ws = ws.clone().with_syntax_guard(guard);
+            ws.edit_settings.auto_repair.enabled = enabled;
+            PARSES.set(0);
+            let result = prepare_edit(&ws, &path, "v = f(1)", src, Some(&[true]), None, block);
+            assert_eq!(PARSES.get(), count, "{enabled}/{guard}/{block}/{src}");
+            assert_eq!(result.as_ref().ok().map(|v| v.text.as_str()), expected);
+            if let Ok(value) = result {
+                assert_eq!(!value.warnings.is_empty(), advisory);
+            }
+        }
+    }
+    let mut ws = ws;
+    ws.edit_settings.auto_repair.enabled = true;
+    assert!(
+        prepare_edit(
+            &ws,
+            &path,
+            "v = f(1)",
+            "v = f(2",
+            Some(&[false]),
+            None,
+            true
+        )
+        .is_err()
+    );
 }

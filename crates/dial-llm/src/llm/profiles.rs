@@ -45,7 +45,7 @@ pub fn default_anthropic_thinking(model: &str) -> Option<ReasoningApi> {
         ThinkingMode::AnthropicBudgetEffort | ThinkingMode::Budget => {
             Some(ReasoningApi::AnthropicBudget)
         }
-        ThinkingMode::Effort | ThinkingMode::GoogleLevel => None,
+        ThinkingMode::Effort | ThinkingMode::GoogleLevel | ThinkingMode::ModelVariant => None,
     }
 }
 
@@ -68,6 +68,8 @@ pub enum ReasoningApi {
     GeminiBudget,
     GeminiLevel,
     OllamaThink,
+    /// Antigravity account rows that list one wire model per effort; the effort selects the model.
+    AntigravityModelVariant,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -372,13 +374,18 @@ pub struct ModelProfile {
     /// Set by `Backend::compaction_handoff_profile`; never persisted or accepted from config.
     #[serde(skip)]
     pub force_tool_choice_none: bool,
-    /// Runtime-only: set on a local-host main or worker request whose operator left the output
+    /// Runtime-only: set on an external main or worker request whose operator left the output
     /// allowance unset (`max_tokens == 0`), so the serving host's own default applies. Never
     /// persisted or accepted from config.
     #[serde(skip)]
     pub inherit_output_limit: bool,
 }
 impl ModelProfile {
+    /// True when the wire should omit an optional output cap, independent of the planning budget.
+    pub fn inherits_output_limit(&self) -> bool {
+        self.inherit_output_limit && self.max_tokens.unwrap_or(0) == 0
+    }
+
     /// `local_hints` minus whatever an explicit profile setting already decides.
     pub fn effective_local_hints(&self, thinking_decided: bool) -> super::local_hints::LocalHints {
         self.local_hints
@@ -641,6 +648,10 @@ impl ModelProfile {
                     );
                 }
             }
+            ReasoningApi::AntigravityModelVariant => ensure!(
+                self.thinking.is_none() && self.thinking_budget.is_none(),
+                "Antigravity model variants select thinking through the model ID; thinking controls are not accepted"
+            ),
         }
         Ok(())
     }
@@ -760,7 +771,7 @@ impl ModelProfile {
             object.insert("top_p".into(), json!(p));
         }
         // A host-inherited allowance is not written at all, under either wire name.
-        if self.inherit_output_limit && self.max_tokens.is_none() {
+        if self.inherits_output_limit() {
             object.remove("max_tokens");
             object.remove("max_completion_tokens");
         }

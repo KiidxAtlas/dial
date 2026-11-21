@@ -192,11 +192,7 @@ impl LocalServer {
             ("mlx", None) if crate::llm::local_format::serves_with_llama_cpp(model) => {
                 Self::LlamaCpp
             }
-            ("mlx", None)
-                if crate::llm::catalog::local_model_metadata(std::path::Path::new(model))
-                    .vision
-                    == Some(true) =>
-            {
+            ("mlx", None) if crate::llm::catalog::uses_mlx_vlm(std::path::Path::new(model)) => {
                 Self::MlxVlmRuntime
             }
             ("mlx", None) => Self::MlxRuntime,

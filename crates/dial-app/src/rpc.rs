@@ -34,6 +34,7 @@ mod live_snapshot;
 mod maintenance;
 mod models;
 mod parity;
+mod permissions;
 mod read_jobs;
 mod reports;
 mod research;
@@ -259,6 +260,24 @@ pub(super) fn coded(code: ErrorCode, error: impl std::fmt::Display) -> anyhow::E
         message: format!("{error:#}"),
     })
 }
+
+/// Validate the parameter object for methods that explicitly reject unknown fields.
+fn check_keys(params: &Value, allowed: &[&str], method: &str) -> Result<()> {
+    let fields = params.as_object().ok_or_else(|| {
+        coded(
+            ErrorCode::InvalidParams,
+            format!("{method} requires params"),
+        )
+    })?;
+    match fields.keys().find(|key| !allowed.contains(&key.as_str())) {
+        Some(unknown) => Err(coded(
+            ErrorCode::InvalidParams,
+            format!("{method} does not accept params.{unknown}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A plain RPC method listed in [`METHODS`].
 fn known_method(method: &str) -> bool {
     dial_protocol::method(method).is_some()
@@ -1562,6 +1581,9 @@ fn run_control(
                 }
                 "collaboration_leave" if !acp => {
                     out.result(&id, collaboration::leave());
+                }
+                "collaboration_answer" if !acp => {
+                    out.result(&id, collaboration::answer(&request["params"]));
                 }
                 "collaboration_stop" if !acp => {
                     out.result(&id, collaboration::hosting::stop());

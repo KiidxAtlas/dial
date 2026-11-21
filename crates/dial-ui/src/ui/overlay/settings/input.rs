@@ -1,16 +1,17 @@
 //! Key handling inside the settings panel for browsing, pickers, paths and text edits.
 use super::super::OverlayEvent;
+use super::super::panel_keys::{self, Edge, list_move};
 use super::super::path_browser::BrowseStep;
 use super::format::{adjust, choice_value, parse_input, value_text};
-use super::memory::{label_for_choice, memory_missing_role, memory_needs};
+use super::memory::{label_for_choice, memory_missing_role};
 use super::value_editors::{Step, View};
-use super::widgets::{is_ctrl, other_scope, scope_name, typed_char};
 use super::{
     ChoiceAction, EMBEDDING_MODEL_PATH, Mode, SettingsOverlay, TYPE_CHOICE, label_of, pick_matches,
 };
-use crate::config::schema::{Kind, SettingDef};
+use crate::config::schema::{Kind, SettingDef, memory_needs};
 use crate::config::settings_store::Scope;
 use crate::ui::keys::{Action, Keymap};
+use crate::ui::overlay::widgets::{is_ctrl, other_scope, scope_name, typed_char};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use toml::Value;
 
@@ -77,19 +78,13 @@ impl SettingsOverlay {
         let count = self.visible().len();
         let last = count.saturating_sub(1);
         // Lists stop at their ends, as every other panel's do; Home and End jump there.
-        if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(last);
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(self.page);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + self.page).min(last);
+        if let Some(next) = list_move(keys, key, self.cursor, count, self.page, Edge::Stop) {
+            self.cursor = next;
         } else if key.code == KeyCode::Home {
             self.cursor = 0;
         } else if key.code == KeyCode::End {
             self.cursor = last;
-        } else if keys.matches(Action::SelectConfirm, key) {
+        } else if panel_keys::matches(keys, Action::SelectConfirm, key) {
             return self.activate();
         } else if keys.matches(Action::TabNext, key) {
             self.change_tab(1);
@@ -188,10 +183,10 @@ impl SettingsOverlay {
         let def: &'static SettingDef = def;
         if def.sensitive() && is_ctrl(key, 'r') {
             self.reveal_sensitive = !self.reveal_sensitive;
-        } else if keys.matches(Action::SelectCancel, key) {
+        } else if panel_keys::matches(keys, Action::SelectCancel, key) {
             self.notes.remove(def.path);
             self.mode = Mode::Browse;
-        } else if keys.matches(Action::SelectConfirm, key) {
+        } else if panel_keys::matches(keys, Action::SelectConfirm, key) {
             match parse_input(def.kind_for(&self.effective), &editor.text) {
                 Ok(value) => {
                     self.mode = Mode::Browse;
@@ -242,7 +237,7 @@ impl SettingsOverlay {
         };
         let at = *cursor;
         let visible = pick_matches(&labels, choices, &filter.text);
-        if keys.matches(Action::SelectCancel, key) {
+        if panel_keys::matches(keys, Action::SelectCancel, key) {
             if self.download_armed.take().is_some() {
                 self.feedback = None;
             }
@@ -261,7 +256,7 @@ impl SettingsOverlay {
                 OverlayEvent::None
             };
         }
-        if keys.matches(Action::SelectConfirm, key) {
+        if panel_keys::matches(keys, Action::SelectConfirm, key) {
             // A filter that matches nothing has nothing to save; Esc clears it.
             if !visible.contains(&at) {
                 return OverlayEvent::None;
@@ -325,14 +320,9 @@ impl SettingsOverlay {
         }
         let pos = visible.iter().position(|&n| n == at).unwrap_or(0);
         let last = visible.len().saturating_sub(1);
-        let next = if keys.matches(Action::SelectUp, key) {
-            Some(if pos == 0 { last } else { pos - 1 })
-        } else if keys.matches(Action::SelectDown, key) {
-            Some(if pos >= last { 0 } else { pos + 1 })
-        } else if keys.matches(Action::SelectPageUp, key) {
-            Some(pos.saturating_sub(page))
-        } else if keys.matches(Action::SelectPageDown, key) {
-            Some((pos + page).min(last))
+        // Picker rows wrap at either end, as the value editors' rows do; paging stops at the ends.
+        let next = if let Some(next) = list_move(keys, key, pos, visible.len(), page, Edge::Wrap) {
+            Some(next)
         } else if filter.text.is_empty() && key.code == KeyCode::Home {
             Some(0)
         } else if filter.text.is_empty() && key.code == KeyCode::End {
@@ -453,16 +443,16 @@ impl SettingsOverlay {
     /// What the open browser or structured editor does, for the description area.
     pub(super) fn structured_help(&self) -> Option<String> {
         Some(match &self.mode {
-            Mode::Path { .. } => "Enter opens a folder or chooses the entry; type to filter. For a typed path, Enter checks/opens it; Enter again chooses a checked file. Ctrl+E types the value instead.".to_owned(),
-            Mode::List { editor, .. } if editor.ordered() => "Space checks or unchecks; Shift+Up/Down reorders (earlier is preferred); the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
-            Mode::List { .. } => "Space checks or unchecks; the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
+            Mode::Path { .. } => "Confirm to open a folder or choose an entry; type to filter. For a typed file path, confirm once to check it and again to choose it. Ctrl+E types the value instead.".to_owned(),
+            Mode::List { editor, .. } if editor.ordered() => "Space checks or unchecks; Shift+Up/Down reorders (earlier is preferred). Confirm the last row to add another value, or any other row to save. Ctrl+E types the list.".to_owned(),
+            Mode::List { .. } => "Space checks or unchecks. Confirm the last row to add another value, or any other row to save. Ctrl+E types the list.".to_owned(),
             Mode::Entries { def, .. } => {
                 let layer = if matches!(def.kind, Kind::Toml) {
                     format!(" Editing only the {} layer; inherited values are not copied.", scope_name(self.scope))
                 } else {
                     String::new()
                 };
-                format!("Enter edits an entry; Delete removes it; choose Save to keep the changes.{layer} Ctrl+E edits it as TOML text.")
+                format!("Confirm an entry to edit it; Delete removes it; choose Save to keep the changes.{layer} Ctrl+E edits it as TOML text.")
             }
             _ => return None,
         })

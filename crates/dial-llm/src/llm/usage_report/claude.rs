@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 
-use super::common::{parse_iso_ms, usage_status, usage_status_opt};
+use super::common::{parse_iso_ms, to_number, usage_status, usage_status_opt};
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageResetCreditDetail, UsageResetCredits, UsageScope,
     UsageUnit, UsageWindow,
@@ -984,12 +984,7 @@ fn str_field(object: &Map<String, Value>, key: &str) -> Option<String> {
 
 /// Finite number from a JSON number or numeric string.
 fn number(value: Option<&Value>) -> Option<f64> {
-    let parsed = match value? {
-        Value::Number(number) => number.as_f64()?,
-        Value::String(text) => text.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    parsed.is_finite().then_some(parsed)
+    value.and_then(to_number)
 }
 
 #[cfg(test)]

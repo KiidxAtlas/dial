@@ -53,8 +53,11 @@ impl Agent<'_> {
             let mut profile = selection.profile.clone();
             if single_call
                 && let Some(profile) = profile.as_mut()
-                && crate::llm::model_config::ApiProtocol::builtin(&profile.provider)
-                    .accepts_parallel_tool_calls()
+                && crate::config::selection::protocol(
+                    &self.auth_config,
+                    &self.auth_config.selection(),
+                )
+                .accepts_parallel_tool_calls()
             {
                 profile.capabilities.parallel_tool_calls = Some(false);
             }

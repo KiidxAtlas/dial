@@ -3,10 +3,8 @@ use crate::config::tools::eval::EvalConfig;
 
 use super::background::AdoptedJob;
 use super::kernel::{
-    ActiveGuard, BackgroundPolicy, CellAction, CellOutcome, CellScope, Deadline, Handoff,
-    NativeProcess, PythonRuntime, busy_job, cell_label, check_operation, code_output, deadline,
-    execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
-    resolve_operator_executable, strip_runtime_injection,
+    CancelDelivery, CellAction, CellOutcome, CellRuntime, CellSpec, NativeProcess, PythonRuntime,
+    code_output, require_fork_containment, resolve_operator_executable, strip_runtime_injection,
 };
 #[cfg(not(windows))]
 use super::kernel::{fenced_command, fork_fence_prefix, shell_quote};
@@ -14,13 +12,12 @@ use crate::config::tools::kernel::KernelConfig;
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, Workspace, tool_schema};
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 const DRIVER: &str = include_str!("eval/driver.cjs");
@@ -145,6 +142,16 @@ pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<
     languages
 }
 
+/// Containment is the only eval prerequisite observable without starting a cell. It does not
+/// verify an operator's interpreter installation.
+fn containment_readiness() -> crate::tools::surface::catalog::Readiness {
+    use crate::tools::surface::catalog::Readiness;
+    match super::kernel::cached_fork_containment() {
+        Some(Err(reason)) => Readiness::MissingPrerequisite { reason },
+        Some(Ok(())) | None => Readiness::Unknown,
+    }
+}
+
 /// Interpreter prerequisites observed without starting a process. Containment and interpreter
 /// versions are still checked by execution; a resolved launcher is not proof of readiness.
 pub fn runtime_readiness(
@@ -157,10 +164,7 @@ pub fn runtime_readiness(
             reason: "No eval interpreter resolves. JavaScript needs a usable Node 22+ launcher or the embedded engine; Python needs a bundled or configured Python 3.8+ launcher. Loading eval does not install an interpreter. Status/reset/cancel remain available.".into(),
         }
     } else {
-        match super::kernel::cached_fork_containment() {
-            Some(Err(reason)) => Readiness::MissingPrerequisite { reason },
-            Some(Ok(())) | None => Readiness::Unknown,
-        }
+        containment_readiness()
     }
 }
 
@@ -205,38 +209,23 @@ impl EvalTool {
     }
 }
 
-/// Persistent JavaScript namespace owned by one execution owner.
+/// Persistent JavaScript namespace owned by one execution owner. The shared cell lifecycle lives in
+/// [`CellRuntime`]; this type supplies only the Node or embedded-engine launch.
 struct JsRuntime {
     config: EvalConfig,
-    session: Arc<Mutex<Option<NativeProcess>>>,
-    busy: Arc<Mutex<Option<String>>>,
-    pid: Arc<AtomicI32>,
-    interrupt: AtomicBool,
-    active: AtomicUsize,
+    cell: CellRuntime,
 }
 impl JsRuntime {
     fn new(config: EvalConfig) -> Self {
         Self {
             config,
-            session: Arc::new(Mutex::new(None)),
-            busy: Arc::new(Mutex::new(None)),
-            pid: Arc::new(AtomicI32::new(0)),
-            interrupt: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
+            cell: CellRuntime::new(),
         }
     }
-    /// Cancels the in-flight cell and reports whether one was running. A flag left behind would
-    /// reject the next cell, so nothing is recorded when idle.
+    /// Cancels the in-flight cell and reports whether one was running. JavaScript cells are killed
+    /// outright rather than interrupted.
     fn cancel(&self) -> bool {
-        if self.active.load(Ordering::Acquire) == 0 {
-            return false;
-        }
-        self.interrupt.store(true, Ordering::Release);
-        let pid = self.pid.load(Ordering::Acquire);
-        if pid > 0 {
-            let _ = crate::platform::process::kill_group(pid as u32);
-        }
-        true
+        self.cell.cancel(CancelDelivery::KillGroup)
     }
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -249,118 +238,53 @@ impl JsRuntime {
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
         effect_started: &AtomicBool,
     ) -> Result<CellOutcome, String> {
-        // Counts the whole operation, including lock wait, so cancel reaches it before startup.
-        let _active = ActiveGuard::new(&self.active);
-        let cell = Arc::new(Deadline::new(execution_deadline(deadline(
-            args,
-            self.config.timeout_secs,
-        )?)));
-        let end = &cell;
-        let pending_cancel = self.interrupt.swap(false, Ordering::AcqRel);
-        if cancel.load(Ordering::Acquire)
-            || (pending_cancel && matches!(action, CellAction::Eval(_)))
-        {
-            return Err("JavaScript execution cancelled before startup".into());
-        }
-        let policy = BackgroundPolicy::from_args(args, ctx.config.shell.auto_background_secs)?;
-        let handoff = Handoff {
-            label: cell_label(args, "js")?,
-            policy: &policy,
-            adopt,
-            session: self.session.clone(),
-            busy: self.busy.clone(),
-            pid: self.pid.clone(),
+        // Redeclaration rewriting is a pure source transform, applied before admission so that a
+        // busy runtime and the namespace see the same code.
+        let redeclared;
+        let action = match action {
+            CellAction::Eval(code) => {
+                redeclared = cells::redeclarable(code);
+                CellAction::Eval(&redeclared)
+            }
+            other => other,
         };
-        let callback_wait = AtomicBool::new(false);
-        let result = guarded_operation(
-            end,
-            &self.pid,
-            &self.interrupt,
+        let spec = CellSpec {
+            code: "js",
+            name: "JavaScript",
+            timeout_secs: self.config.timeout_secs,
+        };
+        self.cell.run(
+            ctx,
+            spec,
+            action,
+            args,
             cancel,
-            &callback_wait,
-            || {
-                let mut slot = lock_session(&self.session, end, &self.interrupt, cancel)?;
-                if let Some(job) = busy_job(&self.busy) {
-                    if matches!(action, CellAction::Status) {
-                        return Ok(CellOutcome::Value(
-                            json!({"running":true,"background":job,"language":"js",
-                                "platform":crate::tools::surface::catalog::execution_platform("eval")}),
-                        ));
-                    }
-                    return Err(format!("runtime busy in background job {job}"));
-                }
-                let code = match action {
-                    CellAction::Reset => {
-                        slot.take();
-                        return Ok(CellOutcome::Value(json!({"reset":true})));
-                    }
-                    CellAction::Status => {
-                        return Ok(CellOutcome::Value(
-                            json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),"language":"js",
-                            "platform":crate::tools::surface::catalog::execution_platform("eval")}),
-                        ));
-                    }
-                    CellAction::Eval(code) => code,
+            adopt,
+            dispatch,
+            effect_started,
+            |slot, attempt| {
+                let node = js_launcher(ctx.workspace.root(), &self.config.node)?;
+                let kernel = if node.is_some() {
+                    "Node kernel (install/configure eval.node)"
+                } else {
+                    "embedded JavaScript engine"
                 };
-                let scope = CellScope {
-                    workspace: ctx.workspace,
-                    prelude_mode: if ctx.config.eval.portable_helpers {
-                        super::preludes::PreludeMode::Portable
-                    } else {
-                        super::preludes::PreludeMode::ExtensionsOnly
-                    },
-                    end,
-                    interrupt: &self.interrupt,
-                    cancel,
-                    callback_wait: &callback_wait,
-                };
-                let result = (|| {
-                    if slot.as_mut().is_some_and(|process| !process.alive()) {
-                        slot.take();
-                    }
-                    if slot.is_none() {
-                        require_fork_containment("eval")?;
-                        let node = js_launcher(ctx.workspace.root(), &self.config.node)?;
-                        let kernel = if node.is_some() {
-                            "Node kernel (install/configure eval.node)"
-                        } else {
-                            "embedded JavaScript engine"
-                        };
-                        check_operation(end, &self.interrupt, cancel)?;
-                        let mut command = js_kernel_command(ctx.workspace, node.as_deref())?;
-                        // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
-                        strip_runtime_injection(&mut command);
-                        check_operation(end, &self.interrupt, cancel)?;
-                        let mut process = NativeProcess::start(command, self.pid.clone())
-                            .map_err(|error| format!("starting {kernel}: {error}"))?;
-                        process.backend = Some(if node.is_some() {
-                            super::preludes::EvalBackend::Node
-                        } else {
-                            super::preludes::EvalBackend::QuickJs
-                        });
-                        *slot = Some(process);
-                    }
-                    check_operation(end, &self.interrupt, cancel)?;
-                    // Re-running an edited cell must not fail on its own earlier declarations.
-                    let code = cells::redeclarable(code);
-                    native_cell(
-                        slot.as_mut().unwrap(),
-                        &scope,
-                        &code,
-                        dispatch,
-                        &handoff,
-                        effect_started,
-                    )
-                })();
-                if result.is_err() {
-                    slot.take();
-                }
-                result
+                attempt.check()?;
+                let mut command = js_kernel_command(ctx.workspace, node.as_deref())?;
+                // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
+                strip_runtime_injection(&mut command);
+                attempt.check()?;
+                let mut process = NativeProcess::start(command, attempt.pid.clone())
+                    .map_err(|error| format!("starting {kernel}: {error}"))?;
+                process.backend = Some(if node.is_some() {
+                    super::preludes::EvalBackend::Node
+                } else {
+                    super::preludes::EvalBackend::QuickJs
+                });
+                *slot = Some(process);
+                Ok(())
             },
-        );
-        // An interrupt raised during this operation must not reject the next cell.
-        self.interrupt.store(false, Ordering::Release);
-        result
+        )
     }
 }
 
@@ -397,12 +321,7 @@ impl Tool for EvalTool {
         schema
     }
     fn readiness(&self, _: &Config) -> crate::tools::surface::catalog::Readiness {
-        use crate::tools::surface::catalog::Readiness;
-        match super::kernel::cached_fork_containment() {
-            Some(Err(reason)) => Readiness::MissingPrerequisite { reason },
-            // Containment alone does not verify an operator's interpreter installation.
-            Some(Ok(())) | None => Readiness::Unknown,
-        }
+        containment_readiness()
     }
     fn needs_approval(&self, _: &Value) -> bool {
         true
@@ -421,14 +340,7 @@ impl Tool for EvalTool {
         self.python.cancel();
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.call_with_dispatch(
-            ctx,
-            args,
-            &|_| {},
-            &AtomicBool::new(false),
-            &no_background,
-            &mut |_| ToolOutput::err("tool callbacks require an execution controller"),
-        )
+        self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
     }
     fn call_streaming(
         &self,

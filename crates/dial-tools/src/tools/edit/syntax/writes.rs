@@ -329,3 +329,137 @@ fn python_string_round_trip_and_focused_repair_preserve_saved_bytes() {
     assert_eq!(saved, expected);
     assert_eq!(report(Path::new("dungeon_game.py"), &saved)["valid"], true);
 }
+
+/// Timed region is one native replace-mode edit, including validation, disk commit and
+/// rendering the tool result. Setup, establishing the read witness and checking bytes are outside.
+fn paired_edit(
+    before: &str,
+    old: &str,
+    new: &str,
+    allow: bool,
+    enabled: bool,
+) -> (String, String, std::time::Duration) {
+    let root = tempfile::tempdir().unwrap();
+    let mut ws = lean(root.path(), EditMode::Replace);
+    ws.edit_settings.auto_repair.enabled = enabled;
+    let path = root.path().join("calc.py");
+    std::fs::write(&path, before).unwrap();
+    let read = execute(&ws, "read", &json!({"path":"calc.py:1-1"}), 5);
+    assert!(!read.is_error, "{}", read.text);
+    let args =
+        json!({"path":"calc.py", "old_string":old, "new_string":new, "allow_syntax_errors":allow});
+    let start = std::time::Instant::now();
+    let out = execute(&ws, "edit", &args, 5);
+    let elapsed = start.elapsed();
+    assert!(!out.is_error, "{}", out.text);
+    (out.text, std::fs::read_to_string(path).unwrap(), elapsed)
+}
+
+#[test]
+fn native_repair_preserves_ordinary_output_and_the_explicit_escape_hatch() {
+    let before = "x = f(1)\n";
+    let (ordinary, bytes, _) = paired_edit(before, "f(1)", "f(2)", false, false);
+    for (new, enabled) in [("f(2)", true), ("f(2", true)] {
+        let (out, saved, _) = paired_edit(before, "f(1)", new, false, enabled);
+        assert_eq!(bytes, "x = f(2)\n");
+        assert_eq!(out, ordinary);
+        assert_eq!(saved, bytes);
+    }
+    for enabled in [false, true] {
+        let (out, saved, _) = paired_edit(before, "f(1)", "f(2", true, enabled);
+        assert_eq!(saved, "x = f(2\n");
+        assert!(out.contains("Syntax advisory"), "{out}");
+    }
+}
+
+#[test]
+#[ignore = "local timing experiment; not a CI latency threshold"]
+fn paired_ordinary_edit_latency() {
+    const SAMPLES: usize = 200;
+    for padding in [0, 200] {
+        let before = format!("x = f(1)\n{}", "other = 123\n".repeat(padding));
+        let expected = before.replacen("f(1)", "f(2)", 1);
+        let mut samples = [Vec::new(), Vec::new()];
+        for pair in 0..SAMPLES + 10 {
+            let mut first = None;
+            for enabled in [pair % 2 != 0, pair % 2 == 0] {
+                let (out, saved, elapsed) = paired_edit(&before, "f(1)", "f(2)", false, enabled);
+                assert_eq!(saved, expected);
+                if let Some(first) = &first {
+                    assert_eq!(&out, first);
+                } else {
+                    first = Some(out);
+                }
+                if pair >= 10 {
+                    samples[usize::from(enabled)].push(elapsed.as_nanos());
+                }
+            }
+        }
+        for (arm, mut times) in samples.into_iter().enumerate() {
+            times.sort_unstable();
+            eprintln!(
+                "{} lines repair={arm}: {SAMPLES} samples, median={}us p95={}us",
+                padding + 1,
+                (times[99] + times[100]) / 2000,
+                times[189] / 1000
+            );
+        }
+    }
+}
+
+/// Decision experiment, not a promise to keep today's guesses. Returning a refusal
+/// scores an abstention; returning a parseable but non-reference file scores a wrong write.
+#[test]
+#[ignore = "offline promotion experiment; prints outcomes against independent intended edits"]
+fn local_repair_intent_replay() {
+    let mut exact = 0;
+    let mut wrong = 0;
+    let mut abstained = 0;
+    for (before, broken, intended) in [
+        ("v = abs(a-b)", "v = abs(a+b", "v = abs(a+b)"),
+        ("v = abs(a-b)", "v = abs(a+b", "v = abs(a)+b"),
+        ("v = abs(1) * 2", "v = abs(3 * 2", "v = abs(3 * 2)"),
+        // From the historical coach drill: the grouping is new, not dropped from before.
+        (
+            "def add(a, b):\n    return a - b",
+            "def add(a, b):\n    return (a + b",
+            "def add(a, b):\n    return (a + b)",
+        ),
+        // Previously checked-in refusal fixtures (not production transcripts).
+        ("print(\"\\n\")", "print(\"\n\")", "print()"),
+        (
+            "WIDTH = 10\n\ndef draw(self):\n    pass",
+            "WIDTH = 10\nSIDEBAR_WIDTH = 5\n\ndef draw(self    :\n    pass",
+            "WIDTH = 10\nSIDEBAR_WIDTH = 5\n\ndef draw(self):\n    pass",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut ws = lean(root.path(), EditMode::Replace);
+        let path = root.path().join("v.py");
+        assert_eq!(report(&path, intended)["valid"], true);
+        std::fs::write(&path, before).unwrap();
+        assert!(!execute(&ws, "read", &json!({"path":"v.py"}), 5).is_error);
+        let args = json!({"path":"v.py", "old_string":before, "new_string":broken});
+        ws.edit_settings.auto_repair.enabled = false;
+        let baseline = execute(&ws, "edit", &args, 5);
+        assert!(
+            baseline.is_error && baseline.text.contains("Edit refused"),
+            "{}",
+            baseline.text
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        ws.edit_settings.auto_repair.enabled = true;
+        let out = execute(&ws, "edit", &args, 5);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        if out.is_error {
+            assert_eq!(baseline.text, out.text);
+            assert_eq!(saved, before);
+            abstained += 1;
+        } else if saved == intended {
+            exact += 1;
+        } else {
+            wrong += 1;
+        }
+    }
+    eprintln!("intent replay: {exact} exact, {wrong} wrong, {abstained} abstained");
+}

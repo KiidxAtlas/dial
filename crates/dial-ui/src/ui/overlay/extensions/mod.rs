@@ -6,13 +6,12 @@ pub mod model;
 
 use super::{
     DrawCtx, OverlayEvent,
-    providers::key_footer,
-    settings::{list_row, pair_label, scroll_cell, typed_char},
+    widgets::{list_row, pair_label, scroll_cell, typed_char},
 };
 use crate::ui::{
     chrome::{self, Section, Status},
     keys::{Action, Keymap},
-    theme::{Theme, Tok},
+    theme::Tok,
 };
 use crossterm::event::{Event, KeyEventKind};
 #[cfg(test)]
@@ -22,7 +21,7 @@ use model::{
 };
 use ratatui::{
     Frame,
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -422,7 +421,7 @@ impl ExtensionsOverlay {
             // Tab strip.
             let mut tabs: Vec<Span<'static>> = vec![Span::raw(" ")];
             for tab in Tab::ALL {
-                let style = tab_style(ctx.theme, tab == browser.tab());
+                let style = chrome::tab_style(ctx.theme, tab == browser.tab());
                 tabs.push(Span::styled(format!(" {} ", tab.label()), style));
                 tabs.push(Span::raw(" "));
             }
@@ -618,7 +617,13 @@ impl ExtensionsOverlay {
                 items.push((ctx.keys.label(Action::SelectCancel), esc.to_owned()));
                 items
             };
-            lines.push(key_footer(ctx.theme, &hints, w));
+            // Not bounded: this footer's own order keeps the row actions for the selection, and
+            // the width drops the middle hints. The key sheet is still reached with F1.
+            let segments: Vec<String> = hints
+                .iter()
+                .map(|(key, label)| super::panel_keys::segment(key, label))
+                .collect();
+            lines.push(super::widgets::hint_line(ctx.theme, &segments, w));
             lines
         };
         let area = frame.area();
@@ -640,10 +645,6 @@ impl ExtensionsOverlay {
         let lines = body(inner.width, inner.height);
         frame.render_widget(Paragraph::new(lines), inner);
     }
-}
-
-fn tab_style(theme: &Theme, active: bool) -> Style {
-    chrome::tab_style(theme, active)
 }
 
 fn action(intent: &Intent) -> OverlayEvent {

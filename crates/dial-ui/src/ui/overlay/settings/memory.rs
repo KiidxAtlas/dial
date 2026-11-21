@@ -1,5 +1,5 @@
 //! Memory backend rows: the summary, the role gaps and the loopback check that drive them.
-use super::{EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, SettingsOverlay};
+use super::SettingsOverlay;
 use crate::config::schema::Kind;
 use toml::Value;
 
@@ -41,66 +41,6 @@ pub(super) fn memory_section(backend: &str) -> Option<&'static str> {
         "semantic" => Some("memory.semantic."),
         _ => None,
     }
-}
-
-/// Whether `endpoint` names this machine, which may use plain HTTP and needs no API key.
-/// Mirrors the loopback rule in `memory_backend::config::endpoint`.
-pub(super) fn is_loopback_url(endpoint: &str) -> bool {
-    url::Url::parse(endpoint).is_ok_and(|url| {
-        url.host_str().is_some_and(|host| {
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
-    })
-}
-
-/// Required fields of `backend` that are still empty or half set, as setting paths, in the order to
-/// fill them. Mirrors `memory_backend::config::validate` and the runtime routes: Hindsight's URL and
-/// key, Sharpshooter's model when the memory role is unassigned, and for semantic the missing half of
-/// the URL/model override, or an embedding model when embeddings are `on` with no route.
-pub(super) fn memory_needs(
-    backend: &str,
-    get: impl Fn(&str) -> Value,
-    has_role: impl Fn(&str) -> bool,
-) -> Vec<&'static str> {
-    let text = |path: &str| get(path).as_str().unwrap_or("").trim().to_owned();
-    let mut needs = Vec::new();
-    match backend {
-        "hindsight" => {
-            let endpoint = text("memory.hindsight.endpoint");
-            if endpoint.is_empty() {
-                needs.push("memory.hindsight.endpoint");
-            } else if text("memory.hindsight.api_key_env").is_empty() && !is_loopback_url(&endpoint)
-            {
-                needs.push("memory.hindsight.api_key_env");
-            }
-        }
-        "sharpshooter" => {
-            if text("memory.sharpshooter.model").is_empty()
-                && !has_role(&text("memory.sharpshooter.model_role"))
-            {
-                needs.push("memory.sharpshooter.model");
-            }
-        }
-        "semantic" => {
-            let (url, model) = (text(EMBEDDING_URL_PATH), text(EMBEDDING_MODEL_PATH));
-            match (url.is_empty(), model.is_empty()) {
-                (false, true) => needs.push(EMBEDDING_MODEL_PATH),
-                (true, false) => needs.push(EMBEDDING_URL_PATH),
-                (true, true)
-                    if text("memory.semantic.embedding") == "on" && !has_role("embedding") =>
-                {
-                    needs.push(EMBEDDING_MODEL_PATH)
-                }
-                _ => {}
-            }
-        }
-        _ => {}
-    }
-    needs
 }
 
 /// A model role the backend cannot work without and that only the Roles view can assign.

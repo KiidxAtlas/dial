@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::common::parse_iso_ms_lenient;
+use super::common::{parse_iso_ms_lenient, to_number};
 use super::gemini::opt_str;
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
@@ -101,6 +101,61 @@ pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<
     let Some(project) = access.project_id.as_deref().filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
+    let now_ms = util::now_ms();
+    let ctx = Ctx {
+        provider: ID,
+        account_id: access.account_id.as_deref(),
+        project_id: project,
+    };
+
+    let summary = post(&access, SUMMARY_PATH, cancel)?;
+    let summary_report = if summary.response.ok() {
+        parse_summary(&summary.response.json()?, ctx, &summary.endpoint, now_ms)?
+    } else {
+        None
+    };
+    let mut report = match summary_report {
+        Some(report) => report,
+        None => {
+            let (endpoint, payload) = model_listing(&access, cancel)?;
+            parse_models(&payload, ctx, &endpoint, now_ms)?
+        }
+    };
+    if let Some(account) = oauth::identity(user_dir, ID) {
+        report.metadata.insert("account".to_owned(), account);
+    }
+    Ok(Some(report))
+}
+
+/// The same project-scoped model listing used by the quota fallback, without requesting quota.
+pub(in crate::llm) fn available_models(
+    user_dir: &Path,
+) -> Result<(Option<(String, String)>, Value)> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Catalog status displays only the outer message, never the OAuth error chain.
+    let access = oauth::access(user_dir, ID, &cancel)
+        .context("Could not load or refresh the saved Antigravity sign-in")?;
+    // The scope is the credential this listing was fetched with, not a later active account.
+    let identity = access.account_id.clone().zip(access.project_id.clone());
+    model_listing(&access, &cancel).map(|(_, payload)| (identity, payload))
+}
+
+fn model_listing(access: &oauth::Access, cancel: &Arc<AtomicBool>) -> Result<(String, Value)> {
+    let listing = post(access, MODELS_PATH, cancel)?;
+    let payload = listing
+        .response
+        .require_ok("Antigravity fetchAvailableModels")?
+        .json()
+        .context("Antigravity fetchAvailableModels returned invalid JSON")?;
+    Ok((listing.endpoint, payload))
+}
+
+fn post(access: &oauth::Access, path: &str, cancel: &Arc<AtomicBool>) -> Result<Attempt> {
+    let project = access
+        .project_id
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .context("Saved Antigravity sign-in has no project ID; sign in again in /providers")?;
     let authorization = format!("Bearer {}", access.token.as_str());
     let endpoints: Vec<String> = match access
         .base_url
@@ -111,37 +166,8 @@ pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<
         Some(base) => vec![base.to_owned()],
         None => DEFAULT_ENDPOINTS.iter().map(|s| (*s).to_owned()).collect(),
     };
-    let now_ms = util::now_ms();
-    let ctx = Ctx {
-        provider: ID,
-        account_id: access.account_id.as_deref(),
-        project_id: project,
-    };
-
-    let summary = post_first_available(&endpoints, SUMMARY_PATH, project, &authorization, cancel)?;
-    let summary_report = if summary.response.ok() {
-        parse_summary(&summary.response.json()?, ctx, &summary.endpoint, now_ms)?
-    } else {
-        None
-    };
-    let mut report = match summary_report {
-        Some(report) => report,
-        None => {
-            let legacy =
-                post_first_available(&endpoints, MODELS_PATH, project, &authorization, cancel)?;
-            if !legacy.response.ok() {
-                bail!(
-                    "Antigravity fetchAvailableModels failed (HTTP {})",
-                    legacy.response.status
-                );
-            }
-            parse_models(&legacy.response.json()?, ctx, &legacy.endpoint, now_ms)?
-        }
-    };
-    if let Some(account) = oauth::identity(user_dir, ID) {
-        report.metadata.insert("account".to_owned(), account);
-    }
-    Ok(Some(report))
+    // The HTTP helper reports a sanitized URL and failure reason, never the response body.
+    post_first_available(&endpoints, path, project, &authorization, cancel)
 }
 
 fn post_first_available(
@@ -158,10 +184,23 @@ fn post_first_available(
         ("Content-Type", "application/json"),
         ("User-Agent", user_agent.as_str()),
     ];
+    let max_bytes = if path == MODELS_PATH {
+        crate::llm::catalog::MAX_RESPONSE
+    } else {
+        util::MAX_BODY as u64
+    };
     let last = endpoints.len().saturating_sub(1);
     for (index, endpoint) in endpoints.iter().enumerate() {
         let url = format!("{endpoint}{path}");
-        match util::request("POST", &url, &headers, util::Body::Json(&body), cancel) {
+        match util::request_with_limits(
+            "POST",
+            &url,
+            &headers,
+            util::Body::Json(&body),
+            cancel,
+            util::TIMEOUT_SECS,
+            max_bytes,
+        ) {
             Ok(response) if response.ok() || !is_transient(response.status) || index == last => {
                 return Ok(Attempt {
                     endpoint: endpoint.clone(),
@@ -219,8 +258,7 @@ fn parse_bucket(value: &Value) -> Result<Bucket> {
         .context("Antigravity quota bucket is not a JSON object")?;
     let remaining_amount = match object.get("remainingAmount") {
         None | Some(Value::Null) => None,
-        Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        Some(value @ (Value::Number(_) | Value::String(_))) => to_number(value),
         Some(_) => bail!("Antigravity quota bucket `remainingAmount` has an unexpected type"),
     };
     Ok(Bucket {

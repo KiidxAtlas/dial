@@ -2,7 +2,12 @@
 name = "dial-worker"
 version = "0.1.0"
 requires-python = ">=3.11,<3.14"
-dependencies = ["mlx-lm[train]==0.32.0", "mlx-vlm==0.7.6", "rich>=14,<15"]
+dependencies = ["mlx-lm[train]==0.32.3.dev26+g0c4c99192", "mlx-vlm==0.7.6", "rich>=14,<15"]
 
 [tool.uv]
 package = false
+
+# Inkling-2-Mini's loader and vision processor (ml-explore/mlx-lm#2086).
+# Return to a release pin once a published wheel contains inkling2_loop.
+[tool.uv.sources]
+mlx-lm = { git = "https://github.com/ml-explore/mlx-lm", rev = "0c4c99192230f1943dd468d297f0b8a64ae7b7c2" }

@@ -4,14 +4,13 @@
 //! from the prompt (in the workspace root, or beside the edited source), never an existing one,
 //! and an edited source is only read. `gif` asks the same tool for an animated `.gif`.
 use crate::agent::Agent;
-use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
+use crate::app::{App, Bridge, Shell, Step};
 use crate::storage::redact::redact_text;
 use crate::tools::net::image_gen;
 use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 const USAGE: &str = "Usage: /image generate <prompt> · /image gif <prompt> · /image edit <file> <prompt> · /image settings";
 /// Prompt words used in the output file name, and that name's maximum slug length.
@@ -98,16 +97,7 @@ fn generate(
     shell.transcript.push_user(&typed);
     shell.composer.set_busy(true);
     let result = {
-        let mut bridge = Bridge {
-            app,
-            shell: &mut *shell,
-            interrupt: app.interrupt.clone(),
-            started: Instant::now(),
-            last_paint: crate::runtime::clock::instant_ago(PAINT_EVERY),
-            failed: false,
-            pending: Vec::new(),
-            next_id: 0,
-        };
+        let mut bridge = Bridge::new(app, &mut *shell);
         bridge.repaint(true);
         agent.generate_image(prompt, &output, source, &mut bridge)
     };

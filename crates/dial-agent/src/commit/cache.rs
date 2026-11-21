@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -302,11 +302,7 @@ fn to_sql_count(value: Option<u64>) -> Option<i64> {
 }
 
 fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        })
+    i64::try_from(crate::runtime::clock::unix_secs()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

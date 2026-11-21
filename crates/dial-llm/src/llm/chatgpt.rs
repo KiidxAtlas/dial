@@ -1264,13 +1264,7 @@ fn codex_model_metadata() -> Option<Value> {
     if metadata.modified().ok()?.elapsed().ok()? > Duration::from_secs(7 * 86400) {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_CATALOG_JSON + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_CATALOG_JSON {
-        return None;
-    }
+    let bytes = crate::llm::read_within(file, MAX_CATALOG_JSON)?;
     serde_json::from_slice(&bytes).ok()
 }
 fn build_catalog(value: &Value, supplemental: Option<&Value>) -> Result<ModelCatalog> {

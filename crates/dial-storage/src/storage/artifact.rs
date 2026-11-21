@@ -7,6 +7,7 @@ mod evidence;
 pub use evidence::StoredEvidence;
 
 use crate::runtime::tool_output::ToolOutput;
+use crate::units::human_bytes;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -487,19 +488,6 @@ impl Drop for TailRing {
         let _ = fs::remove_file(&self.path);
     }
 }
-fn format_bytes(bytes: u64) -> String {
-    const UNIT: f64 = 1024.0;
-    let value = bytes as f64;
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if value < UNIT * UNIT {
-        format!("{:.1}KB", value / UNIT)
-    } else if value < UNIT * UNIT * UNIT {
-        format!("{:.1}MB", value / UNIT / UNIT)
-    } else {
-        format!("{:.1}GB", value / UNIT / UNIT / UNIT)
-    }
-}
 impl ArtifactSpool {
     fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.write_all(bytes)?;
@@ -559,10 +547,10 @@ impl ArtifactSpool {
             };
             let notice = format!(
                 "{head_sep}[ARTIFACT TRUNCATED: kept first {} + last {} of {}; {} elided from the middle]{tail_sep}",
-                format_bytes(self.head_written),
-                format_bytes(kept),
-                format_bytes(self.head_written + tail.len),
-                format_bytes(dropped)
+                human_bytes(self.head_written),
+                human_bytes(kept),
+                human_bytes(self.head_written + tail.len),
+                human_bytes(dropped)
             );
             self.append(notice.as_bytes())?;
         }

@@ -5,6 +5,7 @@ use super::{
     Line, Modifier, ReceiptCheck, Rows, Span, Sym, TranscriptCtx, TurnOutcome, TurnStats, text,
 };
 use crate::runtime::presentation::{Presentation, Tone};
+use crate::ui::status::{rate_label, shown_rate};
 use crate::ui::theme::Tok;
 use std::collections::BTreeMap;
 
@@ -207,10 +208,6 @@ pub(super) fn action_chords(index: usize) -> Option<[crate::ui::keys::Chord; 2]>
     })
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
 fn changed_count(outcome: Option<&TurnOutcome>, recap: &Recap) -> usize {
     // Only the recorder knows which paths really changed (including batches and no-op edits).
     outcome.map_or(recap.files.len(), |o| o.changed_files)
@@ -315,15 +312,12 @@ pub(super) fn receipt_rows(
     ];
     if let Some(target) = &receipt.check_target {
         let mut add = |label, value: String, tok| {
-            let used: usize = check.iter().map(|s| text::width(&s.content)).sum();
+            let used: usize = text::spans_width(&check);
             if used + 3 + text::width(&value) > w {
                 rows.push(super::fitted(std::mem::take(&mut check), w, theme));
                 check.push(field(label));
             } else {
-                check.push(Span::styled(
-                    format!(" {} ", theme.sym(Sym::Dot)),
-                    theme.fg(Tok::Dim),
-                ));
+                check.push(Span::styled(theme.dot_sep(), theme.fg(Tok::Dim)));
             }
             check.push(Span::styled(value, theme.fg(tok)));
         };
@@ -375,7 +369,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         return None;
     }
     let theme = ctx.theme;
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let dot = theme.dot_sep();
     let outcome = stats.outcome.as_ref();
     let (tok, glyph, word) = match outcome {
         Some(o) => super::outcome_mark(&o.status, theme),
@@ -396,7 +390,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
     if changed > 0 {
         head.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
         head.push(Span::styled(
-            format!("{} changed", plural(changed, "file", "files")),
+            format!("{} changed", text::counted(changed, "file")),
             theme.fg(Tok::Text),
         ));
     }
@@ -404,7 +398,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
     if open > 0 {
         head.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
         head.push(Span::styled(
-            plural(open, "open task", "open tasks"),
+            text::counted(open, "open task"),
             theme.fg(outcome.map_or(Tok::Warning, |o| super::open_tasks_tok(&o.status))),
         ));
     }
@@ -459,7 +453,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         ]
         .into_iter()
         .filter(|(n, ..)| *n > 0)
-        .map(|(n, one, many, tok)| frame::chip(theme, &plural(n, one, many), tok)),
+        .map(|(n, one, many, tok)| frame::chip(theme, &text::count_with(n, one, many), tok)),
     );
     let mut activity: Rows = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
@@ -565,11 +559,8 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         if let Some(n) = stats.output_tokens {
             facts.push(format!("{} out", text::compact_count(n)));
         }
-        if let Some(rate) = stats
-            .tokens_per_second
-            .filter(|r| r.is_finite() && *r > 0.0)
-        {
-            facts.push(format!("{rate:.1} tok/s"));
+        if let Some(rate) = shown_rate(stats.tokens_per_second) {
+            facts.push(rate_label(rate, ""));
         }
         card.foot = vec![Span::styled(facts.join(&dot), theme.fg(Tok::Dim))];
     }

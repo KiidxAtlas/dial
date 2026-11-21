@@ -978,7 +978,7 @@ fn footer_drops_whole_items_at_exact_width_boundaries() {
         let mut c = composer();
         c.set_busy(true);
         let hints = c.hint(&env.ctx());
-        let sep = format!(" {} ", env.theme.sym(Sym::Dot));
+        let sep = env.theme.dot_sep();
         for shape in [ComposerShape::Box, ComposerShape::Line] {
             env.ui.composer_shape = shape;
             for width in 0..=120u16 {
@@ -3640,6 +3640,50 @@ fn escape_closes_the_chooser_and_keeps_the_draft_pastes_and_history_exactly() {
 }
 
 #[test]
+fn busy_ctrl_c_hint_names_the_press_it_takes() {
+    let env = Env::new();
+    // (draft, history search open, hint before the press, what the press does, hint after it).
+    // The hint and the key handler read the same decision, so each named action happens.
+    let cases = [
+        (
+            "keep this",
+            false,
+            "Ctrl+C clear draft",
+            ComposerEvent::None,
+            "Ctrl+C again stops",
+        ),
+        (
+            "",
+            false,
+            "Ctrl+C stop",
+            ComposerEvent::Interrupt,
+            "Ctrl+C stop",
+        ),
+        (
+            "keep this",
+            true,
+            "Ctrl+C close search",
+            ComposerEvent::None,
+            "Ctrl+C again stops",
+        ),
+    ];
+    for (draft, searching, before, event, after) in cases {
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft(draft);
+        if searching {
+            ctrl(&mut c, &env, 'r');
+        }
+        assert_eq!(c.search.is_some(), searching, "{before}: setup");
+        assert_eq!(c.hint(&env.ctx())[0], before);
+        assert_eq!(ctrl(&mut c, &env, 'c'), event, "{before}");
+        assert_eq!(c.hint(&env.ctx())[0], after, "{before}");
+        assert!(c.search.is_none(), "{before}: no search remains");
+        assert_eq!(c.draft(), if searching { draft } else { "" }, "{before}");
+    }
+}
+
+#[test]
 fn an_empty_enter_while_busy_without_queued_work_is_a_no_op() {
     let env = Env::new();
     let mut c = composer();
@@ -3853,7 +3897,28 @@ fn a_queue_edit_cleared_to_empty_never_opens_the_stop_choice() {
 }
 
 #[test]
-fn a_narrow_send_choice_keeps_its_way_out_visible_before_navigation_hints() {
+fn busy_enter_hint_names_only_what_enter_does_to_a_queued_edit() {
+    let env = Env::new();
+    let submit = env.keys.label(Action::Submit);
+    let hints = |c: &Composer| c.hint(&env.ctx());
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("queued item");
+    c.submit_queued(false);
+    assert!(c.edit_queued(0));
+    assert!(hints(&c).contains(&format!("{submit} save queued item")));
+    // An emptied edit saves nothing, so Enter must not advertise a save.
+    c.editor.set("");
+    assert!(!hints(&c).iter().any(|h| h.contains("save queued item")));
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    // A command runs instead of saving the edit, and the hint says so.
+    c.editor.set("/help");
+    assert!(hints(&c).contains(&format!("{submit} run command")));
+    assert!(!hints(&c).iter().any(|h| h.contains("save queued item")));
+}
+
+#[test]
+fn compact_audit_send_choice_keeps_confirm_and_cancel_visible_before_navigation_hints() {
     let env = Env::new();
     let mut c = composer();
     c.set_busy(true);
@@ -3861,7 +3926,9 @@ fn a_narrow_send_choice_keeps_its_way_out_visible_before_navigation_hints() {
     press(&mut c, &env, KeyCode::Enter);
     let shown = screen(&c, &env, 38).join("\n");
     assert!(
-        !shown.contains("Esc close") && shown.contains("Ctrl+C clear draft"),
+        !shown.contains("Esc close")
+            && shown.contains("Enter confirm")
+            && shown.contains("Esc cancel"),
         "{shown}"
     );
 }

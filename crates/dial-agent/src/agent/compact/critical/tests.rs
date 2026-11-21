@@ -52,6 +52,40 @@ fn five_forced_session_compactions_preserve_exact_critical_state_without_promoti
 }
 
 #[test]
+fn approved_plan_is_carried_word_for_word_through_repeated_compactions() {
+    let mut session = Session::ephemeral();
+    let plan = crate::agent::workflow::plan_files::approved_record(
+        "# Ship\n1. migrate schema\n2. backfill",
+        Some(std::path::Path::new("/state/plans/s/ship.md")),
+        None,
+    );
+    let control = json!({"current_instruction":"implement","approved_plan":plan});
+    session.set_control_state(control.clone()).unwrap();
+    for round in 0..3 {
+        let prefix = vec![
+            Session::compaction_message(&format!("round {round}: plan was roughly to migrate")),
+            message(&session.control_state(), &Value::Null).unwrap(),
+        ];
+        session
+            .compact_with_prefix(format!("lossy summary {round}"), Some(prefix), 0)
+            .unwrap();
+        let messages = session.messages();
+        let carried = messages
+            .iter()
+            .find(|m| m["dial_compaction_critical"] == true)
+            .unwrap();
+        assert_eq!(carried["dial_critical_state"]["approved_plan"], plan);
+    }
+    let without = message(&json!({"current_instruction":"x"}), &Value::Null).unwrap();
+    assert!(
+        without["dial_critical_state"]
+            .get("approved_plan")
+            .is_none(),
+        "no plan, no field"
+    );
+}
+
+#[test]
 fn oversized_contract_fails_explicitly_and_never_truncates_legacy_state() {
     let control = json!({"current_instruction":"é".repeat(MAX_CRITICAL_BYTES)});
     let error = message(&control, &Value::Null).unwrap_err().to_string();

@@ -409,10 +409,7 @@ fn inline(ws: &Workspace, text: String) -> String {
     if text.len() <= MAX_INLINE_BYTES {
         return text;
     }
-    let mut end = MAX_INLINE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(MAX_INLINE_BYTES);
     let mut out = text[..end].to_owned();
     out.push_str("\n…[output truncated");
     if let Some(store) = ws.artifacts()

@@ -1259,6 +1259,36 @@
         },
         {
           "type": "object",
+          "description": "Native RPC only. As a joined, writable guest, answer the host's open question with a 1-based option number from collaboration_status room.question.options. The host offers only question prompts, never tool approvals, and only with [collab].allow_guest_answers. Returns {routed:\"collaboration_host\",option}; no guest returns not_pending; a read-only link, closed question or unknown option returns refused.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "collaboration_answer"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "option": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "option"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Open, query or stop the local comparison workspace without starting inference. Returns status and a capability-scoped loopback URL. Confirm and start selected runs through that workspace; Python 3.11+ and a Dial benchmark checkout are required. Native RPC only; busy open and invalid actions have coded refusals.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },
@@ -2569,7 +2599,7 @@
         },
         {
           "type": "object",
-          "description": "Set the session's approval mode, as /approval does. Result: {approval, description}.",
+          "description": "Set the session's approval mode, as /approval does. yolo also runs tool calls recovered from model text without asking; it is explicit only (Shift+Tab never selects it). Result: {approval, description}.",
           "properties": {
             "id": {
               "$ref": "#/$defs/id"
@@ -2585,13 +2615,129 @@
                     "ask",
                     "write",
                     "auto",
-                    "readonly"
+                    "readonly",
+                    "yolo"
                   ]
                 }
               },
               "additionalProperties": false,
               "required": [
                 "mode"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The session's permission rules, as /permissions lists them, in evaluation order. Result: {rules:[{index, effect, tool, command_prefix, paths, scope}]}. `index` is zero-based and is what remove_permission_rule takes. Not served over ACP.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "list_permission_rules"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Add a session permission rule, as /permissions allow|deny does; `persist: true` also saves it with the project (the same store as /permissions --persist). A bash rule's command_prefix is parsed and normalised like the terminal's: a single program with its arguments, no compound, wrapper or destructive forms (invalid_params). Result: {rule, persisted, count}; rule.index is the new rule's zero-based index.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "add_permission_rule"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "allow",
+                    "deny"
+                  ]
+                },
+                "tool": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "command_prefix": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": "Words of a bash command prefix, for tool `bash` only."
+                },
+                "paths": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "description": "Project-relative glob patterns, for file tools only (read, write, edit, ast_edit, git, notebook, lsp, browser, revert_edit). Empty means every path."
+                },
+                "persist": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "effect",
+                "tool"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Remove the session permission rule at a zero-based index from /permissions list, and from the saved project store when `persist: true`. An index outside the list is refused (not_found). Result: {removed, persisted, count}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "remove_permission_rule"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "persist": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "index"
               ]
             }
           },

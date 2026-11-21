@@ -296,26 +296,6 @@ fn python_unexecuted(target: &Target, reports: &[serde_json::Value]) -> Option<V
     )
 }
 
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let Some(byte) = text
-                .get(i + 1..i + 3)
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(byte);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Changed lines whose code V8 counted zero times in every process; `None` when no process
 /// loaded the file. Offsets are UTF-16 code units of the source.
 fn node_unexecuted(target: &Target, reports: &[serde_json::Value]) -> Option<Vec<usize>> {
@@ -340,7 +320,7 @@ fn node_unexecuted(target: &Target, reports: &[serde_json::Value]) -> Option<Vec
         for script in report["result"].as_array().into_iter().flatten() {
             if script["url"]
                 .as_str()
-                .map(|url| path_key(&percent_decode(url)))
+                .map(|url| path_key(&dial_llm::url::decode_uri_component_lossy(url)))
                 != Some(url.clone())
             {
                 continue;

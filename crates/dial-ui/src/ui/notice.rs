@@ -159,7 +159,7 @@ fn open_work(body: &str) -> Option<(&'static str, String)> {
             .and_then(|n| n.parse::<usize>().ok())
     });
     let (steps, deliverables, follow_ups) = (numbers.next()??, numbers.next()??, numbers.next()??);
-    let count = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let count = text::counted;
     let (title, mut text) = if steps + deliverables > 0 {
         let mut open = Vec::new();
         if steps > 0 {
@@ -356,10 +356,7 @@ fn pairs(content: &str, theme: &Theme) -> Row {
     let mut out = Vec::new();
     for (i, segment) in content.split(" · ").enumerate() {
         if i > 0 {
-            out.push(Span::styled(
-                format!(" {} ", theme.sym(Sym::Dot)),
-                theme.fg(Tok::Dim),
-            ));
+            out.push(Span::styled(theme.dot_sep(), theme.fg(Tok::Dim)));
         }
         match segment.split_once(": ") {
             Some((key, value)) if is_key(key) => {
@@ -452,7 +449,7 @@ fn modifiers(style: Style) -> Style {
 
 /// Word-wrap `body` to `room`, the first row led by `first` and every later row by `hang` spaces.
 fn hang_wrap(first: Row, body: Row, hang: usize, room: usize) -> Vec<Row> {
-    let first_w: usize = first.iter().map(|s| text::width(&s.content)).sum();
+    let first_w: usize = text::spans_width(&first);
     let hang = hang.min(room.saturating_sub(1));
     let mut rows = vec![first];
     let mut used = first_w;

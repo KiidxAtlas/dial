@@ -104,6 +104,20 @@ pub fn validate_private_path(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace an entry in a caller-managed store using a synced, owner-only temporary file.
+/// Unlike [`write_private`], the caller owns path validation and size limits. The directory
+/// must exist; publication replaces the directory entry and does not request a directory flush.
+pub fn write_owner_only_entry(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("store entry requires a parent")?;
+    let mut staged = tempfile::Builder::new().make_in(dir, |temp| {
+        platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), temp)
+    })?;
+    staged.write_all(bytes)?;
+    platform_fs::sync_file(staged.as_file())?;
+    publish(staged.as_file(), staged.path(), path, DirectorySync::Skip)
+        .with_context(|| format!("publishing {}", path.display()))
+}
+
 /// Owner-private state larger than this is refused. Callers that can defer work (such as stream
 /// reclamation) check it before publishing, so a refusal never corrupts or latches their state.
 pub const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
@@ -163,7 +177,7 @@ enum DirectorySync {
     Required,
     /// The caller flushes the file and directory later ([`DeferredSync::finish`]).
     Deferred,
-    /// No flush at all ([`write_private_volatile`]).
+    /// Do not sync the directory; the caller decides whether the file needs a flush.
     Skip,
 }
 

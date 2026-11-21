@@ -107,18 +107,6 @@ fn read_text(io: &mut Io<'_>, name: &str) -> Result<String, String> {
     read_input(io, name).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Splits text into lines without their terminating `\n`. Empty text has no lines; a final
-/// unterminated line still counts.
-fn split_lines(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    text.strip_suffix('\n')
-        .unwrap_or(text)
-        .split('\n')
-        .collect()
-}
-
 // ---------------------------------------------------------------------------------------------
 // cut
 // ---------------------------------------------------------------------------------------------
@@ -155,7 +143,7 @@ pub(super) fn cut(io: &mut Io<'_>, args: &[String]) -> i32 {
                 continue;
             }
         };
-        for line in split_lines(&text) {
+        for line in text.split_terminator('\n') {
             if !line.contains(delim) {
                 let _ = writeln!(io.stdout, "{line}");
                 continue;
@@ -666,7 +654,7 @@ pub(super) fn sed(io: &mut Io<'_>, args: &[String]) -> i32 {
     let mut status = 0;
     for input in inputs(files) {
         match read_text(io, input) {
-            Ok(text) => lines.extend(split_lines(&text).into_iter().map(str::to_owned)),
+            Ok(text) => lines.extend(text.split_terminator('\n').map(str::to_owned)),
             Err(message) => status = io.fail(message),
         }
     }
@@ -996,7 +984,7 @@ pub(super) fn sort(io: &mut Io<'_>, args: &[String]) -> i32 {
             Ok(text) => text,
             Err(message) => return io.fail(message),
         };
-        lines.extend(split_lines(&text).into_iter().map(|line| {
+        lines.extend(text.split_terminator('\n').map(|line| {
             let key = if numeric { numeric_key(line) } else { 0.0 };
             (key, line.to_owned())
         }));
@@ -1163,7 +1151,7 @@ pub(super) fn uniq(io: &mut Io<'_>, args: &[String]) -> i32 {
 
     // Runs of adjacent equal lines, with their lengths.
     let mut runs: Vec<(&str, usize)> = Vec::new();
-    for line in split_lines(&text) {
+    for line in text.split_terminator('\n') {
         match runs.last_mut() {
             Some(last) if last.0 == line => last.1 += 1,
             _ => runs.push((line, 1)),

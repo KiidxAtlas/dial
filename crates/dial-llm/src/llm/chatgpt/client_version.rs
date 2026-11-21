@@ -7,7 +7,6 @@ use crate::config::settings_store::write_private;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -98,16 +97,7 @@ fn fetch_latest(url: &str) -> Option<String> {
     if !response.status().is_success() {
         return None;
     }
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(MAX_REGISTRY_JSON + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_REGISTRY_JSON {
-        return None;
-    }
+    let bytes = crate::llm::read_within(response.body_mut().as_reader(), MAX_REGISTRY_JSON)?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     value["version"]
         .as_str()

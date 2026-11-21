@@ -249,15 +249,6 @@ fn installed_dirs(user_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_executable(path: &Path) -> bool {
-    crate::platform::fs::is_executable(path)
-}
-
-/// `path`, or on Windows `path` with its `PATHEXT` suffix (`node_modules/.bin/x` → `x.cmd`).
-fn executable(path: &Path) -> Option<PathBuf> {
-    crate::platform::fs::executable_candidate(path)
-}
-
 /// `*` matches any run of characters, `?` one; used for root markers such as `*.cabal`.
 fn wildcard(pattern: &str, name: &str) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
@@ -340,7 +331,7 @@ fn find_program(
         } else {
             program.to_owned()
         };
-        return executable(&path);
+        return crate::platform::fs::executable_candidate(&path);
     }
     let mut seen: Vec<&Path> = Vec::new();
     for root in roots {
@@ -350,7 +341,8 @@ fn find_program(
         seen.push(root);
         for (markers, bin) in LOCAL_BINS {
             if has_markers(root, markers)
-                && let Some(candidate) = executable(&root.join(bin).join(program))
+                && let Some(candidate) =
+                    crate::platform::fs::executable_candidate(&root.join(bin).join(program))
             {
                 return Some(candidate);
             }
@@ -358,7 +350,7 @@ fn find_program(
     }
     let root = roots.first().copied().unwrap_or(ws_root);
     dirs.iter()
-        .filter_map(|dir| executable(&dir.join(program)))
+        .filter_map(|dir| crate::platform::fs::executable_candidate(&dir.join(program)))
         .find_map(|candidate| match pyenv_shim(&candidate, dirs) {
             Some(pyenv) => command_path(&pyenv, &["which", &program.to_string_lossy()], root),
             None => Some(candidate),
@@ -376,7 +368,7 @@ fn pyenv_shim(candidate: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
     std::iter::once(shims.with_file_name("bin"))
         .chain(dirs.iter().cloned())
         .map(|dir| dir.join("pyenv"))
-        .find(|pyenv| is_executable(pyenv))
+        .find(|pyenv| crate::platform::fs::is_executable(pyenv))
         .filter(|_| shims.with_file_name("versions").is_dir())
 }
 
@@ -392,7 +384,8 @@ fn command_path(program: &Path, args: &[&str], root: &Path) -> Option<PathBuf> {
         .output()
         .ok()?;
     let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
-    (output.status.success() && path.is_absolute() && is_executable(&path)).then_some(path)
+    (output.status.success() && path.is_absolute() && crate::platform::fs::is_executable(&path))
+        .then_some(path)
 }
 
 /// Components rustup manages but may not expose as a proxy on `PATH` (Homebrew's `rustup`
@@ -404,7 +397,7 @@ fn toolchain_program(program: &Path, root: &Path, dirs: &[PathBuf]) -> Option<Pa
     }
     let rustup = dirs
         .iter()
-        .find_map(|dir| executable(&dir.join("rustup")))?;
+        .find_map(|dir| crate::platform::fs::executable_candidate(&dir.join("rustup")))?;
     command_path(&rustup, &["which", "rust-analyzer"], root)
 }
 

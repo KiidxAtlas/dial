@@ -14,8 +14,8 @@ use super::{
     GUTTER, Rows, Tool, ToolState, VERB_W, fit_facts, frame::chip, gutter_span, phase_glyph,
 };
 use crate::ui::{
-    markdown::truncate_spans,
     text,
+    text::truncate_spans,
     theme::{Sym, Tok},
     transcript::{TranscriptCtx, ellipsis, fitted},
 };
@@ -100,7 +100,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
         ),
         state => phase_glyph(state, ctx),
     };
-    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let sep = theme.dot_sep();
     let mut facts = Vec::new();
     match (receipts.len(), queued, refused) {
         (0, _, _) => {}
@@ -129,7 +129,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
         format!("{arrow} {to}")
     };
     let lead = gutter_span(glyph, glyph_style);
-    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
+    let lead_w: usize = text::spans_width(&lead);
     let (facts_text, room) = fit_facts(facts, w, lead_w + VERB_W + 1, text::width(&target), &sep);
     let mut head = lead;
     head.push(Span::styled(
@@ -142,7 +142,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
         theme.fg(Tok::Muted),
     ));
     if !facts_text.is_empty() {
-        let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+        let used: usize = text::spans_width(&head);
         let right_w = text::width(&facts_text);
         head.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),

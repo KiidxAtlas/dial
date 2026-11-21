@@ -65,7 +65,8 @@ pub fn resolve(mode: Option<&str>, no_ui: bool) -> Result<Option<Resolved>, Stri
     Ok(resolved)
 }
 
-/// Compatibility spellings of approval policies, shared by parsing and CLI choices.
+/// Compatibility spellings of approval policies, shared by parsing and CLI choices. `yolo` keeps its
+/// long-standing meaning (Full auto); the YOLO mode is chosen with `--approval yolo`.
 pub const APPROVAL_ALIASES: &[(&str, &str)] =
     &[("always-ask", "ask"), ("write", "write"), ("yolo", "auto")];
 

@@ -75,6 +75,7 @@ while True:
  if rmode=='delayed': time.sleep(0.3)
  body={'seq':1,'type':'response','request_seq':req['seq'],'command':cmd,'success':True,'body':{'received':cmd,'args':req.get('arguments',{})}}
  if cmd=='initialize': body['body'].update(json.loads(os.environ.get('DAP_FAKE_CAPS','{}')))
+ if cmd=='readMemory': body['body']={'address':'0x1000','data':__import__('base64').b64encode(b'dial').decode(),'args':req.get('arguments',{})}
  if rmode=='reject':
   body['success']=False; body['message']='restart refused'
  if cmd=='restart': restarted=True
@@ -664,4 +665,131 @@ fn unanswered_restart_times_out_and_cancellation_interrupts_it() {
     setter.join().unwrap();
     assert!(restarted.is_error, "{}", restarted.text);
     assert!(restarted.text.contains("cancelled"), "{}", restarted.text);
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_and_disassembly_reach_the_wire_when_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let caps = json!({"supportsReadMemoryRequest": true, "supportsDisassembleRequest": true});
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter_with_caps(dir.path(), &caps))]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+
+    let memory = tool.call(
+        &ctx,
+        &json!({"action":"readMemory","memoryReference":"0x1000","count":4,"offset":0}),
+    );
+    assert!(!memory.is_error, "{}", memory.text);
+    let memory: Value = serde_json::from_str(&memory.text).unwrap();
+    assert_eq!(
+        memory["args"],
+        json!({"memoryReference":"0x1000","count":4,"offset":0})
+    );
+    assert_eq!(memory["bytes"], 4);
+    assert!(memory.get("data").is_none());
+    assert!(
+        memory["hex"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("0x0000000000001000  64 69 61 6c"),
+        "{memory}"
+    );
+
+    let code = tool.call(
+        &ctx,
+        &json!({"action":"disassemble","memoryReference":"0x1000","instructionCount":3,"resolveSymbols":true}),
+    );
+    assert!(!code.is_error, "{}", code.text);
+    let code: Value = serde_json::from_str(&code.text).unwrap();
+    assert_eq!(code["received"], "disassemble");
+    assert_eq!(
+        code["args"],
+        json!({"memoryReference":"0x1000","instructionCount":3,"resolveSymbols":true})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_requests_refuse_unadvertised_capabilities_and_bad_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter(dir.path(), "valid"))]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+
+    let invalid = tool.call(&ctx, &json!({"action":"readMemory","count":4}));
+    assert!(invalid.is_error && invalid.text.contains("memoryReference is required"));
+    let listed: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"sessions"})).text).unwrap();
+    assert_eq!(listed["count"], 0, "invalid arguments start no adapter");
+
+    for (args, expected) in [
+        (
+            json!({"action":"readMemory","memoryReference":"0x10","count":4}),
+            "supportsReadMemoryRequest is not advertised",
+        ),
+        (
+            json!({"action":"disassemble","memoryReference":"0x10","instructionCount":4}),
+            "supportsDisassembleRequest is not advertised",
+        ),
+    ] {
+        let output = tool.call(&ctx, &args);
+        assert!(output.is_error, "{args}: {}", output.text);
+        assert!(output.text.contains(expected), "{args}: {}", output.text);
+    }
+    let status: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+    assert_eq!(status["active"], true, "a refusal keeps the session");
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_lists_open_sessions_across_tools_and_forks() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter(dir.path(), "valid"))]);
+    let all = tools(&configs);
+    let pinned = pick(all.clone(), "dap_fake");
+    let selector = pick(all, "dap");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+
+    let empty: Value =
+        serde_json::from_str(&selector.call(&ctx, &json!({"action":"sessions"})).text).unwrap();
+    assert_eq!(empty, json!({"count":0,"sessions":[]}));
+
+    let launched = pinned.call(&ctx, &json!({"action":"launch","program":"program"}));
+    assert!(!launched.is_error, "{}", launched.text);
+    let listed: Value =
+        serde_json::from_str(&selector.call(&ctx, &json!({"action":"sessions"})).text).unwrap();
+    assert_eq!(listed["count"], 1, "{listed}");
+    let entry = &listed["sessions"][0];
+    assert_eq!(entry["tool"], "dap_fake");
+    assert_eq!(entry["adapter"], "fake");
+    assert_eq!(entry["target"]["request"], "launch");
+    assert!(
+        entry["target"]["program"]
+            .as_str()
+            .unwrap()
+            .ends_with("program")
+    );
+
+    let fork = pinned.fork_session().unwrap();
+    let from_fork: Value =
+        serde_json::from_str(&fork.call(&ctx, &json!({"action":"sessions"})).text).unwrap();
+    assert_eq!(
+        from_fork["count"], 1,
+        "forks share the registry: {from_fork}"
+    );
+
+    let closed = pinned.call(&ctx, &json!({"action":"disconnect"}));
+    assert!(!closed.is_error, "{}", closed.text);
+    let after: Value =
+        serde_json::from_str(&selector.call(&ctx, &json!({"action":"sessions"})).text).unwrap();
+    assert_eq!(after["count"], 0, "{after}");
 }

@@ -5,6 +5,8 @@ use ast_grep_language::SupportLang;
 use serde_json::{Value, json};
 use std::path::Path;
 
+mod delimiter;
+
 /// ast-grep maps `.zsh` (and zsh rc names) to the Bash grammar, which reports false parse errors on
 /// zsh-only syntax. No zsh grammar is linked, so zsh is reported unsupported and never blocks anything.
 fn language(path: &Path) -> Option<SupportLang> {
@@ -20,21 +22,48 @@ fn is_zsh(path: &Path) -> bool {
             Some(".zshrc" | "zshrc" | ".zprofile" | ".zlogin")
         )
 }
-pub fn report(path: &Path, content: &str) -> Value {
-    if content.len() > 4 * 1024 * 1024 {
-        return json!({"supported":false,"reason":"source exceeds parser budget"});
-    }
-    let Some(lang) = language(path) else {
-        return json!({"supported":false,"reason":"no syntax parser for this extension"});
-    };
-    match error_positions(lang, content) {
-        Some(positions) => {
-            let errors: Vec<_> = positions.into_iter().take(33)
-                .map(|(line, column, missing)| json!({"line":line,"column":column,"missing":missing})).collect();
-            json!({"supported":true,"language":lang.to_string(),"errors":errors,"valid":errors.is_empty()})
+type Tree = AstGrep<ast_grep_core::tree_sitter::StrDoc<SupportLang>>;
+type Position = (usize, usize, bool);
+
+struct Parsed {
+    lang: SupportLang,
+    tree: Tree,
+    errors: Vec<Position>,
+}
+
+impl Parsed {
+    fn parse(path: &Path, content: &str) -> Result<Self, &'static str> {
+        if content.len() > 4 * 1024 * 1024 {
+            return Err("source exceeds parser budget");
         }
-        None => json!({"supported":false,"reason":"parser unavailable"}),
+        let lang = language(path).ok_or("no syntax parser for this extension")?;
+        #[cfg(test)]
+        tests::PARSES.set(tests::PARSES.get() + 1);
+        let tree = AstGrep::try_new(content, lang).map_err(|_| "parser unavailable")?;
+        let errors = error_positions(lang, &tree);
+        Ok(Self { lang, tree, errors })
     }
+
+    fn report(&self) -> Value {
+        let errors: Vec<_> = self
+            .errors
+            .iter()
+            .take(33)
+            .map(|(line, column, missing)| json!({"line":line,"column":column,"missing":missing}))
+            .collect();
+        json!({"supported":true,"language":self.lang.to_string(),"errors":errors,"valid":errors.is_empty()})
+    }
+
+    fn would_refuse(&self, prior: &Self) -> bool {
+        high_confidence(self.lang) && self.errors.len() > prior.errors.len()
+    }
+}
+
+pub fn report(path: &Path, content: &str) -> Value {
+    Parsed::parse(path, content).map_or_else(
+        |reason| json!({"supported":false,"reason":reason}),
+        |p| p.report(),
+    )
 }
 
 /// Declaration kinds whose header (everything before the body) is a call or construction contract.
@@ -89,20 +118,23 @@ pub fn signatures(path: &Path, content: &str) -> Option<Vec<(String, String)>> {
 }
 
 pub fn advisory(path: &Path, before: &str, proposed: &str) -> Option<String> {
-    let after = report(path, proposed);
-    let new = after["errors"].as_array().map_or(0, Vec::len);
-    if new == 0 {
+    let after = Parsed::parse(path, proposed).ok()?;
+    if after.errors.is_empty() {
         return None;
     }
-    let old = report(path, before)["errors"]
-        .as_array()
-        .map_or(0, Vec::len);
+    advisory_from(path, Parsed::parse(path, before).ok().as_ref(), &after)
+}
+
+fn advisory_from(path: &Path, prior: Option<&Parsed>, after: &Parsed) -> Option<String> {
+    let &(line, column, missing) = after.errors.first()?;
+    let new = after.errors.len().min(33);
+    let old = prior.map_or(0, |p| p.errors.len().min(33));
     Some(format!(
         "Syntax advisory for {}: {} parser errors (previously {}). First error: {}. The change was not blocked; the parser may not support this dialect. Use the language's own checks. This is not a type or behavioral check.",
         path.display(),
         new,
         old,
-        after["errors"][0]
+        json!({"line":line,"column":column,"missing":missing})
     ))
 }
 /// Grammars whose tree-sitter parsers are trusted enough to refuse an edit that adds errors.
@@ -118,28 +150,25 @@ fn high_confidence(lang: SupportLang) -> bool {
     )
 }
 /// Error/missing node positions (1-based line, column, missing), bounded so huge broken files stay cheap.
-fn error_positions(lang: SupportLang, content: &str) -> Option<Vec<(usize, usize, bool)>> {
-    let tree = AstGrep::try_new(content, lang).ok()?;
-    Some(
-        tree.root()
-            .dfs()
-            .filter(|node| {
-                node.is_error()
-                    || node.is_missing()
-                    || (lang == SupportLang::Python
-                        && node.kind() == "string_content"
-                        && node.parent().is_some_and(|parent| {
-                            parent.kind() == "string"
-                                && python_short_string_newline(&node.text(), &parent.text())
-                        }))
-            })
-            .take(4096)
-            .map(|node| {
-                let pos = node.start_pos();
-                (pos.line() + 1, pos.column(&node) + 1, node.is_missing())
-            })
-            .collect(),
-    )
+fn error_positions(lang: SupportLang, tree: &Tree) -> Vec<Position> {
+    tree.root()
+        .dfs()
+        .filter(|node| {
+            node.is_error()
+                || node.is_missing()
+                || (lang == SupportLang::Python
+                    && node.kind() == "string_content"
+                    && node.parent().is_some_and(|parent| {
+                        parent.kind() == "string"
+                            && python_short_string_newline(&node.text(), &parent.text())
+                    }))
+        })
+        .take(4096)
+        .map(|node| {
+            let pos = node.start_pos();
+            (pos.line() + 1, pos.column(&node) + 1, node.is_missing())
+        })
+        .collect()
 }
 
 /// The Python tree-sitter grammar accepts unescaped newlines in short string content.
@@ -173,18 +202,27 @@ fn python_short_string_newline(content: &str, string: &str) -> bool {
 /// The refusal for an edit that raises the parser error count of a high-confidence grammar, naming
 /// the first new error with a few lines of the would-be result. `None` lets the edit proceed.
 pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Option<String> {
-    if after.len() > 4 * 1024 * 1024 || before.len() > 4 * 1024 * 1024 {
+    if before.len() > 4 * 1024 * 1024 || !language(path).is_some_and(high_confidence) {
         return None;
     }
-    let lang = language(path).filter(|lang| high_confidence(*lang))?;
-    let new = error_positions(lang, after)?;
-    if new.is_empty() {
+    let new = Parsed::parse(path, after).ok()?;
+    if new.errors.is_empty() {
         return None;
     }
-    let old = error_positions(lang, before)?;
-    if new.len() <= old.len() {
-        return None;
-    }
+    let old = Parsed::parse(path, before).ok()?;
+    new.would_refuse(&old)
+        .then(|| refusal_message(rel, before, after, &old, &new))
+}
+
+fn refusal_message(
+    rel: &str,
+    before: &str,
+    after: &str,
+    prior: &Parsed,
+    proposed: &Parsed,
+) -> String {
+    let lang = proposed.lang;
+    let (old, new) = (&prior.errors, &proposed.errors);
     let old_lines: Vec<&str> = before.lines().collect();
     let new_lines: Vec<&str> = after.lines().collect();
     let prefix = old_lines
@@ -211,7 +249,7 @@ pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Opti
         .join("\n");
     let changed_old = old_lines.len().saturating_sub(prefix + suffix);
     let changed_new = &new_lines[prefix..new_lines.len().saturating_sub(suffix).max(prefix)];
-    Some(format!(
+    format!(
         "Edit refused: it would add {lang} syntax errors to {rel} ({} before, {} after); nothing was written. First new error at {line}:{column} ({}). Would-be result:\n{window}\n{} {} Earlier reads and tags stay valid. If the code is valid, retry with allow_syntax_errors: true.",
         old.len(),
         new.len(),
@@ -222,7 +260,7 @@ pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Opti
         },
         not_landed(before, changed_new),
         refusal_advice(old_lines.len(), changed_old, changed_new.len()),
-    ))
+    )
 }
 
 /// Lines an edit may change before a refusal suggests splitting it.
@@ -473,11 +511,8 @@ pub(crate) struct PreparedSource {
     pub warnings: Vec<String>,
     pub blackbox: Option<Value>,
 }
-/// Repair is a real controller/model callback; it cannot request tools or expand mutation targets.
-/// Failed/invalid repairs retain the requested edit with an explicit warning.
-/// Repair is a real controller/model callback; it cannot request tools or expand mutation targets.
-/// Failed/invalid repairs retain the requested edit with an explicit warning. With `refuse`, a
-/// result that still adds parser errors is an error before anything is committed.
+/// Validate local and explicitly enabled coach repairs before anything is committed.
+/// On abstention the original syntax refusal/advisory policy remains authoritative.
 pub(crate) fn prepare_edit(
     ws: &crate::tools::Workspace,
     path: &Path,
@@ -488,11 +523,6 @@ pub(crate) fn prepare_edit(
     refuse: bool,
 ) -> Result<PreparedSource, String> {
     let settings = &ws.edit_settings;
-    if settings.auto_repair.enabled && repair.is_none() && ws.edit_repair.0.is_none() {
-        return Err(
-            "edit.auto_repair.enabled requires a current-owner model repair callback".into(),
-        );
-    }
     if settings.blackbox.enabled && ws.edit_blackbox_dir.is_none() {
         return Err("edit.blackbox.enabled requires a private session recording directory".into());
     }
@@ -501,22 +531,31 @@ pub(crate) fn prepare_edit(
         warnings: Vec::new(),
         blackbox: None,
     };
-    if !settings.auto_repair.enabled
-        && !settings.blackbox.enabled
-        && !ws.syntax_guard_enabled()
-        && !refuse
-    {
+    if !settings.blackbox.enabled && !ws.syntax_guard_enabled() && !refuse {
         return Ok(output);
     }
-    let prior = report(path, before);
-    let after = report(path, proposed);
-    let regression =
-        prior["valid"] == true && after["supported"] == true && after["valid"] == false;
-    if regression && settings.blackbox.enabled {
-        output.blackbox =
-            Some(json!({"path":ws.rel(path),"before":before,"after":proposed,"diagnostics":after}));
+    // Most proposals are valid. Neither the prior tree nor any repair work is needed then.
+    let Ok(parsed) = Parsed::parse(path, proposed) else {
+        return Ok(output);
+    };
+    if parsed.errors.is_empty() {
+        return Ok(output);
     }
+    let prior = Parsed::parse(path, before).ok();
+    let regression = prior.as_ref().is_some_and(|p| p.errors.is_empty());
+    if regression && settings.blackbox.enabled {
+        output.blackbox = Some(
+            json!({"path":ws.rel(path),"before":before,"after":proposed,"diagnostics":parsed.report()}),
+        );
+    }
+    let Some(prior) = prior.as_ref().filter(|p| refuse && parsed.would_refuse(p)) else {
+        output
+            .warnings
+            .extend(advisory_from(path, prior.as_ref(), &parsed));
+        return Ok(output);
+    };
     if regression && settings.auto_repair.enabled {
+        let after = parsed.report();
         let allowed = settings.enforce_seen_lines.then(|| {
             proposed_seen.map_or_else(
                 || {
@@ -531,35 +570,57 @@ pub(crate) fn prepare_edit(
                 <[bool]>::to_vec,
             )
         });
-        let mut diagnostics = after.clone();
-        if let Some(flags) = &allowed {
-            diagnostics["repair_allowed_lines"] = json!(super::hashline::ranges_from_flags(flags));
-        }
-        let request = crate::tools::EditRepairRequest {
-            path: ws.rel(path),
-            before: before.to_owned(),
-            proposed: proposed.to_owned(),
-            diagnostics,
+        let valid = |fixed: &str| {
+            fixed.len() <= super::edit_transaction::MAX_FILE
+                && bounded_repair(proposed, fixed, &after)
+                && allowed
+                    .as_ref()
+                    .is_none_or(|flags| repair_seen(proposed, fixed, flags))
         };
-        let result = match repair {
-            Some(callback) => callback(&request),
-            None => ws.edit_repair.0.as_ref().unwrap().repair(&request),
-        };
-        match result {
-            Ok(fixed) if fixed.len()<=super::edit_transaction::MAX_FILE && report(path,&fixed)["valid"]==true && bounded_repair(proposed,&fixed,&after)&&allowed.as_ref().is_none_or(|flags|repair_seen(proposed,&fixed,flags))=>{
-                output.text=fixed;output.warnings.push(format!("Auto-repair fixed the parse regression in {} (validated by reparse; not a type or behavior check)",ws.rel(path)));
-            },
-            Ok(_)=>output.warnings.push(format!("Auto-repair for {} was rejected: source was oversized, still invalid, changed unseen source, or changed outside the bounded parser-error region; requested edit retained",ws.rel(path))),
-            Err(error)=>output.warnings.push(format!("Auto-repair for {} failed: {error}; requested edit retained",ws.rel(path))),
+        if let Some(fixed) =
+            delimiter::restore(path, before, proposed, prior).filter(|fixed| valid(fixed))
+        {
+            output.text = fixed;
+            return Ok(output);
+        }
+        if settings.auto_repair.coach {
+            let mut diagnostics = after.clone();
+            if let Some(flags) = &allowed {
+                diagnostics["repair_allowed_lines"] =
+                    json!(super::hashline::ranges_from_flags(flags));
+            }
+            let request = crate::tools::EditRepairRequest {
+                path: ws.rel(path),
+                before: before.to_owned(),
+                proposed: proposed.to_owned(),
+                diagnostics,
+            };
+            let result = match repair {
+                Some(callback) => callback(&request),
+                None => ws
+                    .edit_repair
+                    .0
+                    .as_ref()
+                    .ok_or_else(|| "no current-owner coach callback".to_owned())
+                    .and_then(|callback| callback.repair(&request)),
+            };
+            if let Ok(fixed) = result
+                && valid(&fixed)
+                && Parsed::parse(path, &fixed).is_ok_and(|p| p.errors.is_empty())
+            {
+                output.text = fixed;
+                output.warnings.push(format!("Auto-repair fixed the parse regression in {} (validated by reparse; not a type or behavior check)", ws.rel(path)));
+                return Ok(output);
+            }
         }
     }
-    if refuse && let Some(refused) = refusal(path, &ws.rel(path), before, &output.text) {
-        return Err(refused);
-    }
-    if let Some(note) = advisory(path, before, &output.text) {
-        output.warnings.push(note);
-    }
-    Ok(output)
+    Err(refusal_message(
+        &ws.rel(path),
+        before,
+        proposed,
+        prior,
+        &parsed,
+    ))
 }
 fn bounded_repair(proposed: &str, fixed: &str, diagnostics: &Value) -> bool {
     let old: Vec<_> = proposed.lines().collect();

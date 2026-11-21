@@ -7,12 +7,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub(crate) const MAX_FILE: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_BYTES: usize = 32 * 1024 * 1024;
+use super::{Change, MAX_FILE, Original, matches};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Identity {
+pub(super) struct Identity {
     file: crate::platform::FileIdentity,
     len: u64,
     modified: std::time::SystemTime,
@@ -27,26 +26,11 @@ impl Identity {
             mode: crate::platform::fs::mode(meta),
         })
     }
-}
-#[derive(Clone, Debug)]
-pub(crate) struct Original {
-    pub text: String,
-    identity: Identity,
-    permissions: fs::Permissions,
-}
-#[derive(Clone, Debug)]
-pub(crate) struct Change {
-    pub path: PathBuf,
-    pub before: Option<Original>,
-    pub after: Option<String>,
-    pub report: Option<String>,
-    pub seen_after: Option<Vec<bool>>,
-    pub authored_whole: bool,
-    pub projection: Option<crate::tools::edit::edit_source::Projection>,
-    permissions: Option<fs::Permissions>,
-}
-pub(crate) fn inherit_permissions(change: &mut Change, original: &Original) {
-    change.permissions = Some(original.permissions.clone());
+
+    /// Windows identities carry no ctime, so the captured comparison is the full one.
+    pub(super) fn same_captured(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 fn name(path: &Path) -> Result<PathBuf, String> {
@@ -294,56 +278,14 @@ pub(crate) fn open_read(ws: &Workspace, path: &Path) -> Result<File, String> {
     dir.validate_location(ws, path)?;
     Ok(file)
 }
-pub(crate) fn read(ws: &Workspace, path: &Path) -> Result<Option<Original>, String> {
+pub(super) fn read_local(ws: &Workspace, path: &Path) -> Result<Option<Original>, String> {
     let Some(parent) = path.parent() else {
         return Ok(None);
     };
     if !parent.exists() {
         return Ok(None);
     }
-    let original = Directory::open(ws, path, false, None)?.read(&name(path)?)?;
-    match (original, super::read_bridge(ws, path)) {
-        (Some(mut original), Some(client)) => {
-            original.text = client.read_text(path)?;
-            Ok(Some(original))
-        }
-        (original, _) => Ok(original),
-    }
-}
-impl Change {
-    pub fn load(ws: &Workspace, path: PathBuf, after: Option<String>) -> Result<Self, String> {
-        let before = read(ws, &path)?;
-        let permissions = before.as_ref().map(|x| x.permissions.clone());
-        Ok(Self {
-            path,
-            before,
-            after,
-            report: None,
-            seen_after: None,
-            authored_whole: false,
-            projection: None,
-            permissions,
-        })
-    }
-    pub fn require_text(&self) -> Result<&str, String> {
-        self.before
-            .as_ref()
-            .map(|x| x.text.as_str())
-            .ok_or_else(|| format!("{} does not exist", self.path.display()))
-    }
-    pub fn existing(path: PathBuf, before: Original, after: Option<String>) -> Self {
-        let permissions = Some(before.permissions.clone());
-        Self {
-            path,
-            before: Some(before),
-            after,
-            report: None,
-            seen_after: None,
-            authored_whole: false,
-            projection: None,
-            permissions,
-        }
-    }
+    Directory::open(ws, path, false, None)?.read(&name(path)?)
 }
 struct Staged {
     dir: Directory,
@@ -359,66 +301,7 @@ impl Drop for Staged {
         }
     }
 }
-fn matches(current: &Option<Original>, before: &Option<Original>, captured: bool) -> bool {
-    match (current, before) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.text == b.text
-                && if captured {
-                    a.identity.file == b.identity.file
-                        && a.identity.len == b.identity.len
-                        && a.identity.modified == b.identity.modified
-                        && a.identity.mode == b.identity.mode
-                } else {
-                    a.identity == b.identity
-                }
-        }
-        _ => false,
-    }
-}
 pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, String> {
-    if changes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if changes.len() > 128
-        || changes
-            .iter()
-            .map(|x| {
-                x.before.as_ref().map_or(0, |b| b.text.len())
-                    + x.after.as_ref().map_or(0, String::len)
-            })
-            .sum::<usize>()
-            > MAX_BYTES
-    {
-        return Err("edit transaction exceeds 128 targets or 32 MiB".into());
-    }
-    let mut unique = std::collections::BTreeSet::new();
-    for change in changes {
-        if !unique.insert(&change.path) {
-            return Err(format!("duplicate edit target {}", ws.rel(&change.path)));
-        }
-        if change.after.as_ref().is_some_and(|x| x.len() > MAX_FILE) {
-            return Err("edited file exceeds 4 MiB".into());
-        }
-        if ws.resolve(&ws.rel(&change.path))? != change.path {
-            return Err("edit target physical alias changed".into());
-        }
-        if !matches(&read(ws, &change.path)?, &change.before, false) {
-            return Err(format!(
-                "{} changed before commit; re-read it",
-                ws.rel(&change.path)
-            ));
-        }
-        if change.after.is_some() {
-            ws.observe_write(&change.path)?;
-        } else {
-            ws.observe_delete(&change.path)?;
-        }
-    }
-    // Plain text in a workspace root goes to the editor client: no local stage or rename.
-    if let Some(done) = super::client_commit(ws, changes) {
-        return done;
-    }
     let mut parents = ParentCleanup::default();
     let mut staged = Vec::with_capacity(changes.len());
     for change in changes {

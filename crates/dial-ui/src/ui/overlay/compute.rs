@@ -1,13 +1,14 @@
 //! Live compute, organized by models, jobs, services and tools.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{Axis, arrows, filled, fit, panel, typed_char},
+    panel_keys::{Edge, list_move},
+    widgets::{Axis, arrows, filled, fit, panel, section_rule, typed_char},
 };
 use crate::ui::{
     chrome::{self, Section},
     keys::{Action, Keymap},
     text,
-    theme::{Sym, Theme, Tok},
+    theme::{Sym, Tok},
 };
 use crossterm::event::Event;
 use ratatui::{
@@ -36,38 +37,6 @@ enum ListRow {
     Text(String, Tok),
 }
 
-/// The tab strip in the shared tab style ([`chrome::tab_style`]). ASCII keeps `[tab]`.
-pub(super) fn tab_line(theme: &Theme, tabs: &[&str], active: usize, width: usize) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, tab) in tabs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let name = if i == active && theme.ascii() {
-            format!("[{tab}]")
-        } else {
-            (*tab).to_owned()
-        };
-        spans.push(Span::styled(name, chrome::tab_style(theme, i == active)));
-    }
-    Line::from(fit(spans, width))
-}
-
-/// Section heading of the item list: ` ── TOOLS ───────`, label in secondary, rule muted.
-pub(super) fn section_heading(theme: &Theme, name: &str, width: usize) -> Line<'static> {
-    let rule = theme.sym(Sym::BoxH);
-    let head = format!(" {rule}{rule} ");
-    let title = chrome::label(theme, name);
-    let pad = width.saturating_sub(text::width(&head) + text::width(&title.content) + 1);
-    Line::from(fit(
-        vec![
-            Span::styled(head, theme.fg(Tok::BorderMuted)),
-            title,
-            Span::styled(format!(" {}", rule.repeat(pad)), theme.fg(Tok::BorderMuted)),
-        ],
-        width,
-    ))
-}
 fn memory(value: &Value) -> String {
     let bytes = value.as_u64().unwrap_or(0) as f64;
     if bytes >= 1_000_000_000.0 {
@@ -225,7 +194,7 @@ impl ComputeOverlay {
                 if idle > 0 {
                     items.push(Item {
                         section,
-                        label: format!("{idle} idle job{}", if idle == 1 { "" } else { "s" }),
+                        label: text::counted(idle, "idle job"),
                         active: false,
                         target: Target::Summary,
                     });
@@ -332,14 +301,8 @@ impl ComputeOverlay {
                 .clone()
                 .or_else(|| items.get(self.cursor).map(|item| item.target.clone()));
             self.confirm = target.as_ref().and_then(Self::request);
-        } else if keys.matches(Action::SelectUp, key) {
-            self.cursor = self.cursor.saturating_sub(1);
-        } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
-        } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(10);
-        } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + 10).min(count.saturating_sub(1));
+        } else if let Some(cursor) = list_move(keys, key, self.cursor, count, 10, Edge::Stop) {
+            self.cursor = cursor;
         } else if key.code == crossterm::event::KeyCode::Home && key.modifiers.is_empty() {
             self.cursor = 0;
         } else if key.code == crossterm::event::KeyCode::End && key.modifiers.is_empty() {
@@ -657,7 +620,7 @@ impl ComputeOverlay {
                     }
                 }
                 let header_limit = h.saturating_sub(5);
-                let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, &TABS, self.tab, w)];
+                let mut output = vec![super::widgets::panel_tabs(ctx.theme, &TABS, self.tab, w)];
                 let mut x = 0;
                 for span in &output[0].spans {
                     let cells = text::width(&span.content);
@@ -687,7 +650,7 @@ impl ComputeOverlay {
                     }
                     let selected = self.menu.is_none() && i == selected_row;
                     output.push(match row {
-                        ListRow::Heading(name) => section_heading(ctx.theme, &name, w),
+                        ListRow::Heading(name) => section_rule(ctx.theme, &name, w),
                         // Process rows keep their status color under the selection fill: the
                         // green of a running process is the row's meaning, not decoration.
                         ListRow::Text(line, token) => filled(

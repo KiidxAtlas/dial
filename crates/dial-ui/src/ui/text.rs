@@ -1,6 +1,5 @@
 //! Terminal-safe text primitives shared by every UI component. Everything is measured in terminal
 //! cells (extended grapheme clusters, East Asian width), never bytes or `char`s.
-#[cfg(test)]
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -107,7 +106,12 @@ pub fn width(text: &str) -> usize {
 }
 
 pub fn line_width(line: &Line<'_>) -> usize {
-    line.spans.iter().map(|s| width(&s.content)).sum()
+    spans_width(&line.spans)
+}
+
+/// Cells taken by a run of styled spans.
+pub fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| width(&s.content)).sum()
 }
 
 /// Cell-safe clipping: never bisect a wide or combining grapheme.
@@ -119,6 +123,47 @@ pub fn clip(text: &str, max: usize) -> String {
             used <= max
         })
         .collect()
+}
+
+/// Clip styled spans to `max` cells. When something is cut, the last cells become `ellipsis` (pass
+/// `""` for a plain clip), drawn in the style of the last span that kept text. Never splits a
+/// grapheme; spans that already fit come back unchanged.
+pub fn truncate_spans(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'static>> {
+    if spans_width(&spans) <= max {
+        return spans;
+    }
+    let mark_w = width(ellipsis);
+    let (room, mark) = if mark_w <= max {
+        (max - mark_w, ellipsis)
+    } else {
+        (max, "")
+    };
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut kept = String::new();
+        let mut cut = false;
+        for grapheme in span.content.graphemes(true) {
+            let w = width(grapheme);
+            if used + w > room {
+                cut = true;
+                break;
+            }
+            kept.push_str(grapheme);
+            used += w;
+        }
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, span.style));
+        }
+        if cut {
+            break;
+        }
+    }
+    if !mark.is_empty() {
+        let style = out.last().map_or(Style::default(), |span| span.style);
+        out.push(Span::styled(mark.to_owned(), style));
+    }
+    out
 }
 
 /// Remove the last grapheme cluster, the unit a user sees as one character (an accented letter,
@@ -133,12 +178,17 @@ pub fn pop_grapheme(text: &mut String) -> bool {
     }
 }
 
+/// The mark that ends a cut row: `…`, or `...` on ASCII terminals.
+fn ellipsis_mark(ascii: bool) -> &'static str {
+    if ascii { "..." } else { "…" }
+}
+
 /// Clip to `max` cells, ending in `…` (or `...` when `ascii`) if anything was cut.
 pub fn ellipsize(text: &str, max: usize, ascii: bool) -> String {
     if width(text) <= max {
         return text.to_owned();
     }
-    let mark = if ascii { "..." } else { "…" };
+    let mark = ellipsis_mark(ascii);
     if max < width(mark) {
         return clip(mark, max);
     }
@@ -153,7 +203,7 @@ pub fn ellipsize_words(text: &str, max: usize, ascii: bool, force: bool) -> Stri
     if !force && width(text) <= max {
         return text.to_owned();
     }
-    let mark = if ascii { "..." } else { "…" };
+    let mark = ellipsis_mark(ascii);
     if max < width(mark) {
         return clip(mark, max);
     }
@@ -175,7 +225,7 @@ pub fn ellipsize_start(text: &str, max: usize, ascii: bool) -> String {
     if width(text) <= max {
         return text.to_owned();
     }
-    let mark = if ascii { "..." } else { "…" };
+    let mark = ellipsis_mark(ascii);
     if max < width(mark) {
         return clip(mark, max);
     }
@@ -359,6 +409,33 @@ pub fn compact_count(n: u64) -> String {
     }
 }
 
+/// The plural suffix of a counted noun: `""` for one, `"s"` otherwise (`1 session`, `2 sessions`).
+pub fn plural_s<N: From<u8> + PartialEq>(n: N) -> &'static str {
+    if n == N::from(1) { "" } else { "s" }
+}
+
+/// A count with its noun, pluralised by `plural_s`: `1 file`, `3 files`, `0 files`.
+pub fn counted<N: From<u8> + PartialEq + Copy + std::fmt::Display>(n: N, noun: &str) -> String {
+    format!("{n} {noun}{}", plural_s(n))
+}
+
+/// A count whose plural is not a plain `s` on the noun: each form is given explicitly, such as the
+/// invariant `failed` (`1 failed` / `2 failed`) or `child` / `children`.
+pub fn count_with(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Compact elapsed time in one unit, floored: `45s`, `12m`, `3h`, `2d`. Callers add a suffix such as
+/// `ago` when the context needs one.
+pub fn age_compact(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 /// Observed USD in the one `$` form of the status line, worker rows and cost notices: cents
 /// (`$0.14`, `$12.35`), with four decimals only below a cent (`$0.0041`) so small local spend still
 /// reads. Zero (or unknown garbage) is `$0.00`; a positive amount that rounds to nothing is
@@ -384,10 +461,7 @@ pub fn justify(
     total: usize,
     fill: Style,
 ) -> Vec<Span<'static>> {
-    let (lw, rw): (usize, usize) = (
-        left.iter().map(|s| width(&s.content)).sum(),
-        right.iter().map(|s| width(&s.content)).sum(),
-    );
+    let (lw, rw) = (spans_width(&left), spans_width(&right));
     if lw + rw < total {
         let mut out = left;
         out.push(Span::styled(" ".repeat(total - lw - rw), fill));
@@ -395,22 +469,8 @@ pub fn justify(
         return out;
     }
     let room = total.saturating_sub(rw + 1);
-    let mut out = Vec::new();
-    let mut used = 0;
-    for span in left {
-        let w = width(&span.content);
-        if used + w <= room {
-            used += w;
-            out.push(span);
-            continue;
-        }
-        let keep = clip(&span.content, room - used);
-        used += width(&keep);
-        if !keep.is_empty() {
-            out.push(Span::styled(keep, span.style));
-        }
-        break;
-    }
+    let mut out = truncate_spans(left, room, "");
+    let used = spans_width(&out);
     out.push(Span::styled(
         " ".repeat(total.saturating_sub(used + rw)),
         fill,

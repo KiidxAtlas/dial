@@ -329,11 +329,38 @@ fn chat_request_encodes_history_tools_and_routing() {
         &session,
         "cascade-1",
         "scope",
-        "swe-1-6",
+        ("swe-1-6", None),
         None,
     )
     .unwrap();
     let fields = Fields::parse(&encoded.0).unwrap();
+    let config = fields.message(8).unwrap().unwrap();
+    assert_eq!(config.uint(2), 1000);
+    assert_eq!(config.fixed64_f64(5), 0.4);
+    let mut profile = ModelProfile::minimal("devin", "swe-1-6");
+    profile.capabilities.temperature = false;
+    profile.inherit_output_limit = true;
+    let inherited = chat_request(
+        "swe-1-6",
+        &chat,
+        &session,
+        "cascade-1",
+        "scope",
+        ("swe-1-6", None),
+        Some(&profile),
+    )
+    .unwrap();
+    let config = Fields::parse(&inherited.0)
+        .unwrap()
+        .message(8)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !config
+            .0
+            .iter()
+            .any(|(field, _)| matches!(field, 2 | 5 | 6 | 7 | 8))
+    );
     assert_eq!(fields.string(2), "be terse");
     assert_eq!(fields.uint(7), REQUEST_TYPE_CASCADE);
     assert_eq!(fields.string(16), "cascade-1");

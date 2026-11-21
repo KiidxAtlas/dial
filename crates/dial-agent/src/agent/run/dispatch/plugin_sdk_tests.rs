@@ -6,10 +6,8 @@ use super::*;
 use crate::agent::safety::hooks;
 use std::process::Command;
 
-fn generated_config() -> Option<Config> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let example = root.join("sdk/python/examples/word_tools.py");
-    let output = match Command::new("python3").arg(&example).arg("config").output() {
+fn plugin_config(example: &Path) -> Option<Config> {
+    let output = match Command::new("python3").arg(example).arg("config").output() {
         Ok(output) => output,
         Err(error) => {
             eprintln!("skipping: python3 is unavailable ({error})");
@@ -25,6 +23,34 @@ fn generated_config() -> Option<Config> {
     let config: Config = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     config.validate().unwrap();
     Some(config)
+}
+
+fn generated_config() -> Option<Config> {
+    plugin_config(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/python/examples/word_tools.py"),
+    )
+}
+
+#[test]
+fn sdk_compaction_hook_supplies_attributed_data_not_instructions() {
+    let Some(config) = plugin_config(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/python/tests/fixtures/compact.py"),
+    ) else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let note = hooks::gate_noted(
+        &config.hooks,
+        root.path(),
+        "before_compact",
+        json!({"session_id":"fixture", "reason":"manual"}),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap()
+    .unwrap();
+    assert!(note.contains("untrusted data"), "{note}");
+    assert!(note.ends_with("reason: manual"), "{note}");
 }
 
 #[test]

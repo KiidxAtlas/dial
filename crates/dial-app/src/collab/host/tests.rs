@@ -223,10 +223,92 @@ fn taking_one_prompt_preserves_following_work_and_abort() {
             Steer::Prompt("second".into()),
         ],
         published: None,
+        allow_answers: false,
+        question: None,
+        next_question: 0,
     };
     assert_eq!(host.take_prompt().as_deref(), Some("first"));
     assert!(host.take_aborts());
     assert_eq!(host.take_prompt().as_deref(), Some("second"));
     assert_eq!(host.take_prompt(), None);
     assert!(!host.take_aborts());
+}
+
+fn answering_host(token: [u8; WRITE_TOKEN_BYTES], allow: bool) -> Host {
+    let mut guests = BTreeMap::new();
+    for (peer, writable) in [(1, true), (2, false)] {
+        guests.insert(
+            peer,
+            GuestPeer {
+                name: format!("guest-{peer}"),
+                writable,
+                challenge: "fresh".into(),
+                request_sequence: 0,
+            },
+        );
+    }
+    Host {
+        room_id: "fixture".into(),
+        socket: Socket::detached(),
+        link: String::new(),
+        write_token: Some(token),
+        allow_steering: false,
+        entries: Arc::default(),
+        message_cursor: None,
+        guests,
+        challenges: BTreeMap::new(),
+        steering: Vec::new(),
+        published: None,
+        allow_answers: false,
+        question: None,
+        next_question: 0,
+    }
+    .with_guest_answers(allow)
+}
+
+fn signed_answer(token: &[u8; WRITE_TOKEN_BYTES], sequence: u64, text: &str) -> Value {
+    json!({"t":"answer","text":text,"requestSeq":sequence,
+        "authorization":request_proof(token,"fresh",sequence,"answer",text)})
+}
+
+#[test]
+fn guest_answers_settle_only_the_open_question_from_writable_guests() {
+    let token = [5; WRITE_TOKEN_BYTES];
+    let mut notes = Vec::new();
+    let mut off = answering_host(token, false);
+    assert_eq!(
+        off.offer_question("Pick", "body", &["a", "b"]),
+        None,
+        "opt-in only"
+    );
+
+    let mut host = answering_host(token, true);
+    let id = host.offer_question("Pick", "body", &["a", "b"]).unwrap();
+    // The read-only guest cannot sign; a forged choice fails the proof bound to the text.
+    host.on_frame(2, &signed_answer(&token, 1, &format!("{id}:0")), &mut notes);
+    let mut forged = signed_answer(&token, 1, &format!("{id}:0"));
+    forged["text"] = json!(format!("{id}:1"));
+    host.on_frame(1, &forged, &mut notes);
+    assert_eq!(host.take_answer(id), None);
+    // Out of range and stale ids are refused without settling the question.
+    host.on_frame(1, &signed_answer(&token, 2, &format!("{id}:2")), &mut notes);
+    host.on_frame(
+        1,
+        &signed_answer(&token, 3, &format!("{}:0", id + 1)),
+        &mut notes,
+    );
+    assert_eq!(host.take_answer(id), None);
+    host.on_frame(1, &signed_answer(&token, 4, &format!("{id}:1")), &mut notes);
+    assert_eq!(host.take_answer(id), Some((1, "guest-1".to_owned())));
+    assert_eq!(notes, ["guest-1 answered the open question"]);
+    // A replayed answer runs at most once; a closed question takes no answers.
+    host.on_frame(1, &signed_answer(&token, 4, &format!("{id}:1")), &mut notes);
+    host.close_question(id);
+    host.on_frame(1, &signed_answer(&token, 5, &format!("{id}:0")), &mut notes);
+    assert_eq!(host.take_answer(id), None);
+    assert!(host.question.is_none());
+    // Read-only rooms never offer questions.
+    let mut read_only = answering_host(token, true);
+    read_only.write_token = None;
+    assert_eq!(read_only.offer_question("Pick", "body", &["a"]), None);
 }

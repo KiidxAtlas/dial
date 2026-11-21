@@ -4,7 +4,7 @@
 //! `/checks remove` use (`crate::checks`). A check is a shell command that runs after edits, so both
 //! writes need `confirm: true`, as `skill_action` does for changes that remove or run something.
 //! Saved changes apply on `apply_settings`. A duplicate or unknown name is a coded refusal.
-use super::coded;
+use super::{check_keys, coded};
 use crate::config::paths::Layout;
 use crate::config::types::{Config, VerificationCommand};
 use anyhow::Result;
@@ -79,23 +79,6 @@ pub(super) fn remove(layout: &Layout, params: &Value) -> Result<Value> {
         "removed": true,
         "apply_settings": true,
     }))
-}
-
-/// Refuses a request with a key the method does not accept, rather than ignoring it.
-fn check_keys(params: &Value, allowed: &[&str], method: &str) -> Result<()> {
-    let Some(fields) = params.as_object() else {
-        return Err(coded(
-            ErrorCode::InvalidParams,
-            format!("{method} requires params"),
-        ));
-    };
-    match fields.keys().find(|key| !allowed.contains(&key.as_str())) {
-        Some(unknown) => Err(coded(
-            ErrorCode::InvalidParams,
-            format!("{method} does not accept params.{unknown}"),
-        )),
-        None => Ok(()),
-    }
 }
 
 /// Refuses a write that needs `confirm: true` when the client did not send it.

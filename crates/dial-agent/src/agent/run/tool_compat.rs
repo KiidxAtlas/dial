@@ -360,21 +360,14 @@ fn normalize_container(schema: &Value, value: &mut Value) {
     if let Some(items) = string_list(schema, value) {
         *value = items;
     }
+    normalize_keys(schema, value);
     if let (Some(object), Some(properties)) =
         (value.as_object_mut(), schema["properties"].as_object())
     {
-        let keys: Vec<_> = object.keys().cloned().collect();
-        for key in keys {
-            if !properties.contains_key(&key)
-                && let Ok(decoded) = serde_json::from_str::<String>(&key)
-                && properties.contains_key(&decoded)
-                && !object.contains_key(&decoded)
-            {
-                let child = object.remove(&key).unwrap();
-                object.insert(decoded, child);
-            }
-        }
         object.retain(|key, child| {
+            if !child.is_null() {
+                return true;
+            }
             let Some(sub) = properties.get(key) else {
                 return true;
             };
@@ -385,10 +378,7 @@ fn normalize_container(schema: &Value, value: &mut Value) {
                 .as_array()
                 .is_some_and(|values| values.iter().any(Value::is_null));
             // Unknown/union/nullable types and required values remain the validator's decision.
-            !(child.is_null()
-                && !required
-                && !nullable_enum
-                && sub["type"].as_str().is_some_and(|kind| kind != "null"))
+            required || nullable_enum || sub["type"].as_str().is_none_or(|kind| kind == "null")
         });
     }
 }
@@ -434,10 +424,18 @@ fn normalize_keys(schema: &Value, value: &mut Value) {
     };
     let mut renames = std::collections::BTreeMap::new();
     for key in object.keys().filter(|k| !fields.contains_key(*k)) {
-        let family = field_family(key);
-        let target = unique(fields.keys().map(String::as_str).filter(|f| {
-            same_spelling(key, f) || family.is_some_and(|group| field_family(f) == Some(group))
-        }));
+        // A JSON-quoted exact key is another candidate, not an earlier rename:
+        // account for it in the same collision check as every other spelling.
+        let target = if key.trim_start().starts_with('"') {
+            serde_json::from_str::<String>(key)
+                .ok()
+                .and_then(|decoded| fields.get_key_value(&decoded).map(|(k, _)| k.as_str()))
+        } else {
+            let family = field_family(key);
+            unique(fields.keys().map(String::as_str).filter(|f| {
+                same_spelling(key, f) || family.is_some_and(|group| field_family(f) == Some(group))
+            }))
+        };
         if let Some(target) = target
             && !object.contains_key(target)
         {
@@ -454,11 +452,31 @@ fn normalize_keys(schema: &Value, value: &mut Value) {
     }
 }
 
+/// Use the existing scalar decoder for an explicitly nullable number or boolean.
+/// Other unions may accept the original string or admit more than one conversion.
+fn scalar_kind(kind: &Value) -> Option<&str> {
+    if let Some(single) = kind.as_str() {
+        return Some(single);
+    }
+    let [a, b] = kind.as_array()?.as_slice() else {
+        return None;
+    };
+    let other = if a == "null" {
+        b
+    } else if b == "null" {
+        a
+    } else {
+        return None;
+    };
+    other
+        .as_str()
+        .filter(|k| matches!(*k, "number" | "integer" | "boolean"))
+}
+
 fn normalize_scalars(schema: &Value, value: &mut Value) {
     normalize_container(schema, value);
-    normalize_keys(schema, value);
     if let Some(text) = value.as_str() {
-        let converted = match schema["type"].as_str() {
+        let converted = match scalar_kind(&schema["type"]) {
             Some("string") => schema["enum"]
                 .as_array()
                 .filter(|choices| !choices.contains(value))

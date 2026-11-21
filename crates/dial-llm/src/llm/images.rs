@@ -84,8 +84,12 @@ fn bytes(root: &Path, path: &Path) -> Result<(Vec<u8>, &'static str)> {
     Ok((bytes, mime))
 }
 
-/// The image format named by the leading magic bytes: PNG, JPEG, GIF or WebP, the formats every
-/// image-input route accepts. `None` for anything else.
+/// MIME types [`sniff_mime`] can name: the formats every image-input route accepts. Stores that
+/// validate a declared type against sniffed bytes use this list as their single source.
+pub const SNIFFED_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// The image format named by the leading magic bytes, always one of [`SNIFFED_MIMES`]. `None`
+/// for anything else.
 pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")

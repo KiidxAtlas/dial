@@ -92,6 +92,36 @@ fn appearance_choices_preview_without_mutation_and_save_only_on_enter() {
 }
 
 #[test]
+fn preview_footer_names_only_available_actions() {
+    let rig = Rig::new();
+    let mut o = overlay("ui.motion", Scope::Global);
+    o.handle(&key(KeyCode::Enter), &rig.keys);
+    o.handle(
+        &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+        &rig.keys,
+    );
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &|_, _| Line::default(),
+    };
+    for (height, overflow) in [(30, false), (8, true)] {
+        let rows = o.compose(100, height, &ctx);
+        let footer = rows.last().unwrap().to_string();
+        assert!(
+            footer.contains("Enter save") && footer.contains("Esc discard"),
+            "{footer}"
+        );
+        assert!(
+            !footer.contains("Up/Down preview") && !footer.contains("Type filter"),
+            "{footer}"
+        );
+        assert_eq!(footer.contains("scroll"), overflow, "{footer}");
+    }
+}
+
+#[test]
 fn appearance_outcomes_render_together_at_wide_narrow_and_ascii_sizes() {
     for theme in [Theme::dark(), Theme::mono().with_glyphs(Glyphs::Ascii)] {
         let rig = Rig::with_theme(theme);
@@ -222,4 +252,68 @@ fn preview_key_never_gives_the_global_providers_key_a_second_meaning() {
     );
     o.handle(&plain, &rig.keys);
     assert!(o.appearance_preview, "a free F4 previews");
+}
+
+fn preview_screen(o: &mut SettingsOverlay, rig: &Rig) -> String {
+    let preview =
+        |_: &crate::llm::model_config::UiConfig, _: u16| ratatui::text::Line::from("STATUS");
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &preview,
+    };
+    // The page-key hint is relevant only when there is another page to read.
+    screen(&render(120, 8, |f| o.draw(f, &ctx)))
+}
+
+/// The preview scrolls by the keymap's rows and pages, so remapped keys work and the old keys do
+/// not; its footer names the page keys it answers to. Esc stays a fixed way out, and a remapped
+/// cancel closes it too.
+#[test]
+fn appearance_preview_scrolls_by_keymap_rows_and_pages_and_names_its_keys() {
+    let mut rig = Rig::new();
+    rig.keys
+        .rebind(crate::ui::keys::Action::SelectPageDown, &["Ctrl+G"])
+        .unwrap();
+    let mut o = overlay("ui.show_tools", Scope::Project);
+    o.handle(&key(KeyCode::Enter), &rig.keys);
+    o.handle(&key(KeyCode::Down), &rig.keys);
+    o.handle(
+        &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+        &rig.keys,
+    );
+    assert!(o.appearance_preview);
+    let shown = preview_screen(&mut o, &rig);
+    assert!(shown.contains("Ctrl+G"), "{shown}");
+    assert!(!shown.contains("PgUp/PgDn"), "{shown}");
+    o.handle(&ctrl('n'), &rig.keys);
+    assert_eq!(o.appearance_scroll, 1, "Ctrl+N is the default Down");
+    o.handle(&key(KeyCode::PageDown), &rig.keys);
+    assert_eq!(o.appearance_scroll, 1, "the old page key is unbound");
+    o.handle(&ctrl('g'), &rig.keys);
+    assert_eq!(
+        o.appearance_scroll,
+        1 + o.page,
+        "the bound page key moves a page"
+    );
+    o.handle(&key(KeyCode::Home), &rig.keys);
+    assert_eq!(o.appearance_scroll, 0);
+    o.handle(&key(KeyCode::Esc), &rig.keys);
+    assert!(!o.appearance_preview, "Esc still leaves the preview");
+
+    let mut cancel = Rig::new();
+    cancel
+        .keys
+        .rebind(crate::ui::keys::Action::SelectCancel, &["Ctrl+K"])
+        .unwrap();
+    let mut o = overlay("ui.show_tools", Scope::Project);
+    o.handle(&key(KeyCode::Enter), &cancel.keys);
+    o.handle(&key(KeyCode::Down), &cancel.keys);
+    o.handle(
+        &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+        &cancel.keys,
+    );
+    o.handle(&ctrl('k'), &cancel.keys);
+    assert!(!o.appearance_preview, "the bound cancel leaves the preview");
 }

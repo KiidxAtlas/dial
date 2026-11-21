@@ -1,4 +1,4 @@
-//! Supervision of a persistent local MLX server: MLX-LM for text, MLX-VLM for vision.
+//! Supervision of persistent local MLX-LM, MLX-VLM and llama.cpp servers.
 //!
 //! The server listens on loopback only, runs in its own process group (or Windows Job Object), and
 //! is killed with its descendants on `stop()` or drop. Model and adapter are fixed at
@@ -194,7 +194,7 @@ pub struct ModelServer {
     process: Supervised,
     base_url: String,
     model: String,
-    vision: bool,
+    vlm: bool,
     /// Serves only `POST /v1/embeddings` (MLX-VLM embedding checkpoint), never chat.
     embedding: bool,
     adapter: Option<PathBuf>,
@@ -312,7 +312,7 @@ impl ModelServer {
     }
 
     pub fn request_model(&self) -> &str {
-        if self.vision || self.embedding {
+        if self.vlm || self.embedding {
             &self.model
         } else {
             SERVER_MODEL
@@ -801,13 +801,11 @@ fn launch(
             "{model} is a GGUF file; local image embeddings need an MLX embedding checkpoint, or set an OpenAI-compatible embedding endpoint"
         )));
     }
-    let vision = !embedding
-        && gguf.is_none()
-        && llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
+    let vlm = !embedding && gguf.is_none() && llm::catalog::uses_mlx_vlm(Path::new(model));
     runtime.validate().map_err(Failure::Fatal)?;
-    if gguf.is_none() && vision && !runtime.is_default() {
+    if vlm && !runtime.is_default() {
         return Err(Failure::Fatal(anyhow!(
-            "draft-model and KV-cache settings apply to MLX-LM text models only; vision models run through MLX-VLM without them"
+            "draft-model and KV-cache settings apply to MLX-LM only; this model runs through MLX-VLM without them"
         )));
     }
     let mut command = if let Some(file) = &gguf {
@@ -855,7 +853,7 @@ fn launch(
             .arg("--log-level=WARNING");
         if embedding {
             command.arg("--max-num-seqs=1");
-        } else if vision {
+        } else if vlm {
             command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
             // Bounded, process-local reuse; Python disables APC if its compatibility check fails.
             command
@@ -890,7 +888,7 @@ fn launch(
                 "DIAL_MODEL_ENGINE",
                 if embedding {
                     "mlx-vlm-embedding"
-                } else if vision {
+                } else if vlm {
                     "mlx-vlm"
                 } else {
                     "mlx-lm"
@@ -943,7 +941,7 @@ fn launch(
         &tail,
         deadline,
         interrupt,
-        if vision || embedding {
+        if vlm || embedding {
             model
         } else {
             SERVER_MODEL
@@ -959,7 +957,7 @@ fn launch(
                 process,
                 base_url,
                 model: model.to_string(),
-                vision,
+                vlm,
                 embedding,
                 adapter: adapter.map(Path::to_path_buf),
                 steering: steering.cloned(),

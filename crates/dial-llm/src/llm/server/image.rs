@@ -359,16 +359,9 @@ fn safetensors_names(path: &Path) -> Option<Vec<String>> {
     )
 }
 
+/// A JSON config or index read while planning; over `MAX_HEADER_BYTES` it is unreadable.
 fn read_json(path: &Path) -> Option<Value> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_HEADER_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_HEADER_BYTES {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
+    llm::read_json_within(path, MAX_HEADER_BYTES)
 }
 
 /// The command-line arguments for serving `components` on `port`. `model_dir` keeps sd-server's

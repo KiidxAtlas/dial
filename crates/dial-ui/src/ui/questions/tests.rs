@@ -386,6 +386,33 @@ fn choice_navigation_and_hints_follow_the_keymap() {
 }
 
 #[test]
+fn ascii_dialog_hints_use_key_names_without_changing_question_text() {
+    use crate::ui::theme::{Glyphs, Theme};
+    let theme = Theme::dark().with_glyphs(Glyphs::Ascii);
+    let mut multi = request(2, None);
+    multi.questions[0].question = "Keep → in the prompt?".into();
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::SelectDown, &["F5"]).unwrap();
+    let dialog = Dialog::new(&multi, Path::new("/tmp")).with_keys(&keys);
+    let lines = framed_with_roles(
+        dialog.rows_with_roles(80, 30, theme.glyphs()),
+        80,
+        30,
+        &theme,
+    );
+    let view = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        view.contains("Up/F5 choose") && view.contains("Right next"),
+        "{view}"
+    );
+    assert!(view.contains("Keep → in the prompt?"), "{view}");
+}
+
+#[test]
 fn a_timeout_that_picks_an_answer_says_what_it_chose() {
     let request = request(2, None);
     let mut dialog = Dialog::new(&request, Path::new("/tmp"));
@@ -624,4 +651,82 @@ fn scroll_hint_accounts_for_space_reserved_by_choices() {
     let dialog = Dialog::new(&request, Path::new("/tmp"));
     let view = rendered(&dialog, 70, 18);
     assert!(view.contains("scroll details"), "{view}");
+}
+
+#[test]
+fn footer_roles_are_styled_from_the_role_and_follow_the_glyph_preset() {
+    use crate::ui::theme::{Glyphs, Theme, Tok};
+    let hints = |items: &[&str]| Row::Hints(items.iter().map(|s| (*s).to_owned()).collect());
+    let cases = [
+        // (theme, separator): the ASCII preset swaps only the separator glyph.
+        (Theme::dark(), " · "),
+        (Theme::dark().with_glyphs(Glyphs::Ascii), " | "),
+    ];
+    for (theme, separator) in cases {
+        let rows = vec![
+            Row::Text("Question 1/1".into()),
+            Row::Text("Pick one?".into()),
+            hints(&["Enter select", "Esc cancel"]),
+        ];
+        let lines = framed_with_roles(rows, 60, 20, &theme);
+        let footer = lines
+            .iter()
+            .find(|line| line.to_string().contains("Enter select"))
+            .expect("the hint footer is drawn");
+        let text = footer.to_string();
+        assert!(
+            text.contains(&format!("Enter select{separator}Esc cancel")),
+            "{text}"
+        );
+        assert!(footer.spans.iter().any(|span| {
+            span.content.contains("Enter select") && span.style.fg == theme.fg(Tok::Muted).fg
+        }));
+        for line in &lines {
+            assert_eq!(text::line_width(line), 60);
+        }
+    }
+}
+
+#[test]
+fn a_single_hint_footer_wraps_narrow_and_ascii_without_a_separator() {
+    let theme = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let rows = vec![
+        Row::Text("Question 1/1".into()),
+        Row::Text("Pick one?".into()),
+        Row::Hints(vec!["Esc cancel".into()]),
+    ];
+    for width in [8usize, 12] {
+        let lines = framed_with_roles(rows.clone(), width, 20, &theme);
+        let view = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!view.contains(" | ") && !view.contains(" · "), "{view}");
+        assert!(view.contains("Esc"), "{view}");
+        assert!(
+            lines.iter().all(|line| text::line_width(line) == width),
+            "{view}"
+        );
+    }
+}
+
+#[test]
+fn legacy_string_rows_keep_the_trailing_footer_classification() {
+    let theme = crate::ui::theme::Theme::dark();
+    // A trailing body row without the legacy separator is content, not a footer.
+    let rows = vec!["Question 1/1".to_owned(), "plain trailing text".to_owned()];
+    let lines = framed(rows, 40, 10, &theme);
+    let plain: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    assert!(
+        plain
+            .iter()
+            .any(|line| line.contains("plain trailing text"))
+    );
+    let muted = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains("plain trailing text"))
+        .unwrap();
+    assert_eq!(muted.style.fg, theme.fg(crate::ui::theme::Tok::Text).fg);
 }

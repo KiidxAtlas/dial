@@ -1,5 +1,6 @@
 //! Bounded, session-local notification inbox. Transcript delivery is independent of read state.
 use super::palette::{ChoiceItem, ChoiceSpec};
+use crate::ui::text;
 
 const LIMIT: usize = 200;
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
@@ -224,8 +225,8 @@ impl Inbox {
                 value: "read-all".into(),
                 label: "Mark all read".into(),
                 detail: format!(
-                    "Mark {unread} notice{} read without showing them",
-                    if unread == 1 { "" } else { "s" }
+                    "Mark {} read without showing them",
+                    text::counted(unread, "notice")
                 ),
                 current: false,
             });
@@ -283,9 +284,8 @@ impl Inbox {
                 "Enter shows a notice and marks it read; opening the inbox or settings marks nothing read.{}",
                 if self.overflow_unread > 0 {
                     format!(
-                        " {} unread notice{} evicted at the {LIMIT}-notice limit; transcript delivery is unchanged.",
-                        self.overflow_unread,
-                        if self.overflow_unread == 1 { "" } else { "s" }
+                        " {} evicted at the {LIMIT}-notice limit; transcript delivery is unchanged.",
+                        text::counted(self.overflow_unread, "unread notice"),
                     )
                 } else {
                     String::new()

@@ -24,6 +24,7 @@ pub mod types;
 mod xai;
 mod zai;
 
+pub(super) use antigravity::available_models as antigravity_available_models;
 pub use types::*;
 
 use anyhow::{Result, bail};

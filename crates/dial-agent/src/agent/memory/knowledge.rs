@@ -25,10 +25,7 @@ impl<'a> Agent<'a> {
         if self.hermetic || !self.config.laya.enabled || self.interrupt.load(Ordering::SeqCst) {
             return None;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = crate::runtime::clock::unix_secs();
         if self.session.control_state()["laya"]["retry_after"]
             .as_u64()
             .is_some_and(|retry| now < retry)

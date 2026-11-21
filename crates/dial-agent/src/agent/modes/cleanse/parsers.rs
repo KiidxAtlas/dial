@@ -29,6 +29,7 @@ pub enum Kind {
     DenoLint,
     Stylelint,
     Shellcheck,
+    Swiftlint,
     Generic,
 }
 
@@ -53,6 +54,7 @@ impl Kind {
             "deno-lint" => Self::DenoLint,
             "stylelint" => Self::Stylelint,
             "shellcheck" => Self::Shellcheck,
+            "swiftlint" => Self::Swiftlint,
             "generic" | "mypy" => Self::Generic,
             _ => return None,
         })
@@ -138,6 +140,7 @@ pub fn parse(kind: Kind, ctx: &Ctx, stdout: &str, stderr: &str) -> Vec<Diagnosti
         Kind::DenoLint => deno_lint(stdout, stderr),
         Kind::Stylelint => stylelint(stdout),
         Kind::Shellcheck => shellcheck(stdout, stderr),
+        Kind::Swiftlint => swiftlint(stdout, stderr),
         Kind::Generic => generic(stdout, stderr),
     };
     if drafts.is_empty() && matches!(kind, Kind::Go | Kind::GoTest) {
@@ -862,6 +865,29 @@ fn shellcheck(stdout: &str, stderr: &str) -> Vec<Draft> {
                         .get("fix")
                         .map(|_| "automatic fix available".to_owned()),
                 ),
+            );
+        }
+    }
+    drafts
+}
+
+/// `swiftlint lint --reporter json`: an array of violations with `file`, `line`, `character`,
+/// `rule_id`, `severity` (`Warning`/`Error`) and `reason`.
+fn swiftlint(stdout: &str, stderr: &str) -> Vec<Draft> {
+    let mut drafts = Vec::new();
+    for value in all_json(stdout, stderr) {
+        for violation in value.as_array().map_or(&[][..], Vec::as_slice) {
+            drafts.push(
+                Draft::new(
+                    severity_of_value(violation.get("severity")),
+                    text(violation, &["reason"]).unwrap_or_default(),
+                )
+                .at(
+                    text(violation, &["file"]),
+                    num(violation, &["line"]),
+                    num(violation, &["character"]),
+                )
+                .code(text(violation, &["rule_id"])),
             );
         }
     }

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::forge_policy::{OpPolicy, op_of};
 use crate::config::types::Config;
 use crate::runtime::process::Stream;
 use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext, ToolEvent};
@@ -19,6 +20,7 @@ use crate::tools::vcs::gh_common::clip;
 use crate::tools::{ToolOutput, Workspace, opt_str, opt_u64, req_str, tool_schema};
 
 const READ_OPS: &[&str] = &["pr_list", "pr_view"];
+const ACCESS: OpPolicy = OpPolicy::new(READ_OPS);
 const OPS: &[&str] = &[
     "pr_list",
     "pr_view",
@@ -44,14 +46,6 @@ pub struct GiteaPr;
 /// Registry entry point: the `gitea_pr` tool, gated by name through `config.integrations`.
 pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(GiteaPr)]
-}
-
-fn op_of(args: &Value) -> Option<&str> {
-    args["op"].as_str()
-}
-
-fn is_read_op(args: &Value) -> bool {
-    op_of(args).is_some_and(|op| READ_OPS.contains(&op))
 }
 
 fn execute(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> ToolOutput {
@@ -100,7 +94,7 @@ impl Tool for GiteaPr {
 
     /// Only the read ops run without approval; a missing or unknown op needs it too.
     fn needs_approval(&self, args: &Value) -> bool {
-        !is_read_op(args)
+        ACCESS.needs_approval(args)
     }
 
     /// No op touches the local checkout.
@@ -109,11 +103,7 @@ impl Tool for GiteaPr {
     }
 
     fn concurrency(&self, args: &Value) -> Concurrency {
-        if is_read_op(args) {
-            Concurrency::Shared
-        } else {
-            Concurrency::Exclusive
-        }
+        ACCESS.concurrency(args)
     }
 
     /// Read operations query the forge and the checkout's Git metadata, never source files.
@@ -122,7 +112,7 @@ impl Tool for GiteaPr {
         _workspace: &Workspace,
         args: &Value,
     ) -> Option<crate::tools::surface::resources::Access> {
-        is_read_op(args).then(Default::default)
+        ACCESS.resources(args)
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -398,14 +388,12 @@ fn program() -> Result<OsString, String> {
     if let Some(program) = tests::tea_override() {
         return Ok(program);
     }
-    let exe = if cfg!(windows) { "tea.exe" } else { "tea" };
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir: PathBuf| dir.join(exe))
-        .find(|candidate| candidate.is_file())
-        .map(PathBuf::into_os_string)
-        .ok_or_else(|| MISSING_TEA.to_owned())
+    crate::platform::fs::find_program(
+        std::path::Path::new("tea"),
+        std::env::var_os("PATH").as_deref(),
+    )
+    .map(PathBuf::into_os_string)
+    .ok_or_else(|| MISSING_TEA.to_owned())
 }
 
 #[cfg(test)]

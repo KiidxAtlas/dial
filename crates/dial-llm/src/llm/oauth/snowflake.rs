@@ -6,7 +6,7 @@ use super::{Access, Credentials, Flow, Login, util};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const FLOW: Flow = Flow {
@@ -39,7 +39,7 @@ fn login(l: &Login<'_>) -> Result<Credentials> {
         Some("myorg-myaccount"),
         true,
     )?;
-    ensure!(!l.cancel.load(Ordering::SeqCst), "sign-in cancelled");
+    util::check_cancelled(&l.cancel)?;
     let account_url = normalize_account_url(&account)?;
     let callback = bind_callback(l)?;
     let redirect = callback.redirect_uri();

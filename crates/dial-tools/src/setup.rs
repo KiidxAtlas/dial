@@ -17,6 +17,12 @@ const WORKER: &str = include_str!("../../../python/dial_worker.py");
 const STEERING: &str = include_str!("../../../python/dial_steering.py");
 const WEIGHTS: &str = include_str!("../../../python/dial_weights.py");
 const PYPROJECT: &str = include_str!("../../../python/pyproject.toml");
+const UV_LOCK: &[u8] = include_bytes!("../../../python/uv.lock");
+
+fn write_runtime_manifest(dir: &std::path::Path) -> Result<()> {
+    settings_store::write_private(&dir.join("pyproject.toml"), PYPROJECT.as_bytes())?;
+    settings_store::write_private(&dir.join("uv.lock"), UV_LOCK)
+}
 
 /// Keep the managed worker aligned with the binary without reinstalling Python packages.
 /// Explicit custom worker paths are never replaced.
@@ -62,9 +68,13 @@ pub fn ensure_runtime_with(
     settings_store::write_private(&dir.join("dial_worker.py"), WORKER.as_bytes())?;
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
     settings_store::write_private(&dir.join("dial_weights.py"), WEIGHTS.as_bytes())?;
-    settings_store::write_private(&dir.join("pyproject.toml"), PYPROJECT.as_bytes())?;
+    write_runtime_manifest(&dir)?;
     let mut command = std::process::Command::new("uv");
-    command.args(["sync", "--project"]).arg(&dir);
+    command
+        .args(["sync", "--locked", "--no-dev", "--project"])
+        .arg(&dir)
+        .env("UV_PROJECT_ENVIRONMENT", dir.join(".venv"))
+        .env("UV_NO_CONFIG", "1");
     let timeout = Duration::from_secs(900);
     let output = crate::runtime::process::run(
         command,

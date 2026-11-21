@@ -1,9 +1,9 @@
-use super::super::loopback::Server;
+use super::super::loopback::{Server, read_request};
 use super::*;
 use crate::config::image::ImageModelSettings;
 use crate::config::types::Config;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{ErrorKind, Write};
+use std::net::TcpListener;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -309,29 +309,6 @@ fn failure_reply(status: u16, text: &str) -> Reply {
         content_type: "text/plain",
         body: text.as_bytes().to_vec(),
     }
-}
-
-/// Reads one request head and its body from a loopback connection.
-fn read_request(stream: &TcpStream) -> String {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut raw = String::new();
-    let mut length = 0usize;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap();
-        }
-        let end = line == "\r\n" || line.is_empty();
-        raw.push_str(&line);
-        if end {
-            break;
-        }
-    }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).unwrap();
-    raw.push_str(&String::from_utf8_lossy(&body));
-    raw
 }
 
 /// The JSON body of a recorded request, or `Value::Null` when it has none.

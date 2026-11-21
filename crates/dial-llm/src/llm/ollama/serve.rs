@@ -71,11 +71,7 @@ pub fn local_address(base_url: &str) -> Option<(String, u16)> {
         return None;
     }
     let host = parsed.host_str()?;
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let loopback = bare == "localhost"
-        || bare
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    let loopback = crate::llm::is_loopback_host(host);
     loopback.then(|| (host.to_owned(), parsed.port().unwrap_or(11434)))
 }
 
@@ -121,7 +117,7 @@ impl Host for RealHost {
     fn spawn(&self, dir: &Path) -> Result<ProcId> {
         let program = match &self.program {
             Some(program) => program.clone(),
-            None => find_program().context(
+            None => crate::llm::local_format::find_server_on_path("ollama").context(
                 "Ollama is not installed or not on PATH; install it (https://ollama.com/download) or start your embedding server",
             )?,
         };
@@ -142,20 +138,6 @@ impl Host for RealHost {
         // The child is not waited on: it outlives this call and is stopped by `release`.
         ProcId::of(child.id() as i32).context("`ollama serve` exited immediately")
     }
-}
-
-/// `ollama` on PATH, then the usual install locations a GUI-launched PATH can miss.
-fn find_program() -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        "ollama.exe"
-    } else {
-        "ollama"
-    };
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Makes sure an Ollama server answers at `base_url`, a loopback `http://` address, starting
