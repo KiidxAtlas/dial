@@ -153,6 +153,11 @@ impl DeclaredReasoning {
         efforts
     }
 
+    /// Declared thinking level names selectable for the given role.
+    pub fn thinking_levels(self, role: &str) -> Vec<&'static str> {
+        super::bundled::effort_names(self.efforts(), role != "main")
+    }
+
     /// A `ModelVariant` declaration: each listed effort selects its own wire ID, so the levels
     /// are the exact set the account's listing routes. Levels outside [`DECLARABLE_EFFORTS`] are
     /// not representable and are dropped.

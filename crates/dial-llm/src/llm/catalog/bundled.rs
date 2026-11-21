@@ -577,9 +577,16 @@ pub(super) fn antigravity_context_window(model: &str) -> Option<u32> {
 /// Thinking levels the bundled catalog documents for `provider/model`, weakest first, as level
 /// names. `role` drops levels a helper role cannot hold (`auto` is main-only and is never listed).
 pub fn documented_thinking_levels(provider: &str, model: &str, role: bool) -> Vec<&'static str> {
-    bundled_model(provider, model)
-        .map(|bundled| bundled.thinking_efforts)
-        .unwrap_or_default()
+    effort_names(
+        bundled_model(provider, model)
+            .map(|bundled| bundled.thinking_efforts)
+            .unwrap_or_default(),
+        role,
+    )
+}
+
+pub(super) fn effort_names(efforts: Vec<ReasoningEffort>, role: bool) -> Vec<&'static str> {
+    efforts
         .into_iter()
         .map(level_name)
         .filter(|level| !role || parse_thinking(level).is_ok())

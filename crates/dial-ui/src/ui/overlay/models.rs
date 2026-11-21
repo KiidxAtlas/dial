@@ -1464,12 +1464,8 @@ impl ModelOverlay {
             declared.is_some_and(|d| d.mode == crate::llm::catalog::ThinkingMode::ModelVariant);
         let mut levels: Vec<&'static str> = if grouped || documented.is_empty() {
             declared
-                .map(|declared| declared.efforts())
+                .map(|reasoning| reasoning.thinking_levels(role))
                 .unwrap_or_default()
-                .into_iter()
-                .map(crate::config::thinking::level_name)
-                .filter(|level| main || crate::config::thinking::parse_thinking(level).is_ok())
-                .collect()
         } else {
             documented
         };

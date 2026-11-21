@@ -622,3 +622,6 @@ pub(super) fn next_cycled_approval(current: Approval) -> Approval {
         Approval::Readonly | Approval::Auto | Approval::Yolo => Approval::Ask,
     }
 }
+
+#[cfg(test)]
+mod tests;

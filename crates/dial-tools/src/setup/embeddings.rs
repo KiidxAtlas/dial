@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Settings path of the embedding model row, which carries the setup offer.
-pub const EMBEDDING_MODEL_PATH: &str = "memory.semantic.embedding_model";
+pub use crate::config::schema::EMBEDDING_MODEL_PATH;
 /// The model offered when nothing is configured.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text";
 /// First words of a successful setup summary; the app recognizes a finished embedding setup by it.

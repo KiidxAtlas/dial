@@ -3,12 +3,12 @@ use super::super::OverlayEvent;
 use super::super::panel_keys::{self, Edge, list_move};
 use super::super::path_browser::BrowseStep;
 use super::format::{adjust, choice_value, parse_input, value_text};
-use super::memory::{label_for_choice, memory_missing_role, memory_needs};
+use super::memory::{label_for_choice, memory_missing_role};
 use super::value_editors::{Step, View};
 use super::{
     ChoiceAction, EMBEDDING_MODEL_PATH, Mode, SettingsOverlay, TYPE_CHOICE, label_of, pick_matches,
 };
-use crate::config::schema::{Kind, SettingDef};
+use crate::config::schema::{Kind, SettingDef, memory_needs};
 use crate::config::settings_store::Scope;
 use crate::ui::keys::{Action, Keymap};
 use crate::ui::overlay::widgets::{is_ctrl, other_scope, scope_name, typed_char};

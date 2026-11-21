@@ -438,6 +438,7 @@ mod image;
 mod improvement;
 mod management;
 mod memory;
+pub use memory::{EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, memory_needs};
 mod message_routing;
 mod model;
 mod preparation;

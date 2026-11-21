@@ -10,7 +10,9 @@ use super::widgets::{
     panel, pressed, scope_name,
 };
 use super::{DrawCtx, OverlayEvent};
-use crate::config::schema::{Kind, PathKind, SettingDef, Source};
+use crate::config::schema::{
+    EMBEDDING_MODEL_PATH, EMBEDDING_URL_PATH, Kind, PathKind, SettingDef, Source, memory_needs,
+};
 use crate::config::settings_store::Scope;
 use crate::llm::model_config::{ModelSelection, UiConfig};
 use crate::ui::chrome::Section;
@@ -24,7 +26,7 @@ use crossterm::event::{KeyEvent, KeyModifiers};
 #[cfg(test)]
 use format::{adjust, blank_meaning, edit_text};
 use format::{choice_value, parse_input, setting_edit_text, value_text};
-use memory::{label_for_choice, memory_needs, memory_section};
+use memory::{label_for_choice, memory_section};
 use ratatui::{
     Frame,
     text::{Line, Span},
@@ -258,9 +260,6 @@ pub struct EmbeddingModel {
     pub classified: bool,
 }
 
-/// The settings row that picks the `embedding` role (and holds the advanced model override).
-const EMBEDDING_MODEL_PATH: &str = crate::setup::embeddings::EMBEDDING_MODEL_PATH;
-const EMBEDDING_URL_PATH: &str = "memory.semantic.embedding_base_url";
 /// Override rows kept behind "Show advanced" while no override URL is set.
 const EMBEDDING_OVERRIDE_ROWS: [&str; 2] =
     [EMBEDDING_URL_PATH, "memory.semantic.embedding_api_key_env"];

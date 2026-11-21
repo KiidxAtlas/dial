@@ -466,7 +466,10 @@ fn shift_tab_notes_use_the_mode_names_and_say_how_to_return_to_full_auto() {
     assert!(left_auto.contains("/approval auto"), "{left_auto}");
     let left_yolo = cycled_approval_note(Approval::Yolo, Approval::Ask);
     assert!(left_yolo.starts_with("Ask first"), "{left_yolo}");
-    assert!(left_yolo.contains("/approval yolo returns to YOLO"), "{left_yolo}");
+    assert!(
+        left_yolo.contains("/approval yolo returns to YOLO"),
+        "{left_yolo}"
+    );
     let note = cycled_approval_note(Approval::Ask, Approval::Write);
     assert_eq!(note, "Edit freely for this session");
     assert!(!cycled_approval_note(Approval::Write, Approval::Readonly).contains("readonly"));
