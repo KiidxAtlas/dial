@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-11-21
+
 - The edit-churn guard ("Repeated edits to one file without a passing check; asking the model to reconsider", plus its withheld large rewrites) is now off by default. Set `reliability.edit_churn_guard = true` to restore it (`docs/agent-loop.md`).
 - Native RPC clients can retrieve retained tool screenshots by content hash with `read_image_artifact`, including during a turn.
 - Successful vision requests label explicitly attached files with their reusable local paths. Tool images and inline bytes do not gain path labels.
@@ -3176,7 +3178,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.14...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.15...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3227,3 +3229,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.12]: https://github.com/KiidxAtlas/dial/tree/v0.3.12
 [0.3.13]: https://github.com/KiidxAtlas/dial/tree/v0.3.13
 [0.3.14]: https://github.com/KiidxAtlas/dial/tree/v0.3.14
+[0.3.15]: https://github.com/KiidxAtlas/dial/tree/v0.3.15
