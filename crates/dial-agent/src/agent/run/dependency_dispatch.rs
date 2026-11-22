@@ -467,72 +467,11 @@ fn skipped(text: String) -> ToolOutput {
 /// Whether a non-check shell command (`bash` or `bg start`) is explicitly scoped to a plain
 /// subdirectory strictly disjoint from `failed`'s declared write footprint, with no parent
 /// traversal, repo-wide git invocation or mention of the failed paths.
-fn disjoint_shell_subtree(workspace: &Workspace, call: &ToolCall, failed: &Footprint) -> bool {
-    if is_check_call(call) {
-        return false;
-    }
-    let is_shell_launch = call.name == "bash"
-        || (call.name == "bg" && call.arguments["action"].as_str() == Some("start"));
-    if !is_shell_launch || failed.write_paths().is_empty() {
-        return false;
-    }
-    let Some(raw_command) = call.arguments["command"].as_str() else {
-        return false;
-    };
-    let (cwd_arg, script) = if let Some(cwd) = call.arguments["cwd"].as_str() {
-        (cwd, raw_command)
-    } else if let Some(rest) = raw_command.trim_start().strip_prefix("cd ")
-        && let Some((target, script)) = rest.split_once(" && ")
-    {
-        let target = target.trim();
-        if target.is_empty() || target.contains(['\'', '"', '`', '$', ';', '|']) {
-            return false;
-        }
-        (target, script)
-    } else {
-        return false;
-    };
-    let Ok(cwd) = workspace.resolve(cwd_arg) else {
-        return false;
-    };
-    if cwd == workspace.root() || !cwd.starts_with(workspace.root()) {
-        return false;
-    }
-    let Ok(meta) = std::fs::symlink_metadata(&cwd) else {
-        return false;
-    };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return false;
-    }
-    if failed.overlaps_path(&cwd) {
-        return false;
-    }
-    if script.contains("..") || contains_word(script, "git") {
-        return false;
-    }
-    if let Some(root) = workspace.root().to_str()
-        && !root.is_empty()
-        && script.contains(root)
-    {
-        return false;
-    }
-    for path in failed.write_paths() {
-        let Ok(rel) = path.strip_prefix(workspace.root()) else {
-            return false;
-        };
-        if let Some(first) = rel.components().next()
-            && let Some(name) = first.as_os_str().to_str()
-            && contains_path_token(script, name)
-        {
-            return false;
-        }
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-            && contains_path_token(script, file_name)
-        {
-            return false;
-        }
-    }
-    true
+///
+/// NOTE: Heuristic command-string parsing is not a sound safety boundary for bypassing
+/// failure-based dependency skipping. Keep this gate conservative.
+fn disjoint_shell_subtree(_workspace: &Workspace, _call: &ToolCall, _failed: &Footprint) -> bool {
+    false
 }
 
 fn contains_word(text: &str, word: &str) -> bool {
