@@ -69,14 +69,17 @@ fn a_fourth_large_unverified_write_is_withheld_before_mutating_the_file() {
         None,
     ));
     let server = llm::fake::serve(scripts);
-    with_agent("[compaction]\nenabled=false\n", |agent| {
-        connect(agent, &server.url);
-        agent.turn("Write successive draft versions to encoder.txt and report what was saved; this exercise does not ask you to verify the contents.", &mut NullUi).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(agent.workspace.root().join("encoder.txt")).unwrap(),
-            versions[2]
-        );
-    });
+    with_agent(
+        "[compaction]\nenabled=false\n[reliability]\nedit_churn_guard=true\n",
+        |agent| {
+            connect(agent, &server.url);
+            agent.turn("Write successive draft versions to encoder.txt and report what was saved; this exercise does not ask you to verify the contents.", &mut NullUi).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(agent.workspace.root().join("encoder.txt")).unwrap(),
+                versions[2]
+            );
+        },
+    );
     let requests = completion_requests(&server);
     let messages = requests.last().unwrap()["messages"].to_string();
     assert!(messages.contains("Large rewrite"), "{messages}");
