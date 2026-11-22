@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM python:3.13-slim-bookworm AS python-payload
+FROM --platform=$BUILDPLATFORM python:3.15-slim-bookworm AS python-payload
 ARG TARGETARCH
 WORKDIR /src
 COPY scripts/prepare-python.py scripts/runtime_payload.py scripts/
