@@ -52,9 +52,16 @@ pub(crate) fn prepare_attached_turn(
         .cloned()
         .unwrap_or_default();
     for path in images {
-        let image = user_attachment(root, path)
+        let mut image = user_attachment(root, path)
             .with_context(|| format!("attaching image {}", path.display()))?;
-        if !attached.contains(&image) {
+        if let Some(existing) = attached.iter_mut().find(|existing| {
+            existing["root"] == image["root"]
+                && existing["path"] == image["path"]
+                && existing["sha256"] == image["sha256"]
+        }) {
+            existing["show_path"] = Value::Bool(true);
+        } else {
+            image["show_path"] = Value::Bool(true);
             attached.push(image);
         }
     }

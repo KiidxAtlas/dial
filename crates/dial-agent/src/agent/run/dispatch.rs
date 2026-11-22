@@ -212,6 +212,15 @@ fn listing_readiness(
     output
 }
 
+/// The raw envelope that must be retained before announcing a tool image to clients.
+pub(in crate::agent) fn has_image_payload(output: &ToolOutput) -> bool {
+    !output.is_error
+        && output
+            .data
+            .as_ref()
+            .is_some_and(|d| d["artifact"]["data"].is_string())
+}
+
 /// Turn a successful tool's PNG `data.artifact` envelope into a compact image reference, so
 /// every tool that renders pixels (browser, computer, github, derived-media `read`, `visual`,
 /// `video`, `evidence`, ...) reaches a vision model through one rule instead of a name list.
@@ -222,12 +231,7 @@ pub(in crate::agent) fn capture_output_image(
     call: &ToolCall,
     output: &mut ToolOutput,
 ) -> Result<Option<Value>> {
-    if output.is_error
-        || !output
-            .data
-            .as_ref()
-            .is_some_and(|data| data["artifact"]["data"].is_string())
-    {
+    if !has_image_payload(output) {
         return Ok(None);
     }
     let owner = crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0;
@@ -526,9 +530,53 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
     calls: &[ToolCall],
     already_started: Option<&str>,
     read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+    mutation_controller: Option<GroupMutationController<'_>>,
+    turn_cancel: Option<&crate::runtime::cancellation::TurnCancellation>,
+    streamed: Option<&mut crate::agent::run::streaming_dispatch::StreamingDispatch>,
+) -> Vec<(ToolOutput, f64)> {
+    parallel_tools_inner(
+        ctx,
+        calls,
+        already_started,
+        read_reuse,
+        mutation_controller,
+        turn_cancel,
+        streamed,
+        false,
+    )
+}
+
+/// Top-level rounds retain image bytes before presenting their result. Other callers consume
+/// the ordinary completion notifications immediately, including for callback and child tools.
+pub(in crate::agent) fn parallel_round_reads(
+    ctx: ParallelToolContext<'_>,
+    calls: &[ToolCall],
+    already_started: Option<&str>,
+    reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+    streamed: Option<&mut crate::agent::run::streaming_dispatch::StreamingDispatch>,
+) -> Vec<(ToolOutput, f64)> {
+    parallel_tools_inner(
+        ctx,
+        calls,
+        already_started,
+        reuse,
+        None,
+        None,
+        streamed,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parallel_tools_inner(
+    ctx: ParallelToolContext<'_>,
+    calls: &[ToolCall],
+    already_started: Option<&str>,
+    read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     mut mutation_controller: Option<GroupMutationController<'_>>,
     turn_cancel: Option<&crate::runtime::cancellation::TurnCancellation>,
     mut streamed: Option<&mut crate::agent::run::streaming_dispatch::StreamingDispatch>,
+    defer_images: bool,
 ) -> Vec<(ToolOutput, f64)> {
     let ParallelToolContext {
         workspace,
@@ -738,6 +786,9 @@ pub(in crate::agent) fn parallel_tools_with_mutations(
             // Visible completion is independent of the ordered provider-history settlement.
             // StateUi journals each result before forwarding it to any surface.
             for &index in &members[source] {
+                if defer_images && has_image_payload(&result.0) {
+                    continue;
+                }
                 let call = &calls[index];
                 ui.tool_timing(
                     &call.id,

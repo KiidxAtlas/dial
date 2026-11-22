@@ -97,6 +97,8 @@ the name is already running does not skip actions on the running job.
 
 Native calls in one response run together as a wave only when their resources are provably disjoint. A read-only `bash` command is narrowed to its own files only when it is one plain `cat`, `wc`, `head`, `tail` or `stat` whose operands are literal workspace paths (a directory operand covers its contents) that the native resource rules admit: not a symlink, a hard-linked file, a path outside the workspace, or a missing file. Options are matched against an exact per-program list; an unlisted, abbreviated, bundled or `=`-suffixed option keeps the whole-workspace read, as do pipes, redirection, expansion, globs, stdin reads, `wc --files0-from` and file handles. A `cwd` argument narrows only when it is an existing directory reached without a symlink. Such a read waits behind any write to a path it does not name. `--` ends option parsing. `stat -f` is read as GNU's boolean `--file-system` flag, so on BSD or macOS, where `-f` takes a format, the format is an unresolved operand and the command falls back to the broad read.
 
+After a write fails, a different working directory does not prove a later shell command is independent. In the same batch, shell launches with unknown dependencies are skipped; diagnostic reads and native actions with provably disjoint paths remain available.
+
 An observational native no-op does not advance the source-mutation revision solely because its
 tool is named `edit`, `write` or `ast_edit`.
 
@@ -964,6 +966,8 @@ hook authorization, effect accounting or journal-before-publication requirements
 Unknown effects end the current turn as incomplete after saving results and skipping unstarted actions. They bypass automatic stall recovery, context transitions and memory maintenance. A refusal before execution records no effects. A timeout or interruption after execution starts does not imply rollback. Recovery from a missing durable tool result records an explicit unknown effect and never replays the call. Productive `max_steps = 0` remains unlimited.
 
 Successful edits can also loop: a model may keep inserting and removing the same lines, and each success used to clear repetition checkpoints. `agent/mutation_cycles.rs` hashes the actual committed content of each path the transaction owner reports in `Execution::changed_paths`, resolved and canonicalized through the workspace (including added roots). It never parses tool text or diffs.
+
+**Edit-churn guard (opt-in).** With `reliability.edit_churn_guard = true` (default `false`), every third committed edit or failed attempt on one file without a passing check adds an advisory note to the tool result and a Recovery event, and a large (4 KiB or more) whole-file `write` to that file is withheld until a passing check names it. With the default, nothing is counted, so neither the note nor the withheld write occurs.
 
 One return to an earlier version is an allowed revert. A version committed for the third time, with other versions in between, is an edit loop. An edit loop never ends the turn. The edit's result tells the model that its edits are undoing each other. The exact calls (normalized arguments) that produced the alternating versions are refused for the rest of the turn.
 

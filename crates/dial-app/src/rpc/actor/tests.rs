@@ -1465,6 +1465,30 @@ fn goal_edits_acquire_local_compute_only_when_they_produce_a_prompt() {
 }
 
 #[test]
+fn model_edits_cannot_follow_a_native_session_switch() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let old = runtime.agent.session().id().to_owned();
+            runtime.new_session().unwrap();
+            for (method, params) in [
+                (
+                    "set_model",
+                    json!({"session_id":old,"provider":"wrong","model_id":"wrong"}),
+                ),
+                ("set_thinking", json!({"session_id":old,"level":"default"})),
+            ] {
+                let err = runtime
+                    .handle_request(&json!({"method":method,"params":params}))
+                    .unwrap_err();
+                assert!(err.to_string().contains("active session changed"), "{err}");
+            }
+        },
+    );
+}
+
+#[test]
 fn recovery_publication_fence_orders_controller_events_and_closes_abandoned_tickets() {
     const CHILD: &str = "DIAL_TEST_RPC_RECOVERY_FENCE_CHILD";
     if std::env::var_os(CHILD).is_some() {

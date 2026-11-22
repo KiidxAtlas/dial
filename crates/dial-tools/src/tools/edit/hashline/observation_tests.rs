@@ -129,3 +129,43 @@ fn full_digest_distinguishes_short_tag_collisions() {
     fs::write(path, second).unwrap();
     assert_eq!(ws.changed_observations(), vec!["a.txt"]);
 }
+
+#[test]
+fn ephemeral_tmp_paths_are_excluded_from_changed_observations() {
+    let (_dir, ws) = workspace();
+    fs::create_dir_all(ws.root().join("preview/.tmp/board")).unwrap();
+    let tmp = observed(&ws, "preview/.tmp/board/index.html", "old\n");
+    fs::write(&tmp, "new\n").unwrap();
+    assert!(ws.changed_observations().is_empty());
+}
+
+#[test]
+fn self_caused_command_changes_are_acknowledged_without_hiding_peer_changes_or_granting_witnesses()
+{
+    let (_dir, ws) = workspace();
+    let target = observed(&ws, "fixture.html", "old\n");
+    let pre_changed = observed(&ws, "already_changed.txt", "v1\n");
+    let unrelated = observed(&ws, "unrelated.rs", "fn a() {}\n");
+
+    // Simulate a peer changing `already_changed.txt` before our shell command runs.
+    fs::write(&pre_changed, "v2\n").unwrap();
+
+    let snapshot = ws.snapshot_command_observations(
+        ws.root(),
+        "node -e 'fs.writeFileSync(\"fixture.html\", \"new\\n\")' already_changed.txt",
+    );
+    // Our command modifies `fixture.html`; a peer concurrently modifies `unrelated.rs`.
+    fs::write(&target, "new\n").unwrap();
+    fs::write(&unrelated, "fn b() {}\n").unwrap();
+    ws.acknowledge_command_observations(&snapshot);
+
+    let mut changed = ws.changed_observations();
+    changed.sort();
+    assert_eq!(changed, vec!["already_changed.txt", "unrelated.rs"]);
+    // Edit witnesses for `fixture.html` must still require re-reading before editing.
+    assert!(
+        ws.store()
+            .check_ranges(&target, "new\n", &[(1, 1)])
+            .is_err()
+    );
+}

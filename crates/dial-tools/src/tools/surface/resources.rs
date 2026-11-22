@@ -64,6 +64,15 @@ impl Footprint {
     pub fn writes(&self) -> bool {
         !self.writes.is_empty()
     }
+    pub fn write_paths(&self) -> &[PathBuf] {
+        &self.writes
+    }
+    pub fn overlaps_path(&self, path: &Path) -> bool {
+        self.writes
+            .iter()
+            .chain(&self.reads)
+            .any(|candidate| overlap(candidate, path))
+    }
     /// Whether a recorded change to any of `paths` (absolute, or relative to `root`) may have
     /// reached these resources: the same lexical containment as [`conflicts`](Self::conflicts).
     pub fn touches(&self, root: &Path, paths: &[PathBuf]) -> bool {

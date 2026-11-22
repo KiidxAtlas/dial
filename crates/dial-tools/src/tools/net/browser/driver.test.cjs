@@ -480,3 +480,9 @@ test('accessibility target and duplicate-id descriptions preserve emoji boundari
     assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value || ''));
   }
 });
+test('single-element actions accept target as a selector alias and name the missing argument', () => {
+  const h = harness();
+  assert.equal(h.run('required({action:"click",target:"text=Save"},"selector")'), 'text=Save');
+  assert.equal(h.run('required({action:"click",selector:"#a",target:"#b"},"selector")'), '#a');
+  assert.throws(() => h.run('required({action:"click"},"selector")'), /selector is required for action=click \(pass a CSS or Playwright selector/);
+});

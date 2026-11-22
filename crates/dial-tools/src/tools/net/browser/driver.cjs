@@ -339,8 +339,14 @@ function tabFor(request) {
   return tab;
 }
 function required(request, key) {
-  if (typeof request[key] !== 'string') throw new Error(`${key} must be a string`);
-  return request[key];
+  // Models often send the drag-style `target` for a single-element action; accept it.
+  const value = key === 'selector' && request.selector == null && typeof request.target === 'string' ? request.target : request[key];
+  if (typeof value === 'string') return value;
+  const action = request.action;
+  const hint = key === 'selector'
+    ? 'pass a CSS or Playwright selector such as "#save" or "text=Save"'
+    : key === 'text' ? 'pass the text to enter' : 'pass a string';
+  throw new Error(`${key} is required for action=${action} (${hint})`);
 }
 function frameEntries(tab) {
   const frames = tab.page.frames();
@@ -643,7 +649,9 @@ async function run(request) {
     case 'uncheck': await scope.locator(required(request,'selector')).uncheck(); break;
     case 'hover': await scope.locator(required(request,'selector')).hover(); break;
     case 'focus': await scope.locator(required(request,'selector')).focus(); break;
-    case 'wait': await scope.locator(required(request,'selector')).waitFor({state:request.state || 'visible'}); break;
+    case 'wait':
+      if (request.selector == null && request.target == null) throw new Error('wait needs a condition: selector, text, url, response or duration (milliseconds)');
+      await scope.locator(required(request,'selector')).waitFor({state:request.state || 'visible'}); break;
     case 'evidence': return {tab:request.tab,url:clip(page.url()),title:clip(await page.title()),console:tab.console,network:tab.network,dialogs:tab.dialogs,downloads:tab.downloads,navigation:tab.navigation,frames:frameEntries(tab)};
     case 'events': return {tab:request.tab,...tabEvents(tab,request.after)};
     case 'requests': {

@@ -268,6 +268,24 @@ fn name(args: &Value) -> Result<&str> {
     Ok(name)
 }
 
+/// Retained job names with their state, so a full registry can say which record to forget.
+fn retained_summary(dirs: &[PathBuf]) -> String {
+    dirs.iter()
+        .map(|dir| {
+            let name = dir
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let state = if dir.join("finished.json").exists() {
+                "finished"
+            } else {
+                "live"
+            };
+            format!("{name} ({state})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn job_dirs(registry: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(registry)? {
@@ -544,7 +562,8 @@ fn start_with_owner(
     let dirs = job_dirs(registry)?;
     ensure!(
         dirs.len() < MAX_JOBS,
-        "at most 8 retained durable jobs; kill a finished named job to forget its record"
+        "at most 8 retained durable jobs: {}. `bg kill` a finished job by name to forget its record",
+        retained_summary(&dirs)
     );
     let directory = registry.join(name);
     #[cfg(unix)]

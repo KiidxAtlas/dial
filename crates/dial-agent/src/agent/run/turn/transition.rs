@@ -159,6 +159,17 @@ impl TurnState<'_> {
         self.reset(Transition::ContextRewritten);
         engine.evidence_compacted();
     }
+
+    /// Compaction summarized older messages while possibly retaining a verbatim recent tail:
+    /// keep read-reuse and investigation entries whose tool results remain visible in full.
+    pub(super) fn context_compacted(
+        &mut self,
+        engine: &mut crate::agent::run::engine::Engine,
+        still_full: impl Fn(&str) -> bool,
+    ) {
+        self.reset(Transition::ContextRewritten);
+        engine.evidence_compacted_retaining(still_full);
+    }
 }
 
 impl Agent<'_> {

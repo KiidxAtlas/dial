@@ -14,6 +14,9 @@ pub struct Config {
     /// stalled todo updates), resume the model with a continue notice this many times per turn
     /// before asking the user for direction. 0 asks immediately.
     pub auto_continue_rounds: u32,
+    /// After repeated committed edits to one file without a passing check, ask the model to
+    /// reconsider and withhold further large whole-file writes to that file until a check passes.
+    pub edit_churn_guard: bool,
 }
 
 impl Default for Config {
@@ -24,6 +27,7 @@ impl Default for Config {
             examples: true,
             max_contract_failures: 3,
             auto_continue_rounds: 2,
+            edit_churn_guard: false,
         }
     }
 }

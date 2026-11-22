@@ -274,7 +274,7 @@ impl Agent<'_> {
                         .map(ControlFlow::Break);
                 }
                 turn.compaction_succeeded();
-                turn.context_rewritten(engine);
+                turn.context_compacted(engine, |id| self.holds_full_result(id));
                 turn.budget.give_back();
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }

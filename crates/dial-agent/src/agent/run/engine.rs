@@ -872,6 +872,14 @@ impl Engine {
         self.checkpoint.forget_evidence();
     }
 
+    /// Compaction that retains a verbatim recent tail keeps duplicate and read-reuse memory for
+    /// results still shown in full, while dropping pointers to summarized or pruned history.
+    pub fn evidence_compacted_retaining(&mut self, still_full: impl Fn(&str) -> bool) {
+        self.investigation.compact_retaining(&still_full);
+        self.returned_reads.retain_visible(&still_full);
+        self.checkpoint.forget_evidence();
+    }
+
     /// Witness readiness may come from any native source owner (including an error preview),
     /// not just a `read` call. Every file/range is checked against the current confined source.
     fn witnesses_ready_since_failure(

@@ -65,6 +65,15 @@ impl InvestigationGuard {
         self.observations.retain(|(_, id, _)| visible(id.as_str()));
     }
 
+    /// Retains observations whose results remain verbatim after compaction, resetting repeat streaks.
+    pub fn compact_retaining(&mut self, visible: impl Fn(&str) -> bool) {
+        self.retain_visible(visible);
+        for (_, _, repeats) in &mut self.observations {
+            *repeats = 0;
+        }
+        self.unchanged = 0;
+    }
+
     /// Releases all duplicate memory, e.g. after compaction rewrote the context.
     pub fn forget(&mut self) {
         self.observations.clear();
@@ -247,6 +256,16 @@ impl ReturnedReads {
         }
     }
 
+    /// Drops cached pointers and native coverage whose tool results are no longer shown in full.
+    pub fn retain_visible(&mut self, still_full: impl Fn(&str) -> bool) {
+        self.seen.retain(|_, (_, id)| still_full(id));
+        for runs in self.shown.values_mut() {
+            runs.retain(|(_, id)| still_full(id));
+        }
+        self.shown.retain(|_, runs| !runs.is_empty());
+        self.native.retain_visible(still_full);
+    }
+
     /// Pointer text to send instead of `text`, or None when the full result must be sent (and is recorded).
     /// A read is also answered by a pointer when every line it shows lies inside lines an earlier
     /// read of the same unchanged file returned, and those results are still shown in full.
@@ -370,6 +389,13 @@ impl ReadReuse {
         self.files.is_empty()
     }
 
+    pub fn retain_visible(&mut self, still_full: impl Fn(&str) -> bool) {
+        for runs in self.files.values_mut() {
+            runs.retain(|(_, id)| still_full(id));
+        }
+        self.files.retain(|_, runs| !runs.is_empty());
+    }
+
     fn remember(&mut self, call: &ToolCall, text: &str) {
         for (header, runs) in shown_runs(text) {
             let Some((path, _)) = header.rsplit_once('#') else {
@@ -417,6 +443,17 @@ impl ReadReuse {
         use serde_json::json;
         if self.is_empty() || args["fresh"].as_bool() == Some(true) {
             return read(args);
+        }
+        if args
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+            && args.get("path").is_none_or(serde_json::Value::is_null)
+            && args.get("format").is_none_or(serde_json::Value::is_null)
+        {
+            return self
+                .execute_paths(workspace, args, &mut read)
+                .unwrap_or_else(|| read(args));
         }
         let Some(selection) = workspace.native_read_selection(args) else {
             return self
@@ -621,6 +658,412 @@ impl ReadReuse {
         }}));
         Some(output)
     }
+
+    /// Reuse or narrow each target of a batched `read(paths: [...])` call. Targets without visible
+    /// coverage pass through unchanged; racing edits or budget omissions fall back to `read(args)`.
+    fn execute_paths(
+        &self,
+        workspace: &crate::tools::Workspace,
+        args: &serde_json::Value,
+        read: &mut impl FnMut(&serde_json::Value) -> crate::runtime::tool_output::ToolOutput,
+    ) -> Option<crate::runtime::tool_output::ToolOutput> {
+        use crate::runtime::tool_output::ToolOutput;
+        use serde_json::{Value, json};
+        let targets: Vec<&str> = args["paths"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        if targets.is_empty() || targets.len() > 16 {
+            return None;
+        }
+        let has_outer_window = args.get("offset").is_some_and(|v| !v.is_null())
+            || args.get("limit").is_some_and(|v| !v.is_null());
+        let mut base_single = args.clone();
+        base_single.as_object_mut()?.remove("paths");
+
+        enum TargetPlan {
+            Passthrough,
+            Unchanged {
+                path: String,
+                revision: String,
+                ranges: Vec<(u32, u32)>,
+                covered: Vec<Value>,
+                missing: Vec<(u32, u32)>,
+                narrowed_path: Option<String>,
+            },
+            Delta {
+                path: String,
+                revision: String,
+                covered: Vec<Value>,
+                missing: Vec<(u32, u32)>,
+                note: String,
+                narrowed_path: Option<String>,
+            },
+        }
+
+        let mut plans = Vec::with_capacity(targets.len());
+        let mut any_reused = false;
+        let mut any_passthrough = false;
+        let mut any_narrowed = false;
+        let mut any_delta = false;
+
+        for &target in &targets {
+            let mut entry_args = base_single.clone();
+            entry_args["path"] = json!(target);
+            let plan = if let Some(selection) = workspace.native_read_selection(&entry_args)
+                && let Some(known) = self
+                    .files
+                    .get(&(selection.path.clone(), selection.revision.clone()))
+            {
+                let mut missing = Vec::new();
+                let mut covered = Vec::new();
+                let mut witness_missing = false;
+                for &(first, last) in &selection.ranges {
+                    let mut next = first;
+                    while next <= last {
+                        if let Some(((.., end), id)) = known
+                            .iter()
+                            .filter(|((start, end), _)| *start <= next && next <= *end)
+                            .max_by_key(|((_, end), _)| *end)
+                        {
+                            let end = (*end).min(last);
+                            if !selection
+                                .witnessed_ranges
+                                .iter()
+                                .any(|&(from, to)| from <= next && end <= to)
+                            {
+                                witness_missing = true;
+                                break;
+                            }
+                            covered.push(json!({"path": selection.path, "range": [next, end], "call_id": id}));
+                            next = end + 1;
+                        } else {
+                            let end = known
+                                .iter()
+                                .filter(|((start, _), _)| *start > next)
+                                .map(|((start, _), _)| start - 1)
+                                .min()
+                                .unwrap_or(last)
+                                .min(last);
+                            missing.push((next, end));
+                            next = end + 1;
+                        }
+                    }
+                    if witness_missing {
+                        break;
+                    }
+                }
+                if witness_missing || covered.is_empty() {
+                    TargetPlan::Passthrough
+                } else if missing.is_empty() {
+                    TargetPlan::Unchanged {
+                        path: selection.path,
+                        revision: selection.revision,
+                        ranges: selection.ranges,
+                        covered,
+                        missing,
+                        narrowed_path: None,
+                    }
+                } else {
+                    let ranges_spec = missing
+                        .iter()
+                        .map(|(first, last)| format!("{first}-{last}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let narrowed_path = format!("{}:{ranges_spec}", selection.path);
+                    if workspace.resolve_read_target(&narrowed_path).ok()
+                        == workspace.resolve_read_target(&selection.path).ok()
+                    {
+                        TargetPlan::Unchanged {
+                            path: selection.path,
+                            revision: selection.revision,
+                            ranges: selection.ranges,
+                            covered,
+                            missing,
+                            narrowed_path: Some(narrowed_path),
+                        }
+                    } else {
+                        TargetPlan::Passthrough
+                    }
+                }
+            } else {
+                // Check for a delta against a visible earlier revision of this target.
+                let mut probe = entry_args.clone();
+                if entry_args.get("offset").is_none_or(Value::is_null)
+                    && entry_args.get("limit").is_none_or(Value::is_null)
+                {
+                    probe["limit"] = json!(2000);
+                }
+                let delta_plan = workspace
+                    .native_read_selection(&probe)
+                    .map(|sel| sel.path)
+                    .and_then(|target_path| {
+                        let (earlier_revision, plan) = self
+                            .files
+                            .range((target_path.clone(), String::new())..)
+                            .take_while(|((path, _), _)| *path == target_path)
+                            .find_map(|((_, rev), runs)| {
+                                workspace
+                                    .read_delta_plan(&entry_args, rev, runs)
+                                    .map(|plan| (rev.clone(), plan))
+                            })?;
+                        let note = plan.note(&earlier_revision);
+                        let covered: Vec<_> = plan
+                            .covered
+                            .iter()
+                            .map(|run| {
+                                json!({
+                                    "path": plan.path,
+                                    "range": [run.current.0, run.current.1],
+                                    "earlier_range": [run.earlier.0, run.earlier.1],
+                                    "call_id": run.call_id,
+                                })
+                            })
+                            .collect();
+                        let narrowed_path = if plan.missing.is_empty() {
+                            None
+                        } else {
+                            let ranges_spec = plan
+                                .missing
+                                .iter()
+                                .map(|(first, last)| format!("{first}-{last}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let narrowed_path = format!("{target_path}:{ranges_spec}");
+                            if workspace.resolve_read_target(&narrowed_path).ok()
+                                != workspace.resolve_read_target(&target_path).ok()
+                            {
+                                return None;
+                            }
+                            Some(narrowed_path)
+                        };
+                        Some(TargetPlan::Delta {
+                            path: plan.path,
+                            revision: plan.revision,
+                            covered,
+                            missing: plan.missing,
+                            note,
+                            narrowed_path,
+                        })
+                    });
+                delta_plan.unwrap_or(TargetPlan::Passthrough)
+            };
+            match &plan {
+                TargetPlan::Passthrough => any_passthrough = true,
+                TargetPlan::Unchanged { narrowed_path, .. } => {
+                    any_reused = true;
+                    any_narrowed |= narrowed_path.is_some();
+                }
+                TargetPlan::Delta { narrowed_path, .. } => {
+                    any_reused = true;
+                    any_delta = true;
+                    any_narrowed |= narrowed_path.is_some();
+                }
+            }
+            plans.push(plan);
+        }
+
+        if !any_reused || (has_outer_window && any_passthrough && any_narrowed) {
+            return None;
+        }
+
+        let mut all_covered = Vec::new();
+        let mut all_missing = Vec::new();
+        let mut all_ids = std::collections::BTreeSet::new();
+        let mut effective_targets: Vec<String> = Vec::new();
+        let mut expected_revisions: Vec<(String, String)> = Vec::new();
+        let mut reuse_notes: Vec<String> = Vec::new();
+        let mut delta_notes: Vec<String> = Vec::new();
+        let unchanged_only = !any_passthrough && !any_delta && !any_narrowed;
+        let mut total_unchanged_bytes: usize = 0;
+
+        for (target, plan) in targets.iter().zip(plans) {
+            match plan {
+                TargetPlan::Passthrough => {
+                    effective_targets.push((*target).to_owned());
+                }
+                TargetPlan::Unchanged {
+                    path,
+                    revision,
+                    ranges,
+                    covered,
+                    missing,
+                    narrowed_path,
+                } => {
+                    if unchanged_only {
+                        let header = format!("[Source raw SHA256:{revision}]\n").len();
+                        let source = workspace
+                            .resolve_read_target(&path)
+                            .ok()
+                            .and_then(|resolved| std::fs::read(resolved).ok())?;
+                        total_unchanged_bytes = total_unchanged_bytes
+                            .saturating_add(header + requested_bytes(&source, &ranges));
+                    }
+                    let summary = covered
+                        .iter()
+                        .map(|part| {
+                            let id = part["call_id"].as_str().unwrap_or("");
+                            all_ids.insert(id.to_owned());
+                            format!(
+                                "{path}:{}-{} (call {id})",
+                                part["range"][0], part["range"][1]
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    all_covered.extend(covered);
+                    if let Some(narrowed) = narrowed_path {
+                        let missing_spec = missing
+                            .iter()
+                            .map(|(first, last)| format!("{first}-{last}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        reuse_notes.push(format!(
+                            "{summary} already visible; read only {path}:{missing_spec}"
+                        ));
+                        all_missing.extend(missing);
+                        effective_targets.push(narrowed);
+                        expected_revisions.push((path, revision));
+                    } else {
+                        reuse_notes.push(format!("{summary} already visible"));
+                    }
+                }
+                TargetPlan::Delta {
+                    path,
+                    revision,
+                    covered,
+                    missing,
+                    note,
+                    narrowed_path,
+                } => {
+                    for part in &covered {
+                        if let Some(id) = part["call_id"].as_str() {
+                            all_ids.insert(id.to_owned());
+                        }
+                    }
+                    all_covered.extend(covered);
+                    all_missing.extend(missing);
+                    delta_notes.push(note);
+                    if let Some(narrowed) = narrowed_path {
+                        effective_targets.push(narrowed);
+                        expected_revisions.push((path, revision));
+                    }
+                }
+            }
+        }
+
+        if effective_targets.is_empty() {
+            if unchanged_only {
+                let ids = all_ids.into_iter().collect::<Vec<_>>().join(", ");
+                let pointer = format!(
+                    "{UNCHANGED_READ} Source SHA-256 revalidated; requested rows are already in visible tool call(s) {ids}. No native read executed; reuse that evidence."
+                );
+                if pointer.len() >= total_unchanged_bytes {
+                    return None;
+                }
+                let mut output = ToolOutput::ok(pointer);
+                output.data = Some(json!({"read_reuse": {
+                    "covered": all_covered,
+                    "executed_ranges": all_missing,
+                    "fully_reused": true,
+                }}));
+                return Some(output);
+            }
+            let mut sections = Vec::new();
+            if !reuse_notes.is_empty() {
+                sections.push(format!("[Read reuse] {}.", reuse_notes.join("; ")));
+            }
+            sections.extend(delta_notes);
+            let mut output = ToolOutput::ok(sections.join("\n"));
+            output.data = Some(json!({"read_reuse": {
+                "covered": all_covered,
+                "executed_ranges": all_missing,
+                "fully_reused": true,
+                "delta": any_delta,
+            }}));
+            return Some(output);
+        }
+
+        let mut narrowed_args = args.clone();
+        let object = narrowed_args.as_object_mut()?;
+        if any_narrowed {
+            object.remove("offset");
+            object.remove("limit");
+        }
+        object.insert("paths".into(), json!(effective_targets));
+        let mut output = read(&narrowed_args);
+        if output.is_error {
+            return Some(output);
+        }
+        let revisions = section_revisions(&output.text);
+        for (path, expected) in &expected_revisions {
+            if revisions.get(path.as_str()).copied() != Some(expected.as_str()) {
+                // An external edit raced or the shared budget omitted a narrowed section.
+                return None;
+            }
+        }
+        if !reuse_notes.is_empty() {
+            output
+                .text
+                .push_str(&format!("\n[Read reuse] {}.", reuse_notes.join("; ")));
+        }
+        for note in delta_notes {
+            output.text.push('\n');
+            output.text.push_str(&note);
+        }
+        let reuse_meta = json!({
+            "covered": all_covered,
+            "executed_ranges": all_missing,
+            "fully_reused": false,
+            "delta": any_delta,
+        });
+        match output.data.as_mut().and_then(Value::as_object_mut) {
+            Some(map) => {
+                map.insert("read_reuse".into(), reuse_meta);
+            }
+            None => {
+                output.data = Some(json!({"read_reuse": reuse_meta}));
+            }
+        }
+        Some(output)
+    }
+}
+
+/// Authenticated `[path#TAG]` -> `[Source raw SHA256:...]` pairs parsed from native section headers.
+/// Source rows always start with a line number, so source text cannot spoof column-0 headers.
+fn section_revisions(text: &str) -> std::collections::HashMap<String, &str> {
+    let mut out = std::collections::HashMap::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(header) = source_header(line) else {
+            continue;
+        };
+        let Some((raw_path, _)) = header.rsplit_once('#') else {
+            continue;
+        };
+        let Some(next) = lines.peek().copied() else {
+            break;
+        };
+        let Some(rev) = next
+            .strip_prefix("[Source raw SHA256:")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .filter(|rev| rev.len() == 64 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            continue;
+        };
+        lines.next();
+        let path = if raw_path.starts_with('"') {
+            let Ok(decoded) = serde_json::from_str::<String>(raw_path) else {
+                continue;
+            };
+            decoded
+        } else {
+            raw_path.to_owned()
+        };
+        out.insert(path, rev);
+    }
+    out
 }
 
 /// Bytes of the requested 1-based inclusive line ranges in `source`.

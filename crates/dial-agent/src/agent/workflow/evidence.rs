@@ -497,10 +497,186 @@ fn pruned_form(message: &Value, calls: &HashMap<String, Value>) -> Option<Value>
     Some(pruned)
 }
 
-/// The history a summarizer reads before it folds older turns. Every eligible old observation takes the
-/// same pointer that pressure pruning would write, because the fold replaces that turn with a summary and
-/// the full output stays retrievable from its artifact. The rule is stateless: the same history always
-/// yields the same summarizer input, and results below `PRUNE_MIN_TOKENS` or without an artifact are kept.
+/// Compact bounded location summary for the compaction summarizer so folding a large `read`,
+/// `grep`, `find` or `glob` preserves exact file paths and line ranges instead of blinding
+/// post-compaction turns. Returns `None` for unstructured text (keeping `prune_pointer` exact).
+fn summarize_locations(tool: &str, text: &str) -> Option<String> {
+    const MAX_ITEMS: usize = 8;
+    const MAX_BYTES: usize = 240;
+    let mut items: Vec<String> = Vec::new();
+    let mut overflow = 0usize;
+    match tool {
+        "read" => {
+            let mut current_path: Option<String> = None;
+            let mut first_line: Option<u32> = None;
+            let mut last_line: Option<u32> = None;
+            let flush = |items: &mut Vec<String>,
+                         overflow: &mut usize,
+                         path: &mut Option<String>,
+                         first: &mut Option<u32>,
+                         last: &mut Option<u32>| {
+                if let Some(p) = path.take() {
+                    let entry = match (first.take(), last.take()) {
+                        (Some(a), Some(b)) if a == b => format!("{p}:{a}"),
+                        (Some(a), Some(b)) => format!("{p}:{a}-{b}"),
+                        _ => p,
+                    };
+                    if items.len() < MAX_ITEMS {
+                        items.push(entry);
+                    } else {
+                        *overflow += 1;
+                    }
+                }
+            };
+            for line in text.lines() {
+                if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                    && let Some((path, tag)) = inner.rsplit_once('#')
+                    && !path.is_empty()
+                    && tag.len() == 4
+                    && tag.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    flush(
+                        &mut items,
+                        &mut overflow,
+                        &mut current_path,
+                        &mut first_line,
+                        &mut last_line,
+                    );
+                    let decoded = if path.starts_with('"') {
+                        serde_json::from_str::<String>(path).unwrap_or_else(|_| path.to_owned())
+                    } else {
+                        path.to_owned()
+                    };
+                    current_path = Some(decoded);
+                    continue;
+                }
+                if current_path.is_some()
+                    && let Some((num, _)) = line.split_once(':')
+                    && !num.is_empty()
+                    && let Ok(n) = num.parse::<u32>()
+                    && n > 0
+                {
+                    first_line.get_or_insert(n);
+                    last_line = Some(n);
+                }
+            }
+            flush(
+                &mut items,
+                &mut overflow,
+                &mut current_path,
+                &mut first_line,
+                &mut last_line,
+            );
+        }
+        "grep" | "find" => {
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            let mut index: HashMap<String, usize> = HashMap::new();
+            for line in text.lines() {
+                if line.starts_with('[') {
+                    continue;
+                }
+                let found = line.char_indices().find_map(|(i, c)| {
+                    if !matches!(c, ':' | '-') || i == 0 {
+                        return None;
+                    }
+                    let rest = &line[i + 1..];
+                    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    if digits == 0 || !rest[digits..].starts_with([':', '-']) {
+                        return None;
+                    }
+                    Some(&line[..i])
+                });
+                let Some(raw) = found else {
+                    continue;
+                };
+                let clean = raw
+                    .strip_prefix("@f")
+                    .and_then(|rest| rest.split_once('('))
+                    .and_then(|(_, inner)| inner.strip_suffix(')'))
+                    .unwrap_or(raw);
+                if let Some(&pos) = index.get(clean) {
+                    counts[pos].1 += 1;
+                } else if counts.len() < MAX_ITEMS {
+                    index.insert(clean.to_owned(), counts.len());
+                    counts.push((clean.to_owned(), 1));
+                } else {
+                    overflow += 1;
+                }
+            }
+            items = counts
+                .into_iter()
+                .map(|(path, count)| format!("{path} ({count})"))
+                .collect();
+        }
+        "glob" => {
+            let mut total = 0usize;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('[') {
+                    continue;
+                }
+                // Skip synthetic single-line blobs without path separators or extensions.
+                if !trimmed.contains('/') && !trimmed.contains('.') {
+                    continue;
+                }
+                total += 1;
+                if items.len() < 6 {
+                    items.push(trimmed.to_owned());
+                }
+            }
+            overflow = total.saturating_sub(items.len());
+        }
+        _ => return None,
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        let sep = if idx == 0 { "" } else { ", " };
+        if !out.is_empty() && out.len() + sep.len() + item.len() > MAX_BYTES {
+            overflow += items.len() - idx;
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(item);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if overflow > 0 {
+        out.push_str(&format!(" (+{overflow} more)"));
+    }
+    Some(out)
+}
+
+fn summarizer_pruned_form(message: &Value, calls: &HashMap<String, Value>) -> Option<Value> {
+    if message["role"] != "tool" || !successful(message) {
+        return None;
+    }
+    let artifact = message["dial_evidence"]["artifact"].as_str()?;
+    let tool = calls.get(&result_id(message))?[0].as_str()?;
+    let text = message["content"].as_str().unwrap_or("");
+    let bytes = text.len();
+    let pointer = match summarize_locations(tool, text) {
+        Some(locations) => format!(
+            "[Older {tool} result omitted to save context ({bytes} bytes). Locations: {locations}. Full output: {artifact}; retrieve with read]"
+        ),
+        None => prune_pointer(tool, bytes, artifact),
+    };
+    let mut pruned = message.clone();
+    pruned["content"] = json!(pointer);
+    if let Some(object) = pruned.as_object_mut() {
+        object.remove("dial_images");
+    }
+    Some(pruned)
+}
+
+/// The history a summarizer reads before it folds older turns. Every eligible old observation takes a
+/// compact pointer (preserving file/range locations when present), because the fold replaces that
+/// turn with a summary and the full output stays retrievable from its artifact. The rule is stateless:
+/// the same history always yields the same summarizer input, and results below `PRUNE_MIN_TOKENS` or
+/// without an artifact are kept.
 pub(in crate::agent) fn summarizer_view(messages: &[Value]) -> Vec<Value> {
     let calls = observation_calls(messages);
     messages
@@ -509,13 +685,12 @@ pub(in crate::agent) fn summarizer_view(messages: &[Value]) -> Vec<Value> {
             if estimate(message) < PRUNE_MIN_TOKENS {
                 return message.clone();
             }
-            pruned_form(message, &calls)
+            summarizer_pruned_form(message, &calls)
                 .filter(|pruned| estimate(pruned) < estimate(message))
                 .unwrap_or_else(|| message.clone())
         })
         .collect()
 }
-
 pub fn working_schema() -> Value {
     super::working_state::schema()
 }

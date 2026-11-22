@@ -841,6 +841,21 @@ impl Workspace {
         edit::hashline::changed_observations(self)
     }
 
+    pub(crate) fn snapshot_command_observations(
+        &self,
+        cwd: &Path,
+        command: &str,
+    ) -> edit::hashline::CommandObservationSnapshot {
+        edit::hashline::snapshot_command_observations(self, cwd, command)
+    }
+
+    pub(crate) fn acknowledge_command_observations(
+        &self,
+        snapshot: &edit::hashline::CommandObservationSnapshot,
+    ) {
+        edit::hashline::acknowledge_command_observations(self, snapshot);
+    }
+
     /// Every root this workspace may touch: the primary root first, then the
     /// additional roots attached with `with_additional_roots`.
     pub fn roots(&self) -> impl Iterator<Item = &Path> {

@@ -923,3 +923,47 @@ fn summarizer_input_keeps_failed_and_artifactless_observations_verbatim() {
         "no artifact, no pointer"
     );
 }
+
+#[test]
+fn summarizer_view_preserves_compact_file_and_range_locations_for_reads_and_searches() {
+    let read_body = format!(
+        "[src/alpha.rs#1A2B]\n[Source raw SHA256:{}]\n{}\n[src/beta.rs#3C4D]\n[Source raw SHA256:{}]\n{}",
+        "a".repeat(64),
+        (10..=140)
+            .map(|n| format!("{n}:let value_{n} = \"{}\";\n", "x".repeat(40)))
+            .collect::<String>(),
+        "b".repeat(64),
+        (50..=90)
+            .map(|n| format!("{n}:fn helper_{n}() {{ /* {} */ }}\n", "y".repeat(40)))
+            .collect::<String>(),
+    );
+    let grep_body = (1..=120)
+        .map(|n| {
+            let file = if n <= 80 {
+                "src/engine.rs"
+            } else {
+                "@f4(src/dispatch.rs)"
+            };
+            format!("{file}:{n}:matched line {}\n", "z".repeat(40))
+        })
+        .collect::<String>();
+    let mut m = vec![json!({"role":"user","content":"task"})];
+    m.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"r1","function":{"name":"read","arguments":"{}"}}]}));
+    m.push(json!({"role":"tool","tool_call_id":"r1","content":read_body,"dial_evidence":{"artifact":"artifact://r1"}}));
+    m.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"g1","function":{"name":"grep","arguments":"{}"}}]}));
+    m.push(json!({"role":"tool","tool_call_id":"g1","content":grep_body,"dial_evidence":{"artifact":"artifact://g1"}}));
+
+    let view = summarizer_view(&m);
+    let r1 = content(&view, "r1");
+    assert!(
+        r1.contains("Locations: src/alpha.rs:10-140, src/beta.rs:50-90."),
+        "{r1}"
+    );
+    assert!(r1.contains("artifact://r1"), "{r1}");
+    let g1 = content(&view, "g1");
+    assert!(
+        g1.contains("Locations: src/engine.rs (80), src/dispatch.rs (40)."),
+        "{g1}"
+    );
+    assert!(g1.contains("artifact://g1"), "{g1}");
+}

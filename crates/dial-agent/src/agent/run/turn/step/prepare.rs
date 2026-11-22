@@ -437,7 +437,7 @@ impl Agent<'_> {
                             Ok(Some(outcome)) => {
                                 if !outcome.continue_allowed { return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished).map(ControlFlow::Break); }
                                 turn.compaction_succeeded();
-                                turn.context_rewritten(engine);
+                                turn.context_compacted(engine, |id| self.holds_full_result(id));
                                 turn.budget.give_back();
                                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                             }
@@ -517,7 +517,7 @@ impl Agent<'_> {
                     // after subsequent tool results in this same autonomous turn.
                     turn.compaction_succeeded();
                     self.compaction_retry_carry = None;
-                    turn.context_rewritten(engine);
+                    turn.context_compacted(engine, |id| self.holds_full_result(id));
                     turn.budget.give_back();
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }

@@ -604,7 +604,10 @@ impl Agent<'_> {
                 })
             });
         // A failed mutation that committed nothing is still a repeated attempt on that file.
-        if output.is_error
+        // Nothing is recorded while the guard is off, so it can neither advise nor withhold a write.
+        let churn_guard = self.config.reliability.edit_churn_guard;
+        if churn_guard
+            && output.is_error
             && changed.is_empty()
             && matches!(call.name.as_str(), "edit" | "write" | "ast_edit")
             && let Some(path) = call.arguments["path"]
@@ -613,7 +616,7 @@ impl Agent<'_> {
         {
             turn.edit_churn.observe_failed(&self.workspace.rel(&path));
         }
-        if let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
+        if churn_guard && let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,
                 "Repeated edits to one file without a passing check; asking the model to reconsider",

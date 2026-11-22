@@ -292,3 +292,33 @@ fn completed_script_keeps_exit_facts_when_cleanup_is_uncertain() {
         assert_eq!(output.is_error, termination.uncertain());
     }
 }
+
+#[cfg(feature = "embedded-shell")]
+#[test]
+fn self_caused_bash_write_does_not_trigger_changed_observations_notice() {
+    let (_dir, ws) = unsandboxed();
+    let target = ws.root().join("preview.html");
+    std::fs::write(&target, "old\n").unwrap();
+    let read = crate::tools::execute(&ws, "read", &json!({"path": "preview.html"}), 10);
+    assert!(!read.is_error, "{}", read.text);
+
+    let cancel = AtomicBool::new(false);
+    let out = run_with(
+        &ws,
+        json!({"command": "printf 'new\\n' > preview.html"}),
+        10,
+        &cancel,
+    )
+    .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        ws.changed_observations().is_empty(),
+        "self-caused bash write should not trigger a peer-change notice"
+    );
+    assert!(
+        ws.store()
+            .check_ranges(&target, "new\n", &[(1, 1)])
+            .is_err(),
+        "acknowledging a bash write must not grant stale edit witnesses"
+    );
+}

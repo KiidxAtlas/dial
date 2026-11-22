@@ -515,7 +515,20 @@ pub(crate) fn prepare_for_target(
                 continue;
             }
             match image_part(reference) {
-                Ok(part) => parts.push(part),
+                Ok(part) => {
+                    // Label explicit user files by filename, not by their local directory.
+                    if message["role"] == "user"
+                        && reference["show_path"] == true
+                        && let Some(path) = reference["path"].as_str()
+                        && let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str())
+                    {
+                        let label = json!(name);
+                        parts.push(
+                            json!({"type":"text","text":format!("[Attached image file: {label}]")}),
+                        );
+                    }
+                    parts.push(part);
+                }
                 Err(error) => {
                     let reason = format!("image {path} skipped: {error}");
                     failures.push((failure_key(reference, &reason), reason));

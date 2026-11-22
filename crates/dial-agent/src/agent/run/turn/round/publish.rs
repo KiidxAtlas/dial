@@ -159,6 +159,7 @@ impl Agent<'_> {
             let mut observation = call.arguments.clone();
             if let Some(args) = observation.as_object_mut() {
                 args.remove("i");
+                args.remove("fresh");
             }
             message["dial_evidence"]["observation"] = json!(observation.to_string());
         }

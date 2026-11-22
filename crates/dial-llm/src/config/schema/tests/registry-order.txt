@@ -193,6 +193,7 @@ assistance.teacher_enabled
 assistance.teacher_timeout_secs
 reliability.enabled
 reliability.auto_continue_rounds
+reliability.edit_churn_guard
 reliability.measured_interfaces
 reliability.examples
 reliability.max_contract_failures

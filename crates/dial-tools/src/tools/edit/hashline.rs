@@ -3308,8 +3308,235 @@ fn invalidates_seen(before: &str, after: &str, seen: &Seen) -> bool {
     translate(&mut anchors, &map, current.len()).is_err()
 }
 
-pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
+fn is_ephemeral_observation_path(relative: &Path) -> bool {
+    relative
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some(".tmp" | ".dial-tmp")))
+}
+
+fn observe_disk_file(
+    ws: &Workspace,
+    relative: &Path,
+    expected: [u8; 32],
+    before: &str,
+    seen: &Seen,
+    remaining: &mut usize,
+) -> Option<DiskObservation> {
     use std::io::Read;
+
+    let observed = (|| -> std::io::Result<Option<DiskObservation>> {
+        let file = crate::platform::fs::open_beneath(ws.root(), relative, false)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > OBSERVATION_FILE_BYTES as u64 {
+            return Ok(None);
+        }
+        // The extra byte detects growth after metadata without unbounded allocation/I/O.
+        let limit = (OBSERVATION_FILE_BYTES + 1).min(*remaining);
+        let mut bytes = Vec::new();
+        let read = file.take(limit as u64).read_to_end(&mut bytes);
+        *remaining -= bytes.len();
+        read?;
+        if bytes.len() > OBSERVATION_FILE_BYTES
+            || bytes.len() < metadata.len() as usize
+            || (bytes.len() == limit && limit <= OBSERVATION_FILE_BYTES)
+        {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let normalized = normalize(text);
+        let digest = Sha256::digest(normalized.as_bytes()).into();
+        Ok(Some(DiskObservation::Content(
+            if digest == expected || invalidates_seen(before, &normalized, seen) {
+                digest
+            } else {
+                expected
+            },
+        )))
+    })();
+    match observed {
+        Ok(Some(observed)) => Some(observed),
+        Ok(None) => None,
+        Err(error) => Some(DiskObservation::Unavailable(error.kind())),
+    }
+}
+
+struct CommandObservationEntry {
+    path: PathBuf,
+    expected: [u8; 32],
+    observation_id: u64,
+    before: std::sync::Arc<str>,
+    seen: Seen,
+    pre: DiskObservation,
+}
+
+/// Pre-command observation state for previously read files that a local shell command references.
+#[derive(Default)]
+pub(crate) struct CommandObservationSnapshot {
+    entries: Vec<CommandObservationEntry>,
+}
+
+fn command_references_path(ws_root: &Path, cwd: &Path, path: &Path, command: &str) -> bool {
+    if let Ok(rel_cwd) = path.strip_prefix(cwd)
+        && let Some(text) = rel_cwd.to_str()
+        && !text.is_empty()
+        && command.contains(text)
+    {
+        return true;
+    }
+    if let Ok(rel_root) = path.strip_prefix(ws_root)
+        && let Some(text) = rel_root.to_str()
+        && !text.is_empty()
+        && command.contains(text)
+    {
+        return true;
+    }
+    if path.starts_with(cwd) {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && !name.is_empty()
+            && command.contains(name)
+        {
+            return true;
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| *parent != cwd && *parent != ws_root)
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            && !parent.is_empty()
+            && command.contains(parent)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Captures pre-command disk state for previously observed files referenced by `command` so
+/// self-caused shell writes do not later emit spurious peer-change notices.
+pub(crate) fn snapshot_command_observations(
+    ws: &Workspace,
+    cwd: &Path,
+    command: &str,
+) -> CommandObservationSnapshot {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let candidates = {
+        let store = ws.store();
+        let mut out = Vec::new();
+        for path in store.lru.iter().rev().take(OBSERVATION_FILES) {
+            let Ok(relative) = path.strip_prefix(ws.root()) else {
+                continue;
+            };
+            if is_ephemeral_observation_path(relative)
+                || !command_references_path(ws.root(), cwd, path, command)
+            {
+                continue;
+            }
+            let Some(snapshot) = store.files.get(path).and_then(|s| s.last()) else {
+                continue;
+            };
+            if snapshot.raw_revision.is_some()
+                || ext_of(path) == "ipynb"
+                || snapshot.text.len() > OBSERVATION_FILE_BYTES
+                || snapshot.seen.0.is_empty()
+            {
+                continue;
+            }
+            out.push((
+                path.clone(),
+                snapshot.digest,
+                snapshot.observation_id,
+                snapshot.text.clone(),
+                snapshot.seen.clone(),
+            ));
+        }
+        out
+    };
+    let mut remaining = OBSERVATION_BYTES;
+    let mut entries = Vec::new();
+    for (path, expected, id, before, seen) in candidates {
+        if remaining == 0 || started.elapsed() >= Duration::from_millis(25) {
+            break;
+        }
+        let Ok(relative) = path.strip_prefix(ws.root()) else {
+            continue;
+        };
+        if ws.is_protected(&path) || ws.resolve(&path.to_string_lossy()).is_err() {
+            continue;
+        }
+        let Some(pre) = observe_disk_file(ws, relative, expected, &before, &seen, &mut remaining)
+        else {
+            continue;
+        };
+        entries.push(CommandObservationEntry {
+            path,
+            expected,
+            observation_id: id,
+            before,
+            seen,
+            pre,
+        });
+    }
+    CommandObservationSnapshot { entries }
+}
+
+/// Records post-command disk observations for files whose state changed during this session's
+/// own shell command. Never updates edit witnesses (`store.files`), so stale edits still fail.
+pub(crate) fn acknowledge_command_observations(
+    ws: &Workspace,
+    snapshot: &CommandObservationSnapshot,
+) {
+    use std::time::{Duration, Instant};
+
+    if snapshot.entries.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut remaining = OBSERVATION_BYTES;
+    for entry in &snapshot.entries {
+        if remaining == 0 || started.elapsed() >= Duration::from_millis(25) {
+            break;
+        }
+        let Ok(relative) = entry.path.strip_prefix(ws.root()) else {
+            continue;
+        };
+        if ws.is_protected(&entry.path) || ws.resolve(&entry.path.to_string_lossy()).is_err() {
+            continue;
+        }
+        let Some(after) = observe_disk_file(
+            ws,
+            relative,
+            entry.expected,
+            &entry.before,
+            &entry.seen,
+            &mut remaining,
+        ) else {
+            continue;
+        };
+        if after == entry.pre {
+            continue;
+        }
+        let mut store = ws.store();
+        if store
+            .files
+            .get(&entry.path)
+            .and_then(|s| s.last())
+            .map(|s| s.observation_id)
+            != Some(entry.observation_id)
+        {
+            continue;
+        }
+        if after == DiskObservation::Content(entry.expected) {
+            store.observations.remove(&entry.path);
+        } else {
+            store.observations.insert(entry.path.clone(), after);
+        }
+    }
+}
+
+pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
     use std::time::{Duration, Instant};
 
     let started = Instant::now();
@@ -3363,44 +3590,17 @@ pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
         let Ok(relative) = path.strip_prefix(ws.root()) else {
             continue;
         };
+        if is_ephemeral_observation_path(relative) {
+            continue;
+        }
         // Revalidate policy before opening; no returned name or source for private paths.
         if ws.is_protected(&path) || ws.resolve(&path.to_string_lossy()).is_err() {
             continue;
         }
-        let observed = (|| -> std::io::Result<Option<DiskObservation>> {
-            let file = crate::platform::fs::open_beneath(ws.root(), relative, false)?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file() || metadata.len() > OBSERVATION_FILE_BYTES as u64 {
-                return Ok(None);
-            }
-            // The extra byte detects growth after metadata without unbounded allocation/I/O.
-            let limit = (OBSERVATION_FILE_BYTES + 1).min(remaining);
-            let mut bytes = Vec::new();
-            let read = file.take(limit as u64).read_to_end(&mut bytes);
-            remaining -= bytes.len();
-            read?;
-            if bytes.len() > OBSERVATION_FILE_BYTES
-                || bytes.len() < metadata.len() as usize
-                || (bytes.len() == limit && limit <= OBSERVATION_FILE_BYTES)
-            {
-                return Ok(None);
-            }
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-            let normalized = normalize(text);
-            let digest = Sha256::digest(normalized.as_bytes()).into();
-            Ok(Some(DiskObservation::Content(
-                if digest == expected || invalidates_seen(&before, &normalized, &seen) {
-                    digest
-                } else {
-                    expected
-                },
-            )))
-        })();
-        let observed = match observed {
-            Ok(Some(observed)) => observed,
-            Ok(None) => continue,
-            Err(error) => DiskObservation::Unavailable(error.kind()),
+        let Some(observed) =
+            observe_disk_file(ws, relative, expected, &before, &seen, &mut remaining)
+        else {
+            continue;
         };
         let mut store = ws.store();
         // A concurrent native read/edit supersedes this poll, even for identical text.
