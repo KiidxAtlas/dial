@@ -146,6 +146,43 @@ fn validation_launch_gap(call: &ToolCall, output: &ToolOutput) -> bool {
         })
 }
 
+/// Provenance boundary distinguishing explicit verification receipts from heuristic shell-command
+/// matching. Only explicit receipts (`bash check:true`, configured verification commands, or
+/// controller-issued `focused-check:*` runs) declare intent without scraping command text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) enum CheckReceiptSource {
+    FocusedCheck,
+    ConfiguredCommand,
+    ExplicitBashCheck,
+    HeuristicShellCommand,
+}
+
+impl CheckReceiptSource {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::agent) fn is_explicit_receipt(self) -> bool {
+        !matches!(self, Self::HeuristicShellCommand)
+    }
+}
+
+/// Classify whether a shell tool call is an explicit check receipt or a heuristic check command.
+pub(in crate::agent) fn classify_check_source(
+    call: &ToolCall,
+    configured: &[crate::config::types::VerificationCommand],
+) -> Option<CheckReceiptSource> {
+    let command = call.arguments["command"].as_str()?;
+    if call.id.starts_with("focused-check:") {
+        Some(CheckReceiptSource::FocusedCheck)
+    } else if configured.iter().any(|check| check.command == command) {
+        Some(CheckReceiptSource::ConfiguredCommand)
+    } else if call.arguments["check"] == true {
+        Some(CheckReceiptSource::ExplicitBashCheck)
+    } else if is_check_command(command) {
+        Some(CheckReceiptSource::HeuristicShellCommand)
+    } else {
+        None
+    }
+}
+
 /// Why a declared input witness could not be observed. Never a code-failure diagnosis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckInputError {
@@ -427,10 +464,12 @@ impl<'a> Agent<'a> {
             .commands
             .iter()
             .find(|check| check.command == command);
-        if configured.is_none()
-            && !is_check_command(command)
-            && !call.id.starts_with("focused-check:")
-        {
+        let Some(source) = classify_check_source(call, &self.config.verification.commands) else {
+            return;
+        };
+        // Non-configured `bash check:true` commands are settled by `round/settle.rs` after
+        // checking `exit_status_masked`; do not record pipe-masked ad-hoc commands as passes here.
+        if source == CheckReceiptSource::ExplicitBashCheck && !is_check_command(command) {
             return;
         }
         let kind = if configured.is_some_and(|check| {
@@ -1648,68 +1687,20 @@ impl<'a> Agent<'a> {
     /// A recorded external prerequisite halts automation; missing evidence alone is incomplete.
     /// Classify from controller state rather than a model's explanation or diagnostic prose.
     pub(in crate::agent) fn completion_rejection_outcome(&self) -> TurnOutcome {
-        let blocked_task = self.todo.blocked_steps().next().is_some();
         let control = self.session.control_state();
-        let blocked_deliverable = control["working_state"]["deliverables"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["status"] == "blocked"));
-        if blocked_task || blocked_deliverable {
-            TurnOutcome::Blocked
-        } else {
-            TurnOutcome::Incomplete
-        }
+        crate::agent::workflow::task_ledger::TaskLedger::rejection_outcome(&self.todo, &control)
     }
 
-    /// Side-effect-free completion blockers shared by `finish completed` and `goal complete`: explicit
-    /// blockers, running shell or worker jobs, unreadable worker state, and failed checks with no edit
+    /// Side-effect-free completion blockers shared by `finish completed`, plain completion and
+    /// `goal complete`: explicit blockers (their recorded reason is kept), open execution steps,
+    /// running shell or worker jobs, unreadable worker state, and failed checks with no edit
     /// awaiting a fresh check. Callers decide whether to pump workers or disclose changes.
     pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
-        self.completion_blockers_scoped(true)
-    }
-
-    /// [`Self::completion_blockers`]; `open_steps` false leaves unfinished (not blocked) execution
-    /// steps to the caller, which on non-lean routes lists them with the accepted answer instead.
-    pub(in crate::agent) fn completion_blockers_scoped(
-        &self,
-        open_steps: bool,
-    ) -> Result<(), String> {
-        let blocked: Vec<_> = self
-            .todo
-            .blocked_steps()
-            .map(|task| {
-                format!(
-                    "{}: {}",
-                    task.content,
-                    task.note
-                        .as_deref()
-                        .unwrap_or("No blocking reason recorded")
-                )
-            })
-            .collect();
-        if !blocked.is_empty() {
-            return Err(format!(
-                "Explicitly blocked tasks remain. Resolve their prerequisites or report outcome=blocked.\n{}",
-                blocked.join("\n")
-            ));
-        }
-        let open = self
-            .todo
-            .tasks()
-            .iter()
-            .filter(|task| {
-                task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::Step
-            })
-            .map(|task| task.content.as_str())
-            .collect::<Vec<_>>();
-        if open_steps && !open.is_empty() {
-            return Err(format!(
-                "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
-                open.join("; ")
-            ));
-        }
         let control = self.session.control_state();
         let working = &control["working_state"];
-        if let Some(blocker) = crate::agent::workflow::working_state::completion_blocker(working) {
+        if let Some(blocker) =
+            crate::agent::workflow::task_ledger::TaskLedger::completion_blocker(&self.todo, &control)
+        {
             return Err(blocker);
         }
         let coverage = verify::requirements::snapshot(
@@ -1821,7 +1812,7 @@ impl<'a> Agent<'a> {
     }
 
     /// The latest instruction asks why something fails without asking for a repair.
-    fn diagnosis_requested(&self) -> bool {
+    pub(in crate::agent) fn diagnosis_requested(&self) -> bool {
         self.session.control_state()["current_instruction"]
             .as_str()
             .is_some_and(crate::learn::task_policy::diagnosis_only)
@@ -1984,6 +1975,29 @@ impl<'a> Agent<'a> {
         .then_some(reminder)
     }
 
+    /// Unattended runs only: nobody reviews the result after the run, so a `completed` turn whose
+    /// tools changed the workspace or environment (checkpointed edits, opaque shell commands or
+    /// possibly-modifying extension calls) needs one observed pass on the current state. Accepted
+    /// evidence: any recorded check, a passing `bash` check, a self-asserting `bash` command or a
+    /// current Eval receipt. Diagnosis-only requests may legitimately end on a failing state.
+    pub(in crate::agent) fn unattended_verification_gap(&self) -> Option<&'static str> {
+        if !self.modes.launch.unattended
+            || !self.config.verification.enabled
+            || self.hermetic
+            || self.plan_mode
+            || self.step_checks.effect_epoch() == 0
+            || self.diagnosis_requested()
+        {
+            return None;
+        }
+        let revision = self.step_checks.revision();
+        let verified = self.step_checks.shell_check_passed == Some(revision)
+            || self.step_checks.asserting_shell_passed == Some(revision)
+            || self.step_checks.evidence.any_current_pass(revision)
+            || self.step_checks.eval_checks.current_pass(&self.workspace);
+        (!verified).then_some(UNATTENDED_UNVERIFIED)
+    }
+
     /// Describe each applicable check from one selection and one refreshed evidence snapshot.
     fn current_gate_outcome(&mut self) -> GateOutcome {
         let mut gate = GateOutcome::default();
@@ -2036,18 +2050,9 @@ impl<'a> Agent<'a> {
         gate
     }
 
-    /// One completion boundary for plain reports and explicit finish calls. Pumps worker results
-    /// first, so a worker that already finished is not reported as running.
+    /// One completion boundary for plain reports and explicit finish calls, on every route. Pumps
+    /// worker results first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
-        self.validate_completion_scoped(ui, true)
-    }
-
-    /// [`Self::validate_completion`]; `open_steps` as in [`Self::completion_blockers_scoped`].
-    pub(in crate::agent) fn validate_completion_scoped(
-        &mut self,
-        ui: &mut dyn Ui,
-        open_steps: bool,
-    ) -> Result<(), String> {
         self.pump_subagents(ui);
         self.refresh_check_inputs();
         if !self.hermetic
@@ -2090,7 +2095,7 @@ impl<'a> Agent<'a> {
         if let Some(notice) = self.exit_bound_jobs_notice() {
             return Err(notice);
         }
-        self.completion_blockers_scoped(open_steps)?;
+        self.completion_blockers()?;
         if !self.hermetic {
             self.disclose_turn_changes(ui);
         }
@@ -2255,6 +2260,98 @@ impl<'a> Agent<'a> {
             })
             .collect()
     }
+}
+
+/// Completion reason for an unattended `completed` turn with effects and no current passing check.
+pub(in crate::agent) const UNATTENDED_UNVERIFIED: &str = "This unattended run changed files or the environment, but no check has passed on the current state, and nobody will review the result after the run. Before finishing, verify the deliverable against the task's stated requirements: run the task's own tests or the deliverable's intended consumer with `bash` check:true (or `verify`), assert the saved outputs in an Eval cell with dial.check, or use a command whose inline assertions fail on a wrong result. Fix what the check reveals. A task's grader and its test files may only appear after the run, so a missing or unrunnable provided test is not a blocker: write your own check from the stated requirements. A failed attempt or a hard problem is not a blocker either; try a different approach. Start the reply with `Blocked:` only for an external prerequisite you tried and cannot obtain (credentials, hardware, network access), and name it.";
+
+/// A shell command that carries its own assertion (`assert x == y`, `assert.equal`, `assert_eq!`,
+/// R's `stopifnot`), so its zero exit is a verdict on the result it checks.
+pub(in crate::agent) fn asserts_inline(command: &str) -> bool {
+    command
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| matches!(word, "assert" | "assert_eq" | "stopifnot"))
+}
+
+/// Appended to a `check` command whose zero exit went through a pipe without `pipefail`.
+pub(in crate::agent) const MASKED_CHECK_NOTE: &str = "\n[Dial check] Not counted as a passing check: the exit status went through a pipe without `pipefail`, so a failure of the checked command is hidden (`cmd | tail` exits with tail's status). Rerun it with `set -o pipefail;` first, or without the pipe, so its exit code is a verdict.";
+
+/// A shell command whose zero exit can hide a failure: an unquoted pipe (`|` or `|&`, not `||`)
+/// outside quotes, comments and heredoc bodies, with no `pipefail`. `cmd | tail` exits with
+/// `tail`'s status, so `cmd`'s failure is invisible to the exit code.
+pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
+    if command.contains("pipefail") {
+        return false;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let (mut single, mut double, mut escaped, mut comment) = (false, false, false, false);
+    let mut heredoc: Option<String> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            comment = false;
+            escaped = false;
+            if !single
+                && !double
+                && let Some(end) = heredoc.take()
+            {
+                // Skip the body through its delimiter line.
+                let mut j = i + 1;
+                loop {
+                    let start = j;
+                    while j < chars.len() && chars[j] != '\n' {
+                        j += 1;
+                    }
+                    let line: String = chars[start..j].iter().collect();
+                    if line.trim() == end || j >= chars.len() {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if comment {
+        } else if escaped {
+            escaped = false;
+        } else if c == '\\' && !single {
+            escaped = true;
+        } else if c == '\'' && !double {
+            single = !single;
+        } else if c == '"' && !single {
+            double = !double;
+        } else if !single && !double {
+            if c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+                comment = true;
+            } else if c == '|' {
+                if chars.get(i + 1) == Some(&'|') {
+                    i += 2;
+                    continue;
+                }
+                return true;
+            } else if c == '<' && chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') {
+                let rest: String = chars[i + 2..].iter().collect();
+                let word: String = rest
+                    .trim_start_matches('-')
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')' | '>'))
+                    .collect();
+                let word = word.trim_matches(|c| c == '\'' || c == '"');
+                if !word.is_empty() {
+                    heredoc = Some(word.to_owned());
+                }
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]

@@ -59,6 +59,12 @@ impl<'a> Agent<'a> {
                     .effective_threshold(identity, window)?,
             );
         }
+        let compaction_identity = crate::config::compaction::CompactionIdentity {
+            provider: &identity.provider,
+            model: &identity.model,
+            agent: None,
+        };
+        let projection_mode = HistoryProjectionMode::for_identity(compaction_identity);
         let policy = sent_history_policy(
             crate::agent::workflow::evidence::Policy {
                 warm_tokens: if economy || self.config.compaction.preserve_prefix {
@@ -71,11 +77,7 @@ impl<'a> Agent<'a> {
                 supersede_reads: self.config.compaction.supersede_reads,
                 drop_useless: self.config.compaction.drop_useless,
             },
-            crate::config::compaction::CompactionIdentity {
-                provider: &identity.provider,
-                model: &identity.model,
-                agent: None,
-            },
+            compaction_identity,
         );
         let objective = if self.config.verification.behavioral_checks.is_empty() {
             "No operator-declared behavioral check. Syntax/build success alone does not establish task correctness.".to_owned()
@@ -111,19 +113,14 @@ impl<'a> Agent<'a> {
         let latest_request = if self.hermetic || self.turn_optimizer_enabled() {
             None
         } else {
-            crate::agent::run::intent::request_context(&control, messages)
+            crate::agent::run::intent::request_context(&control, |entry_id| {
+                self.session.message_visible(entry_id)
+            })
         };
         if !self.hermetic {
             crate::agent::window::file_handles::project(&self.workspace, messages);
         }
-        if economy
-            && !(crate::config::compaction::CompactionIdentity {
-                provider: &identity.provider,
-                model: &identity.model,
-                agent: None,
-            })
-            .preserved_thinking()
-        {
+        if economy && projection_mode.allows_history_rewrite() {
             crate::agent::workflow::evidence::project_duplicates(messages, superseded);
         }
         crate::agent::workflow::evidence::project(messages, superseded, &policy);
@@ -149,7 +146,7 @@ impl<'a> Agent<'a> {
             .last()
             .filter(|m| m["role"] == "tool")
             .filter(|_| packet.is_none())
-            .and_then(|_| self.todo.focus(self.finish_closes_steps()));
+            .and_then(|_| self.todo.focus());
         // Keep a bare todo focus advisory even when admitted user context is also present.
         if let Some(focus) = focus {
             let mut message = json!({"role":"user","content":focus,"dial_transient":true,"dial_task_context":true});
@@ -354,6 +351,49 @@ impl<'a> Agent<'a> {
     }
 }
 
+/// Explicit sent-history projection mode for a provider/model identity.
+///
+/// `AppendOnly` forbids any rewrite of already-sent messages (superseding reads, dropping
+/// observations, pressure pruning, and duplicate placeholders), preserving exact prompt prefixes
+/// and preserved-thinking signatures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) enum HistoryProjectionMode {
+    AppendOnly,
+    Rewritable,
+}
+
+impl HistoryProjectionMode {
+    pub(in crate::agent) fn for_identity(
+        identity: crate::config::compaction::CompactionIdentity<'_>,
+    ) -> Self {
+        if identity.preserved_thinking() {
+            Self::AppendOnly
+        } else {
+            Self::Rewritable
+        }
+    }
+
+    pub(in crate::agent) fn allows_history_rewrite(self) -> bool {
+        matches!(self, Self::Rewritable)
+    }
+
+    pub(in crate::agent) fn apply(
+        self,
+        policy: crate::agent::workflow::evidence::Policy,
+    ) -> crate::agent::workflow::evidence::Policy {
+        match self {
+            Self::Rewritable => policy,
+            Self::AppendOnly => crate::agent::workflow::evidence::Policy {
+                warm_tokens: 0,
+                pressure: false,
+                supersede_reads: false,
+                drop_useless: false,
+                ..policy
+            },
+        }
+    }
+}
+
 /// On a preserved-thinking model every replayed thinking block is checked against the exact
 /// history that preceded it, so a request may only append to what was already sent. Superseding
 /// reads, dropping observations, pressure pruning and repeated-notice placeholders all rewrite
@@ -363,16 +403,7 @@ pub(in crate::agent) fn sent_history_policy(
     policy: crate::agent::workflow::evidence::Policy,
     identity: crate::config::compaction::CompactionIdentity<'_>,
 ) -> crate::agent::workflow::evidence::Policy {
-    if !identity.preserved_thinking() {
-        return policy;
-    }
-    crate::agent::workflow::evidence::Policy {
-        warm_tokens: 0,
-        pressure: false,
-        supersede_reads: false,
-        drop_useless: false,
-        ..policy
-    }
+    HistoryProjectionMode::for_identity(identity).apply(policy)
 }
 
 #[cfg(test)]

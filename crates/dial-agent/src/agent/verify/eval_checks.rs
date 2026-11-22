@@ -127,6 +127,16 @@ impl History {
         })
     }
 
+    /// Some source's most recent Eval receipt passed and still matches that file's current bytes.
+    pub(in crate::agent) fn current_pass(&self, workspace: &Workspace) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        self.recent.iter().rev().any(|r| {
+            seen.insert(r.path.as_str())
+                && r.passed
+                && eval::check_source_digest(workspace, &r.path).is_some_and(|sha| sha == r.sha256)
+        })
+    }
+
     /// Called to render a report; read each distinct source at most once per report.
     pub(in crate::agent) fn snapshot(&self, workspace: &Workspace) -> Value {
         if self.recent.is_empty() {

@@ -69,6 +69,30 @@ impl<'a> Agent<'a> {
             && self.config.assistance.compact_tools
             && self.config.harness.tools == config::tools::default_tools()
     }
+
+    /// Canonical static route-level tool-offer policy: unifies hosted/local budget,
+    /// byte-stability eligibility, and provider surface exposure mode.
+    pub(in crate::agent) fn tool_offer_policy(
+        &self,
+        exposure: crate::llm::tool_offer::Exposure,
+    ) -> ToolOfferPolicy {
+        use crate::llm::tool_offer::Exposure;
+        let hosted = self.hosted_route();
+        let stable_offer = self.stable_tool_offer();
+        let preserve_surface = !self.hermetic
+            && match exposure {
+                Exposure::Plain => false,
+                Exposure::Deferred => stable_offer,
+                Exposure::AllowedTools => true,
+            };
+        ToolOfferPolicy {
+            hosted,
+            core_schema_budget: self.core_schema_budget(),
+            stable_offer,
+            exposure,
+            preserve_surface,
+        }
+    }
     /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
     /// loads on demand, llama.cpp splits `-c` across slots, Ollama defaults small and truncates silently.
     /// Their native APIs report the served size (see `catalog::loaded_context`); hosted and unknown
@@ -414,14 +438,8 @@ impl<'a> Agent<'a> {
         request: &mut Chat,
     ) -> Result<()> {
         use crate::llm::tool_offer::{self, Exposure, Mark};
-        if self.hermetic
-            || request.tools.is_empty()
-            || match exposure {
-                Exposure::Plain => true,
-                Exposure::Deferred => !self.stable_tool_offer(),
-                Exposure::AllowedTools => false,
-            }
-        {
+        let policy = self.tool_offer_policy(exposure);
+        if request.tools.is_empty() || !policy.preserve_surface {
             return Ok(());
         }
         let name_of = |schema: &Value| schema["function"]["name"].as_str().map(str::to_owned);
@@ -1356,12 +1374,12 @@ impl<'a> Agent<'a> {
     }
 
     /// Append to the durable session; training capture happens at the inference boundary.
-    pub(in crate::agent) fn push(&mut self, message: Value) -> Result<()> {
-        self.session.append(message)?;
+    pub(in crate::agent) fn push(&mut self, message: Value) -> Result<String> {
+        let id = self.session.append(message)?;
         if let Some(memory) = &self.memory_runtime {
             memory.resume(memory_authority(&self.session, 0));
         }
-        Ok(())
+        Ok(id)
     }
 }
 /// A capability gap the controller observed during a turn. Each gap maps to one fixed query owned
@@ -1696,3 +1714,16 @@ pub(in crate::agent) fn parameter_help(schema: &Value) -> Option<String> {
     let help = crate::runtime::arguments::parameter_help(schema.pointer("/function/parameters")?);
     (!help.is_empty()).then_some(help)
 }
+
+/// Resolved route-level policy governing static tool-offer budgeting and byte-stable surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) struct ToolOfferPolicy {
+    pub(in crate::agent) hosted: bool,
+    pub(in crate::agent) core_schema_budget: usize,
+    pub(in crate::agent) stable_offer: bool,
+    pub(in crate::agent) exposure: crate::llm::tool_offer::Exposure,
+    pub(in crate::agent) preserve_surface: bool,
+}
+
+#[cfg(test)]
+mod tool_offer_policy_tests;

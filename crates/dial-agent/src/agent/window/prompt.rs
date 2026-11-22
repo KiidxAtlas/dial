@@ -149,6 +149,9 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     }
     // Workflow sentences that name a tool appear only when it is offered.
     let mut rules = String::from(RULES);
+    if has("finish") {
+        rules.push_str("\n- For a necessary user decision, call `finish` with outcome=needs_input rather than ending with a question.");
+    }
     if has("todo") {
         rules.push_str(TODO_RULE);
     }
@@ -264,16 +267,23 @@ fn example_edit(mode: EditMode) -> serde_json::Value {
     }
 }
 
+/// The policy section and, for a custom template, its provenance-carrying render.
 fn policy_prompt(
     i: &Inputs<'_>,
     template_context: &[ContextFile],
     append: Option<&str>,
-) -> anyhow::Result<String> {
-    let body = match i.template {
+) -> anyhow::Result<(String, Option<prompt_template::Rendered>)> {
+    let rendered = match i.template {
         Some(template) => {
             let data = template_data(i, template_context, append);
-            prompt_template::render_system_prompt(template, &data)?
+            Some(prompt_template::render_system_prompt_with_provenance(
+                template, &data,
+            )?)
         }
+        None => None,
+    };
+    let body = match &rendered {
+        Some(rendered) => rendered.text().to_owned(),
         None => match i.overrides.0.as_deref() {
             Some(text) => text.trim().to_owned(),
             None => {
@@ -297,10 +307,9 @@ fn policy_prompt(
             }
         },
     };
-    let rendered = i.template.map(|_| body.as_str());
     let mut out = String::new();
     if let Some(soul) = &i.soul
-        && !already_rendered(rendered, soul)
+        && !already_rendered(rendered.as_ref(), "soul", soul)
     {
         out.push_str(soul.trim());
         out.push_str("\n\n");
@@ -311,25 +320,20 @@ fn policy_prompt(
         out.push_str(crate::computer::USE_PROMPT.trim());
         out.push('\n');
     }
-    Ok(out)
+    Ok((out, rendered))
 }
 
-/// Whether a custom template rendered a complete normalized block or note bullet.
-/// Embedded substrings do not count: conservatively repeat transformed or inline-wrapped data
-/// rather than silently dropping guidance. Without a template nothing is deduplicated.
-fn already_rendered(rendered: Option<&str>, text: &str) -> bool {
-    let Some(rendered) = rendered else {
-        return false;
-    };
-    let text = prompt_template::format_system(text.trim());
-    !text.is_empty()
-        && rendered.match_indices(&text).any(|(start, _)| {
-            let before = &rendered[..start];
-            let line_prefix = before.rsplit('\n').next().unwrap_or("");
-            let after = &rendered[start + text.len()..];
-            (line_prefix.is_empty() || line_prefix == "- ")
-                && (after.is_empty() || after.starts_with('\n'))
-        })
+/// Whether a custom template emitted this harness value, from `source` (its template-data origin,
+/// such as `memory` or `contextFiles.0.content`), as a complete line or bullet. Render provenance
+/// decides, not output text search: literal template text, transformed values, embedded substrings
+/// and equal values from other sources do not count, so they are repeated. Without a template
+/// nothing is deduplicated.
+fn already_rendered(
+    rendered: Option<&prompt_template::Rendered>,
+    source: &str,
+    text: &str,
+) -> bool {
+    rendered.is_some_and(|rendered| rendered.contains_block(source, text))
 }
 
 pub fn system_prompt(
@@ -337,9 +341,8 @@ pub fn system_prompt(
     template_context: &[ContextFile],
     append: Option<&str>,
 ) -> anyhow::Result<String> {
-    let mut out = policy_prompt(i, template_context, append)?;
-    let rendered = i.template.is_some().then_some(out.as_str());
-    let environment = environment_prompt(i, rendered, TurnNotes::Inline);
+    let (mut out, rendered) = policy_prompt(i, template_context, append)?;
+    let environment = environment_prompt(i, rendered.as_ref(), TurnNotes::Inline);
     out.push_str(&environment);
     Ok(out)
 }
@@ -354,8 +357,12 @@ enum TurnNotes {
 
 /// The environment section. `rendered` is the custom template's output: harness blocks it already
 /// contains (operator guidance, notes, memory, skills, context files) are not repeated.
-fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) -> String {
-    let repeated = |text: &str| already_rendered(rendered, text);
+fn environment_prompt(
+    i: &Inputs<'_>,
+    rendered: Option<&prompt_template::Rendered>,
+    notes: TurnNotes,
+) -> String {
+    let repeated = |source: &str, text: &str| already_rendered(rendered, source, text);
     let mut out = String::new();
     let compact = i.concise_guidance && i.template.is_none() && i.overrides.0.is_none();
     out.push_str(&format!(
@@ -432,7 +439,9 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
             }
         }
     }
-    if !i.harness.system_prompt.trim().is_empty() && !repeated(&i.harness.system_prompt) {
+    if !i.harness.system_prompt.trim().is_empty()
+        && !repeated("operatorGuidance", &i.harness.system_prompt)
+    {
         out.push_str(&format!(
             "\n# Operator guidance\n{}\n",
             i.harness.system_prompt.trim()
@@ -442,17 +451,19 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
         if let Some(notes) = admitted_notes(&i.harness.memory, rendered) {
             out.push_str(&notes);
         }
-        if !i.memory.trim().is_empty() && !repeated(&i.memory) {
+        if !i.memory.trim().is_empty() && !repeated("memory", &i.memory) {
             out.push_str(&format!("\n{}\n", i.memory.trim()));
         }
     }
-    if !i.skills.trim().is_empty() && !repeated(&i.skills) {
+    if !i.skills.trim().is_empty() && !repeated("skillsCatalog", &i.skills) {
         out.push_str(&format!("\n{}\n", i.skills.trim()));
     }
     let context: Vec<&ContextFile> = i
         .context
         .iter()
-        .filter(|file| !repeated(&file.content))
+        .enumerate()
+        .filter(|(index, file)| !repeated(&context_source(*index), &file.content))
+        .map(|(_, file)| file)
         .collect();
     if !context.is_empty() {
         out.push_str(CONTEXT_HEADING);
@@ -537,12 +548,27 @@ fn mcp_catalog_summary(servers: &std::collections::BTreeMap<&str, (usize, &str)>
     )
 }
 
+/// Template-data origins of the per-item sources; they match `template_data` and the template's
+/// canonical origin for `{{#each}}` items and indexed paths.
+fn note_source(index: usize) -> String {
+    format!("admittedNotes.{index}")
+}
+
+fn context_source(index: usize) -> String {
+    format!("contextFiles.{index}.content")
+}
+
 /// The unrendered admitted notes, one trimmed bullet per note, or no section when all are rendered.
-fn admitted_notes(notes: &[String], rendered: Option<&str>) -> Option<String> {
+fn admitted_notes(
+    notes: &[String],
+    rendered: Option<&prompt_template::Rendered>,
+) -> Option<String> {
     let mut out = String::new();
     for note in notes
         .iter()
-        .filter(|note| !already_rendered(rendered, note))
+        .enumerate()
+        .filter(|(index, note)| !already_rendered(rendered, &note_source(*index), note))
+        .map(|(_, note)| note)
     {
         if out.is_empty() {
             out.push_str("\n# Admitted notes\n");
@@ -712,30 +738,28 @@ pub fn system_messages(mut inputs: Inputs<'_>) -> anyhow::Result<Vec<serde_json:
     let append = inputs.overrides.1.take();
     let append = append.as_deref();
     let mut messages = Vec::with_capacity(context.len() + 5);
-    let rendered = match inputs.template {
-        None => {
-            let fixed = policy_prompt(&inputs, context, append)?;
-            messages.push(system(Band::Frozen, fixed));
-            None
-        }
-        // A template may interpolate per-turn values, so it is not frozen. It still leads:
-        // project context and the append text supplement it and come after.
-        Some(_) => Some(policy_prompt(&inputs, context, append)?),
-    };
-    let rendered = rendered.as_deref();
+    // A template may interpolate per-turn values, so it is not frozen. It still leads:
+    // project context and the append text supplement it and come after.
+    let (policy, rendered) = policy_prompt(&inputs, context, append)?;
+    let rendered = rendered.as_ref();
     let environment = environment_prompt(&inputs, rendered, TurnNotes::Separate);
-    match rendered {
-        None => messages.push(system(Band::Stable, environment)),
-        Some(policy) => messages.push(system(Band::Stable, format!("{policy}{environment}"))),
+    if rendered.is_some() {
+        messages.push(system(Band::Stable, format!("{policy}{environment}")));
+    } else {
+        messages.push(system(Band::Frozen, policy));
+        messages.push(system(Band::Stable, environment));
     }
-    for (index, file) in context
-        .iter()
-        .filter(|file| !already_rendered(rendered, &file.content))
-        .enumerate()
+    let mut emitted = 0;
+    for (index, file) in context.iter().enumerate() {
+        if already_rendered(rendered, &context_source(index), &file.content) {
+            continue;
+        }
+        messages.push(context_message(file, emitted == 0));
+        emitted += 1;
+    }
+    if let Some(append) =
+        append.filter(|append| !already_rendered(rendered, "appendPrompt", append))
     {
-        messages.push(context_message(file, index == 0));
-    }
-    if let Some(append) = append.filter(|append| !already_rendered(rendered, append)) {
         messages
             .push(serde_json::json!({"role":"system","content":format!("\n{}\n", append.trim())}));
     }
@@ -743,7 +767,7 @@ pub fn system_messages(mut inputs: Inputs<'_>) -> anyhow::Result<Vec<serde_json:
     if let Some(notes) = admitted_notes(&inputs.harness.memory, rendered) {
         messages.push(system(Band::Dynamic, notes));
     }
-    if !inputs.memory.trim().is_empty() && !already_rendered(rendered, &inputs.memory) {
+    if !inputs.memory.trim().is_empty() && !already_rendered(rendered, "memory", &inputs.memory) {
         messages.push(system(
             Band::Dynamic,
             format!("\n{}\n", inputs.memory.trim()),
@@ -753,8 +777,8 @@ pub fn system_messages(mut inputs: Inputs<'_>) -> anyhow::Result<Vec<serde_json:
     Ok(messages)
 }
 
-/// One instruction file as its own system message; `AGENTS.md` rows are tagged for archive
-/// selectors and delegated workers. Only the first file of a run carries the heading.
+/// One admitted instruction source. Preserve the AGENTS.md-only archive selector independently
+/// of worker inheritance. Only the first source carries the heading.
 fn context_message(file: &ContextFile, heading: bool) -> serde_json::Value {
     let heading = if heading { CONTEXT_HEADING } else { "" };
     let mut message = serde_json::json!({"role":"system",
@@ -769,17 +793,11 @@ fn context_message(file: &ContextFile, heading: bool) -> serde_json::Value {
     message
 }
 
-/// The `AGENTS.md` rows that delegated workers inherit. They come from the discovered files, not
-/// from the parent's system messages, so a custom template that renders the project context itself
-/// does not leave workers without it.
-pub fn agents_md_messages(context: &[ContextFile]) -> Vec<serde_json::Value> {
+/// Assemble the worker view from admitted sources, independent of parent template rendering.
+pub fn worker_instruction_messages(context: &[ContextFile]) -> Vec<serde_json::Value> {
     context
         .iter()
-        .filter(|file| {
-            file.path
-                .file_name()
-                .is_some_and(|name| name == "AGENTS.md")
-        })
+        .filter(|file| file.audience == super::context::InstructionAudience::ParentAndWorkers)
         .enumerate()
         .map(|(index, file)| context_message(file, index == 0))
         .collect()

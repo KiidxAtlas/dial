@@ -206,6 +206,9 @@ struct StepChecks {
     /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
     /// the completion gate when the model verifies through `bash` rather than `check`.
     shell_check_passed: Option<verify::evidence::Revision>,
+    /// Revision at which a foreground `bash` command carrying its own inline assertion (`assert`,
+    /// `stopifnot`) last exited 0 with complete output. Evidence only for the unattended gate.
+    asserting_shell_passed: Option<verify::evidence::Revision>,
     /// A foreground validation attempt exited 127. Never itself evidence of a code defect.
     validation_launch_gap: bool,
     /// `bash` calls marked `check` that ran to an exit this turn, as `(command, passed, revision)`,
@@ -327,6 +330,13 @@ impl StepChecks {
             "failed_checks":self.failed_checks.iter().map(|check| &check.name).collect::<Vec<_>>()
         })
     }
+}
+
+/// The Type a user turn belongs to. Its id is kept on the message; its briefing is model-only context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeContext {
+    pub id: String,
+    pub briefing: Option<String>,
 }
 
 pub struct Agent<'a> {
@@ -464,6 +474,8 @@ pub struct Agent<'a> {
     side_questions: workers::side_questions::Questions,
     superseded: workflow::evidence::Supersession,
     legacy_memory_migrated: bool,
+    /// The Type the next user turn was written in; set by the RPC layer for that turn only.
+    pending_type: Option<TypeContext>,
     /// Live steering the server accepted for the reply in flight; journaled after that reply.
     accepted_live_steering: Vec<(Value, String)>,
     pending_tool_steering: Vec<String>,

@@ -44,6 +44,10 @@ impl<'a> Agent<'a> {
     ) -> Result<TurnReport> {
         self.turn_with_state(user_text, ui, false, None, TurnOrigin::User)
     }
+    /// Set the Type the next turn was written in. The caller clears it once the turn returns.
+    pub fn set_type_context(&mut self, context: Option<TypeContext>) {
+        self.pending_type = context;
+    }
     /// ACP has already resolved explicit content blocks. Do not interpret resource bodies as
     /// terminal @file syntax: a referenced document must not attach other local files implicitly.
     pub fn turn_prepared_preserving_interrupt(
@@ -461,6 +465,8 @@ fn failure_cause(error: &anyhow::Error) -> String {
     )
 }
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod repair_progress_tests;
 #[cfg(test)]

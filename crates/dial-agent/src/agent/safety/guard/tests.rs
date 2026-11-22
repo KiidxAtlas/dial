@@ -87,6 +87,49 @@ fn narration_recovery_recurs_until_real_progress() {
 }
 
 #[test]
+fn fulfilled_inspection_and_verification_promises_do_not_trigger_repeated_promise() {
+    let mut guard = NarrationGuard::default();
+    for (index, text) in [
+        "I'll inspect the engine module.",
+        "Next I will read the guard file.",
+        "Now I will search the callers.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            guard
+                .observe(&reply(
+                    text,
+                    vec![call("read", json!({"path": format!("file-{index}.rs")}))],
+                ))
+                .is_none(),
+            "announcing inspection while reading is not an unfulfilled promise"
+        );
+    }
+    for text in [
+        "I'll verify the change.",
+        "Next I will run the test suite.",
+        "Now I will check the build.",
+    ] {
+        assert!(
+            guard
+                .observe(&reply(text, vec![call("verify", json!({}))]))
+                .is_none(),
+            "announcing verification while invoking verify is not an unfulfilled promise"
+        );
+    }
+    // Promising inspection while only updating todo bookkeeping still triggers after 3 rounds.
+    for round in 1..=3 {
+        let notice = guard.observe(&reply(
+            "I'll inspect the source files next.",
+            vec![call("todo", json!({"op": "view"}))],
+        ));
+        assert_eq!(notice.is_some(), round == 3);
+    }
+}
+
+#[test]
 fn cosmetic_arguments_do_not_disguise_failures_but_payloads_do() {
     let mut guard = RepeatGuard::default();
     for n in 0..FAILURE_LIMIT {

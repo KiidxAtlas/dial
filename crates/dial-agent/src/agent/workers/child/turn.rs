@@ -1995,7 +1995,8 @@ impl<'a> ChildTurn<'a> {
             }
             if portable_batch_intercepted && parallel.is_empty() {
                 let reason = "This call was not executed: portable guidance intercepted an earlier callback in this assistant batch. Regenerate with the staged guidance before further tool actions.";
-                self.messages.push(llm::tool_message(&call.id, reason));
+                self.messages
+                    .push(crate::tools::surface::outcome::skipped(&call.id, reason));
                 approver.notice(reason);
                 crate::telemetry::tool_with_effects(
                     env.config,
@@ -2009,7 +2010,7 @@ impl<'a> ChildTurn<'a> {
                 continue;
             }
             if preview_abort.get() && parallel.is_empty() {
-                self.messages.push(llm::tool_message(&call.id, "This call was not executed: an authorized completed edit preview failed earlier in this assistant batch. Replan before further tool actions."));
+                self.messages.push(crate::tools::surface::outcome::skipped(&call.id, "This call was not executed: an authorized completed edit preview failed earlier in this assistant batch. Replan before further tool actions."));
                 crate::telemetry::tool_with_effects(
                     env.config,
                     false,
@@ -2025,7 +2026,7 @@ impl<'a> ChildTurn<'a> {
                 let journal = children.journal.borrow();
                 journal.pending.is_some() || journal.exploration.requested_rewind()
             } {
-                self.messages.push(llm::tool_message(&call.id, "This call was not executed: a private context transition was requested earlier in this batch. Only completed results are retained; regenerate after the owned boundary."));
+                self.messages.push(crate::tools::surface::outcome::skipped(&call.id, "This call was not executed: a private context transition was requested earlier in this batch. Only completed results are retained; regenerate after the owned boundary."));
                 crate::telemetry::tool_with_effects(
                     env.config,
                     false,
@@ -2044,7 +2045,7 @@ impl<'a> ChildTurn<'a> {
                     .filter(|text| !text.trim().is_empty()),
             );
             if !round_messages.is_empty() && parallel.is_empty() {
-                self.messages.push(llm::tool_message(&call.id, "This call was not executed: a new coordination message arrived before it started. Re-evaluate this action with the new message and the existing task constraints."));
+                self.messages.push(crate::tools::surface::outcome::skipped(&call.id, "This call was not executed: a new coordination message arrived before it started. Re-evaluate this action with the new message and the existing task constraints."));
                 crate::telemetry::tool_with_effects(
                     env.config,
                     false,

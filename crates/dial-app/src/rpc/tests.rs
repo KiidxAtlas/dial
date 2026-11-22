@@ -368,6 +368,8 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
     };
     assert!(capability(&rpc, "questions") && capability(&rpc, "live_voice"));
     assert_eq!(rpc["methods"].as_array().unwrap().len(), METHODS.len());
+    // A client negotiates the structured Type context on this flag, not on the engine version.
+    assert_eq!(rpc["features"]["type_context"], json!(true));
 
     let acp = ready_frame("s1", "m", json!([]), false, true);
     assert_eq!(acp["limits"]["max_request_bytes"], MAX_ACP_REQUEST);

@@ -64,6 +64,8 @@ fn request_limit(acp: bool) -> usize {
     if acp { MAX_ACP_REQUEST } else { MAX_REQUEST }
 }
 
+mod type_context;
+
 /// Capabilities a transport lacks: ACP has no custom question input, no live voice, no host tool or
 /// host URI bridge, no provider sign-in, and no session administration, settings, checkpoint,
 /// workspace-directory, background-job, session-control or schema methods (these are native
@@ -138,6 +140,7 @@ pub(crate) fn ready_frame(
         "model":model,
         "tools":tools,
         "image_input":image_input,
+        "features":{"type_context":true},
         "methods":methods,
         "capabilities":capabilities,
         "limits":{

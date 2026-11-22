@@ -146,6 +146,9 @@ impl Agent<'_> {
                     .with_effects(tools::surface::outcome::Effects::None);
                 output.execution.retry_barrier = retry_barrier;
             }
+            if kind == "batch_contract" {
+                output = output.with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
+            }
             if first_ran && kind == "batch_contract" {
                 output = output
                     .with_status(tools::ToolStatus::Skipped)

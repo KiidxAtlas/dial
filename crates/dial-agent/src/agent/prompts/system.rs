@@ -78,7 +78,7 @@ pub(crate) const READ_BATCH_RULE: &str = "Read known files together via `read` p
 pub(crate) const SEARCH_SCOPE_RULE: &str =
     "Size broad `grep` searches with output=files; ast=true matches code structure.";
 pub(crate) const VERIFY_REPRO_RULE: &str =
-    "For a bug fix, register a failing `verify` repro first; the final gate reruns it.";
+    "For bug fixes, prefer a failing `verify` repro before editing.";
 pub(crate) const EVAL_SHELL_RULE: &str =
     "Compute data in `eval`; run programs, builds and tests in `bash`.";
 pub(crate) const PROJECT_MAP_RULE: &str =

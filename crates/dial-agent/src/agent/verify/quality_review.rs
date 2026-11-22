@@ -8,7 +8,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::agent::run::guidance::{Priority, note};
+use crate::agent::run::guidance::Priority;
 use crate::agent::{Agent, Ui};
 
 /// Changed paths named in the request; the agent finds the rest from its own checkpoints.
@@ -79,7 +79,14 @@ impl Agent<'_> {
         control[CONTROL_KEY] = json!({"instruction": instruction});
         self.session.set_control_state(control)?;
         ui.notice("Quality review is on: asking the agent to check its work before finishing.");
-        Ok(Some(note(Priority::Review, request(&paths))))
+        let body = request(&paths);
+        Ok(crate::agent::verify::coach_intervention::CoachIntervention::advisory(
+            crate::agent::verify::coach_intervention::InterventionKind::QualityReview,
+            Priority::Review,
+            &body,
+            body.clone(),
+        )
+        .map(crate::agent::verify::coach_intervention::CoachIntervention::into_message))
     }
 }
 

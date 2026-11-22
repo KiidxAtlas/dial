@@ -917,9 +917,9 @@ See [OpenAI function calling](https://developers.openai.com/api/docs/guides/func
 and [Anthropic strict tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use).
 
 `finish completed` checks pending edits with existing focused verification before accepting the
-claim, refuses unresolved failed checks, refuses blocked todos (and, on lean local routes, any open
-todo step; elsewhere an accepted completion closes open steps), and refuses while background jobs it
-awaits are still running. An edit whose complete diff a tool result already showed does not trigger
+claim. Open execution steps, blocked todos, unresolved failing checks, and outstanding background
+jobs refuse completion on every model route; a final reply never closes a step. An edit whose
+complete diff a tool result already showed does not trigger
 a review; a file changed after its last shown diff, or by a non-edit tool, gets one bounded diff in
 the refusal, and the next `finish completed` is accepted once that diff has been shown. A pending
 diff or visual review continues the agent normally; it is not a tool failure or an accepted completion. Visual edits require fresh rendered

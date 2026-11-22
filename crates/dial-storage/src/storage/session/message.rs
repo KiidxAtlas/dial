@@ -7,6 +7,16 @@ use super::*;
 /// Like every `dial_*` key it never reaches a provider.
 pub const TURN_DRAFT_KEY: &str = "dial_turn_draft";
 
+/// Message key of the Type a user turn was written in: `{"id": <type id>}`. The id stays with the
+/// message for history and resume; the Type's briefing reaches the model as context only.
+/// Like every `dial_*` key it never reaches a provider.
+pub const TYPE_KEY: &str = "dial_type";
+
+/// Message key set on every user message the engine admits from a person. A message without it
+/// was written before structured Type context: its text may carry legacy `[[type:ID]]` framing that
+/// clients must read back as framing. Like every `dial_*` key it never reaches a provider.
+pub const STRUCTURED_TEXT_KEY: &str = "dial_structured_text";
+
 /// The text the user typed for a message the turn drafter rewrote; `None` for any other message.
 pub fn typed_text(message: &Value) -> Option<&str> {
     message.get(TURN_DRAFT_KEY)?.get("original")?.as_str()

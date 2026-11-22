@@ -53,6 +53,48 @@ impl Agent<'_> {
     pub fn external_thinking_enabled(&self) -> bool {
         self.modes.launch.external_thinking
     }
+
+    /// Strip private `<scratchpad>` blocks when `--external-thinking` is active; otherwise return
+    /// the text unchanged. Single normalization entry point for replies, partials and `finish`.
+    pub(in crate::agent) fn normalize_visible_text(&self, text: &str) -> String {
+        if self.external_thinking_enabled() {
+            strip_scratchpad(text)
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// Normalize a received provider reply at ingestion and emit visible text when streaming was
+    /// withheld for scratchpad filtering.
+    pub(in crate::agent) fn normalize_reply(
+        &self,
+        reply: &mut crate::llm::Reply,
+        stream_visible: bool,
+        ui: &mut dyn crate::agent::Ui,
+    ) {
+        if !self.external_thinking_enabled() {
+            return;
+        }
+        reply.text = strip_scratchpad(&reply.text);
+        if stream_visible && !reply.text.is_empty() {
+            ui.text_delta(&reply.text);
+        }
+    }
+
+    /// Strip `<scratchpad>` blocks from every user-visible field of a typed `finish` outcome.
+    pub(in crate::agent) fn normalize_finish(
+        &self,
+        finish: &mut crate::agent::verify::completion::Finish,
+    ) {
+        if !self.external_thinking_enabled() {
+            return;
+        }
+        finish.summary = strip_scratchpad(&finish.summary);
+        finish.text = strip_scratchpad(&finish.text);
+        if let Some(question) = finish.question.as_mut() {
+            *question = strip_scratchpad(question);
+        }
+    }
 }
 
 #[cfg(test)]

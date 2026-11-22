@@ -1351,7 +1351,7 @@ fn a_granted_directory_releases_the_failed_outside_read_for_an_identical_retry()
         edits.settle(&read, vec![], ToolOutput::err(error));
         assert!(barred(&mut edits, &read), "{selector}");
         assert!(
-            !edits.engine.failed_access.is_empty(),
+            edits.engine.barriers.has_access_barriers(),
             "access error was not tracked for {selector}"
         );
         let grant = grant_of(&mut edits, outside.path());

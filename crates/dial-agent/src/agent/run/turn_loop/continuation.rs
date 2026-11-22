@@ -21,11 +21,36 @@ struct TurnContinuation<'turn> {
     candidate_summary: String,
 }
 
+impl TurnContinuation<'_> {
+    fn record_candidate_summary(&mut self) {
+        if let Ok(report) = &self.result
+            && report.outcome == TurnOutcome::Completed
+            && !report.text.trim().is_empty()
+        {
+            self.candidate_summary.clone_from(&report.text);
+        }
+    }
+
+    fn downgrade_if_interrupted(&mut self, interrupted: bool, reason: &str) -> bool {
+        if !interrupted {
+            return false;
+        }
+        if let Ok(report) = &mut self.result
+            && report.outcome == TurnOutcome::Completed
+        {
+            report.outcome = TurnOutcome::Interrupted;
+            report.interrupted = true;
+            report.text = unsettled_report(&self.candidate_summary, reason);
+            return true;
+        }
+        false
+    }
+}
+
 enum HookProgress {
     Resumed,
     Settled,
 }
-
 impl Agent<'_> {
     pub(super) fn run_admitted_turn(
         &mut self,
@@ -91,23 +116,15 @@ impl Agent<'_> {
             candidate_summary: String::new(),
         };
         loop {
-            if let Ok(report) = &run.result
-                && report.outcome == TurnOutcome::Completed
-                && !report.text.trim().is_empty()
-            {
-                run.candidate_summary.clone_from(&report.text);
-            }
-            if let Ok(report) = &mut run.result
-                && report.outcome == TurnOutcome::Completed
-                && (report.interrupted || self.interrupt.load(Ordering::SeqCst))
-            {
-                report.outcome = TurnOutcome::Interrupted;
-                report.interrupted = true;
-                report.text = unsettled_report(
-                    &run.candidate_summary,
-                    "Interrupted before finalization; completion was not accepted.",
-                );
-            }
+            run.record_candidate_summary();
+            let report_interrupted = run
+                .result
+                .as_ref()
+                .is_ok_and(|report| report.interrupted);
+            run.downgrade_if_interrupted(
+                report_interrupted || self.interrupt.load(Ordering::SeqCst),
+                "Interrupted before finalization; completion was not accepted.",
+            );
             self.verify_turn_candidate(&mut run, backend, checkpoint_turn, ui);
             if let HookProgress::Settled = self.resume_after_stop_hook(&mut run, backend, ui) {
                 break;
@@ -242,23 +259,10 @@ impl Agent<'_> {
             if let Err(error) = repair_outcome {
                 run.result = Err(error);
             }
-            if self.interrupt.load(Ordering::SeqCst)
-                && run
-                    .result
-                    .as_ref()
-                    .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
-            {
-                let steps = run.result.as_ref().map_or(0, |report| report.steps);
-                run.result = Ok(TurnReport {
-                    text: unsettled_report(
-                        &run.candidate_summary,
-                        "Interrupted during focused verification; completion was not accepted.",
-                    ),
-                    outcome: TurnOutcome::Interrupted,
-                    steps,
-                    interrupted: true,
-                    trajectory: None,
-                });
+            if run.downgrade_if_interrupted(
+                self.interrupt.load(Ordering::SeqCst),
+                "Interrupted during focused verification; completion was not accepted.",
+            ) {
             } else if !check_run.failures.is_empty()
                 && run.result.as_ref().is_ok_and(|report| {
                     matches!(
@@ -333,16 +337,10 @@ impl Agent<'_> {
                 n,
             ))
         });
-        if self.interrupt.load(Ordering::SeqCst)
-            && let Ok(report) = &mut run.result
-            && report.outcome == TurnOutcome::Completed
-        {
-            report.outcome = TurnOutcome::Interrupted;
-            report.interrupted = true;
-            report.text = unsettled_report(
-                &run.candidate_summary,
-                "Interrupted during the stop hook; completion was not accepted.",
-            );
+        if run.downgrade_if_interrupted(
+            self.interrupt.load(Ordering::SeqCst),
+            "Interrupted during the stop hook; completion was not accepted.",
+        ) {
             return HookProgress::Settled;
         }
         let reason = match verdict {

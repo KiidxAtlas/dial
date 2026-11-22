@@ -67,3 +67,52 @@ fn toggling_restates_the_instruction_in_the_mode_notice() {
     agent.set_external_thinking(false);
     assert!(!agent.external_thinking_enabled() && !has_instruction(&agent));
 }
+
+#[test]
+fn normalize_finish_strips_scratchpad_from_all_visible_fields() {
+    use crate::agent::Agent;
+    use crate::agent::verify::completion::Finish;
+    use crate::config::types::{Config, Version};
+    use crate::llm::provider::{Backend, ProviderKind};
+    use serde_json::json;
+
+    let config = Config {
+        model: "test".into(),
+        ..Config::default()
+    };
+    let backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "test".into(),
+            api_key: None,
+        },
+        std::path::PathBuf::new(),
+        5,
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let version = Version {
+        id: 0,
+        parent: None,
+        kind: "config".into(),
+        harness: config.harness.clone(),
+        adapter: None,
+        status: "active".into(),
+    };
+    let mut agent =
+        Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
+    agent.set_external_thinking(true);
+    let mut finish = Finish::parse(&json!({
+        "outcome": "needs_input",
+        "summary": "<scratchpad>private thought</scratchpad>\nSummary ready",
+        "reason": "<scratchpad>secret</scratchpad>Choose A or B?"
+    }))
+    .unwrap();
+    agent.normalize_finish(&mut finish);
+    assert_eq!(finish.summary, "Summary ready");
+    assert_eq!(finish.question.as_deref(), Some("Choose A or B?"));
+    assert!(!finish.text.contains("<scratchpad>"));
+    assert!(!finish.text.contains("private thought"));
+    assert!(!finish.text.contains("secret"));
+    assert!(finish.text.contains("Summary ready"));
+    assert!(finish.text.contains("Choose A or B?"));
+}

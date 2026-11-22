@@ -1537,7 +1537,12 @@ impl<'a> Agent<'a> {
                 Ok(request) => request,
                 Err(error) => return ToolOutput::err(error),
             };
-            match self.completion_decision(TurnOutcome::NeedsInput, &args.to_string(), ui) {
+            match self.completion_decision(
+                TurnOutcome::NeedsInput,
+                &args.to_string(),
+                crate::agent::verify::completion::ReplyChannel::Explicit,
+                ui,
+            ) {
                 crate::agent::verify::completion::Decision::Continue(note)
                 | crate::agent::verify::completion::Decision::Incomplete(note) => {
                     return ToolOutput::err(note);
@@ -1824,7 +1829,12 @@ impl<'a> Agent<'a> {
                     }
                 }
 
-                match self.completion_decision(finish.outcome, &finish.summary, ui) {
+                match self.completion_decision(
+                    finish.outcome,
+                    &finish.summary,
+                    crate::agent::verify::completion::ReplyChannel::Explicit,
+                    ui,
+                ) {
                     crate::agent::verify::completion::Decision::Continue(note) => {
                         return ToolOutput::ok(note)
                             .with_effects(crate::tools::surface::outcome::Effects::None);

@@ -7,7 +7,10 @@ use crate::agent::*;
 
 mod begin;
 pub(in crate::agent) mod cost_warn;
+mod finalize;
+mod policy;
 pub(in crate::agent) mod progress;
+mod progress_machine;
 mod round;
 mod settle;
 mod step;
@@ -115,16 +118,9 @@ pub(in crate::agent) struct TurnState<'a> {
     solo_todo_noted: bool,
     /// The most recent `edit`/`write` this turn failed, so nothing from it landed.
     last_edit_refused: bool,
-    pending_nudges: Vec<Value>,
-    /// Notes the last reply answered, held until that reply is known to be kept. A reply thrown
-    /// away after it arrived (truncation raise, rejected preview, repair, regeneration) has not
-    /// answered them, so they are sent again with the retry.
-    delivered_nudges: Vec<Value>,
-    /// Message count when the last reply arrived; see [`TurnState::settle_delivered`].
-    reply_mark: Option<usize>,
+    notices: crate::agent::run::notice_bus::NoticeBus,
     /// "Call rewind" reminders sent this turn while an investigation checkpoint stayed open.
     exploration_reminders: u32,
-    emissions: crate::agent::run::guidance::Emissions,
     coach_turn: modes::advisor::CoachTurn,
     automatic_coach_pending: bool,
     auto_continues: u32,
@@ -156,8 +152,7 @@ impl TurnState<'_> {
     /// then a discarded request (fallback, overflow, steering, guidance regeneration) resends them.
     /// `history_len` is the session's message count before the reply is recorded.
     fn reply_received(&mut self, history_len: usize) {
-        self.delivered_nudges = std::mem::take(&mut self.pending_nudges);
-        self.reply_mark = Some(history_len);
+        self.notices.reply_received(history_len);
         self.budget.replied();
         self.overflow_retries = 0;
         self.compacted_without_reply = false;
@@ -171,17 +166,7 @@ impl TurnState<'_> {
         &mut self,
         assistants_since: impl FnOnce(usize) -> usize,
     ) -> Option<Vec<Value>> {
-        let mark = self.reply_mark.take()?;
-        if assistants_since(mark) > 0 {
-            self.emissions.confirm();
-            Some(std::mem::take(&mut self.delivered_nudges))
-        } else {
-            let mut again = std::mem::take(&mut self.delivered_nudges);
-            again.append(&mut self.pending_nudges);
-            self.pending_nudges = again;
-            self.emissions.retract();
-            None
-        }
+        self.notices.settle_delivered(assistants_since)
     }
 
     /// Refund the step of an unusable reply. Once the free retries are spent the retry is
@@ -463,11 +448,8 @@ impl Agent<'_> {
             todo_recovery: Default::default(),
             solo_todo_noted: false,
             last_edit_refused: false,
-            pending_nudges: Vec::new(),
-            delivered_nudges: Vec::new(),
-            reply_mark: None,
+            notices: Default::default(),
             exploration_reminders: 0,
-            emissions: Default::default(),
             coach_turn: Default::default(),
             automatic_coach_pending: false,
             auto_continues: 0,

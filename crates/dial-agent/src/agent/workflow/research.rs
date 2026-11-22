@@ -23,6 +23,34 @@ const ADVISORY_ROUNDS: u32 = 60;
 const MAX_ATTEMPTS: u32 = 3;
 const MAX_EVIDENCE: usize = 128;
 
+/// Dedicated structured tool name for research synthesis checkpoints.
+pub(in crate::agent) const CHECKPOINT_TOOL_NAME: &str = "research_checkpoint";
+
+/// Provider-compatible JSON schema for the structured `research_checkpoint` tool.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::agent) fn checkpoint_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": CHECKPOINT_TOOL_NAME,
+            "description": "Record a research synthesis checkpoint tied to returned observation IDs before continuing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "finding": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "evidence": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "minItems": 1
+                    },
+                    "next_action": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                },
+                "required": ["finding", "evidence", "next_action"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
 /// Whether a worker gets the forced, tool-free synthesis checkpoint: a worker that may change
 /// files, on a lean local route (`assistance.lean_local` on, or `auto`, since a worker's planned
 /// window is not known here). Read-only workers and hosted or full-tier local routes keep their
@@ -171,12 +199,13 @@ impl Research {
     /// in the reply are never executed. A valid checkpoint in the reply text is accepted even when
     /// the model also requested tools (small local models often do, because schemas stay offered).
     pub fn synthesize(&mut self, reply: &Reply) -> Synthesis {
-        let parsed = if reply.finish_reason != "length" && reply.text.len() <= 8192 {
-            serde_json::from_str::<Checkpoint>(unfenced(&reply.text)).ok()
-        } else {
-            None
-        };
-        if let Some(checkpoint) = parsed {
+        let parsed = parse_checkpoint_call(reply).or_else(|| {
+            (reply.finish_reason != "length" && reply.text.len() <= 8192)
+                .then(|| parse_checkpoint(&reply.text))
+                .flatten()
+                .map(|(raw, checkpoint)| (raw.to_owned(), checkpoint))
+        });
+        if let Some((raw_json, checkpoint)) = parsed {
             let finding = normalized(&checkpoint.finding);
             if !finding.is_empty()
                 && !checkpoint.next_action.trim().is_empty()
@@ -194,7 +223,7 @@ impl Research {
                 self.rounds = 0;
                 self.attempts = 0;
                 self.evidence.clear();
-                self.continuation = Some(unfenced(&reply.text).to_owned());
+                self.continuation = Some(raw_json);
                 return Synthesis::Accepted;
             }
         }
@@ -241,6 +270,80 @@ fn unfenced(text: &str) -> &str {
     };
     // Drop the info string (`json`) on the opening line.
     body.split_once('\n').map_or(body, |(_, body)| body).trim()
+}
+
+/// Accept a single structured `research_checkpoint` tool call with well-formed arguments.
+/// Extra or malformed tool calls are rejected so a checkpoint never smuggles side effects.
+fn parse_checkpoint_call(reply: &Reply) -> Option<(String, Checkpoint)> {
+    if reply.finish_reason == "length" || reply.tool_calls.len() != 1 {
+        return None;
+    }
+    let call = &reply.tool_calls[0];
+    if call.name != CHECKPOINT_TOOL_NAME || call.malformed_arguments {
+        return None;
+    }
+    let checkpoint: Checkpoint = serde_json::from_value(call.arguments.clone()).ok()?;
+    let raw_json = serde_json::to_string(&call.arguments).ok()?;
+    (raw_json.len() <= 8192).then_some((raw_json, checkpoint))
+}
+
+/// Parse a `Checkpoint` from bare JSON, a fenced JSON block, or brief prose wrapping a single
+/// unambiguous JSON object. Rejects ambiguous replies containing multiple valid checkpoint objects.
+fn parse_checkpoint(text: &str) -> Option<(&str, Checkpoint)> {
+    let direct = unfenced(text);
+    if let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(direct) {
+        return Some((direct, checkpoint));
+    }
+    let mut found: Option<(&str, Checkpoint)> = None;
+    for candidate in balanced_json_objects(text) {
+        if let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(candidate) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((candidate, checkpoint));
+        }
+    }
+    found
+}
+/// Return every top-level balanced `{ ... }` span in `text`, honoring JSON string quotes and
+/// backslash escapes so braces inside string values do not confuse nesting depth.
+fn balanced_json_objects(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' if depth > 0 => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(begin) = start.take()
+                {
+                    spans.push(&text[begin..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 #[cfg(test)]

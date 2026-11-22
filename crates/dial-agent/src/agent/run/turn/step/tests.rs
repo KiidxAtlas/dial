@@ -82,11 +82,7 @@ fn a_note_answered_by_a_discarded_reply_is_sent_again_with_the_retry() {
         let mut turn = agent
             .begin_turn(&mut backend, &[], 5, "goal", &mut NullUi)
             .unwrap();
-        turn.pending_nudges.push(json!({
-            "role": "user",
-            "dial_transient": true,
-            "content": "[Dial] background job bg1 is no longer running"
-        }));
+        turn.notices.push_protocol("[Dial] background job bg1 is no longer running");
         let mut engine = crate::agent::run::engine::Engine::default();
         let mut schemas = Vec::new();
         for _ in 0..2 {
@@ -219,10 +215,10 @@ fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
                     [0, 0, 0],
                 );
             }
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
+            turn.notices.push_advisory(
                 crate::agent::run::guidance::Priority::Failure,
                 "Resolve the failed prerequisite.",
-            ));
+            );
             let first = prepare(agent, &mut turn, &mut backend, 0);
             assert!(
                 !json!(first.request.messages)
@@ -272,7 +268,7 @@ fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
 
 #[test]
 fn local_repair_brief_survives_preemption_and_discard_but_not_a_kept_reply() {
-    use crate::agent::run::guidance::{Priority, note};
+    use crate::agent::run::guidance::Priority;
     with_agent("[compaction]\nenabled=false", |agent| {
         let mut backend = agent.backend.take().unwrap();
         let mut turn = agent
@@ -313,8 +309,8 @@ fn local_repair_brief_survives_preemption_and_discard_but_not_a_kept_reply() {
             5,
         );
         assert!(!has_brief(prepare(agent, &mut turn, &mut hosted, 1)));
-        turn.pending_nudges
-            .push(note(Priority::Blocker, "Resolve the blocker first."));
+        turn.notices
+            .push_advisory(Priority::Blocker, "Resolve the blocker first.");
         assert!(!has_brief(prepare(agent, &mut turn, &mut backend, 1)));
         turn.reply_received(agent.session.message_count());
         agent

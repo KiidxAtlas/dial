@@ -1398,6 +1398,7 @@ impl ActorRuntime<'_> {
             return result;
         }
         let mut attached = None;
+        let mut type_context = None;
         let (spoken, transcript) = if request["method"] == "live_listen" {
             let session = live_state(&self.worker_live)
                 .session
@@ -1416,16 +1417,23 @@ impl ActorRuntime<'_> {
             let text = params["text"]
                 .as_str()
                 .ok_or_else(|| coded(ErrorCode::InvalidParams, "send requires params.text"))?;
+            let (text, context) = super::type_context::split(params, text)
+                .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
+            type_context = context;
             // `/custom args` and `/skill:name task` expand as they do in the terminal.
-            let text = crate::app::expand_prompt_command(self.layout, text)
+            let text = crate::app::expand_prompt_command(self.layout, &text)
                 .map_err(|error| coded(ErrorCode::InvalidParams, error))?
-                .unwrap_or_else(|| text.to_owned());
+                .unwrap_or(text);
             if !self.acp {
                 attached = self.attachments(&text, params)?;
             }
             (text, None)
         };
-        self.turn_prompt(params, spoken, transcript, attached)
+        // The Type applies to this turn only; it never outlives the request.
+        self.agent.set_type_context(type_context);
+        let result = self.turn_prompt(params, spoken, transcript, attached);
+        self.agent.set_type_context(None);
+        result
     }
 
     /// Shared turn lifecycle after client-only slash expansion and attachments are resolved.

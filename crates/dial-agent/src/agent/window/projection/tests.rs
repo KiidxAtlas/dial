@@ -59,7 +59,11 @@ fn a_visible_single_request_is_not_reissued_after_each_tool_round() {
     with_agent("", |agent| {
         let request = "Write summary.csv from the logs and verify its counts.";
         let mut control = json!({});
-        record(&mut control, request, json!("entry-request"), Kind::Turn);
+        let admitted = agent
+            .session
+            .append(json!({"role":"user","content":request,"dial_context_request":true}))
+            .unwrap();
+        record(&mut control, request, json!(admitted), Kind::Turn);
         set_control(agent, control);
         let history = vec![
             json!({"role":"user","content":request,"dial_context_request":true}),
@@ -79,7 +83,16 @@ fn a_visible_single_request_is_not_reissued_after_each_tool_round() {
             assert_eq!(messages[0]["content"], request);
         }
 
-        // Losing the original during compaction must restore the admitted request context.
+        // Losing the original during compaction must restore the admitted request context: the
+        // admitted entry has left the active view.
+        let mut compacted_control = json!({});
+        record(
+            &mut compacted_control,
+            request,
+            json!("entry-compacted-away"),
+            Kind::Turn,
+        );
+        set_control(agent, compacted_control);
         let mut compacted = vec![json!({"role":"user","content":"Earlier work was summarized."})];
         project(agent, &mut compacted);
         let payload =
@@ -104,6 +117,27 @@ fn matching_tool_text_does_not_suppress_the_admitted_request() {
 }
 
 #[test]
+fn identical_visible_text_under_another_entry_does_not_suppress_the_admitted_request() {
+    with_agent("", |agent| {
+        let request = "Fix the requested application.";
+        // The same text is visible, but as a different journal entry than the admitted one.
+        agent
+            .session
+            .append(json!({"role":"user","content":request,"dial_context_request":true}))
+            .unwrap();
+        let mut control = json!({});
+        record(&mut control, request, json!("entry-admitted"), Kind::Turn);
+        set_control(agent, control);
+        let mut messages =
+            vec![json!({"role":"user","content":request,"dial_context_request":true})];
+        project(agent, &mut messages);
+        let payload = intent_payload(task_context(&messages)["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["entry_id"], "entry-admitted");
+        assert_eq!(payload["text"], request);
+    });
+}
+
+#[test]
 fn a_visible_latest_turn_is_not_reissued_even_after_earlier_turns() {
     with_agent("", |agent| {
         let mut control = json!({});
@@ -113,12 +147,11 @@ fn a_visible_latest_turn_is_not_reissued_even_after_earlier_turns() {
             json!("entry-old"),
             Kind::Turn,
         );
-        record(
-            &mut control,
-            CORRECTION,
-            json!("entry-correction"),
-            Kind::Turn,
-        );
+        let correction = agent
+            .session
+            .append(json!({"role":"user","content":CORRECTION,"dial_context_request":true}))
+            .unwrap();
+        record(&mut control, CORRECTION, json!(correction), Kind::Turn);
         set_control(agent, control);
         let mut messages = history_after_correction();
         messages[3]["dial_context_request"] = json!(true);
@@ -130,7 +163,15 @@ fn a_visible_latest_turn_is_not_reissued_even_after_earlier_turns() {
             }),
             "{messages:#?}"
         );
-        // Once compaction removes it, the reminder returns.
+        // Once compaction removes the admitted entry from the active view, the reminder returns.
+        let mut compacted_control = json!({});
+        record(
+            &mut compacted_control,
+            CORRECTION,
+            json!("entry-compacted-away"),
+            Kind::Turn,
+        );
+        set_control(agent, compacted_control);
         let mut compacted = vec![json!({"role":"user","content":"Earlier work was summarized."})];
         project(agent, &mut compacted);
         let payload =
@@ -631,4 +672,29 @@ fn efficiency_projects_new_exact_repeats_before_pressure_but_preserves_opt_outs(
             },
         );
     }
+}
+
+#[test]
+fn history_projection_mode_append_only_disables_all_sent_history_rewrites() {
+    let base = crate::agent::workflow::evidence::Policy {
+        warm_tokens: 4096,
+        pressure: true,
+        protect_tokens: 2048,
+        supersede_reads: true,
+        drop_useless: true,
+    };
+    let locked = HistoryProjectionMode::AppendOnly.apply(base);
+    assert!(!HistoryProjectionMode::AppendOnly.allows_history_rewrite());
+    assert_eq!(locked.warm_tokens, 0);
+    assert!(!locked.pressure);
+    assert!(!locked.supersede_reads);
+    assert!(!locked.drop_useless);
+    assert_eq!(locked.protect_tokens, 2048);
+
+    let rewritable = HistoryProjectionMode::Rewritable.apply(base);
+    assert!(HistoryProjectionMode::Rewritable.allows_history_rewrite());
+    assert_eq!(rewritable.warm_tokens, 4096);
+    assert!(rewritable.pressure);
+    assert!(rewritable.supersede_reads);
+    assert!(rewritable.drop_useless);
 }

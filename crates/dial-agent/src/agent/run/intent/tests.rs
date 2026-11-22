@@ -155,7 +155,7 @@ fn utf8_request_excerpt_keeps_both_ends_within_the_byte_budget() {
     for text in ["🦀".repeat(1_400), "a🦀é".repeat(1_000)] {
         let mut control = json!({});
         record_turn(&mut control, &text, 0);
-        let context = request_context(&control, &[]).unwrap();
+        let context = request_context(&control, |_| false).unwrap();
         let payload = context.lines().find(|line| line.starts_with('{')).unwrap();
         let payload: Value = serde_json::from_str(payload).unwrap();
         let excerpt = payload["text"].as_str().unwrap();
@@ -170,4 +170,30 @@ fn utf8_request_excerpt_keeps_both_ends_within_the_byte_budget() {
         assert_eq!(payload["text_truncated"], true);
         assert_eq!(control["user_intent"]["latest"]["text"], text);
     }
+}
+
+#[test]
+fn admitted_turn_is_suppressed_only_by_its_own_visible_entry() {
+    let mut control = json!({});
+    record(&mut control, "ship it", json!("entry-a"), Kind::Turn);
+    // Identity decides: another visible entry must not suppress the request.
+    assert!(request_context(&control, |id| id == "entry-a").is_none());
+    assert!(request_context(&control, |id| id == "entry-other").is_some());
+    let context = request_context(&control, |_| false).unwrap();
+    assert!(context.contains("\"entry_id\":\"entry-a\""), "{context}");
+}
+
+#[test]
+fn legacy_and_steering_requests_are_never_suppressed_by_visibility() {
+    // Legacy control state without a turn entry ID cannot prove what is visible: re-attach.
+    let legacy = json!({"user_intent":{"latest":{"text":"ship it","kind":"user_turn"}}});
+    assert!(request_context(&legacy, |_| true).is_some());
+    // Migrated control keeps unknown legacy context: the admitted turn is re-attached as well.
+    let migrated = json!({"user_intent":{"latest":{"text":"ship it","entry_id":"e","kind":"user_turn"},
+        "legacy_context":{"text":"old","provenance":"unknown_effective_instruction"}}});
+    assert!(request_context(&migrated, |_| true).is_some());
+    // Steering arrives mid-turn and keeps its precedence reminder even when its entry is visible.
+    let mut control = json!({});
+    record(&mut control, "use v2", json!("steer-1"), Kind::Steering);
+    assert!(request_context(&control, |_| true).is_some());
 }

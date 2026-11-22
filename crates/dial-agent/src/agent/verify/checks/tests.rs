@@ -75,7 +75,12 @@ fn an_unlaunched_validation_helper_cannot_be_settled_by_a_write() {
     std::fs::write(root.path().join("result.txt"), "wrong").unwrap();
     agent.step_checks.mutations += 1;
     let decide = |agent: &mut Agent<'_>| {
-        agent.completion_decision(TurnOutcome::Completed, "Written.", &mut NullUi)
+        agent.completion_decision(
+            TurnOutcome::Completed,
+            "Written.",
+            crate::agent::verify::completion::ReplyChannel::Explicit,
+            &mut NullUi,
+        )
     };
     assert!(
         matches!(decide(&mut agent), Decision::Continue(_)),
@@ -1943,4 +1948,62 @@ fn identical_clipped_presentations_cannot_hide_a_changed_baseline_failure() {
             .unchanged_unrelated_failure("cargo test unit")
     );
     assert_eq!(agent.disclosed_failure(&check, false), None);
+}
+
+#[test]
+fn classify_check_source_distinguishes_explicit_receipts_from_heuristic_shell_commands() {
+    let configured = vec![crate::config::types::VerificationCommand {
+        name: "lint".into(),
+        command: "custom-lint --strict".into(),
+        file_extensions: vec![],
+        timeout_secs: 0,
+    }];
+    let focused = ToolCall {
+        id: "focused-check:unit".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "echo ok"}),
+        malformed_arguments: false,
+    };
+    let explicit = ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "my-validator", "check": true}),
+        malformed_arguments: false,
+    };
+    let configured_call = ToolCall {
+        id: "c2".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "custom-lint --strict"}),
+        malformed_arguments: false,
+    };
+    let heuristic = ToolCall {
+        id: "c3".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "cargo test"}),
+        malformed_arguments: false,
+    };
+    let plain = ToolCall {
+        id: "c4".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "ls -la"}),
+        malformed_arguments: false,
+    };
+
+    let f = classify_check_source(&focused, &configured).unwrap();
+    assert_eq!(f, CheckReceiptSource::FocusedCheck);
+    assert!(f.is_explicit_receipt());
+
+    let e = classify_check_source(&explicit, &configured).unwrap();
+    assert_eq!(e, CheckReceiptSource::ExplicitBashCheck);
+    assert!(e.is_explicit_receipt());
+
+    let c = classify_check_source(&configured_call, &configured).unwrap();
+    assert_eq!(c, CheckReceiptSource::ConfiguredCommand);
+    assert!(c.is_explicit_receipt());
+
+    let h = classify_check_source(&heuristic, &configured).unwrap();
+    assert_eq!(h, CheckReceiptSource::HeuristicShellCommand);
+    assert!(!h.is_explicit_receipt());
+
+    assert!(classify_check_source(&plain, &configured).is_none());
 }

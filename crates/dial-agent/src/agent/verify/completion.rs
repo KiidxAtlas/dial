@@ -98,7 +98,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, required jobs finished and checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
+        "description":"End the request; call last. completed: work and steps done, jobs finished, checks passing. answered: information only. blocked: name the missing prerequisite in reason. needs_input: ask the unresolved question in reason; optionally give 1–8 options.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
@@ -129,46 +129,8 @@ pub(in crate::agent) fn outstanding_notice(
     working: &Value,
     outcome: TurnOutcome,
 ) -> Option<String> {
-    let steps = todo
-        .tasks()
-        .iter()
-        .filter(|task| {
-            task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::Step
-        })
-        .count();
-    let follow_ups = todo
-        .tasks()
-        .iter()
-        .filter(|task| {
-            task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::FollowUp
-        })
-        .count();
-    let deliverables = crate::agent::workflow::working_state::open_deliverables(working);
-    if steps == 0 && follow_ups == 0 && deliverables.is_empty() {
-        return None;
-    }
-    let mut notice = format!(
-        "Outstanding work retained: {steps} execution step(s), {} required deliverable(s), {follow_ups} optional follow-up(s).",
-        deliverables.len()
-    );
-    if outcome == TurnOutcome::Answered {
-        notice.push_str(" This answer does not mark that work complete.");
-    }
-    for (index, task) in todo
-        .tasks()
-        .iter()
-        .enumerate()
-        .filter(|(_, task)| task.status.is_open())
-        .take(3)
-    {
-        notice.push_str(&format!(
-            "\n{}",
-            crate::agent::base::helpers::byte_prefix(&task.label(index + 1), 300)
-        ));
-    }
-    Some(notice)
+    crate::agent::workflow::task_ledger::TaskLedger::outstanding_notice(todo, working, outcome)
 }
-
 /// A candidate is reconciled with controller observations before either delivery surface ends.
 pub(in crate::agent) enum Decision {
     Accept(TurnOutcome),
@@ -178,18 +140,32 @@ pub(in crate::agent) enum Decision {
 
 pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For standalone files, an Eval cell can bind assertions to each saved file with dial.check(name, passed, dial.read receipt). A different engine gives only partial coverage; disclose an unavailable consumer.";
 
+/// Completion reason for a candidate that admits the requested work is unfinished or abandoned.
+pub(in crate::agent) const ADMITTED_UNFINISHED: &str = "The reply says the requested work is not finished (the deliverable was not produced, does not work yet, or the attempt was abandoned), so it was not accepted as completed. Continue the permitted work: diagnose why the last approach failed and try a different one, then verify the deliverable. If a concrete prerequisite really prevents progress, start the reply with `Blocked:` and name it.";
+
+/// Nudge for a plain reply that asks the user a question while `finish` is offered: the typed pause is
+/// the supported protocol, so the model is asked to use it once before the question is accepted.
+pub(in crate::agent) const TYPED_PAUSE_NUDGE: &str = "This reply asks the user a question. Pause through the typed protocol instead: call finish with outcome=needs_input, put the question in reason, and offer up to 8 options when the choices are known. Do not end the reply with a plain question.";
+
+/// How a completion candidate reached the controller. Only plain replies may pause through the
+/// clarification path; explicit calls carry their own outcome.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::agent) enum ReplyChannel {
+    /// A `finish` call, a goal completion or a side-question check: the outcome is explicit.
+    Explicit,
+    /// A plain final reply. `signals` is classified once before any background wait; `typed_pause`
+    /// says whether `finish` is offered on this turn.
+    Plain {
+        typed_pause: bool,
+        asks_user: bool,
+        signals: Option<crate::agent::verify::reply_signals::ReplySignals>,
+    },
+}
+
 impl crate::agent::Agent<'_> {
-    /// Small local models keep every completion guard rail: open execution steps block, the
-    /// lexical investigation nudge applies and long observation runs get the forced research
-    /// checkpoint. Hosted and full-tier local routes rely on the state gate alone.
+    /// Lean routes add investigation guidance. Execution obligations apply on every route.
     pub(in crate::agent) fn lean_completion_route(&self) -> bool {
         self.lean_local() || self.local_escalated()
-    }
-
-    /// Whether an accepted `completed` answer closes open execution steps (`settle_open_steps`),
-    /// so the todo focus need not ask for a closing `todo done`.
-    pub(in crate::agent) fn finish_closes_steps(&self) -> bool {
-        !(self.hermetic || self.plan_mode || self.lean_completion_route())
     }
 
     /// One instruction-scoped nudge for missing work or observations. Wording never grants
@@ -198,6 +174,7 @@ impl crate::agent::Agent<'_> {
         &mut self,
         requested: TurnOutcome,
         candidate: &str,
+        channel: ReplyChannel,
         ui: &mut dyn crate::agent::Ui,
     ) -> Decision {
         if self.hermetic || self.plan_mode {
@@ -215,32 +192,45 @@ impl crate::agent::Agent<'_> {
         let instruction = control["current_instruction_entry_id"].clone();
         let nudged = control["completion_gate"]["instruction"] == instruction
             && control["completion_gate"]["nudged"] == true;
+        // A plain question for the user is a clarification. Where `finish` is offered, one nudge asks
+        // for the typed pause; otherwise, or after that nudge, the question stands as needs_input. The
+        // lean investigation nudge still runs first when no observation has been made.
+        if let ReplyChannel::Plain {
+            typed_pause,
+            asks_user: true,
+            ..
+        } = channel
+            && requested == TurnOutcome::NeedsInput
+            && typed_pause
+            && !nudged
+            && !(lean && self.step_checks.observations == 0)
+        {
+            control["completion_gate"] =
+                json!({"instruction":instruction,"nudged":true,"reason":TYPED_PAUSE_NUDGE});
+            if let Err(error) = self.session.set_control_state(control) {
+                return Decision::Incomplete(format!(
+                    "Completion recovery could not be recorded: {error:#}"
+                ));
+            }
+            self.efficiency_metrics.completion_nudges += 1;
+            ui.notice(&format!(
+                "Completion deferred for a plain question instead of finish(needs_input): {TYPED_PAUSE_NUDGE}"
+            ));
+            return Decision::Continue(format!("\n[Dial completion] {TYPED_PAUSE_NUDGE}"));
+        }
         let delivery = matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered);
-        let open_steps = self
-            .todo
-            .tasks()
-            .iter()
-            .filter(|task| {
-                task.kind == crate::agent::workflow::todo::Kind::Step && task.status.is_open()
-            })
-            .map(|task| task.content.as_str())
-            .collect::<Vec<_>>();
-        let has_open_steps = !open_steps.is_empty();
-        // Lean routes refuse a final reply over open steps. Other routes settle the remaining
-        // blockers first and, once the answer is accepted, close or list the steps (`settle_open_steps`).
-        let open = (lean && has_open_steps).then(|| format!(
-            "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
-            open_steps.join("; ")));
+        let obligations =
+            crate::agent::workflow::task_ledger::TaskLedger::obligations(&self.todo, &control);
+        let has_open_steps = obligations.has_open_steps();
+        let has_open_deliverables = obligations.has_open_deliverables();
+        let externally_blocked = obligations.has_external_blocker();
+        // shared boundary reports them (keeping each blocked step's recorded reason).
         let mut blocker = if delivery {
-            open.or_else(|| self.validate_completion_scoped(ui, lean).err())
+            self.validate_completion(ui).err()
         } else {
             None
         };
-        let hard_blocker = delivery
-            && blocker.is_some()
-            && !has_open_steps
-            && crate::agent::workflow::working_state::open_deliverables(&control["working_state"])
-                .is_empty();
+        let hard_blocker = delivery && blocker.is_some() && !has_open_steps && !has_open_deliverables;
         if delivery && blocker.is_none() {
             let gate = self.gate_unverified_edits(!nudged, ui);
             if gate.unverified.is_some() || gate.blocking {
@@ -270,6 +260,10 @@ impl crate::agent::Agent<'_> {
                 blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
             } else if let Some(reminder) = self.artifact_check_reminder() {
                 blocker = Some(reminder.to_owned());
+            } else if requested == TurnOutcome::Completed
+                && let Some(gap) = self.unattended_verification_gap()
+            {
+                blocker = Some(gap.to_owned());
             }
         }
         // The lexical investigation nudge is a guard rail for small local models only.
@@ -299,22 +293,40 @@ impl crate::agent::Agent<'_> {
             self.efficiency_metrics.questions_before_investigation += 1;
         }
         let investigation_only = blocker.is_none() && missing_observation;
-        let missing = blocker.or_else(|| missing_observation.then(||
-            "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()));
-        let Some(reason) = missing else {
-            return self.accept_completion(requested, lean, ui);
+        // Explicit typed `finish(outcome=answered|blocked|needs_input)` carries authoritative
+        // intent without prose re-scanning. Plain replies reuse their single `ReplySignals` pass.
+        let signals = match channel {
+            ReplyChannel::Plain {
+                signals: Some(signals),
+                ..
+            } => Some(signals),
+            ReplyChannel::Explicit if requested != TurnOutcome::Completed => None,
+            _ => Some(crate::agent::verify::reply_signals::ReplySignals::classify(
+                candidate,
+            )),
         };
-        let externally_blocked = self.todo.blocked_steps().next().is_some()
-            || control["working_state"]["deliverables"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item["status"] == "blocked"));
-        let unfinished = crate::agent::safety::stream_guards::announces_unexpected_stop(candidate)
-            || crate::agent::safety::stream_guards::reports_unfinished_work(candidate);
+        // A completion that itself admits the deliverable was not produced is not delivered work
+        // on any route; it shares the single nudge, then ends `Incomplete`. Diagnosis-only
+        // requests may legitimately report a failing state.
+        let admitted = (requested == TurnOutcome::Completed
+            && blocker.is_none()
+            && !missing_observation
+            && !self.diagnosis_requested()
+            && signals.is_some_and(|s| s.admitted_unfinished()))
+        .then(|| ADMITTED_UNFINISHED.to_owned());
+        let missing = blocker
+            .or_else(|| missing_observation.then(||
+            "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()))
+            .or(admitted);
+        let Some(reason) = missing else {
+            return self.accept_completion(requested, ui);
+        };
+        let unfinished = signals.is_some_and(|s| s.unfinished_closing());
         if nudged || hard_blocker || externally_blocked || self.stop_boundary().is_some() {
             // The keyword-classified investigation nudge advises; it never ends a turn Incomplete
             // on its own. A candidate that itself says the work is unfinished is not an answer.
             if investigation_only && !unfinished {
-                return self.accept_completion(requested, lean, ui);
+                return self.accept_completion(requested, ui);
             }
             self.efficiency_metrics.incomplete_stops += 1;
             // A later blocker can preempt the reminder's own check run; keep its observed output.
@@ -348,19 +360,15 @@ impl crate::agent::Agent<'_> {
         ))
     }
 
-    /// Accept `requested`, disclosing what the answer leaves unverified. On non-lean routes a
-    /// delivered answer also settles open execution steps (`settle_open_steps`).
+    /// Accept `requested`, disclosing what the answer leaves unverified. Accepted steps are never
+    /// closed implicitly: open execution steps refused the delivery before this point.
     fn accept_completion(
         &mut self,
         requested: TurnOutcome,
-        lean: bool,
         ui: &mut dyn crate::agent::Ui,
     ) -> Decision {
         if !matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered) {
             return Decision::Accept(requested);
-        }
-        if !lean {
-            self.settle_open_steps(requested, ui);
         }
         let gaps = self.disclosed_gaps();
         if !gaps.is_empty() {
@@ -371,139 +379,13 @@ impl crate::agent::Agent<'_> {
         }
         Decision::Accept(requested)
     }
-
-    /// Non-lean routes only: an accepted `completed` answer closes every pending or in-progress
-    /// execution step, so the model spends no request on closing bookkeeping. Blocked steps never
-    /// reach here (they refuse completion) and optional follow-ups stay listed by `outstanding_notice`.
-    fn settle_open_steps(&mut self, requested: TurnOutcome, ui: &mut dyn crate::agent::Ui) {
-        if requested != TurnOutcome::Completed {
-            return;
-        }
-        let mut next = self.todo.clone();
-        let closed = next.close_open_steps();
-        if closed.is_empty() {
-            return;
-        }
-        let mut state = self.session.control_state();
-        state["todo"] = next.snapshot();
-        if let Err(error) = self.session.set_control_state(state) {
-            ui.diagnostic(&format!("could not persist the closed steps: {error:#}"));
-            return;
-        }
-        self.todo = next;
-        ui.todo(&self.todo);
-        ui.notice(&format!(
-            "Closed {} open step(s) with the accepted completion: {}",
-            closed.len(),
-            closed.join("; ")
-        ));
-    }
 }
 
-/// Explicit labels in plain reports use the same outcomes as typed finish calls.
-pub(in crate::agent) fn declared_outcome(text: &str) -> Option<TurnOutcome> {
-    let first = text
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if first.starts_with("blocked:") || first.starts_with("blocked on ") {
-        Some(TurnOutcome::Blocked)
-    } else if first.starts_with("incomplete:") {
-        Some(TurnOutcome::Incomplete)
-    } else if first.starts_with("failed:") {
-        Some(TurnOutcome::Failed)
-    } else if first.starts_with("needs input:") {
-        Some(TurnOutcome::NeedsInput)
-    } else {
-        None
-    }
-}
-
-/// Recognize an explicit final request for clarification, not arbitrary question marks
-/// in a report, code sample, or rhetorical explanation. Open todos must survive it.
-pub(in crate::agent) fn awaiting_input(text: &str) -> bool {
-    let last = text
-        .trim()
-        .rsplit("\n\n")
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if !last.ends_with('?') || last.contains("```") {
-        return false;
-    }
-    [
-        "could you clarify",
-        "can you clarify",
-        "could you provide",
-        "can you provide",
-        "could you confirm",
-        "can you confirm",
-        "which option would you",
-        "which would you like",
-        "what would you like me to",
-        "should i proceed with",
-    ]
-    .iter()
-    .any(|prefix| last.starts_with(prefix))
-}
-
-/// Whether an answer says a capability is unavailable to the agent itself ("I cannot provide an
-/// interactive terminal", "a browser is not available to me"): one sentence pairs a first-person
-/// subject or object with a denial and a capability noun, so prose about the project ("this env
-/// var is not available in tests") does not match. Code is ignored. A heuristic for one search
-/// reminder per turn, never a reason to reject an answer outright.
-pub(in crate::agent) fn denies_capability(text: &str) -> bool {
-    const FIRST_PERSON: &[&str] = &["i", "i'm", "im", "i've", "me", "my", "myself"];
-    const DENIALS: &[&str] = &[
-        "cannot",
-        "can't",
-        "can not",
-        "unable to",
-        "not available",
-        "isn't available",
-        "don't have",
-        "do not have",
-        "no access",
-        "not possible",
-        "isn't possible",
-        "not supported",
-        "lack ",
-    ];
-    const CAPABILITIES: &[&str] = &[
-        "tool",
-        "environment",
-        "terminal",
-        "tty",
-        "access to",
-        "capabilit",
-        "ability",
-        "interactive",
-        "browser",
-        "internet",
-        "network",
-        "display",
-        "screen",
-        "gui",
-    ];
-    text.split("```")
-        .step_by(2)
-        .flat_map(|prose| prose.split(['.', '!', '?', '\n']))
-        .map(|sentence| sentence.to_lowercase().replace('\u{2019}', "'"))
-        .any(|sentence| {
-            sentence
-                .split(|c: char| !c.is_alphanumeric() && c != '\'')
-                .any(|word| FIRST_PERSON.contains(&word))
-                && DENIALS.iter().any(|denial| sentence.contains(denial))
-                && CAPABILITIES
-                    .iter()
-                    .any(|capability| sentence.contains(capability))
-        })
-}
-
+#[cfg(test)]
+pub(in crate::agent) use crate::agent::verify::reply_signals::awaiting_input;
+pub(in crate::agent) use crate::agent::verify::reply_signals::{
+    declared_outcome, denies_capability,
+};
 /// One reminder per instruction to search the tool catalog before an answer says a capability is
 /// unavailable. Spent once the model searched or loaded tools itself, or after one reminder.
 #[derive(Default)]

@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::RwLock;
 use serde_json::{Number, Value, json};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
@@ -40,6 +40,37 @@ const VALUE_HELPERS: &[&str] = &[
     "jsonStringify",
     "escapeXml",
 ];
+
+/// Output of a template render plus provenance: which harness values reached the output verbatim.
+///
+/// Provenance is recorded while rendering, not by searching the output text afterwards. Only a
+/// direct data output (`{{path}}`, `{{{path}}}`, `{{&path}}`, or a bare name) that fills a complete
+/// line, or a `- ` bullet line, counts. Literal template text, helper and sub-expression results,
+/// and values inside `#list`/`#table`/`#codeblock`/`#xml` bodies (which reshape them) do not, so
+/// callers repeat those rather than drop them. Partials and conditional bodies keep provenance
+/// because they emit the data unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct Rendered {
+    text: String,
+    /// `(source, format_system(value.trim()))` for every provenance-carrying complete line.
+    direct: BTreeSet<(String, String)>,
+}
+
+impl Rendered {
+    /// The normalized rendered text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the template emitted `text` as a complete line or block that came from `source`.
+    /// `source` is the canonical data origin (for example `memory`, `admittedNotes.2` or
+    /// `contextFiles.0.content`): an equal value from another source does not count, and neither
+    /// do embedded substrings or literal template text.
+    pub fn contains_block(&self, source: &str, text: &str) -> bool {
+        let text = format_system(text.trim());
+        !text.is_empty() && self.direct.contains(&(source.to_owned(), text))
+    }
+}
 
 /// A compiled system-prompt template.
 #[derive(Debug)]
@@ -150,10 +181,18 @@ pub fn compile(source: &str) -> Result<Template> {
 
 /// Render a compiled template against `data` and normalize the output.
 pub fn render_system_prompt(template: &Template, data: &Value) -> Result<String> {
+    render_system_prompt_with_provenance(template, data).map(|rendered| rendered.text)
+}
+
+/// Like [`render_system_prompt`], also returning which harness values were emitted verbatim.
+pub fn render_system_prompt_with_provenance(template: &Template, data: &Value) -> Result<Rendered> {
     let rendered = template
         .render(data)
         .map_err(|error| anyhow!("Invalid system prompt template: {error}"))?;
-    Ok(format_system(&rendered))
+    Ok(Rendered {
+        text: format_system(&rendered.text),
+        direct: rendered.direct,
+    })
 }
 
 /// Render without whitespace normalization; callers select their explicit formatting policy.
@@ -161,6 +200,7 @@ pub fn render_raw(source: &str, data: &Value) -> Result<String> {
     Template::parse(source)
         .map_err(anyhow::Error::msg)?
         .render(data)
+        .map(|rendered| rendered.text)
         .map_err(anyhow::Error::msg)
 }
 
@@ -176,13 +216,27 @@ impl Template {
         }
     }
 
-    fn render(&self, data: &Value) -> Result<String, String> {
+    fn render(&self, data: &Value) -> Result<Rendered, String> {
         let mut renderer = Renderer {
-            frames: vec![Frame::new(data.clone())],
+            frames: vec![Frame {
+                origin: Some(String::new()),
+                ..Frame::new(data.clone())
+            }],
+            emitted: Vec::new(),
+            transformed: 0,
         };
         let mut out = String::new();
         renderer.render_nodes(&self.nodes, &mut out)?;
-        Ok(out)
+        let direct = renderer
+            .emitted
+            .iter()
+            .filter(|emitted| complete_line(&out, emitted.start, emitted.end))
+            .filter_map(|emitted| {
+                let source = emitted.source.clone()?;
+                Some((source, format_system(emitted.value.trim())))
+            })
+            .collect();
+        Ok(Rendered { text: out, direct })
     }
 }
 
@@ -823,9 +877,54 @@ fn value_helper(name: &str, args: &[Value]) -> Result<Value, String> {
 
 // ---------------------------------------------------------------- rendering
 
+/// A data output written to the top-level buffer at `start..end`, unmodified. `source` is its
+/// canonical origin in the data; outputs without one are never provenance.
+struct Emitted {
+    start: usize,
+    end: usize,
+    source: Option<String>,
+    value: String,
+}
+
+/// Canonical dotted origin of a child of `origin`; numeric indices are plain segments.
+fn join_origin(origin: &str, segment: &str) -> String {
+    if origin.is_empty() {
+        segment.to_owned()
+    } else {
+        format!("{origin}.{segment}")
+    }
+}
+
+/// Whether `text[start..end]` occupies a complete line, optionally after a `- ` bullet, allowing
+/// only horizontal whitespace after it.
+fn complete_line(text: &str, start: usize, end: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    let prefix = &text[line_start..start];
+    let suffix = text[end..].trim_start_matches([' ', '\t']);
+    (prefix.is_empty() || prefix == "- ") && (suffix.is_empty() || suffix.starts_with('\n'))
+}
+
+/// Whether the expression emits a harness value unchanged: a path or bare name, not a literal,
+/// helper or sub-expression.
+fn is_data_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(Arg::Path(_)) => true,
+        Expr::Value(_) => false,
+        Expr::Call(call) => {
+            call.args.is_empty()
+                && call.hash.is_empty()
+                && call.name != "arg"
+                && !BLOCK_HELPERS.contains(&call.name.as_str())
+                && !VALUE_HELPERS.contains(&call.name.as_str())
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Frame {
     ctx: Value,
+    /// Canonical data origin of `ctx`, when it is addressable from the root context.
+    origin: Option<String>,
     index: Option<Value>,
     key: Option<Value>,
     first: Option<Value>,
@@ -836,6 +935,7 @@ impl Frame {
     fn new(ctx: Value) -> Self {
         Self {
             ctx,
+            origin: None,
             index: None,
             key: None,
             first: None,
@@ -856,6 +956,10 @@ impl Frame {
 
 struct Renderer {
     frames: Vec<Frame>,
+    /// Provenance candidates; only offsets in the top-level buffer are meaningful.
+    emitted: Vec<Emitted>,
+    /// Depth of bodies whose output is reshaped into a sub-buffer; nothing inside is provenance.
+    transformed: usize,
 }
 
 impl Renderer {
@@ -863,7 +967,19 @@ impl Renderer {
         for node in nodes {
             match node {
                 Node::Text(text) => out.push_str(text),
-                Node::Output(expr) => out.push_str(&stringify(&self.eval(expr)?)),
+                Node::Output(expr) => {
+                    let value = stringify(&self.eval(expr)?);
+                    let start = out.len();
+                    out.push_str(&value);
+                    if self.transformed == 0 && is_data_path(expr) {
+                        self.emitted.push(Emitted {
+                            start,
+                            end: out.len(),
+                            source: self.expr_origin(expr),
+                            value,
+                        });
+                    }
+                }
                 Node::Partial(name) => {
                     let Some(partial) = partial_template(name) else {
                         return Err(format!("The partial {name} could not be found"));
@@ -922,27 +1038,37 @@ impl Renderer {
             return self.block_helper(call, main, alt, out);
         }
         let value = self.eval(head)?;
-        self.value_block(value, main, alt, out)
+        let origin = self.expr_origin(head);
+        self.value_block(value, origin, main, alt, out)
     }
 
     /// Path block: arrays iterate, empty values take the inverse, anything else sets context.
     fn value_block(
         &mut self,
         value: Value,
+        origin: Option<String>,
         main: &[Node],
         alt: &[Node],
         out: &mut String,
     ) -> Result<(), String> {
         match value {
-            Value::Array(items) => self.each_array(&items, main, alt, out),
+            Value::Array(items) => self.each_array(&items, origin, main, alt, out),
             other if is_empty(&other) => self.render_nodes(alt, out),
-            other => self.with_frame(Frame::new(other), main, out),
+            other => self.with_frame(
+                Frame {
+                    origin,
+                    ..Frame::new(other)
+                },
+                main,
+                out,
+            ),
         }
     }
 
     fn each_array(
         &mut self,
         items: &[Value],
+        origin: Option<String>,
         main: &[Node],
         alt: &[Node],
         out: &mut String,
@@ -954,6 +1080,9 @@ impl Renderer {
         for (index, item) in items.iter().enumerate() {
             let frame = Frame {
                 ctx: item.clone(),
+                origin: origin
+                    .as_deref()
+                    .map(|origin| join_origin(origin, &index.to_string())),
                 index: Some(Value::from(index)),
                 key: Some(Value::from(index)),
                 first: Some(json!(index == 0)),
@@ -990,11 +1119,22 @@ impl Renderer {
                 if is_empty(&value) {
                     self.render_nodes(alt, out)
                 } else {
-                    self.with_frame(Frame::new(value), main, out)
+                    let origin = self.arg_origin(call.args.first());
+                    self.with_frame(
+                        Frame {
+                            origin,
+                            ..Frame::new(value)
+                        },
+                        main,
+                        out,
+                    )
                 }
             }
             "each" => match arg(0) {
-                Value::Array(items) => self.each_array(&items, main, alt, out),
+                Value::Array(items) => {
+                    let origin = self.arg_origin(call.args.first());
+                    self.each_array(&items, origin, main, alt, out)
+                }
                 Value::Object(map) => {
                     if map.is_empty() {
                         return self.render_nodes(alt, out);
@@ -1050,7 +1190,10 @@ impl Renderer {
         let mut parts = Vec::with_capacity(items.len());
         for item in items {
             let mut rendered = String::new();
-            self.with_frame(Frame::new(item.clone()), main, &mut rendered)?;
+            self.transformed += 1;
+            let result = self.with_frame(Frame::new(item.clone()), main, &mut rendered);
+            self.transformed -= 1;
+            result?;
             parts.push(format!("{prefix}{rendered}{suffix}"));
         }
         out.push_str(&parts.join(&separator));
@@ -1083,7 +1226,10 @@ impl Renderer {
         let mut lines = Vec::with_capacity(rows.len());
         for row in rows {
             let mut rendered = String::new();
-            self.with_frame(Frame::new(row.clone()), main, &mut rendered)?;
+            self.transformed += 1;
+            let result = self.with_frame(Frame::new(row.clone()), main, &mut rendered);
+            self.transformed -= 1;
+            result?;
             lines.push(format!("| {} |", rendered.trim()));
         }
         out.push_str(&lines.join("\n"));
@@ -1099,7 +1245,10 @@ impl Renderer {
     ) -> Result<(), String> {
         let lang = hash_value(hash, "lang").map(stringify).unwrap_or_default();
         let mut content = String::new();
-        self.render_nodes(main, &mut content)?;
+        self.transformed += 1;
+        let result = self.render_nodes(main, &mut content);
+        self.transformed -= 1;
+        result?;
         out.push_str(&format!("```{lang}\n{}\n```", content.trim()));
         Ok(())
     }
@@ -1107,7 +1256,10 @@ impl Renderer {
     /// `{{#xml "tag"}}…{{/xml}}`: wraps trimmed content in `<tag>` lines; empty content renders nothing.
     fn xml(&mut self, tag: &Value, main: &[Node], out: &mut String) -> Result<(), String> {
         let mut content = String::new();
-        self.render_nodes(main, &mut content)?;
+        self.transformed += 1;
+        let result = self.render_nodes(main, &mut content);
+        self.transformed -= 1;
+        result?;
         let content = content.trim();
         if content.is_empty() {
             return Ok(());
@@ -1188,6 +1340,45 @@ impl Renderer {
             values.push((key.clone(), self.eval_arg(arg)?));
         }
         Ok(values)
+    }
+
+    /// Canonical origin of a data path against the current frames; `None` for `@data` and
+    /// frames whose origin is unknown (helper results, object iteration, transformed bodies).
+    fn origin_of(&self, path: &Path) -> Option<String> {
+        if path.data.is_some() {
+            return None;
+        }
+        let frame = if path.root {
+            self.frames.first()
+        } else {
+            self.frames
+                .len()
+                .checked_sub(path.up + 1)
+                .and_then(|index| self.frames.get(index))
+        }?;
+        let mut origin = frame.origin.clone()?;
+        for segment in &path.segs {
+            origin = join_origin(&origin, segment);
+        }
+        Some(origin)
+    }
+
+    fn arg_origin(&self, arg: Option<&Arg>) -> Option<String> {
+        match arg? {
+            Arg::Path(path) => self.origin_of(path),
+            _ => None,
+        }
+    }
+
+    /// Origin of a block head or output expression that reads data directly; `None` otherwise.
+    fn expr_origin(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(arg) => self.arg_origin(Some(arg)),
+            Expr::Call(call) if call.args.is_empty() && call.hash.is_empty() => {
+                self.origin_of(&Path::parse(&call.name))
+            }
+            Expr::Call(_) => None,
+        }
     }
 
     fn lookup(&self, path: &Path) -> Value {

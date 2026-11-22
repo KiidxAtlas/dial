@@ -29,9 +29,13 @@ pub fn canonicalize(message: &mut Value) {
         object.remove("dial_tool_contracts");
         object.remove("dial_execution_status");
         object.remove("dial_execution");
+        // Typed unexecuted-result bookkeeping for the loop guard; never a chat-template field.
+        object.remove("dial_result_origin");
         object.remove("dial_effects");
         // The typed text behind a turn-optimizer draft; the model sees only the draft.
         object.remove("dial_turn_draft");
+        object.remove("dial_type");
+        object.remove("dial_structured_text");
     }
 }
 

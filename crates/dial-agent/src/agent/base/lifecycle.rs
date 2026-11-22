@@ -486,6 +486,7 @@ impl<'a> Agent<'a> {
             side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
+            pending_type: None,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
             undrafted_steering: Vec::new(),
@@ -668,6 +669,7 @@ impl<'a> Agent<'a> {
             side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
+            pending_type: None,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
             undrafted_steering: Vec::new(),
@@ -834,6 +836,8 @@ impl<'a> Agent<'a> {
             messages.push(json!({"role":"system","content":system}));
         }
         llm::prompt::order(&mut messages);
+        self.agents_messages =
+            crate::agent::window::prompt::worker_instruction_messages(&self.parts.context);
         if messages == self.system_messages {
             return;
         }
@@ -841,8 +845,6 @@ impl<'a> Agent<'a> {
             .iter()
             .filter_map(|message| message["content"].as_str())
             .collect();
-        self.agents_messages =
-            crate::agent::window::prompt::agents_md_messages(&self.parts.context);
         self.system_messages = messages;
     }
 

@@ -11,6 +11,7 @@ pub(in crate::agent) mod reasoning;
 pub(in crate::agent) mod recovery_checkpoint;
 pub(in crate::agent) mod research;
 pub mod solve;
+pub(in crate::agent) mod task_ledger;
 pub mod todo;
 pub(in crate::agent) mod todo_recovery;
 pub(in crate::agent) mod working_state;

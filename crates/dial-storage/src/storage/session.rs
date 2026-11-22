@@ -57,7 +57,7 @@ use journal::{Claimed, MAX_LINE, busy_session_error, entry_json, read_bounded_li
 pub use lifecycle::Resumed;
 pub use listing::{SessionInfo, latest_conversation};
 use listing::{TITLE_CHARS, artifact_root, file_id, session_files, valid_id};
-pub use message::{TURN_DRAFT_KEY, typed_text};
+pub use message::{STRUCTURED_TEXT_KEY, TURN_DRAFT_KEY, TYPE_KEY, typed_text};
 use message::{
     apply_control_entry, collect_strings, content_text, control_entry_field,
     is_conversation_message, is_original_record, role_of, set_string, truncate_chars,
@@ -390,6 +390,15 @@ impl Session {
             .branch
             .iter()
             .any(|&i| self.entries[i].id == leaf)
+    }
+
+    /// Whether the model-visible conversation still contains the journaled message `entry_id`.
+    /// Identity, not text: compaction and rewinds remove an entry from the active view.
+    pub fn message_visible(&self, entry_id: &str) -> bool {
+        self.active
+            .messages
+            .iter()
+            .any(|&i| self.entries[i].id == entry_id)
     }
 
     /// Ephemeral children and inspection snapshots have no authority over a durable notebook.

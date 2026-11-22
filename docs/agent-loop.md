@@ -355,14 +355,29 @@ deliverables, live jobs, stale or failed required evidence and unverified edits 
 as completed or bypassed with `outcome=answered`. A refused candidate is kept beside its observed
 unmet prerequisite and the turn ends `Incomplete`. Optional follow-ups remain separate, and explicit
 blockers and necessary questions retain their non-success outcomes after investigation.
+A plain `completed` reply that itself admits, in first-person prose, that the requested
+deliverable was not produced or the attempt was abandoned ("I'm stopping here without a working
+`out.html`", "I have not yet built the required circuit") is not accepted on any route. It uses the
+shared completion nudge to continue the work; if the next reply still admits it, the turn ends
+`Incomplete` instead of `completed`. Fenced code, quotes, list items, explicit `Blocked:` reports,
+user handoffs and diagnosis-only requests ("explain why the build fails") are exempt. This is
+phrase recognition: it catches explicit admissions, not silently wrong work, and grants nothing.
 
-Open execution steps depend on the route. On lean local routes (`assistance.lean_local`, or a local
-profile that escalated to the lean prompt) a final reply does not close todos and open steps refuse
-completion. On hosted and full-tier local routes, open steps do not refuse an answer that nothing
-else blocks: an accepted `completed` answer closes every pending or `in_progress` execution step (a
-notice names them), so the model spends no request on closing bookkeeping. Optional follow-ups stay
-open and are listed after the answer by the outstanding-work notice. Blocked steps refuse
-completion on every route.
+A question for the user is a typed pause when `finish` is offered: `finish(outcome=needs_input)` with
+the question in `reason` and up to 8 `options`. One classifier (`awaiting_input`) reads the plain final
+reply once, before any background-job wait: its last paragraph must end with `?` and either start with an
+explicit request ("could you clarify", "can you provide", "which option would you") or open a decision
+question ("should I", "should we", "do you", "would you", "shall I"). Such a question bypasses pending
+background-job waits. Where `finish` is offered it gets one nudge toward the typed pause; if the next
+plain reply still asks, it is accepted as `needs_input`, and on lean routes the investigation nudge
+takes that single allowance first. Where `finish` is unavailable, the plain question is accepted as
+`needs_input` directly. Words such as "which" alone do not make a question, and questions inside code
+are not clarifications.
+
+Open execution steps refuse `completed` and `answered` on every route. A final reply never closes
+todos. Use `todo done` for finished work, or record a real blocker with `todo block` and report it
+with `finish(outcome=blocked)`. A blocked step remains outstanding. Optional follow-ups stay open
+without preventing delivery and are listed in the outstanding-work notice.
 
 Some check failures say nothing about this turn's code. They are disclosed with the accepted answer
 ("Accepted with disclosed gaps") and in `completion_evidence.disclosed_gaps` instead of ending the
@@ -402,9 +417,11 @@ arbitrary model claims are correct.
 | Gate | Trigger | Extra model rounds | Routes |
 |---|---|---|---|
 | Completion nudge | Open deliverables, unverified edits, failed checks or other completion blockers on a `completed` or `answered` candidate | 1 per instruction (shared by every reason below), then `Incomplete` | All |
+| Admitted unfinished work | A plain `completed` reply admits the deliverable was not produced or the attempt was abandoned | Shares the completion nudge, then `Incomplete` | All |
 | Hard completion blocker | A blocker with no open steps or deliverables to work on (for example a failure introduced this turn after the nudge) | 0, ends `Incomplete` | All |
 | Disclosed gaps | Environment, permission, timeout, unchanged pre-existing or asked-to-diagnose failures | 0, accepted with a notice | All |
-| Open execution steps | `kind=step` todos still open | Shares the completion nudge | Lean local only; elsewhere an accepted `completed` answer closes them |
+| Open execution steps | `kind=step` todos still open | Shares the completion nudge | All: `completed` and `answered` refuse; accepted text never closes steps |
+| Typed pause for a question | A plain reply's last paragraph asks the user to choose or confirm while `finish` is offered | One nudge toward `finish(outcome=needs_input)`, then `needs_input` | All |
 | Investigation nudge | Keyword-classified work request with no observed tool call | Shares the completion nudge; ends `Incomplete` only if the next reply still announces unfinished work | Lean local only |
 | Capability-search reminder | The answer says, in the first person, that a capability is unavailable, with loadable tools and no search this instruction | 1 per instruction | All |
 | Unverified-edit check run | Current edits with no passing applicable check (`automatic_checks` off) | 0, the controller runs the checks itself | All |
@@ -1259,7 +1276,7 @@ edit witnesses. Automatic hints use source-validated lexical neighbors; explicit
 retains the richer saved-architecture context. Mandatory pre-edit source checks are unchanged.
 Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping for long multi-step work, not a verification checkpoint; the prompt and schema tell the model to skip it for short tasks and to send each update with a real tool call. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries.
 
-No separate tool-activity, citation or text-delivery gate applies. On lean local routes final prose never closes execution steps; elsewhere an accepted `completed` answer closes them. Explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
+No separate tool-activity, citation or text-delivery gate applies. Final prose never closes execution steps on any route; open steps refuse completion until `todo` closes or blocks them. Explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
 Todo-only updates receive a one-time batching reminder only when the active request allows
 multiple calls. The small local tier's one-call contract, and any later one-call reliability
@@ -1287,8 +1304,8 @@ missing/observed/not-required pixels, and effects outside checkpoints. Baseline 
 observations remain separate. Passing checks establish what ran, not independent proof of all
 requirements. A simple answer needs no todo list and is not forced into verification ceremony.
 
-Accepted `completed` reports close the remaining pending and in-progress execution steps outside
-lean local routes; optional follow-ups stay open and are disclosed in the report/evidence. Missing
+Accepted `completed` reports never close execution steps: open steps refuse completion on every route.
+Optional follow-ups stay open and are disclosed in the report/evidence. Missing
 visual evidence remains an honest limitation, not a fabricated screenshot or a bypass of browser
 approval. Automatic behavioral learning credit additionally requires no outstanding obligations or
 missing required pixels. Native, shell, and extension effect revisions invalidate old visual evidence.
@@ -1493,6 +1510,9 @@ limits, reasoning budgets, approvals or verification requirements:
   incidental path component is not sufficient to admit an entire subsystem.
 - Tool results are shown whole up to the per-model limit (48 KiB for large windows, about an eighth
   of the window for small ones), with the complete output retained in artifacts.
+  Results of work-dependent tools (`bash`, `eval`, `verify`, `bg`, `task`, `browser`, web, SSH,
+  database and similar) end with `[elapsed …]` wall time, and any other tool's result does once it
+  takes 5 seconds or more, so the model can see what a call cost before planning the next one.
   `efficiency.tool_preview_bytes` can reduce successful inspection results further; errors, read/edit
   snapshots, explicit artifact retrieval and unretained output are never reduced.
   Settled background pipe output and completion notifications also use the shell output minimizer
@@ -1646,8 +1666,8 @@ opt-in, independent of normal verification. Enable or disable each independently
   note (`advise`) or is refused once (`gate`). The `advise` note follows an edit that already
   applied, so it asks for a focused check of the reported behavior rather than a reproduction;
   `gate` asks for the reproduction before the edit. It fires at most once per turn; the next
-  attempt proceeds. A fix request that does not ask for verification is not steered toward a
-  reproduction.
+  attempt proceeds. The built-in prompt recommends a failing reproduction when feasible; that
+  recommendation alone does not refuse an edit or register a check.
 - `experimental.outcome_gradient_rounds` (0–10, 0 = off): after this many consecutive checked
   rounds with edits in which the error count (failing checks plus failing libtest, pytest, Go or
   Jest tests) does not drop below its best, a loop note suggests changing hypothesis.

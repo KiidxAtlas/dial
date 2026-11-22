@@ -384,6 +384,14 @@ impl Ledger {
         }
     }
 
+    /// Any recorded check (focused, `verify`, registered acceptance or reproduction) passed on
+    /// exactly `revision`.
+    pub fn any_current_pass(&self, revision: Revision) -> bool {
+        self.latest
+            .values()
+            .any(|o| o.current(revision) && o.status == CheckStatus::Passed)
+    }
+
     pub fn snapshot(&self, revision: Revision) -> serde_json::Value {
         let current: Vec<_> = self
             .latest

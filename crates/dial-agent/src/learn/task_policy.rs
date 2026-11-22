@@ -1,6 +1,7 @@
 //! Small deterministic task classification. Profiles still require measured acceptance;
 //! classification never grants permissions or changes success criteria.
 use serde::{Deserialize, Serialize};
+mod outcome;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -11,43 +12,24 @@ pub enum Kind {
     General,
 }
 impl Kind {
+    /// Classifies by the requested outcome. A failure noun ("bug", "crash") still marks the
+    /// subject as debugging work; repair, edit and investigation words count only in request
+    /// position, so "don't change anything, explain why" is investigation and "explain the fix"
+    /// is not a fix.
     pub fn classify(prompt: &str) -> Self {
+        let outcomes = outcome::requested(prompt);
         let lower = prompt.to_lowercase();
         let words: std::collections::HashSet<_> =
             lower.split(|c: char| !c.is_alphanumeric()).collect();
-        if ["fix", "bug", "crash", "regression", "failing", "debug"]
+        let failure_subject = ["bug", "crash", "regression", "failing"]
             .iter()
-            .any(|w| words.contains(w))
-        {
+            .any(|w| words.contains(w));
+        let requests = |list: &[&str]| list.iter().any(|w| outcomes.contains(w));
+        if failure_subject || requests(outcome::DEBUG) {
             Self::Debugging
-        } else if [
-            "implement",
-            "change",
-            "edit",
-            "rename",
-            "add",
-            "remove",
-            "refactor",
-        ]
-        .iter()
-        .any(|w| words.contains(w))
-        {
+        } else if requests(outcome::EDIT) {
             Self::Editing
-        } else if [
-            "explain",
-            "investigate",
-            "diagnose",
-            "inspect",
-            "read",
-            "audit",
-            "locate",
-            "find",
-            "why",
-            "trace",
-        ]
-        .iter()
-        .any(|w| words.contains(w))
-        {
+        } else if requests(outcome::INVESTIGATE) {
             Self::Investigation
         } else {
             Self::General
@@ -95,37 +77,12 @@ impl Policy {
 
 /// Whether `prompt` asks to explain a behaviour ("run X and tell me why it fails") without asking
 /// for a repair. Observing such a failure answers the request; it does not count as unfinished
-/// work. Any repair word ("fix", "make it pass", ...) keeps it an ordinary task.
+/// work. A repair word in request position ("fix", "make it pass", ...) keeps it an ordinary task;
+/// negated repair words ("don't fix it") and repair nouns ("explain the fix") do not.
 pub fn diagnosis_only(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    let words: std::collections::HashSet<_> = lower.split(|c: char| !c.is_alphanumeric()).collect();
-    let asks_why = [
-        "why",
-        "diagnose",
-        "diagnosis",
-        "explain",
-        "investigate",
-        "cause",
-        "causes",
-    ]
-    .iter()
-    .any(|word| words.contains(word));
-    let asks_repair = [
-        "fix",
-        "repair",
-        "resolve",
-        "patch",
-        "make",
-        "solve",
-        "correct",
-        "implement",
-        "change",
-        "edit",
-        "update",
-        "refactor",
-    ]
-    .iter()
-    .any(|word| words.contains(word));
+    let outcomes = outcome::requested(prompt);
+    let asks_why = outcome::DIAGNOSE.iter().any(|w| outcomes.contains(w));
+    let asks_repair = outcome::REPAIR.iter().any(|w| outcomes.contains(w));
     asks_why && !asks_repair
 }
 

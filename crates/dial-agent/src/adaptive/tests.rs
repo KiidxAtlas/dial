@@ -218,20 +218,99 @@ fn request_settings_are_labelled_as_dial_requests_with_unconfirmed_enforcement()
     ));
 }
 
+fn settled(succeeded: bool, committed: bool, check: bool) -> Settled {
+    Settled {
+        succeeded,
+        committed,
+        check,
+    }
+}
+
 #[test]
 fn task_phase_follows_observed_work_and_recovery_is_not_a_quality_label() {
     let mut s = State::begin(Kind::Editing, "Implement change");
     assert_eq!(s.phase, Phase::Investigation);
-    s.observe("write", true, false);
+    s.observe("write", settled(true, true, false));
     assert_eq!(s.phase, Phase::Editing);
-    s.observe("bash", true, true);
+    s.observe("bash", settled(true, false, true));
     assert_eq!(s.phase, Phase::Verification);
-    s.observe("read", false, false);
+    s.observe("read", settled(false, false, false));
     assert_eq!(s.phase, Phase::Recovery);
-    s.observe("todo", true, false);
+    s.observe("todo", settled(true, false, false));
     assert_eq!(s.phase, Phase::Recovery);
-    s.observe("read", true, false);
+    s.observe("read", settled(true, false, false));
     assert_eq!(s.phase, Phase::Editing);
+}
+
+#[test]
+fn mutation_phase_comes_from_committed_effects_not_tool_names() {
+    // A tool name is never a mutation: only a commit reported by the controller is.
+    for (name, committed, expected) in [
+        ("write", false, Phase::Investigation),
+        ("edit", true, Phase::Editing),
+        ("ast_edit", true, Phase::Editing),
+        ("solve", true, Phase::Editing),
+        ("eval", true, Phase::Editing),
+        ("bash", false, Phase::Investigation),
+        ("bash", true, Phase::Editing),
+    ] {
+        let mut state = State::begin(Kind::Editing, "Implement change");
+        state.observe(name, settled(true, committed, false));
+        assert_eq!(state.phase, expected, "{name} committed={committed}");
+    }
+}
+
+#[test]
+fn committed_history_survives_failed_and_verified_observations() {
+    // (steps as (name, succeeded, committed, check), next observation, expected phase)
+    type Step = (&'static str, bool, bool, bool);
+    let cases: Vec<(&str, Vec<Step>, &str, Phase)> = vec![
+        (
+            "failed write",
+            vec![("write", false, true, false)],
+            "read",
+            Phase::Editing,
+        ),
+        (
+            "verified edit",
+            vec![("edit", true, true, true)],
+            "read",
+            Phase::Editing,
+        ),
+        (
+            "failed check after commit",
+            vec![("bash", false, true, true)],
+            "read",
+            Phase::Editing,
+        ),
+        (
+            "failed write then shell",
+            vec![("write", false, true, false)],
+            "bash",
+            Phase::Editing,
+        ),
+        (
+            "failed check without commit",
+            vec![("bash", false, false, true)],
+            "read",
+            Phase::Investigation,
+        ),
+    ];
+    for (label, steps, next, expected) in cases {
+        let mut state = State::begin(Kind::Editing, "Implement change");
+        for (name, succeeded, committed, check) in steps {
+            state.observe(
+                name,
+                Settled {
+                    succeeded,
+                    committed,
+                    check,
+                },
+            );
+        }
+        state.observe(next, settled(true, false, false));
+        assert_eq!(state.phase, expected, "{label}");
+    }
 }
 
 #[test]
@@ -253,29 +332,29 @@ fn successful_shell_work_resumes_the_phase_before_repeated_failures() {
         (
             Kind::Editing,
             "Implement change",
-            Some(("edit", false)),
+            Some(("edit", true, false)),
             Phase::Editing,
         ),
         (
             Kind::Editing,
             "Implement change",
-            Some(("bash", true)),
+            Some(("bash", false, true)),
             Phase::Verification,
         ),
     ] {
         let mut state = State::begin(kind, objective);
-        if let Some((name, check)) = work {
-            state.observe(name, true, check);
+        if let Some((name, committed, check)) = work {
+            state.observe(name, settled(true, committed, check));
         }
         for _ in 0..2 {
-            state.observe("bash", false, false);
+            state.observe("bash", settled(false, false, false));
             assert_eq!(state.phase, Phase::Recovery, "{expected:?}");
         }
         for name in ["todo", "working_state", "tool_load"] {
-            state.observe(name, true, false);
+            state.observe(name, settled(true, false, false));
             assert_eq!(state.phase, Phase::Recovery, "{name} is bookkeeping");
         }
-        state.observe("bash", true, false);
+        state.observe("bash", settled(true, false, false));
         assert_eq!(state.phase, expected, "{kind:?}: {objective}");
     }
 }
@@ -326,7 +405,7 @@ fn budgets_respect_operator_limits_and_length_recovery_escapes_phase_cap() {
 fn phase_sampling_is_opt_in_and_pins_and_unknown_capabilities_win() {
     let mut c = config();
     let mut s = State::begin(Kind::Editing, "Change");
-    s.observe("write", true, false);
+    s.observe("write", settled(true, true, false));
     assert_eq!(choose(&c, &s, None, false, false).temperature, Some(0.4));
     c.adaptive.sampling = true;
     assert_eq!(choose(&c, &s, None, false, false).temperature, Some(0.15));
@@ -365,7 +444,7 @@ fn phase_sampling_is_opt_in_and_pins_and_unknown_capabilities_win() {
 fn reasoning_only_uses_declared_values_and_never_clips_thinking_budget() {
     let c = config();
     let mut s = State::begin(Kind::Editing, "Implement");
-    s.observe("write", true, false);
+    s.observe("write", settled(true, true, false));
     let mut p = ModelProfile {
         provider: "test".into(),
         model: "test".into(),

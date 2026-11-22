@@ -13,6 +13,11 @@ impl Agent<'_> {
     ) -> Result<()> {
         let typed_text = prompt.typed();
         let user_text = typed_text;
+        let in_type = message[crate::storage::session::TYPE_KEY].is_object();
+        let type_briefing = message
+            .as_object_mut()
+            .and_then(|object| object.remove("dial_type_context"))
+            .and_then(|value| value.as_str().map(str::to_owned));
         if let (Some(hint), Some(content)) = (
             self.skill_hint(user_text),
             message["content"].as_str().map(str::to_owned),
@@ -79,7 +84,7 @@ impl Agent<'_> {
                 )),
             }
         }
-        if !self.hermetic && crate::agent::verify::visual::useful(user_text) {
+        if !self.hermetic && crate::agent::verify::visual::useful(user_text, in_type) {
             context.push_str("\n\n");
             context.push_str(crate::agent::verify::visual::INITIAL_GUIDANCE);
         }
@@ -105,13 +110,26 @@ impl Agent<'_> {
             context.push_str("\nRun the named configured checks against the final result; required visuals need delivered browser pixels. Missing, stale, failed or unavailable evidence remains uncovered. Do not weaken checks or edit code to hide environment failures.");
         }
         self.append_provenance_context(&mut context, user_text, ui);
+        // The Type's briefing leads the model-only context, ahead of recall and the user's words.
+        if let Some(briefing) = type_briefing {
+            context = if context.is_empty() {
+                briefing
+            } else {
+                format!("{briefing}\n\n{context}")
+            };
+        }
         if !context.is_empty() {
             message["dial_recall"] = json!(context);
         }
         message["dial_context_request"] = json!(true);
-        self.session.append(message)?;
+        if matches!(origin, TurnOrigin::User) {
+            message["dial_structured_text"] = json!(true);
+        }
+        // Identity is the entry this append created. Recovery and pending-plan notes are pushed
+        // after it and must not become the admitted user request's entry.
+        let admitted = self.session.append(message)?;
         self.training_capture
-            .set_source_turn(self.session.branch_leaf());
+            .set_source_turn(Some(admitted.as_str()));
         let recovery = self.session.take_recovery_diagnostics();
         if !recovery.is_empty() {
             let count = recovery.len();
@@ -150,10 +168,10 @@ impl Agent<'_> {
             crate::agent::run::intent::record(
                 &mut state,
                 typed_text,
-                json!(self.session.branch_leaf()),
+                json!(admitted),
                 crate::agent::run::intent::Kind::Turn,
             );
-            state["current_instruction_entry_id"] = json!(self.session.branch_leaf());
+            state["current_instruction_entry_id"] = json!(admitted);
             if state["original_goal"].is_null() {
                 state["original_goal"] = json!(crate::agent::window::prompt::truncate_chars(
                     user_text, 4096

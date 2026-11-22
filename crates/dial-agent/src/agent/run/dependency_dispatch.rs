@@ -462,6 +462,7 @@ fn skipped(text: String) -> ToolOutput {
     ToolOutput::err(text)
         .with_status(tools::ToolStatus::Skipped)
         .with_effects(tools::surface::outcome::Effects::None)
+        .with_result_origin(tools::surface::outcome::ResultOrigin::Skipped)
 }
 
 /// Whether a non-check shell command (`bash` or `bg start`) is explicitly scoped to a plain

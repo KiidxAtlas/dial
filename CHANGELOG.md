@@ -17,6 +17,15 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+- Workers inherit admitted `CLAUDE.md` and `AGENTS.md` guidance independently of parent prompt formatting. Other ambient context stays parent-only. Built-in guidance recommends a failing reproduction for bug fixes; only the configured reproduction gate refuses an edit.
+- Custom prompts use the template field that supplied a block, not a text match, to decide whether to repeat it. Request reminders use the admitted journal entry rather than comparing message bodies.
+- Diagnosis-only detection distinguishes a requested fix from a negated or quoted one. The adaptive editing phase uses committed paths; a successful no-op does not count as an edit. Repeat recovery follows the recorded call reference for new duplicate answers and retains a fallback for older histories.
+- Native RPC accepts optional Desktop Type metadata alongside `send.text`. The Type briefing supplies model context without becoming part of the user's request for classification or verification.
+
+- A final reply that admits the requested work is unfinished ("I'm stopping here without a working `out.html`", "I have not yet built the required circuit") is no longer accepted as `completed` on hosted routes. Dial asks once to continue, then ends the turn `Incomplete` if the next reply admits it again. Diagnosis-only requests are exempt (`docs/agent-loop.md`).
+
+- Open execution steps refuse `completed` and `answered` on hosted and local routes; a final reply no longer closes them. A blocked step keeps its reason and remains outstanding. For a necessary user decision, `finish(outcome=needs_input)` is the preferred pause; a plain-question fallback remains available (`docs/agent-loop.md`).
+
 ## [0.3.15] - 2026-11-21
 
 - The edit-churn guard ("Repeated edits to one file without a passing check; asking the model to reconsider", plus its withheld large rewrites) is now off by default. Set `reliability.edit_churn_guard = true` to restore it (`docs/agent-loop.md`).

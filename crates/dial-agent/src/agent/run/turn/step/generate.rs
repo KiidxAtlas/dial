@@ -413,45 +413,6 @@ impl Agent<'_> {
             }
             steered_during_generation = true;
         }
-        // A reply that completed before the cancellation took effect is kept: the round skips its
-        // unstarted tools at the boundary and a final answer is still delivered.
-        if deadline_cancelled && result.is_err() && !self.interrupt.load(Ordering::SeqCst) {
-            self.record(
-                step,
-                "deadline_cancelled_generation",
-                json!({"elapsed_ms":started.elapsed().as_millis()}),
-            )?;
-            return self
-                .stop_turn(
-                    ui,
-                    "Stopped: --max-time deadline reached during a model request; the unfinished generation was discarded.".into(),
-                    step + 1,
-                )
-                .map(crate::agent::run::engine::Tick::Finished).map(ControlFlow::Break);
-        }
-        if let Some(error) = steering_error {
-            return Err(error)
-                .map(crate::agent::run::engine::Tick::Finished)
-                .map(ControlFlow::Break);
-        }
-        if steered_during_generation && !self.interrupt.load(Ordering::SeqCst) {
-            turn.steering_pending = true;
-            self.record(
-                step,
-                "steering_superseded_generation",
-                json!({"elapsed_ms":started.elapsed().as_millis()}),
-            )?;
-            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                crate::agent::ui::ui_event::EventKind::Steering,
-                "Stopped the old generation; replanning with your new instruction.",
-            ));
-            turn.budget.give_back();
-            return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-        }
-        // A reply's thinking is bound to the notes this request carried; keep them on the wire.
-        if result.is_ok() {
-            self.record_sent_notes(&context_before, ui);
-        }
         let rule_hit = result
             .as_ref()
             .err()
@@ -465,22 +426,30 @@ impl Agent<'_> {
                 &reply.tool_calls,
             )
         });
-        if !self.interrupt.load(Ordering::SeqCst) && (rule_hit.is_some() || scoped_paths.is_some())
-        {
-            if result.is_ok() {
+        let interrupted = self.interrupt.load(Ordering::SeqCst);
+        if let Some(discard) = classify_generation_discard(
+            deadline_cancelled && result.is_err(),
+            steering_error,
+            steered_during_generation,
+            rule_hit,
+            scoped_paths,
+            interrupted,
+        ) {
+            // A reply's thinking is bound to the notes this request carried; keep them on the wire
+            // whenever the generation completed before a portable-rule discard.
+            if result.is_ok()
+                && matches!(discard, GenerationDiscard::PortableRule { .. })
+            {
+                self.record_sent_notes(&context_before, ui);
                 record_rejected_reply(&self.usage_scope, backend, repairing)?;
             }
-            let discarded = scoped_paths.is_some().then_some("New file-scoped guidance must be delivered before these tools; discarded the entire tool attempt.");
             return self
-                .regenerate_for_guidance(
-                    turn,
-                    engine,
-                    step,
-                    (rule_hit, scoped_paths),
-                    discarded,
-                    ui,
-                )
+                .apply_generation_discard(turn, engine, step, started, discard, ui)
                 .map(ControlFlow::Break);
+        }
+        // A reply's thinking is bound to the notes this request carried; keep them on the wire.
+        if result.is_ok() {
+            self.record_sent_notes(&context_before, ui);
         }
         Ok(ControlFlow::Continue(Generation {
             result,
@@ -510,3 +479,94 @@ impl Agent<'_> {
         }))
     }
 }
+
+/// Ordered reasons a streaming or completed generation is discarded before tool admission.
+enum GenerationDiscard {
+    DeadlineCancelled,
+    SteeringError(anyhow::Error),
+    SteeringSuperseded,
+    PortableRule {
+        hit: Option<crate::agent::safety::rules::Hit>,
+        scoped_paths: Option<std::collections::BTreeSet<String>>,
+    },
+}
+
+/// Classify generation-discard reasons in deterministic precedence order:
+/// `DeadlineCancelled` > `SteeringError` > `SteeringSuperseded` > `PortableRule`.
+fn classify_generation_discard(
+    deadline_cancelled_err: bool,
+    steering_error: Option<anyhow::Error>,
+    steered_during_generation: bool,
+    rule_hit: Option<crate::agent::safety::rules::Hit>,
+    scoped_paths: Option<std::collections::BTreeSet<String>>,
+    interrupted: bool,
+) -> Option<GenerationDiscard> {
+    if deadline_cancelled_err && !interrupted {
+        return Some(GenerationDiscard::DeadlineCancelled);
+    }
+    if let Some(error) = steering_error {
+        return Some(GenerationDiscard::SteeringError(error));
+    }
+    if steered_during_generation && !interrupted {
+        return Some(GenerationDiscard::SteeringSuperseded);
+    }
+    if !interrupted && (rule_hit.is_some() || scoped_paths.is_some()) {
+        return Some(GenerationDiscard::PortableRule {
+            hit: rule_hit,
+            scoped_paths,
+        });
+    }
+    None
+}
+
+impl Agent<'_> {
+    fn apply_generation_discard(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
+        step: u32,
+        started: std::time::Instant,
+        discard: GenerationDiscard,
+        ui: &mut dyn Ui,
+    ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
+        match discard {
+            GenerationDiscard::DeadlineCancelled => {
+                self.record(
+                    step,
+                    "deadline_cancelled_generation",
+                    json!({"elapsed_ms": started.elapsed().as_millis()}),
+                )?;
+                self.stop_turn(
+                    ui,
+                    "Stopped: --max-time deadline reached during a model request; the unfinished generation was discarded.".into(),
+                    step + 1,
+                )
+                .map(crate::agent::run::engine::Tick::Finished)
+            }
+            GenerationDiscard::SteeringError(error) => Err(error),
+            GenerationDiscard::SteeringSuperseded => {
+                turn.steering_pending = true;
+                self.record(
+                    step,
+                    "steering_superseded_generation",
+                    json!({"elapsed_ms": started.elapsed().as_millis()}),
+                )?;
+                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Steering,
+                    "Stopped the old generation; replanning with your new instruction.",
+                ));
+                turn.budget.give_back();
+                Ok(crate::agent::run::engine::Tick::Again)
+            }
+            GenerationDiscard::PortableRule { hit, scoped_paths } => {
+                let discarded = scoped_paths.is_some().then_some(
+                    "New file-scoped guidance must be delivered before these tools; discarded the entire tool attempt.",
+                );
+                self.regenerate_for_guidance(turn, engine, step, (hit, scoped_paths), discarded, ui)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
