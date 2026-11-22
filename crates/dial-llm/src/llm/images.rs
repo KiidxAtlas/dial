@@ -520,11 +520,13 @@ pub(crate) fn prepare_for_target(
                     // inline bytes or internal artifacts.
                     if message["role"] == "user"
                         && reference["show_path"] == true
-                        && let (Some(root), Some(path)) =
-                            (reference["root"].as_str(), reference["path"].as_str())
+                        && let Some(path) = reference["path"].as_str()
                     {
-                        let absolute = Path::new(root).join(path);
-                        let label = json!(absolute.to_string_lossy());
+                        let safe_label = Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(path);
+                        let label = json!(safe_label);
                         parts.push(
                             json!({"type":"text","text":format!("[Attached image file: {label}]")}),
                         );
