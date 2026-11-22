@@ -1483,10 +1483,7 @@ fn image_references_reach_both_provider_wire_formats() {
     let mut reference =
         llm::images::user_attachment(root.path(), std::path::Path::new("tiny.png")).unwrap();
     reference["show_path"] = json!(true);
-    let label = format!(
-        "[Attached image file: {}]",
-        json!(root.path().canonicalize().unwrap().join("tiny.png"))
-    );
+    let label = r#"[Attached image file: "tiny.png"]"#;
     let message = json!({
         "role": "user",
         "content": "Describe @tiny.png",

@@ -431,7 +431,6 @@ impl BatchPrerequisites {
                 .iter()
                 .find(|(_, failed)| match (failed.as_ref(), resources.as_ref()) {
                     (Some(failed), Some(resources)) => failed.conflicts(resources),
-                    (Some(failed), None) => !disjoint_shell_subtree(workspace, call, failed),
                     _ => true,
                 })?;
         Some(skipped(format!(
@@ -462,61 +461,6 @@ fn skipped(text: String) -> ToolOutput {
     ToolOutput::err(text)
         .with_status(tools::ToolStatus::Skipped)
         .with_effects(tools::surface::outcome::Effects::None)
-}
-
-/// Whether a non-check shell command (`bash` or `bg start`) is explicitly scoped to a plain
-/// subdirectory strictly disjoint from `failed`'s declared write footprint, with no parent
-/// traversal, repo-wide git invocation or mention of the failed paths.
-///
-/// NOTE: Heuristic command-string parsing is not a sound safety boundary for bypassing
-/// failure-based dependency skipping. Keep this gate conservative.
-fn disjoint_shell_subtree(_workspace: &Workspace, _call: &ToolCall, _failed: &Footprint) -> bool {
-    false
-}
-
-fn contains_word(text: &str, word: &str) -> bool {
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .any(|token| token == word)
-}
-
-fn contains_path_token(text: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '/' | '\\'
-                    | '\''
-                    | '"'
-                    | '`'
-                    | ';'
-                    | ','
-                    | ':'
-                    | '('
-                    | ')'
-                    | '{'
-                    | '}'
-                    | '['
-                    | ']'
-                    | '='
-                    | '&'
-                    | '|'
-                    | '<'
-                    | '>'
-            )
-    })
-    .any(|token| {
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            token.eq_ignore_ascii_case(needle)
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            token == needle
-        }
-    })
 }
 
 impl Agent<'_> {

@@ -97,6 +97,8 @@ the name is already running does not skip actions on the running job.
 
 Native calls in one response run together as a wave only when their resources are provably disjoint. A read-only `bash` command is narrowed to its own files only when it is one plain `cat`, `wc`, `head`, `tail` or `stat` whose operands are literal workspace paths (a directory operand covers its contents) that the native resource rules admit: not a symlink, a hard-linked file, a path outside the workspace, or a missing file. Options are matched against an exact per-program list; an unlisted, abbreviated, bundled or `=`-suffixed option keeps the whole-workspace read, as do pipes, redirection, expansion, globs, stdin reads, `wc --files0-from` and file handles. A `cwd` argument narrows only when it is an existing directory reached without a symlink. Such a read waits behind any write to a path it does not name. `--` ends option parsing. `stat -f` is read as GNU's boolean `--file-system` flag, so on BSD or macOS, where `-f` takes a format, the format is an unresolved operand and the command falls back to the broad read.
 
+After a write fails, a different working directory does not prove a later shell command is independent. In the same batch, shell launches with unknown dependencies are skipped; diagnostic reads and native actions with provably disjoint paths remain available.
+
 An observational native no-op does not advance the source-mutation revision solely because its
 tool is named `edit`, `write` or `ast_edit`.
 

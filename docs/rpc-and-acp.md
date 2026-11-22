@@ -87,7 +87,7 @@ Native clients can pass `session_id` to `set_model` and `set_thinking`. A reques
 
 `send` attachments (native `dial rpc` only): `images` (paths: absolute, `~`, or relative to the workspace root) and `inline_images` (base64 image bytes, for pasted screenshots) attach images to the prompt through the same owner as `dial -p --image`. `@file` references in the text expand as in the terminal. A file that cannot be read, invalid base64, or a model that does not accept image input (`ready.image_input`) fails with `invalid_params` before the turn starts.
 
-With a vision model, explicit `images` file attachments include the local path next to the image so the agent can reference the original in local tools. This path is visible to the inference provider. Pasted `inline_images` and tool images do not get a path label.
+With a vision model, an explicit `images` file attachment is labeled with its filename, not its local directory. The inference provider sees that filename. Pasted `inline_images` and tool images do not get this label.
 
 Live voice (`docs/voice.md`): `live_start` (optional `voice`, `instructions`), `live_mute` (`muted`), `live_stop`, and `live_listen` (records one utterance and runs it as a turn; not available over ACP). While a live session is active, `send` text gets its instructions, and each finished answer is read aloud.
 Approval responses must name the currently pending `approval_id`; future/stale/replayed decisions fail.
