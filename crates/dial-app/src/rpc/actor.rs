@@ -917,6 +917,16 @@ impl ActorRuntime<'_> {
                 "leave the collaboration guest session before starting a local goal",
             ));
         }
+        if !self.acp
+            && matches!(method, "set_model" | "set_thinking")
+            && let Some(expected) = params.get("session_id")
+            && expected.as_str() != Some(self.agent.session().id())
+        {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                "The active session changed; reopen its model picker",
+            ));
+        }
         if self.acp
             && !matches!(
                 method,

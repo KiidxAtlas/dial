@@ -965,6 +965,8 @@ Unknown effects end the current turn as incomplete after saving results and skip
 
 Successful edits can also loop: a model may keep inserting and removing the same lines, and each success used to clear repetition checkpoints. `agent/mutation_cycles.rs` hashes the actual committed content of each path the transaction owner reports in `Execution::changed_paths`, resolved and canonicalized through the workspace (including added roots). It never parses tool text or diffs.
 
+**Edit-churn guard (opt-in).** With `reliability.edit_churn_guard = true` (default `false`), every third committed edit or failed attempt on one file without a passing check adds an advisory note to the tool result and a Recovery event, and a large (4 KiB or more) whole-file `write` to that file is withheld until a passing check names it. With the default, nothing is counted, so neither the note nor the withheld write occurs.
+
 One return to an earlier version is an allowed revert. A version committed for the third time, with other versions in between, is an edit loop. An edit loop never ends the turn. The edit's result tells the model that its edits are undoing each other. The exact calls (normalized arguments) that produced the alternating versions are refused for the rest of the turn.
 
 Different edits, the same file through other arguments, other files and every other tool remain available, and the turn continues to completion. A mutation that only returns a file to content it already had is not progress, so it cannot clear other recovery restrictions. Consecutive identical versions count as one visit. Reads, todos and other files do not clear this history; only new steering resets it.

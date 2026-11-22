@@ -576,7 +576,7 @@ fn native_coverage_invalidates_on_edits_missing_context_and_unsupported_represen
     let reuse = returned.reusable(|_| true);
     for args in [
         json!({"path":"src/lib.rs:raw:1-10"}),
-        json!({"paths":["src/lib.rs:1-10"]}),
+        json!({"paths":["src/lib.rs:raw:1-10"]}),
         json!({"path":"src/lib.rs:outline"}),
     ] {
         let mut calls = 0;
@@ -814,4 +814,139 @@ fn a_batch_names_the_large_file_and_a_hinted_result_still_parses_as_rows() {
     assert!(hint.contains("350 lines of src/big.rs"), "{hint}");
     let hinted = format!("{text}\n{hint}");
     assert_eq!(shown_runs(&hinted), shown_runs(&text));
+}
+
+#[test]
+fn batched_paths_reads_reuse_narrow_and_delta_per_target() {
+    let (root, workspace, mut returned) = native_fixture();
+    let second: String = (1..=30)
+        .map(|n| format!("second {n} {}\n", "y".repeat(40)))
+        .collect();
+    let third: String = (1..=20)
+        .map(|n| format!("third {n} {}\n", "z".repeat(40)))
+        .collect();
+    std::fs::write(root.path().join("src/two.rs"), &second).unwrap();
+    std::fs::write(root.path().join("src/three.rs"), &third).unwrap();
+
+    remember_native(&mut returned, &workspace, "r1", "src/lib.rs:1-30");
+    remember_native(&mut returned, &workspace, "r2", "src/two.rs:1-15");
+
+    let reuse = returned.reusable(|_| true);
+
+    // 1. All targets already covered -> pointer with zero native reads.
+    let mut invoked = Vec::new();
+    let all_covered = reuse.execute(
+        &workspace,
+        &json!({"paths": ["src/lib.rs:1-20", "src/two.rs:1-15"]}),
+        |args| {
+            invoked.push(args.clone());
+            crate::tools::execute(&workspace, "read", args, 10)
+        },
+    );
+    assert!(!all_covered.is_error, "{}", all_covered.text);
+    assert!(
+        invoked.is_empty(),
+        "all-covered batch should not invoke native read"
+    );
+    assert!(is_unchanged_read(&all_covered.text), "{}", all_covered.text);
+    assert_eq!(
+        all_covered.data.as_ref().unwrap()["read_reuse"]["fully_reused"],
+        true
+    );
+
+    // 2. Mixed batch: lib.rs fully covered, two.rs narrowed to 16-30, three.rs passthrough.
+    let mut invoked = Vec::new();
+    let mixed = reuse.execute(
+        &workspace,
+        &json!({"paths": ["src/lib.rs:1-20", "src/two.rs:1-30", "src/three.rs:1-10"]}),
+        |args| {
+            invoked.push(args.clone());
+            crate::tools::execute(&workspace, "read", args, 10)
+        },
+    );
+    assert!(!mixed.is_error, "{}", mixed.text);
+    assert_eq!(
+        invoked,
+        [json!({"paths": ["src/two.rs:16-30", "src/three.rs:1-10"]})]
+    );
+    assert!(mixed.text.contains("16:second 16"), "{}", mixed.text);
+    assert!(!mixed.text.contains("15:second 15"), "{}", mixed.text);
+    assert!(mixed.text.contains("1:third 1"), "{}", mixed.text);
+    assert!(mixed.text.contains("[Read reuse]"), "{}", mixed.text);
+    assert_eq!(
+        mixed.data.as_ref().unwrap()["read_reuse"]["fully_reused"],
+        false
+    );
+    assert_eq!(mixed.data.as_ref().unwrap()["read"], 2);
+
+    // 3. Changed file inside a batched `paths` read gets delta narrowing.
+    std::fs::write(
+        root.path().join("src/two.rs"),
+        second.replace("second 8 ", "edited 8 "),
+    )
+    .unwrap();
+    let mut invoked = Vec::new();
+    let delta = reuse.execute(
+        &workspace,
+        &json!({"paths": ["src/lib.rs:1-20", "src/two.rs:1-15"]}),
+        |args| {
+            invoked.push(args.clone());
+            crate::tools::execute(&workspace, "read", args, 10)
+        },
+    );
+    assert!(!delta.is_error, "{}", delta.text);
+    assert_eq!(invoked, [json!({"paths": ["src/two.rs:8-8"]})]);
+    assert!(delta.text.contains("8:edited 8"), "{}", delta.text);
+    assert!(delta.text.contains("[Read delta]"), "{}", delta.text);
+    assert_eq!(delta.data.as_ref().unwrap()["read_reuse"]["delta"], true);
+
+    // 4. `fresh: true` bypasses batch reuse completely.
+    let fresh_args = json!({"paths": ["src/lib.rs:1-20", "src/two.rs:1-15"], "fresh": true});
+    let mut invoked = Vec::new();
+    let fresh = reuse.execute(&workspace, &fresh_args, |args| {
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(invoked, [fresh_args]);
+    assert!(
+        fresh
+            .data
+            .as_ref()
+            .and_then(|d| d.get("read_reuse"))
+            .is_none()
+    );
+}
+
+#[test]
+fn batched_paths_reconciles_racing_edit_on_narrowed_target() {
+    let (root, workspace, mut returned) = native_fixture();
+    let second: String = (1..=30).map(|n| format!("second {n}\n")).collect();
+    std::fs::write(root.path().join("src/two.rs"), &second).unwrap();
+    remember_native(&mut returned, &workspace, "r1", "src/lib.rs:1-10");
+    remember_native(&mut returned, &workspace, "r2", "src/two.rs:1-10");
+
+    let reuse = returned.reusable(|_| true);
+    let original = json!({"paths": ["src/lib.rs:1-20", "src/two.rs:1-20"]});
+    let mut invoked = Vec::new();
+    let output = reuse.execute(&workspace, &original, |args| {
+        if invoked.is_empty() {
+            std::fs::write(
+                root.path().join("src/two.rs"),
+                (1..=30).map(|n| format!("raced {n}\n")).collect::<String>(),
+            )
+            .unwrap();
+        }
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(invoked.len(), 2);
+    assert_eq!(invoked[1], original);
+    assert!(output.text.contains("raced 1"), "{}", output.text);
+    assert!(
+        output
+            .data
+            .as_ref()
+            .and_then(|d| d.get("read_reuse"))
+            .is_none()
+    );
 }

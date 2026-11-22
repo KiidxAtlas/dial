@@ -1929,3 +1929,27 @@ fn a_session_start_naming_lifetime_starts_the_job_and_says_the_lifetime_is_ignor
     assert!(invalid.is_error, "{}", invalid.text);
     assert!(!tool.has_live_work());
 }
+
+#[test]
+fn name_defaults_to_the_only_running_job_and_otherwise_lists_choices() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let none = bg(&tool, &ws, json!({"action":"output"}));
+    assert!(
+        none.is_error && none.text.contains("no background jobs"),
+        "{}",
+        none.text
+    );
+    assert!(!start(&tool, &ws, "alpha", "echo alpha-marker; sleep 30").is_error);
+    let only = bg(&tool, &ws, json!({"action":"output"}));
+    assert!(!only.is_error, "{}", only.text);
+    assert!(only.text.contains("alpha"), "{}", only.text);
+    assert!(!start(&tool, &ws, "beta", "sleep 30").is_error);
+    let ambiguous = bg(&tool, &ws, json!({"action":"output"}));
+    assert!(
+        ambiguous.is_error && ambiguous.text.contains("alpha, beta"),
+        "{}",
+        ambiguous.text
+    );
+    assert!(!bg(&tool, &ws, json!({"action":"kill", "all":true})).is_error);
+}

@@ -397,8 +397,40 @@ impl Background {
         Ok(output.with_shell_launch(launch))
     }
 
+    /// The job an action targets: the given `name`, else the only running job, else the only
+    /// job. Otherwise the error lists the choices instead of just saying `name` is missing.
+    fn target_name(&self, args: &Value) -> Result<String, String> {
+        if let Some(name) = opt_str(args, "name")? {
+            return Ok(name.to_owned());
+        }
+        let mut table = self.table();
+        table.refresh();
+        let running: Vec<&str> = table
+            .procs
+            .iter()
+            .filter(|proc| proc.is_running())
+            .map(|proc| proc.name.as_str())
+            .collect();
+        match (running.as_slice(), table.procs.as_slice()) {
+            ([only], _) => Ok((*only).to_owned()),
+            ([], [only]) => Ok(only.name.clone()),
+            _ => {
+                let all: Vec<&str> = table.procs.iter().map(|proc| proc.name.as_str()).collect();
+                Err(if all.is_empty() {
+                    "missing required argument \"name\"; no background jobs exist".to_owned()
+                } else {
+                    format!(
+                        "missing required argument \"name\"; choose one of: {}",
+                        all.join(", ")
+                    )
+                })
+            }
+        }
+    }
+
     fn input(&self, args: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
-        let name = req_str(args, "name")?;
+        let name = self.target_name(args)?;
+        let name = name.as_str();
         let input = self.table().input(name)?;
         let timeout = super::kernel::deadline(args, 0)?;
         let end = super::kernel::execution_deadline(timeout);
@@ -459,7 +491,8 @@ impl Background {
     }
 
     fn output(&self, ws: &Workspace, args: &Value) -> Result<ToolOutput, String> {
-        let name = req_str(args, "name")?;
+        let name = self.target_name(args)?;
+        let name = name.as_str();
         let tail = match opt_u64(args, "tail")? {
             Some(0) => return Err("tail must be at least 1 line".to_string()),
             Some(lines) => Some(lines as usize),
@@ -478,7 +511,8 @@ impl Background {
         cancel: &AtomicBool,
         wait_for: WaitFor,
     ) -> Result<ToolOutput, String> {
-        let name = req_str(args, "name")?;
+        let name = self.target_name(args)?;
+        let name = name.as_str();
         let (ready, startup) = match wait_for {
             WaitFor::Requested(ready) => (ready, false),
             WaitFor::PtyStartup => (None, true),

@@ -742,8 +742,15 @@ impl<'a> ChildTurn<'a> {
             ) {
                 Ok(true) => {
                     self.compaction_retry_floor = None;
-                    // The compacted context no longer holds the results duplicate memory cited.
-                    engine.evidence_compacted();
+                    // Retain duplicate and read-reuse memory for results kept verbatim in the tail.
+                    engine.evidence_compacted_retaining(|id| {
+                        self.superseded.holds_full(id)
+                            && request.messages.iter().any(|message| {
+                                message["tool_call_id"].as_str() == Some(id)
+                                    && message["dial_execution"]["output"]["presentation"]
+                                        != "partial"
+                            })
+                    });
                 }
                 Ok(false) => {
                     return Ok(ControlFlow::Break(
@@ -2514,6 +2521,7 @@ impl<'a> ChildTurn<'a> {
                 let mut observation = call.arguments.clone();
                 if let Some(args) = observation.as_object_mut() {
                     args.remove("i");
+                    args.remove("fresh");
                 }
                 message["dial_evidence"]["observation"] = json!(observation.to_string());
             }

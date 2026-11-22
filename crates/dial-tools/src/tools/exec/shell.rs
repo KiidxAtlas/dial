@@ -1184,13 +1184,18 @@ fn run_bash(
     if cancel.load(Ordering::Acquire) {
         return Ok(ToolOutput::err("[cancelled before command started]\n"));
     }
+    let command_observations = if !asynchronous {
+        Some(ws.snapshot_command_observations(&cwd, &command))
+    } else {
+        None
+    };
     // Background requests need a child process, so they take the child-host path below.
     if !asynchronous
         && session.is_none()
         && idle_timeout.is_none()
         && runner_for(ws)? == Runner::InProcess
     {
-        return inprocess::run(
+        let result = inprocess::run(
             ws,
             &command,
             &cwd,
@@ -1199,6 +1204,10 @@ fn run_bash(
             on_output,
             cancel,
         );
+        if let Some(snapshot) = &command_observations {
+            ws.acknowledge_command_observations(snapshot);
+        }
+        return result;
     }
     let entries_before = directory_entries(&cwd);
     let mut spool = ws
@@ -1403,6 +1412,9 @@ fn run_bash(
         on_output,
         Duration::from_millis(300),
     )?;
+    if let Some(snapshot) = &command_observations {
+        ws.acknowledge_command_observations(snapshot);
+    }
 
     use crate::runtime::execution::Completeness;
     let original = capture.total as u64;

@@ -10,6 +10,7 @@ function waitCondition(request) {
   if (request.url != null) return 'url';
   if (request.text != null) return 'text';
   if (request.response != null) return 'response';
+  if (request.duration != null) return 'duration';
   return null;
 }
 
@@ -116,6 +117,10 @@ async function run(request, ctx) {
       return done({ selector: sel, styles });
     }
     case 'wait': {
+      if (condition === 'duration') {
+        await new Promise(resolve => setTimeout(resolve, request.duration));
+        return done({ condition, waited_ms: request.duration });
+      }
       if (condition === 'url') {
         await page.waitForFunction(fragment => location.href.includes(fragment), request.url, { timeout: request.timeout_ms });
         return done({ condition, url: clip(request.url), current_url: clip(page.url()) });

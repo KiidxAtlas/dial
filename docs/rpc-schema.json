@@ -2004,6 +2004,7 @@
             "params": {
               "type": "object",
               "properties": {
+                "session_id": {"type": "string", "minLength": 1},
                 "provider": {"type": "string", "minLength": 1},
                 "model_id": {"type": "string", "minLength": 1}
               },
@@ -2022,6 +2023,7 @@
             "params": {
               "type": "object",
               "properties": {
+                "session_id": {"type": "string", "minLength": 1},
                 "level": {"type": "string", "minLength": 1}
               },
               "additionalProperties": false,
@@ -2321,6 +2323,17 @@
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "pin_session"},
             "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}, "pinned": {"type": "boolean"}}, "additionalProperties": false, "required": ["session_id", "pinned"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Read a retained raster image from this project's artifact store. Returns media_type and base64 data, up to the 5 MiB image limit. Native RPC only.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "read_image_artifact"},
+            "params": {"type": "object", "properties": {"uri": {"type": "string", "pattern": "^artifact://[0-9a-fA-F]{64}$"}}, "additionalProperties": false, "required": ["uri"]}
           },
           "required": ["method", "params"],
           "additionalProperties": false

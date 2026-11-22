@@ -104,12 +104,21 @@ pub fn validate(action: &str, args: &Value) -> Result<(), String> {
 }
 
 fn has_wait_condition(args: &Value) -> bool {
-    ["url", "text", "response"]
+    ["url", "text", "response", "duration"]
         .iter()
         .any(|key| present(args, key).is_some())
 }
 
 fn wait(args: &Value) -> Result<(), String> {
+    if present(args, "duration").is_some() {
+        if ["url", "text", "response", "selector", "state"]
+            .iter()
+            .any(|key| present(args, key).is_some())
+        {
+            return Err("wait duration is a plain pause and takes no other condition".into());
+        }
+        return duration(args);
+    }
     let url = present(args, "url").is_some();
     let response = present(args, "response").is_some();
     let text = present(args, "text").is_some();

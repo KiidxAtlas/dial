@@ -271,6 +271,11 @@ impl Agent<'_> {
                         }
                     }
                     for (candidate, (output, seconds)) in group.iter().zip(&outputs) {
+                        // Image results are announced below, after their large wire payload has
+                        // been replaced with the immutable preview URI.
+                        if crate::agent::run::dispatch::has_image_payload(output) {
+                            continue;
+                        }
                         ui.tool_timing(&candidate.id, &candidate.name, *seconds);
                         ui.tool_result_with_id(&candidate.id, &candidate.name, output);
                     }
@@ -300,7 +305,7 @@ impl Agent<'_> {
                     let reused_before = streamed.as_ref().map_or(0, |s| s.statistics().1);
                     let mut steering = Vec::new();
                     let read_reuse = engine.reusable_reads(|id| self.holds_full_result(id));
-                    let outputs = crate::agent::run::dispatch::parallel_tools_with_reads(
+                    let outputs = crate::agent::run::dispatch::parallel_round_reads(
                         ParallelToolContext {
                             workspace: &self.workspace,
                             config: self.effective_config(),
@@ -332,7 +337,9 @@ impl Agent<'_> {
                 }
             }
 
-            let result_presented = !parallel.is_empty();
+            let result_presented = parallel
+                .front()
+                .is_some_and(|(out, _)| !crate::agent::run::dispatch::has_image_payload(out));
             let (mut out, seconds, executed) = match parallel.pop_front() {
                 Some(result) => {
                     // Batched bash skips `dispatch`; record verification evidence as the serial path does.

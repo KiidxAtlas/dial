@@ -31,6 +31,7 @@ fn explicit_image_is_attached_once_with_its_digest() {
     assert_eq!(turn.text, "what is in this picture?");
     let attached = turn.message["dial_images"].as_array().unwrap();
     assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0]["show_path"], true);
     assert!(
         attached[0]["sha256"]
             .as_str()

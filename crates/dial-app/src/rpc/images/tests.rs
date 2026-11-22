@@ -37,3 +37,22 @@ fn reports_a_working_route_and_why_a_broken_one_fails() {
     assert_eq!(page["role"]["model"], "/nowhere/painter");
     assert!(page["options"]["sizes"].as_array().unwrap().len() > 1);
 }
+
+#[test]
+fn preview_only_returns_an_intact_raster_from_the_project_store() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(dir.path()).unwrap();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jBmcAAAAASUVORK5CYII=";
+    let mut spool = store.spool().unwrap();
+    spool.write_all(&STANDARD.decode(png).unwrap()).unwrap();
+    let uri = spool.finish().unwrap();
+    let read = |uri: &str| artifact(dir.path(), &json!({"uri":uri}));
+    assert_eq!(
+        read(&uri).unwrap(),
+        json!({"media_type":"image/png","data":png})
+    );
+    assert!(read("artifact://../other").is_err());
+    assert!(read(&store.retain("not an image").unwrap()).is_err());
+}

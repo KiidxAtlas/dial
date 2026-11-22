@@ -1480,10 +1480,17 @@ fn image_references_reach_both_provider_wire_formats() {
     let root = tempfile::tempdir().unwrap();
     let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=").unwrap();
     std::fs::write(root.path().join("tiny.png"), &png).unwrap();
+    let mut reference =
+        llm::images::user_attachment(root.path(), std::path::Path::new("tiny.png")).unwrap();
+    reference["show_path"] = json!(true);
+    let label = format!(
+        "[Attached image file: {}]",
+        json!(root.path().canonicalize().unwrap().join("tiny.png"))
+    );
     let message = json!({
         "role": "user",
         "content": "Describe @tiny.png",
-        "dial_images": [llm::images::user_attachment(root.path(), std::path::Path::new("tiny.png")).unwrap()],
+        "dial_images": [reference],
     });
     assert!(!message.to_string().contains("base64"));
     for (anthropic, vision) in [
@@ -1514,7 +1521,9 @@ fn image_references_reach_both_provider_wire_formats() {
         req.messages = vec![message.clone()];
         assert_eq!(remote.chat(None, &req, 5, None).unwrap().text, "pixel");
         let body = fake::body(&server.requests()[0]);
-        let image = &body["messages"][0]["content"][1];
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["text"], label);
+        let image = &parts[2];
         let observation = remote.wire_observation().unwrap();
         assert_eq!(observation.boundary, "final_provider_wire");
         assert!(observation.payload_bytes > png.len());
@@ -1569,6 +1578,7 @@ fn image_references_reach_both_provider_wire_formats() {
         "{text}"
     );
     assert!(!content.to_string().contains("image_url"));
+    assert!(!text.contains("Attached image file"));
 }
 
 #[test]

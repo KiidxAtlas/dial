@@ -49,6 +49,38 @@ fn stale_image_notices_do_not_repeat_or_mutate_request_history() {
 }
 
 #[test]
+fn explicit_image_path_is_paired_with_pixels_without_labeling_other_references() {
+    let root = tempfile::tempdir().unwrap();
+    let name = Path::new("image with spaces.png");
+    fs::write(root.path().join(name), tiny_png()).unwrap();
+    let mut explicit = attachment(root.path(), name).unwrap();
+    let plain = explicit.clone();
+    explicit["show_path"] = json!(true);
+    let req = super::super::Chat {
+        messages: vec![
+            json!({"role":"user","content":"save these","dial_images":[explicit, plain]}),
+        ],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 100,
+        seed: None,
+    };
+    let prepared = prepare(&req, true, &NoticeTracker::default(), &mut |_| {
+        panic!("expected pixels")
+    })
+    .unwrap();
+    let parts = prepared.messages[0]["content"].as_array().unwrap();
+    let path = root.path().canonicalize().unwrap().join(name);
+    assert_eq!(
+        parts[1]["text"],
+        format!("[Attached image file: {}]", json!(path))
+    );
+    assert_eq!(parts[2]["type"], "image_url");
+    assert_eq!(parts[3]["type"], "image_url");
+    assert_eq!(parts.len(), 4);
+}
+
+#[test]
 fn image_notices_distinguish_failure_changes_and_model_capabilities() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("shot.png");

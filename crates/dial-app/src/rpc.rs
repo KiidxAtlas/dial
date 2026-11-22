@@ -1100,6 +1100,7 @@ impl Admin {
             method,
             "list_sessions"
                 | "search_sessions"
+                | "read_image_artifact"
                 | "list_models"
                 | "image_settings"
                 | "settings_schema"
@@ -1125,6 +1126,7 @@ impl Admin {
         match method {
             "list_sessions" => sessions::list(&layout, session.as_deref(), params),
             "search_sessions" => sessions::search(&layout, params),
+            "read_image_artifact" => images::artifact(&layout.state_dir.join("artifacts"), params),
             "delete_session" => sessions::delete(&layout, session.as_deref(), params),
             "pin_session" => sessions::pin(&layout, params),
             "list_models" => {
@@ -2157,11 +2159,28 @@ fn run_control(
                     };
                     out.result(&id, result);
                 }
-                "list_jobs" | "stop_job" | "list_sessions" | "delete_session" | "pin_session"
-                | "list_models" | "image_settings" | "delete_local_model" | "settings_schema"
-                | "get_settings" | "set_setting" | "reset_setting" | "list_extensions"
-                | "get_schema" | "list_checks" | "add_check" | "remove_check" | "list_skills"
-                | "search_sessions" | "code_history" | "stats"
+                "list_jobs"
+                | "stop_job"
+                | "list_sessions"
+                | "delete_session"
+                | "pin_session"
+                | "list_models"
+                | "image_settings"
+                | "delete_local_model"
+                | "settings_schema"
+                | "get_settings"
+                | "set_setting"
+                | "reset_setting"
+                | "list_extensions"
+                | "get_schema"
+                | "list_checks"
+                | "add_check"
+                | "remove_check"
+                | "list_skills"
+                | "search_sessions"
+                | "code_history"
+                | "stats"
+                | "read_image_artifact"
                     if !acp =>
                 {
                     let method = request["method"].as_str().unwrap_or_default().to_owned();

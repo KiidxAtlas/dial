@@ -267,3 +267,71 @@ fn pointer_projection_keeps_shorter_handle_source_without_resetting_recovery() {
             .is_some()
     );
 }
+
+#[test]
+fn compaction_retains_read_reuse_for_visible_tail_and_drops_summarized_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("old.rs"),
+        (1..=30)
+            .map(|n| format!("old line {n} {}\n", "x".repeat(30)))
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("kept.rs"),
+        (1..=30)
+            .map(|n| format!("kept line {n} {}\n", "y".repeat(30)))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut engine = Engine::default();
+    for (id, path) in [
+        ("summarized-read", "old.rs:1-30"),
+        ("retained-read", "kept.rs:1-30"),
+    ] {
+        let call = read(id, path);
+        let mut res = crate::tools::execute(&workspace, "read", &call.arguments, 10);
+        engine.settle(&workspace, &call, &mut res, Default::default(), |_| true);
+    }
+
+    // Soft compaction summarized `summarized-read` and kept `retained-read` verbatim.
+    engine.evidence_compacted_retaining(|id| id == "retained-read");
+
+    // The summarized read must run fresh and return full content.
+    let reuse = engine.reusable_reads(|id| id == "retained-read");
+    let mut old_calls = 0;
+    let old_out = reuse.execute(&workspace, &json!({"path": "old.rs:1-20"}), |args| {
+        old_calls += 1;
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(old_calls, 1);
+    assert!(old_out.text.contains("1:old line 1"));
+
+    // The retained-tail read stays reusable without executing a native read.
+    let mut kept_calls = 0;
+    let kept_out = reuse.execute(&workspace, &json!({"path": "kept.rs:1-20"}), |args| {
+        kept_calls += 1;
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(kept_calls, 0);
+    assert!(investigation::is_unchanged_read(&kept_out.text));
+    assert!(kept_out.text.contains("retained-read"));
+
+    // Duplicate pointer checks also respect retained vs summarized visibility.
+    let mut kept_again =
+        crate::tools::execute(&workspace, "read", &json!({"path": "kept.rs:1-30"}), 10);
+    let (pointer, _, _) = engine.settle(
+        &workspace,
+        &read("kept-2", "kept.rs:1-30"),
+        &mut kept_again,
+        Default::default(),
+        |id| id == "retained-read",
+    );
+    assert!(
+        pointer
+            .as_deref()
+            .is_some_and(investigation::is_unchanged_read)
+    );
+}

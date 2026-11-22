@@ -258,6 +258,82 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
 }
 
 #[test]
+fn failed_mutation_does_not_skip_shell_scoped_to_disjoint_subdirectory() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dial-engine/src")).unwrap();
+    std::fs::create_dir_all(root.path().join("dial-desktop/.tmp")).unwrap();
+    std::fs::write(root.path().join("dial-engine/src/app.rs"), "fn main() {}\n").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::default();
+    let mode = crate::config::types::EditMode::default();
+    let mut prerequisites = BatchPrerequisites::default();
+    prerequisites.observe(
+        &workspace,
+        mode,
+        &call("write", "dial-engine/src/app.rs"),
+        &ToolOutput::err("refused").with_effects(tools::surface::outcome::Effects::None),
+        &registry,
+    );
+    for (name, args, skipped) in [
+        (
+            "bash",
+            json!({"command": "node -e 'const base=\".tmp/preview\"'", "cwd": "dial-desktop"}),
+            false,
+        ),
+        (
+            "bash",
+            json!({"command": "cd dial-desktop && node -e 'console.log(1)'"}),
+            false,
+        ),
+        (
+            "bg",
+            json!({"action": "start", "name": "preview", "command": "node index.mjs", "cwd": "dial-desktop"}),
+            false,
+        ),
+        // Same subtree, parent escape, git command, check flag, or explicit reference stay skipped.
+        (
+            "bash",
+            json!({"command": "cargo test", "cwd": "dial-engine"}),
+            true,
+        ),
+        (
+            "bash",
+            json!({"command": "node ../dial-engine/script.mjs", "cwd": "dial-desktop"}),
+            true,
+        ),
+        (
+            "bash",
+            json!({"command": "git add .", "cwd": "dial-desktop"}),
+            true,
+        ),
+        (
+            "bash",
+            json!({"command": "node verify.mjs", "cwd": "dial-desktop", "check": true}),
+            true,
+        ),
+        (
+            "bash",
+            json!({"command": "node script.mjs dial-engine", "cwd": "dial-desktop"}),
+            true,
+        ),
+        (
+            "bash",
+            json!({"command": "node script.mjs app.rs", "cwd": "dial-desktop"}),
+            true,
+        ),
+    ] {
+        let action = ToolCall {
+            id: "later".into(),
+            name: name.into(),
+            arguments: args,
+            malformed_arguments: false,
+        };
+        let result = prerequisites.rejection(&workspace, mode, &registry, &action);
+        assert_eq!(result.is_some(), skipped, "{action:?}");
+    }
+}
+
+#[test]
 fn a_failed_job_start_skips_later_actions_on_that_job_only() {
     let root = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(root.path()).unwrap();

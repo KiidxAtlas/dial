@@ -17,6 +17,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+- The edit-churn guard ("Repeated edits to one file without a passing check; asking the model to reconsider", plus its withheld large rewrites) is now off by default. Set `reliability.edit_churn_guard = true` to restore it (`docs/agent-loop.md`).
+- Native RPC clients can retrieve retained tool screenshots by content hash with `read_image_artifact`, including during a turn.
+- Successful vision requests label explicitly attached files with their reusable local paths. Tool images and inline bytes do not gain path labels.
+- Dial Desktop Type context no longer triggers visual inspection on non-visual requests.
+
 ## [0.3.14] - 2026-11-21
 
 ### Added

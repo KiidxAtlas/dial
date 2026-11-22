@@ -132,6 +132,7 @@ pub const METHODS: &[Method] = &[
     write("add_check", "checks"),
     write("remove_check", "checks"),
     read("evidence", "evidence"),
+    read("read_image_artifact", "evidence"),
     write("evidence_correct", "evidence"),
     write("evidence_compare", "evidence"),
     read("policy", "diagnostics"),

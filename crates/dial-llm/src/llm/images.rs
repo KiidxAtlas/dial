@@ -515,7 +515,22 @@ pub(crate) fn prepare_for_target(
                 continue;
             }
             match image_part(reference) {
-                Ok(part) => parts.push(part),
+                Ok(part) => {
+                    // Only explicit user file attachments get reusable paths, not tool images,
+                    // inline bytes or internal artifacts.
+                    if message["role"] == "user"
+                        && reference["show_path"] == true
+                        && let (Some(root), Some(path)) =
+                            (reference["root"].as_str(), reference["path"].as_str())
+                    {
+                        let absolute = Path::new(root).join(path);
+                        let label = json!(absolute.to_string_lossy());
+                        parts.push(
+                            json!({"type":"text","text":format!("[Attached image file: {label}]")}),
+                        );
+                    }
+                    parts.push(part);
+                }
                 Err(error) => {
                     let reason = format!("image {path} skipped: {error}");
                     failures.push((failure_key(reference, &reason), reason));

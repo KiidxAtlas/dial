@@ -95,3 +95,13 @@ fn wait_conditions_are_exclusive_and_scoped() {
     assert!(validate("wait", &json!({"url": ""})).is_err());
     assert!(validate("wait", &json!({"text": "Saved", "state": "visible"})).is_err());
 }
+
+#[test]
+fn wait_duration_is_a_bounded_plain_pause() {
+    assert!(is_page_action("wait", &json!({"duration": 500})));
+    assert!(validate("wait", &json!({"duration": 6000})).is_ok());
+    assert!(validate("wait", &json!({"duration": 10001})).is_err());
+    assert!(validate("wait", &json!({"duration": -1})).is_err());
+    assert!(validate("wait", &json!({"duration": 100, "selector": "#x"})).is_err());
+    assert!(validate("wait", &json!({"duration": 100, "text": "x"})).is_err());
+}

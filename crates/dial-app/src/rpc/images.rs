@@ -48,5 +48,26 @@ pub(super) fn settings(config: &Config) -> Value {
     }
 }
 
+/// Only immutable raster bytes from this project's engine-owned store; never a caller's path.
+pub(super) fn artifact(root: &std::path::Path, params: &Value) -> anyhow::Result<Value> {
+    use crate::storage::artifact::{ArtifactStore, artifact_id};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use dial_protocol::ErrorCode;
+    use sha2::{Digest, Sha256};
+
+    let uri = params["uri"].as_str().unwrap_or_default();
+    let id = artifact_id(uri).map_err(|e| super::coded(ErrorCode::InvalidParams, e))?;
+    let bytes =
+        ArtifactStore::new(root)?.exact_bytes(uri, crate::llm::images::MAX_IMAGE_BYTES as usize)?;
+    anyhow::ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == id,
+        "image artifact changed"
+    );
+    let mime = crate::llm::images::sniff_mime(&bytes)
+        .ok_or_else(|| super::coded(ErrorCode::InvalidParams, "artifact is not a raster image"))?;
+    crate::llm::images::dimensions(&bytes)?;
+    Ok(json!({"media_type":mime,"data":STANDARD.encode(bytes)}))
+}
+
 #[cfg(test)]
 mod tests;

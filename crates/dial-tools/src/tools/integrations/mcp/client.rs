@@ -376,8 +376,17 @@ impl Client {
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        let mut child = crate::platform::process::spawn_group(&mut command)
-            .with_context(|| format!("starting `{}`", config.program.display()))?;
+        let mut child = crate::platform::process::spawn_group(&mut command).with_context(|| {
+            let program = config.program.display();
+            if config.program.is_absolute() && !config.program.exists() {
+                format!(
+                    "starting `{program}`: no such file; fix `mcp.{server}.program` \
+                     (a moved or rebuilt app re-registers itself when it starts)"
+                )
+            } else {
+                format!("starting `{program}`")
+            }
+        })?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {

@@ -36,6 +36,17 @@ fn pagination_wording_does_not_request_visual_work() {
     assert!(useful("fix the page layout"));
     assert!(useful("the page looks broken on mobile"));
 }
+
+#[test]
+fn type_context_is_not_the_users_visual_request() {
+    let prefix = "[[type:inspiration]]\n<type-context>\nImage board layout; change the look.\n</type-context>\n";
+    assert!(!useful(&format!("{prefix}Add the four items")));
+    assert!(!useful(&format!("{prefix}Take a look at the items")));
+    assert!(useful(&format!("{prefix}Restyle this")));
+    assert!(useful(&format!("{prefix}Take a screenshot")));
+    assert!(useful(&format!("{prefix}Make it look better")));
+}
+
 #[test]
 fn explicit_visual_inspection_requests_require_delivered_pixels() {
     for prompt in ["do visual inspection", "visually verify the game"] {

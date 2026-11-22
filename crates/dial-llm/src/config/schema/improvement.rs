@@ -590,6 +590,15 @@ pub(super) static LEARNING: &[SettingDef] = &[
         },
     ),
     field!(
+        "reliability.edit_churn_guard",
+        reliability.edit_churn_guard,
+        IM,
+        "Tool reliability",
+        "Edit-churn guard",
+        "After three committed edits to one file without a passing check, ask the model to reconsider and withhold large whole-file rewrites of that file until a check passes. Off by default.",
+        Kind::Bool,
+    ),
+    field!(
         "reliability.measured_interfaces",
         reliability.measured_interfaces,
         IM,
