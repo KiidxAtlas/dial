@@ -14,9 +14,9 @@ use crate::runtime::execution::{EvalNamespace, NativeEditRetry};
 use crate::tools::Workspace;
 
 #[derive(Default)]
-struct FileTargets {
-    paths: Vec<PathBuf>,
-    versions: Vec<Option<[u8; 32]>>,
+pub(super) struct FileTargets {
+    pub(super) paths: Vec<PathBuf>,
+    pub(super) versions: Vec<Option<[u8; 32]>>,
 }
 
 #[derive(Default)]
@@ -46,7 +46,7 @@ struct BlockedCall {
 pub(super) struct FailureRecord {
     pub diagnostic: Option<String>,
     pub shell_tree: Option<String>,
-    pub file_targets: Option<(Vec<PathBuf>, Vec<Option<[u8; 32]>>)>,
+    pub file_targets: Option<FileTargets>,
     pub native_witness: Option<NativeEditRetry>,
     pub access: Option<(String, Vec<String>)>,
     pub eval: Option<(EvalNamespace, String)>,
@@ -81,8 +81,8 @@ impl RetryBarriers {
         if let Some(tree) = record.shell_tree {
             entry.shell_tree = Some(tree);
         }
-        if let Some((paths, versions)) = record.file_targets {
-            entry.file_targets = Some(FileTargets { paths, versions });
+        if let Some(targets) = record.file_targets {
+            entry.file_targets = Some(targets);
         }
     }
 

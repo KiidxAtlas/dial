@@ -581,7 +581,10 @@ impl Engine {
                     .iter()
                     .map(|path| workspace.read_identity(&workspace.rel(path)))
                     .collect();
-                (targets, versions)
+                retry_barriers::FileTargets {
+                    paths: targets,
+                    versions,
+                }
             });
             self.barriers.record(
                 identity,

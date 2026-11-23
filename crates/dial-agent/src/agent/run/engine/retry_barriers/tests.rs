@@ -39,7 +39,10 @@ fn service_start_releases_unknown_barriers_without_releasing_job_file_or_access_
         id(3),
         FailureRecord {
             diagnostic: Some("bad edit".into()),
-            file_targets: Some((vec![dir.path().join("a.rs")], vec![None])),
+            file_targets: Some(FileTargets {
+                paths: vec![dir.path().join("a.rs")],
+                versions: vec![None],
+            }),
             ..Default::default()
         },
     );
