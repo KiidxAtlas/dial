@@ -1209,7 +1209,11 @@ impl Admin {
                 if !model.model.is_empty() {
                     in_use.push(model.model.clone());
                 }
-                models::delete_local(params, &in_use)
+                let result = models::delete_local(params, &in_use)?;
+                if result["deleted"] == true {
+                    self.scan.reset();
+                }
+                Ok(result)
             }
             "settings_schema" => Ok(settings::schema()),
             "get_settings" => settings::get(&layout, params),
