@@ -47,7 +47,7 @@ fn explicit_auth_selection_validates_and_survives_role_resolution() {
 fn context_window_accepts_auto_and_numeric_values() {
     assert_eq!(
         resolve("context_window='auto'\n").unwrap().context_window,
-        32768
+        131_072
     );
     assert_eq!(
         resolve("context_window=8192\n").unwrap().context_window,
@@ -62,6 +62,9 @@ fn context_auto_and_family_caps_follow_model_capacity_without_loading_weights() 
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
     chatgpt::test_account(home.path(), false);
+    let load = |text: &str| Config::from_table(&layout, toml::from_str(text).unwrap()).unwrap();
+    let before_discovery = load("provider='chatgpt'\nmodel='large'\n");
+    assert_eq!(before_discovery.context_window, 131_072);
     chatgpt::test_catalog(
         home.path(),
         &serde_json::json!({"models":[
@@ -69,7 +72,9 @@ fn context_auto_and_family_caps_follow_model_capacity_without_loading_weights() 
             {"slug":"small","context_window":16000}
         ]}),
     );
-    let load = |text: &str| Config::from_table(&layout, toml::from_str(text).unwrap()).unwrap();
+    let bound = before_discovery.with_account_id("oaiapp_test");
+    assert_eq!(bound.context_window, 272_000);
+    assert_eq!(bound.requested_context_window(), None);
     let auto = load("provider='chatgpt'\nmodel='large'\ncontext_window='auto'\n");
     assert_eq!(auto.context_window, 272000);
     assert_eq!(
@@ -91,9 +96,14 @@ fn context_auto_and_family_caps_follow_model_capacity_without_loading_weights() 
         model: "unknown".into(),
         ..Default::default()
     };
+    assert_eq!(auto.with_selection(&unknown).context_window, 131_072);
     assert_eq!(capped.with_selection(&unknown).context_window, 64000);
     let override_main = load(
         "provider='chatgpt'\nmodel='large'\ncontext_window=96000\ncloud_context_window=64000\n",
+    );
+    assert_eq!(
+        override_main.with_account_id("oaiapp_test").context_window,
+        96000
     );
     assert_eq!(override_main.context_window, 96000);
     assert_eq!(override_main.with_selection(&small).context_window, 16000);
@@ -131,6 +141,33 @@ fn context_auto_and_family_caps_follow_model_capacity_without_loading_weights() 
             .count(),
         0
     );
+}
+
+#[test]
+fn bare_cloud_selection_reads_capacity_only_from_its_resolved_endpoint() {
+    use crate::llm::model_config::ModelSelection;
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let config = Config::from_table(
+        &layout,
+        toml::from_str("[providers.hosted]\nbase_url='https://hosted.example/v1'\napi_key_env='TEST_HOSTED_KEY'\n").unwrap(),
+    ).unwrap();
+    let cache = serde_json::json!({"rows": [{
+        "label": "deployment", "source": "cached", "available": true,
+        "selection": {"provider": "hosted", "model": "deployment",
+            "base_url": "https://hosted.example/v1", "api_key_env": "TEST_HOSTED_KEY",
+            "context_window": 256000}
+    }]});
+    crate::config::settings_store::write_private(
+        &crate::config::paths::model_catalog_file(home.path()),
+        &serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let mut pick = ModelSelection::new("hosted", "deployment");
+    assert_eq!(config.with_selection(&pick).context_window, 256_000);
+    pick.base_url = Some("https://other.example/v1".into());
+    assert_eq!(config.with_selection(&pick).context_window, 131_072);
 }
 
 #[test]
@@ -203,7 +240,7 @@ fn antigravity_neon_context_resolves_for_effort_ids_without_overriding_caps() {
         pick.base_url = Some("https://proxy.example/v1".into());
         assert_eq!(
             config.with_selection(&pick).context_window,
-            32_768,
+            131_072,
             "custom route"
         );
     }
@@ -240,7 +277,7 @@ fn claude_context_resolves_on_load_and_selection_without_overriding_user_limits(
         selection.context_window = None;
         assert_eq!(
             config.with_selection(&selection).context_window,
-            32768,
+            131_072,
             "{model}: custom endpoint"
         );
     }

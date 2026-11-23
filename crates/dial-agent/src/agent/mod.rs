@@ -36,6 +36,8 @@ pub use model::backend::{Runtime, make_backend, make_session_backend, unconfigur
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
 pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage, PeerSender};
+#[cfg(any(test, feature = "test-support"))]
+pub use run::failure_guidance::test_provider_failure;
 pub use run::failure_guidance::user_failure_text;
 pub use run::scheduling_replay::{SchedulingReplay, replay_scheduling};
 pub use safety::approval;
@@ -203,12 +205,8 @@ struct StepChecks {
     eval_checks: verify::eval_checks::History,
     /// At most one local advisory awaiting a reply; never consulted by verification gates.
     repair_brief: Option<verify::checks::RepairBrief>,
-    /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
-    /// the completion gate when the model verifies through `bash` rather than `check`.
+    /// Revision of the latest successful foreground shell check explicitly declared or configured.
     shell_check_passed: Option<verify::evidence::Revision>,
-    /// Revision at which a foreground `bash` command carrying its own inline assertion (`assert`,
-    /// `stopifnot`) last exited 0 with complete output. Evidence only for the unattended gate.
-    asserting_shell_passed: Option<verify::evidence::Revision>,
     /// A foreground validation attempt exited 127. Never itself evidence of a code defect.
     validation_launch_gap: bool,
     /// `bash` calls marked `check` that ran to an exit this turn, as `(command, passed, revision)`,

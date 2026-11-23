@@ -26,14 +26,14 @@ pub(crate) const TOOL_POLICY: &str = "
 - For new artifacts with clear inputs and outputs, read inputs, compute, write, and validate in one run. Inspect separately only if it could change the approach.
 - Keep tool arguments short; use `edit` for local changes.";
 pub(crate) const LEAN_BATCHING: &str = "
-- Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; `&&`-chain dependent commands and verify after the edits a check covers.";
+- Send independent reads, searches and read-only commands as parallel tool calls; batch ordered evals, disjoint edits and todo updates. `&&`-chain dependent commands; verify after covered edits.";
 pub(crate) const LEAN_ONE_CALL: &str = "
 - This route allows one tool call per response: read its result before choosing the next action.";
 /// Present only when the presentation itself limits calls per response.
 pub(crate) const CALL_CONTRACT_PRECEDENCE: &str = "
 - The call limit outranks batching advice and counts bookkeeping calls such as todo.";
 
-pub(in crate::agent) const FOCUSED_WORK: &str = "- For an advisory question, answer once each claim about the project (exists, missing, works) rests on a lookup, and say in plain words which points are inference.
+pub(in crate::agent) const FOCUSED_WORK: &str = "- For an advisory question, give findings (differences for comparisons) once each claim about the project (exists, missing, works) rests on a lookup. Label inference.
 - For implementation, continue through the requested behavior and its checks; search again only when a concrete question remains open or evidence conflicts.";
 pub(crate) const LEAN_WAITING: &str = "
 - While jobs or tests run, do independent work without changing their inputs. Wait only when progress or completion needs the result.";

@@ -198,7 +198,14 @@ impl std::fmt::Display for TerminalFailure {
             f,
             "Responses {} ({field}: {}); no tool calls were executed",
             self.kind, self.code
-        )
+        )?;
+        // Sending again cannot succeed, and the person reading this may see no other hint.
+        if self.code == "model_not_found" {
+            f.write_str(
+                ". The provider does not offer this model to this account; choose another model",
+            )?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for TerminalFailure {}

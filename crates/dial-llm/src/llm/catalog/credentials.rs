@@ -49,7 +49,16 @@ pub fn credential_token(user_dir: &Path, base_url: &str) -> Result<Option<String
 }
 /// Base URLs (without a trailing `/`) that have a saved credential, read once per discovery pass.
 /// An unreadable store yields none; a probed provider still reports that error from [`prepare`].
-pub(super) fn saved_credential_urls(user_dir: &Path) -> BTreeSet<String> {
+pub fn saved_credential_urls(user_dir: &Path) -> BTreeSet<String> {
+    stored_credential_urls(user_dir)
+        .into_iter()
+        .map(|url| url.trim_end_matches('/').to_owned())
+        .collect()
+}
+
+/// Exact store keys, as used by save/remove. Unlike discovery, the credential-management
+/// inventory must not merge a custom URL ending in `/` with a catalog URL without it.
+pub fn stored_credential_urls(user_dir: &Path) -> BTreeSet<String> {
     if user_dir.as_os_str().is_empty() {
         return BTreeSet::new();
     }
@@ -57,12 +66,7 @@ pub(super) fn saved_credential_urls(user_dir: &Path) -> BTreeSet<String> {
         return BTreeSet::new();
     };
     credential_map(user_dir)
-        .map(|saved| {
-            saved
-                .into_keys()
-                .map(|url| url.trim_end_matches('/').to_owned())
-                .collect()
-        })
+        .map(|saved| saved.into_keys().collect())
         .unwrap_or_default()
 }
 /// Bundled API-key providers that `taken` does not already cover (the always-probed [`KNOWN`]

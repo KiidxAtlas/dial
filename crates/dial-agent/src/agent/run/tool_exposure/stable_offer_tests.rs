@@ -4,6 +4,73 @@ use super::*;
 const HOSTED: &str = "[endpoint]\nbase_url='https://example.com/v1'";
 
 #[test]
+fn notebook_recovery_is_callable_within_the_stable_budget_and_on_small_window_retries() {
+    let notebook = "[compaction]\nexperimental_context_management=true";
+    for profile in [
+        HOSTED,
+        "context_window=8192",
+        "context_window=8192\n[harness]\ntools=['read','bash']",
+    ] {
+        with_agent(&format!("{profile}\n{notebook}"), |agent| {
+            for lean in [false, true] {
+                agent.lean_tools = lean;
+                let schemas = agent.schemas(&agent.offered()).unwrap();
+                for name in ["context_notes", "new_context", "session_search"] {
+                    let schema = schemas
+                        .iter()
+                        .find(|s| s["function"]["name"] == name)
+                        .unwrap_or_else(|| panic!("missing {name} on {profile}, lean={lean}"));
+                    if name == "session_search" {
+                        assert_eq!(
+                            schema["function"]["parameters"]["properties"]["history"]["type"],
+                            "boolean"
+                        );
+                    }
+                }
+                if agent.stable_tool_offer() {
+                    assert!(
+                        serde_json::to_vec(&schemas).unwrap().len() <= agent.core_schema_budget()
+                    );
+                }
+            }
+            agent.modes.launch.tools = Some(["read".to_owned()].into());
+            assert!(!agent.offered().iter().any(|tool| matches!(
+                tool.as_str(),
+                "new_context" | "context_notes" | "session_search"
+            )));
+        });
+    }
+    with_agent(HOSTED, |agent| {
+        assert!(!agent.offered().iter().any(|tool| matches!(
+            tool.as_str(),
+            "new_context" | "context_notes" | "session_search"
+        )));
+    });
+}
+
+#[test]
+fn snapcompact_requires_layer_recovery_not_notebook_tools() {
+    with_agent("[compaction.snapcompact]\noverlay=true", |agent| {
+        let schemas = agent.schemas(&agent.offered()).unwrap();
+        let search = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "session_search")
+            .unwrap();
+        assert!(
+            search["function"]["parameters"]["properties"]["view"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("layers"))
+        );
+        assert!(
+            !schemas
+                .iter()
+                .any(|s| s["function"]["name"] == "new_context")
+        );
+    });
+}
+
+#[test]
 fn enabled_interactive_questions_fit_without_crowding_out_hosted_core_capabilities() {
     with_agent(&format!("{HOSTED}\n[ask]\nenabled=true"), |agent| {
         let offered = agent.offered();
@@ -278,6 +345,27 @@ fn searching_a_specialist_leaves_the_offer_and_cached_prefix_unchanged() {
         assert_eq!(agent.offered(), before);
         assert_eq!(agent.system_messages(), system);
         assert!(agent.discovered_tools().is_empty());
+    });
+}
+
+#[test]
+fn every_offered_tool_says_how_it_batches() {
+    with_agent(HOSTED, |agent| {
+        let offered = agent.offered();
+        for schema in agent.schemas(&offered).unwrap() {
+            let text = schema["function"]["description"].as_str().unwrap();
+            assert!(text.contains("Batch:"), "{text}");
+        }
+        let note = |name: &str| {
+            agent.schemas(&[name.into()]).unwrap()[0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(note("bash").contains("read-only ones run in parallel"));
+        assert!(note("grep").contains("in parallel with `read`"));
+        assert!(note("edit").contains("runs in order"));
+        assert!(note("finish").contains("must be last"));
     });
 }
 

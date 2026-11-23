@@ -6,7 +6,7 @@
 # Changing the suite list, a case count or the repetitions changes the denominator, so bump `name`
 # and do not compare the result against reports recorded under the previous name.
 version = 1
-name = "release-slice-v1"
+name = "release-slice-v2"
 # Every case runs this many times per configuration. One attempt cannot tell a dependable
 # configuration from a lucky one, so the slice refuses anything below three.
 repetitions = 3
@@ -26,7 +26,7 @@ cases = 3
 
 [[suites]]
 path = "representative.toml"
-cases = 3
+cases = 4
 
 [[suites]]
 path = "local-tasks.toml"

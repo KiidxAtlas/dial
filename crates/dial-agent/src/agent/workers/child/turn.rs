@@ -2130,7 +2130,8 @@ impl<'a> ChildTurn<'a> {
                         Ok(candidate.clone())
                     },
                 );
-                self.scheduling.barrier(plan.barrier);
+                self.scheduling
+                    .barrier(plan.barrier, plan.barrier_tool.as_deref());
                 let dispatchable = plan.dispatchable();
                 let footprints = plan.footprints;
                 let group = plan.calls;

@@ -185,7 +185,10 @@ impl RetryBarriers {
         self.entries.values().any(|entry| entry.access.is_some())
     }
 
-    fn remove_matching(&mut self, mut predicate: impl FnMut(&BlockedCall) -> Option<String>) -> Vec<String> {
+    fn remove_matching(
+        &mut self,
+        mut predicate: impl FnMut(&BlockedCall) -> Option<String>,
+    ) -> Vec<String> {
         let mut released_ids = Vec::new();
         let mut released_keys = Vec::new();
         for (&identity, entry) in &self.entries {

@@ -59,6 +59,85 @@ fn preparation_failure_clears_the_pending_profile_before_the_backend_is_reused()
 }
 
 #[test]
+fn an_oversized_default_offer_dispatches_only_after_schemas_shrink() {
+    use crate::agent::compact::compaction::request_tokens_with_policy;
+    use crate::agent::run::tool_exposure::default_offer_tests::with_default_agent;
+    use crate::agent::run::turn::completion_tests::response;
+
+    let server = llm::fake::serve(vec![response("Done.", None)]);
+    with_default_agent(
+        "[endpoint]\nbase_url='https://example.invalid/v1'\n[harness]\nmax_tokens=4096\n[compaction]\nenabled=false\nreserve_tokens=4096\n[verification.review]\nenabled=false",
+        |agent| {
+            connect(agent, &server.url);
+            agent.select_tools(&["git".into()], &[]).unwrap();
+            let names = agent.offered();
+            let mut schemas = agent.schemas(&names).unwrap();
+
+            // Even the lean instructions alone, with the old schemas and no user history,
+            // must exceed the prompt budget. Rebuilding only the prompt cannot pass.
+            agent.lean_tools = true;
+            agent.rebuild_system();
+            let selection = agent.auth_config.selection();
+            let tokens = request_tokens_with_policy(
+                &Chat {
+                    messages: agent.system_messages(),
+                    tools: schemas.clone(),
+                    temperature: 0.0,
+                    max_tokens: 4096,
+                    seed: None,
+                },
+                &agent.config.compaction,
+                crate::config::compaction::CompactionIdentity {
+                    provider: &selection.provider,
+                    model: &selection.model,
+                    agent: None,
+                },
+            );
+            agent.context_cap = Some(u32::try_from(tokens).unwrap() + 4096 - 1);
+            agent.lean_tools = false;
+            agent.rebuild_system();
+
+            let mut backend = agent.backend.take().unwrap();
+            let mut engine = crate::agent::run::engine::Engine::default();
+            let goal = "Say done";
+            agent.push(json!({"role":"user","content":goal})).unwrap();
+            let mut turn = agent
+                .begin_turn(&mut backend, &names, 5, goal, &mut NullUi)
+                .unwrap();
+            let retry = agent
+                .turn_step(
+                    &mut turn,
+                    &mut engine,
+                    &mut backend,
+                    &mut schemas,
+                    &mut NullUi,
+                )
+                .unwrap();
+            assert!(agent.lean_tools);
+            assert!(matches!(retry, crate::agent::run::engine::Tick::Again));
+            agent
+                .turn_step(
+                    &mut turn,
+                    &mut engine,
+                    &mut backend,
+                    &mut schemas,
+                    &mut NullUi,
+                )
+                .unwrap();
+            let requests = completion_requests(&server);
+            assert_eq!(requests.len(), 1);
+            let sent = offered_names(requests[0]["tools"].as_array().unwrap());
+            assert_eq!(sent, offered_names(&schemas));
+            assert!(sent.len() < names.len());
+            for name in ["read", "edit", "finish", "tool_search", "git"] {
+                assert!(sent.iter().any(|entry| entry == name), "{name}: {sent:?}");
+            }
+            agent.backend = Some(backend);
+        },
+    );
+}
+
+#[test]
 fn a_note_answered_by_a_discarded_reply_is_sent_again_with_the_retry() {
     let server = llm::fake::serve(vec![
         // Cut off at the output limit: the reply is discarded and the request retried.
@@ -82,7 +161,8 @@ fn a_note_answered_by_a_discarded_reply_is_sent_again_with_the_retry() {
         let mut turn = agent
             .begin_turn(&mut backend, &[], 5, "goal", &mut NullUi)
             .unwrap();
-        turn.notices.push_protocol("[Dial] background job bg1 is no longer running");
+        turn.notices
+            .push_protocol("[Dial] background job bg1 is no longer running");
         let mut engine = crate::agent::run::engine::Engine::default();
         let mut schemas = Vec::new();
         for _ in 0..2 {

@@ -1,5 +1,5 @@
 version = 1
-name = "local-tasks-v1"
+name = "local-tasks-v2"
 
 # Task outcomes are graded from the workspace after the run: the first command check of each case is
 # independent of any file the agent can edit. Valid JSON, tool counts and error text are never task success.
@@ -7,10 +7,10 @@ name = "local-tasks-v1"
 [[cases]]
 id = "research-cited-comparison"
 project = "examples/benchmarks/local-tasks-fixture"
-prompt = "Compare the 2025 growth figures in source_a.md and source_b.md. Write answer.md with exactly two lines: one per source, each naming the source file, its figure and its direction (grew or shrank), then reply DONE."
+prompt = "Compare the 2025 growth figures in source_a.md and source_b.md. Write answer.md with exactly two rows in either order, no header or commentary. Use the format filename | direction | magnitude for each source: direction is grew or shrank; magnitude is an unsigned integer in percent, without units. Then reply DONE."
 categories = ["research", "citation"]
 checks = [
-  {kind="command", command='''python3 -c "import re; L = open('answer.md').read().splitlines(); A = [l for l in L if 'source_a.md' in l]; B = [l for l in L if 'source_b.md' in l]; assert len(L) == 2 and len(A) == 1 and len(B) == 1; assert 'grew' in A[0] and re.search(r'\b3 percent', A[0]) and not re.search(r'\b2 percent', A[0]); assert 'shrank' in B[0] and re.search(r'\b2 percent', B[0]) and not re.search(r'\b3 percent', B[0])"'''},
+  {kind="command", command='''python3 -c "from pathlib import Path; rows = [tuple(field.strip() for field in line.split('|')) for line in Path('answer.md').read_text().splitlines()]; assert sorted(rows) == [('source_a.md', 'grew', '3'), ('source_b.md', 'shrank', '2')]"'''},
   {kind="response_equals", content="DONE"},
 ]
 

@@ -156,31 +156,33 @@ impl Agent<'_> {
         let research_step = research_forced && engine.research_required();
         let mut repeat_streak = None;
         let mut repetition_event = None;
-        let dropped = turn.notices.flush_with(&mut messages, notes_start, |current| {
-            let super::super::progress_machine::RequestAdvisories {
-                repeat_streak: streak,
-                repetition_event: event,
-                notes: mut extra_notes,
-            } = super::super::progress_machine::evaluate_request_advisories(
-                current,
-                &turn.pace,
-                planning_required,
-                research_step,
-                &turn.names,
-                single_call,
-            );
-            repeat_streak = streak;
-            repetition_event = event;
-            if let Some(note) = engine.research_prompt(research_forced) {
-                extra_notes.push(note);
-            }
-            if !self.experimental_context_owner()
-                && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
-            {
-                extra_notes.push(guidance);
-            }
-            extra_notes
-        });
+        let dropped = turn
+            .notices
+            .flush_with(&mut messages, notes_start, |current| {
+                let super::super::progress_machine::RequestAdvisories {
+                    repeat_streak: streak,
+                    repetition_event: event,
+                    notes: mut extra_notes,
+                } = super::super::progress_machine::evaluate_request_advisories(
+                    current,
+                    &turn.pace,
+                    planning_required,
+                    research_step,
+                    &turn.names,
+                    single_call,
+                );
+                repeat_streak = streak;
+                repetition_event = event;
+                if let Some(note) = engine.research_prompt(research_forced) {
+                    extra_notes.push(note);
+                }
+                if !self.experimental_context_owner()
+                    && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
+                {
+                    extra_notes.push(guidance);
+                }
+                extra_notes
+            });
         if let Some(event) = repetition_event {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,

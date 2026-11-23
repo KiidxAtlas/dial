@@ -70,7 +70,8 @@ impl Agent<'_> {
                             crate::agent::run::engine::Tick::Finished(report),
                         ));
                     }
-                    turn.notices.push_protocol(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE);
+                    turn.notices
+                        .push_protocol(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE);
                     turn.refund_unusable(ui);
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }

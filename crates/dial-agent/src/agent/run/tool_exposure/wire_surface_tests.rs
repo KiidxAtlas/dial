@@ -154,6 +154,41 @@ fn allowed_tools_routes_keep_mode_tools_and_narrow_by_callability() {
 }
 
 #[test]
+fn overflow_never_expands_the_accounted_contract_or_bypasses_mode_restrictions() {
+    with_agent(HOSTED, |agent| {
+        agent.select_tools(&["bash".into()], &[]).unwrap();
+        agent.lean_tools = true;
+        agent.modes.goal.interview = true;
+        assert!(agent.offered().iter().any(|name| name == "goal"));
+        agent.plan_mode = true;
+        let (offer, chat) = request(agent, loaded_history("loaded earlier"));
+        assert!(offer.iter().any(|tool| name(tool) == "exit_plan"));
+        assert!(!offer.iter().any(|tool| name(tool) == "bash"));
+        for exposure in [Exposure::Deferred, Exposure::AllowedTools] {
+            let mut gated = chat.clone();
+            gated.tools.retain(|tool| name(tool) == "todo");
+            let accounted = gated.tools.clone();
+            assert!(!accounted.is_empty());
+            agent
+                .wire_tool_surface(exposure, &offer, &mut gated)
+                .unwrap();
+            assert_eq!(gated.tools, accounted, "{exposure:?}");
+        }
+        // With discovery itself disallowed, dropping the only selected search capability
+        // would make it unreachable. Neither a pin nor an active goal widens this allowlist.
+        agent.plan_mode = false;
+        agent.modes.launch.tools = Some(["grep".to_owned()].into());
+        let restricted = agent.offered();
+        assert!(restricted.iter().any(|name| name == "grep"));
+        assert!(
+            !restricted
+                .iter()
+                .any(|name| name == "bash" || name == "goal")
+        );
+    });
+}
+
+#[test]
 fn plain_routes_and_hermetic_runs_are_unchanged() {
     with_agent(HOSTED, |agent| {
         let (offer, mut chat) = request(agent, loaded_history("text"));

@@ -88,7 +88,7 @@ Keys resolve like fallback chains (`default`, then exact `provider/model`, then 
 
 A promotion is not a fallback: it has no cooldown and nothing returns to the earlier model. It lasts until you switch models (`/model`), which resets the route. It replaces an active fallback; a later fallback fails over from the promoted model and returns to it. After an overflow, the rejected request is retried on the promoted model. Promotion is announced as a model event, and the promoted route is session-only: a rebuilt or resumed session starts on the configured model again.
 
-Model capabilities and supported reasoning levels come from the bundled catalog when known, with explicit operator profiles remaining authoritative. Catalog context windows are used when available; otherwise remote requests use a conservative 32768-token capacity. Output budgets remain separately bounded rather than reserving the entire context window.
+Model capabilities and supported reasoning levels come from the bundled catalog when known, with explicit operator profiles remaining authoritative. Auto follows the selected model's known context window; if it is unknown, Dial plans for 131,072 tokens. Output budgets remain separately bounded rather than reserving the entire context window.
 
 ## Model roles in the picker
 

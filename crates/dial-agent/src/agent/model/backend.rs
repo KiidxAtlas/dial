@@ -294,9 +294,7 @@ pub fn make_session_backend(config: &Config, session: &Session) -> Result<Backen
                 .is_none_or(|ids| ids.contains(id)),
             "ChatGPT account is restricted by private global policy"
         );
-        let mut selection = config.selection();
-        selection.account_id = Some(id.to_owned());
-        scoped = config.with_selection(&selection);
+        scoped = config.with_account_id(id);
         scoped.chatgpt_pinned_accounts.insert(id.to_owned());
     }
     make_backend(&scoped).map(|backend| backend.with_session_id(session.id().to_owned()))
@@ -322,9 +320,7 @@ pub(in crate::agent) fn session_auth_config(
 ) -> Result<Config> {
     let mut scoped = config.clone();
     if let Some(id) = backend.account_id() {
-        let mut selection = config.selection();
-        selection.account_id = Some(id.to_owned());
-        scoped = config.with_selection(&selection);
+        scoped = config.with_account_id(id);
         scoped.chatgpt_pinned_accounts.insert(id.to_owned());
     }
     let mut state = session.control_state();

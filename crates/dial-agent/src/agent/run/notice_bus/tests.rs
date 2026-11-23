@@ -9,10 +9,12 @@ fn discarded_reply_restores_notes_and_retracts_advisory_emission() {
     let mut first = vec![json!({"role":"user","content":"task"})];
     let dropped = bus.flush_to_request(&mut first, 1, []);
     assert!(dropped.is_empty());
-    assert!(first[1]["content"]
-        .as_str()
-        .unwrap()
-        .contains("Avoid repeating"));
+    assert!(
+        first[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Avoid repeating")
+    );
 
     // Reply arrived, then was discarded (0 assistant messages reached durable history).
     bus.reply_received(1);
@@ -24,10 +26,12 @@ fn discarded_reply_restores_notes_and_retracts_advisory_emission() {
     let mut retry = vec![json!({"role":"user","content":"task"})];
     let dropped = bus.flush_to_request(&mut retry, 1, []);
     assert!(dropped.is_empty());
-    assert!(retry[1]["content"]
-        .as_str()
-        .unwrap()
-        .contains("Avoid repeating"));
+    assert!(
+        retry[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Avoid repeating")
+    );
 
     // Once durable history records the assistant message, notes are retired and confirmed.
     bus.reply_received(1);
@@ -43,8 +47,10 @@ fn steering_reset_keeps_safety_boundaries_and_clears_lower_advice() {
     bus.push_advisory(Priority::Safety, "Keep this safety boundary.");
     bus.reset(true, true);
     assert_eq!(bus.pending().len(), 1);
-    assert!(bus.pending()[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("safety boundary"));
+    assert!(
+        bus.pending()[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("safety boundary")
+    );
 }

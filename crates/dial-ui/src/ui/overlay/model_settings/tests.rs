@@ -125,7 +125,7 @@ fn context_size_saves_validates_and_resets_for_local_and_cloud_models() {
         assert_eq!(overlay.profile.context_window, None);
         assert!(matches!(
             overlay.event(&key(KeyCode::Right), &rig.keys),
-            OverlayEvent::Set { value, .. } if value["context_window"].as_integer() == Some(32768)
+            OverlayEvent::Set { value, .. } if value["context_window"].as_integer() == Some(131_072)
         ));
     }
 }

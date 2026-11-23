@@ -304,36 +304,5 @@ impl Agent<'_> {
     }
 }
 
-/// Whether `selection` names a chat model Dial can offer without a network round trip: a bundled
-/// catalog entry, a configured selection (current model, role, favorite or profile), a downloaded
-/// local model, or a model in a provider listing saved by an earlier `/models` refresh. Local and
-/// listed models that declare a non-chat kind (embedding, rerank, image, audio) are excluded.
-pub fn is_known_model(
-    config: &Config,
-    user_dir: &std::path::Path,
-    selection: &ModelSelection,
-) -> bool {
-    let same = |a: &ModelSelection| a.provider == selection.provider && a.model == selection.model;
-    let mut configured = std::iter::once(config.selection())
-        .chain(config.model_roles.values().cloned())
-        .chain(config.model_favorites.iter().cloned())
-        .chain(
-            config
-                .model_profiles
-                .values()
-                .map(|profile| ModelSelection {
-                    provider: profile.provider.clone(),
-                    model: profile.model.clone(),
-                    ..Default::default()
-                }),
-        );
-    configured.any(|candidate| same(&candidate))
-        || crate::llm::catalog::bundled_model(&selection.provider, &selection.model).is_some()
-        || crate::llm::catalog::downloaded_local_models(user_dir)
-            .iter()
-            .chain(crate::llm::catalog::saved_listing_models(user_dir).iter())
-            .any(|entry| entry.supports_chat() && same(&entry.selection))
-}
-
 #[cfg(test)]
 mod tests;

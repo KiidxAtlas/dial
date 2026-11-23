@@ -10,6 +10,12 @@ the current focused selection, requirement IDs, working-state deliverable IDs, a
 It includes recorded evidence statuses at the current effect revision; it does **not** revalidate
 external input freshness, record a pass, or establish that the declared checks cover the task.
 
+For shell checks, exit 0 from a trailing filter does not prove that an earlier pipeline stage
+passed. Run the check directly, or put `set -o pipefail` immediately before the foreground
+check pipeline. A comment mentioning `pipefail`, a disabled option, or a setting confined
+to another shell is not evidence. An ambiguous pipeline can still produce useful output, but
+its aggregate zero does not earn a passing receipt.
+
 The latest 32 source-bound Eval checks in the turn are reported separately under
 `artifact_local_checks`. The plan and completion evidence compare each source's current bytes
 to its recorded SHA-256 and mark its freshness `current`, `stale`, or `unavailable`.

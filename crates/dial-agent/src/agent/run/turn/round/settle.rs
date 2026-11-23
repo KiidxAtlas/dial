@@ -108,7 +108,15 @@ impl Agent<'_> {
         if call.name == "todo" && !output.is_error {
             self.observe_local_plan_change();
         }
-        let is_check = crate::agent::memory::selfplay::is_check_call(call);
+        let shell_receipt = call.name == "bash"
+            && call.arguments["background"] != true
+            && call.arguments["pty"] != true
+            && crate::agent::verify::checks::classify_check_source(
+                call,
+                &self.config.verification.commands,
+            )
+            .is_some_and(|source| source.is_explicit_receipt());
+        let is_check = shell_receipt || crate::agent::memory::selfplay::is_check_call(call);
         if call.name == "bash"
             && let Some(command) = call.arguments["command"].as_str()
         {
@@ -357,27 +365,9 @@ impl Agent<'_> {
             self.start_background_check(ui);
         }
         // Bound after this call's own shell effect, like the ledger's observations.
-        if shell_check_passed {
-            self.step_checks.shell_check_passed = Some(self.step_checks.revision());
-        }
-        if call.name == "bash"
-            && !controller_blocked
-            && !is_check
-            && !output.is_error
-            && call.arguments["background"] != true
-            && call.arguments["pty"] != true
-            && call.arguments["command"].as_str().is_some_and(|command| {
-                crate::agent::verify::checks::asserts_inline(command)
-                    && !crate::agent::verify::checks::exit_status_masked(command)
-            })
-            && output.process_outcome().is_some_and(|process| {
-                process.started
-                    && !process.cancelled
-                    && process.exit_code == Some(0)
-                    && process.output_complete
-            })
-        {
-            self.step_checks.asserting_shell_passed = Some(self.step_checks.revision());
+        if shell_receipt && check_ran {
+            self.step_checks.shell_check_passed =
+                shell_check_passed.then(|| self.step_checks.revision());
         }
         if committed && let Some(reminder) = self.artifact_check_reminder() {
             output.text.push('\n');

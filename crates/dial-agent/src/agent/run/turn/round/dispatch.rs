@@ -195,9 +195,11 @@ impl Agent<'_> {
                     admitted += 1;
                 }
                 if admitted < plan.calls.len() {
-                    self.efficiency_metrics.scheduling.barrier("admission");
+                    plan.close_at(admitted, "admission");
+                    self.efficiency_metrics
+                        .scheduling
+                        .barrier("admission", plan.barrier_tool.as_deref());
                 }
-                plan.truncate(admitted);
                 let dispatchable = plan.dispatchable();
                 let verifies = plan.calls.iter().any(|call| {
                     call.arguments["verify"]

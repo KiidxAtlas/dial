@@ -21,7 +21,11 @@ pub(in crate::agent) struct NoticeBus {
 
 impl NoticeBus {
     /// Queue a prioritized advisory note for the next request.
-    pub(in crate::agent) fn push_advisory(&mut self, priority: Priority, content: impl Into<String>) {
+    pub(in crate::agent) fn push_advisory(
+        &mut self,
+        priority: Priority,
+        content: impl Into<String>,
+    ) {
         self.pending.push(guidance::note(priority, content));
     }
 
@@ -32,6 +36,18 @@ impl NoticeBus {
             "dial_transient": true,
             "content": content.into(),
         }));
+    }
+
+    /// A checkpoint reply is control state, not an assistant history entry. Replace just its
+    /// retry notice before `settle_delivered` restores the other notes from that request.
+    pub(in crate::agent) fn replace_research_correction(&mut self, correction: Option<String>) {
+        const KIND: &str = "research_correction";
+        self.delivered.retain(|note| note["dial_reminder"] != KIND);
+        if let Some(content) = correction {
+            self.push_raw(json!({
+                "role": "user", "dial_transient": true, "dial_reminder": KIND, "content": content
+            }));
+        }
     }
 
     /// Queue a pre-built transient message (marked context, review, or hook note).

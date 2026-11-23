@@ -519,7 +519,7 @@ fn one_call_guidance_replaces_batching() {
             false,
         );
         assert!(batching.contains(LEAN_BATCHING));
-        assert!(batching.contains("independent reads and searches as parallel tool calls"));
+        assert!(batching.contains("read-only commands as parallel tool calls"));
         assert!(batching.contains("`&&`-chain dependent commands"));
         assert!(!batching.contains(LEAN_ONE_CALL));
     }

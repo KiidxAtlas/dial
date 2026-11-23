@@ -10,6 +10,7 @@ from test_quality import checks_pass
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
+RECALL_JOURNEY = 'deferred-rollout-recall-journey'
 
 
 def reference_repair(case, workspace):
@@ -23,12 +24,16 @@ def reference_repair(case, workspace):
             path.write_text(path.read_text().replace('DEFAULT_PAGE_SIZE', 'PAGE_SIZE'))
         path = workspace / 'pages.ts'
         path.write_text(path.read_text().replace('return Math.ceil', 'if (rows === null) return 0;\n    return Math.ceil'))
-    elif case['id'] == 'corrected-retracted-compaction-journey':
+    elif case['id'] in ('corrected-retracted-compaction-journey', RECALL_JOURNEY):
         for name in ('settings.py', 'reports.py'):
             path = workspace / name
             path.write_text(path.read_text().replace('DEFAULT_PAGE_SIZE', 'PAGE_SIZE'))
         path = workspace / 'reports.py'
         path.write_text(path.read_text().replace('def page_count(rows):\n', 'def page_count(rows):\n    if rows is None:\n        return 0\n'))
+        if case['id'] == RECALL_JOURNEY:
+            path = workspace / 'settings.py'
+            path.write_text(path.read_text().replace('PAGE_SIZE = 25', 'PAGE_SIZE = 37'))
+            (workspace / 'rollout.txt').write_text('R-908 Flint\n')
     else:
         raise AssertionError('case needs independent reference repair')
 
@@ -97,6 +102,32 @@ class RepresentativeFixtureTests(unittest.TestCase):
             path = workspace / 'settings.py'
             path.write_text(path.read_text().replace('25', '50'))
             self.assertFalse(checks_pass(case, workspace))
+
+    def test_deferred_rollout_needs_both_corrected_plan_and_final_ticket(self):
+        case = next(c for c in self.suite['cases'] if c['id'] == RECALL_JOURNEY)
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = pathlib.Path(temp) / 'project'
+            shutil.copytree(REPO / case['project'], workspace,
+                            ignore=shutil.ignore_patterns('__pycache__'))
+            reference_repair(case, workspace)
+            settings = workspace / 'settings.py'
+            accepted_settings = settings.read_text()
+            for name, size, handoff, passes in [
+                ('accepted', 37, 'R-908 Flint', True),
+                ('staged code only', 25, None, False),
+                ('initial size', 32, 'R-908 Flint', False),
+                ('retracted size', 64, 'R-908 Flint', False),
+                ('previous owner', 37, 'R-908 Mica', False),
+                ('early handoff without final ticket', 37, 'Flint', False),
+            ]:
+                with self.subTest(name=name):
+                    settings.write_text(accepted_settings.replace('PAGE_SIZE = 37', f'PAGE_SIZE = {size}'))
+                    receipt = workspace / 'rollout.txt'
+                    if handoff is None:
+                        receipt.unlink(missing_ok=True)
+                    else:
+                        receipt.write_text(handoff)
+                    self.assertEqual(checks_pass(case, workspace), passes)
 
 
 if __name__ == '__main__':

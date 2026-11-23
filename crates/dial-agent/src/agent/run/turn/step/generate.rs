@@ -437,9 +437,7 @@ impl Agent<'_> {
         ) {
             // A reply's thinking is bound to the notes this request carried; keep them on the wire
             // whenever the generation completed before a portable-rule discard.
-            if result.is_ok()
-                && matches!(discard, GenerationDiscard::PortableRule { .. })
-            {
+            if result.is_ok() && matches!(discard, GenerationDiscard::PortableRule { .. }) {
                 self.record_sent_notes(&context_before, ui);
                 record_rejected_reply(&self.usage_scope, backend, repairing)?;
             }

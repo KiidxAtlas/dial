@@ -895,7 +895,7 @@ fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() 
             "",
             Some((
                 "bash",
-                json!({"command":"python3 -I -S -B - <<'PY'\nimport csv\nwith open('result.csv', 'w', newline='') as f:\n    writer = csv.writer(f, lineterminator='\\n')\n    writer.writerow(['value'])\n    writer.writerow([sum([2, 3])])\nwith open('result.csv', newline='') as f:\n    assert list(csv.reader(f)) == [['value'], ['5']], 'generated artifact failed verification'\nPY"}),
+                json!({"check":true,"command":"python3 -I -S -B - <<'PY'\nimport csv\nwith open('result.csv', 'w', newline='') as f:\n    writer = csv.writer(f, lineterminator='\\n')\n    writer.writerow(['value'])\n    writer.writerow([sum([2, 3])])\nwith open('result.csv', newline='') as f:\n    assert list(csv.reader(f)) == [['value'], ['5']], 'generated artifact failed verification'\nPY"}),
             )),
         ),
         llm::fake::json(200, &json!({"total_slots":1})),
@@ -934,74 +934,25 @@ fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() 
     assert_eq!(calls, ["bash"]);
 }
 
-const ADMISSION: &str = "The honest state: I have not yet built the required circuit.";
-
 #[test]
-fn a_completion_that_admits_unfinished_work_is_nudged_once_then_can_complete() {
+fn report_wording_does_not_create_or_close_an_obligation() {
+    let finding = "| Example | I have not yet built the unrelated demo. |";
     let server = llm::fake::serve(vec![
-        response(ADMISSION, None),
+        response(finding, None),
         llm::fake::json(200, &json!({"total_slots":1})),
-        response("Built the circuit; the simulator check passes.", None),
+        response("Incomplete: the requested demo does not build.", None),
     ]);
     with_agent("[compaction]\nenabled=false\n", |agent| {
         connect(agent, &server.url);
-        let mut ui = NoticeUi::default();
-        let report = agent.turn("Report the implemented fix", &mut ui).unwrap();
-        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
-        assert!(report.text.contains("Built the circuit"));
-    });
-    let requests = completion_requests(&server);
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests[1]["messages"]
-            .to_string()
-            .contains("so it was not accepted as completed")
-    );
-}
-
-#[test]
-fn a_repeated_admission_of_unfinished_work_ends_incomplete_not_completed() {
-    let server = llm::fake::serve(vec![
-        response(ADMISSION, None),
-        llm::fake::json(200, &json!({"total_slots":1})),
-        response("I'm stopping here without a working circuit.", None),
-    ]);
-    with_agent("[compaction]\nenabled=false\n", |agent| {
-        connect(agent, &server.url);
-        let mut ui = NoticeUi::default();
-        let report = agent.turn("Report the implemented fix", &mut ui).unwrap();
-        assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
-        assert!(
-            report
-                .text
-                .starts_with("Incomplete: The reply says the requested work is not finished"),
-            "{}",
-            report.text
-        );
-        assert!(report.text.contains("without a working circuit"));
-        assert_eq!(
-            agent.completion_evidence(report.outcome)["work_completion_accepted"],
-            false
-        );
-    });
-    assert_eq!(completion_requests(&server).len(), 2);
-}
-
-#[test]
-fn a_diagnosis_request_may_report_that_the_work_does_not_succeed() {
-    let server = llm::fake::serve(vec![
-        response(ADMISSION, None),
-        llm::fake::json(200, &json!({"total_slots":1})),
-    ]);
-    with_agent("[compaction]\nenabled=false\n", |agent| {
-        connect(agent, &server.url);
-        let mut ui = NoticeUi::default();
         let report = agent
-            .turn("Explain why the circuit build fails", &mut ui)
+            .turn("Report the review finding", &mut NullUi)
             .unwrap();
         assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert_eq!(report.text, finding);
+        let report = agent.turn("Build the demo", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     });
-    assert_eq!(completion_requests(&server).len(), 1);
+    assert_eq!(completion_requests(&server).len(), 2);
 }
 
 const WRITE_RESULT: &str = "printf 'value\\n5\\n' > result.csv";
@@ -1054,7 +1005,7 @@ fn an_unattended_shell_deliverable_needs_a_passing_check_before_completion() {
     assert!(
         requests[2]["messages"]
             .to_string()
-            .contains("nobody will review the result after the run")
+            .contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED)
     );
 }
 
@@ -1109,83 +1060,102 @@ fn an_interactive_shell_deliverable_is_not_held_for_a_check() {
 }
 
 #[test]
-fn inline_assertions_are_recognized_as_self_checking_commands() {
-    use crate::agent::verify::checks::asserts_inline;
-    for command in [
-        "python3 - <<'PY'\nassert total == 5\nPY",
-        "node -e \"require('assert').equal(f(), 5)\"",
-        "Rscript -e 'stopifnot(all.equal(x, 5))'",
-        "cargo run --example x && grep -q ok out # assert_eq",
+fn unattended_verification_depends_on_declared_checks_not_request_or_command_words() {
+    for (request, marker) in [
+        ("Create result.csv", "assert"),
+        ("Explain why the calculation works", "ordinary output"),
+        ("Create result.csv", "cargo test"),
     ] {
-        assert!(asserts_inline(command), "{command}");
-    }
-    for command in [
-        "printf 'value' > out.csv",
-        "python3 assertions.py",
-        "pip install pytest-assertions",
-    ] {
-        assert!(!asserts_inline(command), "{command}");
+        let command = format!("{WRITE_RESULT}; echo '{marker}'");
+        let server = llm::fake::serve(vec![
+            response("", Some(("bash", json!({"command":command})))),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response("Wrote the file.", None),
+            response("The file is ready.", None),
+        ]);
+        with_launch(true, |agent| {
+            connect(agent, &server.url);
+            let report = agent.turn(request, &mut NullUi).unwrap();
+            assert_eq!(
+                report.outcome,
+                TurnOutcome::Incomplete,
+                "{marker}: {}",
+                report.text
+            );
+        });
+        assert_eq!(completion_requests(&server).len(), 3, "{marker}");
     }
 }
 
 #[test]
-fn pipes_without_pipefail_mask_a_check_exit_status() {
-    use crate::agent::verify::checks::exit_status_masked;
-    for command in [
-        // Observed haiku81fix check: R printed `Execution halted`, the pipe reported exit 0.
-        "cd /app && Rscript -e 'source(\"ars.R\"); x <- ars(dnorm, 10)' 2>&1 | tail -20",
-        "pytest -q |& tee log",
-        "Rscript -e '\n  a <- 1 | 2\n' | head",
-        "python3 - <<'PY' | tail -5\nprint(1)\nPY",
-    ] {
-        assert!(exit_status_masked(command), "{command}");
-    }
-    for command in [
-        "set -o pipefail; pytest -q | tail -20",
-        "make test || echo failed",
-        "python3 - <<'PY'\nflags = a | b\nPY\necho done",
-        "grep -E 'a|b' out.txt",
-        "pytest -q # | tail",
-        "test \"$(cat out.csv | head -1)\" = value",
-    ] {
-        assert!(!exit_status_masked(command), "{command}");
-    }
+fn unattended_delivery_uses_the_same_revision_for_answered_and_completed() {
+    use crate::agent::verify::completion::{Decision, ReplyChannel};
+    with_launch(true, |agent| {
+        let decide = |agent: &mut Agent<'_>, outcome| {
+            agent.completion_decision(outcome, ReplyChannel::Explicit, &mut NullUi)
+        };
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Accept(TurnOutcome::Answered)
+        ));
+        agent.step_checks.uncheckpointed_extension_calls += 1;
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Continue(_)
+        ));
+        agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+        assert!(matches!(
+            decide(agent, TurnOutcome::Completed),
+            Decision::Accept(TurnOutcome::Completed)
+        ));
+        agent.step_checks.uncheckpointed_extension_calls += 1;
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Incomplete(_)
+        ));
+    });
 }
 
 #[test]
 fn a_pipe_masked_unattended_check_does_not_satisfy_the_gate() {
     let check =
         |command: &str| response("", Some(("bash", json!({"command":command,"check":true}))));
-    let server = llm::fake::serve(vec![
-        response("", Some(("bash", json!({"command":WRITE_RESULT})))),
-        llm::fake::json(200, &json!({"total_slots":1})),
-        check("false 2>&1 | tail -5"),
-        response("Wrote result.csv; the check passes.", None),
-        check("set -o pipefail; grep -q value result.csv | tail -5"),
-        response("Wrote result.csv; the pipefail check passes.", None),
-    ]);
-    with_launch(true, |agent| {
-        connect(agent, &server.url);
-        let report = agent
-            .turn(
-                "Write the sum of 2 and 3 into result.csv with header value.",
-                &mut NullUi,
-            )
-            .unwrap();
-        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    for masked in [
+        "false 2>&1 | tail -5 # set -o pipefail",
+        "set -o pipefail; set +o pipefail; false | tail -5",
+        "(set -o pipefail); false | tail -5",
+    ] {
+        let server = llm::fake::serve(vec![
+            response("", Some(("bash", json!({"command":WRITE_RESULT})))),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            check(masked),
+            response("Wrote result.csv; the check passes.", None),
+            check("set -o pipefail; grep -q value result.csv | tail -5"),
+            response("Wrote result.csv; the pipefail check passes.", None),
+        ]);
+        with_launch(true, |agent| {
+            connect(agent, &server.url);
+            let report = agent
+                .turn(
+                    "Write the sum of 2 and 3 into result.csv with header value.",
+                    &mut NullUi,
+                )
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert!(
+                report.text.contains("pipefail check passes"),
+                "{}",
+                report.text
+            );
+        });
+        let requests = completion_requests(&server);
+        assert_eq!(requests.len(), 5);
+        let after_masked = requests[2]["messages"].to_string();
+        assert!(after_masked.contains("Not counted as a passing check"));
         assert!(
-            report.text.contains("pipefail check passes"),
-            "{}",
-            report.text
+            requests[3]["messages"]
+                .to_string()
+                .contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED)
         );
-    });
-    let requests = completion_requests(&server);
-    assert_eq!(requests.len(), 5);
-    let after_masked = requests[2]["messages"].to_string();
-    assert!(after_masked.contains("Not counted as a passing check"));
-    assert!(
-        requests[3]["messages"]
-            .to_string()
-            .contains("nobody will review the result after the run")
-    );
+    }
 }

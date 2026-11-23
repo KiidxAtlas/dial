@@ -267,7 +267,7 @@ Use `/model defaults` (or press `d` in `/model settings`) for direct access to s
 defaults. This opens in global scope; switch scope for a project-specific default.
 `/settings` → Model → Context offers **Current model context**, **Cloud context default** and
 **Local context default**. Each accepts `auto` (the default) or a token cap from 2,048 to 2,097,152.
-Auto follows the selected model's catalog/downloaded metadata; unknown capacities fall back to 32,768.
+Auto follows the selected model's catalog/downloaded metadata; unknown capacities fall back to 131,072 tokens.
 ChatGPT discovery uses `max_context_window` when valid and larger than the standard `context_window`
 default, so the picker and Auto budget expose the account's extended capacity instead of stopping at 272k.
 Subscription capacities come from the account catalog and may differ from API model-card capacities.
@@ -388,7 +388,9 @@ choose **high** to send `gemini-4-neon-high`. The picker offers only the variant
 listing. You can change the level later with `/effort` without picking the model again. Distinct
 models such as Flash and Flash Lite stay separate. The group uses the smallest known input window
 across its efforts. If Google does not report one, Neon uses Dial's catalog value of **524,288
-tokens**, not the 32,768-token fallback for unknown models. An explicit smaller cap still applies.
+tokens**. An explicit smaller cap still applies.
+The refreshed listing is tied to the active sign-in and Google project, even if the token has no
+account ID. After changing accounts or signing in again, refresh the picker before switching models.
 
 If listing fails, Dial reports the provider as unavailable instead of offering bundled models as
 account models. Highlight **Google Antigravity** in `/providers` for the request error.
@@ -460,8 +462,10 @@ one and any cooling down, `dial auth accounts <provider> select <key>` makes an 
 accounts are managed in its own rows above and are not part of these commands.
 
 Dial combines the account model list with visible models in a recent local Codex model metadata
-cache, when present, so newly released models can appear before the account list catches up.
-Those additions are labeled **Codex catalog**; their first completed request verifies account access.
+cache when a newer Codex client than the version Dial reported wrote that cache, so newly released
+models can appear before the account list catches up. Those additions are labeled **Codex
+catalog**; their first completed request verifies account access. A cache from the same or an
+older client adds nothing: a model the account list no longer returns is no longer offered.
 Dial reads model metadata only from Codex and uses its own OAuth credentials for every request.
 
 The ChatGPT backend lists and serves newer models only to a recent enough Codex client, so Dial
@@ -477,7 +481,7 @@ persist per model in this project's settings and are sent through the Responses 
 **LM Studio.** Dial reads LM Studio's native model list (`/api/v0/models`, loopback or LAN hosts only) to show
 whether each model is `loaded` (with its real context length) or `loads on first use`, and identifies
 embedding models for the embedding role rather than chat. LM Studio loads a model on demand with a
-context length of its own choosing, often far below Dial's 32768 default (an 8192 load was seen in practice); Dial asks the server
+context length of its own choosing, which can be smaller than the model's advertised window. Dial asks the server
 what is actually loaded and plans compaction and the context meter against the smaller number. A model
 LM Studio refuses to load (memory guardrail, unsupported architecture) is reported with the server's own
 message; load it in LM Studio first, with a smaller context, or choose another model. Larger models need

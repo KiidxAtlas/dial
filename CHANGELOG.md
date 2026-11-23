@@ -17,15 +17,34 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-11-23
+
+- A shell pipeline cannot earn verification credit merely by mentioning `pipefail`. Scheduled edits honor the same verification and repro-first gates as serial edits. On lean local routes, a repeated progress reply without any inspection no longer completes an explicit workspace diagnosis.
+- Context-overflow retries can shed optional tool schemas without losing explicit loads. Benchmarks now check the substance of cited comparisons and diagnoses, exercise recall of a corrected plan after compaction, and report open declared deliverables and observed model starts around the last passing check. The release slice is now 28 cases (84 trials per configuration); do not compare that denominator with older reports.
+- A successful foreground research checkpoint retires its JSON-only correction before ordinary work resumes. Opt-in context notebooks expose their recovery tools, and skill hints name an available loading route. Compatible read-only shell batches use ordered authorization before parallel execution.
+- When Dial has no context-window metadata for the selected model, Auto now budgets 131,072 tokens instead of 32,768. Known model capacities and explicit caps still take precedence.
+- ChatGPT model lists no longer keep models the account has lost. A local Codex model cache adds models only when a newer Codex client than the version Dial reported wrote it, so a model the plan stopped serving leaves `/models` instead of failing every request with `model_not_found`. That error now says to choose another model, and Native RPC failure replies carry the diagnostic without the recovery guidance written for the model.
+- Multi-call routes now guide the agent to send known eval cells together rather than spend a model round on each cell.
+- Agent recovery guidance now favors reusing anchors supplied by rejected edits and checking the affected Cargo test targets after compile failures before rerunning the original tests.
+- Comparison replies are guided to give concrete differences. Completion no longer depends on matching a release recap or an unfinished-work phrase; tracked obligations and explicit non-success reports remain authoritative.
+- Scheduling reports now name the tool behind each wave barrier (`barrier_tools`, keyed `reason:tool`), and `replay_scheduling` restores each session's file handles so recorded `@fN` paths are judged as they were live. One plain `ls`, `grep` (pattern excluded) or filtering `find` with literal operands now reads only those paths, so it can run beside an edit elsewhere. Shell commands proven to write nothing, such as `git status`, `git diff`, `rg … | head`, `df` and `du`, now run alongside reads in the same response instead of ending the group; they still need approval as before and never run beside a write. Checkpoints no longer snapshot around these commands.
+
 - Workers inherit admitted `CLAUDE.md` and `AGENTS.md` guidance independently of parent prompt formatting. Other ambient context stays parent-only. Built-in guidance recommends a failing reproduction for bug fixes; only the configured reproduction gate refuses an edit.
 - Custom prompts use the template field that supplied a block, not a text match, to decide whether to repeat it. Request reminders use the admitted journal entry rather than comparing message bodies.
 - Diagnosis-only detection distinguishes a requested fix from a negated or quoted one. The adaptive editing phase uses committed paths; a successful no-op does not count as an edit. Repeat recovery follows the recorded call reference for new duplicate answers and retains a fallback for older histories.
 - Native RPC accepts optional Desktop Type metadata alongside `send.text`. The Type briefing supplies model context without becoming part of the user's request for classification or verification.
-- Native RPC starts without a selected model so Desktop can connect on first run and offer provider setup.
+- Refreshed RPC chat listings include the connected providers found by the scan, including subscription models that have no saved listing.
+- Graphical clients can set up Claude and ChatGPT subscriptions and save hosted provider API keys through the native sign-in protocol.
 
-- A final reply that admits the requested work is unfinished ("I'm stopping here without a working `out.html`", "I have not yet built the required circuit") is no longer accepted as `completed` on hosted routes. Dial asks once to continue, then ends the turn `Incomplete` if the next reply admits it again. Diagnosis-only requests are exempt (`docs/agent-loop.md`).
+- After recorded effects, unattended `completed` and `answered` deliveries need current check evidence regardless of how the request is phrased. An undeclared shell command cannot earn this credit by mentioning an assertion or a test runner (`docs/agent-loop.md`).
 
 - Open execution steps refuse `completed` and `answered` on hosted and local routes; a final reply no longer closes them. A blocked step keeps its reason and remains outstanding. For a necessary user decision, `finish(outcome=needs_input)` is the preferred pause; a plain-question fallback remains available (`docs/agent-loop.md`).
+
+## [0.3.16] - 2026-11-22
+
+- Native model pickers reuse the provider scan for chat, image and embedding choices. Switching a chat model uses the endpoint Dial discovered, including local servers and listings that are not saved to disk.
+- Desktop can select Google Antigravity models even when the sign-in token has no account ID. The listing stays private to that grant and project.
+- Native RPC clients can connect before choosing a first model.
 
 ## [0.3.15] - 2026-11-21
 
@@ -3188,7 +3207,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.15...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.17...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3240,3 +3259,5 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.13]: https://github.com/KiidxAtlas/dial/tree/v0.3.13
 [0.3.14]: https://github.com/KiidxAtlas/dial/tree/v0.3.14
 [0.3.15]: https://github.com/KiidxAtlas/dial/tree/v0.3.15
+[0.3.17]: https://github.com/KiidxAtlas/dial/tree/v0.3.17
+[0.3.16]: https://github.com/KiidxAtlas/dial/tree/v0.3.16

@@ -180,6 +180,21 @@ impl Launch {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetConsoleWindow() -> *mut std::ffi::c_void;
+            }
+            // A GUI with no console would otherwise give `dial rpc` a visible console of its
+            // own, even with pipes. Leave console inheritance alone for terminal clients.
+            // SAFETY: GetConsoleWindow takes no arguments; its borrowed handle is only inspected.
+            if unsafe { GetConsoleWindow() }.is_null() {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+        }
         command
             .arg("rpc")
             .args(&self.args)

@@ -721,3 +721,32 @@ fn a_spoken_reply_is_bracketed_by_live_speech_events_even_when_it_fails() {
     assert_eq!(events[1]["speaking"], false);
     assert_eq!(events[1]["cancelled"], false);
 }
+
+#[test]
+fn a_failed_turn_replies_with_its_diagnostic_and_not_the_guidance_written_for_the_model() {
+    let failure = || {
+        crate::agent::test_provider_failure(
+            anyhow::anyhow!("Responses error (code: model_not_found)")
+                .context("reading chat stream"),
+        )
+    };
+    assert!(format!("{:#}", failure()).starts_with("Recovery state:"));
+    let diagnostic = "reading chat stream: Responses error (code: model_not_found)";
+    assert_eq!(
+        Sender::result_frame(&json!(7), Err(failure()), 2),
+        json!({"id":7,"error":{"code":"failed","message":diagnostic}})
+    );
+    assert_eq!(
+        Sender::result_frame(&json!(7), Err(failure()), 1),
+        json!({"id":7,"error":{"message":diagnostic}})
+    );
+    // A coded request failure keeps its code and its message.
+    assert_eq!(
+        Sender::result_frame(
+            &json!(8),
+            Err(coded(ErrorCode::Busy, "workers are running")),
+            2
+        ),
+        json!({"id":8,"error":{"code":ErrorCode::Busy.as_str(),"message":"workers are running"}})
+    );
+}

@@ -55,6 +55,79 @@ fn completed_process(exit_code: i32) -> crate::runtime::execution::ProcessOutcom
 }
 
 #[test]
+fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
+    for command in [
+        "cd /app && Rscript -e 'source(\"ars.R\"); x <- ars(dnorm, 10)' 2>&1 | tail -20",
+        "pytest -q |& tee log",
+        "Rscript -e '\n  a <- 1 | 2\n' | head",
+        "python3 - <<'PY' | tail -5\nprint(1)\nPY",
+        "false | true # set -o pipefail",
+        "echo 'set -o pipefail'; false | true",
+        "set -o pipefail; set +o pipefail; false | true",
+        "(set -o pipefail); false | true",
+        "set -o pipefail & false | true",
+        "false && set -o pipefail; false | true",
+        "false | true; set -o pipefail",
+        "set -o pipefail; false | true; echo done",
+        "set -o pipefail; ! false | true",
+    ] {
+        assert!(exit_status_masked(command), "{command}");
+    }
+    for command in [
+        "set -o pipefail; pytest -q | tail -20",
+        "# run a check\nset -euo pipefail\npytest -q 2>&1 |& tee log",
+        "set -o pipefail && make test | tail -5 > summary",
+        "make test || echo failed",
+        "python3 - <<'PY'\nflags = a | b\nPY\necho done",
+        "grep -E 'a|b' out.txt",
+        "pytest -q # | tail",
+        "echo yes >| out",
+        "test \"$(cat out.csv | head -1)\" = value",
+    ] {
+        assert!(!exit_status_masked(command), "{command}");
+    }
+}
+
+#[test]
+fn pipefail_check_credit_uses_the_observed_exit_without_promoting_masked_zeroes() {
+    use verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    for (script, exit, expected) in [
+        ("false | true # pipefail", 0, CheckStatus::Unverified),
+        (
+            "true | false # pipefail",
+            1,
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "set -o pipefail; false | true",
+            1,
+            CheckStatus::FailedUnknownCause,
+        ),
+        ("set -o pipefail; true | true", 0, CheckStatus::Passed),
+    ] {
+        let check = verify::verification::FocusedCheck {
+            name: "pipeline".into(),
+            command: script.into(),
+            timeout_secs: 5,
+        };
+        let output = agent.run_focused_check(&check, &mut NullUi);
+        assert_eq!(
+            output.process_outcome().unwrap().exit_code,
+            Some(exit),
+            "{script}"
+        );
+        assert_eq!(
+            agent.step_checks.evidence.latest_status(script),
+            Some(expected),
+            "{script}"
+        );
+    }
+}
+
+#[test]
 fn an_unlaunched_validation_helper_cannot_be_settled_by_a_write() {
     use crate::agent::verify::completion::Decision;
     let root = tempfile::tempdir().unwrap();
@@ -77,7 +150,6 @@ fn an_unlaunched_validation_helper_cannot_be_settled_by_a_write() {
     let decide = |agent: &mut Agent<'_>| {
         agent.completion_decision(
             TurnOutcome::Completed,
-            "Written.",
             crate::agent::verify::completion::ReplyChannel::Explicit,
             &mut NullUi,
         )
@@ -262,21 +334,28 @@ fn printed_exit_code_earns_no_behavior_credit_without_observed_completion() {
         data: None,
         execution: Default::default(),
     };
-    struct PassCounter(u32);
+    #[derive(Default)]
+    struct PassCounter(Vec<usize>);
     impl Ui for PassCounter {
-        fn check_passed(&mut self) {
-            self.0 += 1;
+        fn check_passed_with_delivery(&mut self, open_count: &dyn Fn() -> usize) {
+            self.0.push(open_count());
         }
     }
-    let mut ui = PassCounter(0);
+    agent
+        .session_mut()
+        .set_control_state(json!({"working_state":{"deliverables":[
+            {"id":"docs","status":"open"}, {"id":"code","status":"satisfied"}
+        ]}}))
+        .unwrap();
+    let mut ui = PassCounter::default();
     agent.note_verification(&call, &prose, &mut ui);
-    assert_eq!(ui.0, 0);
+    assert!(ui.0.is_empty());
     assert_eq!(agent.verifications, vec![false]);
     assert_eq!(agent.behavioral_checks, vec![false]);
 
     let observed = prose.with_process(completed_process(0));
     agent.note_verification(&call, &observed, &mut ui);
-    assert_eq!(ui.0, 1);
+    assert_eq!(ui.0, [1]);
     assert_eq!(agent.verifications, vec![false, true]);
     assert_eq!(agent.behavioral_checks, vec![false, true]);
 }

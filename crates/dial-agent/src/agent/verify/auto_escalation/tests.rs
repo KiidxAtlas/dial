@@ -114,7 +114,12 @@ fn advice_note_drops_empty_and_content_free_coach_replies() {
     let note = advice_note("Inspect src/cache.rs:42 before retrying.").expect("substantive advice");
     assert_eq!(note["role"], "user");
     assert_eq!(note["dial_transient"], true);
-    assert!(note["content"].as_str().unwrap().contains("src/cache.rs:42"));
+    assert!(
+        note["content"]
+            .as_str()
+            .unwrap()
+            .contains("src/cache.rs:42")
+    );
 }
 
 #[test]

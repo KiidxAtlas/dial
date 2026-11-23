@@ -4,9 +4,9 @@
 
 mod bundled;
 pub use bundled::{
-    ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models,
-    documented_thinking_levels, known_context_window, model_capabilities, model_protocol,
-    provider_endpoint,
+    BuiltinProvider, ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models,
+    documented_thinking_levels, key_providers, known_context_window, model_capabilities,
+    model_protocol, provider_endpoint,
 };
 
 mod cache;
@@ -20,14 +20,15 @@ mod probe;
 mod subscription;
 use crate::config::paths::Layout;
 use crate::llm::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
-pub use cache::saved_listing_models;
 use cache::{cached, persist_cache, probe_cache_key, same_model};
+pub use cache::{saved_listing_models, saved_subscription_models};
 pub(crate) use credentials::origin;
 pub use credentials::{
     EndpointSettings, credential_token, fill_endpoint_template, known_key_env, remove_credential,
-    remove_provider_credentials, resolve_credential, save_credential, set_cli_api_key,
+    remove_provider_credentials, resolve_credential, save_credential, saved_credential_urls,
+    set_cli_api_key, stored_credential_urls,
 };
-use credentials::{bundled_endpoints, saved_credential_urls, validated_url};
+use credentials::{bundled_endpoints, validated_url};
 use local_models::{annotate_embedding_checkpoints, lora_support, mlx_architectures, snapshot};
 pub(crate) use local_models::{
     chat_template, hf_cache, local_model_entries, read_json, uses_mlx_vlm,
@@ -215,6 +216,15 @@ fn local_server_url(id: &str, variable: &str, default: &str) -> String {
         })
         .unwrap_or_else(|| default.into())
 }
+
+/// Resolve a discovered server by provider ID when a picker sends only `provider/model`.
+pub fn local_server_endpoint(provider: &str) -> Option<String> {
+    LOCAL_SERVERS
+        .iter()
+        .find(|&&(id, ..)| id == provider)
+        .map(|&(id, _, variable, default)| local_server_url(id, variable, default))
+}
+
 /// Whether something accepts TCP connections at `base_url` within `timeout`.
 fn accepts_connections(base_url: &str, timeout: Duration) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};

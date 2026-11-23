@@ -19,8 +19,10 @@ fn worn(turn: &mut TurnState<'_>) {
     turn.reviewed_paths.insert("src/lib.rs".into());
     turn.completion_candidate = Some("done".into());
     turn.reliability.consecutive_contract_failures = 2;
-    turn.notices.push_advisory(Priority::Failure, "old failure advice");
-    turn.notices.push_advisory(Priority::Safety, "safety boundary");
+    turn.notices
+        .push_advisory(Priority::Failure, "old failure advice");
+    turn.notices
+        .push_advisory(Priority::Safety, "safety boundary");
 }
 
 fn with_turn(check: impl Fn(&mut TurnState<'_>)) {

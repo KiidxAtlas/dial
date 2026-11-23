@@ -18,6 +18,24 @@ pub struct SchedulingReplay {
     pub read_batching_only: ReplayGroups,
     pub resource_dispatch: ReplayGroups,
     pub resource_barriers: BTreeMap<String, usize>,
+    /// Barriers closed by a specific call, keyed `reason:tool` (see `Scheduling::barrier_tools`).
+    pub resource_barrier_tools: BTreeMap<String, usize>,
+}
+
+impl SchedulingReplay {
+    /// Combine reports from separate sessions, each replayed with its own file handles.
+    pub fn extend(&mut self, other: Self) {
+        self.responses += other.responses;
+        self.calls += other.calls;
+        self.read_batching_only.extend(other.read_batching_only);
+        self.resource_dispatch.extend(other.resource_dispatch);
+        for (key, count) in other.resource_barriers {
+            *self.resource_barriers.entry(key).or_default() += count;
+        }
+        for (key, count) in other.resource_barrier_tools {
+            *self.resource_barrier_tools.entry(key).or_default() += count;
+        }
+    }
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -34,9 +52,18 @@ impl ReplayGroups {
         }
         *self.sizes.entry(count).or_default() += 1;
     }
+    fn extend(&mut self, other: Self) {
+        self.groups += other.groups;
+        self.grouped_calls += other.grouped_calls;
+        for (size, count) in other.sizes {
+            *self.sizes.entry(size).or_default() += count;
+        }
+    }
 }
 
 /// Uses the execution planner and tool-owned resource declarations without invoking any tool.
+/// Calls are expanded through `workspace`'s file-handle registry exactly as the live wave does, so
+/// restore the recorded session's handles first; an unknown handle is a `file_reference` barrier.
 pub fn replay_scheduling(
     workspace: &Workspace,
     config: &Config,
@@ -64,12 +91,21 @@ pub fn replay_scheduling(
                         if call.malformed_arguments {
                             return Err("malformed_arguments");
                         }
-                        Ok(call.clone())
+                        let mut effective = call.clone();
+                        crate::agent::window::file_handles::expand(workspace, &mut effective)
+                            .map_err(|_| "file_reference")?;
+                        Ok(effective)
                     });
                     *report
                         .resource_barriers
                         .entry(plan.barrier.into())
                         .or_default() += 1;
+                    if let Some(tool) = &plan.barrier_tool {
+                        *report
+                            .resource_barrier_tools
+                            .entry(format!("{}:{tool}", plan.barrier))
+                            .or_default() += 1;
+                    }
                     if plan.dispatchable() {
                         count = plan.calls.len();
                     }

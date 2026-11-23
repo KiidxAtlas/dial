@@ -331,17 +331,17 @@ Rewrote the read description."
 }
 
 #[test]
-fn explicit_typed_non_completed_finish_is_authoritative_without_prose_overrides() {
+fn explicit_finish_outcomes_do_not_depend_on_summary_wording() {
     use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
     with_agent("[compaction]\nenabled=false", |agent| {
         for outcome in [
+            TurnOutcome::Completed,
             TurnOutcome::Answered,
             TurnOutcome::Blocked,
             TurnOutcome::NeedsInput,
         ] {
             let decision = agent.completion_decision(
                 outcome,
-                "I have not fixed this yet; should I continue?",
                 ReplyChannel::Explicit,
                 &mut crate::agent::NullUi,
             );
@@ -350,5 +350,31 @@ fn explicit_typed_non_completed_finish_is_authoritative_without_prose_overrides(
                 "expected explicit {outcome:?} to be accepted directly"
             );
         }
+    });
+}
+
+#[test]
+fn comparison_wording_does_not_spend_the_recovery_for_actual_open_work() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let mut control = agent.session.control_state();
+        control["current_instruction"] = json!("Compare the two versions");
+        agent.session.set_control_state(control).unwrap();
+        let finish =
+            Finish::parse(&json!({"outcome":"answered","summary":"I compared them."})).unwrap();
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                finish.outcome,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        assert!(matches!(
+            decide(agent),
+            Decision::Accept(TurnOutcome::Answered)
+        ));
+        agent.todo = todo();
+        assert!(matches!(decide(agent), Decision::Continue(_)));
+        assert!(matches!(decide(agent), Decision::Incomplete(_)));
     });
 }

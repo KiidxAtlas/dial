@@ -31,6 +31,15 @@ pub enum CheckStatus {
 }
 
 impl CheckStatus {
+    /// The process observed only an aggregate zero exit, not individual pipeline stages.
+    pub(super) fn from_shell_success(command: &str) -> Self {
+        if super::checks::exit_status_masked(command) {
+            Self::Unverified
+        } else {
+            Self::Passed
+        }
+    }
+
     /// Only an observed code diagnostic may be sent to the repair loop. An unexplained nonzero
     /// exit, infrastructure, permission, cancellation, timeout or unverifiable run is not one.
     pub fn repairable(self) -> bool {
@@ -120,7 +129,9 @@ pub(in crate::agent) fn classify_with_artifacts(
             .is_some_and(|process| process.exit_code == Some(0))
         && !incomplete
     {
-        return CheckStatus::Passed;
+        return check.map_or(CheckStatus::Passed, |check| {
+            CheckStatus::from_shell_success(&check.command)
+        });
     }
     let runner_launch_observed = runner.is_none()
         || (complete

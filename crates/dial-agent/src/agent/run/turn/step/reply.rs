@@ -144,9 +144,7 @@ impl Agent<'_> {
                         .map(ControlFlow::Break);
                 }
             };
-            if let Some(message) = message {
-                turn.notices.push_protocol(message);
-            }
+            turn.notices.replace_research_correction(message);
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
         }
         let length_facts = crate::agent::run::reply_triage::LengthFacts {
@@ -389,11 +387,11 @@ impl Agent<'_> {
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
         }
         let plain = reply.tool_calls.is_empty();
-        let plain_signals = plain
-            .then(|| crate::agent::verify::reply_signals::ReplySignals::classify(&reply.text));
+        let plain_signals =
+            plain.then(|| crate::agent::verify::reply_signals::ReplySignals::classify(&reply.text));
         let declared = plain_signals.and_then(|signals| signals.declared);
-        let asks_user =
-            plain_signals.is_some_and(|signals| signals.declared.is_none() && signals.awaiting_input);
+        let asks_user = plain_signals
+            .is_some_and(|signals| signals.declared.is_none() && signals.awaiting_input);
         // spend another inference asking the model to poll. Explicit blockers/questions still
         // end normally; uncertain effects must stop rather than enter another continuation.
         if plain
@@ -512,13 +510,11 @@ impl Agent<'_> {
                 asks_user,
                 signals: plain_signals,
             };
-            match self.completion_decision(requested, &reply.text, channel, ui) {
+            match self.completion_decision(requested, channel, ui) {
                 crate::agent::verify::completion::Decision::Continue(note) => {
                     turn.completion_candidate = Some(reply.text.clone());
-                    turn.notices.push_advisory(
-                        crate::agent::run::guidance::Priority::Review,
-                        note,
-                    );
+                    turn.notices
+                        .push_advisory(crate::agent::run::guidance::Priority::Review, note);
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }
                 crate::agent::verify::completion::Decision::Incomplete(reason) => {

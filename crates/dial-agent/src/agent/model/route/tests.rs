@@ -357,6 +357,8 @@ fn threshold_promotion_replaces_compaction_for_a_request_over_the_trigger() {
     let server = fake::serve(vec![sse("done on the big model")]);
     let overlay = format!("{PROMOTING}{}", big_role(&server.url, 200_000));
     with_server_agent(&server.url, &overlay, |agent| {
+        // Exercise threshold promotion independently of the fallback window for unknown models.
+        agent.context_cap = Some(32_768);
         // About 30k estimated tokens: over the small window's trigger, far under the big one's.
         let report = agent
             .turn(&"lorem ipsum ".repeat(10_000), &mut NullUi)

@@ -25,13 +25,16 @@ pub(in crate::agent) fn footprint_for(
         return Some(Footprint::default());
     }
     // A plain inspection of literal workspace files reads only those files, so it can join a wave
-    // beside writes to other paths. Every other read-only shell form reads every root.
+    // beside writes to other paths. Every other command that writes nothing (still approved like
+    // any shell command) reads every root, so it joins reads but never runs beside a write.
     if call.name == "bash" {
-        if !crate::agent::safety::approval::parallel_read(registry, "bash", &call.arguments) {
-            return None;
+        if crate::agent::safety::approval::parallel_read(registry, "bash", &call.arguments) {
+            return literal_shell_reads(workspace, &call.arguments)
+                .or_else(|| crate::tools::surface::resources::workspace_read(workspace));
         }
-        return literal_shell_reads(workspace, &call.arguments)
-            .or_else(|| crate::tools::surface::resources::workspace_read(workspace));
+        return read_only_shell_batch(&call.arguments)
+            .then(|| crate::tools::surface::resources::workspace_read(workspace))
+            .flatten();
     }
     crate::tools::surface::resources::resolve(
         workspace,
@@ -40,6 +43,23 @@ pub(in crate::agent) fn footprint_for(
         &call.name,
         &call.arguments,
     )
+}
+
+/// A one-shot shell call (no `session`, `pty` or `background`) whose every command the effect
+/// tracker proves writes nothing. Scheduling only: approval still decides whether it runs.
+fn read_only_shell_batch(arguments: &Value) -> bool {
+    let off = |key| {
+        matches!(
+            arguments.get(key),
+            None | Some(Value::Null | Value::Bool(false))
+        )
+    };
+    off("background")
+        && off("pty")
+        && arguments["session"].is_null()
+        && arguments["command"]
+            .as_str()
+            .is_some_and(|command| !crate::agent::safety::approval::opaque_shell_effect(command))
 }
 
 /// Options a literal read accepts for one program. Names are exact: no abbreviations, bundled short
@@ -121,6 +141,97 @@ fn read_options(program: &str) -> Option<ReadOptions> {
             ],
             valued: &["-c", "--format", "--printf"],
         },
+        // GNU `-L` dereferences symlinks; `-H` follows symlinked operands. Both stay unlisted.
+        "ls" => ReadOptions {
+            flags: &[
+                "-1",
+                "-a",
+                "-A",
+                "-c",
+                "-C",
+                "-d",
+                "-F",
+                "-g",
+                "-h",
+                "-i",
+                "-l",
+                "-m",
+                "-n",
+                "-o",
+                "-p",
+                "-r",
+                "-R",
+                "-s",
+                "-S",
+                "-t",
+                "-u",
+                "-x",
+                "--all",
+                "--almost-all",
+                "--classify",
+                "--directory",
+                "--human-readable",
+                "--recursive",
+                "--reverse",
+            ],
+            valued: &[],
+        },
+        // `-f FILE` reads a pattern file and `-R` follows symlinks below directories (GNU), so both
+        // stay unlisted. `-r` follows no symlink it meets while recursing, in GNU and BSD alike.
+        "grep" => ReadOptions {
+            flags: &[
+                "-c",
+                "-E",
+                "-F",
+                "-G",
+                "-h",
+                "-H",
+                "-i",
+                "-I",
+                "-l",
+                "-L",
+                "-n",
+                "-o",
+                "-q",
+                "-r",
+                "-s",
+                "-v",
+                "-w",
+                "-x",
+                "--count",
+                "--extended-regexp",
+                "--files-with-matches",
+                "--files-without-match",
+                "--fixed-strings",
+                "--ignore-case",
+                "--invert-match",
+                "--line-number",
+                "--line-regexp",
+                "--no-filename",
+                "--no-messages",
+                "--only-matching",
+                "--quiet",
+                "--recursive",
+                "--silent",
+                "--with-filename",
+                "--word-regexp",
+            ],
+            // BSD takes `-C`/`--context` with an optional attached value, so `-C 3` would make `3` the
+            // pattern there; both stay unlisted.
+            valued: &[
+                "-A",
+                "-B",
+                "-e",
+                "-m",
+                "--after-context",
+                "--before-context",
+                "--exclude",
+                "--exclude-dir",
+                "--include",
+                "--max-count",
+                "--regexp",
+            ],
+        },
         _ => return None,
     })
 }
@@ -147,8 +258,79 @@ fn read_base_directory(workspace: &Workspace, arguments: &Value) -> Option<std::
     Some(lexical)
 }
 
+/// Options whose value is the search pattern, and whether the first operand is the pattern when
+/// none of them appears. A pattern is the program's argument, never a file it reads.
+fn pattern_options(program: &str) -> (&'static [&'static str], bool) {
+    match program {
+        "grep" => (&["-e", "--regexp"], true),
+        _ => (&[], false),
+    }
+}
+
+/// A word that may name a literal workspace file: no stdin marker, handle or shell-special byte.
+/// Option values and patterns reach the program verbatim and are not file names, so they skip this.
+fn literal_operand(word: &str) -> bool {
+    !(word.is_empty()
+        || word == "-"
+        || word.starts_with('@')
+        || word.contains(['$', '*', '?', '[', ']', '{', '}', '~', '`', '\\']))
+}
+
+/// `find` predicates that read nothing beyond the starting points (`-newer FILE`, `-samefile`,
+/// `-L`, `-follow` and `-xtype` would). Every other predicate keeps the broad read.
+const FIND_FLAGS: &[&str] = &[
+    "!", "(", ")", "-a", "-and", "-depth", "-empty", "-false", "-mount", "-not", "-o", "-or",
+    "-print", "-print0", "-prune", "-true", "-xdev",
+];
+const FIND_VALUED: &[&str] = &[
+    "-amin",
+    "-atime",
+    "-cmin",
+    "-ctime",
+    "-gid",
+    "-group",
+    "-iname",
+    "-inum",
+    "-ipath",
+    "-iregex",
+    "-iwholename",
+    "-links",
+    "-maxdepth",
+    "-mindepth",
+    "-mmin",
+    "-mtime",
+    "-name",
+    "-path",
+    "-perm",
+    "-regex",
+    "-size",
+    "-type",
+    "-uid",
+    "-user",
+    "-wholename",
+];
+
+/// Literal starting points of a `find` whose expression only filters and prints. Leading options
+/// (`-H`, `-L`, `-P`) and any predicate outside the lists above return `None`.
+fn find_operands(words: &[String]) -> Option<Vec<&str>> {
+    let start = words
+        .iter()
+        .position(|word| word.starts_with('-') || matches!(word.as_str(), "!" | "(" | ")"))
+        .unwrap_or(words.len());
+    let (operands, expression) = words.split_at(start);
+    let mut rest = expression.iter();
+    while let Some(word) = rest.next() {
+        if FIND_VALUED.contains(&word.as_str()) {
+            rest.next()?;
+        } else if !FIND_FLAGS.contains(&word.as_str()) {
+            return None;
+        }
+    }
+    Some(operands.iter().map(String::as_str).collect())
+}
+
 /// Inspections whose operands are exactly the files they read: one plain command from
-/// [`read_options`], with literal operands. `None` keeps the broad read for every other shape.
+/// [`read_options`] (or a filtering `find`), with literal operands. `None` keeps the broad read.
 fn literal_shell_reads(workspace: &Workspace, arguments: &Value) -> Option<Footprint> {
     let command = arguments["command"].as_str()?;
     // `safe_bash` allows one plain command only. Newlines, `;`, `&&`, `\r` and `&` are lexer
@@ -157,40 +339,57 @@ fn literal_shell_reads(workspace: &Workspace, arguments: &Value) -> Option<Footp
         return None;
     }
     let words = crate::agent::safety::approval::shell_words(command)?;
-    let options = read_options(words.first()?.as_str())?;
+    let program = words.first()?.as_str();
     let base = read_base_directory(workspace, arguments)?;
     let mut operands = Vec::new();
-    let mut value_pending = false;
-    let mut operands_only = false;
-    for word in &words[1..] {
-        if word.is_empty()
-            || word == "-"
-            || word.starts_with('@')
-            || word.contains(['$', '*', '?', '[', ']', '{', '}', '~', '`', '\\'])
-        {
-            return None;
-        }
-        if std::mem::take(&mut value_pending) {
-            continue;
-        }
-        if operands_only || !word.starts_with('-') {
-            operands.push(base.join(word));
-        } else if word == "--" {
-            operands_only = true;
-        } else if options.flags.contains(&word.as_str()) {
-            continue;
-        } else if options.valued.contains(&word.as_str()) {
-            value_pending = true;
-        } else {
-            // Only `--name=value` for a listed valued long option is accepted here.
-            let (name, _) = word.split_once('=')?;
-            if !(name.starts_with("--") && options.valued.contains(&name)) {
+    if program == "find" {
+        for word in find_operands(&words[1..])? {
+            if !literal_operand(word) {
                 return None;
             }
+            operands.push(base.join(word));
+        }
+    } else {
+        let options = read_options(program)?;
+        let (patterns, pattern_first) = pattern_options(program);
+        let mut pattern_pending = pattern_first;
+        let mut value_pending = false;
+        let mut operands_only = false;
+        for word in &words[1..] {
+            if std::mem::take(&mut value_pending) {
+                continue;
+            }
+            if operands_only || !word.starts_with('-') || word == "-" {
+                if std::mem::take(&mut pattern_pending) {
+                    continue;
+                }
+                if !literal_operand(word) {
+                    return None;
+                }
+                operands.push(base.join(word));
+            } else if word == "--" {
+                operands_only = true;
+            } else if options.flags.contains(&word.as_str()) {
+                continue;
+            } else if options.valued.contains(&word.as_str()) {
+                value_pending = true;
+                pattern_pending &= !patterns.contains(&word.as_str());
+            } else {
+                // Only `--name=value` for a listed valued long option is accepted here.
+                let (name, _) = word.split_once('=')?;
+                if !(name.starts_with("--") && options.valued.contains(&name)) {
+                    return None;
+                }
+                pattern_pending &= !patterns.contains(&name);
+            }
+        }
+        // A valued option without its value, or a missing pattern, reads nothing provable.
+        if value_pending || pattern_pending {
+            return None;
         }
     }
-    // A valued option without its value, or no operand at all, reads nothing provable.
-    if value_pending || operands.is_empty() {
+    // No operand at all means the working directory or stdin: keep the broad read.
+    if operands.is_empty() {
         return None;
     }
     crate::tools::surface::resources::literal_reads(workspace, &operands)
@@ -203,6 +402,9 @@ pub(in crate::agent) struct Plan {
     /// One resolved footprint per admitted call, in call order.
     pub footprints: Vec<Footprint>,
     pub barrier: &'static str,
+    /// Tool name of the call that closed the prefix; `None` for `response_end` and
+    /// `concurrency_limit`, which no particular call caused.
+    pub barrier_tool: Option<String>,
 }
 
 impl Plan {
@@ -218,18 +420,31 @@ impl Plan {
             .any(|(call, footprint)| footprint.is_empty() && !bookkeeping(call))
     }
 
-    /// Keep the first `admitted` calls after a controller check closed the prefix early.
-    pub(in crate::agent) fn truncate(&mut self, admitted: usize) {
+    /// Keep the first `admitted` calls after a controller check closed the prefix early at
+    /// `reason`; the first excluded call becomes the closing call.
+    pub(in crate::agent) fn close_at(&mut self, admitted: usize, reason: &'static str) {
+        self.barrier_tool = self.calls.get(admitted).map(|call| call.name.clone());
+        self.barrier = reason;
         self.calls.truncate(admitted);
         self.footprints.truncate(admitted);
     }
 
     /// Whether this prefix should run as a native wave rather than through the parallel-read
     /// group or serially: more than one native call, and at least one the read group cannot take
-    /// (a declared write, an approval-gated external read, or settled bookkeeping).
+    /// (a declared write, a gated shell inspection, an external read, or settled bookkeeping).
     pub(in crate::agent) fn dispatchable(&self) -> bool {
         self.calls.iter().filter(|call| !bookkeeping(call)).count() > 1
-            && (self.writes() || self.external() || self.calls.iter().any(bookkeeping))
+            && (self.writes()
+                || self.external()
+                || self.calls.iter().any(bookkeeping)
+                // Admitted shell reads are already one-shot; only safe_bash inspections can
+                // take the parallel-read path without the native wave's authorization pass.
+                || self.calls.iter().any(|call| {
+                    call.name == "bash"
+                        && call.arguments["command"]
+                            .as_str()
+                            .is_some_and(|cmd| !crate::agent::safety::approval::safe_bash(cmd))
+                }))
     }
 }
 
@@ -305,6 +520,7 @@ pub(in crate::agent) fn plan_prefix(
         calls: Vec::new(),
         footprints: Vec::new(),
         barrier: "response_end",
+        barrier_tool: None,
     };
     for call in calls {
         if plan.calls.len() >= limit {
@@ -315,6 +531,7 @@ pub(in crate::agent) fn plan_prefix(
             Ok(admitted) => admitted,
             Err(reason) => {
                 plan.barrier = reason;
+                plan.barrier_tool = Some(call.name.clone());
                 break;
             }
         };
@@ -324,15 +541,19 @@ pub(in crate::agent) fn plan_prefix(
             .any(|previous| resources.conflicts(previous))
         {
             plan.barrier = "resource_conflict";
+            plan.barrier_tool = Some(call.name.clone());
             break;
         }
         plan.footprints.push(resources);
         let verifies = call.arguments["verify"]
             .as_array()
             .is_some_and(|entries| !entries.is_empty());
-        plan.calls.push(call);
         if verifies {
             plan.barrier = "verification";
+            plan.barrier_tool = Some(call.name.clone());
+        }
+        plan.calls.push(call);
+        if verifies {
             break;
         }
     }
@@ -594,26 +815,24 @@ impl Agent<'_> {
             hooks: self.tool_hooks(),
             limit: config.task.dependency_wave_limit(),
         };
-        let mut plan = plan_wave(calls, scope, WavePolicy::PARENT, |call| {
+        let plan = plan_wave(calls, scope, WavePolicy::PARENT, |call| {
             if self.speculative_pending(call) {
                 return Err(WavePolicy::PARENT.refusal);
             }
             let mut effective = call.clone();
             crate::agent::window::file_handles::expand(&self.workspace, &mut effective)
                 .map_err(|_| "file_reference")?;
+            // Only serial dispatch delivers the refusal (and consumes the one-shot gate).
+            if self.verification_option_disabled(&effective)
+                || self.repro_first_pending(&effective, crate::config::types::ReproFirst::Gate)
+            {
+                return Err(WavePolicy::PARENT.refusal);
+            }
             Ok(effective)
         });
-        // The repro-first gate consumes a once-per-turn trigger, so it is asked only of calls
-        // the shared admission already accepted, in call order; a firing gate closes the wave.
-        if let Some(gated) = plan
-            .calls
-            .iter()
-            .position(|call| self.repro_first_fires(call, crate::config::types::ReproFirst::Gate))
-        {
-            plan.truncate(gated);
-            plan.barrier = WavePolicy::PARENT.refusal;
-        }
-        self.efficiency_metrics.scheduling.barrier(plan.barrier);
+        self.efficiency_metrics
+            .scheduling
+            .barrier(plan.barrier, plan.barrier_tool.as_deref());
         plan
     }
 
@@ -682,7 +901,7 @@ impl Agent<'_> {
         // Settle source epochs before any coalesced verification sees the final candidate tree.
         for (call, output) in calls.iter().zip(&mut results) {
             if let Some((output, _)) = output {
-                self.settle_tool_mutation(call, output);
+                self.settle_mutation_output(call, output);
             }
         }
         for (index, call) in calls.iter().enumerate() {

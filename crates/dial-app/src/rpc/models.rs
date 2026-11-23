@@ -1,19 +1,65 @@
-//! Offline model listing for RPC `list_models`, the `state` model fields and the ACP model and
-//! thought-level config options. The listing is exactly the set `set_model` accepts without a
-//! network round trip (see `agent::modes::switch::is_known_model`): configured selections (main
-//! model, roles, favorites, profiles), bundled catalog rows of the providers those selections and
-//! `[providers]` name, and downloaded local models. Remote provider listings are never queried.
+//! Chat and role listings for RPC, plus the `state` and ACP model controls. Ordinary listings
+//! use configured models, saved provider catalogs and downloads without network access. A chat
+//! refresh uses available entries from the same provider scan as the terminal picker.
 use crate::config::types::Config;
 use crate::llm::catalog;
 use crate::llm::model_config::ModelSelection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// One full discovery per RPC connection. A project/config rebuild or newer scan invalidates
+/// in-flight writers; provider filters and picker purpose never truncate the shared snapshot.
+#[derive(Default)]
+pub(super) struct ModelScan(Mutex<ScanState>);
+
+#[derive(Default)]
+struct ScanState {
+    generation: u64,
+    rows: Option<Arc<[catalog::ModelEntry]>>,
+}
+
+impl ModelScan {
+    pub(super) fn begin(&self) -> u64 {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.generation += 1;
+        state.generation
+    }
+
+    pub(super) fn reset(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.generation += 1;
+        state.rows = None;
+    }
+
+    pub(super) fn publish(
+        &self,
+        ticket: u64,
+        rows: Vec<catalog::ModelEntry>,
+    ) -> anyhow::Result<Arc<[catalog::ModelEntry]>> {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            ticket == state.generation,
+            "model scan superseded; refresh the picker"
+        );
+        let rows: Arc<[_]> = rows.into();
+        state.rows = Some(rows.clone());
+        Ok(rows)
+    }
+
+    pub(super) fn snapshot(&self) -> Option<Arc<[catalog::ModelEntry]>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rows
+            .clone()
+    }
+}
 
 /// One listed model, keyed by `provider/model`.
 struct Row {
-    provider: String,
-    model: String,
+    selection: ModelSelection,
     label: String,
     sources: Vec<String>,
     local: Option<catalog::ModelMetadata>,
@@ -46,6 +92,49 @@ pub(super) fn list(
     user_dir: &Path,
     provider: Option<&str>,
 ) -> Vec<Value> {
+    chat_list(config, current, user_dir, provider, None)
+}
+
+/// Use the scan itself when available. Some signed-in subscriptions offer selectable
+/// cached or bundled rows without writing a provider listing to disk.
+pub(super) fn chat_list(
+    config: &Config,
+    current: &ModelSelection,
+    user_dir: &Path,
+    provider: Option<&str>,
+    discovered: Option<&[catalog::ModelEntry]>,
+) -> Vec<Value> {
+    chat_rows(config, current, user_dir, provider, discovered)
+        .into_values()
+        .map(|row| {
+            let is_current =
+                row.selection.provider == current.provider && row.selection.model == current.model;
+            describe(config, row, is_current)
+        })
+        .collect()
+}
+
+pub(super) fn select_chat(
+    config: &Config,
+    current: &ModelSelection,
+    user_dir: &Path,
+    provider: &str,
+    model: &str,
+    discovered: Option<&[catalog::ModelEntry]>,
+) -> anyhow::Result<ModelSelection> {
+    chat_rows(config, current, user_dir, Some(provider), discovered)
+        .remove(&format!("{provider}/{model}"))
+        .map(|row| row.selection)
+        .ok_or_else(|| super::coded(dial_protocol::ErrorCode::NotFound, format!("unknown model {provider}/{model}: not a selectable chat model; refresh the picker")))
+}
+
+fn chat_rows(
+    config: &Config,
+    current: &ModelSelection,
+    user_dir: &Path,
+    provider: Option<&str>,
+    discovered: Option<&[catalog::ModelEntry]>,
+) -> BTreeMap<String, Row> {
     let mut rows: BTreeMap<String, Row> = BTreeMap::new();
     fn add(
         rows: &mut BTreeMap<String, Row>,
@@ -54,8 +143,7 @@ pub(super) fn list(
         source: String,
     ) {
         let row = rows.entry(key(selection)).or_insert_with(|| Row {
-            provider: selection.provider.clone(),
-            model: selection.model.clone(),
+            selection: selection.clone(),
             label: label.unwrap_or(&selection.model).to_owned(),
             sources: Vec::new(),
             local: None,
@@ -69,7 +157,9 @@ pub(super) fn list(
     if !provider_disabled(config, &main.provider) {
         add(&mut rows, &main, None, "main".into());
     }
-    add(&mut rows, current, None, "current".into());
+    if !provider_disabled(config, &current.provider) {
+        add(&mut rows, current, None, "current".into());
+    }
     for (role, selection) in &config.model_roles {
         if !provider_disabled(config, &selection.provider) {
             add(&mut rows, selection, None, format!("role:{role}"));
@@ -93,8 +183,7 @@ pub(super) fn list(
     }
     let mut providers: BTreeSet<String> = rows
         .values()
-        .filter(|row| !provider_disabled(config, &row.provider))
-        .map(|row| row.provider.clone())
+        .map(|row| row.selection.provider.clone())
         .collect();
     providers.extend(
         config
@@ -103,25 +192,23 @@ pub(super) fn list(
             .filter(|(_, spec)| spec.enabled && !spec.is_reset())
             .map(|(name, _)| name.clone()),
     );
-    if let Some(provider) = provider {
+    if let Some(provider) = provider.filter(|p| !provider_disabled(config, p)) {
         providers.insert(provider.to_owned());
     }
     // Downloaded local models and the saved listings of enabled providers. Models whose
     // metadata declares a non-chat kind (embedding, rerank, image, audio) cannot be the main model.
     let mut listed_providers: BTreeSet<String> = BTreeSet::new();
-    let listed: Vec<_> = catalog::saved_listing_models(user_dir)
-        .into_iter()
-        .filter(|entry| providers.contains(&entry.selection.provider))
-        .inspect(|entry| {
+    let mut non_chat = BTreeSet::new();
+    for entry in picker_entries(config, user_dir, provider, discovered) {
+        let source = entry_source(&entry);
+        if source == "listing" {
             listed_providers.insert(entry.selection.provider.clone());
-        })
-        .map(|entry| (entry, "listing"))
-        .collect();
-    let local = catalog::downloaded_local_models(user_dir)
-        .into_iter()
-        .map(|entry| (entry, "local"));
-    for (entry, source) in local.chain(listed) {
+        }
         if !entry.supports_chat() {
+            non_chat.insert(key(&entry.selection));
+            continue;
+        }
+        if discovered.is_some() && !entry.available {
             continue;
         }
         add(
@@ -133,6 +220,19 @@ pub(super) fn list(
         if let Some(row) = rows.get_mut(&key(&entry.selection))
             && row.local.is_none()
         {
+            // An explicit configured route wins intact; never transplant credentials or
+            // transport policy from one endpoint onto another. A bare ID takes the scan route.
+            let mut bare = ModelSelection::new(&row.selection.provider, &row.selection.model);
+            bare.context_window = row.selection.context_window;
+            bare.thinking.clone_from(&row.selection.thinking);
+            if row.selection == bare {
+                row.selection = entry.selection.clone();
+                row.selection.context_window = bare.context_window.or(row.selection.context_window);
+                if bare.thinking.is_some() {
+                    row.selection.thinking = bare.thinking;
+                }
+            }
+            row.label.clone_from(&entry.label);
             row.image_output = Some(entry.supports_images());
             row.local = Some(entry.metadata);
         }
@@ -141,7 +241,10 @@ pub(super) fn list(
     // listing yet and is not strictly account-scoped (ChatGPT/Antigravity listings come from the
     // signed-in account, never static bundled IDs).
     for provider in &providers {
-        if listed_providers.contains(provider) || is_account_scoped_provider(provider) {
+        if discovered.is_some()
+            || listed_providers.contains(provider)
+            || is_account_scoped_provider(provider)
+        {
             continue;
         }
         for model in catalog::bundled_models(provider) {
@@ -153,13 +256,110 @@ pub(super) fn list(
             add(&mut rows, &selection, None, "catalog".into());
         }
     }
-    rows.into_values()
-        .filter(|row| provider.is_none_or(|wanted| row.provider == wanted))
-        .map(|row| {
-            let is_current = row.provider == current.provider && row.model == current.model;
-            describe(config, row, is_current)
-        })
+    rows.retain(|key, row| {
+        !non_chat.contains(key)
+            && !row.selection.model.trim().is_empty()
+            && !row.selection.provider.trim().is_empty()
+            && provider.is_none_or(|p| p == row.selection.provider)
+    });
+    rows
+}
+
+/// Shared source for all picker purposes. Account-scoped rows from a completed scan are usable
+/// only while the active account's offline catalog still lists them. Never trust client routes.
+fn picker_entries(
+    config: &Config,
+    user_dir: &Path,
+    provider: Option<&str>,
+    discovered: Option<&[catalog::ModelEntry]>,
+) -> Vec<catalog::ModelEntry> {
+    let wanted = |e: &catalog::ModelEntry| {
+        !provider_disabled(config, &e.selection.provider)
+            && provider.is_none_or(|p| p == e.selection.provider)
+    };
+    if let Some(discovered) = discovered {
+        let mut scoped = None;
+        let mut entries: Vec<_> = discovered
+            .iter()
+            .filter(|e| wanted(e))
+            .filter_map(|entry| {
+                let entry =
+                    if is_account_scoped_provider(&entry.selection.provider) && entry.available {
+                        let active = scoped.get_or_insert_with(|| {
+                            catalog::saved_subscription_models(user_dir)
+                                .into_iter()
+                                .map(|e| (key(&e.selection), e))
+                                .collect::<BTreeMap<_, _>>()
+                        });
+                        let saved = active.get(&key(&entry.selection))?;
+                        if entry.selection.account_id.is_some()
+                            && entry.selection.account_id != saved.selection.account_id
+                        {
+                            return None;
+                        }
+                        saved
+                    } else {
+                        entry
+                    };
+                Some(entry.clone())
+            })
+            .collect();
+        // A generation since the scan may have verified or refused this image route.
+        catalog::image_capabilities::apply_cached(user_dir, &mut entries);
+        return entries;
+    }
+    catalog::downloaded_local_models(user_dir)
+        .into_iter()
+        .filter(&wanted)
+        .chain(
+            catalog::saved_listing_models(user_dir)
+                .into_iter()
+                .filter(wanted)
+                .filter(|e| saved_route_allowed(config, &e.selection)),
+        )
         .collect()
+}
+
+fn entry_source(entry: &catalog::ModelEntry) -> &'static str {
+    if entry.selection.provider == "mlx" && entry.selection.base_url.is_none() {
+        "local"
+    } else {
+        "listing"
+    }
+}
+
+// The on-disk endpoint catalog is shared between workspaces. Only restore a route still
+// configured here, a builtin route, or the active subscription's account-scoped listing.
+fn saved_route_allowed(config: &Config, saved: &ModelSelection) -> bool {
+    let matches =
+        |route: &ModelSelection| {
+            if route.provider != saved.provider {
+                return false;
+            }
+            let Some(endpoint) = config.selection_endpoint(route) else {
+                return saved.base_url.is_none();
+            };
+            saved.base_url.as_deref().is_some_and(|url| {
+                url.trim_end_matches('/') == endpoint.base_url.trim_end_matches('/')
+            }) && saved.headers.as_deref().unwrap_or_default()
+                == endpoint.headers.as_deref().unwrap_or_default()
+                && (!saved.allow_insecure || endpoint.allow_insecure)
+                && saved
+                    .api_key_env
+                    .as_ref()
+                    .is_none_or(|env| Some(env) == endpoint.api_key_env.as_ref())
+                && saved
+                    .protocol
+                    .is_none_or(|protocol| endpoint.protocol == Some(protocol))
+        };
+    saved.base_url.is_none()
+        || matches(&ModelSelection::new(&saved.provider, &saved.model))
+        || matches(&config.selection())
+        || config
+            .model_roles
+            .values()
+            .chain(&config.model_favorites)
+            .any(matches)
 }
 
 /// What a non-chat `list_models` listing is for (`purpose` param).
@@ -189,28 +389,19 @@ impl Purpose {
 /// marks the assigned `image` role (or `image.model` when unset) or the assigned `embedding` role;
 /// `base_url` is the endpoint the selection needs and `image_api` (image rows) what `image.api`
 /// needs.
-pub(super) fn list_for(
+pub(super) fn role_list(
     config: &Config,
     user_dir: &Path,
     provider: Option<&str>,
     purpose: Purpose,
+    discovered: Option<&[catalog::ModelEntry]>,
 ) -> Vec<Value> {
-    let local = catalog::downloaded_local_models(user_dir)
-        .into_iter()
-        .map(|entry| (entry, "local"));
-    let listed = catalog::saved_listing_models(user_dir)
-        .into_iter()
-        .map(|entry| (entry, "listing"));
     let image_role = config.model_roles.get("image");
     let embedding = config.model_roles.get("embedding");
     let mut rows: BTreeMap<String, Value> = BTreeMap::new();
-    for (entry, source) in local.chain(listed) {
-        if provider_disabled(config, &entry.selection.provider) {
-            continue;
-        }
-        if !purpose.accepts(&entry)
-            || provider.is_some_and(|wanted| entry.selection.provider != wanted)
-        {
+    for entry in picker_entries(config, user_dir, provider, discovered) {
+        let source = entry_source(&entry);
+        if (discovered.is_some() && !entry.available) || !purpose.accepts(&entry) {
             continue;
         }
         rows.entry(key(&entry.selection)).or_insert_with(|| {
@@ -261,9 +452,15 @@ pub(super) fn list_for(
 
 /// Probe configured/signed-in providers via `catalog::discover` and refresh the persistent
 /// provider listing caches and image-capability cache (`image-capabilities.json`).
-/// Clears stale hosted-image refusals so upgraded accounts or updated endpoints are re-evaluated.
-pub(super) fn refresh_and_check(layout: &crate::config::paths::Layout, config: &Config) -> Value {
-    crate::tools::net::image_gen::clear_refusals(&layout.user_dir);
+/// An explicit image refresh also retries previously refused hosted image routes.
+pub(super) fn refresh_and_check(
+    layout: &crate::config::paths::Layout,
+    config: &Config,
+    purpose: Option<Purpose>,
+) -> (Value, Vec<catalog::ModelEntry>) {
+    if matches!(purpose, Some(Purpose::Image)) {
+        crate::tools::net::image_gen::clear_refusals(&layout.user_dir);
+    }
     let selections: Vec<ModelSelection> = std::iter::once(config.selection())
         .chain(config.model_favorites.iter().cloned())
         .chain(config.model_roles.values().cloned())
@@ -286,43 +483,60 @@ pub(super) fn refresh_and_check(layout: &crate::config::paths::Layout, config: &
             candidates += 1;
         }
     }
-    json!({
+    let checked = json!({
         "providers": checked_providers,
         "capable": capable,
         "candidates": candidates,
         "checked_at": catalog::image_capabilities::last_updated_at(&layout.user_dir),
-    })
+    });
+    (checked, discovery.models)
 }
 
 fn describe(config: &Config, row: Row, current: bool) -> Value {
-    let bundled = catalog::bundled_model(&row.provider, &row.model);
+    let provider = &row.selection.provider;
+    let model = &row.selection.model;
+    let bundled = catalog::bundled_model(provider, model);
     let levels = thinking_levels(
         config,
-        &row.provider,
-        &row.model,
+        provider,
+        model,
         row.local
             .as_ref()
             .and_then(|metadata| metadata.declared_reasoning),
     );
     let mut value = json!({
-        "provider": row.provider,
-        "model_id": row.model,
+        "provider": provider,
+        "model_id": model,
         "label": row.label,
         "sources": row.sources,
         "current": current,
         "thinking_levels": levels,
     });
+    let window = row
+        .local
+        .as_ref()
+        .and(row.selection.context_window)
+        .or_else(|| bundled.as_ref()?.context_window);
+    if let Some(window) = window {
+        value["context_window"] = json!(window);
+    }
     if let Some(bundled) = &bundled {
-        value["context_window"] = json!(bundled.context_window);
         value["max_output_tokens"] = json!(bundled.max_output_tokens);
         value["vision"] = json!(bundled.vision);
         value["reasoning"] = json!(bundled.reasoning);
         value["default_thinking"] = json!(bundled.default_effort.map(|effort| effort.as_str()));
         value["pricing"] = json!(bundled.pricing);
-    } else if let Some(metadata) = &row.local {
-        value["max_output_tokens"] = json!(metadata.max_output_tokens);
-        value["vision"] = json!(metadata.vision);
-        value["reasoning"] = json!(metadata.reasoning);
+    }
+    if let Some(metadata) = &row.local {
+        if let Some(limit) = metadata.max_output_tokens {
+            value["max_output_tokens"] = json!(limit);
+        }
+        if let Some(vision) = metadata.vision {
+            value["vision"] = json!(vision);
+        }
+        if let Some(reasoning) = metadata.reasoning {
+            value["reasoning"] = json!(reasoning);
+        }
         value["kind"] = json!(metadata.kind);
     }
     if let Some(images) = row.image_output {

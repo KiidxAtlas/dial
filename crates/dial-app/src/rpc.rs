@@ -507,6 +507,8 @@ impl Sender {
         self.emit(Self::result_frame(id, result, self.protocol()));
     }
 
+    /// A failed request's message is for a person: recovery guidance addressed to the model is
+    /// left out, as in the TUI and print mode.
     fn result_frame(id: &Value, result: Result<Value>, protocol: u32) -> Value {
         match result {
             Ok(v) => json!({"id":id,"result":v}),
@@ -515,9 +517,9 @@ impl Sender {
                     .downcast_ref::<RequestError>()
                     .map_or(ErrorCode::Failed, |error| error.code)
                     .as_str();
-                json!({"id":id,"error":{"code":code,"message":format!("{e:#}")}})
+                json!({"id":id,"error":{"code":code,"message":crate::agent::user_failure_text(&e)}})
             }
-            Err(e) => json!({"id":id,"error":{"message":format!("{e:#}")}}),
+            Err(e) => json!({"id":id,"error":{"message":crate::agent::user_failure_text(&e)}}),
         }
     }
     fn protocol_error(&self, message: &str, parse: bool) {
@@ -736,8 +738,9 @@ impl Ui for RpcUi {
     fn efficiency(&mut self, report: &Value) {
         self.out.emit(json!({"event":"efficiency","report":report}));
     }
-    fn check_passed(&mut self) {
-        self.out.emit(json!({"event":"check_passed"}));
+    fn check_passed_with_delivery(&mut self, open_count: &dyn Fn() -> usize) {
+        self.out
+            .emit(json!({"event":"check_passed","open_declared_deliverables":open_count()}));
     }
     fn tool_timing(&mut self, call_id: &str, name: &str, seconds: f64) {
         self.out
@@ -1063,6 +1066,7 @@ fn schema_document() -> Result<Value> {
 struct Admin {
     layout: Arc<std::sync::RwLock<Layout>>,
     config: Arc<std::sync::RwLock<Config>>,
+    scan: Arc<models::ModelScan>,
     /// Command-line settings, kept when a method reads the saved configuration again.
     overlay: toml::Table,
 }
@@ -1162,25 +1166,44 @@ impl Admin {
                         coded(ErrorCode::InvalidParams, "refresh must be a boolean")
                     })?,
                 };
-                let list_with = |cfg: &Config| {
-                    if let Some(purpose) = purpose {
-                        models::list_for(cfg, &layout.user_dir, provider, purpose)
-                    } else if model.provider.is_empty() {
-                        models::list(cfg, &cfg.selection(), &layout.user_dir, provider)
-                    } else {
-                        models::list(cfg, &model, &layout.user_dir, provider)
-                    }
-                };
-                if refresh {
-                    let cloned = config.clone();
-                    drop(config);
-                    let checked = models::refresh_and_check(&layout, &cloned);
-                    let models = list_with(&cloned);
-                    Ok(json!({"models": models, "checked": checked}))
+                // Reserve the scan under the config lock, but perform provider I/O outside it.
+                let cfg = config.clone();
+                let ticket = refresh.then(|| self.scan.begin());
+                let previous = self.scan.snapshot();
+                drop(config);
+                let (checked, discovered) = if let Some(ticket) = ticket {
+                    let (checked, rows) = models::refresh_and_check(&layout, &cfg, purpose);
+                    (Some(checked), Some(self.scan.publish(ticket, rows)?))
                 } else {
-                    let models = list_with(&config);
-                    Ok(json!({"models": models}))
+                    (None, previous)
+                };
+                let models = if let Some(purpose) = purpose {
+                    models::role_list(
+                        &cfg,
+                        &layout.user_dir,
+                        provider,
+                        purpose,
+                        discovered.as_deref(),
+                    )
+                } else {
+                    let current = if model.provider.is_empty() {
+                        cfg.selection()
+                    } else {
+                        model
+                    };
+                    models::chat_list(
+                        &cfg,
+                        &current,
+                        &layout.user_dir,
+                        provider,
+                        discovered.as_deref(),
+                    )
+                };
+                let mut reply = json!({"models": models});
+                if let Some(checked) = checked {
+                    reply["checked"] = checked;
                 }
+                Ok(reply)
             }
             "image_settings" => {
                 drop(config);
@@ -1455,6 +1478,7 @@ fn run_control(
     let admin = Arc::new(Admin {
         layout: admin_layout.clone(),
         config: admin_config.clone(),
+        scan: Default::default(),
         overlay: overlay.clone(),
     });
     let read_jobs = read_jobs::ReadJobs::new();
@@ -1485,6 +1509,7 @@ fn run_control(
         worker_live,
         queue,
         admin_config,
+        scan: admin.scan.clone(),
         admin_layout,
         worker_fs,
         sides: sides.clone(),
@@ -1915,6 +1940,12 @@ fn run_control(
                         auth::ensure_v2(&out)?;
                         auth::cancel_login(&auth_state, &request["params"])
                     })();
+                    out.result(&id, result);
+                }
+                "remove_api_key" => {
+                    let result = auth::ensure_v2(&out).and_then(|()| {
+                        auth::remove_api_key(&auth_state, &auth_dir, &request["params"])
+                    });
                     out.result(&id, result);
                 }
                 "logout" => {

@@ -2284,6 +2284,25 @@
         },
         {
           "type": "object",
+          "description": "Remove only the local saved credential for a catalog API-key provider, without signing out or revoking the key at its issuer.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "remove_api_key"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "pattern": "^api-key:.+"},
+                "confirm": {"const": true}
+              },
+              "additionalProperties": false,
+              "required": ["provider", "confirm"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "properties": {
             "id": {
               "$ref": "#/$defs/id"
@@ -4106,6 +4125,7 @@
           "description": "A recognized main-agent check just ran and received a passing verdict. Not a cached pass or a claim that the task is complete.",
           "properties": {
             "event": {"const": "check_passed"},
+            "open_declared_deliverables": {"type": "integer", "minimum": 0, "description": "Outstanding deliverables recorded in working state at the pass. Zero is not independent evidence that every requested deliverable is complete."},
             "seq": {"type": "integer", "minimum": 1},
             "session_id": {"type": "string"},
             "request_id": {"type": ["string", "integer", "null"]}

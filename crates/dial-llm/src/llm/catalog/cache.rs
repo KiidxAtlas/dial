@@ -153,8 +153,14 @@ pub(super) fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
 /// absent. Persisted verified image-capability observations are applied before returning.
 pub fn saved_listing_models(user_dir: &Path) -> Vec<ModelEntry> {
     let mut models: Vec<ModelEntry> = cached(user_dir).values().flatten().cloned().collect();
-    models.extend(super::subscription::saved_antigravity_models(user_dir));
-    models.extend(crate::llm::chatgpt::saved_active_models(user_dir));
+    models.extend(saved_subscription_models(user_dir));
     super::image_capabilities::apply_cached(user_dir, &mut models);
     models
+}
+
+/// Only subscription catalogs bound to the currently active account and project.
+pub fn saved_subscription_models(user_dir: &Path) -> Vec<ModelEntry> {
+    let mut rows = super::subscription::saved_antigravity_models(user_dir);
+    rows.extend(crate::llm::chatgpt::saved_active_models(user_dir));
+    rows
 }

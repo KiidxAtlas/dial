@@ -355,13 +355,14 @@ deliverables, live jobs, stale or failed required evidence and unverified edits 
 as completed or bypassed with `outcome=answered`. A refused candidate is kept beside its observed
 unmet prerequisite and the turn ends `Incomplete`. Optional follow-ups remain separate, and explicit
 blockers and necessary questions retain their non-success outcomes after investigation.
-A plain `completed` reply that itself admits, in first-person prose, that the requested
-deliverable was not produced or the attempt was abandoned ("I'm stopping here without a working
-`out.html`", "I have not yet built the required circuit") is not accepted on any route. It uses the
-shared completion nudge to continue the work; if the next reply still admits it, the turn ends
-`Incomplete` instead of `completed`. Fenced code, quotes, list items, explicit `Blocked:` reports,
-user handoffs and diagnosis-only requests ("explain why the build fails") are exempt. This is
-phrase recognition: it catches explicit admissions, not silently wrong work, and grants nothing.
+Dial does not infer a missing deliverable from a sentence in the report. Use a recorded step or
+required deliverable to track outstanding work, `Incomplete:` to report an unfinished attempt, or
+`finish(outcome=blocked)` to name a missing prerequisite. Quoted examples and optional follow-ups
+are not evidence that the requested work failed.
+
+For `finish(outcome=answered)`, `summary` is the reply shown to the user. Give the finding itself,
+not just the fact that you investigated. For a version comparison, lead with what changed; use
+tag or changelog status to qualify the findings. This is answer guidance, not a wording check.
 
 A question for the user is a typed pause when `finish` is offered: `finish(outcome=needs_input)` with
 the question in `reason` and up to 8 `options`. One classifier (`awaiting_input`) reads the plain final
@@ -378,6 +379,12 @@ Open execution steps refuse `completed` and `answered` on every route. A final r
 todos. Use `todo done` for finished work, or record a real blocker with `todo block` and report it
 with `finish(outcome=blocked)`. A blocked step remains outstanding. Optional follow-ups stay open
 without preventing delivery and are listed in the outstanding-work notice.
+
+With verification enabled, an unattended turn that recorded a workspace or environment effect
+needs current evidence before either `completed` or `answered`. Use a configured foreground
+check, `bash` with `check:true`, `verify`, or a passing Eval assertion bound to the current file
+contents. A command that prints `assert` or mentions a test runner is not a check receipt. Pure
+lookups owe no post-edit check; diagnostic wording does not waive the gate after an effect.
 
 Some check failures say nothing about this turn's code. They are disclosed with the accepted answer
 ("Accepted with disclosed gaps") and in `completion_evidence.disclosed_gaps` instead of ending the
@@ -400,29 +407,25 @@ nudge, the report keeps the nudge's observed check output. The first run of a ch
 the instruction's first edit, shell effect or extension effect becomes that check's baseline, also
 when `automatic_checks` is off.
 
-On lean local routes, a fresh workspace work request with no observed tool attempt gets one
-instruction-scoped investigation nudge before a question or completion is accepted. The request is
-classified by keywords, so the nudge is advisory: if the model answers again without a tool, the
-answer is accepted rather than ending `Incomplete`, unless that reply itself announces further
-action or unfinished work ("I will run the tests next"), which is not an answer. Hosted and full-tier local routes skip the
-nudge. Self-contained general questions need no tool, and peer and monitor callbacks carry an
-existing task rather than creating a fresh investigation obligation. Missing work and post-edit
-evidence share this one nudge allowance; inner-loop retries cannot renew it, and repeating the
-candidate never grants completion. Phrase recognition can choose recovery wording and keep a
-promise of further action from counting as an answer, but never grants acceptance. Controller observations are a prerequisite, not independent proof that
-arbitrary model claims are correct.
+On lean local routes, a fresh workspace work request with no observed tool attempt gets at most
+one investigation reminder. For a direct request such as “Diagnose the failure in this project,”
+repeating a progress update or calling `finish` without investigating ends `Incomplete`; it does
+not deliver a diagnosis. An explicit blocker can stop immediately. For ambiguous requests the
+reminder stays advisory, so a self-contained explanation need not manufacture a tool call.
+Hosted and full-tier local routes skip this reminder. Peer and monitor callbacks carry an existing
+task rather than creating a new obligation. Investigation, missing work and post-edit evidence share
+one reminder per instruction. An observed attempt is not proof that the resulting finding is correct.
 
 #### Completion and loop gates
 
 | Gate | Trigger | Extra model rounds | Routes |
 |---|---|---|---|
 | Completion nudge | Open deliverables, unverified edits, failed checks or other completion blockers on a `completed` or `answered` candidate | 1 per instruction (shared by every reason below), then `Incomplete` | All |
-| Admitted unfinished work | A plain `completed` reply admits the deliverable was not produced or the attempt was abandoned | Shares the completion nudge, then `Incomplete` | All |
 | Hard completion blocker | A blocker with no open steps or deliverables to work on (for example a failure introduced this turn after the nudge) | 0, ends `Incomplete` | All |
 | Disclosed gaps | Environment, permission, timeout, unchanged pre-existing or asked-to-diagnose failures | 0, accepted with a notice | All |
 | Open execution steps | `kind=step` todos still open | Shares the completion nudge | All: `completed` and `answered` refuse; accepted text never closes steps |
 | Typed pause for a question | A plain reply's last paragraph asks the user to choose or confirm while `finish` is offered | One nudge toward `finish(outcome=needs_input)`, then `needs_input` | All |
-| Investigation nudge | Keyword-classified work request with no observed tool call | Shares the completion nudge; ends `Incomplete` only if the next reply still announces unfinished work | Lean local only |
+| Investigation nudge | Fresh workspace work request with no observed tool attempt | Shares the completion nudge; a direct workspace investigation with no subsequent observation ends `Incomplete` | Lean local only |
 | Capability-search reminder | The answer says, in the first person, that a capability is unavailable, with loadable tools and no search this instruction | 1 per instruction | All |
 | Unverified-edit check run | Current edits with no passing applicable check (`automatic_checks` off) | 0, the controller runs the checks itself | All |
 | Research advisory note | 12 observation rounds without progress where the checkpoint is forced; 60 elsewhere (one threshold for the parent and workers) | 0, a request-tail note | All |
@@ -531,6 +534,9 @@ work should answer from the established evidence; further retrieval should addre
 remaining question or contradiction rather than restart a broad survey. These are model claims
 and guidance, not verification or a semantic proof that a lookup is necessary. There is no total
 research cap and no requirement to edit files or manufacture todos.
+If a foreground checkpoint rejects a reply, its correction goes to the retry. Once a valid
+synthesis arrives, the next ordinary request gets the follow-through, not another demand for
+checkpoint JSON. Unrelated pending notices keep their usual delivery rules.
 
 Focused full and lean prompts also connect discovery to action: once a likely target is supported,
 state the concrete defect or hypothesis and run the smallest check that distinguishes it before a
@@ -821,6 +827,7 @@ Recognized missing selected toolchains and offline Cargo dependency-cache failur
 environment-unavailable, never passing checks; compiler errors, assertions and missing
 application imports remain code failures. A command that executes zero tests supplies
 no passing behavioral evidence, including in the persisted behavior-check cache.
+If Cargo cannot compile the tests, recovery guidance recommends checking the affected package's test targets with the same features and target, then rerunning the original check. A successful compile is not a passing test. For rejected edits, the agent is guided to reuse the diagnostic's current header and numbered lines rather than reread them.
 Round settlement retains verification statuses and bounded receipt history.
 New-turn admission clears checkpoint association and current checks before validation or prompt
 hooks can fail. A rejected prompt therefore cannot inherit the preceding turn's changes, checks or
@@ -1283,6 +1290,8 @@ multiple calls. The small local tier's one-call contract, and any later one-call
 recovery, permit a standalone todo update without contradictory advice to pair it with real work.
 This does not force a plan or change which tools are eligible.
 
+On multi-call routes, Dial can send several `eval` calls in one model response. Each has its own approval and result. Use foreground cells for ordered work in a shared language namespace; wait for a result before composing a cell whose source depends on it.
+
 Plain final replies and `finish` use the shared state gate and final configured verification/repair
 pipeline. Missing work and post-edit evidence get at most one instruction-scoped corrective nudge;
 repeated rejection remains incomplete with its candidate and diagnostic. Empty/malformed replies
@@ -1343,14 +1352,14 @@ storage fails instead of stopping an otherwise healthy process. Cleanup drains o
 Dial's shared agent loop applies these controls to cloud and local models without changing output
 limits, reasoning budgets, approvals or verification requirements:
 
-- Ordinary hosted and local routes default to a stable core under 12 KiB of serialized schemas.
-  Core priority is `tool_search`, `tool_load`, `finish`, `read`, `edit`, `write`, `bash`, `grep`,
-  `glob`, `todo`, `verify`, `eval` (when containment and a cell runtime are available);
-  eligibility, the byte ceiling and `initial_tool_limit` can narrow it.
-  Lean local routes retain their eight-tool count limit. MCP, memory and specialist tools load
-  only through explicit `tool_load`; ordinary searches, inferred task routing, argument recovery
-  and missing-capability hints do not change the default offer. Search/listing still reports
-  readiness and the exact loading action without executing tools. Explicit pins survive resume.
+- Ordinary hosted and local routes default to a stable core, with separate serialized-schema
+  budgets (27 KiB hosted, 12 KiB local). `tool_search`, `finish`, `read`, `edit`, `write` and
+  `bash` have first priority; eligibility, the byte ceiling and `initial_tool_limit` can narrow
+  it. Lean local routes retain their eight-tool count limit. `tool_search` loads eligible
+  specialists on explicit request; listing alone does not load a schema. Explicit pins survive
+  resume. If pre-dispatch context accounting leaves too little room, Dial can drop optional
+  schemas rather than rebuilding the oversized prefix on the wire. Eligible explicit loads
+  and active mode controls remain. If required tools still do not fit, dispatch is not guaranteed.
   The cached system band uses generic schema authority rather than enumerating offered or
   loadable tools. Built-in loading preserves that policy band; explicit MCP loads may add bounded
   server instructions. Mode changes,
@@ -2010,8 +2019,10 @@ requires real inactivity without pending user/tool/child/background work, and do
 completed tasks. Local compute follows foreground lease ownership rather than duplicating a model.
 Experimental context management exposes branch-owned `context_notes` and explicitly requested
 `new_context`; notes are untrusted data, and a reset is acknowledged only after paired tool results,
-protected-state budget validation and durable journal commit. Both tools must be available in the
-active model/tool projection; disabling them does not silently substitute a summary or reset.
+protected-state budget validation and durable journal commit. Rollover needs both notebook tools
+and raw-history `session_search`. A stable compact offer reserves room for eligible recovery tools
+before adding optional schemas. Restrictions still apply; disabling a required tool does not
+silently substitute a summary or reset.
 Reset outcomes identify `kind = "new_context"` with no compaction method and genuine archive
 evidence. Child notebooks and archives are owned private task sessions, never the parent's session.
 

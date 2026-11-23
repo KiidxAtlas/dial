@@ -1,8 +1,7 @@
 //! Unified prose-signal classifiers for plain assistant replies.
 //!
-//! All reply-text heuristics (explicit outcome prefixes, user clarification questions, capability
-//! denials, unexpected-stop announcements, and unfinished-work admissions) share one fenced-code
-//! and typography normalization pass so they cannot disagree on quotes, apostrophes or code fences.
+//! Plain reports can declare a terminal status or ask a question. Closing-line hints serve
+//! bounded recovery; they do not establish a delivery obligation or a verification receipt.
 
 use crate::agent::verify::completion::TurnOutcome;
 
@@ -13,8 +12,6 @@ pub(in crate::agent) struct ReplySignals {
     pub awaiting_input: bool,
     pub announces_unexpected_stop: bool,
     pub reports_unfinished_work: bool,
-    pub admits_unfinished_delivery: bool,
-    pub denies_capability: bool,
 }
 
 impl ReplySignals {
@@ -24,19 +21,12 @@ impl ReplySignals {
             awaiting_input: awaiting_input(text),
             announces_unexpected_stop: announces_unexpected_stop(text),
             reports_unfinished_work: reports_unfinished_work(text),
-            admits_unfinished_delivery: admits_unfinished_delivery(text),
-            denies_capability: denies_capability(text),
         }
     }
 
     /// True when the reply's closing line announces an immediate next action or unfinished work.
     pub(in crate::agent) fn unfinished_closing(&self) -> bool {
         self.announces_unexpected_stop || self.reports_unfinished_work
-    }
-
-    /// True when the reply admits the requested deliverable was not produced or finished.
-    pub(in crate::agent) fn admitted_unfinished(&self) -> bool {
-        self.admits_unfinished_delivery || self.reports_unfinished_work
     }
 }
 
@@ -99,13 +89,7 @@ pub(in crate::agent) fn awaiting_input(text: &str) -> bool {
     if has_unclosed_fence(text) {
         return false;
     }
-    let last = normalize_prose(
-        text.trim()
-            .rsplit("\n\n")
-            .next()
-            .unwrap_or("")
-            .trim(),
-    );
+    let last = normalize_prose(text.trim().rsplit("\n\n").next().unwrap_or("").trim());
     if !last.ends_with('?') || last.contains("```") {
         return false;
     }
@@ -357,78 +341,6 @@ pub(crate) fn reports_unfinished_work(text: &str) -> bool {
             .iter()
             .any(|word| rest.starts_with(word))
         })
-}
-
-/// A first-person admission, anywhere in the reply's prose, that the requested deliverable was
-/// not produced or the attempt was abandoned ("I'm stopping here without a working out.html",
-/// "I have not yet built the required circuit"). Unlike [`reports_unfinished_work`], which reads
-/// only the closing line, these admissions often lead a long status report. Fenced code, quotes
-/// and list items are skipped; explicit blockers and user handoffs are not admissions.
-pub(crate) fn admits_unfinished_delivery(text: &str) -> bool {
-    const ADMISSIONS: [&str; 37] = [
-        "i'm stopping here",
-        "i am stopping here",
-        "i'm stopping the probing",
-        "i'll stop here",
-        "i will stop here",
-        "i'll stop probing",
-        "i will stop probing",
-        "i've stopped at this point",
-        "i have stopped at this point",
-        "i've stopped here",
-        "i have stopped here",
-        "so i'll stop",
-        "so i will stop",
-        "i'll stop rather than",
-        "i will stop rather than",
-        "i have not yet built",
-        "i haven't yet built",
-        "i have not built the",
-        "i haven't built the",
-        "i have not yet implemented",
-        "i haven't yet implemented",
-        "i have not implemented the",
-        "i haven't implemented the",
-        "i have not yet solved",
-        "i haven't solved",
-        "i have not solved",
-        "i have not found a working",
-        "i haven't found a working",
-        "i have not found a payload",
-        "i haven't found a payload",
-        "i couldn't get it to work",
-        "i could not get it to work",
-        "i was not able to complete",
-        "i wasn't able to complete",
-        "i was unable to complete",
-        "i could not complete the",
-        "i couldn't complete the",
-    ];
-    let mut fenced = false;
-    text.lines().any(|line| {
-        let line = line.trim();
-        if line.starts_with("```") {
-            fenced = !fenced;
-            return false;
-        }
-        if fenced || line.starts_with(['>', '-', '*', '"', '“', '`']) {
-            return false;
-        }
-        let lower = normalize_prose(line);
-        if [
-            "blocked",
-            "if you",
-            "when you",
-            "you'll need",
-            "you will need",
-        ]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-        {
-            return false;
-        }
-        ADMISSIONS.iter().any(|phrase| lower.contains(phrase))
-    })
 }
 
 #[cfg(test)]

@@ -26,6 +26,9 @@ assume every machine has the same catalog. See [extensibility](extensibility.md#
 Only names and brief descriptions enter the initial catalog. The agent loads a body through
 `skill` and requests bundled files separately. `/skill:<name>` requests an enabled skill in chat;
 `/skills` manages the inventory. There is no `/skills test` execution API.
+When `skill` is eligible but deferred, a matching skill hint points to `tool_search` with
+`names: ["skill"]`. Once loaded, the hint names `skill` directly. A tool restriction that
+prevents loading the skill suppresses that hint.
 
 ## Authoring contract
 

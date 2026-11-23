@@ -4304,7 +4304,7 @@ fn automatic_compaction_uses_the_selected_role_during_a_live_turn() {
 
 #[test]
 fn lm_studio_loaded_context_overrides_the_configured_window_and_drives_compaction() {
-    // LM Studio loaded this model with 16384 tokens although Dial is configured for 32768.
+    // The server's loaded window is smaller than Dial's automatic fallback.
     let server = serve_with(
         vec![
             Reply::Text("first"),
@@ -4338,7 +4338,7 @@ fn lm_studio_loaded_context_overrides_the_configured_window_and_drives_compactio
             ..Default::default()
         },
     );
-    assert_eq!(e.config.context_window, 32768);
+    assert_eq!(e.config.context_window, 131_072);
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
@@ -4373,7 +4373,7 @@ fn local_context_auto_follows_loaded_capacity_and_manual_caps_still_apply() {
         let mut e = env(&server.url, "auto");
         e.config.harness.tools = vec!["read".into()];
         e.config.local_context_window = mode;
-        // A stale catalog or unknown-model fallback must not pin Auto to 32768 after probing.
+        // A stale catalog window must not pin Auto to 32768 after probing.
         e.config.context_window = 32768;
         let mut backend = make_backend(&e.config).unwrap();
         let mut a = agent(&e, &mut backend, None);
@@ -4532,7 +4532,7 @@ fn servers_without_a_native_context_api_keep_the_configured_window() {
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     a.turn("hello", &mut Recorder::default()).unwrap();
-    assert_eq!(a.context_window(), 32768);
+    assert_eq!(a.context_window(), 131_072);
     // A 404 on the metadata probe must not have been mistaken for a chat reply.
     assert_eq!(server.requests.lock().len(), 1);
 }
@@ -5063,7 +5063,8 @@ fn child_rereads_after_an_edit_are_fresh_evidence() {
 }
 
 /// What the parent's second request carried back from its `task` call: the worker's answer,
-/// without the controller-acceptance suffix that rendered task results carry.
+/// without the controller-acceptance suffix that rendered task results carry or the trailing
+/// `[elapsed …]` wall-time note every timed tool result ends with.
 fn task_result(main: &Scripted) -> String {
     let requests = main.requests.lock();
     let messages = requests[1]["messages"].as_array().unwrap();
@@ -5073,7 +5074,15 @@ fn task_result(main: &Scripted) -> String {
         .find(|m| m["role"] == "tool")
         .and_then(|m| m["content"].as_str())
         .unwrap();
-    strip_controller_acceptance(content)
+    strip_controller_acceptance(strip_elapsed(content))
+}
+
+/// Remove the trailing `\n[elapsed …]` note the parent appends to timed tool results.
+fn strip_elapsed(content: &str) -> &str {
+    content
+        .rsplit_once("\n[elapsed ")
+        .filter(|(_, note)| note.ends_with(']') && !note.contains('\n'))
+        .map_or(content, |(body, _)| body)
 }
 
 /// Remove every `[Controller acceptance: {...}]` suffix (one per rendered job) and keep the rest.

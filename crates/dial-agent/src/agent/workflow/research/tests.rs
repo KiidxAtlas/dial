@@ -416,7 +416,9 @@ fn prose_wrapped_single_json_checkpoint_is_accepted_and_ambiguous_multi_object_i
     })
     .to_string();
     let mut wrapped = Reply {
-        text: format!("Here is the synthesis checkpoint:\n```json\n{json_body}\n```\nReady to continue."),
+        text: format!(
+            "Here is the synthesis checkpoint:\n```json\n{json_body}\n```\nReady to continue."
+        ),
         finish_reason: "stop".into(),
         ..Default::default()
     };

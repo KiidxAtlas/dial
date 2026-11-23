@@ -146,6 +146,7 @@ pub(super) fn with_runtime(
         compute: None,
         layout: &layout,
         config: &config,
+        scan: Default::default(),
         overlay: &toml::Table::new(),
         acp: true,
         rx,
@@ -460,6 +461,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
             let admin = Admin {
                 layout: published_layout.clone(),
                 config: published_config.clone(),
+                scan: Default::default(),
                 overlay: overlay.clone(),
             };
             let (requests, rx) = mpsc::channel();
@@ -504,6 +506,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
                 queue: Default::default(),
                 worker_fs: Default::default(),
                 admin_config: published_config.clone(),
+                scan: admin.scan.clone(),
                 admin_layout: published_layout.clone(),
                 sides: runtime.sides.clone(),
             };
@@ -787,6 +790,79 @@ fn code(error: &anyhow::Error) -> ErrorCode {
         .downcast_ref::<RequestError>()
         .unwrap_or_else(|| panic!("uncoded error: {error:#}"))
         .code
+}
+
+#[test]
+fn picker_round_trip_uses_the_discovered_route_and_wire_id_without_a_disk_listing() {
+    use crate::llm::catalog::{ModelEntry, ModelKind, ModelMetadata};
+    use crate::llm::model_config::ModelSelection;
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let provider = "fixture-endpoint";
+            let selection = ModelSelection {
+                base_url: Some("http://127.0.0.1:49152/v1".into()),
+                context_window: Some(65_536),
+                ..ModelSelection::new(provider, "owner/model:revision")
+            };
+            let entry = |id: &str, kind| ModelEntry {
+                selection: ModelSelection {
+                    model: id.into(),
+                    ..selection.clone()
+                },
+                label: "Display label, not wire ID".into(),
+                source: "fixture".into(),
+                available: true,
+                metadata: ModelMetadata {
+                    kind,
+                    ..Default::default()
+                },
+            };
+            runtime
+                .scan
+                .publish(
+                    runtime.scan.begin(),
+                    vec![
+                        entry(&selection.model, ModelKind::Chat),
+                        entry("vectors", ModelKind::Embedding),
+                        entry("paint", ModelKind::Image),
+                    ],
+                )
+                .unwrap();
+            let admin = Admin {
+                layout: Arc::new(std::sync::RwLock::new(runtime.layout.clone())),
+                config: Arc::new(std::sync::RwLock::new(runtime.config.clone())),
+                scan: runtime.scan.clone(),
+                overlay: toml::Table::new(),
+            };
+            for (purpose, expected) in [
+                ("embedding", "vectors"),
+                ("image", "paint"),
+                ("chat", selection.model.as_str()),
+            ] {
+                let reply = admin
+                    .handle(
+                        "list_models",
+                        &json!({"purpose":purpose,"provider":provider}),
+                        (None, runtime.config.selection()),
+                    )
+                    .unwrap();
+                let rows = reply["models"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["model_id"], expected);
+                let set = runtime.handle_request(&json!({"method":"set_model", "params": {"provider":rows[0]["provider"], "model_id": rows[0]["model_id"]}}));
+                if purpose == "chat" {
+                    assert_eq!(set.unwrap()["model"], selection.model);
+                    let cfg = runtime.agent.effective_config();
+                    assert_eq!(cfg.selection().base_url, selection.base_url);
+                    assert_eq!(cfg.context_window, 65_536);
+                } else {
+                    assert_eq!(code(&set.unwrap_err()), ErrorCode::NotFound);
+                }
+            }
+        },
+    );
 }
 
 #[test]
@@ -1284,6 +1360,7 @@ fn persistent_modes_rebuild_and_publish_effective_settings_without_resetting_ses
                 queue: Default::default(),
                 worker_fs: Default::default(),
                 admin_config: published_config.clone(),
+                scan: Default::default(),
                 admin_layout: Arc::new(std::sync::RwLock::new(runtime.layout.clone())),
                 sides: runtime.sides.clone(),
             };

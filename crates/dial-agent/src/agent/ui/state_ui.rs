@@ -425,6 +425,9 @@ impl Ui for StateUi<'_> {
     fn check_passed(&mut self) {
         self.inner.check_passed();
     }
+    fn check_passed_with_delivery(&mut self, open_count: &dyn Fn() -> usize) {
+        self.inner.check_passed_with_delivery(open_count);
+    }
     fn laya_activity(&mut self, status: &str, message: &str) {
         self.inner.laya_activity(status, message)
     }

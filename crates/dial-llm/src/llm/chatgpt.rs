@@ -1170,7 +1170,7 @@ pub fn discover(
             .find_map(|url| codex_request(&id, &token, url, 5).ok())
             .ok_or_else(|| anyhow::anyhow!("OpenAI Codex model discovery failed"))?;
         let value = limited_json(&mut response, MAX_CATALOG_JSON, "model catalog")?;
-        let catalog = build_catalog(&value, supplemental.as_ref())?;
+        let catalog = listed_catalog(&value, supplemental.as_ref(), &version)?;
         save_catalog(dir, &id, &catalog)?;
         let models = catalog.models;
         let info = accounts(dir)?
@@ -1288,6 +1288,16 @@ fn codex_model_metadata() -> Option<Value> {
     }
     let bytes = crate::llm::read_within(file, MAX_CATALOG_JSON)?;
     serde_json::from_slice(&bytes).ok()
+}
+/// The account's catalog from a listing answered for client version `sent`. A local Codex cache
+/// adds models only when a newer client wrote it, since the backend may withhold those from this
+/// request. From the same or an older client, the only models it can add are ones the account
+/// no longer has; offering them leaves the user selecting a model every request refuses.
+fn listed_catalog(value: &Value, codex: Option<&Value>, sent: &str) -> Result<ModelCatalog> {
+    build_catalog(
+        value,
+        codex.filter(|codex| client_version::codex_is_newer(Some(codex), sent)),
+    )
 }
 fn build_catalog(value: &Value, supplemental: Option<&Value>) -> Result<ModelCatalog> {
     use super::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};

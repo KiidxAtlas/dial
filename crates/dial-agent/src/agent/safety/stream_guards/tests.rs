@@ -132,40 +132,6 @@ fn completed_answers_and_handoffs_are_not_unfinished_work() {
 }
 
 #[test]
-fn admissions_anywhere_in_the_prose_report_unfinished_delivery() {
-    for text in [
-        // Observed Harbor replies that Dial accepted as completed.
-        "The SVG animation payload also failed, so I'm stopping here without a working `out.html`. I have not found a payload that survives the filter.\n\n**Current state**\n- `/app/out.html` holds the last attempt.",
-        "That tiny test isn't informative enough. The honest state: I have not yet built the required circuit. Let me be concrete about the feasibility.",
-        "The JPGs are compressed image data with no embedded text, so I'll stop rather than guess.\n\nWhat I've established:\n- Clear invoices: 3 PDFs.",
-        "I couldn’t get it to work with the installed toolchain.",
-        "I was unable to complete the migration in the time available.",
-        // Observed haiku81fix and haiku81 give-ups that the first phrase list missed.
-        "The sampler returns `NaN` at step 2.  I've stopped at this point. Current state:",
-        "I'll stop probing and report where things stand, since the attack is not finished.",
-        "I'm stopping the probing here. I have not fixed the bug.",
-    ] {
-        assert!(admits_unfinished_delivery(text), "{text}");
-    }
-}
-
-#[test]
-fn finished_reports_blockers_and_quotes_are_not_unfinished_delivery() {
-    for text in [
-        "Implemented the parser; all 12 tests pass.",
-        "I haven't found a bug in the retry path after reviewing it.",
-        "Blocked: I'm stopping here because the API token is missing.",
-        "Done. If you want the optional cache, I'll stop the server first.",
-        "> I'm stopping here without a working build.",
-        "- I have not yet built the docs (optional follow-up).",
-        "```\necho \"I'm stopping here\"\n```\nThe script prints a farewell and exits 0.",
-        "Fixed the race. You will need to restart the service; I couldn't get it to work without a restart.",
-    ] {
-        assert!(!admits_unfinished_delivery(text), "{text}");
-    }
-}
-
-#[test]
 fn gemini_reminder_shows_header_count() {
     assert!(render_gemini_tool_call_reminder(36).contains("36"));
     assert!(!render_gemini_tool_call_reminder(36).contains("{{count}}"));

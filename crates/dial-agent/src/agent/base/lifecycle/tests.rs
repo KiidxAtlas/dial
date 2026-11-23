@@ -40,17 +40,42 @@ fn capability_prose_only_asks_to_load_web_tools_that_are_not_offered() {
 }
 
 #[test]
-fn skill_loader_line_names_only_offered_tools() {
-    let catalog = "## Skills\n- review: reviews diffs\n";
-    let direct = super::with_skill_loader(catalog, &names(&["skill", "tool_search"]));
-    assert!(direct.contains("with the `skill` tool"), "{direct}");
-    // `skill` is not offered yet: the line says how to load it with the offered loader.
-    let deferred = super::with_skill_loader(catalog, &names(&["tool_search"]));
-    assert!(
-        deferred.contains("`tool_search` names:[\"skill\"]")
-            && !deferred.contains("with the `skill` tool"),
-        "{deferred}"
-    );
-    assert_eq!(super::with_skill_loader(catalog, &[]), catalog);
-    assert_eq!(super::with_skill_loader("", &names(&["skill"])), "");
+fn skill_catalog_and_matched_hint_follow_the_callable_route() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_default_agent;
+
+    with_default_agent("[endpoint]\nbase_url='https://example.com/v1'", |agent| {
+        let name = "quasar-review";
+        let layout = agent.layout.as_ref().unwrap();
+        let directory = layout.skills_dirs()[0].join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Review quasar calibration\n---\n# Procedure\n"
+            ),
+        )
+        .unwrap();
+        agent.parts.skills = super::skills::catalog_block(&super::skills::discover(layout));
+        agent.rebuild_system();
+        let prefix = agent.system_messages();
+        let deferred = "`tool_search` names:[\"skill\"]";
+        assert!(agent.system.contains(deferred));
+        assert!(agent.skill_hint(name).unwrap().contains(deferred));
+        agent.select_tools(&["skill".to_owned()], &[]).unwrap();
+        assert!(
+            agent
+                .skill_hint(name)
+                .unwrap()
+                .contains("with the `skill` tool")
+        );
+        assert_eq!(agent.system_messages(), prefix);
+
+        // `skill_manage` exposes the same public controller but cannot load a skill's body.
+        for allowed in [vec!["tool_search"], vec!["skill_manage", "tool_search"]] {
+            agent.modes.launch.tools = Some(allowed.into_iter().map(str::to_owned).collect());
+            agent.rebuild_system();
+            assert!(agent.skill_hint(name).is_none());
+            assert!(!agent.system.contains(name));
+        }
+    });
 }

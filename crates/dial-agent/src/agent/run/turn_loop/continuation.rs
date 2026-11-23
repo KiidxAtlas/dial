@@ -117,10 +117,7 @@ impl Agent<'_> {
         };
         loop {
             run.record_candidate_summary();
-            let report_interrupted = run
-                .result
-                .as_ref()
-                .is_ok_and(|report| report.interrupted);
+            let report_interrupted = run.result.as_ref().is_ok_and(|report| report.interrupted);
             run.downgrade_if_interrupted(
                 report_interrupted || self.interrupt.load(Ordering::SeqCst),
                 "Interrupted before finalization; completion was not accepted.",

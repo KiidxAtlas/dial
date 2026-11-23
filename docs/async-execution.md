@@ -66,11 +66,27 @@ operations run together, bounded by `task.max_concurrency` (at most 32). Multi-p
 Directory reads cover membership and descendants, including absent matches; they conflict with
 any writer in that scope. Read/read overlap is safe. A conflict closes the prefix; calls never
 jump over a conflicting or unknown operation. Git mutations remain exclusive.
+Batching does not bypass pre-edit checks: `edit` or `write` with a `verify` option is refused
+before changing that file if verification is disabled. Planning a wave does not consume a
+once-per-turn repro-first gate; the call that would actually edit receives the refusal.
 
 Read-only shell commands (the parallel-read form: no `session`, `pty` or `background`),
 `dep_source`, and `git status`/`diff` without `path` read every workspace root, so they join
-waves with reads, external reads and bookkeeping but never run beside a write. `git
-status`/`diff`/`blame` with `path` read only that path. `git log`/`reflog`/`show`/`branches`
+waves with reads, external reads and bookkeeping but never run beside a write. One plain
+`cat`, `wc`, `head`, `tail`, `stat`, `ls` or `grep` with listed options and literal operands, or a
+`find` whose expression only filters and prints, reads just those operands (directories include
+their descendants); a `grep` pattern is not an operand. Bundled short options, `grep -f`/`-R`/`-C`,
+`ls -L`, `find -L`/`-newer` and a missing operand keep the every-root read.
+
+Other one-shot shell commands that the checkpoint effect tracker proves write nothing also read
+every root and join waves of reads: `;`/`&&`/newline batches of pipelines built from those
+inspections, line filters (`sort`, `uniq`, `cut`, ...), `rg` without `--pre`, `df`, `du`,
+`diff`, `cmp`, `jq` and checksum commands, and `git status`/`diff`/`grep`/`log`/`show` and
+similar history reads without leading `git` options, `--output`, `--ext-diff` or `-O`. This only
+schedules them; such a command still needs approval like any shell command, and each wave member
+is authorized in model order before any starts. Redirection, expansion, `cd`, builds, tests and
+package scripts stay barriers. `git status`/`diff`/`blame` tools with `path` read only that path.
+`git log`/`reflog`/`show`/`branches`
 (object-database reads) and the `pr_view`/`pr_checks`/`issue_view` actions, `github` read ops and
 `glab_mr` read ops touch no source file and are effect-free external reads (below). In a jj
 repository every jj-backed read snapshots the working copy and reads every root.
@@ -104,8 +120,8 @@ still gets its own result, and the provider sees those results in request order.
 
 File handles that cannot be expanded, ambiguous selectors, aliases, symlinks, hardlinks, version-control
 and Dial metadata directories (`.git`, `.hg`, `.svn`, `.jj`, `.dial`), host-shaped leading
-segments (`user@host/...`), missing parent directories, shell commands other than read-only
-ones, hooks and unknown effects
+segments (`user@host/...`), missing parent directories, shell commands not proven to write
+nothing, hooks and unknown effects
 remain barriers. Ordinary dotfile directories such as `.github/` and `.cargo/`, and scoped package
 directories such as `node_modules/@scope/`, are schedulable paths.
 Local line, symbol, outline, raw and byte selectors conflict with writes to the underlying file.
@@ -166,7 +182,9 @@ the whole batch is refused as before.
 
 The existing efficiency report includes `scheduling` and separately aggregated `worker_scheduling`:
 group counts, call counts, size histograms, wall/work microseconds, prefix barrier reasons, and
-early-read starts/reuse/discards. Work time is inclusive tool time and overlaps other measurements;
+early-read starts/reuse/discards. `barrier_tools` counts the barriers a specific call closed, keyed
+`reason:tool` (for example `unknown_resources:bash`); a prefix ended by the reply or the
+concurrency limit names no tool. Work time is inclusive tool time and overlaps other measurements;
 its difference from group elapsed time is not a measured end-to-end speedup. Worker reports carry
 their controller's metrics, including provider fallback attempts, and repeated delivery is counted
 once.
@@ -174,11 +192,14 @@ once.
 Compare recorded call ordering without executing any recorded effects:
 
 ```sh
-cargo run --locked --example replay_scheduling -- /path/to/workspace /path/to/session.jsonl
+cargo run --locked --example replay_scheduling -- /path/to/workspace /path/to/session.jsonl...
 ```
 
 The comparison uses the same prefix planner and current workspace metadata with default config.
-It compares read batching alone against resource scheduling and reports group sizes and barriers.
+Each session's recorded `@fN` file handles are restored and expanded as the live wave does;
+`sessions_without_file_handles` counts sessions that had none, whose handles then close the
+prefix as `file_reference`. It compares read batching alone against resource scheduling and
+reports group sizes, barriers and `resource_barrier_tools`.
 It cannot reconstruct historical files, approvals, dynamic preflights or provider streaming timing;
 these are structural opportunities, not predicted wall-time savings. Session paths and call
 contents are not printed. For actual local timing, the opt-in `scheduling_measurements` integration
@@ -199,7 +220,12 @@ reliable end-to-end write speedup. The grouped runs observed two native groups o
 A read-only analysis of five recorded project sessions (213 call-bearing responses, 301 calls)
 found 235 groups with read batching alone versus 231 with resource scheduling, using current
 workspace metadata. Most barriers were unknown resources. The traces were not executed and
-these counts do not reconstruct historical timing. Reproduce the local timings with:
+these counts do not reconstruct historical timing. A later replay of fourteen sessions (136 calls)
+found 102 groups with resource scheduling versus 108 with read batching alone. Of 102 barriers, 56
+were unknown resources (`bash` 25, `task` 17, `skill` 5, others at most 2 each), 46 were the
+reply's end, and none was a resource conflict. Live reports for seven turns agreed (5 unknown
+resources, 2 reply ends). Letting a wave look past a conflict, and a per-hook opt-in to join waves,
+therefore stay deferred: neither barrier occurred. Reproduce the local timings with:
 
 ```sh
 python3 scripts/embedded-host.py -- cargo test --locked --test integration scheduling_measurements -- --ignored --nocapture --test-threads=1

@@ -608,6 +608,11 @@ fn failed_events_expose_only_safe_diagnostic_identifiers() {
             .to_string();
         assert!(err.contains(expected), "{err}");
         assert!(!err.contains("private prompt"), "{err}");
+        assert_eq!(
+            err.contains("choose another model"),
+            expected == "code: model_not_found",
+            "{err}"
+        );
     }
 }
 

@@ -30,8 +30,15 @@ fn hermetic_policy_keeps_batch_mode_and_disables_lightweight() {
         adapter: None,
         status: "active".into(),
     };
-    let mut agent =
-        Agent::hermetic(&config, test_backend(), &version, workspace.path(), None, None).unwrap();
+    let mut agent = Agent::hermetic(
+        &config,
+        test_backend(),
+        &version,
+        workspace.path(),
+        None,
+        None,
+    )
+    .unwrap();
     let mut ui = NullUi;
     let turn = agent
         .begin_turn(&mut backend, &[], 5, "test goal", &mut ui)

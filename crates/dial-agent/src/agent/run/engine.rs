@@ -568,7 +568,8 @@ impl Engine {
                 .filter(|_| status == crate::runtime::execution::ToolStatus::Error)
                 .cloned();
             let access_targets = inaccessible_read_targets(workspace, call, &output.text);
-            let access = (!access_targets.is_empty()).then(|| (call_identity(call), access_targets));
+            let access =
+                (!access_targets.is_empty()).then(|| (call_identity(call), access_targets));
             let shell_tree = crate::agent::verify::shared_runs::shell_tree(workspace, call);
             output.text.push_str("\nRetry barrier: this exact call is withheld until its arguments or inputs change.");
             let targets = recovery_checkpoint::declared_targets(workspace, call);

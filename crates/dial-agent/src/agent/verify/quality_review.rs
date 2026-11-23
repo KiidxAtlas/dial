@@ -80,13 +80,15 @@ impl Agent<'_> {
         self.session.set_control_state(control)?;
         ui.notice("Quality review is on: asking the agent to check its work before finishing.");
         let body = request(&paths);
-        Ok(crate::agent::verify::coach_intervention::CoachIntervention::advisory(
-            crate::agent::verify::coach_intervention::InterventionKind::QualityReview,
-            Priority::Review,
-            &body,
-            body.clone(),
+        Ok(
+            crate::agent::verify::coach_intervention::CoachIntervention::advisory(
+                crate::agent::verify::coach_intervention::InterventionKind::QualityReview,
+                Priority::Review,
+                &body,
+                body.clone(),
+            )
+            .map(crate::agent::verify::coach_intervention::CoachIntervention::into_message),
         )
-        .map(crate::agent::verify::coach_intervention::CoachIntervention::into_message))
     }
 }
 

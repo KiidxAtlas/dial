@@ -158,7 +158,6 @@ pub(in crate::agent) enum CheckReceiptSource {
 }
 
 impl CheckReceiptSource {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::agent) fn is_explicit_receipt(self) -> bool {
         !matches!(self, Self::HeuristicShellCommand)
     }
@@ -514,10 +513,22 @@ impl<'a> Agent<'a> {
                 self.workspace.artifacts(),
             )
         });
+        // Configured/focused receipts already considered the pipeline in shared classification.
+        // For undeclared shell commands only this caller has the original command text.
+        let verdict = if check.is_none() && verdict == verify::verification::CheckStatus::Passed {
+            verify::verification::CheckStatus::from_shell_success(command)
+        } else {
+            verdict
+        };
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
         if passed {
-            ui.check_passed();
+            ui.check_passed_with_delivery(&|| {
+                crate::agent::workflow::working_state::open_deliverables(
+                    &self.session.control_state()["working_state"],
+                )
+                .len()
+            });
         }
         // A previous run made before any edit, shell effect or extension effect of this
         // instruction describes the code the user handed over: keep it as the command's
@@ -1698,9 +1709,9 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
         let control = self.session.control_state();
         let working = &control["working_state"];
-        if let Some(blocker) =
-            crate::agent::workflow::task_ledger::TaskLedger::completion_blocker(&self.todo, &control)
-        {
+        if let Some(blocker) = crate::agent::workflow::task_ledger::TaskLedger::completion_blocker(
+            &self.todo, &control,
+        ) {
             return Err(blocker);
         }
         let coverage = verify::requirements::snapshot(
@@ -1975,25 +1986,20 @@ impl<'a> Agent<'a> {
         .then_some(reminder)
     }
 
-    /// Unattended runs only: nobody reviews the result after the run, so a `completed` turn whose
-    /// tools changed the workspace or environment (checkpointed edits, opaque shell commands or
-    /// possibly-modifying extension calls) needs one observed pass on the current state. Accepted
-    /// evidence: any recorded check, a passing `bash` check, a self-asserting `bash` command or a
-    /// current Eval receipt. Diagnosis-only requests may legitimately end on a failing state.
+    /// An unattended delivery after a recorded effect needs current verification evidence.
+    /// Read-only turns have no such obligation; request classification cannot waive one.
     pub(in crate::agent) fn unattended_verification_gap(&self) -> Option<&'static str> {
         if !self.modes.launch.unattended
             || !self.config.verification.enabled
             || self.hermetic
             || self.plan_mode
             || self.step_checks.effect_epoch() == 0
-            || self.diagnosis_requested()
         {
             return None;
         }
         let revision = self.step_checks.revision();
         let verified = self.step_checks.shell_check_passed == Some(revision)
-            || self.step_checks.asserting_shell_passed == Some(revision)
-            || self.step_checks.evidence.any_current_pass(revision)
+            || self.step_checks.evidence.current_focused_pass(revision)
             || self.step_checks.eval_checks.current_pass(&self.workspace);
         (!verified).then_some(UNATTENDED_UNVERIFIED)
     }
@@ -2262,96 +2268,102 @@ impl<'a> Agent<'a> {
     }
 }
 
-/// Completion reason for an unattended `completed` turn with effects and no current passing check.
-pub(in crate::agent) const UNATTENDED_UNVERIFIED: &str = "This unattended run changed files or the environment, but no check has passed on the current state, and nobody will review the result after the run. Before finishing, verify the deliverable against the task's stated requirements: run the task's own tests or the deliverable's intended consumer with `bash` check:true (or `verify`), assert the saved outputs in an Eval cell with dial.check, or use a command whose inline assertions fail on a wrong result. Fix what the check reveals. A task's grader and its test files may only appear after the run, so a missing or unrunnable provided test is not a blocker: write your own check from the stated requirements. A failed attempt or a hard problem is not a blocker either; try a different approach. Start the reply with `Blocked:` only for an external prerequisite you tried and cannot obtain (credentials, hardware, network access), and name it.";
+/// Shared by the completed and answered delivery paths.
+pub(in crate::agent) const UNATTENDED_UNVERIFIED: &str = "This unattended run recorded workspace or environment effects, but no declared check has passed on the current state. Verify the deliverable with a configured check, `verify`, `bash` with check:true, or a file-bound Eval assertion. Report a concrete blocker if verification cannot proceed.";
 
-/// A shell command that carries its own assertion (`assert x == y`, `assert.equal`, `assert_eq!`,
-/// R's `stopifnot`), so its zero exit is a verdict on the result it checks.
-pub(in crate::agent) fn asserts_inline(command: &str) -> bool {
-    command
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|word| matches!(word, "assert" | "assert_eq" | "stopifnot"))
-}
+/// Appended when an aggregate zero exit cannot establish that the checked pipeline passed.
+pub(in crate::agent) const MASKED_CHECK_NOTE: &str = "\n[Dial check] Not counted as a passing check: the shell's zero exit does not establish that every pipeline stage passed. Rerun without the pipe, or run `set -o pipefail;` followed directly by the foreground check pipeline.";
 
-/// Appended to a `check` command whose zero exit went through a pipe without `pipefail`.
-pub(in crate::agent) const MASKED_CHECK_NOTE: &str = "\n[Dial check] Not counted as a passing check: the exit status went through a pipe without `pipefail`, so a failure of the checked command is hidden (`cmd | tail` exits with tail's status). Rerun it with `set -o pipefail;` first, or without the pipe, so its exit code is a verdict.";
-
-/// A shell command whose zero exit can hide a failure: an unquoted pipe (`|` or `|&`, not `||`)
-/// outside quotes, comments and heredoc bodies, with no `pipefail`. `cmd | tail` exits with
-/// `tail`'s status, so `cmd`'s failure is invisible to the exit code.
+/// Only a literal, unconditional setup followed by the checked foreground pipeline makes an
+/// aggregate zero reliable here. Do not try to simulate shell option state across other commands.
 pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
-    if command.contains("pipefail") {
+    use ast_grep_language::{LanguageExt, SupportLang};
+
+    if !command.contains('|') {
         return false;
     }
-    let chars: Vec<char> = command.chars().collect();
-    let (mut single, mut double, mut escaped, mut comment) = (false, false, false, false);
-    let mut heredoc: Option<String> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\n' {
-            comment = false;
-            escaped = false;
-            if !single
-                && !double
-                && let Some(end) = heredoc.take()
-            {
-                // Skip the body through its delimiter line.
-                let mut j = i + 1;
-                loop {
-                    let start = j;
-                    while j < chars.len() && chars[j] != '\n' {
-                        j += 1;
-                    }
-                    let line: String = chars[start..j].iter().collect();
-                    if line.trim() == end || j >= chars.len() {
-                        break;
-                    }
-                    j += 1;
-                }
-                i = j;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if comment {
-        } else if escaped {
-            escaped = false;
-        } else if c == '\\' && !single {
-            escaped = true;
-        } else if c == '\'' && !double {
-            single = !single;
-        } else if c == '"' && !single {
-            double = !double;
-        } else if !single && !double {
-            if c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
-                comment = true;
-            } else if c == '|' {
-                if chars.get(i + 1) == Some(&'|') {
-                    i += 2;
-                    continue;
-                }
-                return true;
-            } else if c == '<' && chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') {
-                let rest: String = chars[i + 2..].iter().collect();
-                let word: String = rest
-                    .trim_start_matches('-')
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')' | '>'))
-                    .collect();
-                let word = word.trim_matches(|c| c == '\'' || c == '"');
-                if !word.is_empty() {
-                    heredoc = Some(word.to_owned());
-                }
-                i += 2;
-                continue;
-            }
-        }
-        i += 1;
+    let ast = SupportLang::Bash.ast_grep(command);
+    let root = ast.root();
+    if root.get_inner_node().has_error() {
+        return true;
     }
-    false
+    // A predicate comparing a substitution's output checks its value, not its exit.
+    let mut pipelines = root
+        .dfs()
+        .filter(|n| n.kind() == "pipeline")
+        .filter(|node| {
+            let predicate = node
+                .ancestors()
+                .find(|n| n.kind() == "command_substitution")
+                .and_then(|substitution| {
+                    substitution
+                        .ancestors()
+                        .find(|n| matches!(n.kind().as_ref(), "command" | "test_command"))
+                });
+            !predicate.is_some_and(|n| {
+                n.kind() == "test_command"
+                    || n.field("name").is_some_and(|name| name.text() == "test")
+            })
+        });
+    let Some(pipeline) = pipelines.next() else {
+        return false;
+    };
+    if pipelines.next().is_some() {
+        return true;
+    }
+
+    // Keep operators (including background `&`) when matching the two-statement program.
+    let statements: Vec<_> = root
+        .children()
+        .filter(|n| !matches!(n.kind().as_ref(), "comment" | ";"))
+        .collect();
+    let (setup, check) = match statements.as_slice() {
+        [setup, check] => (setup.clone(), check.clone()),
+        [statement] => {
+            // A trailing file redirect can wrap the whole `set ... && cmd | filter` list.
+            let list = statement
+                .field("body")
+                .filter(|_| statement.kind() == "redirected_statement")
+                .unwrap_or_else(|| statement.clone());
+            if list.kind() != "list" {
+                return true;
+            }
+            let items: Vec<_> = list.children().filter(|n| n.kind() != "comment").collect();
+            let [setup, operator, check] = items.as_slice() else {
+                return true;
+            };
+            if operator.kind() != "&&" {
+                return true;
+            }
+            (setup.clone(), check.clone())
+        }
+        _ => return true,
+    };
+    let text = setup.text();
+    let mut words = text.split([' ', '\t']).filter(|word| !word.is_empty());
+    let enables = setup.kind() == "command"
+        && words.next() == Some("set")
+        && words
+            .next()
+            .and_then(|w| w.strip_prefix('-')?.strip_suffix('o'))
+            .is_some_and(|flags| flags.bytes().all(|b| matches!(b, b'e' | b'u' | b'x')))
+        && words.next() == Some("pipefail")
+        && words.next().is_none();
+    let check = check
+        .field("body")
+        .filter(|_| check.kind() == "redirected_statement")
+        .unwrap_or(check);
+    !enables
+        || check.node_id() != pipeline.node_id()
+        || !pipeline.named_children().all(|stage| {
+            matches!(
+                stage.kind().as_ref(),
+                "command" | "test_command" | "comment"
+            ) || stage.kind() == "redirected_statement"
+                && stage
+                    .field("body")
+                    .is_some_and(|body| matches!(body.kind().as_ref(), "command" | "test_command"))
+        })
 }
 
 #[cfg(test)]

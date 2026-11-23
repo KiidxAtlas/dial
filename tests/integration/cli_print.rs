@@ -184,6 +184,17 @@ impl Env {
         .unwrap();
         env
     }
+    /// An environment whose unattended runs skip the verification gate. For tests of approval
+    /// semantics whose scripted model makes a change without running a check; the gate itself
+    /// is covered by the completion tests.
+    fn without_verification() -> Self {
+        let env = Self::new();
+        let config = env.home.path().join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[verification]\nenabled = false\n");
+        std::fs::write(config, text).unwrap();
+        env
+    }
     fn run(&self, server: &Server, args: &[&str], stdin: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dial"))
             .env("DIAL_HOME", self.home.path())
@@ -359,7 +370,7 @@ fn named_approval_controls_mutations_and_reports_denial_exit_code() {
         ("ask", true, true),
         ("readonly", true, false),
     ] {
-        let e = Env::new();
+        let e = Env::without_verification();
         let server = Server::new(vec![
             call("write", json!({"path":"out.txt","content":"approved"})),
             text("finished"),
@@ -393,7 +404,7 @@ fn named_approval_controls_mutations_and_reports_denial_exit_code() {
 #[test]
 fn only_explicit_yolo_executes_a_tool_call_recovered_from_text_without_consent() {
     for (mode, allowed) in [("auto", false), ("yolo", true)] {
-        let env = Env::new();
+        let env = Env::without_verification();
         let server = Server::new(vec![
             text(
                 r#"<tool_call>{"name":"write","arguments":{"path":"out.txt","content":"approved"}}</tool_call>"#,

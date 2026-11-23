@@ -98,10 +98,10 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the request; call last. completed: work and steps done, jobs finished, checks passing. answered: information only. blocked: name the missing prerequisite in reason. needs_input: ask the unresolved question in reason; optionally give 1–8 options.",
+        "description":"End the request; call last. `summary` is the whole reply the user sees, not a log of your steps: for answered, the answer or findings themselves; for completed, what changed and how it was checked. A plain final reply works the same. completed: work and steps done, jobs finished, checks passing. answered: information only. blocked: name the missing prerequisite in reason. needs_input: ask the unresolved question in reason; optionally give 1–8 options.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
-            "summary":{"type":"string","minLength":1,"maxLength":8192},
+            "summary":{"type":"string","minLength":1,"maxLength":8192,"description":"The user-facing reply itself: the answer or findings, not a recap of looking them up."},
             "reason":{"type":"string","minLength":1,"maxLength":8192},
             "options":{"type":"array","items":{"type":"string","minLength":1,"maxLength":512},"minItems":1,"maxItems":8}
         },"required":["outcome","summary"],"additionalProperties":false}
@@ -140,9 +140,6 @@ pub(in crate::agent) enum Decision {
 
 pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For standalone files, an Eval cell can bind assertions to each saved file with dial.check(name, passed, dial.read receipt). A different engine gives only partial coverage; disclose an unavailable consumer.";
 
-/// Completion reason for a candidate that admits the requested work is unfinished or abandoned.
-pub(in crate::agent) const ADMITTED_UNFINISHED: &str = "The reply says the requested work is not finished (the deliverable was not produced, does not work yet, or the attempt was abandoned), so it was not accepted as completed. Continue the permitted work: diagnose why the last approach failed and try a different one, then verify the deliverable. If a concrete prerequisite really prevents progress, start the reply with `Blocked:` and name it.";
-
 /// Nudge for a plain reply that asks the user a question while `finish` is offered: the typed pause is
 /// the supported protocol, so the model is asked to use it once before the question is accepted.
 pub(in crate::agent) const TYPED_PAUSE_NUDGE: &str = "This reply asks the user a question. Pause through the typed protocol instead: call finish with outcome=needs_input, put the question in reason, and offer up to 8 options when the choices are known. Do not end the reply with a plain question.";
@@ -162,6 +159,38 @@ pub(in crate::agent) enum ReplyChannel {
     },
 }
 
+/// Require an observation only for a direct instruction to investigate the current workspace.
+/// A failure noun, an explanation request, or a quoted example isn't such an instruction.
+/// Ambiguous requests keep the ordinary advisory nudge, not a new delivery obligation.
+fn requests_workspace_investigation(instruction: &str) -> bool {
+    // A snippet, diagnostic or other supplied context can answer the request without a tool.
+    // Only promote a bare imperative, not a request accompanied by an example or quotation.
+    if instruction.trim().contains(['`', '"', ':', '\n']) {
+        return false;
+    }
+    let lower = instruction.to_ascii_lowercase();
+    let mut words = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty());
+    let verb = words.by_ref().find(|word| *word != "please");
+    if !matches!(verb, Some("diagnose" | "investigate" | "debug" | "inspect")) {
+        return false;
+    }
+    let mut local = false;
+    for word in words {
+        if local
+            && matches!(
+                word,
+                "project" | "workspace" | "repo" | "repository" | "codebase"
+            )
+        {
+            return true;
+        }
+        local = matches!(word, "this" | "current");
+    }
+    false
+}
+
 impl crate::agent::Agent<'_> {
     /// Lean routes add investigation guidance. Execution obligations apply on every route.
     pub(in crate::agent) fn lean_completion_route(&self) -> bool {
@@ -173,7 +202,6 @@ impl crate::agent::Agent<'_> {
     pub(in crate::agent) fn completion_decision(
         &mut self,
         requested: TurnOutcome,
-        candidate: &str,
         channel: ReplyChannel,
         ui: &mut dyn crate::agent::Ui,
     ) -> Decision {
@@ -230,7 +258,8 @@ impl crate::agent::Agent<'_> {
         } else {
             None
         };
-        let hard_blocker = delivery && blocker.is_some() && !has_open_steps && !has_open_deliverables;
+        let hard_blocker =
+            delivery && blocker.is_some() && !has_open_steps && !has_open_deliverables;
         if delivery && blocker.is_none() {
             let gate = self.gate_unverified_edits(!nudged, ui);
             if gate.unverified.is_some() || gate.blocking {
@@ -260,72 +289,55 @@ impl crate::agent::Agent<'_> {
                 blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
             } else if let Some(reminder) = self.artifact_check_reminder() {
                 blocker = Some(reminder.to_owned());
-            } else if requested == TurnOutcome::Completed
-                && let Some(gap) = self.unattended_verification_gap()
-            {
+            } else if let Some(gap) = self.unattended_verification_gap() {
                 blocker = Some(gap.to_owned());
             }
         }
-        // The lexical investigation nudge is a guard rail for small local models only.
-        let missing_observation = lean && {
-            // Inspecting the directory is only an availability check. It supplies no task evidence.
-            let workspace_available =
+        // Neither an honest blocker nor an explicit request for input claims investigation.
+        let plain_question = matches!(
+            channel,
+            ReplyChannel::Plain {
+                asks_user: true,
+                ..
+            }
+        );
+        let prompt = control["current_instruction"].as_str().unwrap_or_default();
+        let missing_observation = lean
+            && (delivery || plain_question)
+            && !self.step_checks.autonomous_continuation
+            && self.step_checks.observations == 0
+            && !self.interrupt.load(std::sync::atomic::Ordering::SeqCst)
+            && crate::learn::task_policy::Kind::classify(prompt)
+                != crate::learn::task_policy::Kind::General
+            && {
+                // Directory availability supplies no task evidence.
                 std::fs::read_dir(self.workspace.root())
                     .ok()
                     .is_some_and(|entries| {
                         entries.filter_map(Result::ok).any(|entry| {
                             !matches!(entry.file_name().to_str(), Some(".git" | ".dial" | ".tmp"))
                         })
-                    });
-            let work_request = control["current_instruction"]
-                .as_str()
-                .is_some_and(|prompt| {
-                    crate::learn::task_policy::Kind::classify(prompt)
-                        != crate::learn::task_policy::Kind::General
-                });
-            !self.step_checks.autonomous_continuation
-                && self.step_checks.observations == 0
-                && workspace_available
-                && work_request
-                && !self.interrupt.load(std::sync::atomic::Ordering::SeqCst)
-        };
+                    })
+            };
         if requested == TurnOutcome::NeedsInput && self.step_checks.observations == 0 {
             self.efficiency_metrics.questions_before_investigation += 1;
         }
         let investigation_only = blocker.is_none() && missing_observation;
-        // Explicit typed `finish(outcome=answered|blocked|needs_input)` carries authoritative
-        // intent without prose re-scanning. Plain replies reuse their single `ReplySignals` pass.
-        let signals = match channel {
-            ReplyChannel::Plain {
-                signals: Some(signals),
-                ..
-            } => Some(signals),
-            ReplyChannel::Explicit if requested != TurnOutcome::Completed => None,
-            _ => Some(crate::agent::verify::reply_signals::ReplySignals::classify(
-                candidate,
-            )),
-        };
-        // A completion that itself admits the deliverable was not produced is not delivered work
-        // on any route; it shares the single nudge, then ends `Incomplete`. Diagnosis-only
-        // requests may legitimately report a failing state.
-        let admitted = (requested == TurnOutcome::Completed
-            && blocker.is_none()
-            && !missing_observation
-            && !self.diagnosis_requested()
-            && signals.is_some_and(|s| s.admitted_unfinished()))
-        .then(|| ADMITTED_UNFINISHED.to_owned());
-        let missing = blocker
-            .or_else(|| missing_observation.then(||
-            "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()))
-            .or(admitted);
+        let missing = blocker.or_else(|| missing_observation.then(||
+            "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()));
         let Some(reason) = missing else {
             return self.accept_completion(requested, ui);
         };
-        let unfinished = signals.is_some_and(|s| s.unfinished_closing());
+        // Closing-line hints only guide recovery once an independent gap exists. In particular,
+        // an explicit finish decision never inspects the summary to invent or clear a blocker.
+        let unfinished = matches!(channel, ReplyChannel::Plain { signals: Some(s), .. } if s.unfinished_closing());
         if nudged || hard_blocker || externally_blocked || self.stop_boundary().is_some() {
-            // The keyword-classified investigation nudge advises; it never ends a turn Incomplete
-            // on its own. A candidate that itself says the work is unfinished is not an answer.
-            if investigation_only && !unfinished {
+            // Ambiguous work gets advice, not a hard tool requirement. For a direct workspace
+            // investigation, neither prose nor a typed finish replaces the missing observation.
+            if investigation_only
+                && !unfinished
+                && !(delivery && requests_workspace_investigation(prompt))
+            {
                 return self.accept_completion(requested, ui);
             }
             self.efficiency_metrics.incomplete_stops += 1;

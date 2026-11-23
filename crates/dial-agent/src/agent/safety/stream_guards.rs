@@ -21,9 +21,7 @@ pub(crate) const TOOL_CALL_LOOP_EXEMPT_TOOLS: &[&str] = &["wait"];
 
 pub(crate) use crate::agent::verify::reply_signals::announces_unexpected_stop;
 #[cfg(test)]
-pub(crate) use crate::agent::verify::reply_signals::{
-    admits_unfinished_delivery, reports_unfinished_work,
-};
+pub(crate) use crate::agent::verify::reply_signals::reports_unfinished_work;
 
 /// Raised when a generation emits a run of reasoning-summary headers with no tool call
 /// (`GEMINI_HEADER_INTERRUPT_REASON`). The attempt is cancelled and re-sampled with the gemini
