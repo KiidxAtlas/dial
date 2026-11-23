@@ -61,6 +61,10 @@ pub(in crate::agent) struct OperationTiming {
 pub(in crate::agent) struct Scheduling {
     pub groups: BTreeMap<String, GroupTiming>,
     pub barriers: BTreeMap<String, u64>,
+    /// Barriers closed by a specific call, keyed `reason:tool`. A prefix ended by the reply or the
+    /// concurrency limit has no closing call and appears only in `barriers`.
+    #[serde(default)]
+    pub barrier_tools: BTreeMap<String, u64>,
     pub early_reads_started: u64,
     pub early_reads_reused: u64,
     pub early_reads_discarded: u64,
@@ -135,6 +139,10 @@ impl Scheduling {
             let entry = self.barriers.entry(reason).or_default();
             *entry = entry.saturating_add(count);
         }
+        for (key, count) in other.barrier_tools {
+            let entry = self.barrier_tools.entry(key).or_default();
+            *entry = entry.saturating_add(count);
+        }
         self.early_reads_started = self
             .early_reads_started
             .saturating_add(other.early_reads_started);
@@ -145,8 +153,15 @@ impl Scheduling {
             .early_reads_discarded
             .saturating_add(other.early_reads_discarded);
     }
-    pub fn barrier(&mut self, reason: &str) {
+    /// Count one closed prefix; `tool` names the call that closed it, when one did.
+    pub fn barrier(&mut self, reason: &str, tool: Option<&str>) {
         *self.barriers.entry(reason.to_owned()).or_default() += 1;
+        if let Some(tool) = tool {
+            *self
+                .barrier_tools
+                .entry(format!("{reason}:{tool}"))
+                .or_default() += 1;
+        }
     }
     pub fn stream(&mut self, started: u64, reused: u64) {
         self.early_reads_started += started;

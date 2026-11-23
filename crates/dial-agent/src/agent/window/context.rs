@@ -49,7 +49,26 @@ pub struct ContextFile {
     pub path: PathBuf,
     pub display: String,
     pub content: String,
+    pub audience: InstructionAudience,
 }
+
+/// Inheritance of an already admitted source; never permission to read a new file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstructionAudience {
+    ParentOnly,
+    ParentAndWorkers,
+}
+
+impl InstructionAudience {
+    pub fn for_source(path: &Path) -> Self {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("AGENTS.md" | "CLAUDE.md") => Self::ParentAndWorkers,
+            _ => Self::ParentOnly,
+        }
+    }
+}
+
+type SeenInstructions = HashSet<(InstructionAudience, String)>;
 
 // ---------------------------------------------------------------- reading helpers
 
@@ -234,7 +253,7 @@ fn discover_with(
         .collect();
 
     let mut budget = TOTAL_CAP;
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = SeenInstructions::new();
     let mut groups: Vec<Vec<ContextFile>> = dirs
         .iter()
         .map(|dir| {
@@ -332,7 +351,7 @@ fn load_dir(
     layout: &Layout,
     home: Option<&Path>,
     budget: &mut usize,
-    seen: &mut HashSet<String>,
+    seen: &mut SeenInstructions,
 ) -> Vec<ContextFile> {
     names
         .iter()
@@ -392,8 +411,9 @@ fn dedupe_contained_context(files: Vec<ContextFile>) -> Vec<ContextFile> {
         .enumerate()
         .map(|(i, rule)| {
             rule.is_empty()
-                || !blocks[i + 1..].iter().any(|candidate| {
-                    candidate.len() >= rule.len()
+                || !blocks[i + 1..].iter().enumerate().any(|(j, candidate)| {
+                    files[i].audience == files[i + 1 + j].audience
+                        && candidate.len() >= rule.len()
                         && candidate
                             .windows(rule.len())
                             .any(|window| window == rule.as_slice())
@@ -414,12 +434,15 @@ fn dedupe_contained_context(files: Vec<ContextFile>) -> Vec<ContextFile> {
 /// notice is never removed. Work is one pass over the loaded text.
 fn dedupe_overlapping_paragraphs(files: Vec<ContextFile>) -> Vec<ContextFile> {
     let mut projected = vec![String::new(); files.len()];
-    let mut later: HashSet<&str> = HashSet::new();
+    let mut later: HashSet<(InstructionAudience, &str)> = HashSet::new();
     for (index, file) in files.iter().enumerate().rev() {
         let mut kept: Vec<&str> = Vec::new();
         for paragraph in file.content.split("\n\n") {
             let key = paragraph.trim();
-            if key.is_empty() || paragraph.contains(TRUNCATION_NOTICE) || !later.contains(key) {
+            if key.is_empty()
+                || paragraph.contains(TRUNCATION_NOTICE)
+                || !later.contains(&(file.audience, key))
+            {
                 kept.push(paragraph);
             }
         }
@@ -428,7 +451,8 @@ fn dedupe_overlapping_paragraphs(files: Vec<ContextFile>) -> Vec<ContextFile> {
             file.content
                 .split("\n\n")
                 .map(str::trim)
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .map(|key| (file.audience, key)),
         );
     }
     files
@@ -446,14 +470,15 @@ fn load_context_file(
     display: String,
     imports: &Imports,
     budget: &mut usize,
-    seen: &mut HashSet<String>,
+    seen: &mut SeenInstructions,
 ) -> Option<ContextFile> {
     let (raw, cut) = read_text(path, FILE_CAP)?;
     if raw.trim().is_empty() {
         return None;
     }
     let mut content = imports::expand(&raw, path, imports);
-    if *budget == 0 || !seen.insert(content.clone()) {
+    let audience = InstructionAudience::for_source(path);
+    if *budget == 0 || !seen.insert((audience, content.clone())) {
         return None;
     }
     let mut cut = cut;
@@ -469,6 +494,7 @@ fn load_context_file(
         path: path.to_path_buf(),
         display,
         content,
+        audience,
     })
 }
 
@@ -480,7 +506,7 @@ fn load_walked(
     layout: &Layout,
     home: Option<&Path>,
     budget: &mut usize,
-    seen: &mut HashSet<String>,
+    seen: &mut SeenInstructions,
 ) -> Option<ContextFile> {
     match fs::canonicalize(path) {
         Ok(real) if real.starts_with(boundary) => {}
@@ -504,7 +530,7 @@ fn foreign_user_file(
     home: Option<&Path>,
     enabled: &[&str],
     budget: &mut usize,
-    seen: &mut HashSet<String>,
+    seen: &mut SeenInstructions,
 ) -> Option<ContextFile> {
     let home = home?;
     let real_home = fs::canonicalize(home).ok()?;

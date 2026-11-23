@@ -264,6 +264,12 @@ fn deadline_failures_attribute_time_to_completed_and_pending_phases() {
 #[test]
 fn timing_survives_a_lost_reply_and_only_counts_passes_from_this_send() {
     let mut metrics = RunMetrics::default();
+    let inference = |send: u64, id: &str, parent: Option<&str>| {
+        json!({
+            "event":"state_node", "request_id":send,
+            "node":{"id":id,"kind":"inference","parent":parent,"result":{"phase":"running"}}
+        })
+    };
     for (id, method, events) in [
         (
             1,
@@ -278,15 +284,24 @@ fn timing_survives_a_lost_reply_and_only_counts_passes_from_this_send() {
             2,
             "send",
             vec![
-                json!({"event":"check_passed","request_id":2}),
-                json!({"event":"check_passed","request_id":2}),
+                json!({"event":"check_passed","request_id":2,"open_declared_deliverables":3}),
+                inference(2, "before", None),
+                json!({"event":"check_passed","request_id":2,"open_declared_deliverables":1}),
+                inference(2, "before", None),
+                inference(2, "after", None),
+                inference(2, "after", None),
+                inference(2, "worker", Some("child")),
+                inference(9, "foreign", None),
                 json!({"id":2,"result":{}}),
             ],
         ),
         (
             3,
             "send",
-            vec![json!({"event":"check_passed","request_id":3})],
+            vec![
+                json!({"event":"check_passed","request_id":3}),
+                inference(3, "unfinished", None),
+            ],
         ),
         (
             4,
@@ -316,11 +331,21 @@ fn timing_survives_a_lost_reply_and_only_counts_passes_from_this_send() {
     let observed: Vec<_> = metrics
         .post_check_timings
         .iter()
-        .map(|t| (t.send_id, t.end))
+        .map(|t| {
+            (
+                t.send_id,
+                t.end,
+                t.open_declared_deliverables,
+                t.observed_model_starts_after_pass,
+            )
+        })
         .collect();
     assert_eq!(
         observed,
-        [(2, PostCheckEnd::Reply), (3, PostCheckEnd::RpcError)]
+        [
+            (2, PostCheckEnd::Reply, Some(1), Some(1)),
+            (3, PostCheckEnd::RpcError, None, Some(1))
+        ]
     );
 }
 

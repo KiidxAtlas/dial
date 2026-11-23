@@ -174,8 +174,9 @@ connection) are part of the protocol contract; `dial-client` reports them rather
 - `agent::verify::completion` owns one state-based decision for plain replies, `finish` and
   clarification. Execution obligations and current evidence, not candidate phrasing or repetition,
   determine acceptance. One instruction-scoped recovery allowance survives inner-loop reentry.
-  On lean local routes accepted text cannot auto-close execution todos; on other routes an accepted
-  `completed` answer closes the single in-progress execution step and lists other open steps.
+  Open execution steps refuse `completed` and `answered` on every route; accepted text never closes
+  them (only `todo` does). A plain reply that asks the user to decide is nudged once toward
+  `finish(outcome=needs_input)` when `finish` is offered, and accepted as `needs_input` after that.
   Check failures not introduced by the turn (unavailable environment, denied approval, timeout,
   unchanged baseline failure, or a failure the request only asked to diagnose) are accepted with
   disclosed gaps (`verify/checks.rs::disclosed_failure`). Optional follow-ups remain separate.

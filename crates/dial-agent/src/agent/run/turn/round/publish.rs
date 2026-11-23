@@ -108,6 +108,9 @@ impl Agent<'_> {
         if let Some(note) = repro_advice {
             body.push_str(note);
         }
+        if let Some(note) = elapsed_note(&call.name, tool_seconds) {
+            body.push_str(&note);
+        }
         budget.spend(body.len());
         self.efficiency_metrics.result(&output.text, &body);
         let mut message = llm::tool_message(&call.id, &body);
@@ -123,7 +126,7 @@ impl Agent<'_> {
         if call.name == "task"
             && let Some(note) = crate::agent::workers::subagents::structured_result_note(&output)
         {
-            turn.pending_nudges.push(note);
+            turn.notices.push_raw(note);
         }
         let clipped = output.text.len() > limit
             || output.text.contains("output omitted")
@@ -267,3 +270,54 @@ impl Agent<'_> {
         Ok(())
     }
 }
+
+/// Tools whose duration depends on the requested work. Their results always state elapsed time so
+/// the model can calibrate the cost of its next call; any other tool states it once it is slow.
+const TIMED_TOOLS: &[&str] = &[
+    "bash",
+    "eval",
+    "verify",
+    "bg",
+    "task",
+    "browser",
+    "web_fetch",
+    "web_search",
+    "research",
+    "autoresearch",
+    "ssh",
+    "database",
+    "db_query",
+    "lsp",
+    "ida",
+    "deploy",
+    "notebook",
+    "test_watch",
+];
+const SLOW_TOOL_SECS: f64 = 5.0;
+
+/// Model-facing wall time of one call. Zero marks a result shared with an earlier batch member,
+/// which already carries the time.
+fn elapsed_note(name: &str, seconds: f64) -> Option<String> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    if seconds < SLOW_TOOL_SECS && !TIMED_TOOLS.contains(&name) {
+        return None;
+    }
+    Some(format!("\n[elapsed {}]", format_elapsed(seconds)))
+}
+
+fn format_elapsed(seconds: f64) -> String {
+    if seconds < 9.95 {
+        return format!("{seconds:.1}s");
+    }
+    let total = seconds.round() as u64;
+    match total {
+        0..60 => format!("{total}s"),
+        60..3600 => format!("{}m{:02}s", total / 60, total % 60),
+        _ => format!("{}h{:02}m", total / 3600, total % 3600 / 60),
+    }
+}
+
+#[cfg(test)]
+mod tests;

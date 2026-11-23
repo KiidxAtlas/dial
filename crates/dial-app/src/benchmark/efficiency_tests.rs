@@ -66,14 +66,16 @@ fn case(passed: bool, outcome_checks: usize, tokens: u64) -> CaseResult {
 
 #[test]
 fn failed_and_unchecked_work_remain_in_efficiency_numerator() {
-    let report = score_report(
-        "s",
-        vec![case(true, 1, 10), case(false, 1, 20), case(true, 0, 30)],
-    );
+    let mut attempts = vec![case(true, 1, 10), case(false, 1, 20), case(true, 0, 30)];
+    for attempt in &mut attempts {
+        attempt.metrics.runtime_usage = Some(serde_json::json!({"all":{"requests":2}}));
+    }
+    let report = score_report("s", attempts);
     let work = report.useful_work.unwrap();
     assert_eq!(work.verified_completed_cases, 1);
     assert_eq!(work.outcome_checked_cases, 2);
     assert_eq!(work.elapsed_ms_per_verified_completion, Some(300.0));
+    assert_eq!(work.requests_per_verified_completion, Some(6.0));
     assert_eq!(work.tokens_per_verified_completion, Some(60.0));
     assert_eq!(work.cost_usd_per_verified_completion, Some(1.5));
 }
@@ -85,9 +87,11 @@ fn unknown_usage_and_no_completions_do_not_become_zero_cost() {
     partial.metrics.observed_cost_complete = false;
     let work = UsefulWork::measured(&[case(true, 1, 10), partial]);
     assert_eq!(work.tokens_per_verified_completion, None);
+    assert_eq!(work.requests_per_verified_completion, None);
     assert_eq!(work.cost_usd_per_verified_completion, None);
     let work = UsefulWork::measured(&[case(false, 1, 10), case(true, 0, 20)]);
     assert_eq!(work.elapsed_ms_per_verified_completion, None);
+    assert_eq!(work.requests_per_verified_completion, None);
     assert_eq!(work.tokens_per_verified_completion, None);
     assert_eq!(work.cost_usd_per_verified_completion, None);
 }
@@ -132,6 +136,42 @@ checks = [{kind="response_equals",content="4"},{kind="metric",metric="tool_calls
                 .unwrap()
                 .contains(" 4")
         );
+    }
+}
+
+#[test]
+fn lifecycle_read_only_task_requires_the_correct_diagnosis() {
+    let mut suite = BenchmarkSuite::parse_toml(include_str!(
+        "../../../../examples/benchmarks/lifecycle-efficiency.toml"
+    ))
+    .unwrap();
+    suite.cases.retain(|c| c.id == "investigate-before-asking");
+    assert_eq!(suite.cases.len(), 1);
+    let case = &mut suite.cases[0];
+    // Exercise the shipped independent outcome in isolation from the live efficiency metrics.
+    case.checks
+        .retain(|c| matches!(c, Assertion::ResponseEquals { .. }));
+    assert_eq!(case.checks.len(), 1);
+    case.project = None;
+    let root = tempfile::tempdir().unwrap();
+    for (answer, passed) in [
+        ("calc.add: - instead of +", true),
+        ("calc.add: + instead of -", false),
+    ] {
+        let report = suite
+            .run(
+                root.path(),
+                |_, _| {
+                    Ok(RunMetrics {
+                        agent_succeeded: true,
+                        response_sha256: Some(response_sha256(answer)),
+                        ..Default::default()
+                    })
+                },
+                |_, _| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(report.cases[0].passed, passed, "{answer}");
     }
 }
 

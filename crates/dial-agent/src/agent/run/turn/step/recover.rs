@@ -43,11 +43,7 @@ impl Agent<'_> {
                         < crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES
                 {
                     turn.stall_continues += 1;
-                    let partial = if self.external_thinking_instruction().is_some() {
-                        crate::agent::modes::external_thinking::strip_scratchpad(&stalled.partial)
-                    } else {
-                        stalled.partial.clone()
-                    };
+                    let partial = self.normalize_visible_text(&stalled.partial);
                     self.request_phase
                         .recover("the stream stalled after partial text; continuing");
                     ui.event(&crate::agent::ui::ui_event::UiEvent::new(
@@ -74,7 +70,8 @@ impl Agent<'_> {
                             crate::agent::run::engine::Tick::Finished(report),
                         ));
                     }
-                    turn.pending_nudges.push(json!({"role":"user","content":crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE,"dial_transient":true}));
+                    turn.notices
+                        .push_protocol(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE);
                     turn.refund_unusable(ui);
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }

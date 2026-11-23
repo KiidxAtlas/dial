@@ -31,22 +31,23 @@ fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> St
     }
     out
 }
-/// The skills catalog plus one line naming how to load a skill with the tools this prompt offers:
-/// `skill` directly, or `tool_load` for it when only discovery is offered. Decided from the policy
-/// offer, so loading a tool mid-session leaves the cached prefix unchanged.
-fn with_skill_loader(catalog: &str, tools: &[String]) -> String {
-    let has = |name: &str| tools.iter().any(|tool| tool == name);
-    if catalog.trim().is_empty() {
-        return catalog.to_owned();
+/// The public route that can actually load a skill (not just manage skills or search tools).
+#[derive(Clone, Copy)]
+enum SkillLoader {
+    Direct,
+    Deferred,
+}
+
+impl SkillLoader {
+    fn catalog(self, catalog: &str) -> String {
+        let loader = match self {
+            Self::Direct => "Load a skill by name with the `skill` tool.",
+            Self::Deferred => {
+                "To load a skill, first load the `skill` tool with `tool_search` names:[\"skill\"], then call it with the skill name."
+            }
+        };
+        format!("{}\n{loader}\n", catalog.trim_end())
     }
-    let loader = if has("skill") {
-        "Load a skill by name with the `skill` tool."
-    } else if has("tool_search") || has("tool_load") {
-        "To load a skill, first load the `skill` tool with `tool_search` names:[\"skill\"], then call it with the skill name."
-    } else {
-        return catalog.to_owned();
-    };
-    format!("{}\n{loader}\n", catalog.trim_end())
 }
 
 impl Agent<'_> {
@@ -486,6 +487,7 @@ impl<'a> Agent<'a> {
             side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
+            pending_type: None,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
             undrafted_steering: Vec::new(),
@@ -668,6 +670,7 @@ impl<'a> Agent<'a> {
             side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
+            pending_type: None,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
             undrafted_steering: Vec::new(),
@@ -677,25 +680,33 @@ impl<'a> Agent<'a> {
         Ok(agent)
     }
 
+    fn skill_loader(&self, tools: &[String]) -> Option<SkillLoader> {
+        if !self.controller_operation_available("skill") {
+            return None;
+        }
+        if tools.iter().any(|tool| tool == "skill") {
+            Some(SkillLoader::Direct)
+        } else if tools.iter().any(|tool| tool == "tool_search")
+            && self.controller_operation_available("tool_load")
+        {
+            Some(SkillLoader::Deferred)
+        } else {
+            None
+        }
+    }
+
     /// Deterministic pointer to enabled skills whose names or descriptions match the user's words.
     pub(in crate::agent) fn skill_hint(&self, user_text: &str) -> Option<String> {
         if self.modes.skillful == Some(false) {
             return None;
         }
         let layout = self.layout.as_ref()?;
+        let loader = self.skill_loader(&self.offered())?;
         let visible: Vec<_> = skills::discover(layout)
             .into_iter()
             .filter(|skill| self.modes.launch.skill_visible(&skill.name))
             .collect();
-        // The hint names the route this request actually has: the `skill` tool itself, or
-        // `tool_load` to add it. With neither offered there is nothing to act on.
-        let offered = self.offered();
-        let has = |name: &str| offered.iter().any(|tool| tool == name);
-        let skill_offered = has("skill");
-        if !skill_offered && !has("tool_load") {
-            return None;
-        }
-        skills::match_hint(&visible, user_text, skill_offered)
+        skills::match_hint(&visible, user_text, matches!(loader, SkillLoader::Direct))
     }
 
     pub(in crate::agent) fn rebuild_system(&mut self) {
@@ -765,12 +776,17 @@ impl<'a> Agent<'a> {
                 soul: self.parts.soul.clone(),
                 overrides: self.parts.overrides.clone(),
                 context: &self.parts.context,
-                skills: if (self.minimal_tools() || lean)
-                    && !offered.iter().any(|tool| tool == "skill")
+                skills: if self.parts.skills.trim().is_empty()
+                    || ((self.minimal_tools() || lean)
+                        && !offered.iter().any(|tool| tool == "skill"))
                 {
                     String::new()
                 } else {
-                    with_skill_loader(&self.parts.skills, &policy_tools)
+                    // The policy offer keeps this catalog stable across explicit loads. The
+                    // transient hint above uses the current request's actual route instead.
+                    self.skill_loader(&policy_tools)
+                        .map(|loader| loader.catalog(&self.parts.skills))
+                        .unwrap_or_default()
                 },
                 // Unattended runs defer `memory`; its guidance waits until the tool is loaded.
                 memory: if self.modes.launch.unattended
@@ -834,6 +850,8 @@ impl<'a> Agent<'a> {
             messages.push(json!({"role":"system","content":system}));
         }
         llm::prompt::order(&mut messages);
+        self.agents_messages =
+            crate::agent::window::prompt::worker_instruction_messages(&self.parts.context);
         if messages == self.system_messages {
             return;
         }
@@ -841,8 +859,6 @@ impl<'a> Agent<'a> {
             .iter()
             .filter_map(|message| message["content"].as_str())
             .collect();
-        self.agents_messages =
-            crate::agent::window::prompt::agents_md_messages(&self.parts.context);
         self.system_messages = messages;
     }
 

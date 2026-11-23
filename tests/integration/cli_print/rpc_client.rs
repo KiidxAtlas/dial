@@ -45,11 +45,107 @@ fn first_run_client_can_connect_and_list_sign_in_providers_without_a_model() {
     let env = Env::new();
     let launch = Launch::new(env!("CARGO_BIN_EXE_dial"))
         .env("DIAL_HOME", env.home.path())
+        .env("DIAL_SUBSCRIPTION_AUTH_HOME", env.home.path())
         .current_dir(env.project.path());
     let mut client = Client::connect(&launch, WAIT).unwrap();
     assert!(client.ready().model.is_empty());
     let list = client.call("auth_providers", json!({}), WAIT).unwrap();
-    assert!(list["providers"].as_array().is_some_and(|p| !p.is_empty()));
+    let providers = list["providers"].as_array().unwrap();
+    for provider in ["anthropic", "openai"] {
+        assert!(providers.iter().any(|p| p["provider"] == provider));
+    }
+    let key_provider = "api-key:abliteration";
+    assert!(
+        list["key_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["provider"] == key_provider
+                && p["key_saved"] == false
+                && p["can_remove"] == true)
+    );
+    let login = client
+        .request("login", json!({"provider":key_provider}))
+        .unwrap();
+    let prompt = loop {
+        if let Message::Event(e) = next(&mut client)
+            && e.kind == "auth_prompt"
+        {
+            assert_eq!(e.body["secret"], true);
+            break e.body["prompt_id"].clone();
+        }
+    };
+    let removal = json!({"provider":key_provider,"confirm":true});
+    assert_eq!(
+        code(
+            client
+                .call("remove_api_key", removal.clone(), WAIT)
+                .unwrap_err()
+        ),
+        "busy"
+    );
+    client
+        .call(
+            "auth_code",
+            json!({"prompt_id":prompt,"code":"fixture-key"}),
+            WAIT,
+        )
+        .unwrap();
+    loop {
+        if let Message::Response { id, result, .. } = next(&mut client)
+            && id == login
+        {
+            assert!(!result.unwrap().to_string().contains("fixture-key"));
+            break;
+        }
+    }
+    for refused in [
+        json!({"provider":key_provider}),
+        json!({"provider":key_provider,"confirm":false}),
+        json!({"provider":"openai","confirm":true}),
+        json!({"provider":"api-key:https://example.invalid","confirm":true}),
+    ] {
+        assert_eq!(
+            code(client.call("remove_api_key", refused, WAIT).unwrap_err()),
+            "invalid_params"
+        );
+    }
+    let list = client.call("auth_providers", json!({}), WAIT).unwrap();
+    assert!(
+        list["key_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["provider"] == key_provider && p["key_saved"] == true)
+    );
+    assert!(
+        client
+            .call(
+                "login",
+                json!({"provider":"api-key:https://example.invalid"}),
+                WAIT
+            )
+            .is_err()
+    );
+    // The store uses exact URLs. A custom endpoint with a trailing slash is a distinct key.
+    let canonical = &dial::llm::catalog::builtin_provider("abliteration")
+        .unwrap()
+        .base_url;
+    let other = format!("{canonical}/");
+    dial::llm::catalog::save_credential(env.home.path(), &other, "another-fixture").unwrap();
+    assert_eq!(
+        client.call("remove_api_key", removal, WAIT).unwrap(),
+        json!({"provider":key_provider})
+    );
+    let list = client.call("auth_providers", json!({}), WAIT).unwrap();
+    assert!(
+        list["key_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["provider"] == key_provider && p["key_saved"] == false)
+    );
+    assert!(dial::llm::catalog::stored_credential_urls(env.home.path()).contains(&other));
     assert!(client.shutdown(WAIT).unwrap().success());
 }
 

@@ -48,30 +48,63 @@ fn open_execution_steps_cannot_finish_through_either_delivery_surface() {
 }
 
 #[test]
-fn an_unrecognized_promise_without_workspace_observations_gets_one_nudge_then_is_accepted() {
-    // The keyword-classified investigation nudge never ends a turn Incomplete on its own. Replies
-    // the stream guards recognize as announcing more work ("I will run the tests next") still stop
-    // Incomplete (integration: consistent_ux_promised_actions_stop_incomplete_after_bounded_recovery);
-    // this wording is not one of them. First-person admissions such as "I haven't finished" or
-    // "Next I'd load the source" are recognized (stream_guards tests).
+fn a_workspace_diagnosis_cannot_finish_on_a_promise_after_one_reminder() {
     let candidate = "Diagnosis is underway.\nThe source comes next, then a fix.";
-    let server = serve(vec![response(candidate, None), response(candidate, None)]);
-    with_agent(
-        "[compaction]\nenabled=false\n[retry]\nmax_attempts=1",
-        |agent| {
-            std::fs::write(
-                agent.workspace.root().join("failure.txt"),
-                "the observed failure",
-            )
-            .unwrap();
-            connect(agent, &server.url);
-            let report = agent
-                .turn("Diagnose the failure in this project", &mut NullUi)
+    for second in [
+        response(candidate, None),
+        response(
+            "",
+            Some(("finish", json!({"outcome":"answered","summary":candidate}))),
+        ),
+    ] {
+        let server = serve(vec![response(candidate, None), second]);
+        with_agent(
+            "[compaction]\nenabled=false\n[retry]\nmax_attempts=1",
+            |agent| {
+                std::fs::write(
+                    agent.workspace.root().join("failure.txt"),
+                    "the observed failure",
+                )
                 .unwrap();
-            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
-        },
-    );
-    assert_eq!(completion_requests(&server).len(), 2);
+                connect(agent, &server.url);
+                let report = agent
+                    .turn("Diagnose the failure in this project", &mut NullUi)
+                    .unwrap();
+                assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+                assert!(report.text.contains(candidate), "{}", report.text);
+            },
+        );
+        assert_eq!(completion_requests(&server).len(), 2);
+    }
+}
+
+#[test]
+fn a_tool_free_blocker_or_self_contained_answer_is_not_a_workspace_diagnosis_claim() {
+    for (prompt, answer, outcome) in [
+        (
+            "Diagnose the failure in this project",
+            "Blocked: the incident log requires the operator's credentials.",
+            TurnOutcome::Blocked,
+        ),
+        (
+            "What does EADDRINUSE mean?",
+            "Another process already holds the requested address.",
+            TurnOutcome::Completed,
+        ),
+    ] {
+        let server = serve(vec![response(answer, None)]);
+        with_agent(
+            "[compaction]\nenabled=false\n[retry]\nmax_attempts=1",
+            |agent| {
+                std::fs::write(agent.workspace.root().join("failure.txt"), "invalid port").unwrap();
+                connect(agent, &server.url);
+                let report = agent.turn(prompt, &mut NullUi).unwrap();
+                assert_eq!(report.outcome, outcome, "{}", report.text);
+                assert_eq!(report.text, answer);
+            },
+        );
+        assert_eq!(completion_requests(&server).len(), 1);
+    }
 }
 
 #[test]
@@ -79,12 +112,19 @@ fn a_question_before_workspace_investigation_continues_to_a_tool_call() {
     let server = serve(vec![
         response("Could you clarify what the failure is?", None),
         response("", Some(("read", json!({"path":"failure.txt"})))),
-        response("The recorded failure is an invalid port.", None),
+        response(
+            "The recorded failure is an invalid port.\n\nThe log's status message was:\n> The source comes next, then a fix.",
+            None,
+        ),
     ]);
     with_agent(
         "[compaction]\nenabled=false\n[retry]\nmax_attempts=1",
         |agent| {
-            std::fs::write(agent.workspace.root().join("failure.txt"), "invalid port").unwrap();
+            std::fs::write(
+                agent.workspace.root().join("failure.txt"),
+                "invalid port\nThe source comes next, then a fix.",
+            )
+            .unwrap();
             connect(agent, &server.url);
             let report = agent
                 .turn("Investigate this project's failure", &mut NullUi)

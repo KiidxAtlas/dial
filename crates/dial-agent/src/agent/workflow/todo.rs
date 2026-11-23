@@ -361,8 +361,8 @@ impl TodoList {
 
     /// Current step plus a bounded tail of investigation findings. Ordinary single-step lists
     /// need no reminder. Appended transiently to mid-turn requests to preserve the cached prefix.
-    /// `finish_closes` says whether an accepted completion closes the remaining steps on this route.
-    pub fn focus(&self, finish_closes: bool) -> Option<String> {
+    /// Final replies never close steps, so the focus always asks for an explicit `todo done`.
+    pub fn focus(&self) -> Option<String> {
         if self.tasks.len() < 2 && !self.tasks.iter().any(|t| t.investigation) {
             return None;
         }
@@ -385,12 +385,8 @@ impl TodoList {
                 )
             })
             .unwrap_or_else(|| {
-                if finish_closes {
-                    "This is the last open step; an accepted finish(completed) closes it, so no todo call is needed."
-                } else {
-                    "This is the last open step; close it with todo done before finishing."
-                }
-                .to_owned()
+                "This is the last open step; close it with todo done before finishing. A final reply never closes execution steps."
+                    .to_owned()
             });
         let mut focus = format!(
             "[Task focus from dial, not the user] Current step ({closed}/{total} done): {}. {next}",
@@ -414,23 +410,6 @@ impl TodoList {
 
     pub fn snapshot(&self) -> Value {
         serde_json::to_value(&self.tasks).unwrap_or_else(|_| json!([]))
-    }
-
-    /// Complete every pending or in-progress execution step, returning their contents. Blocked
-    /// steps and optional follow-ups are left as they are.
-    pub fn close_open_steps(&mut self) -> Vec<String> {
-        self.tasks
-            .iter_mut()
-            .filter(|task| {
-                task.kind == Kind::Step
-                    && matches!(task.status, Status::Pending | Status::InProgress)
-            })
-            .map(|task| {
-                task.status = Status::Completed;
-                task.note = None;
-                task.content.clone()
-            })
-            .collect()
     }
 
     /// Replace the list from a previously persisted snapshot. The snapshot is validated like model
@@ -785,7 +764,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. set the list once ({\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]}); done closes the active item and starts the next. Indices are 1-based. Send updates alongside the next real tool call. An accepted finish(completed) closes open steps. state_* ops keep deliverables across compaction.",
+            "description": "Plan long work once ({\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]}). done closes the active step and starts the next. Use 1-based indices. Pair updates with the next real tool call. Final replies never close steps. state_* retains deliverables across compaction.",
             "parameters": {
                 "type": "object",
                 "properties": {

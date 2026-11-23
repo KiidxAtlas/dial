@@ -293,6 +293,12 @@ pub fn user_failure_text(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
+/// An inference failure as a turn returns it, for tests of the surfaces that report one.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_provider_failure(error: anyhow::Error) -> anyhow::Error {
+    error.context(PROVIDER_RECOVERY)
+}
+
 pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
     format!("{error:#}\n{PROVIDER_RECOVERY}")
 }

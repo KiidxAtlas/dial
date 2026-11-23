@@ -129,6 +129,7 @@ fn request(
     // The silence window starts at dispatch, so a silent first response is bounded too.
     metrics.last_progress_at = Some(Instant::now());
     let mut last_pass = None;
+    let mut inference_nodes = std::collections::HashSet::new();
     let result = loop {
         let event = match receive(rx, guard, metrics)
             .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))
@@ -136,8 +137,23 @@ fn request(
             Ok(event) => event,
             Err(error) => break Err(error),
         };
-        if method == "send" && event["event"] == "check_passed" && event["request_id"] == id {
-            last_pass = Some(Instant::now());
+        if method == "send" && event["request_id"] == id {
+            if event["event"] == "check_passed" {
+                last_pass = Some((
+                    Instant::now(),
+                    event["open_declared_deliverables"].as_u64(),
+                    inference_nodes.len(),
+                ));
+            } else if event["event"] == "state_node" {
+                let node = &event["node"];
+                if node["kind"] == "inference"
+                    && node["parent"].is_null()
+                    && node["result"]["phase"] == "running"
+                    && let Some(id) = node["id"].as_str()
+                {
+                    inference_nodes.insert(id.to_owned());
+                }
+            }
         }
         observe(metrics, &event);
         if event["id"] == id {
@@ -147,10 +163,12 @@ fn request(
             break Ok(event["result"].clone());
         }
     };
-    if let Some(mark) = last_pass {
+    if let Some((mark, open_declared_deliverables, starts_at_pass)) = last_pass {
         metrics.post_check_timings.push(PostCheckTiming {
             send_id: id,
             elapsed_ms: mark.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            open_declared_deliverables,
+            observed_model_starts_after_pass: Some((inference_nodes.len() - starts_at_pass) as u64),
             end: if result.is_ok() {
                 PostCheckEnd::Reply
             } else {

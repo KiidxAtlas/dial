@@ -11,6 +11,7 @@
 use super::{Sender, coded};
 use crate::config::types::Config;
 use crate::llm::oauth::{self, Interaction};
+use crate::llm::{anthropic_oauth, catalog, chatgpt};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use dial_protocol::ErrorCode;
 use serde_json::{Value, json};
@@ -218,9 +219,32 @@ pub(super) fn start_login(
     params: &Value,
 ) -> Result<()> {
     let provider = params["provider"].as_str().context("provider required")?;
+    let user_dir = user_dir.to_owned();
+    if provider.starts_with("api-key:") {
+        let p = key_endpoint(provider)?;
+        let provider = provider.to_owned();
+        return spawn_flow(state, out, id, provider.clone(), move |ui, cancel| {
+            let mut key = ui.prompt_secret(&format!("API key for {}", p.label), None, false)?;
+            ensure!(!cancel.load(Ordering::SeqCst), "setup cancelled");
+            catalog::verify_and_save_credential(&user_dir, &p.id, &p.base_url, &mut key)?;
+            Ok(json!({"provider":provider,"message":"API key saved"}))
+        });
+    }
+    if matches!(provider, "anthropic" | "openai") {
+        let dir = crate::config::paths::subscription_auth_dir(&user_dir)?;
+        let provider = provider.to_owned();
+        return spawn_flow(state, out, id, provider.clone(), move |ui, cancel| {
+            ui.progress("Complete sign-in in your browser.");
+            let message = if provider == "anthropic" {
+                anthropic_oauth::login(&dir, cancel)?
+            } else {
+                chatgpt::login(&dir, None, cancel)?
+            };
+            Ok(json!({"provider":provider,"message":message}))
+        });
+    }
     let flow = oauth::flow(provider)
         .with_context(|| format!("unknown provider {provider:?}; call auth_providers"))?;
-    let user_dir = user_dir.to_path_buf();
     spawn_flow(state, out, id, flow.id.to_owned(), move |ui, cancel| {
         oauth::login(&user_dir, flow.id, ui, cancel)
             .map(|message| json!({"provider": flow.id, "message": message}))
@@ -328,9 +352,50 @@ pub(super) fn cancel_login(state: &AuthState, params: &Value) -> Result<Value> {
     Ok(json!({"provider": provider, "cancelling": true}))
 }
 
+/// Resolve only the opaque inventory IDs used by login and removal, never a caller's URL.
+fn key_endpoint(provider: &str) -> Result<&'static catalog::BuiltinProvider> {
+    let id = provider.strip_prefix("api-key:");
+    catalog::key_providers()
+        .find(|p| Some(p.id.as_str()) == id)
+        .ok_or_else(|| coded(ErrorCode::InvalidParams, "unknown API-key provider"))
+}
+
+pub(super) fn remove_api_key(state: &AuthState, user_dir: &Path, params: &Value) -> Result<Value> {
+    if params["confirm"].as_bool() != Some(true) {
+        return Err(coded(
+            ErrorCode::InvalidParams,
+            "removal requires confirm:true",
+        ));
+    }
+    let provider = params["provider"].as_str().unwrap_or_default();
+    let endpoint = key_endpoint(provider)?;
+    if locked(&state.job).is_some() {
+        return Err(coded(
+            ErrorCode::Busy,
+            "finish or cancel sign-in before removing a key",
+        ));
+    }
+    catalog::remove_credential(user_dir, &endpoint.base_url)?;
+    Ok(json!({"provider": provider}))
+}
+
 /// `logout`: removes the stored grant. A sign-in running for the same provider is cancelled.
 pub(super) fn logout(state: &AuthState, user_dir: &Path, params: &Value) -> Result<Value> {
     let provider = params["provider"].as_str().context("provider required")?;
+    if matches!(provider, "anthropic" | "openai") {
+        ensure!(
+            locked(&state.job).is_none(),
+            "finish or cancel sign-in before signing out"
+        );
+        let dir = crate::config::paths::subscription_auth_dir(user_dir)?;
+        let message = if provider == "anthropic" {
+            anthropic_oauth::sign_out(&dir)?
+        } else {
+            let account = chatgpt::resolve_account(&dir, None)?;
+            chatgpt::sign_out(&dir, &account, Arc::new(AtomicBool::new(false)))?
+        };
+        return Ok(json!({"provider":provider,"message":message}));
+    }
     let flow = oauth::flow(provider)
         .with_context(|| format!("unknown provider {provider:?}; call auth_providers"))?;
     if let Some(job) = locked(&state.job)
@@ -345,17 +410,29 @@ pub(super) fn logout(state: &AuthState, user_dir: &Path, params: &Value) -> Resu
 
 /// `auth_providers`: sign-in providers with their signed-in state.
 pub(super) fn providers(user_dir: &Path) -> Value {
-    let providers: Vec<Value> = oauth::flows()
-        .map(|flow| {
+    let dir = crate::config::paths::subscription_auth_dir(user_dir).ok();
+    let mut providers = vec![
+        json!({"provider":"anthropic","name":"Claude subscription","signed_in":dir.as_ref().is_some_and(|d| anthropic_oauth::signed_in(d)),"needs_terminal":false}),
+        json!({"provider":"openai","name":"ChatGPT subscription","signed_in":dir.as_ref().is_some_and(|d| chatgpt::resolve_account(d, None).is_ok()),"needs_terminal":false}),
+    ];
+    providers.extend(oauth::flows().map(|flow| {
+        json!({
+            "provider": flow.id,
+            "name": flow.name,
+            "signed_in": oauth::signed_in(user_dir, flow.id),
+            "needs_terminal": flow.needs_terminal,
+        })
+    }));
+    let saved = catalog::stored_credential_urls(user_dir);
+    let key_providers: Vec<_> = catalog::key_providers()
+        .map(|p| {
             json!({
-                "provider": flow.id,
-                "name": flow.name,
-                "signed_in": oauth::signed_in(user_dir, flow.id),
-                "needs_terminal": flow.needs_terminal,
+                "provider": format!("api-key:{}", p.id), "name":p.label,
+                "key_saved":saved.contains(&p.base_url), "can_remove":true
             })
         })
         .collect();
-    json!({ "providers": providers })
+    json!({ "providers": providers, "key_providers": key_providers })
 }
 
 #[cfg(test)]

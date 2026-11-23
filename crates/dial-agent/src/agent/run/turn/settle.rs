@@ -44,14 +44,13 @@ impl Agent<'_> {
             steering: round_steering,
             portable_batch_intercepted,
         } = outcome;
-        if progress != crate::agent::run::engine::RoundProgress::Productive
-            && (short_circuited
-                || execution_failed
-                || observed_check_failure
-                || !form_kinds.is_empty())
-        {
-            progress = crate::agent::run::engine::RoundProgress::Stalled;
-        }
+        progress = super::progress_machine::normalize_round_progress(
+            progress,
+            short_circuited,
+            execution_failed,
+            observed_check_failure,
+            !form_kinds.is_empty(),
+        );
         if let Some(reason) = engine.pending_refusal() {
             self.accept_steering(round_steering, ui)?;
             return self
@@ -83,27 +82,13 @@ impl Agent<'_> {
         // The first identical repeat past the escalation is answered with references; a model
         // that repeats it again is not changing approach, so the turn stops instead of spending
         // further requests on references to references.
-        if short_circuited
-            && let Some(repeat) = repeat_streak.as_ref()
-            && repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD + 1
-        {
-            let attempts = repeat.count + 1;
-            self.record(
-                step,
-                "repeated_call_stop",
-                json!({"name":repeat.tool_name,"count":attempts}),
-            )?;
-            let result = if repeat.result_summary.is_empty() {
-                "(no text result)"
-            } else {
-                repeat.result_summary.as_str()
-            };
-            let reason = format!(
-                "Blocked: the model sent the identical `{}` call {attempts} times in a row and kept repeating it after being told it would not run again.\nArguments: `{}`\nLast executed result: `{result}`\nCompleted effects and the conversation are kept; no completion was recorded. Send a direction (for example the corrected command) or say \"continue\" to resume.",
-                repeat.tool_name, repeat.arguments_summary
-            );
-            let mut report = self.stop_turn(ui, reason, step + 1)?;
-            report.outcome = TurnOutcome::Blocked;
+        if let Some(hard_stop) = super::progress_machine::repeated_call_hard_stop(
+            short_circuited,
+            repeat_streak.as_ref(),
+        ) {
+            self.record(step, hard_stop.event_kind, hard_stop.event_data)?;
+            let mut report = self.stop_turn(ui, hard_stop.reason, step + 1)?;
+            report.outcome = hard_stop.outcome;
             return Ok(crate::agent::run::engine::Tick::Finished(report));
         }
         if let Some(check) = self.auto_registered_checks(ui) {
@@ -191,66 +176,48 @@ impl Agent<'_> {
                 }
             }
         }
-        if let Some(advice) = narration_warning {
+        let eval = super::progress_machine::evaluate_round(
+            super::progress_machine::RoundSignals {
+                raw_progress: progress,
+                short_circuited,
+                narration_warning,
+                round_succeeded,
+                tool_calls: &reply.tool_calls,
+                repeat_streak: repeat_streak.as_ref(),
+                form_kinds: &form_kinds,
+                execution_failed,
+                observed_check_failure,
+                round_checked,
+                mutations: self.step_checks.mutations,
+                failed_checks: self.step_checks.failed_checks.len(),
+                failing_tests: round_failing_tests.len(),
+                unnamed_failures: round_unnamed_failures,
+                gradient_rounds: self.config.experimental.outcome_gradient_rounds,
+                reliability_enabled: self.config.reliability.enabled,
+                max_contract_failures: self.config.reliability.max_contract_failures,
+                hermetic: self.hermetic,
+            },
+            &mut turn.stall,
+            &mut turn.pace,
+            &mut turn.reliability,
+            &mut self.step_checks.outcome_gradient,
+        );
+        if let Some(advice) = eval.narration_event {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,
                 advice.as_str(),
             ));
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Loop,
-                advice,
-            ));
         }
-        // A short-circuited round neither failed nor succeeded, so it must not advance failure streaks.
-        let stall_round = if short_circuited {
-            crate::agent::safety::guard::Stall::None
-        } else {
-            turn.stall.round(!round_succeeded)
-        };
-        let warning = match stall_round {
-            crate::agent::safety::guard::Stall::Warn(advice) => Some(advice),
-            crate::agent::safety::guard::Stall::None => None,
-        };
-        if let Some(advice) = warning {
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Failure,
-                advice,
-            ));
-        }
-        // A round in which work was withheld is not evidence of serial lookups.
-        turn.pace.observe_round(if short_circuited {
-            &[]
-        } else {
-            &reply.tool_calls
-        });
-        let gradient_rounds = self.config.experimental.outcome_gradient_rounds;
-        if round_checked && self.step_checks.mutations > 0 {
-            let score = self.step_checks.failed_checks.len()
-                + round_failing_tests.len()
-                + round_unnamed_failures;
-            if let Some(advice) = self
-                .step_checks
-                .outcome_gradient
-                .observe(score, gradient_rounds)
-            {
-                turn.pending_nudges.push(crate::agent::run::guidance::note(
-                    crate::agent::run::guidance::Priority::Loop,
-                    advice,
-                ));
-            }
+        for (priority, advice) in eval.advisories {
+            turn.notices.push_advisory(priority, advice);
         }
         if let Some(plan) = self.pending_plan.take() {
             self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
         }
-        turn.reliability
-            .round(!form_kinds.is_empty(), round_succeeded);
         // A reached escalation step takes effect at the next turn, so this turn's prompt and
         // offer stay as they are.
         self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui);
-        let tool_round_failed = progress == crate::agent::run::engine::RoundProgress::Stalled
-            || !form_kinds.is_empty()
-            || execution_failed
-            || observed_check_failure;
+        let tool_round_failed = eval.tool_round_failed;
         if !self.hermetic {
             let mut control = self.session.control_state();
             settle_reliability(
@@ -262,19 +229,6 @@ impl Agent<'_> {
             );
             self.session.set_control_state(control.clone())?;
             ui.request_policy(&control);
-            // Repeated contract failures escalate the guidance instead of ending the turn; the step
-            // budget still bounds the retries.
-            let failures = turn.reliability.consecutive_contract_failures;
-            let limit = self.config.reliability.max_contract_failures;
-            if self.config.reliability.enabled
-                && limit > 0
-                && failures >= limit
-                && failures.is_multiple_of(limit)
-            {
-                turn.pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Failure, format!(
-                        "[Escalation from dial] {failures} tool calls in a row broke the tool contract, and none of the rejected calls ran. Call only the offered tools, with arguments that match their schemas exactly. Do not restate the rules or explain the failure at length: make the next call now."
-                    )));
-            }
             let mut result = control["adaptive_policy"]["result"].clone();
             result["tool_round_failed"] = json!(tool_round_failed);
             result["next_observed_phase"] = json!(self.request_phase.phase);
@@ -354,19 +308,28 @@ impl Agent<'_> {
             };
             match outcome {
                 Ok(answer) => {
-                    turn.automatic_coach_pending = true;
-                    turn.pending_nudges.push(
-                        crate::agent::verify::auto_escalation::advice_message(
-                            answer["advice"].as_str().unwrap_or_default(),
-                        ),
-                    );
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Coach, "Automatic escalation: the coach model's unverified advice is added to the next turn.",));
                     let cost = self.session_cost.unwrap_or(0.0) - before.unwrap_or(0.0);
-                    self.record(
-                        step,
-                        "auto_escalation",
-                        json!({"status":"advised","cost":cost}),
-                    )?;
+                    if let Some(note) = crate::agent::verify::auto_escalation::advice_note(
+                        answer["advice"].as_str().unwrap_or_default(),
+                    ) {
+                        turn.automatic_coach_pending = true;
+                        turn.notices.push_raw(note);
+                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                            crate::agent::ui::ui_event::EventKind::Coach,
+                            "Automatic escalation: the coach model's unverified advice is added to the next turn.",
+                        ));
+                        self.record(
+                            step,
+                            "auto_escalation",
+                            json!({"status":"advised","cost":cost}),
+                        )?;
+                    } else {
+                        self.record(
+                            step,
+                            "auto_escalation",
+                            json!({"status":"empty","cost":cost}),
+                        )?;
+                    }
                 }
                 Err(error) => {
                     let reason = format!("{error:#}");
@@ -388,7 +351,7 @@ impl Agent<'_> {
             && let Some(note) =
                 self.coach_round(&mut turn.coach_turn, backend, turn.user_goal, step, ui)?
         {
-            turn.pending_nudges.push(note);
+            turn.notices.push_raw(note);
         }
         if let Some(mut message) = stop {
             if self.hermetic {
@@ -492,64 +455,19 @@ impl Agent<'_> {
         }
         turn.names = self.offered();
         *schemas = self.schemas(&turn.names)?;
-        if let Some(mut finish) = finished {
-            let accepted_live = self.flush_accepted_live_steering(ui)?;
-            if self.take_steering(ui)? || accepted_live {
-                turn.steering_pending = true;
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if self.interrupt.load(Ordering::SeqCst) {
-                return Ok(crate::agent::run::engine::Tick::Finished(
-                    TurnReport::interrupted(step + 1),
-                ));
-            }
-            // Past a deadline or cost cap the answer is delivered without another coach call.
-            let reviewable = self.stop_boundary().is_none();
-            if finish.outcome == TurnOutcome::Completed {
-                if reviewable && let Some(message) = self.quality_review(ui)? {
-                    turn.pending_nudges.push(message);
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                if reviewable
-                    && let Some(message) = self.coach_completion(
-                        &mut turn.coach_turn,
-                        backend,
-                        turn.user_goal,
-                        &finish.text,
-                        step,
-                        ui,
-                    )?
-                {
-                    turn.pending_nudges.push(message);
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                finish.text.push_str(&turn.coach_turn.completion_note());
-                finish.text = self
-                    .step_checks
-                    .visual
-                    .summary(finish.text, self.step_checks.revision());
-                if self.capture_training_requests() {
-                    self.training_capture.record(
-                        &context_before,
-                        &request_tools,
-                        llm::assistant_message(&reply),
-                        reply.wire_form,
-                    );
-                }
-            }
-            if self.external_thinking_instruction().is_some() {
-                finish.text =
-                    crate::agent::modes::external_thinking::strip_scratchpad(&finish.text);
-            }
-            self.push(json!({"role":"assistant","content":finish.text}))?;
-            ui.text_delta(&finish.text);
-            return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                text: finish.text,
-                outcome: finish.outcome,
-                steps: step + 1,
-                interrupted: false,
-                trajectory: None,
-            }));
+        if let Some(finish) = finished {
+            return self.finalize_turn_delivery(
+                turn,
+                backend,
+                ui,
+                super::finalize::DeliveryContext {
+                    step,
+                    reply: &reply,
+                    context_before: &context_before,
+                    request_tools: &request_tools,
+                },
+                super::finalize::DeliverySurface::Finish(finish),
+            );
         }
         if self.interrupt.load(Ordering::SeqCst) {
             return Ok(crate::agent::run::engine::Tick::Finished(

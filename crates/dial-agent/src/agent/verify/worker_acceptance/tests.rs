@@ -44,15 +44,22 @@ fn observed(code: i32) -> ToolOutput {
 
 #[test]
 fn only_observed_current_configured_checks_accept_a_candidate() {
-    let (_dir, workspace, config) = fixture();
-    for (output, expected) in [
-        (observed(0), State::Accepted),
-        (observed(1), State::Rejected),
+    let (_dir, workspace, mut config) = fixture();
+    for (command, output, expected) in [
+        ("configured-command", observed(0), State::Accepted),
         (
+            "false | true # set -o pipefail",
+            observed(0),
+            State::NeedsVerification,
+        ),
+        ("configured-command", observed(1), State::Rejected),
+        (
+            "configured-command",
             ToolOutput::ok("passed; evidence: artifact://obsolete-report".into()),
             State::NeedsVerification,
         ),
         (
+            "configured-command",
             ToolOutput::ok("running 0 tests\n".into()).with_process(ProcessOutcome {
                 started: true,
                 exit_code: Some(0),
@@ -64,6 +71,7 @@ fn only_observed_current_configured_checks_accept_a_candidate() {
             State::NeedsVerification,
         ),
     ] {
+        config.commands[0].command = command.into();
         let receipt = evaluate_with(
             &workspace,
             &config,

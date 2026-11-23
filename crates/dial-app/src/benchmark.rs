@@ -215,6 +215,13 @@ pub struct PostCheckTiming {
     pub send_id: u64,
     pub elapsed_ms: u64,
     pub end: PostCheckEnd,
+    /// Model-declared open deliverables at the pass; absent for legacy children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_declared_deliverables: Option<u64>,
+    /// Distinct top-level running inference nodes first observed after the pass. A lower bound,
+    /// including on a deadline; never interpreted as the total number of network attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model_starts_after_pass: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -635,6 +642,9 @@ pub struct UsefulWork {
     /// Sum of case runtimes, not benchmark wall time (which includes external verification).
     pub attempted_elapsed_ms: u64,
     pub elapsed_ms_per_verified_completion: Option<f64>,
+    /// All-attempt runtime-ledger requests divided by independently verified completions.
+    #[serde(default)]
+    pub requests_per_verified_completion: Option<f64>,
     /// Unknown unless every attempted case has complete observed token usage.
     pub tokens_per_verified_completion: Option<f64>,
     /// Unknown unless every attempted case has complete observed API pricing.
@@ -659,6 +669,13 @@ impl UsefulWork {
         let elapsed = cases
             .iter()
             .fold(0u64, |sum, c| sum.saturating_add(c.metrics.elapsed_ms));
+        let requests = cases.iter().try_fold(0u64, |sum, case| {
+            let metrics = &case.metrics;
+            if metrics.token_usage_incomplete {
+                return None;
+            }
+            sum.checked_add(metrics.runtime_usage.as_ref()?["all"]["requests"].as_u64()?)
+        });
         let tokens = cases.iter().try_fold(0u64, |sum, c| {
             (c.metrics.token_usage_observed && !c.metrics.token_usage_incomplete).then(|| {
                 sum.saturating_add(c.metrics.prompt_tokens)
@@ -678,6 +695,9 @@ impl UsefulWork {
             attempted_elapsed_ms: elapsed,
             elapsed_ms_per_verified_completion: (completed > 0 && elapsed > 0)
                 .then(|| elapsed as f64 / completed as f64),
+            requests_per_verified_completion: requests
+                .filter(|_| completed > 0)
+                .map(|requests| requests as f64 / completed as f64),
             tokens_per_verified_completion: tokens
                 .filter(|_| completed > 0)
                 .map(|tokens| tokens as f64 / completed as f64),

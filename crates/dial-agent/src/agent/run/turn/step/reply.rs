@@ -28,12 +28,7 @@ impl Agent<'_> {
         // ends in text, a tool dispatch, or a guidance discard. Pre-reply regenerations, stream failures
         // and interceptions return earlier and are not counted.
         self.metrics.tool_trace.record_offered(&sent.request_tools);
-        if self.external_thinking_instruction().is_some() {
-            reply.text = crate::agent::modes::external_thinking::strip_scratchpad(&reply.text);
-            if !sent.research_step && !reply.text.is_empty() {
-                ui.text_delta(&reply.text);
-            }
-        }
+        self.normalize_reply(&mut reply, !sent.research_step, ui);
         self.context_meter.complete(
             sent.request_estimate,
             sent.request_context,
@@ -149,10 +144,7 @@ impl Agent<'_> {
                         .map(ControlFlow::Break);
                 }
             };
-            if let Some(message) = message {
-                turn.pending_nudges
-                    .push(json!({"role":"user","dial_transient":true,"content":message}));
-            }
+            turn.notices.replace_research_correction(message);
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
         }
         let length_facts = crate::agent::run::reply_triage::LengthFacts {
@@ -226,15 +218,10 @@ impl Agent<'_> {
                         .recover("continue truncated output without executing a partial tool call");
                     turn.recovering_output = true;
                     if let Some(text) = partial {
-                        let text = if self.external_thinking_instruction().is_some() {
-                            crate::agent::modes::external_thinking::strip_scratchpad(&text)
-                        } else {
-                            text
-                        };
+                        let text = self.normalize_visible_text(&text);
                         self.push(json!({"role":"assistant","content":text}))?;
                     }
-                    turn.pending_nudges
-                        .push(json!({"role":"user","content":message,"dial_transient":true}));
+                    turn.notices.push_protocol(message);
                     turn.refund_unusable(ui);
                 }
                 Truncation::Stop(reason) | Truncation::ReasoningExhausted(reason) => {
@@ -388,9 +375,7 @@ impl Agent<'_> {
             failed.kinds.push(failure.kind().into());
             match failure {
                 FormFailure::DroppedCall => {
-                    turn.pending_nudges.push(
-                        json!({"role":"user","content":failure.correction(),"dial_transient":true}),
-                    );
+                    turn.notices.push_protocol(failure.correction());
                 }
                 FormFailure::TextCall => {
                     failed.reject(json!({"role":"assistant","content":reply.text.clone()}));
@@ -401,16 +386,20 @@ impl Agent<'_> {
             turn.refund_unusable(ui);
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
         }
-        // A tool-free yield with outstanding owned work is a runtime wait, not a reason to
+        let plain = reply.tool_calls.is_empty();
+        let plain_signals =
+            plain.then(|| crate::agent::verify::reply_signals::ReplySignals::classify(&reply.text));
+        let declared = plain_signals.and_then(|signals| signals.declared);
+        let asks_user = plain_signals
+            .is_some_and(|signals| signals.declared.is_none() && signals.awaiting_input);
         // spend another inference asking the model to poll. Explicit blockers/questions still
         // end normally; uncertain effects must stop rather than enter another continuation.
-        if reply.tool_calls.is_empty()
+        if plain
             && !self.hermetic
             && (turn.budget.limit() == 0 || turn.budget.spent() < turn.budget.limit())
             && engine.pending_refusal().is_none()
-            && !crate::agent::verify::completion::awaiting_input(&reply.text)
-            && crate::agent::verify::completion::declared_outcome(&reply.text)
-                .is_none_or(|outcome| outcome == TurnOutcome::Completed)
+            && !asks_user
+            && declared.is_none()
             && self.wait_for_background_event(ui)?
         {
             if !reply.text.trim().is_empty() {
@@ -443,8 +432,7 @@ impl Agent<'_> {
                 if !reply.text.trim().is_empty() {
                     self.push(json!({"role":"assistant","content":reply.text}))?;
                 }
-                turn.pending_nudges
-                    .push(json!({"role":"user","content":message,"dial_transient":true}));
+                turn.notices.push_protocol(message);
                 turn.refund_unusable(ui);
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
@@ -508,24 +496,25 @@ impl Agent<'_> {
                     }),
                 ));
             }
-            let requested = crate::agent::verify::completion::declared_outcome(&reply.text)
-                .unwrap_or_else(|| {
-                    if crate::agent::verify::completion::awaiting_input(&reply.text) {
-                        TurnOutcome::NeedsInput
-                    } else {
-                        TurnOutcome::Completed
-                    }
-                });
-            if requested == TurnOutcome::Completed && self.await_background_jobs(ui) {
+            if declared.is_none() && !asks_user && self.await_background_jobs(ui) {
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
-            match self.completion_decision(requested, &reply.text, ui) {
+            let requested = declared.unwrap_or(if asks_user {
+                TurnOutcome::NeedsInput
+            } else {
+                TurnOutcome::Completed
+            });
+            let typed_pause = turn.names.iter().any(|name| name == "finish");
+            let channel = crate::agent::verify::completion::ReplyChannel::Plain {
+                typed_pause,
+                asks_user,
+                signals: plain_signals,
+            };
+            match self.completion_decision(requested, channel, ui) {
                 crate::agent::verify::completion::Decision::Continue(note) => {
                     turn.completion_candidate = Some(reply.text.clone());
-                    turn.pending_nudges.push(crate::agent::run::guidance::note(
-                        crate::agent::run::guidance::Priority::Review,
-                        note,
-                    ));
+                    turn.notices
+                        .push_advisory(crate::agent::run::guidance::Priority::Review, note);
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }
                 crate::agent::verify::completion::Decision::Incomplete(reason) => {
@@ -555,7 +544,7 @@ impl Agent<'_> {
                 crate::agent::verify::completion::Decision::Accept(_) => {}
             }
             let route = self.route.generation();
-            if self.before_yield(backend, &turn.names, &mut turn.pending_nudges, ui)? {
+            if self.before_yield(backend, &turn.names, turn.notices.pending_mut(), ui)? {
                 if self.route.generation() != route {
                     turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
                 }
@@ -572,58 +561,28 @@ impl Agent<'_> {
                     .any(|name| !turn.names.contains(name) && self.tool_eligible(name));
             if turn.capability_search.remind(&reply.text, loadable_tools) {
                 ui.notice("Answer denies a capability without a tool search; asking once to search the catalog.");
-                turn.pending_nudges.push(crate::agent::run::guidance::note(
+                turn.notices.push_advisory(
                     crate::agent::run::guidance::Priority::Review,
                     crate::agent::verify::completion::CAPABILITY_SEARCH_REMINDER,
-                ));
-                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-            }
-            if let Some(message) = self.quality_review(ui)? {
-                turn.pending_nudges.push(message);
-                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-            }
-            if let Some(message) = self.coach_completion(
-                &mut turn.coach_turn,
-                backend,
-                turn.user_goal,
-                &reply.text,
-                sent.step,
-                ui,
-            )? {
-                turn.pending_nudges.push(message);
-                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-            }
-            let note = turn.coach_turn.completion_note();
-            if !note.is_empty() {
-                reply.text.push_str(&note);
-                ui.text_delta(&note);
-            }
-            self.disclose_turn_changes(ui);
-            if self.capture_training_requests() {
-                self.training_capture.record(
-                    &sent.context_before,
-                    &sent.request_tools,
-                    llm::assistant_message(&reply),
-                    reply.wire_form,
                 );
+                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
-            let streamed_len = reply.text.len();
-            let text = self
-                .step_checks
-                .visual
-                .summary(reply.text, self.step_checks.revision());
-            if text.len() > streamed_len {
-                ui.text_delta(&text[streamed_len..]);
-            }
-            return Ok(ControlFlow::Break(
-                crate::agent::run::engine::Tick::Finished(TurnReport {
-                    text,
-                    outcome: TurnOutcome::Completed,
-                    steps: sent.step + 1,
-                    interrupted: false,
-                    trajectory: None,
-                }),
-            ));
+            return self
+                .finalize_turn_delivery(
+                    turn,
+                    backend,
+                    ui,
+                    super::super::finalize::DeliveryContext {
+                        step: sent.step,
+                        reply: &reply,
+                        context_before: &sent.context_before,
+                        request_tools: &sent.request_tools,
+                    },
+                    super::super::finalize::DeliverySurface::Plain {
+                        outcome: TurnOutcome::Completed,
+                    },
+                )
+                .map(ControlFlow::Break);
         }
         Ok(ControlFlow::Continue(ReceivedReply { reply, sent }))
     }

@@ -56,6 +56,36 @@ fn model_history_keeps_controller_execution_and_integrity_facts() {
 }
 
 #[test]
+fn history_records_a_typed_result_origin_and_null_for_executed_calls() {
+    let executed = message("c1", &ToolOutput::ok("ran".to_owned()));
+    assert_eq!(executed["dial_result_origin"], serde_json::Value::Null);
+    let duplicate = message(
+        "c2",
+        &ToolOutput::ok("[Not executed: identical to your earlier ...]".to_owned())
+            .with_result_origin(ResultOrigin::Duplicate {
+                call_id: "c1".into(),
+            }),
+    );
+    assert_eq!(
+        duplicate["dial_result_origin"],
+        serde_json::json!({"kind":"duplicate","call_id":"c1"})
+    );
+    let mut refused = ToolOutput::err("Failed-operation retry barrier: x")
+        .with_status(ToolStatus::Blocked)
+        .with_effects(Effects::None);
+    refused.execution.retry_barrier = true;
+    let barrier = message("c3", &refused);
+    assert_eq!(
+        barrier["dial_result_origin"],
+        serde_json::json!({"kind":"retry_barrier"})
+    );
+    assert_eq!(
+        skipped("c4", "This call was not executed.")["dial_result_origin"],
+        serde_json::json!({"kind":"skipped"})
+    );
+}
+
+#[test]
 fn edit_projection_is_named_digest_bound_and_never_applied_to_errors() {
     let model = "[a.txt#ABCD]\nupdated (+1 -1 lines)\n1:new\n";
     let raw = format!("{model}\nchange preview (+1 -1 lines)\n-old\n+new\n");

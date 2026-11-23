@@ -1,5 +1,5 @@
 version = 1
-name = "lifecycle-efficiency"
+name = "lifecycle-efficiency-v2"
 
 # Real configured models use the normal runner and its observed usage/efficiency counters.
 [[cases]]
@@ -12,9 +12,9 @@ checks = [{kind="response_equals",content="4"}, {kind="metric",metric="tool_call
 [[cases]]
 id = "investigate-before-asking"
 project = "examples/benchmarks/efficiency-fixture"
-prompt = "Investigate the arithmetic failure in this project's calculator and explain its cause."
+prompt = "Investigate the arithmetic failure in this project's calculator without changing files. Identify the broken function, the Python operator it uses, and the one it should use. Reply only in the form module.function: actual instead of expected, using operator symbols."
 categories = ["lifecycle", "read_only"]
-checks = [{kind="tool_invoked",tool="read"}, {kind="metric",metric="questions_before_investigation",max=0}, {kind="metric",metric="completion_nudges",max=0}, {kind="metric",metric="full_builds",max=0}, {kind="metric",metric="delivered_answer_bytes",max=2400}]
+checks = [{kind="response_equals",content="calc.add: - instead of +"}, {kind="tool_invoked",tool="read"}, {kind="metric",metric="questions_before_investigation",max=0}, {kind="metric",metric="completion_nudges",max=0}, {kind="metric",metric="full_builds",max=0}, {kind="metric",metric="delivered_answer_bytes",max=2400}]
 
 [[cases]]
 id = "finish-the-fix"

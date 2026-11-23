@@ -4,9 +4,9 @@
 
 mod bundled;
 pub use bundled::{
-    ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models,
-    documented_thinking_levels, known_context_window, model_capabilities, model_protocol,
-    provider_endpoint,
+    BuiltinProvider, ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models,
+    documented_thinking_levels, key_providers, known_context_window, model_capabilities,
+    model_protocol, provider_endpoint,
 };
 
 mod cache;
@@ -25,9 +25,10 @@ pub use cache::{saved_listing_models, saved_subscription_models};
 pub(crate) use credentials::origin;
 pub use credentials::{
     EndpointSettings, credential_token, fill_endpoint_template, known_key_env, remove_credential,
-    remove_provider_credentials, resolve_credential, save_credential, set_cli_api_key,
+    remove_provider_credentials, resolve_credential, save_credential, saved_credential_urls,
+    set_cli_api_key, stored_credential_urls,
 };
-use credentials::{bundled_endpoints, saved_credential_urls, validated_url};
+use credentials::{bundled_endpoints, validated_url};
 use local_models::{annotate_embedding_checkpoints, lora_support, mlx_architectures, snapshot};
 pub(crate) use local_models::{
     chat_template, hf_cache, local_model_entries, read_json, uses_mlx_vlm,

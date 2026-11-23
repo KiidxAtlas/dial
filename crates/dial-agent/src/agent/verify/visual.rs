@@ -21,16 +21,8 @@ fn without_compound_identifiers(prompt: &str) -> String {
         .collect()
 }
 
-pub fn useful(prompt: &str) -> bool {
-    // A Type client can prepend a briefing whose appearance words are not the user's request.
-    let type_prompt = prompt
-        .strip_prefix("[[type:")
-        .and_then(|tail| tail.split_once("]]\n"));
-    let prompt = type_prompt.map_or(prompt, |(_, body)| {
-        body.strip_prefix("<type-context>\n")
-            .and_then(|context| context.split_once("\n</type-context>\n"))
-            .map_or(body, |(_, request)| request)
-    });
+/// `in_type`: the turn belongs to a Type conversation, where appearance words are design requests.
+pub fn useful(prompt: &str, in_type: bool) -> bool {
     let words: HashSet<String> = dial_core::prose::words(prompt).collect();
     let any = |terms: &[&str]| terms.iter().any(|term| words.contains(*term));
     // UI subjects and edit verbs count only as standalone words: crate names and paths such as
@@ -52,7 +44,7 @@ pub fn useful(prompt: &str) -> bool {
     ];
     any(&["screenshot", "visually", "appearance"])
         || (words.contains("visual") && any(&["inspect", "inspection", "verify", "verification"]))
-        || (type_prompt.is_some()
+        || (in_type
             && (any_standalone(&["redesign", "restyle"])
                 || (any_standalone(APPEARANCE)
                     && any_standalone(&["better", "fix", "change", "improve", "bad", "broken"]))))
@@ -89,9 +81,9 @@ pub struct Review {
 }
 
 impl Review {
-    pub fn new(prompt: &str) -> Self {
+    pub fn new(prompt: &str, in_type: bool) -> Self {
         Self {
-            required: useful(prompt),
+            required: useful(prompt, in_type),
             ..Self::default()
         }
     }

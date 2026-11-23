@@ -104,7 +104,7 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         ),
         "doctor" | "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
         "update" => Terminal("installs a new binary; use `dial update`"),
-        "providers" => Terminal("provider setup wizard; use set_setting and login"),
+        "providers" => Terminal("provider setup wizard; use set_setting, login and remove_api_key"),
         "commit" | "git" | "wt" | "changes" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),

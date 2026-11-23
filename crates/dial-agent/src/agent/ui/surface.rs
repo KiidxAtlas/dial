@@ -115,6 +115,11 @@ pub trait Ui {
     fn efficiency(&mut self, _report: &Value) {}
     /// A check just executed and received a passing verification verdict (not cached evidence).
     fn check_passed(&mut self) {}
+    /// Count model-declared deliverables still open at the instant of the verdict. Most UIs
+    /// need only the verdict and need not materialize a working-state snapshot.
+    fn check_passed_with_delivery(&mut self, _open_count: &dyn Fn() -> usize) {
+        self.check_passed();
+    }
     fn model_progress(&mut self, _progress: &llm::ModelProgress) {}
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     /// Latest progress snapshot for a running tool; replaces the previous one in place.

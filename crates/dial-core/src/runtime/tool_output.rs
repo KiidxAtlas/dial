@@ -94,6 +94,12 @@ impl ToolOutput {
         self.execution.shell_launch = Some(launch);
         self
     }
+    /// Record that the controller answered without executing the call.
+    pub fn with_result_origin(mut self, origin: super::execution::ResultOrigin) -> Self {
+        self.execution.result_origin = Some(origin);
+        self
+    }
+
     pub fn with_status(mut self, status: ToolStatus) -> Self {
         self.execution.status = Some(status);
         self.is_error |= status != ToolStatus::Ok;

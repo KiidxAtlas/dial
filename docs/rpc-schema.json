@@ -1332,6 +1332,21 @@
                     "type": "string",
                     "minLength": 1
                   }
+                },
+                "type_context": {
+                  "description": "The Type the prompt was written in. Null: a modern prompt that names no Type; its text is the user's own words, even when it looks like legacy framing. Object: the Type; `id` is kept on the stored user message and `briefing` is model-only context, never part of `text`. Absent: a client that predates this field; a `[[type:ID]]` line on its own at the start of `text`, optionally followed by a complete `<type-context>` block, is read as framing. Clients send this field only when ready.features.type_context is true.",
+                  "oneOf": [
+                    {"type": "null"},
+                    {
+                      "type": "object",
+                      "properties": {
+                        "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+                        "briefing": {"type": "string", "minLength": 1, "maxLength": 65536}
+                      },
+                      "required": ["id", "briefing"],
+                      "additionalProperties": false
+                    }
+                  ]
                 }
               },
               "additionalProperties": false,
@@ -2262,6 +2277,25 @@
               },
               "additionalProperties": false,
               "required": ["provider"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Remove only the local saved credential for a catalog API-key provider, without signing out or revoking the key at its issuer.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "remove_api_key"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "pattern": "^api-key:.+"},
+                "confirm": {"const": true}
+              },
+              "additionalProperties": false,
+              "required": ["provider", "confirm"]
             }
           },
           "required": ["method", "params"],
@@ -3855,6 +3889,13 @@
             },
             "question_input": {
               "type": "object"
+            },
+            "features": {
+              "type": "object",
+              "description": "Optional request features this engine accepts; a missing key means unsupported.",
+              "properties": {
+                "type_context": {"type": "boolean"}
+              }
             }
           },
           "required": [
@@ -4084,6 +4125,7 @@
           "description": "A recognized main-agent check just ran and received a passing verdict. Not a cached pass or a claim that the task is complete.",
           "properties": {
             "event": {"const": "check_passed"},
+            "open_declared_deliverables": {"type": "integer", "minimum": 0, "description": "Outstanding deliverables recorded in working state at the pass. Zero is not independent evidence that every requested deliverable is complete."},
             "seq": {"type": "integer", "minimum": 1},
             "session_id": {"type": "string"},
             "request_id": {"type": ["string", "integer", "null"]}

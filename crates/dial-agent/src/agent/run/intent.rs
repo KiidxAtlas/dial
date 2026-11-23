@@ -69,10 +69,17 @@ pub(in crate::agent) fn record(control: &mut Value, text: &str, entry_id: Value,
 }
 
 /// Restore admitted user provenance when history no longer carries the latest request, as after
-/// compaction. A user turn still visible verbatim in history is not repeated: reissuing it at every
-/// tool boundary costs tokens and can look like a new turn, earlier turns or not. Steering keeps
+/// compaction. A user turn is not repeated while its admitted entry is still in the model-visible
+/// history: reissuing it at every tool boundary costs tokens and can look like a new turn. Identity
+/// is the journal entry ID, never message text, which tool output or other notes can repeat.
+/// Turns without an entry ID, or with migrated `legacy_context`, are always re-attached. Steering keeps
 /// its explicit precedence reminder because it arrives mid-turn.
-pub(in crate::agent) fn request_context(control: &Value, messages: &[Value]) -> Option<String> {
+/// With the turn optimizer on, this block is not projected: the reviewed draft is inline in the
+/// user message and is never compared against history text, so no draft-text match exists.
+pub(in crate::agent) fn request_context(
+    control: &Value,
+    is_visible: impl Fn(&str) -> bool,
+) -> Option<String> {
     const MAX_TEXT_BYTES: usize = 4096;
     const OMITTED: &str =
         "\n[... middle omitted; full user message remains in session history ...]\n";
@@ -83,14 +90,10 @@ pub(in crate::agent) fn request_context(control: &Value, messages: &[Value]) -> 
     let text = latest["text"]
         .as_str()
         .filter(|text| !text.trim().is_empty())?;
+    // Legacy control state (migrated legacy_context present) cannot prove what is visible: re-attach.
     if latest["kind"] == "user_turn"
         && control["user_intent"]["legacy_context"].is_null()
-        && messages.iter().any(|message| {
-            message["role"] == "user"
-                && message["dial_context_request"] == true
-                && message["dial_transient"] != true
-                && message["content"].as_str() == Some(text)
-        })
+        && latest["entry_id"].as_str().is_some_and(&is_visible)
     {
         return None;
     }

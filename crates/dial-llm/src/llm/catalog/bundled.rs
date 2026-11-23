@@ -99,6 +99,17 @@ pub fn builtin_providers() -> &'static [BuiltinProvider] {
     &PROVIDERS
 }
 
+/// Hosted catalog endpoints for which the UI can offer a key without asking for a URL.
+pub fn key_providers() -> impl Iterator<Item = &'static BuiltinProvider> {
+    builtin_providers().iter().filter(|p| {
+        routable(p.protocol)
+            && p.base_url.starts_with("https://")
+            && !p.base_url.contains('<')
+            && p.env_keys().next().is_some()
+            && crate::llm::oauth::flow(&p.id).is_none()
+    })
+}
+
 pub fn builtin_provider(id: &str) -> Option<&'static BuiltinProvider> {
     builtin_providers()
         .iter()

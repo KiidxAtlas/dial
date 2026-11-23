@@ -282,6 +282,10 @@ fn read_only_pipelines_are_not_counted_as_effects_outside_undo() {
         "find . -type f -exec wc -c {} + | sort -rn | head -5",
         "grep -rn foo src | cut -d: -f1 | uniq",
         "git log --oneline | head -3",
+        "git status --short; git diff HEAD -- src | head",
+        "rg -n foo src | sort | uniq",
+        "df -h . && du -sh target",
+        "git grep -n foo | wc -l",
     ] {
         assert!(!opaque_shell_effect(quiet), "{quiet}");
     }
@@ -294,6 +298,11 @@ fn read_only_pipelines_are_not_counted_as_effects_outside_undo() {
         "find . -delete",
         "cat x > y",
         "cargo build | head",
+        "rg --pre cat foo",
+        "git diff --output=x",
+        "git grep -O foo",
+        "git -c core.pager=less diff",
+        "git branch new",
     ] {
         assert!(opaque_shell_effect(effect), "{effect}");
     }

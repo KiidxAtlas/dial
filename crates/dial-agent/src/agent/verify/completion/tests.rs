@@ -138,6 +138,28 @@ fn explicit_clarification_is_not_a_rhetorical_question() {
     ));
     assert!(!awaiting_input("```\ncan you clarify?\n```"));
 }
+#[test]
+fn plain_questions_for_the_user_are_classified_and_rhetorical_questions_are_not() {
+    for (text, asks) in [
+        ("Which branch should I use?", true),
+        (
+            "I found two targets.\n\nShould I proceed with the first?",
+            true,
+        ),
+        ("Do you want the docs updated too?", true),
+        ("Do you prefer tabs or spaces?", true),
+        ("Why did you create that task?", false),
+        ("The regression now passes. What changed?", false),
+        ("Which is why it failed?", false),
+        (
+            "Which branch should I use?\n\nI'll proceed with main.",
+            false,
+        ),
+        ("```\nwhich branch should I use?\n```", false),
+    ] {
+        assert_eq!(awaiting_input(text), asks, "{text}");
+    }
+}
 
 #[test]
 fn needs_input_parses_optional_bounded_choices() {
@@ -306,4 +328,53 @@ Rewrote the read description."
     );
     let long = rejected_report("x", &"word ".repeat(400), TurnOutcome::Incomplete);
     assert!(long.chars().count() < 700 && long.contains('…'), "{long}");
+}
+
+#[test]
+fn explicit_finish_outcomes_do_not_depend_on_summary_wording() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        for outcome in [
+            TurnOutcome::Completed,
+            TurnOutcome::Answered,
+            TurnOutcome::Blocked,
+            TurnOutcome::NeedsInput,
+        ] {
+            let decision = agent.completion_decision(
+                outcome,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            );
+            assert!(
+                matches!(decision, Decision::Accept(accepted) if accepted == outcome),
+                "expected explicit {outcome:?} to be accepted directly"
+            );
+        }
+    });
+}
+
+#[test]
+fn comparison_wording_does_not_spend_the_recovery_for_actual_open_work() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let mut control = agent.session.control_state();
+        control["current_instruction"] = json!("Compare the two versions");
+        agent.session.set_control_state(control).unwrap();
+        let finish =
+            Finish::parse(&json!({"outcome":"answered","summary":"I compared them."})).unwrap();
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                finish.outcome,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        assert!(matches!(
+            decide(agent),
+            Decision::Accept(TurnOutcome::Answered)
+        ));
+        agent.todo = todo();
+        assert!(matches!(decide(agent), Decision::Continue(_)));
+        assert!(matches!(decide(agent), Decision::Incomplete(_)));
+    });
 }

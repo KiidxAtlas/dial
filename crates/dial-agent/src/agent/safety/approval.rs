@@ -416,6 +416,11 @@ fn read_only_stage(stage: &str) -> bool {
             .iter()
             .any(|a| short_flag(a, 'o') || a.starts_with("--output")),
         "cut" | "tr" | "nl" | "rev" | "tac" | "column" => true,
+        // Report on files or the filesystem without changing them.
+        "df" | "du" | "diff" | "cmp" | "jq" | "realpath" | "readlink" | "basename" | "dirname"
+        | "shasum" | "sha256sum" | "md5sum" | "md5" | "whoami" => true,
+        // `--pre` runs a program on every searched file.
+        "rg" => !args.iter().any(|a| a.starts_with("--pre")),
         // A second operand is uniq's output file.
         "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
         "find" => {
@@ -435,9 +440,11 @@ fn read_only_stage(stage: &str) -> bool {
     }
 }
 
-/// Effect tracking only: `git log`, `show`, `rev-parse`, `ls-files`, `blame`, `shortlog` or
-/// `describe` read history and the index without writing the work tree. Options that write a file
-/// (`--output`) or run an external diff are excluded. Approval keeps the exact `safe_bash` forms.
+/// Effect tracking only: `git log`, `show`, `rev-parse`, `ls-files`, `blame`, `shortlog`,
+/// `describe`, `status`, `diff`, `grep`, `rev-list`, `cat-file`, `ls-tree` or `merge-base` read
+/// history, the index and the work tree without writing the work tree. Options that write a file
+/// (`--output`), run an external diff or open a pager on matches are excluded, as are leading
+/// `git` options such as `-c`. Approval keeps the exact `safe_bash` forms.
 fn history_inspection(command: &str) -> bool {
     let Some(words) = shell_words(command) else {
         return false;
@@ -446,12 +453,30 @@ fn history_inspection(command: &str) -> bool {
         && words.get(1).is_some_and(|sub| {
             matches!(
                 sub.as_str(),
-                "log" | "show" | "rev-parse" | "ls-files" | "blame" | "shortlog" | "describe"
+                "log"
+                    | "show"
+                    | "rev-parse"
+                    | "ls-files"
+                    | "blame"
+                    | "shortlog"
+                    | "describe"
+                    | "status"
+                    | "diff"
+                    | "grep"
+                    | "rev-list"
+                    | "cat-file"
+                    | "ls-tree"
+                    | "merge-base"
             )
         })
-        && !words[2..]
-            .iter()
-            .any(|w| w.starts_with("--output") || w == "--ext-diff" || w.starts_with("--exec"))
+        && !words[2..].iter().any(|w| {
+            w.starts_with("--output")
+                || w == "--ext-diff"
+                || w.starts_with("--exec")
+                || w == "-O"
+                || w.starts_with("--open-files-in-pager")
+                || (words[1] == "grep" && w.starts_with("-O"))
+        })
 }
 
 /// Split at unquoted `;`, `&&` and newlines; malformed quoting or escapes fail closed.

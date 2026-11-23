@@ -36,6 +36,8 @@ pub use model::backend::{Runtime, make_backend, make_session_backend, unconfigur
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
 pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage, PeerSender};
+#[cfg(any(test, feature = "test-support"))]
+pub use run::failure_guidance::test_provider_failure;
 pub use run::failure_guidance::user_failure_text;
 pub use run::scheduling_replay::{SchedulingReplay, replay_scheduling};
 pub use safety::approval;
@@ -203,8 +205,7 @@ struct StepChecks {
     eval_checks: verify::eval_checks::History,
     /// At most one local advisory awaiting a reply; never consulted by verification gates.
     repair_brief: Option<verify::checks::RepairBrief>,
-    /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
-    /// the completion gate when the model verifies through `bash` rather than `check`.
+    /// Revision of the latest successful foreground shell check explicitly declared or configured.
     shell_check_passed: Option<verify::evidence::Revision>,
     /// A foreground validation attempt exited 127. Never itself evidence of a code defect.
     validation_launch_gap: bool,
@@ -327,6 +328,13 @@ impl StepChecks {
             "failed_checks":self.failed_checks.iter().map(|check| &check.name).collect::<Vec<_>>()
         })
     }
+}
+
+/// The Type a user turn belongs to. Its id is kept on the message; its briefing is model-only context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeContext {
+    pub id: String,
+    pub briefing: Option<String>,
 }
 
 pub struct Agent<'a> {
@@ -464,6 +472,8 @@ pub struct Agent<'a> {
     side_questions: workers::side_questions::Questions,
     superseded: workflow::evidence::Supersession,
     legacy_memory_migrated: bool,
+    /// The Type the next user turn was written in; set by the RPC layer for that turn only.
+    pending_type: Option<TypeContext>,
     /// Live steering the server accepted for the reply in flight; journaled after that reply.
     accepted_live_steering: Vec<(Value, String)>,
     pending_tool_steering: Vec<String>,

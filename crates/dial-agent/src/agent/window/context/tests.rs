@@ -82,6 +82,7 @@ fn containment_removes_only_complete_earlier_paragraph_sequences() {
         path: PathBuf::from("AGENTS.md"),
         display: "AGENTS.md".into(),
         content: content.into(),
+        audience: InstructionAudience::ParentAndWorkers,
     };
     let base = "Shared rule A.\n\nShared rule B.";
     let fuller = format!("{base}\n\nProject-specific rule.");
@@ -126,6 +127,7 @@ fn overlap_dedup_removes_only_exact_shared_paragraphs_from_earlier_files() {
         path: PathBuf::from(path),
         display: path.into(),
         content: content.into(),
+        audience: InstructionAudience::for_source(Path::new(path)),
     };
     // Partial overlap: only the shared paragraph leaves the earlier file; its unique paragraphs,
     // their order and its label stay.
@@ -203,6 +205,24 @@ fn discovery_overlap_dedup_is_opt_in_and_keeps_labels() {
     assert_eq!(displays(&on), displays(&off));
     assert_eq!(on[0].content, "Root only.");
     assert_eq!(on[1].content, off[1].content);
+}
+
+#[test]
+fn parent_only_context_cannot_displace_inherited_instructions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(repo.join("CLAUDE.md"), "Shared.");
+    write(repo.join("pkg/AGENTS.local.md"), "Shared.\n\nParent only.");
+    let layout = layout_at(&repo.join("pkg"), &home.join("userdial"));
+    let files = discover_with_home(&layout, Some(&home), true);
+    let inherited: Vec<_> = files
+        .iter()
+        .filter(|f| f.audience == InstructionAudience::ParentAndWorkers)
+        .collect();
+    assert_eq!(inherited.len(), 1);
+    assert_eq!(inherited[0].content, "Shared.");
 }
 
 #[test]

@@ -404,3 +404,96 @@ fn checkpoint_and_follow_through_render_inside_one_envelope_with_quoted_data() {
         "quoted model text cannot close the envelope: {follow}"
     );
 }
+
+#[test]
+fn prose_wrapped_single_json_checkpoint_is_accepted_and_ambiguous_multi_object_is_rejected() {
+    let mut research = Research::default();
+    observations(&mut research, SYNTHESIS_ROUNDS, 1);
+    let json_body = json!({
+        "finding": "Brace {inside} string parses cleanly",
+        "evidence": ["read-5"],
+        "next_action": "Edit the owner module"
+    })
+    .to_string();
+    let mut wrapped = Reply {
+        text: format!(
+            "Here is the synthesis checkpoint:\n```json\n{json_body}\n```\nReady to continue."
+        ),
+        finish_reason: "stop".into(),
+        ..Default::default()
+    };
+    assert!(matches!(research.synthesize(&wrapped), Synthesis::Accepted));
+    assert_eq!(research.continuation.as_deref(), Some(json_body.as_str()));
+
+    // Two valid checkpoint JSON objects in one reply are ambiguous and rejected.
+    observations(&mut research, SYNTHESIS_ROUNDS, 1);
+    let first = json!({
+        "finding": "Candidate one",
+        "evidence": ["read-5"],
+        "next_action": "Do one"
+    });
+    let second = json!({
+        "finding": "Candidate two",
+        "evidence": ["read-5"],
+        "next_action": "Do two"
+    });
+    wrapped.text = format!("{first}\n{second}");
+    assert!(matches!(research.synthesize(&wrapped), Synthesis::Retry(_)));
+}
+
+#[test]
+fn structured_research_checkpoint_tool_call_is_validated_and_accepted() {
+    let schema = checkpoint_schema();
+    assert_eq!(schema["function"]["name"], CHECKPOINT_TOOL_NAME);
+    assert_eq!(
+        schema["function"]["parameters"]["required"],
+        json!(["finding", "evidence", "next_action"])
+    );
+
+    let mut research = Research::default();
+    observations(&mut research, SYNTHESIS_ROUNDS, 1);
+    let structured = Reply {
+        finish_reason: "tool_calls".into(),
+        tool_calls: vec![lookup(
+            99,
+            CHECKPOINT_TOOL_NAME,
+            json!({
+                "finding": "Structured checkpoint established root cause",
+                "evidence": ["read-5"],
+                "next_action": "Patch the handler"
+            }),
+        )],
+        ..Default::default()
+    };
+    assert!(matches!(
+        research.synthesize(&structured),
+        Synthesis::Accepted
+    ));
+    assert!(!research.required());
+    assert!(
+        research
+            .continuation
+            .as_deref()
+            .is_some_and(|text| text.contains("Structured checkpoint established root cause"))
+    );
+
+    // Smuggling another tool call alongside `research_checkpoint` must be rejected.
+    observations(&mut research, SYNTHESIS_ROUNDS, 1);
+    let mixed = Reply {
+        finish_reason: "tool_calls".into(),
+        tool_calls: vec![
+            lookup(
+                100,
+                CHECKPOINT_TOOL_NAME,
+                json!({
+                    "finding": "Another distinct finding",
+                    "evidence": ["read-5"],
+                    "next_action": "Edit file"
+                }),
+            ),
+            lookup(101, "read", json!({"path": "Cargo.toml"})),
+        ],
+        ..Default::default()
+    };
+    assert!(matches!(research.synthesize(&mixed), Synthesis::Retry(_)));
+}

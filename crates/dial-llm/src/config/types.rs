@@ -269,7 +269,7 @@ impl Default for Config {
             thinking_auto: false,
             worker_timeout_secs: 0,
             compute_locks: true,
-            context_window: 32768,
+            context_window: DEFAULT_CONTEXT_WINDOW,
             context_limit: ContextWindow::Auto,
             cloud_context_window: ContextWindow::Auto,
             local_context_window: ContextWindow::Auto,

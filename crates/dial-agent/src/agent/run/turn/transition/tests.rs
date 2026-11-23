@@ -1,7 +1,7 @@
 //! The reset table: what each transition clears and what survives it.
 use super::super::completion_tests::connect;
 use super::*;
-use crate::agent::run::guidance::{Priority, note};
+use crate::agent::run::guidance::Priority;
 use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 
 /// Mark every instruction-scoped and turn-wide field as used, so a reset is observable.
@@ -19,10 +19,10 @@ fn worn(turn: &mut TurnState<'_>) {
     turn.reviewed_paths.insert("src/lib.rs".into());
     turn.completion_candidate = Some("done".into());
     turn.reliability.consecutive_contract_failures = 2;
-    turn.pending_nudges = vec![
-        note(Priority::Failure, "old failure advice"),
-        note(Priority::Safety, "safety boundary"),
-    ];
+    turn.notices
+        .push_advisory(Priority::Failure, "old failure advice");
+    turn.notices
+        .push_advisory(Priority::Safety, "safety boundary");
 }
 
 fn with_turn(check: impl Fn(&mut TurnState<'_>)) {
@@ -56,9 +56,9 @@ fn steering_starts_the_instruction_over_but_keeps_turn_bounds_and_project_facts(
         assert_eq!(turn.reliability.consecutive_contract_failures, 0);
         assert_eq!(turn.enrichment_epoch, epoch.wrapping_add(1));
         // Only safety boundaries outlive the old task's advice.
-        assert_eq!(turn.pending_nudges.len(), 1);
+        assert_eq!(turn.notices.pending().len(), 1);
         assert!(
-            turn.pending_nudges[0]["content"]
+            turn.notices.pending()[0]["content"]
                 .as_str()
                 .unwrap()
                 .contains("safety boundary")
@@ -82,7 +82,7 @@ fn a_continuation_keeps_its_own_round_count_and_the_task_state() {
             assert!(turn.solo_todo_noted);
             assert!(turn.automatic_coach_pending);
             assert_eq!(turn.completion_candidate.as_deref(), Some("done"));
-            assert_eq!(turn.pending_nudges.len(), 2);
+            assert_eq!(turn.notices.pending().len(), 2);
         });
     }
 }
@@ -95,7 +95,7 @@ fn a_rewritten_context_keeps_the_task_state() {
         assert_eq!(turn.reliability.consecutive_contract_failures, 2);
         assert!(turn.compaction_failed);
         assert_eq!(turn.completion_candidate.as_deref(), Some("done"));
-        assert_eq!(turn.pending_nudges.len(), 2);
+        assert_eq!(turn.notices.pending().len(), 2);
         assert!(turn.reviewed_paths.contains("src/lib.rs"));
     });
 }
@@ -110,7 +110,7 @@ fn a_resumed_round_ends_the_rejected_attempt_but_keeps_delivered_advice_and_revi
         assert!(!turn.automatic_coach_pending);
         assert_eq!(turn.completion_candidate, None);
         assert_eq!(turn.reliability.consecutive_contract_failures, 0);
-        assert_eq!(turn.pending_nudges.len(), 1);
+        assert_eq!(turn.notices.pending().len(), 1);
         // Same instruction: no new enrichment epoch, and once-per-turn notes stay delivered.
         assert_eq!(turn.enrichment_epoch, epoch);
         assert!(turn.solo_todo_noted);

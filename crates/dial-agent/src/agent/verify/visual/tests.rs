@@ -1,4 +1,9 @@
 use super::*;
+
+/// Plain (non-Type) requests; the Type-context case passes `in_type` explicitly.
+fn useful(prompt: &str) -> bool {
+    super::useful(prompt, false)
+}
 #[test]
 fn visual_work_is_conditional_and_test_or_backend_edits_do_not_trigger_it() {
     assert!(useful("fix the spacing on this page"));
@@ -39,18 +44,26 @@ fn pagination_wording_does_not_request_visual_work() {
 
 #[test]
 fn type_context_is_not_the_users_visual_request() {
-    let prefix = "[[type:inspiration]]\n<type-context>\nImage board layout; change the look.\n</type-context>\n";
-    assert!(!useful(&format!("{prefix}Add the four items")));
-    assert!(!useful(&format!("{prefix}Take a look at the items")));
-    assert!(useful(&format!("{prefix}Restyle this")));
-    assert!(useful(&format!("{prefix}Take a screenshot")));
-    assert!(useful(&format!("{prefix}Make it look better")));
+    // The Type briefing is sent apart from the user's text, so only the typed request is judged.
+    for (request, expected) in [
+        ("Add the four items", false),
+        ("Take a look at the items", false),
+        ("Restyle this", true),
+        ("Take a screenshot", true),
+        ("Make it look better", true),
+    ] {
+        assert_eq!(super::useful(request, true), expected, "{request}");
+    }
+    assert!(
+        !useful("Make it look better"),
+        "outside a Type, appearance words alone are not a request"
+    );
 }
 
 #[test]
 fn explicit_visual_inspection_requests_require_delivered_pixels() {
     for prompt in ["do visual inspection", "visually verify the game"] {
-        let mut review = Review::new(prompt);
+        let mut review = Review::new(prompt, false);
         assert_eq!(review.status([0, 0, 0]), "missing", "{prompt}");
         review.captured([0, 0, 0], false);
         review.delivered();
@@ -60,7 +73,7 @@ fn explicit_visual_inspection_requests_require_delivered_pixels() {
 }
 #[test]
 fn only_rendered_pixels_delivered_after_latest_edit_satisfy_site_review() {
-    let mut review = Review::new("fix the site layout");
+    let mut review = Review::new("fix the site layout", false);
     review.changed(Path::new("style.css"));
     review.captured([1, 0, 0], false);
     review.delivered();
@@ -90,7 +103,7 @@ fn only_rendered_pixels_delivered_after_latest_edit_satisfy_site_review() {
 }
 #[test]
 fn missing_visual_evidence_is_disclosed_in_the_summary() {
-    let mut review = Review::new("inspect the screenshot");
+    let mut review = Review::new("inspect the screenshot", false);
     assert!(
         review
             .summary("done".into(), [0, 0, 0])

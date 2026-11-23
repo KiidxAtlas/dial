@@ -92,7 +92,8 @@ unexpected Hosts are refused. The URL is private. ACP does not expose this capab
 Offline contracts: `python3 -m unittest discover -s examples/benchmarks -p 'test_benchmark_dashboard.py'`.
 
 The `examples/benchmarks/lifecycle-efficiency.toml` slice covers a self-contained answer, a read-only
-workspace investigation and a completed calculator fix. Run it deliberately with a configured model:
+workspace investigation and a completed calculator fix. The investigation must identify both the
+actual and expected arithmetic operation; a quiet, efficient but wrong answer fails. Run it deliberately with a configured model:
 
 ```sh
 dial benchmark examples/benchmarks/lifecycle-efficiency.toml --report benchmarks/lifecycle.json
@@ -333,9 +334,9 @@ python3 examples/benchmarks/smoke.py --dial ./target/debug/dial --suite compacti
 ```
 
 `useful_work` counts only passing cases with independent outcome checks. Its per-completion elapsed,
-token and API-cost numerators include **all** attempted cases, including failures and metric-only
-cases, so dropping failed work cannot improve efficiency. Tokens and cost remain unknown when any
-case has incomplete usage or pricing; zero completions never yields a finite efficiency ratio.
+request, token and API-cost numerators include **all** attempted cases, including failures and metric-only
+cases. A missing or incomplete ledger leaves `requests_per_verified_completion` unknown; tokens and
+cost likewise require complete usage and pricing. Zero completions never yields a finite ratio.
 Elapsed is summed agent-case time, not wall time including external acceptance checks.
 `metrics.runtime_usage` preserves the runtime ledger's total, main/worker and purpose breakdowns,
 including retries, discarded and unreported attempts and pricing coverage. These are orthogonal
@@ -521,7 +522,7 @@ It verifies orchestration and graders, **not real-model performance**.
 
 `examples/benchmarks/release-slice.toml` fixes the suites a release candidate is measured on:
 `quality`, `reliability`, `representative`, `local-tasks`, `recovery` and `tool-effectiveness`
-(27 cases), each case run three times per configuration (81 case runs). It is a plan, not a run:
+(28 cases), each case run three times per configuration (84 case runs). It is a plan, not a run:
 
 ```sh
 python3 examples/benchmarks/release_slice.py --profile local --label v0.3.4
@@ -563,13 +564,14 @@ established by the scripted regressions or this integration alone.
 
 ### Representative multi-language and long-journey suite
 
-`examples/benchmarks/representative.toml` adds three independently executable contracts:
+`examples/benchmarks/representative.toml` has four independently executable contracts:
 
 | case | independent acceptance |
 | --- | --- |
 | Rust non-default workspace member | An external temporary Cargo test crate depends on `pricing` and `checkout`; checks quantity/zero/negative boundaries and the public caller. The default member's unrelated baseline failure and workspace defaults must remain unchanged. |
 | TypeScript API / JavaScript caller | Native Node TypeScript stripping exercises the renamed export, null/empty/exact/over-page boundaries and the JS consumer. No npm install or transpiler. |
 | Corrected/retracted journey | Seven sequential requests, three forced compactions; verifies the corrected 25-row default, rename, null boundary, removal of a retracted artifact and preservation of unrelated billing code. |
+| Deferred rollout recall | Seven sequential requests, three forced compactions. The final ticket selects a prior plan without restating its corrected page size or owner. A previously finished workspace cannot supply the new handoff. |
 
 Prerequisites are an installed Cargo/Rust toolchain, Python 3.11+ and Node with native TypeScript
 stripping (22.18+ or newer). The offline tests explicitly skip an unavailable language runtime rather
@@ -1201,7 +1203,7 @@ not model results.
 
 Grading is by outcome. The first command check of each case is independent of any file the agent
 can edit: `calc.py` is checked against fixed `add` boundaries, and research must associate each
-figure and direction with its own source line. The visible `test_calc.py` is still run as a
+figure and direction with its source in exactly two structured rows; contradictory commentary does not pass. The visible `test_calc.py` is still run as a
 prompt-level check, but weakening it cannot pass the case. Valid JSON, tool counts and error text
 are never task success. Denial passes only when `../denied_probe.txt` does not exist and the reply
 is `STOPPED`.
@@ -1215,8 +1217,7 @@ guard, not a proof against arbitrary adversarial test code.
 
 `tool_invoked` and `metric` checks are integration-path coverage, reported separately from task
 outcomes. They show that the path was exercised, not that the answer is correct. Deferred discovery
-requires `tool_search`, `tool_load` and `ast_search` (a deferred builtin in `DEFERRED_BY_DEFAULT`,
-`crates/dial-tools/src/tools/mod.rs`); empty-discovery recovery requires a `tool_search` call for
+requires `tool_search` and the deferred `ast_edit` tool it loads. Empty-discovery recovery requires a `tool_search` call for
 `zzqxjvkmnop`, absent from builtin names and descriptions (the real-dispatch empty-search test uses
 the same query; these profiles use core integration isolation); denial requires a `write` call and a tool error. The outside-workspace path is rejected
 by the file tool itself, even with automatic ordinary approvals; the prompt forbids requesting
@@ -1265,6 +1266,12 @@ When the child reports a freshly executed passing check during a `send`, `metric
 records that send's ID and milliseconds from receipt of the **last** such event to the RPC reply
 (`end: reply`) or to loss of the reply, including a deadline (`end: rpc_error`). The latter is
 only the observed wait. An omitted send means no attributed pass was observed, not zero wait.
+The same entry reports the number of model-declared deliverables still open **at the pass** (unknown
+for older children) and the number of distinct top-level model starts observed afterward. The latter
+includes an unfinished request but excludes workers, repeated phase updates and other sends. These
+are observations, not an inventory of undeclared work. Rank whole-task passes first; divide requests
+and time across **all attempts**, including failures, by independently verified completions. A missing
+ledger or zero verified completions leaves requests per completion unknown.
 This is not the independent grader, a completion signal, or a reason to skip remaining work.
 
 Offline checks: `cd examples/benchmarks && python3 -m unittest test_local_tasks` verifies that each

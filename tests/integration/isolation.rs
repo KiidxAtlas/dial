@@ -58,7 +58,7 @@ fn merges_a_worker_write(backend: &str) {
     fs::write(
         home.path().join("config.toml"),
         format!(
-            "integrations = []\n[improve]\nenabled = false\n[isolation]\nbackend = \"{backend}\"\n"
+            "integrations = []\n[improve]\nenabled = false\n[verification]\nenabled = false\n[isolation]\nbackend = \"{backend}\"\n"
         ),
     )
     .unwrap();

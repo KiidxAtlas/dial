@@ -2870,6 +2870,44 @@ fn ollama_enrichment_has_a_request_cap_and_keeps_the_basic_listing() {
 }
 
 #[test]
+fn chatgpt_context_window_uses_the_shared_account_catalog() {
+    use crate::llm::chatgpt;
+
+    const CHILD: &str = "DIAL_TEST_SHARED_CHATGPT_CONTEXT";
+    if std::env::var_os(CHILD).is_none() {
+        let shared = tempfile::tempdir().unwrap();
+        chatgpt::test_account(shared.path(), false);
+        chatgpt::test_catalog(
+            shared.path(),
+            &serde_json::json!({"models":[{"slug":"account-model", "context_window":246000}]}),
+        );
+        // Set the auth override for this test alone, not for parallel account-store tests.
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::chatgpt_context_window_uses_the_shared_account_catalog");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test])
+            .env(CHILD, "1")
+            .env(crate::config::paths::SUBSCRIPTION_AUTH_HOME, shared.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let isolated = tempfile::tempdir().unwrap();
+    let mut selection = ModelSelection {
+        provider: chatgpt::PROVIDER.into(),
+        model: "account-model".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        model_context_window(isolated.path(), &selection),
+        Some(246000)
+    );
+    selection.account_id = Some("other-account".into());
+    assert_eq!(model_context_window(isolated.path(), &selection), None);
+}
+
+#[test]
 fn immutable_catalog_lookup_invalidates_file_stamp_without_changing_old_snapshot() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

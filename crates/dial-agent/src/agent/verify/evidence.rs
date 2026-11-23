@@ -384,6 +384,17 @@ impl Ledger {
         }
     }
 
+    /// Controller-run checks (including acceptance and reproduction) on the current revision.
+    /// Direct shell calls have their own declared-check receipt; conventional runner names alone
+    /// can inform diagnostics but cannot satisfy unattended verification.
+    pub fn current_focused_pass(&self, revision: Revision) -> bool {
+        self.latest.values().any(|o| {
+            o.call_id.starts_with(FOCUSED_CHECK_CALL)
+                && o.current(revision)
+                && o.status == CheckStatus::Passed
+        })
+    }
+
     pub fn snapshot(&self, revision: Revision) -> serde_json::Value {
         let current: Vec<_> = self
             .latest

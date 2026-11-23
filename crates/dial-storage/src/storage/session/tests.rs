@@ -540,14 +540,14 @@ fn active_reads_follow_append_compaction_rewind_fork_and_reopen() {
     let e = env();
     let mut s = new_session(&e);
     assert_active_reads(&s);
-    s.append(user("first")).unwrap();
+    let first_user = s.append(user("first")).unwrap();
     s.set_control_state(json!({"turn":1})).unwrap();
     let first = s.runtime().start("tool", "first branch result", None);
     first.settle("done".into(), None, Phase::Completed);
     s.flush_runtime().unwrap();
     s.append(assistant("first answer")).unwrap();
     assert_active_reads(&s);
-    s.append(user("second")).unwrap();
+    let second_user = s.append(user("second")).unwrap();
     s.set_control_state(json!({"turn":2})).unwrap();
     let second = s.runtime().start("tool", "abandoned result", None);
     second.settle("done".into(), None, Phase::Completed);
@@ -557,6 +557,8 @@ fn active_reads_follow_append_compaction_rewind_fork_and_reopen() {
     s.compact("earlier conversation".into(), 3).unwrap();
     s.rename("branch title").unwrap();
     assert_active_reads(&s);
+    assert!(!s.message_visible(&first_user));
+    assert!(s.message_visible(&second_user));
     // Compaction advances the provider history generation; the floor keeps it across rewinds.
     assert_eq!(
         s.control_state(),
@@ -565,6 +567,8 @@ fn active_reads_follow_append_compaction_rewind_fork_and_reopen() {
     assert_eq!(s.rewind(1).unwrap(), 2);
     assert_active_reads(&s);
     assert_eq!(s.messages(), vec![user("first"), assistant("first answer")]);
+    assert!(s.message_visible(&first_user));
+    assert!(!s.message_visible(&second_user));
     assert_eq!(
         s.control_state(),
         json!({"turn":1,"provider_identity":{"history_generation":2}})

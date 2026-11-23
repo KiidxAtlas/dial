@@ -172,3 +172,65 @@ fn diagnosis_only_requests_ask_why_without_asking_for_a_repair() {
         assert!(!diagnosis_only(prompt), "{prompt}");
     }
 }
+
+#[test]
+fn negated_repair_words_request_no_repair() {
+    for prompt in [
+        "Don't fix it, just tell me why it fails",
+        "Do not change anything; explain why the build fails",
+        "Without changing the code, explain why the test fails",
+        "Run the suite, stop editing, and diagnose the failure",
+        "Investigate why it fails and do not make any changes",
+    ] {
+        assert!(diagnosis_only(prompt), "{prompt}");
+    }
+}
+
+#[test]
+fn repair_and_edit_nouns_name_the_subject_not_the_request() {
+    for prompt in [
+        "Explain why the fix for the parser fails",
+        "Explain the update to the parser that breaks in CI",
+        "Investigate why the make target fails",
+        "Explain why the build fails after you change the config",
+        "Give me a diagnosis, not a fix",
+        "Explain why `fix --test` fails",
+        "Explain why `make` fails, but do not touch the code",
+    ] {
+        assert!(diagnosis_only(prompt), "{prompt}");
+    }
+}
+
+#[test]
+fn repair_in_request_position_is_not_diagnosis_only() {
+    for prompt in [
+        "Don't just explain it, fix it",
+        "Tell me why the test fails, and make it pass",
+        "Explain why it fails; do not explain anything, change the parser",
+        "Explain why it fails and fix it",
+        "Explain why it fails. Make it pass.",
+        "Explain why it fails and add a regression test",
+        "Explain why it fails, then rename the helper",
+    ] {
+        assert!(!diagnosis_only(prompt), "{prompt}");
+    }
+}
+
+#[test]
+fn kind_follows_requested_outcome_not_subject_nouns() {
+    for (prompt, kind) in [
+        ("Make the change to the parser", Kind::Editing),
+        ("Add a flag", Kind::Editing),
+        (
+            "Don't change anything, explain why the build fails",
+            Kind::Investigation,
+        ),
+        ("Explain the fix for the parser", Kind::Investigation),
+        ("Read the change log and summarise", Kind::Investigation),
+        ("Don't fix the bug", Kind::Debugging),
+        ("Fixing the crash now", Kind::Debugging),
+        ("Don't edit anything", Kind::General),
+    ] {
+        assert_eq!(Kind::classify(prompt), kind, "{prompt}");
+    }
+}

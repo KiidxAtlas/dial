@@ -640,7 +640,7 @@ pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) 
         .or_else(|| {
             if selection.provider == crate::llm::chatgpt::PROVIDER {
                 crate::llm::chatgpt::scoped_model_context_window(
-                    user_dir,
+                    &crate::config::paths::subscription_auth_dir(user_dir).ok()?,
                     selection.account_id.as_deref(),
                     &selection.model,
                 )

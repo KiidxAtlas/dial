@@ -62,9 +62,172 @@ fn an_identical_repeat_gets_the_earlier_result_and_its_own_call_id() {
     let repeated = [call("new", "read", json!({"path": "a", "i": "again"}))];
     let results = repeat.short_circuit(&repeated).expect("identical repeat");
     assert_eq!(results.len(), 1);
-    assert!(results[0].starts_with("[Not executed:"));
-    assert!(results[0].contains("tool_call_id `c5`"));
-    assert!(results[0].contains("`same result`"));
+    assert!(results[0].text.starts_with("[Not executed:"));
+    assert!(results[0].text.contains("tool_call_id `c5`"));
+    assert!(results[0].text.contains("`same result`"));
+    assert_eq!(results[0].call_id, "c5");
+}
+
+/// Assistant call plus a tool answer carrying a typed origin (`null` when the call executed).
+fn typed_turn(
+    id: &str,
+    name: &str,
+    args: &str,
+    content: &str,
+    origin: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    vec![
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args}}]}),
+        json!({"role":"tool","tool_call_id":id,"content":content,"dial_result_origin":origin}),
+    ]
+}
+
+fn duplicate_of(target: &str) -> serde_json::Value {
+    json!({"kind":"duplicate","call_id":target})
+}
+
+/// The executed id the guard resolves for the newest read of an identical streak, and its text.
+/// `None` means no recoverable executed result exists.
+fn quoted_for_streak(messages: &[serde_json::Value]) -> (Option<String>, String) {
+    let repeat = RepeatedToolCall::detect(messages, 5, &["wait"]).expect("streak of five");
+    let quoted = repeat
+        .earlier
+        .iter()
+        .find(|call| call.name == "read")
+        .expect("read call");
+    (quoted.id.clone(), quoted.result.clone())
+}
+
+/// Whether a fresh identical read would be answered by a duplicate short circuit.
+fn short_circuits(messages: &[serde_json::Value]) -> bool {
+    RepeatedToolCall::detect(messages, 5, &["wait"])
+        .expect("streak of five")
+        .short_circuit(&[call("new", "read", json!({"path": "a"}))])
+        .is_some()
+}
+
+#[test]
+fn a_typed_duplicate_follows_its_reference_to_the_executed_result() {
+    let read = "{\"path\":\"a\"}";
+    let mut messages = typed_turn("target", "read", read, "executed A", json!(null));
+    // The target lies before a different call, so it is outside the identical streak.
+    messages.extend(turn("x", "read", "{\"path\":\"b\"}"));
+    for n in 1..5 {
+        messages.extend(typed_turn(
+            &format!("c{n}"),
+            "read",
+            read,
+            "[Not executed: identical to your earlier ...]",
+            duplicate_of("target"),
+        ));
+    }
+    messages.extend(typed_turn(
+        "c5",
+        "read",
+        read,
+        "[Not executed: identical to your earlier ...]",
+        duplicate_of("target"),
+    ));
+    assert_eq!(
+        quoted_for_streak(&messages),
+        (Some("target".to_owned()), "executed A".to_owned())
+    );
+    let answer = RepeatedToolCall::detect(&messages, 5, &["wait"])
+        .expect("streak of five")
+        .short_circuit(&[call("new", "read", json!({"path": "a"}))])
+        .expect("recoverable target answers the repeat");
+    assert_eq!(answer[0].call_id, "target");
+}
+
+#[test]
+fn a_typed_duplicate_never_becomes_an_execution_without_a_usable_target() {
+    let read = "{\"path\":\"a\"}";
+    let dup = "[Not executed: identical to your earlier ...]";
+    // Table: the reference is missing, mismatched in signature, or names an unexecuted answer.
+    // None may become an executed target, and none may short circuit into a new quote.
+    let cases: Vec<(&str, Vec<serde_json::Value>)> = vec![
+        ("missing target", {
+            let mut m = Vec::new();
+            for n in 0..6 {
+                m.extend(typed_turn(
+                    &format!("c{n}"),
+                    "read",
+                    read,
+                    dup,
+                    duplicate_of("gone"),
+                ));
+            }
+            m
+        }),
+        ("mismatched signature", {
+            let mut m = typed_turn("other", "read", "{\"path\":\"b\"}", "B result", json!(null));
+            for n in 0..6 {
+                m.extend(typed_turn(
+                    &format!("c{n}"),
+                    "read",
+                    read,
+                    dup,
+                    duplicate_of("other"),
+                ));
+            }
+            m
+        }),
+        ("unexecuted target", {
+            let mut m = typed_turn(
+                "skip",
+                "read",
+                read,
+                "This call was not executed",
+                json!({"kind":"skipped"}),
+            );
+            for n in 0..6 {
+                m.extend(typed_turn(
+                    &format!("c{n}"),
+                    "read",
+                    read,
+                    dup,
+                    duplicate_of("skip"),
+                ));
+            }
+            m
+        }),
+    ];
+    for (case, messages) in cases {
+        let (id, text) = quoted_for_streak(&messages);
+        assert_eq!(id, None, "{case}: no synthetic executed target");
+        assert_eq!(text, dup, "{case}: diagnostic only");
+        assert!(!short_circuits(&messages), "{case}: the call must run");
+    }
+}
+
+#[test]
+fn typed_origin_decides_over_prose_for_new_records() {
+    // A typed executed record whose text looks like a duplicate answer is still an execution.
+    let read = "{\"path\":\"a\"}";
+    let dup = "[Not executed: identical to your earlier ...]";
+    let mut messages = Vec::new();
+    for n in 0..5 {
+        messages.extend(typed_turn(&format!("c{n}"), "read", read, dup, json!(null)));
+    }
+    messages.extend(typed_turn("c5", "read", read, dup, json!(null)));
+    assert_eq!(
+        quoted_for_streak(&messages),
+        (Some("c5".to_owned()), dup.to_owned())
+    );
+
+    // A typed unexecuted record with ordinary text is not quoted as an execution.
+    let mut messages = Vec::new();
+    for n in 0..6 {
+        messages.extend(typed_turn(
+            &format!("c{n}"),
+            "read",
+            read,
+            "plain text",
+            json!({"kind":"skipped"}),
+        ));
+    }
+    assert_eq!(quoted_for_streak(&messages).0, None);
+    assert!(!short_circuits(&messages));
 }
 
 #[test]
@@ -191,9 +354,11 @@ fn a_multi_call_repeat_pairs_each_call_with_its_own_earlier_result() {
         call("r", "read", json!({"path": "a"})),
     ];
     let results = repeat.short_circuit(&reordered).expect("same call set");
-    assert!(results[0].contains("`grep`") && results[0].contains("tool_call_id `g5`"));
-    assert!(results[0].contains("`grep hits`"));
-    assert!(results[1].contains("tool_call_id `r5`") && results[1].contains("`file text`"));
+    assert!(results[0].text.contains("`grep`") && results[0].text.contains("tool_call_id `g5`"));
+    assert!(results[0].text.contains("`grep hits`"));
+    assert!(
+        results[1].text.contains("tool_call_id `r5`") && results[1].text.contains("`file text`")
+    );
 }
 
 #[test]
@@ -226,17 +391,21 @@ fn the_quoted_result_skips_references_and_barrier_refusals_that_ran_nothing() {
             json!({"command": "python3 -m venv.venv"}),
         )])
         .expect("identical repeat");
-    assert!(results[0].contains("tool_call_id `c0`"), "{}", results[0]);
     assert!(
-        results[0].contains("No module named venv.venv"),
+        results[0].text.contains("tool_call_id `c0`"),
         "{}",
-        results[0]
+        results[0].text
+    );
+    assert!(
+        results[0].text.contains("No module named venv.venv"),
+        "{}",
+        results[0].text
     );
     assert_eq!(
-        results[0].matches("[Not executed").count(),
+        results[0].text.matches("[Not executed").count(),
         1,
         "{}",
-        results[0]
+        results[0].text
     );
 
     // With no executed result in the streak, the newest one is still quoted.

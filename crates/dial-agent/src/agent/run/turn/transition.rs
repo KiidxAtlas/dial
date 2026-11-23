@@ -89,12 +89,9 @@ impl TurnState<'_> {
             reasoning_budget,
             todo_recovery,
             solo_todo_noted,
-            pending_nudges,
-            delivered_nudges,
-            reply_mark,
+            notices,
             // Turn-wide: steering or a resumed round cannot reopen the reminder budget.
             exploration_reminders: _,
-            emissions,
             coach_turn,
             automatic_coach_pending,
             auto_continues,
@@ -109,12 +106,10 @@ impl TurnState<'_> {
             enrichment_epoch,
         } = self;
         // Every transition starts from a known history: no earlier reply is left to settle.
-        delivered_nudges.clear();
-        *reply_mark = None;
+        notices.reset(steering, steering || resumed);
         if steering {
             // A new instruction is a new task: its advice and reviews start over.
             *enrichment_epoch = enrichment_epoch.wrapping_add(1);
-            *emissions = Default::default();
             *solo_todo_noted = false;
             *coach_turn = Default::default();
         }
@@ -124,8 +119,6 @@ impl TurnState<'_> {
             *completion_candidate = None;
             *capability_search = Default::default();
             *pending = None;
-            crate::agent::run::guidance::reset_for_steering(pending_nudges);
-            // Do not coach the replacement instruction about the previous lookup streak.
             // Shell command identities remain valid until the context or workspace changes.
             pace.observe_round(&[]);
             *rejected_edit_previews = 0;

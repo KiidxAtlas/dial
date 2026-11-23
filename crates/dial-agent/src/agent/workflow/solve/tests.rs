@@ -277,6 +277,23 @@ fn applies_scoped_create_modify_delete_preserving_user_files() {
     );
 }
 #[test]
+fn solve_reports_only_applied_patch_files_as_committed_effects() {
+    let applied = settled_output(Ok((
+        json!({"applied":["a.rs"]}),
+        vec![PathBuf::from("/ws/a.rs")],
+    )));
+    assert!(!applied.is_error);
+    assert_eq!(
+        applied.execution.changed_paths,
+        vec![PathBuf::from("/ws/a.rs")]
+    );
+    let refused = settled_output(Err(anyhow::anyhow!(
+        "source changed during candidate search"
+    )));
+    assert!(refused.is_error);
+    assert!(refused.execution.changed_paths.is_empty());
+}
+#[test]
 fn smallest_patch_counts_changed_bytes_not_whole_file() {
     let before = Tree::from([(
         "file".into(),

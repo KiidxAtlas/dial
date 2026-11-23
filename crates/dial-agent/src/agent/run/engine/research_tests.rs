@@ -125,6 +125,9 @@ fn parent_research_synthesis_resumes_read_only_work_and_ordinary_completion() {
             )
         })
         .collect();
+    // This unexecuted tool's unique name appears in the checkpoint correction, not in history.
+    const INVALID_TOOL: &str = "unexpected_checkpoint_probe";
+    scripts.push(response("", Some((24, INVALID_TOOL, json!({})))));
     let finding = json!({"finding":"The source files have distinct numbered evidence","evidence":["observation-23"],"next_action":"Report the source evidence and its verification limits"}).to_string();
     scripts.push(response(&finding, None));
     scripts.push(response("The 24 source files contain distinct numbered evidence. Runtime behavior was not exercised.", None));
@@ -159,7 +162,16 @@ fn parent_research_synthesis_resumes_read_only_work_and_ordinary_completion() {
             assert_ne!(report.text, finding, "a checkpoint is not the final answer");
         },
     );
-    assert_eq!(server.requests().len(), 27);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 28);
+    let retry = llm::fake::body(&requests[26])["messages"].to_string();
+    let ordinary = llm::fake::body(&requests[27])["messages"].to_string();
+    assert!(retry.contains(INVALID_TOOL), "retry lacked its correction");
+    assert!(ordinary.contains("research_follow_through"));
+    assert!(
+        !ordinary.contains(INVALID_TOOL),
+        "stale checkpoint correction"
+    );
 }
 
 #[test]

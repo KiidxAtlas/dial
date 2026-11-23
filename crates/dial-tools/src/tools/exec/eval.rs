@@ -297,15 +297,15 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS has no Node modules except require('fs') and require('path') shims; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson (overwrite only with expectedSha256, Python expected_sha256=, from a whole-file read receipt; never read implicitly), writeBytes (create only), run, batch (raises unless collect:true), check(name, bool, optional dial.read receipt; local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call; relative paths resolve in the project directory. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: in one cell read inputs, compute, write, reopen and check saved bytes; prove tricky logic on a tiny known-answer case; never print then transcribe. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
+                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS: only fs/path require() shims; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson (overwrite only with expectedSha256, Python expected_sha256=, from a whole-file read receipt; never read implicitly), writeBytes (create only), run, batch (raises unless collect:true), check(name, bool, optional dial.read receipt; local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call; paths are project-relative. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: one cell reads inputs, computes, writes, rechecks saved bytes; prove tricky logic on a tiny known-answer case; never print then transcribe. Big scans: size first; read files once; one regex for all patterns. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
             ),
             json!({
-                "language":{"type":"string","enum":["js","py"],"description":"Defaults to js. Windows Python requires explicit unsandboxed opt-in."},
-                "action":{"type":"string","enum":["eval","reset","cancel","status"],"description":"Default eval; reset/status/cancel need no code. Cancel without language affects both."},
-                "code":{"type":"string","description":"Required nonblank source for eval, max 64 KiB."},
-                "timeout":{"type":"integer","minimum":0,"maximum":3600,"description":"Seconds; timeout or cancel discards the namespace. Callback time is excluded."},
-                "background":{"type":"boolean","description":"Omit to follow shell.auto_background_secs (default 0: the cell stays in the foreground); false keeps it in the foreground; true moves it immediately."},
-                "title":{"type":"string","description":"Label for a backgrounded cell in the background job list."}
+                "language":{"type":"string","enum":["js","py"],"description":"Default js. Windows Python needs explicit unsandboxed opt-in."},
+                "action":{"type":"string","enum":["eval","reset","cancel","status"],"description":"Default eval; reset/status/cancel need no code. Cancel without language: both."},
+                "code":{"type":"string","description":"Nonblank source for eval, max 64 KiB."},
+                "timeout":{"type":"integer","minimum":0,"maximum":3600,"description":"Seconds; timeout/cancel discards the namespace; callback time excluded."},
+                "background":{"type":"boolean","description":"Omit: follow shell.auto_background_secs (default 0 = foreground); false: foreground; true: move now."},
+                "title":{"type":"string","description":"Background job label."}
             }),
             &[],
         );

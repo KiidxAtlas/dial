@@ -67,6 +67,24 @@ impl AutoEscalation {
     }
 }
 
+/// Transient user-side message carrying unverified advice into the next request, or `None` when
+/// the coach returned empty or content-free filler ("LGTM", "Looks good", etc.).
+pub(in crate::agent) fn advice_note(advice: &str) -> Option<Value> {
+    use crate::agent::verify::coach_intervention::{CoachIntervention, InterventionKind};
+    CoachIntervention::transient(
+        InterventionKind::FailureEscalation,
+        advice,
+        Some(2400),
+        |clipped| {
+            advice_message(clipped)["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        },
+    )
+    .map(CoachIntervention::into_message)
+}
+
 /// Transient user-side message carrying unverified advice into the next request.
 pub(in crate::agent) fn advice_message(advice: &str) -> Value {
     json!({

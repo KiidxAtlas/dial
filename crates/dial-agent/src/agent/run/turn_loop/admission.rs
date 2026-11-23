@@ -176,6 +176,13 @@ impl Agent<'_> {
         } else {
             json!({"role":"user","content":typed_text})
         };
+        // The Type rides on the message: its id is kept with it; its briefing is model-only context.
+        if let Some(context) = self.pending_type.take() {
+            message[crate::storage::session::TYPE_KEY] = json!({"id": context.id});
+            if let Some(briefing) = context.briefing {
+                message["dial_type_context"] = json!(briefing);
+            }
+        }
         if let Some(drafted) = drafted {
             crate::agent::run::turn_draft::apply_draft(&mut message, typed_text, drafted);
         }
@@ -196,7 +203,10 @@ impl Agent<'_> {
             visual: if self.hermetic {
                 crate::agent::verify::visual::Review::default()
             } else {
-                crate::agent::verify::visual::Review::new(user_text)
+                crate::agent::verify::visual::Review::new(
+                    user_text,
+                    message[crate::storage::session::TYPE_KEY].is_object(),
+                )
             },
             // Autonomous and peer continuations are not user requests to run anything.
             targets: if self.hermetic

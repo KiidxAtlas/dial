@@ -48,6 +48,16 @@ pub(crate) fn experimental_output_effort(
         .then_some(requested)
 }
 
+/// Facts a settled tool call carries from the controller: whether it succeeded, whether an
+/// execution transaction committed paths (`Execution::changed_paths`), and whether it was a
+/// recognized check. Tool names never establish a mutation.
+#[derive(Clone, Copy, Debug)]
+pub struct Settled {
+    pub succeeded: bool,
+    pub committed: bool,
+    pub check: bool,
+}
+
 #[derive(Debug)]
 pub struct State {
     pub phase: Phase,
@@ -82,16 +92,24 @@ impl State {
         self.phase = Phase::Recovery;
         self.reason = reason.into();
     }
-    pub fn observe(&mut self, name: &str, success: bool, check: bool) {
-        if !success {
+    /// Settled controller facts for a completed call. Committed paths are recorded as history
+    /// before the call's own verdict or check role is applied, so a later read still resumes
+    /// editing after a failed or verified write. A `bash` call without a commit is never a mutation.
+    pub fn observe(&mut self, name: &str, settled: Settled) {
+        if settled.committed {
+            self.mutated = true;
+        }
+        if !settled.succeeded {
             self.recover("last tool failed; correct the observed failure");
+            if settled.committed {
+                self.resume_phase = Phase::Editing;
+            }
             return;
         }
-        if check {
+        if settled.check {
             self.phase = Phase::Verification;
             self.reason = "a recognized check ran; inspect its evidence".into();
-        } else if matches!(name, "write" | "edit" | "ast_edit" | "solve") {
-            self.mutated = true;
+        } else if settled.committed {
             self.phase = Phase::Editing;
             self.reason = "a source mutation succeeded; continue focused implementation".into();
         } else if matches!(name, "read" | "grep" | "glob" | "find" | "ast_search") {

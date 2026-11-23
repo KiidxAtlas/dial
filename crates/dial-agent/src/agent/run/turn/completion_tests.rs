@@ -895,7 +895,7 @@ fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() 
             "",
             Some((
                 "bash",
-                json!({"command":"python3 -I -S -B - <<'PY'\nimport csv\nwith open('result.csv', 'w', newline='') as f:\n    writer = csv.writer(f, lineterminator='\\n')\n    writer.writerow(['value'])\n    writer.writerow([sum([2, 3])])\nwith open('result.csv', newline='') as f:\n    assert list(csv.reader(f)) == [['value'], ['5']], 'generated artifact failed verification'\nPY"}),
+                json!({"check":true,"command":"python3 -I -S -B - <<'PY'\nimport csv\nwith open('result.csv', 'w', newline='') as f:\n    writer = csv.writer(f, lineterminator='\\n')\n    writer.writerow(['value'])\n    writer.writerow([sum([2, 3])])\nwith open('result.csv', newline='') as f:\n    assert list(csv.reader(f)) == [['value'], ['5']], 'generated artifact failed verification'\nPY"}),
             )),
         ),
         llm::fake::json(200, &json!({"total_slots":1})),
@@ -932,4 +932,230 @@ fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() 
         .map(|call| call["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(calls, ["bash"]);
+}
+
+#[test]
+fn report_wording_does_not_create_or_close_an_obligation() {
+    let finding = "| Example | I have not yet built the unrelated demo. |";
+    let server = llm::fake::serve(vec![
+        response(finding, None),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("Incomplete: the requested demo does not build.", None),
+    ]);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        let report = agent
+            .turn("Report the review finding", &mut NullUi)
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert_eq!(report.text, finding);
+        let report = agent.turn("Build the demo", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    });
+    assert_eq!(completion_requests(&server).len(), 2);
+}
+
+const WRITE_RESULT: &str = "printf 'value\\n5\\n' > result.csv";
+
+/// Unattended agent from the benchmark-launch shape of
+/// `a_permitted_computation_delivers_its_artifact_without_a_transcription_call`.
+fn with_launch<R>(unattended: bool, run: impl FnOnce(&mut crate::agent::Agent<'_>) -> R) -> R {
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[compaction]\nenabled=false\n[verification]\nautomatic_checks=false",
+        |agent| {
+            agent.modes.launch.unattended = unattended;
+            agent.approval = crate::config::types::Approval::Auto;
+            run(agent)
+        },
+    )
+}
+
+#[test]
+fn an_unattended_shell_deliverable_needs_a_passing_check_before_completion() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":WRITE_RESULT})))),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("Wrote result.csv.", None),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"test \"$(cat result.csv)\" = \"$(printf 'value\\n5')\"","check":true}),
+            )),
+        ),
+        response("Wrote result.csv; the content check passes.", None),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        let report = agent
+            .turn(
+                "Write the sum of 2 and 3 into result.csv with header value.",
+                &mut NullUi,
+            )
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert!(
+            report.text.contains("content check passes"),
+            "{}",
+            report.text
+        );
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED)
+    );
+}
+
+#[test]
+fn a_repeated_unverified_unattended_completion_ends_incomplete() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":WRITE_RESULT})))),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("Wrote result.csv.", None),
+        response("Wrote result.csv as requested.", None),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        let report = agent
+            .turn(
+                "Write the sum of 2 and 3 into result.csv with header value.",
+                &mut NullUi,
+            )
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+        assert!(
+            report.text.starts_with("Incomplete: This unattended run"),
+            "{}",
+            report.text
+        );
+        assert_eq!(
+            agent.completion_evidence(report.outcome)["work_completion_accepted"],
+            false
+        );
+    });
+    assert_eq!(completion_requests(&server).len(), 3);
+}
+
+#[test]
+fn an_interactive_shell_deliverable_is_not_held_for_a_check() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":WRITE_RESULT})))),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("Wrote result.csv.", None),
+    ]);
+    with_launch(false, |agent| {
+        connect(agent, &server.url);
+        let report = agent
+            .turn(
+                "Write the sum of 2 and 3 into result.csv with header value.",
+                &mut NullUi,
+            )
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    });
+    assert_eq!(completion_requests(&server).len(), 2);
+}
+
+#[test]
+fn unattended_verification_depends_on_declared_checks_not_request_or_command_words() {
+    for (request, marker) in [
+        ("Create result.csv", "assert"),
+        ("Explain why the calculation works", "ordinary output"),
+        ("Create result.csv", "cargo test"),
+    ] {
+        let command = format!("{WRITE_RESULT}; echo '{marker}'");
+        let server = llm::fake::serve(vec![
+            response("", Some(("bash", json!({"command":command})))),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response("Wrote the file.", None),
+            response("The file is ready.", None),
+        ]);
+        with_launch(true, |agent| {
+            connect(agent, &server.url);
+            let report = agent.turn(request, &mut NullUi).unwrap();
+            assert_eq!(
+                report.outcome,
+                TurnOutcome::Incomplete,
+                "{marker}: {}",
+                report.text
+            );
+        });
+        assert_eq!(completion_requests(&server).len(), 3, "{marker}");
+    }
+}
+
+#[test]
+fn unattended_delivery_uses_the_same_revision_for_answered_and_completed() {
+    use crate::agent::verify::completion::{Decision, ReplyChannel};
+    with_launch(true, |agent| {
+        let decide = |agent: &mut Agent<'_>, outcome| {
+            agent.completion_decision(outcome, ReplyChannel::Explicit, &mut NullUi)
+        };
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Accept(TurnOutcome::Answered)
+        ));
+        agent.step_checks.uncheckpointed_extension_calls += 1;
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Continue(_)
+        ));
+        agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+        assert!(matches!(
+            decide(agent, TurnOutcome::Completed),
+            Decision::Accept(TurnOutcome::Completed)
+        ));
+        agent.step_checks.uncheckpointed_extension_calls += 1;
+        assert!(matches!(
+            decide(agent, TurnOutcome::Answered),
+            Decision::Incomplete(_)
+        ));
+    });
+}
+
+#[test]
+fn a_pipe_masked_unattended_check_does_not_satisfy_the_gate() {
+    let check =
+        |command: &str| response("", Some(("bash", json!({"command":command,"check":true}))));
+    for masked in [
+        "false 2>&1 | tail -5 # set -o pipefail",
+        "set -o pipefail; set +o pipefail; false | tail -5",
+        "(set -o pipefail); false | tail -5",
+    ] {
+        let server = llm::fake::serve(vec![
+            response("", Some(("bash", json!({"command":WRITE_RESULT})))),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            check(masked),
+            response("Wrote result.csv; the check passes.", None),
+            check("set -o pipefail; grep -q value result.csv | tail -5"),
+            response("Wrote result.csv; the pipefail check passes.", None),
+        ]);
+        with_launch(true, |agent| {
+            connect(agent, &server.url);
+            let report = agent
+                .turn(
+                    "Write the sum of 2 and 3 into result.csv with header value.",
+                    &mut NullUi,
+                )
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert!(
+                report.text.contains("pipefail check passes"),
+                "{}",
+                report.text
+            );
+        });
+        let requests = completion_requests(&server);
+        assert_eq!(requests.len(), 5);
+        let after_masked = requests[2]["messages"].to_string();
+        assert!(after_masked.contains("Not counted as a passing check"));
+        assert!(
+            requests[3]["messages"]
+                .to_string()
+                .contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED)
+        );
+    }
 }

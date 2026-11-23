@@ -50,11 +50,22 @@ pub(in crate::agent) struct RepeatedToolCall {
     earlier: Vec<EarlierCall>,
 }
 
+/// The answer to one repeated call: the text shown to the model and the earlier call it names.
+/// The controller records that reference in history as a typed `duplicate` origin.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::agent) struct DuplicateAnswer {
+    pub text: String,
+    pub call_id: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct EarlierCall {
     name: String,
     arguments: serde_json::Value,
-    id: String,
+    /// The executed call whose result is quoted. `None` when no executed result is recoverable;
+    /// the repeat is still observed, but it is never answered from a synthetic reference.
+    id: Option<String>,
+    /// Quoted executed result, or the newest recorded text as a diagnostic when `id` is `None`.
     result: String,
 }
 
@@ -70,10 +81,21 @@ fn call_key(calls: &[(String, String, serde_json::Value)]) -> String {
     serde_json::to_string(&parts).unwrap_or_default()
 }
 
-/// Whether a tool result is a harness reference that ran nothing: a duplicate-call answer or a
-/// retry-barrier refusal. Quoting one of these as "the earlier result" nests references and
-/// truncates the real diagnostic away.
-fn is_unexecuted_reference(text: &str) -> bool {
+/// Whether a tool message recorded no execution (a duplicate answer, retry-barrier refusal or
+/// skip). New records carry `dial_result_origin` (null when the call ran), and that typed value
+/// alone decides. Records without the key predate it and fall back to the prose leads. Quoting an
+/// unexecuted result as "the earlier result" nests references and truncates the real diagnostic.
+fn unexecuted_message(message: &serde_json::Value) -> bool {
+    match message.get("dial_result_origin") {
+        Some(origin) => !origin.is_null(),
+        None => message["content"]
+            .as_str()
+            .is_some_and(unexecuted_reference_prose),
+    }
+}
+
+/// Legacy-only: recognizes the leads of records written before `dial_result_origin`.
+fn unexecuted_reference_prose(text: &str) -> bool {
     text.starts_with(crate::agent::prompts::recovery::DUPLICATE_RESULT_LEAD)
         || text
             .strip_prefix("invalid tool call: ")
@@ -88,21 +110,90 @@ fn executed_result(
     turns: &[Vec<(String, String, serde_json::Value)>],
     name: &str,
     canonical: &serde_json::Value,
-) -> (String, String) {
-    let mut newest = None;
+) -> (Option<String>, String) {
+    // The newest recorded text, kept only as a diagnostic. It never names an executed call.
+    let mut diagnostic = None;
     for turn in turns {
         let Some((id, _, _)) = turn.iter().find(|(_, other, args)| {
             other == name && identity_arguments(other, args) == *canonical
         }) else {
             continue;
         };
-        let result = result_text_for(messages, id);
-        if !is_unexecuted_reference(&result) {
-            return (id.clone(), result);
+        let answer = result_message(messages, id);
+        let resolved = match answer.and_then(typed_duplicate_target) {
+            Some(target) => referenced_result(messages, target, name, canonical),
+            None => answer
+                .filter(|message| !unexecuted_message(message))
+                .map(|_| id.clone()),
+        };
+        if let Some(executed) = resolved {
+            let text = result_text_for(messages, &executed);
+            return (Some(executed), text);
         }
-        newest.get_or_insert((id.clone(), result));
+        diagnostic.get_or_insert_with(|| result_text_for(messages, id));
     }
-    newest.unwrap_or_default()
+    (None, diagnostic.unwrap_or_default())
+}
+
+/// The call a typed duplicate answer names, when it is a `duplicate` origin.
+fn typed_duplicate_target(message: &serde_json::Value) -> Option<&str> {
+    let origin = message.get("dial_result_origin")?;
+    (origin["kind"].as_str() == Some("duplicate"))
+        .then(|| origin["call_id"].as_str())
+        .flatten()
+}
+
+/// Follows a duplicate's reference to the executed result it names. Refused (`None`) unless the
+/// target answer exists in `messages`, its call has the same tool name and canonical arguments as
+/// the repeated call, and that answer itself executed. A missing, mismatched or unexecuted target is
+/// never treated as an execution. The target may lie outside the current streak.
+fn referenced_result(
+    messages: &[serde_json::Value],
+    target: &str,
+    name: &str,
+    canonical: &serde_json::Value,
+) -> Option<String> {
+    let (target_name, target_arguments) = call_signature(messages, target)?;
+    if target_name != name || target_arguments != *canonical {
+        return None;
+    }
+    let answer = result_message(messages, target)?;
+    if unexecuted_message(answer) {
+        return None;
+    }
+    Some(target.to_owned())
+}
+
+/// Tool name and canonical arguments of the newest assistant call with `id`.
+fn call_signature(messages: &[serde_json::Value], id: &str) -> Option<(String, serde_json::Value)> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message["role"].as_str() == Some("assistant"))
+        .filter_map(|message| message["tool_calls"].as_array())
+        .find_map(|calls| {
+            calls
+                .iter()
+                .find(|call| call["id"].as_str() == Some(id))
+                .map(|call| {
+                    let name = call["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let arguments = identity_arguments(&name, &call_arguments(&call["function"]));
+                    (name, arguments)
+                })
+        })
+}
+
+/// The newest tool message that answers `id`.
+fn result_message<'a>(
+    messages: &'a [serde_json::Value],
+    id: &str,
+) -> Option<&'a serde_json::Value> {
+    messages.iter().rev().find(|message| {
+        message["role"].as_str() == Some("tool") && message["tool_call_id"].as_str() == Some(id)
+    })
 }
 
 /// Summarized text of the tool result that answers `id`, or empty when none is in `messages`.
@@ -112,12 +203,7 @@ fn result_text_for(messages: &[serde_json::Value], id: &str) -> String {
 
 /// Full text of the tool result that answers `id`, or empty when none is in `messages`.
 fn result_content_for(messages: &[serde_json::Value], id: &str) -> String {
-    messages
-        .iter()
-        .rev()
-        .find(|message| {
-            message["role"].as_str() == Some("tool") && message["tool_call_id"].as_str() == Some(id)
-        })
+    result_message(messages, id)
         .map(|message| match &message["content"] {
             serde_json::Value::String(text) => text.clone(),
             serde_json::Value::Null => String::new(),
@@ -237,7 +323,10 @@ impl RepeatedToolCall {
     /// When the reply's calls repeat this streak exactly (same call set, every call well formed),
     /// returns one synthetic result per call, in order. Each names the earlier identical call and
     /// its result, so the repeat is answered without running again. `None` lets the calls run.
-    pub(in crate::agent) fn short_circuit(&self, calls: &[ToolCall]) -> Option<Vec<String>> {
+    pub(in crate::agent) fn short_circuit(
+        &self,
+        calls: &[ToolCall],
+    ) -> Option<Vec<DuplicateAnswer>> {
         if calls.is_empty() || calls.iter().any(|call| call.malformed_arguments) {
             return None;
         }
@@ -257,13 +346,16 @@ impl RepeatedToolCall {
                     .iter()
                     .position(|earlier| earlier.name == *name && earlier.arguments == canonical)?;
                 let earlier = unmatched.remove(at);
-                Some(
-                    crate::agent::safety::stream_guards::render_duplicate_call_result(
+                // No recoverable executed result: refuse the whole short circuit so the call runs.
+                let id = earlier.id.as_ref()?;
+                Some(DuplicateAnswer {
+                    text: crate::agent::safety::stream_guards::render_duplicate_call_result(
                         name,
-                        &earlier.id,
+                        id,
                         &earlier.result,
                     ),
-                )
+                    call_id: id.clone(),
+                })
             })
             .collect()
     }
@@ -400,7 +492,7 @@ impl RecurringCall {
                 if let (Some(id), Some(content)) =
                     (message["tool_call_id"].as_str(), message.get("content"))
                     && !content.is_null()
-                    && !content.as_str().is_some_and(is_unexecuted_reference)
+                    && !unexecuted_message(message)
                 {
                     results.entry(id).or_insert(content);
                 }
@@ -513,7 +605,9 @@ impl NarrationGuard {
             } else {
                 None
             };
-            if let Some(category) = category {
+            if let Some(category) = category
+                && !promise_fulfilled_by_calls(category, &reply.tool_calls)
+            {
                 let count = self.promises.entry(category).or_default();
                 *count = count.saturating_add(1);
                 if *count >= 3 && (*count).is_multiple_of(3) {
@@ -545,6 +639,21 @@ impl NarrationGuard {
     pub fn progress(&mut self) {
         self.seen.clear();
         self.promises.clear();
+    }
+}
+
+/// Whether the reply's own tool calls match the action it just announced, so announcing an
+/// inspection while reading files or announcing verification while running checks does not count
+/// as an unfulfilled promise.
+fn promise_fulfilled_by_calls(category: &str, calls: &[ToolCall]) -> bool {
+    match category {
+        "verification" => calls
+            .iter()
+            .any(|call| matches!(call.name.as_str(), "verify" | "bash" | "eval")),
+        "inspection" => calls
+            .iter()
+            .any(crate::agent::workflow::research::is_observation),
+        _ => false,
     }
 }
 

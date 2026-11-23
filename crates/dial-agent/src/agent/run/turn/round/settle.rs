@@ -108,7 +108,15 @@ impl Agent<'_> {
         if call.name == "todo" && !output.is_error {
             self.observe_local_plan_change();
         }
-        let is_check = crate::agent::memory::selfplay::is_check_call(call);
+        let shell_receipt = call.name == "bash"
+            && call.arguments["background"] != true
+            && call.arguments["pty"] != true
+            && crate::agent::verify::checks::classify_check_source(
+                call,
+                &self.config.verification.commands,
+            )
+            .is_some_and(|source| source.is_explicit_receipt());
+        let is_check = shell_receipt || crate::agent::memory::selfplay::is_check_call(call);
         if call.name == "bash"
             && let Some(command) = call.arguments["command"].as_str()
         {
@@ -154,6 +162,7 @@ impl Agent<'_> {
         }
         // Runtime check receipts record calls that actually executed. They are local algorithm
         // checks, not blanket verification of all workspace edits at the cell's final revision.
+        let mut check_ran = false;
         let mut eval_passed = false;
         if call.name == "eval" {
             let (passed, failed) = self
@@ -162,6 +171,7 @@ impl Agent<'_> {
                 .observe(&call.arguments, &output);
             turn.reliability.passing_checks += passed;
             turn.reliability.failing_checks += failed;
+            check_ran |= passed + failed > 0;
             eval_passed = passed > 0;
         }
         let mut shell_check_passed = false;
@@ -173,17 +183,29 @@ impl Agent<'_> {
             && !process.cancelled
             && (process.exit_code.is_some() || process.timed_out || process.signal.is_some())
         {
+            check_ran = true;
             let passed = !(output.is_error
                 || check_failed
                 || process.exit_code != Some(0)
                 || !process.output_complete);
-            if passed {
+            // A zero exit through `cmd | tail` is the filter's status, not a verdict; a nonzero
+            // exit is still a real failure.
+            let masked_pass = passed
+                && call.arguments["command"]
+                    .as_str()
+                    .is_some_and(crate::agent::verify::checks::exit_status_masked);
+            if masked_pass {
+                output
+                    .text
+                    .push_str(crate::agent::verify::checks::MASKED_CHECK_NOTE);
+            } else if passed {
                 turn.reliability.passing_checks += 1;
                 shell_check_passed = true;
+                shell_check_run = Some(true);
             } else {
                 turn.reliability.failing_checks += 1;
+                shell_check_run = Some(false);
             }
-            shell_check_run = Some(passed);
         }
         outcome.observed_check_failure |= check_failed;
         self.step_checks.reproduced |= check_failed;
@@ -216,8 +238,6 @@ impl Agent<'_> {
                 is_check,
             );
         }
-        self.request_phase
-            .observe(&call.name, !output.is_error && !check_failed, is_check);
         if output.is_error && outcome.form_kinds.is_empty() {
             outcome.execution_failed = true;
         }
@@ -261,6 +281,32 @@ impl Agent<'_> {
                 turn.reliability.passing_checks += 1;
             }
         }
+        // Phase follows observed check receipts only: a shell check that exited, an eval check
+        // that ran, or a verify result with `ran` set (attached or the `verify` tool). A plan or a
+        // reused result is not a run. Verification credit above is unchanged.
+        let verify_ran = [
+            output
+                .data
+                .as_ref()
+                .filter(|_| call.name == "verify")
+                .map(|data| &data["results"]),
+            attached_verify.map(|check| &check["data"]["results"]),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|results| {
+            results
+                .as_array()
+                .is_some_and(|results| results.iter().any(|result| result["ran"] == true))
+        });
+        self.request_phase.observe(
+            &call.name,
+            crate::adaptive::Settled {
+                succeeded: !output.is_error && !check_failed,
+                committed,
+                check: check_ran || verify_ran,
+            },
+        );
         // A call the controller refused (retry barrier, contract or preflight) never ran.
         if call.name == "bash" && !controller_blocked {
             if call.arguments["command"]
@@ -319,8 +365,9 @@ impl Agent<'_> {
             self.start_background_check(ui);
         }
         // Bound after this call's own shell effect, like the ledger's observations.
-        if shell_check_passed {
-            self.step_checks.shell_check_passed = Some(self.step_checks.revision());
+        if shell_receipt && check_ran {
+            self.step_checks.shell_check_passed =
+                shell_check_passed.then(|| self.step_checks.revision());
         }
         if committed && let Some(reminder) = self.artifact_check_reminder() {
             output.text.push('\n');
@@ -344,6 +391,7 @@ impl Agent<'_> {
         if call.name == "finish" && !output.is_error && self.step_checks.finish_accepted {
             let mut finish = crate::agent::verify::completion::Finish::parse(&call.arguments)
                 .map_err(anyhow::Error::msg)?;
+            self.normalize_finish(&mut finish);
             if let Some(data) = output.data.as_ref()
                 && matches!(
                     data["accepted_outcome"].as_str(),

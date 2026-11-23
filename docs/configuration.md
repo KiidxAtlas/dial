@@ -393,7 +393,7 @@ effort/budget and reasoning-guard limits. No sampler or thinking policy is chang
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 approval = "auto"         # ask | write | auto (built-in default) | readonly; interactive first run saves "write"
 integrations = ["bg", "web_fetch", "web_search", "lsp", "ast_search", "ast_edit", "dap"]
-context_window = "auto" # defaults to 32768 tokens; serving endpoints may cap to loaded context
+context_window = "auto" # use the model's known window, or 131072 tokens if unknown
 [sandbox]
 mode = "off"              # off (default) | dev | strict
 allow_network = true

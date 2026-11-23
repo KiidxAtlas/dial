@@ -146,6 +146,9 @@ impl Agent<'_> {
                     .with_effects(tools::surface::outcome::Effects::None);
                 output.execution.retry_barrier = retry_barrier;
             }
+            if kind == "batch_contract" {
+                output = output.with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
+            }
             if first_ran && kind == "batch_contract" {
                 output = output
                     .with_status(tools::ToolStatus::Skipped)
@@ -192,9 +195,11 @@ impl Agent<'_> {
                     admitted += 1;
                 }
                 if admitted < plan.calls.len() {
-                    self.efficiency_metrics.scheduling.barrier("admission");
+                    plan.close_at(admitted, "admission");
+                    self.efficiency_metrics
+                        .scheduling
+                        .barrier("admission", plan.barrier_tool.as_deref());
                 }
-                plan.truncate(admitted);
                 let dispatchable = plan.dispatchable();
                 let verifies = plan.calls.iter().any(|call| {
                     call.arguments["verify"]

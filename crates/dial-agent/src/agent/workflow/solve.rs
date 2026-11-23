@@ -238,10 +238,29 @@ pub(in crate::agent) fn run(
     args: &Value,
     ui: &mut dyn Ui,
 ) -> ToolOutput {
-    output(search(&mut parent, args, ui))
+    settled_output(search(&mut parent, args, ui))
 }
 
-fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> Result<Value> {
+/// Applied patch files are controller-committed effects, so the mutation phase must see them.
+/// A refused or rolled-back search commits nothing.
+fn settled_output(result: Result<(Value, Vec<PathBuf>)>) -> ToolOutput {
+    match result {
+        Ok((value, changed_paths)) => ToolOutput {
+            execution: crate::runtime::execution::Execution {
+                changed_paths,
+                ..Default::default()
+            },
+            ..output(Ok(value))
+        },
+        Err(error) => output(Err(error)),
+    }
+}
+
+fn search(
+    parent: &mut subagents::Parent<'_>,
+    args: &Value,
+    ui: &mut dyn Ui,
+) -> Result<(Value, Vec<PathBuf>)> {
     let env = parent.env;
     ensure!(
         env.config.solve.enabled,
@@ -411,9 +430,14 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
         &paths,
         env.config.solve.max_snapshot_bytes,
     )?;
-    Ok(
+    let changed = paths
+        .iter()
+        .map(|path| env.workspace.root().join(path))
+        .collect();
+    Ok((
         json!({"winner":index + 1,"applied":paths,"verified_against":"only the explicit checks listed","attempts":attempts,"training_evidence":false}),
-    )
+        changed,
+    ))
 }
 
 /// Own one wave's copies until generation, verification and ordered reduction finish.

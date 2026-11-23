@@ -77,6 +77,7 @@ impl<'a> Agent<'a> {
             ui.image(reference);
         }
         message["dial_context_request"] = json!(true);
+        message["dial_structured_text"] = json!(true);
         Some(message)
     }
 
@@ -98,7 +99,7 @@ impl<'a> Agent<'a> {
             .as_str()
             .unwrap_or(text)
             .to_owned();
-        self.push(message)?;
+        let entry_id = self.push(message)?;
         self.efficiency_metrics
             .intervention("steering_message_journaled");
         self.task_policy = crate::learn::task_policy::Policy::for_prompt(
@@ -118,10 +119,10 @@ impl<'a> Agent<'a> {
         crate::agent::run::intent::record(
             &mut control,
             &original,
-            json!(self.session.branch_leaf()),
+            json!(entry_id),
             crate::agent::run::intent::Kind::Steering,
         );
-        control["current_instruction_entry_id"] = json!(self.session.branch_leaf());
+        control["current_instruction_entry_id"] = json!(entry_id);
         control["current_instruction"] = json!(text);
         control["steering_active"] = json!(true);
         self.session.set_control_state(control)

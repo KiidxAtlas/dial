@@ -38,8 +38,7 @@ class SnakeTest(unittest):
 }
 
 REFERENCE = {
-    "research-cited-comparison": {"answer.md": "source_a.md: Alpha grew 3 percent in 2025.\n"
-                                               "source_b.md: Beta shrank 2 percent in 2025.\n"},
+    "research-cited-comparison": {"answer.md": "source_b.md | shrank | 2\nsource_a.md | grew | 3\n"},
     "deferred-tool-discovery": {"ledger.py": "def bounded_total(rows):\n    return min(sum(rows), 250)\n\n\n"
                                              "def total(rows):\n    return sum(rows)\n"},
     "unavailable-tool-recovery": {"summary.txt": "alpha beta\n"},
@@ -133,15 +132,23 @@ class LocalTasksSuiteTests(unittest.TestCase):
                        "    def test_", "    @unittest.skip('skip all')\n    def test_")}
         self.assertFalse(all(command_outcomes(SNAKE, skipped)))
 
-    def test_research_rejects_swapped_figures_and_directions(self):
-        swapped = {"answer.md": "source_a.md: Beta shrank 2 percent in 2025.\n"
-                                "source_b.md: Alpha grew 3 percent in 2025.\n"}
-        self.assertFalse(all(command_outcomes("research-cited-comparison", swapped)))
-
-    def test_research_rejects_both_figures_on_one_source_line(self):
-        both = {"answer.md": "source_a.md: Alpha grew 3 percent, Beta shrank 2 percent.\n"
-                             "source_b.md: Beta shrank 2 percent in 2025.\n"}
-        self.assertFalse(all(command_outcomes("research-cited-comparison", both)))
+    def test_citations_must_make_one_unambiguous_claim_per_source(self):
+        correct_b = "source_b.md | shrank | 2"
+        cases = [
+            ("swapped", "source_a.md | shrank | 2", "source_b.md | grew | 3"),
+            ("duplicate citation", "source_b.md | grew | 3", correct_b),
+            ("two magnitudes", "source_a.md | grew | 3 or 2", correct_b),
+            ("negated", "source_a.md | never grew | 3", correct_b),
+            ("contradicted", "source_a.md | grew | 3 | actually it shrank", correct_b),
+            # The former substring grader accepted this denial as a positive claim.
+            ("negated prose", "source_a.md: Alpha never grew 3 percent in 2025.",
+             "source_b.md: Beta shrank 2 percent in 2025."),
+        ]
+        for name, first, second in cases:
+            with self.subTest(name=name):
+                self.assertEqual(command_outcomes("research-cited-comparison", {
+                    "answer.md": f"{first}\n{second}\n",
+                }), [False])
 
     def test_denial_outcome_needs_no_written_file_and_error_text_is_not_enough(self):
         self.assertTrue(all(command_outcomes(DENIAL)))

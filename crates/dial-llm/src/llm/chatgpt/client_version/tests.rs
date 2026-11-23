@@ -79,3 +79,18 @@ fn failed_or_invalid_registry_answers_keep_the_previous_release() {
     assert_eq!(stamp.version.as_deref(), Some("0.165.0"));
     assert!(stamp.checked_at > 0);
 }
+
+#[test]
+fn only_a_codex_cache_from_a_newer_client_counts_as_newer() {
+    let cache = |version: &str| json!({"client_version": version});
+    assert!(codex_is_newer(Some(&cache("0.172.0")), "0.171.0"));
+    assert!(codex_is_newer(Some(&cache("0.172.0-alpha.3")), "0.171.0"));
+    for same_or_older in ["0.171.0", "0.170.9", "0.171.0-alpha.1", "junk"] {
+        assert!(
+            !codex_is_newer(Some(&cache(same_or_older)), "0.171.0"),
+            "{same_or_older}"
+        );
+    }
+    assert!(!codex_is_newer(Some(&json!({})), "0.171.0"));
+    assert!(!codex_is_newer(None, "0.171.0"));
+}

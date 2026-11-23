@@ -71,6 +71,7 @@ pub const METHODS: &[Method] = &[
     write("auth_code", "auth"),
     write("auth_cancel", "auth"),
     write("logout", "auth"),
+    write("remove_api_key", "auth"),
     write("new_session", "sessions"),
     write("resume", "sessions"),
     write("rename", "sessions"),

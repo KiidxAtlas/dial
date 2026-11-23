@@ -1071,9 +1071,7 @@ impl Config {
         }
         config.project_root = layout.project_root.clone();
         config.user_dir = layout.user_dir.clone();
-        let mut selection = config.selection();
-        selection.context_window = config.context_limit.tokens();
-        config.context_window = config.resolve_context_window(&selection);
+        config.context_window = config.resolve_context_window();
         let python = crate::config::paths::python_dir(&layout.user_dir);
         if config.python.as_os_str().is_empty() {
             config.python = python.join(".venv/bin/python");
@@ -1359,9 +1357,18 @@ impl Config {
             .context_window
             .map(types::ContextWindow::Tokens)
             .unwrap_or_default();
-        config.context_window = config.resolve_context_window(selection);
+        config.context_window = config.resolve_context_window();
         config
     }
+
+    /// Bind the current model to an account without turning its estimated window into a cap.
+    pub fn with_account_id(&self, account: &str) -> Self {
+        let mut selection = self.selection();
+        selection.account_id = Some(account.to_owned());
+        selection.context_window = self.context_limit.tokens();
+        self.with_selection(&selection)
+    }
+
     /// Resolve an explicitly named, operator-configured profile without accepting inline
     /// provider/model overrides from task input.
     pub fn with_named_model_profile(&self, name: &str) -> anyhow::Result<Self> {
@@ -1406,35 +1413,20 @@ impl Config {
             .or_else(|| self.family_context_limit(&self.selection()).tokens())
     }
 
-    fn resolve_context_window(&self, selection: &crate::llm::model_config::ModelSelection) -> u32 {
-        let family = self.family_context_limit(selection);
-        let mut metadata = selection.clone();
+    fn resolve_context_window(&self) -> u32 {
+        // Look up the effective route, including endpoint defaults, not the partial picker selection.
+        let mut metadata = self.selection();
         metadata.context_window = None;
-        if metadata.headers.is_none() {
-            metadata.headers = self
-                .providers
-                .get(&selection.provider)
-                .filter(|spec| {
-                    self.selection_base_url(selection).is_some_and(|url| {
-                        url.trim_end_matches('/') == spec.base_url.trim_end_matches('/')
-                    })
-                })
-                .and_then(|spec| spec.headers.clone());
+        if metadata.headers.is_none() && !self.request_headers().is_empty() {
+            metadata.headers = Some(self.request_headers().to_vec());
         }
         let capacity = crate::llm::catalog::model_context_window(&self.user_dir, &metadata);
-        let requested = self
-            .active_model_profile()
-            .filter(|profile| {
-                profile.provider == selection.provider && profile.model == selection.model
-            })
-            .and_then(|profile| profile.context_window)
-            .or(selection.context_window)
-            .or_else(|| family.tokens());
+        let requested = self.requested_context_window();
         match (requested, capacity) {
             (Some(limit), Some(capacity)) => limit.min(capacity),
             (Some(limit), None) => limit,
             (None, Some(capacity)) => capacity,
-            (None, None) => types::Config::default().context_window,
+            (None, None) => types::DEFAULT_CONTEXT_WINDOW,
         }
     }
 

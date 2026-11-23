@@ -158,6 +158,25 @@ fn catalog_merges_new_codex_models_and_preserves_account_capabilities() {
         super::super::profiles::ReasoningApi::OpenaiResponses
     );
 }
+
+#[test]
+fn a_codex_cache_from_the_same_client_cannot_restore_models_the_account_lost() {
+    // The account listing shrank; the local Codex cache still names the models it used to hold.
+    let account = json!({"models":[{"slug":"gpt-luna","visibility":"list"}]});
+    let cache = |version: &str| json!({"client_version":version,"models":[{"slug":"gpt-luna","visibility":"list"},{"slug":"gpt-astra","visibility":"list"}]});
+    let slugs = |catalog: ModelCatalog| {
+        catalog
+            .models
+            .into_iter()
+            .map(|entry| entry.selection.model)
+            .collect::<Vec<_>>()
+    };
+    let same = listed_catalog(&account, Some(&cache("0.171.0")), "0.171.0").unwrap();
+    assert_eq!(slugs(same), ["gpt-luna"]);
+    // A newer client may see models the backend withheld from this request.
+    let newer = listed_catalog(&account, Some(&cache("0.172.0")), "0.171.0").unwrap();
+    assert_eq!(slugs(newer), ["gpt-luna", "gpt-astra"]);
+}
 #[test]
 fn codex_model_discovery_sends_dial_account_headers_and_normalizes_catalog() {
     let server = crate::llm::fake::serve(vec![crate::llm::fake::json(

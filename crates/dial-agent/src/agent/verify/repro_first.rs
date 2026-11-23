@@ -57,24 +57,28 @@ impl Agent<'_> {
         }
     }
 
-    /// Consume the once-per-turn trigger when `mode` is configured and the policy applies.
-    pub(in crate::agent) fn repro_first_fires(
-        &mut self,
-        call: &ToolCall,
-        mode: ReproFirst,
-    ) -> bool {
+    /// Side-effect-free: looking ahead during wave planning must not consume a refusal.
+    pub(in crate::agent) fn repro_first_pending(&self, call: &ToolCall, mode: ReproFirst) -> bool {
         if self.config.experimental.repro_first != mode {
             return false;
         }
-        let targets = self.repro_first_targets(call);
-        let fires = applies(
+        applies(
             mode,
             self.task_policy.kind,
             self.task_policy.verification_requested,
             self.step_checks.reproduced,
             self.step_checks.repro_first_fired,
-            &targets,
-        );
+            &self.repro_first_targets(call),
+        )
+    }
+
+    /// Consume the trigger only when dispatch returns the refusal or settlement emits advice.
+    pub(in crate::agent) fn repro_first_fires(
+        &mut self,
+        call: &ToolCall,
+        mode: ReproFirst,
+    ) -> bool {
+        let fires = self.repro_first_pending(call, mode);
         self.step_checks.repro_first_fired |= fires;
         fires
     }

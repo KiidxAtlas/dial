@@ -109,6 +109,16 @@ fn codex_version(codex: Option<&Value>) -> Option<&str> {
     codex?["client_version"].as_str()
 }
 
+/// Whether a local Codex model cache came from a client newer than `sent`, the version a listing
+/// request reported. Only such a cache can name models the backend withheld from that request;
+/// from the same or an older client, a model the answer lacks has left the account. A
+/// pre-release counts by its base release.
+pub(super) fn codex_is_newer(codex: Option<&Value>, sent: &str) -> bool {
+    let theirs = codex_version(codex)
+        .and_then(|version| parse(version.split(['-', '+']).next().unwrap_or(version)));
+    matches!((theirs, parse(sent)), (Some(theirs), Some(ours)) if theirs > ours)
+}
+
 /// A stable `MAJOR.MINOR.PATCH` release; pre-releases and anything else are ignored.
 fn parse(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.');

@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parent
 class ManifestTests(unittest.TestCase):
     def test_committed_slice_matches_its_suites_and_profiles(self):
         manifest = release_slice.load()
-        self.assertEqual(manifest["name"], "release-slice-v1")
+        self.assertEqual(manifest["name"], "release-slice-v2")
         self.assertGreaterEqual(manifest["repetitions"], 3)
         cases = sum(suite["cases"] for suite in manifest["suites"])
-        self.assertEqual(cases, 27)
-        self.assertEqual(release_slice.trials(manifest), 81)
+        self.assertEqual(cases, 28)
+        self.assertEqual(release_slice.trials(manifest), 84)
 
     def test_local_profile_cannot_reach_a_remote_provider(self):
         manifest = release_slice.load()

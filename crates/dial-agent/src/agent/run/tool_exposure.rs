@@ -26,7 +26,8 @@ impl<'a> Agent<'a> {
     /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
     /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`, then
     /// briefly to 27 KiB; shorter `eval`, `finish`, `message` and `task` descriptions restored 25 KiB.
-    const HOSTED_CORE_SCHEMA_BYTES: usize = 25 * 1024;
+    /// Raised to 27 KiB again for the per-tool batching notes ([`Self::batching_note`]).
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 27 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
     /// Basic workspace operations precede questions, which precede optional execution helpers.
@@ -68,6 +69,31 @@ impl<'a> Agent<'a> {
         !self.hermetic
             && self.config.assistance.compact_tools
             && self.config.harness.tools == config::tools::default_tools()
+    }
+
+    /// Canonical static route-level tool-offer policy: unifies hosted/local budget,
+    /// byte-stability eligibility, and provider surface exposure mode.
+    pub(in crate::agent) fn tool_offer_policy(
+        &self,
+        exposure: crate::llm::tool_offer::Exposure,
+    ) -> ToolOfferPolicy {
+        use crate::llm::tool_offer::Exposure;
+        let hosted = self.hosted_route();
+        let stable_offer = self.stable_tool_offer();
+        let preserve_surface = !self.hermetic
+            && !self.lean_tools
+            && match exposure {
+                Exposure::Plain => false,
+                Exposure::Deferred => stable_offer,
+                Exposure::AllowedTools => true,
+            };
+        ToolOfferPolicy {
+            hosted,
+            core_schema_budget: self.core_schema_budget(),
+            stable_offer,
+            exposure,
+            preserve_surface,
+        }
     }
     /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
     /// loads on demand, llama.cpp splits `-c` across slots, Ollama defaults small and truncates silently.
@@ -406,6 +432,8 @@ impl<'a> Agent<'a> {
     ///   mode tool, a controller load, a compacted result) is sent loaded so it stays visible.
     /// - `AllowedTools` (OpenAI Responses): the full offer plus the mode tools; narrowing and mode
     ///   state change only `tool_choice`.
+    /// - Under context-overflow recovery, use exactly the accounted, callable schemas; expanding
+    ///   the prefix again here could undo the retry's reduction after the headroom check.
     /// - `Plain`, hermetic runs and (for `Deferred`) operator-pinned offers: unchanged.
     pub(in crate::agent) fn wire_tool_surface(
         &self,
@@ -414,14 +442,8 @@ impl<'a> Agent<'a> {
         request: &mut Chat,
     ) -> Result<()> {
         use crate::llm::tool_offer::{self, Exposure, Mark};
-        if self.hermetic
-            || request.tools.is_empty()
-            || match exposure {
-                Exposure::Plain => true,
-                Exposure::Deferred => !self.stable_tool_offer(),
-                Exposure::AllowedTools => false,
-            }
-        {
+        let policy = self.tool_offer_policy(exposure);
+        if request.tools.is_empty() || !policy.preserve_surface {
             return Ok(());
         }
         let name_of = |schema: &Value| schema["function"]["name"].as_str().map(str::to_owned);
@@ -710,7 +732,7 @@ impl<'a> Agent<'a> {
             if self.plan_mode && self.tool_eligible("exit_plan") {
                 names.push("exit_plan".into());
             }
-            if self.modes.goal.tool_offered() {
+            if self.modes.goal.tool_offered() && self.tool_eligible("goal") {
                 names.push("goal".into());
             }
             names.sort();
@@ -873,21 +895,14 @@ impl<'a> Agent<'a> {
             names.push("message".into());
             names.sort();
         }
-        for tool in crate::agent::window::context_notes::TOOL_NAMES {
-            if catalog.iter().any(|name| name == tool) && self.plan_tool_available(tool) {
-                names.push(tool.to_owned());
-            }
-        }
-        // The notes-backed context window needs raw-history recovery up front; investigation
-        // checkpoints only once exploration is under way (its tools join the offer just below).
+        // Investigation checkpoints need search only once exploration is under way. Context
+        // recovery tools have a separate owner and must survive the final minimal cut below.
         let exploring = self.exploration.busy()
             || crate::agent::workflow::exploration::TOOL_NAMES
                 .iter()
                 .any(|tool| names.iter().any(|name| name == tool));
-        if (self.config.compaction.snapcompact.overlay
-            || crate::agent::compact::snapcompact::views::available_in(&self.session)
-            || self.experimental_context_owner()
-            || (self.exploration_owner() && (exploring || !deferred("session_search"))))
+        if self.exploration_owner()
+            && (exploring || !deferred("session_search"))
             && catalog.iter().any(|name| name == "session_search")
             && self.plan_tool_available("session_search")
         {
@@ -946,14 +961,30 @@ impl<'a> Agent<'a> {
                     || memory_core.contains(name)
             });
         }
+        names.extend(self.context_recovery_tools(&catalog));
         // The plan exit is a control operation, not an optional schema-budget candidate.
         if self.plan_mode && self.tool_eligible("exit_plan") {
             names.push("exit_plan".into());
-            names.sort();
-            names.dedup();
         }
-
+        names.sort();
+        names.dedup();
         names
+    }
+
+    /// Recovery schemas are part of the active context strategy, not optional discoveries. The
+    /// catalog (including model restrictions) and the mode/launch allowlist remain authoritative.
+    fn context_recovery_tools(&self, catalog: &[String]) -> Vec<String> {
+        let notebook = self.experimental_context_owner();
+        let recovery = notebook
+            || self.config.compaction.snapcompact.overlay
+            || crate::agent::compact::snapcompact::views::available_in(&self.session);
+        crate::agent::window::context_notes::TOOL_NAMES
+            .into_iter()
+            .filter(|_| notebook)
+            .chain(recovery.then_some("session_search"))
+            .filter(|tool| catalog.iter().any(|name| name == *tool) && self.tool_eligible(tool))
+            .map(str::to_owned)
+            .collect()
     }
 
     pub(in crate::agent) fn stable_core_tools(&self) -> Vec<String> {
@@ -963,11 +994,14 @@ impl<'a> Agent<'a> {
     fn stable_core_tools_with(&self, eval_ready: &dyn Fn() -> bool) -> Vec<String> {
         let catalog = self.catalog();
         let mut core = Vec::new();
-        let mut bytes = 2;
+        let recovery = self.context_recovery_tools(&catalog);
         let limit = self.initial_tool_limit();
         let budget = self.core_schema_budget();
         // `bash` is counted with its note that `bg` is loadable until `bg` itself joins.
         let schema_size = |name: &str| self.budgeted_schema_bytes(name, true).unwrap_or(budget);
+        // Reserve mandatory recovery schemas before admitting optional core tools; don't grow
+        // the hosted or local byte budget, and don't trade recovery away on an overflow retry.
+        let mut bytes = 2 + recovery.iter().map(|name| schema_size(name)).sum::<usize>();
         let bg_note_bytes = || {
             schema_size("bash")
                 .saturating_sub(self.budgeted_schema_bytes("bash", false).unwrap_or(budget))
@@ -1002,7 +1036,10 @@ impl<'a> Agent<'a> {
                 0
             };
             let control = matches!(name, "tool_search" | "tool_load" | "finish");
-            if control || ((limit == 0 || core.len() < limit) && bytes + size <= budget + note) {
+            if control
+                || ((limit == 0 || recovery.len() + core.len() < limit)
+                    && bytes + size <= budget + note)
+            {
                 bytes = bytes + size - note;
                 core.push(name.to_owned());
                 if delegation {
@@ -1010,6 +1047,20 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        // On overflow, narrow the already-admitted core, not the catalog: do not fill a
+        // dropped schema's budget slot with a different one. Keep inspection, editing,
+        // shell, planning, verification and discovery; `offered_with_eval_readiness` adds
+        // eligible explicit loads and active mode controls independently of this cut. Never hide
+        // a selected capability when the mode/allowlist forbids the loader that could restore it.
+        if self.lean_tools && core.iter().any(|name| name == "tool_search") {
+            core.retain(|name| {
+                matches!(
+                    name.as_str(),
+                    "tool_search" | "finish" | "read" | "edit" | "bash" | "todo" | "verify"
+                )
+            });
+        }
+        core.extend(recovery);
         core.sort();
         core.dedup();
         core
@@ -1282,9 +1333,46 @@ impl<'a> Agent<'a> {
                     _ => {}
                 }
             }
+            // Say how each tool batches, matching dispatch: read-only shared calls form parallel
+            // groups, everything else runs in order, and `finish` must come last. One-call
+            // routes state their own limit instead.
+            if !self.local_one_call() {
+                let schema = schemas.last_mut().expect("schema was just inserted");
+                let description = schema["function"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                schema["function"]["description"] =
+                    json!(format!("{description} {}", self.batching_note(name)));
+            }
         }
         crate::tools::surface::catalog::Catalog::validate_schemas(&schemas)?;
         Ok(schemas)
+    }
+
+    /// The batching sentence appended to `name`'s description. It depends only on the tool, not
+    /// the offer, so a tool's schema is identical whichever subset is requested.
+    fn batching_note(&self, name: &str) -> &'static str {
+        let parallel = match name {
+            "read" | "glob" | "grep" | "ast_search" => true,
+            "bash" | "finish" => false,
+            _ => self.ext.get(name).is_some_and(|tool| {
+                let args = json!({});
+                tool.concurrency(&args) == crate::tools::integrations::ext::Concurrency::Shared
+                    && !tool.supports_tool_dispatch()
+                    && !tool.needs_approval(&args)
+            }),
+        };
+        match name {
+            "bash" => {
+                "Batch: independent calls may share a response; read-only ones run in parallel with reads, others in order."
+            }
+            "finish" => "Batch: may follow other calls; must be last.",
+            _ if parallel => {
+                "Batch: independent calls may share a response, in parallel with `read`/`grep`/`glob`/read-only `bash`."
+            }
+            _ => "Batch: may share a response with independent calls; runs in order.",
+        }
     }
 
     pub(in crate::agent) fn record(&self, step: u32, kind: &str, mut data: Value) -> Result<()> {
@@ -1356,12 +1444,12 @@ impl<'a> Agent<'a> {
     }
 
     /// Append to the durable session; training capture happens at the inference boundary.
-    pub(in crate::agent) fn push(&mut self, message: Value) -> Result<()> {
-        self.session.append(message)?;
+    pub(in crate::agent) fn push(&mut self, message: Value) -> Result<String> {
+        let id = self.session.append(message)?;
         if let Some(memory) = &self.memory_runtime {
             memory.resume(memory_authority(&self.session, 0));
         }
-        Ok(())
+        Ok(id)
     }
 }
 /// A capability gap the controller observed during a turn. Each gap maps to one fixed query owned
@@ -1399,9 +1487,12 @@ impl Agent<'_> {
             else {
                 continue;
             };
-            let description = schema["function"]["description"]
-                .as_str()
-                .unwrap_or("")
+            // Listings show the tool's own text; the batching note is part of an offered schema.
+            let description = schema["function"]["description"].as_str().unwrap_or("");
+            let note = format!(" {}", self.batching_note(&name));
+            let description = description
+                .strip_suffix(note.as_str())
+                .unwrap_or(description)
                 .to_owned();
             let indexed = super::dispatch::search_index::text(&schema);
             out.push((name, description, indexed));
@@ -1696,3 +1787,16 @@ pub(in crate::agent) fn parameter_help(schema: &Value) -> Option<String> {
     let help = crate::runtime::arguments::parameter_help(schema.pointer("/function/parameters")?);
     (!help.is_empty()).then_some(help)
 }
+
+/// Resolved route-level policy governing static tool-offer budgeting and byte-stable surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) struct ToolOfferPolicy {
+    pub(in crate::agent) hosted: bool,
+    pub(in crate::agent) core_schema_budget: usize,
+    pub(in crate::agent) stable_offer: bool,
+    pub(in crate::agent) exposure: crate::llm::tool_offer::Exposure,
+    pub(in crate::agent) preserve_surface: bool,
+}
+
+#[cfg(test)]
+mod tool_offer_policy_tests;

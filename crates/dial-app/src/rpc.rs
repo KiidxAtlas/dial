@@ -64,6 +64,8 @@ fn request_limit(acp: bool) -> usize {
     if acp { MAX_ACP_REQUEST } else { MAX_REQUEST }
 }
 
+mod type_context;
+
 /// Capabilities a transport lacks: ACP has no custom question input, no live voice, no host tool or
 /// host URI bridge, no provider sign-in, and no session administration, settings, checkpoint,
 /// workspace-directory, background-job, session-control or schema methods (these are native
@@ -138,6 +140,7 @@ pub(crate) fn ready_frame(
         "model":model,
         "tools":tools,
         "image_input":image_input,
+        "features":{"type_context":true},
         "methods":methods,
         "capabilities":capabilities,
         "limits":{
@@ -504,6 +507,8 @@ impl Sender {
         self.emit(Self::result_frame(id, result, self.protocol()));
     }
 
+    /// A failed request's message is for a person: recovery guidance addressed to the model is
+    /// left out, as in the TUI and print mode.
     fn result_frame(id: &Value, result: Result<Value>, protocol: u32) -> Value {
         match result {
             Ok(v) => json!({"id":id,"result":v}),
@@ -512,9 +517,9 @@ impl Sender {
                     .downcast_ref::<RequestError>()
                     .map_or(ErrorCode::Failed, |error| error.code)
                     .as_str();
-                json!({"id":id,"error":{"code":code,"message":format!("{e:#}")}})
+                json!({"id":id,"error":{"code":code,"message":crate::agent::user_failure_text(&e)}})
             }
-            Err(e) => json!({"id":id,"error":{"message":format!("{e:#}")}}),
+            Err(e) => json!({"id":id,"error":{"message":crate::agent::user_failure_text(&e)}}),
         }
     }
     fn protocol_error(&self, message: &str, parse: bool) {
@@ -733,8 +738,9 @@ impl Ui for RpcUi {
     fn efficiency(&mut self, report: &Value) {
         self.out.emit(json!({"event":"efficiency","report":report}));
     }
-    fn check_passed(&mut self) {
-        self.out.emit(json!({"event":"check_passed"}));
+    fn check_passed_with_delivery(&mut self, open_count: &dyn Fn() -> usize) {
+        self.out
+            .emit(json!({"event":"check_passed","open_declared_deliverables":open_count()}));
     }
     fn tool_timing(&mut self, call_id: &str, name: &str, seconds: f64) {
         self.out
@@ -1938,6 +1944,12 @@ fn run_control(
                         auth::ensure_v2(&out)?;
                         auth::cancel_login(&auth_state, &request["params"])
                     })();
+                    out.result(&id, result);
+                }
+                "remove_api_key" => {
+                    let result = auth::ensure_v2(&out).and_then(|()| {
+                        auth::remove_api_key(&auth_state, &auth_dir, &request["params"])
+                    });
                     out.result(&id, result);
                 }
                 "logout" => {

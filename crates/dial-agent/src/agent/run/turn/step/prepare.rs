@@ -45,58 +45,25 @@ impl Agent<'_> {
             revision: self.step_checks.revision(),
             instruction: turn.enrichment_epoch,
         }) {
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Review,
-                hints,
-            ));
+            turn.notices
+                .push_advisory(crate::agent::run::guidance::Priority::Review, hints);
         }
         let budget_window = self.budget_window();
         let route = self.route.generation();
-        self.before_request(backend, &turn.names, &mut turn.pending_nudges, ui)?;
+        self.before_request(backend, &turn.names, turn.notices.pending_mut(), ui)?;
         // A mode hook (prewalk handoff) may have installed another model: size for it.
         if self.route.generation() != route {
             turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
         }
         let mut messages = self.system_messages();
         self.session.extend_messages(&mut messages);
-        let pre_action_secs = if step == 0 {
-            self.task_policy.initial_reasoning_secs
-        } else {
-            self.config.reasoning_guard.max_pre_action_secs
-        };
-        let mut selection = crate::adaptive::select(
-            self.config,
-            &self.request_phase,
-            crate::adaptive::Request {
-                kind: self.task_policy.kind,
-                temperature: turn.harness.temperature,
-                tokens: turn.reasoning_budget.unwrap_or(turn.max_tokens),
-                pre_action_secs,
-                base_profile: backend.model_profile(),
-                recovering_output: turn.recovering_output || turn.reasoning_budget.is_some(),
-                hermetic: self.hermetic,
-            },
-        );
-        if let Some(source) =
-            self.apply_local_sampling(&mut selection.profile, turn.harness.temperature)
-        {
-            selection.sampling_source = source.to_owned();
-            if selection
-                .profile
-                .as_ref()
-                .is_some_and(|p| !p.capabilities.temperature)
-            {
-                selection.temperature = None;
-            }
-        }
-        // Recovery budgets remain explicit; ordinary unlimited requests inherit the host's limit.
-        if !turn.recovering_output
-            && turn.reasoning_budget.is_none()
-            && !(selection.enabled && self.config.adaptive.output_limits)
-        {
-            self.apply_local_output_limit(&mut selection.profile, turn.harness.max_tokens);
-        }
         let mut request_control = self.session.control_state();
+        let super::super::policy::ResolvedRequestPolicy {
+            mut selection,
+            single_call,
+            measured_single,
+            lightweight,
+        } = self.resolve_request_policy(turn, backend, step, &mut request_control);
         let mut packet_cache = std::mem::take(&mut self.task_packet);
         let mut superseded = std::mem::take(&mut self.superseded);
         let sent_messages = self.project_history(
@@ -137,37 +104,16 @@ impl Agent<'_> {
             turn.names.retain(|name| name == "todo" || name == "finish");
         }
         turn.planning_notice = planning_required;
-        let mut call_reasons = if self.hermetic {
-            Vec::new()
-        } else {
-            crate::reliability::single_call_reasons(
-                self.config,
-                turn.measured.as_ref(),
-                &turn.reliability,
-            )
-        };
-        let measured_single = !call_reasons.is_empty();
-        // Local and measured constraints compose; record every applicable cause.
-        if !self.hermetic && self.local_one_call() {
-            call_reasons.push("small_local_tier_without_batch_evidence");
-        }
-        let single_call = !call_reasons.is_empty();
-        request_control["reliability"]["call_policy"] = json!({
-            "mode": if single_call { "one_call" } else { "batch" },
-            "reasons": call_reasons,
-        });
         // Re-render deferred advice, rather than replaying a batch recommendation after the
         // request policy changes. Keep the target pending if higher-priority guidance wins.
-        turn.pending_nudges
+        turn.notices
             .retain(|note| !crate::agent::run::search_frontier::EmptySearches::is_advice(note));
         let discovery_advice = (!self.hermetic)
             .then(|| self.step_checks.empty_searches.advice(single_call))
             .flatten();
         if let Some(advice) = &discovery_advice {
-            turn.pending_nudges.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Loop,
-                advice.clone(),
-            ));
+            turn.notices
+                .push_advisory(crate::agent::run::guidance::Priority::Loop, advice.clone());
         }
         let mut contract = crate::reliability::Contract::new(offer)?;
         if measured_single {
@@ -182,13 +128,7 @@ impl Agent<'_> {
             contract = crate::reliability::Contract::new(contract.schemas)?;
         }
         turn.names = contract.names.clone();
-        let lightweight = self.config.efficiency.enabled
-            && !self.hermetic
-            && self.task_policy.lightweight
-            && step < self.config.efficiency.lightweight_requests
-            && !self.todo.has_open()
-            && self.efficiency_metrics.failed_tool_results == 0;
-        // The tool contract is restated only when the model is constrained to one call or has
+        // Restate the tool contract only when running single-call recovery or after the model
         // just broken the contract; the offered schemas already carry it otherwise.
         if !self.hermetic
             && self.config.reliability.enabled
@@ -201,63 +141,54 @@ impl Agent<'_> {
             messages.push(json!({"role":"user","content":guidance,"dial_transient":true}));
         }
         turn.todo_recovery.apply(&mut messages);
-        turn.pending_nudges.extend(
+        turn.notices.extend(
             std::mem::take(&mut self.background_notices)
                 .into_iter()
                 .map(|text| json!({"role":"user","content":text,"dial_transient":true})),
         );
         // Lifecycle hooks' `additional_context` is delivered once, like background notices.
-        turn.pending_nudges.extend(self.take_hook_context());
-        turn.pending_nudges.extend(self.poll_coordination(ui));
-        turn.pending_nudges.extend(self.take_monitor_context());
-        messages.extend(turn.pending_nudges.iter().cloned());
-        // The redirect is stated once; if the identical repeat continues, the stronger
-        // guidance replaces it. Neither stage ends the turn.
-        let repeat_streak = crate::agent::safety::guard::RepeatedToolCall::detect(
-            &messages,
-            crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD,
-            crate::agent::safety::stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
-        );
-        if let Some((event, guidance)) =
-            crate::agent::safety::stream_guards::repetition_guidance_with_streak(
-                &messages,
-                repeat_streak.as_ref(),
-            )
-        {
-            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                crate::agent::ui::ui_event::EventKind::Recovery,
-                event,
-            ));
-            messages.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Repetition,
-                guidance,
-            ));
-        }
+        turn.notices.extend(self.take_hook_context());
+        turn.notices.extend(self.poll_coordination(ui));
+        turn.notices.extend(self.take_monitor_context());
         // Only lean local routes get the forced tool-free checkpoint; elsewhere a long
         // observation run receives the advisory note and keeps its tools.
         let research_forced = self.lean_completion_route();
         let research_step = research_forced && engine.research_required();
-        if !planning_required
-            && !research_step
-            && !turn.names.is_empty()
-            && let Some(advice) = turn
-                .pace
-                .lookup_advice(single_call, turn.names.iter().any(|name| name == "read"))
-        {
-            messages.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Loop,
-                advice,
+        let mut repeat_streak = None;
+        let mut repetition_event = None;
+        let dropped = turn
+            .notices
+            .flush_with(&mut messages, notes_start, |current| {
+                let super::super::progress_machine::RequestAdvisories {
+                    repeat_streak: streak,
+                    repetition_event: event,
+                    notes: mut extra_notes,
+                } = super::super::progress_machine::evaluate_request_advisories(
+                    current,
+                    &turn.pace,
+                    planning_required,
+                    research_step,
+                    &turn.names,
+                    single_call,
+                );
+                repeat_streak = streak;
+                repetition_event = event;
+                if let Some(note) = engine.research_prompt(research_forced) {
+                    extra_notes.push(note);
+                }
+                if !self.experimental_context_owner()
+                    && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
+                {
+                    extra_notes.push(guidance);
+                }
+                extra_notes
+            });
+        if let Some(event) = repetition_event {
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Recovery,
+                event,
             ));
         }
-        if let Some(note) = engine.research_prompt(research_forced) {
-            messages.push(note);
-        }
-        // One advisory note per request, by priority, then one merged harness message; protocol
-        // notes and gates are unaffected. A previous request that was discarded before any reply
-        // delivered nothing.
-        turn.emissions.retract();
-        let dropped =
-            crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut turn.emissions);
         if let Some(brief) = &mut self.step_checks.repair_brief {
             brief.selected = repair_note
                 .as_ref()
@@ -270,13 +201,8 @@ impl Agent<'_> {
                     .is_some_and(|text| text.contains(advice))
             })
         }) {
-            turn.pending_nudges
+            turn.notices
                 .retain(|note| !crate::agent::run::search_frontier::EmptySearches::is_advice(note));
-        }
-        if !self.experimental_context_owner()
-            && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
-        {
-            messages.push(guidance);
         }
         turn.rule_state.save(&mut request_control);
         let mut request = Chat {

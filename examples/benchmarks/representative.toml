@@ -1,5 +1,5 @@
 version = 1
-name = "representative-quality-v1"
+name = "representative-quality-v2"
 
 # All command bodies are part of the frozen suite, not mutable project tests.
 [[cases]]
@@ -96,4 +96,32 @@ def invoice_total(items):
 def discounted_total(subtotal, fraction):
     return round(subtotal * (1 - fraction))
 '''},
+]
+
+# No on-disk plan: until the final selection the staged code is the same for either rollout.
+# The ticket first arrives after compaction, so a previously finished handoff cannot suffice.
+[[cases]]
+id = "deferred-rollout-recall-journey"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Stage a pagination rollout: rename DEFAULT_PAGE_SIZE to PAGE_SIZE in settings and reports, but keep the current default until activation. Keep the rollout plans only in conversation, not in files: Cedar is 32 rows/page with owner Mica; Larch is 48 with owner Topaz. When I select a plan, activate its page size and create rollout.txt with one line in the format 'ticket owner' (one space; use the supplied ticket and selected owner). Preserve the discount setting."
+turns = [
+  {prompt="Correction to the pending Cedar plan: 37 rows/page, owner Flint. Do not activate or write down the plan yet."},
+  {prompt="Add page_count(None) returning 0. Preserve pagination for ordinary lists.",compact_before=true},
+  {prompt="Provisional planning change: use 64 rows for Cedar, with no ownership change. Do not activate it."},
+  {prompt="Retract that provisional size change. Restore the preceding approved plan, still without activating it.",compact_before=true},
+  {prompt="Verify the staged behavior for empty and full pages, without recording or activating either pending plan."},
+  {prompt="Activate Cedar for ticket R-908 and complete the agreed handoff. Verify the resulting behavior.",compact_before=true},
+]
+categories = ["quality", "journey", "multi_turn", "compaction", "correction", "retraction", "goal_preservation", "deferred_requirement"]
+checks = [
+  {kind="command",command='''python3 -B - <<'PY'
+from pathlib import Path
+import settings
+from reports import page_count
+assert settings.PAGE_SIZE == 37 and not hasattr(settings, 'DEFAULT_PAGE_SIZE')
+assert settings.DISCOUNT_FRACTION == 0.20
+assert page_count(None) == 0
+assert [page_count(list(range(n))) for n in [0,1,36,37,38,74,75]] == [0,1,1,1,2,2,3]
+assert Path('rollout.txt').read_text().splitlines() == ['R-908 Flint']
+PY'''},
 ]

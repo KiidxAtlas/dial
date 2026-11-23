@@ -28,6 +28,10 @@ pub struct Execution {
     /// JSON, diagnostic prose, or tool payloads; a permission refusal cannot manufacture it.
     #[serde(skip)]
     pub retry_barrier: bool,
+    /// The controller recorded this result without executing the call. Persisted to history as
+    /// `dial_result_origin`; never restored from JSON, payloads or diagnostic prose.
+    #[serde(skip)]
+    pub result_origin: Option<ResultOrigin>,
     /// A successful native eval reset repairs only the named namespace's dependencies.
     #[serde(skip)]
     pub namespace_reset: Option<EvalNamespace>,
@@ -51,6 +55,19 @@ pub struct Execution {
     /// Native source-witness prerequisites for retry, never inferred from diagnostic text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_edit_retry: Option<NativeEditRetry>,
+}
+
+/// Why the controller answered a call without executing it. Typed history records are decided by
+/// this value alone; prose in the result text never selects it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultOrigin {
+    /// Answered from an identical earlier call in the same turn; `call_id` names that call.
+    Duplicate { call_id: String },
+    /// Refused by the failed-operation retry barrier.
+    RetryBarrier,
+    /// Not started: a pending refusal, stop boundary, supersession or batch contract.
+    Skipped,
 }
 
 /// One admitted native invocation and its synchronous parent. IDs are unique in this process;

@@ -1,6 +1,6 @@
 //! Execution outcomes are independent of presentation hooks.
 use crate::runtime::Phase;
-pub use crate::runtime::execution::{Effects, Execution, ToolStatus};
+pub use crate::runtime::execution::{Effects, Execution, ResultOrigin, ToolStatus};
 use crate::tools::ToolOutput;
 use serde_json::Value;
 
@@ -73,11 +73,24 @@ pub fn effects(output: &ToolOutput) -> Effects {
     output.execution.effects
 }
 
+/// The typed reason no execution happened, if any. The retry barrier is recorded as its own origin.
+pub fn result_origin(output: &ToolOutput) -> Option<ResultOrigin> {
+    output.execution.result_origin.clone().or_else(|| {
+        output
+            .execution
+            .retry_barrier
+            .then_some(ResultOrigin::RetryBarrier)
+    })
+}
+
 /// Persist the same typed outcome used by presentation and telemetry in the model history.
+/// `dial_result_origin` is always written (null when the call executed), so its presence marks a
+/// typed record for the loop guard.
 pub fn annotate(message: &mut Value, output: &ToolOutput) {
     message["dial_execution_status"] = serde_json::json!(ToolStatus::from_output(output));
     message["dial_effects"] = serde_json::json!(effects(output));
     message["dial_execution"] = serde_json::json!(output.execution);
+    message["dial_result_origin"] = serde_json::json!(result_origin(output));
     if let Some(recovery) = output.recovery() {
         message["dial_recovery"] = serde_json::json!(recovery);
     }
@@ -175,7 +188,8 @@ pub fn skipped(id: &str, reason: &str) -> Value {
         id,
         &ToolOutput::err(reason)
             .with_status(ToolStatus::Skipped)
-            .with_effects(Effects::None),
+            .with_effects(Effects::None)
+            .with_result_origin(ResultOrigin::Skipped),
     )
 }
 

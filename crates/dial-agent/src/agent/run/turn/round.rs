@@ -32,7 +32,7 @@ struct RoundRequest<'a> {
 #[derive(Default)]
 struct BatchState {
     narration_warning: Option<String>,
-    duplicates: Option<Vec<String>>,
+    duplicates: Option<Vec<crate::agent::safety::guard::DuplicateAnswer>>,
     parallel: std::collections::VecDeque<(ToolOutput, f64)>,
     prerequisites: crate::agent::run::dependency_dispatch::BatchPrerequisites,
     launch_sources:
@@ -111,10 +111,8 @@ impl Agent<'_> {
                     turn.reliability.passing_checks + turn.reliability.failing_checks,
                 )
             {
-                turn.pending_nudges.push(crate::agent::run::guidance::note(
-                    crate::agent::run::guidance::Priority::Review,
-                    note,
-                ));
+                turn.notices
+                    .push_advisory(crate::agent::run::guidance::Priority::Review, note);
             }
             let mut expanded = call.clone();
             if crate::agent::window::file_handles::expand(&self.workspace, &mut expanded).is_ok()
@@ -289,7 +287,12 @@ impl Agent<'_> {
             if let Some(results) = duplicates.as_ref() {
                 // The loop guard answered this call from the earlier identical round.
                 self.record(step, "repeated_call", json!({"name":call.name}))?;
-                let output = ToolOutput::ok(results[index].clone());
+                let answer = &results[index];
+                let output = ToolOutput::ok(answer.text.clone()).with_result_origin(
+                    tools::surface::outcome::ResultOrigin::Duplicate {
+                        call_id: answer.call_id.clone(),
+                    },
+                );
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
@@ -298,7 +301,8 @@ impl Agent<'_> {
             if self.edit_preview_intercepted && parallel.is_empty() {
                 let output = ToolOutput::err(
                     "This call was not executed: a completed, authorized edit preview failed earlier in this assistant batch. Regenerate the edit before starting further tools; completed effects and prefetched results remain intact.",
-                );
+                )
+                .with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
@@ -315,7 +319,8 @@ impl Agent<'_> {
             if outcome.portable_batch_intercepted && parallel.is_empty() {
                 let output = ToolOutput::err(
                     "This call was not executed: portable guidance intercepted an earlier native-code callback in this assistant batch. Regenerate with the staged guidance before any further tool action.",
-                );
+                )
+                .with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
@@ -337,7 +342,7 @@ impl Agent<'_> {
             if !outcome.steering.is_empty() && parallel.is_empty() {
                 // Close the old call/result pair before appending the new user
                 // message. Already-prefetched reads keep their actual results.
-                self.push(llm::tool_message(&call.id, "This call was not executed: a newer user instruction superseded this pending action. Replan from the latest user message."))?;
+                self.push(crate::tools::surface::outcome::skipped(&call.id, "This call was not executed: a newer user instruction superseded this pending action. Replan from the latest user message."))?;
                 crate::telemetry::tool(
                     self.config,
                     self.hermetic,
@@ -351,7 +356,8 @@ impl Agent<'_> {
             if self.exploration.requested_rewind() && parallel.is_empty() {
                 let output = ToolOutput::err(
                     "This call was not executed: rewind was requested earlier in this assistant batch. Completed sibling effects and their actual results are preserved; continue after the owner commits or rejects the anchored report.",
-                );
+                )
+                .with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
@@ -368,7 +374,8 @@ impl Agent<'_> {
             if self.pending_context_rollover.is_some() && parallel.is_empty() {
                 let output = ToolOutput::err(
                     "This call was not executed: a new context window was requested earlier in this assistant batch. Continue after the owner commits or rejects that request; previously completed effects and results are preserved.",
-                );
+                )
+                .with_result_origin(tools::surface::outcome::ResultOrigin::Skipped);
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 self.push(crate::tools::surface::outcome::message(&call.id, &output))?;

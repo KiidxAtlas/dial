@@ -83,36 +83,9 @@ pub(in crate::agent) struct Settlement<'a> {
 #[derive(Default)]
 pub(in crate::agent) struct Engine {
     checkpoint: recovery_checkpoint::RecoveryCheckpoint,
-    /// Failed normalized calls stay withheld across continuations and compaction. Each failure is
-    /// released only by its own dependency: a committed change to its known files, a changed shell
-    /// tree, a matching grant, or a new instruction. Unknown dependencies keep the whole-turn rule.
-    failed: std::collections::BTreeSet<[u8; 32]>,
-    /// Tree a failed shell command ran against. Another session can repair the checkout, so a
-    /// later tree (different HEAD or uncommitted content) releases that command's barrier.
-    failed_trees: std::collections::HashMap<[u8; 32], String>,
-    /// Known files a failed `edit`/`write` targeted; committed/external source repairs release
-    /// their barriers independently of native witness readiness.
-    failed_writes: std::collections::HashMap<[u8; 32], Vec<std::path::PathBuf>>,
-    /// Only native validators can declare missing witnesses. Reads of a path, prose and payload
-    /// claims never substitute for exact current source and all required complete rows.
-    failed_witnesses:
-        std::collections::HashMap<[u8; 32], crate::runtime::execution::NativeEditRetry>,
-    /// Known files a failed `read` targeted. Re-reading is not new evidence, so only a committed
-    /// change to one of them releases the barrier.
-    failed_reads: std::collections::HashMap<[u8; 32], Vec<std::path::PathBuf>>,
-    /// File identities at a failed file operation's settlement. External repairs release only
-    /// calls whose own inputs changed, without treating an unrelated edit as recovery.
-    failed_versions: std::collections::HashMap<[u8; 32], Vec<Option<[u8; 32]>>>,
-    /// Read targets refused by workspace confinement, tracked until a grant admits them.
-    failed_access: std::collections::HashMap<[u8; 32], (String, Vec<String>)>,
-    /// Bounded original diagnostics, captured before harness feedback and never from refusals.
-    failed_errors: std::collections::HashMap<[u8; 32], String>,
-    /// Namespace dependencies are repaired by an actual reset, not a printed reset claim.
-    failed_eval:
-        std::collections::HashMap<[u8; 32], (crate::runtime::execution::EvalNamespace, String)>,
-    /// Background-job dependencies (job name, call key). A failed `bg` call that named a job is
-    /// repaired by an actual lifecycle change of that job: a successful start or kill naming it.
-    failed_jobs: std::collections::HashMap<[u8; 32], (String, String)>,
+    /// Failed normalized calls and all of their release dependencies, kept in one atomic table
+    /// across continuations and compaction.
+    barriers: retry_barriers::RetryBarriers,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -386,13 +359,12 @@ impl Engine {
     pub fn pending_refusal(&self) -> Option<&'static str> {
         self.uncertain.then_some("This call was not executed: an earlier tool ended with uncertain effects. Inspect affected state before starting further actions.")
     }
+    /// Reset execution-guard state for a turn transition while preserving `uncertain` safety
+    /// boundaries across steering/coordination and preserving evidence across continuations.
     pub fn transition(&mut self, reason: RecoveryTransition) {
         match reason {
             RecoveryTransition::Steering | RecoveryTransition::Coordination => {
-                // Even a new instruction cannot turn an uninspected partial effect into permission.
-                let uncertain = self.uncertain;
-                *self = Self::default();
-                self.uncertain = uncertain;
+                self.reset_execution_guards_preserving_uncertainty();
             }
             RecoveryTransition::AutomaticContinue | RecoveryTransition::DirectedContinue => {
                 // A retry changes the approach, not the evidence or committed-content history.
@@ -401,17 +373,20 @@ impl Engine {
             }
         }
     }
+
+    fn reset_execution_guards_preserving_uncertainty(&mut self) {
+        // Even a new instruction cannot turn an uninspected partial effect into permission.
+        let uncertain = self.uncertain;
+        *self = Self::default();
+        self.uncertain = uncertain;
+    }
     pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<ToolOutput> {
         let identity = failed_identity(call);
-        if self.failed.contains(&identity)
-            && !self.tree_changed_since_failure(workspace, call)
-            && !self.sources_changed_since_failure(workspace, &identity)
-            && !self.witnesses_ready_since_failure(workspace, &identity)
-        {
-            let error = self.failed_errors.get(&identity);
+        if let Some(error) = self.barriers.active_diagnostic(workspace, call, &identity) {
             // The full diagnostic is already in the earlier result; quote enough to name the
             // cause, keeping its lines (compiler carets depend on them).
             let original = error
+                .as_deref()
                 .map(|error| {
                     let error = error.trim();
                     let mut quoted: String = error.chars().take(600).collect();
@@ -422,6 +397,7 @@ impl Engine {
                 })
                 .unwrap_or_default();
             let hint = error
+                .as_deref()
                 .and_then(|error| malformed_command_hint(call, error))
                 .unwrap_or_default();
             let mut output = ToolOutput::err(format!(
@@ -447,57 +423,9 @@ impl Engine {
                 .with_effects(Effects::None)
         })
     }
-    /// Release only failures whose own file content changed outside this controller.
-    fn sources_changed_since_failure(
-        &mut self,
-        workspace: &Workspace,
-        identity: &[u8; 32],
-    ) -> bool {
-        if self.failed_access.contains_key(identity) {
-            return false;
-        }
-        let Some(previous) = self.failed_versions.get(identity) else {
-            return false;
-        };
-        let Some(targets) = self
-            .failed_writes
-            .get(identity)
-            .or_else(|| self.failed_reads.get(identity))
-        else {
-            return false;
-        };
-        let current: Vec<_> = targets
-            .iter()
-            .map(|path| workspace.read_identity(&workspace.rel(path)))
-            .collect();
-        if current == *previous {
-            return false;
-        }
-        self.forget_failure(identity);
-        true
-    }
-    /// A failed shell command whose tree has since changed (for example another session fixed the
-    /// file that broke the build) may run again; its barrier is released.
-    fn tree_changed_since_failure(&mut self, workspace: &Workspace, call: &ToolCall) -> bool {
-        let identity = failed_identity(call);
-        // Explicit check inputs take precedence over a whole-tree fallback. An unrelated edit
-        // must not authorize a retry of a check whose own source is unchanged.
-        if self.failed_versions.contains_key(&identity) {
-            return false;
-        }
-        let Some(before) = self.failed_trees.get(&identity) else {
-            return false;
-        };
-        let changed = crate::agent::verify::shared_runs::shell_tree(workspace, call)
-            .is_some_and(|now| &now != before);
-        if changed {
-            self.forget_failure(&identity);
-        }
-        changed
-    }
     /// Snapshot admission restrictions before experimental early reads can start.
     pub fn failed_calls(&self) -> std::collections::BTreeSet<[u8; 32]> {
-        self.failed.clone()
+        self.barriers.identities()
     }
     pub fn arm(&mut self, call: &ToolCall, advice: &str) {
         self.checkpoint.arm(call, advice);
@@ -597,19 +525,20 @@ impl Engine {
         );
         let succeeded = !output.is_error && !check_failed;
         if mutated && succeeded {
-            self.release_for_change(&output.execution.changed_paths);
+            self.barriers
+                .release_for_change(&output.execution.changed_paths);
         } else if succeeded && status_is_ok(output) && environment_changing_shell(call) {
             // Installing a package or a header changes state no tracked path records. A failed
             // command with unknown dependencies may then succeed, so its barrier is released;
             // failures tied to known files still wait for those files to change.
-            self.release_for_change(&[]);
+            self.barriers.release_for_change(&[]);
         } else if succeeded
             && status_is_ok(output)
             && (starts_background_job(call) || job_lifecycle_change(call, output).is_some())
         {
             // A started or killed background service changes reachable process/network state the
             // same way: a probe or request refused before it changed may now succeed.
-            self.release_for_service_start();
+            self.barriers.release_for_service_start();
         }
         // Native refusals can themselves return complete source rows. Reuse those witnesses;
         // neither a marker in prose nor a successful read receipt grants retry readiness.
@@ -623,103 +552,68 @@ impl Engine {
             });
         if status.failed() && !witnessed {
             let identity = failed_identity(call);
-            if call.name == "eval"
-                && matches!(call.arguments["action"].as_str(), None | Some("eval"))
-            {
+            let eval = (call.name == "eval"
+                && matches!(call.arguments["action"].as_str(), None | Some("eval")))
+            .then(|| {
                 let namespace = match call.arguments["language"].as_str().unwrap_or("js") {
                     "js" => Some(crate::runtime::execution::EvalNamespace::JavaScript),
                     "py" => Some(crate::runtime::execution::EvalNamespace::Python),
                     _ => None,
                 };
-                if let Some(namespace) = namespace {
-                    self.failed_eval
-                        .insert(identity, (namespace, call_identity(call)));
-                }
-            }
-            if let Some(job) = background_job(call) {
-                self.failed_jobs
-                    .insert(identity, (job, call_identity(call)));
-            }
-            self.failed_witnesses.remove(&identity);
-            if let Some(retry) =
-                native_retry.filter(|_| status == crate::runtime::execution::ToolStatus::Error)
-            {
-                self.failed_witnesses.insert(identity, retry.clone());
-            }
-            let targets = inaccessible_read_targets(workspace, call, &output.text);
-            if !targets.is_empty() {
-                self.failed_access
-                    .insert(identity, (call_identity(call), targets));
-            }
-            self.failed.insert(identity);
-            if !original_diagnostic.trim().is_empty() {
-                self.failed_errors
-                    .entry(identity)
-                    .or_insert(original_diagnostic);
-            }
-            if let Some(tree) = crate::agent::verify::shared_runs::shell_tree(workspace, call) {
-                self.failed_trees.insert(identity, tree);
-            }
+                namespace.map(|namespace| (namespace, call_identity(call)))
+            })
+            .flatten();
+            let job = background_job(call).map(|job| (job, call_identity(call)));
+            let native_witness = native_retry
+                .filter(|_| status == crate::runtime::execution::ToolStatus::Error)
+                .cloned();
+            let access_targets = inaccessible_read_targets(workspace, call, &output.text);
+            let access =
+                (!access_targets.is_empty()).then(|| (call_identity(call), access_targets));
+            let shell_tree = crate::agent::verify::shared_runs::shell_tree(workspace, call);
             output.text.push_str("\nRetry barrier: this exact call is withheld until its arguments or inputs change.");
             let targets = recovery_checkpoint::declared_targets(workspace, call);
-            if !targets.is_empty() {
-                self.failed_versions.insert(
-                    identity,
-                    targets
-                        .iter()
-                        .map(|path| workspace.read_identity(&workspace.rel(path)))
-                        .collect(),
-                );
-                if call.name == "read" {
-                    self.failed_reads.insert(identity, targets);
-                } else {
-                    if native_retry.is_some() {
-                        output.text.push_str(" Complete native witnesses for every required current source range release this call.");
-                    }
-                    self.failed_writes.insert(identity, targets);
+            let file_targets = (!targets.is_empty()).then(|| {
+                if call.name != "read" && native_retry.is_some() {
+                    output.text.push_str(" Complete native witnesses for every required current source range release this call.");
                 }
-            }
+                let versions = targets
+                    .iter()
+                    .map(|path| workspace.read_identity(&workspace.rel(path)))
+                    .collect();
+                retry_barriers::FileTargets {
+                    paths: targets,
+                    versions,
+                }
+            });
+            self.barriers.record(
+                identity,
+                retry_barriers::FailureRecord {
+                    diagnostic: Some(original_diagnostic),
+                    shell_tree,
+                    file_targets,
+                    native_witness,
+                    access,
+                    eval,
+                    job,
+                },
+            );
         } else if status == crate::runtime::execution::ToolStatus::Ok {
             if call.name == "eval"
                 && let Some(namespace) = output.execution.namespace_reset
             {
-                let repaired: Vec<_> = self
-                    .failed_eval
-                    .iter()
-                    .filter(|(_, (failed_namespace, _))| *failed_namespace == namespace)
-                    .map(|(id, (_, key))| (*id, key.clone()))
-                    .collect();
-                for (id, key) in repaired {
-                    self.forget_failure(&id);
+                for key in self.barriers.release_eval_namespace(namespace) {
                     self.checkpoint.release_key(&key);
                 }
             }
             if let Some(job) = job_lifecycle_change(call, output) {
-                let repaired: Vec<_> = self
-                    .failed_jobs
-                    .iter()
-                    .filter(|(_, (name, _))| job.as_deref().is_none_or(|job| job == name))
-                    .map(|(id, (_, key))| (*id, key.clone()))
-                    .collect();
-                for (id, key) in repaired {
-                    self.forget_failure(&id);
+                for key in self.barriers.release_job_lifecycle(job.as_deref()) {
                     self.checkpoint.release_key(&key);
                 }
             }
-            self.release_ready_witnesses(workspace);
+            self.barriers.release_ready_witnesses(workspace);
             if call.name == "request_directory" {
-                let released: Vec<([u8; 32], String)> = self
-                    .failed_access
-                    .iter()
-                    .filter(|(_, (_, targets))| {
-                        targets
-                            .iter()
-                            .any(|target| workspace.resolve(target).is_ok())
-                    })
-                    .map(|(identity, (key, _))| (*identity, key.clone()))
-                    .collect();
-                for (identity, key) in released {
-                    self.forget_failure(&identity);
+                for key in self.barriers.release_granted_access(workspace) {
                     self.checkpoint.release_key(&key);
                 }
             }
@@ -879,86 +773,6 @@ impl Engine {
         self.returned_reads.retain_visible(&still_full);
         self.checkpoint.forget_evidence();
     }
-
-    /// Witness readiness may come from any native source owner (including an error preview),
-    /// not just a `read` call. Every file/range is checked against the current confined source.
-    fn witnesses_ready_since_failure(
-        &mut self,
-        workspace: &Workspace,
-        identity: &[u8; 32],
-    ) -> bool {
-        if self.failed_access.contains_key(identity) {
-            return false;
-        }
-        let ready = self.failed_witnesses.get(identity).is_some_and(|retry| {
-            crate::tools::edit::hashline::native_edit_retry_ready(workspace, retry)
-        });
-        if ready {
-            self.forget_failure(identity);
-        }
-        ready
-    }
-
-    fn release_ready_witnesses(&mut self, workspace: &Workspace) {
-        let identities: Vec<_> = self.failed_witnesses.keys().copied().collect();
-        for identity in identities {
-            self.witnesses_ready_since_failure(workspace, &identity);
-        }
-    }
-
-    /// Releases failures that a novel successful mutation can repair. A failure whose known files
-    /// were not changed stays barred. An unknown-dependency failure (for example an arbitrary shell
-    /// command) keeps the conservative rule: any such mutation releases it. Access refusals are
-    /// never released here; only a matching grant does that.
-    fn release_for_change(&mut self, changed: &[std::path::PathBuf]) {
-        let released: Vec<[u8; 32]> = self
-            .failed
-            .iter()
-            .copied()
-            .filter(|identity| {
-                if self.failed_access.contains_key(identity) {
-                    return false;
-                }
-                match self
-                    .failed_writes
-                    .get(identity)
-                    .or_else(|| self.failed_reads.get(identity))
-                {
-                    Some(targets) => targets.iter().any(|target| changed.contains(target)),
-                    None => true,
-                }
-            })
-            .collect();
-        for identity in released {
-            self.forget_failure(&identity);
-        }
-    }
-
-    /// Releases unknown-dependency failures after a background job starts, except failures that
-    /// named a job (released only by that job's own lifecycle) and file- or access-tied ones.
-    fn release_for_service_start(&mut self) {
-        let jobs: Vec<[u8; 32]> = self.failed_jobs.keys().copied().collect();
-        let kept: Vec<[u8; 32]> = jobs
-            .into_iter()
-            .filter(|identity| self.failed.remove(identity))
-            .collect();
-        self.release_for_change(&[]);
-        self.failed.extend(kept);
-    }
-
-    /// Drops every record of one failed operation; other failures keep their own barriers.
-    fn forget_failure(&mut self, identity: &[u8; 32]) {
-        self.failed.remove(identity);
-        self.failed_trees.remove(identity);
-        self.failed_writes.remove(identity);
-        self.failed_witnesses.remove(identity);
-        self.failed_reads.remove(identity);
-        self.failed_versions.remove(identity);
-        self.failed_access.remove(identity);
-        self.failed_errors.remove(identity);
-        self.failed_eval.remove(identity);
-        self.failed_jobs.remove(identity);
-    }
 }
 
 /// Capture only read paths whose actual failure was a workspace access boundary. The error is
@@ -1052,6 +866,8 @@ fn status_is_ok(output: &ToolOutput) -> bool {
     crate::runtime::execution::ToolStatus::from_output(output)
         == crate::runtime::execution::ToolStatus::Ok
 }
+
+mod retry_barriers;
 
 #[cfg(test)]
 mod tests;

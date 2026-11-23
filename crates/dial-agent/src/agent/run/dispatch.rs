@@ -1260,11 +1260,29 @@ impl<'a> Agent<'a> {
         out.execution
             .invocation
             .get_or_insert_with(crate::runtime::execution::Invocation::fresh);
-        if let Some(advice) = self.settle_tool_mutation(call, &mut out) {
-            crate::tools::surface::outcome::append_text(&mut out, &format!("\n\n{advice}"));
-        }
+        self.settle_mutation_output(call, &mut out);
         self.post_mutation_verification(call, &mut out, ui);
         out
+    }
+
+    /// Advance the mutation revision and attach any resulting policy advice to this receipt,
+    /// before serial or grouped verification can consume the new revision.
+    pub(in crate::agent::run) fn settle_mutation_output(
+        &mut self,
+        call: &ToolCall,
+        out: &mut ToolOutput,
+    ) {
+        if let Some(advice) = self.settle_tool_mutation(call, out) {
+            crate::tools::surface::outcome::append_text(out, &format!("\n\n{advice}"));
+        }
+    }
+
+    pub(in crate::agent::run) fn verification_option_disabled(&self, call: &ToolCall) -> bool {
+        !self.config.verification.enabled
+            && matches!(call.name.as_str(), "edit" | "write")
+            && call.arguments["verify"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
     }
 
     pub(in crate::agent) fn post_mutation_verification(
@@ -1289,9 +1307,6 @@ impl<'a> Agent<'a> {
                     ),
                 ),
                 VerifyStep::Run(targets) => {
-                    if let Some(advice) = self.settle_tool_mutation(call, out) {
-                        crate::tools::surface::outcome::append_text(out, &format!("\n\n{advice}"));
-                    }
                     let verify = self.verify_tool(&json!({"targets": targets}), ui);
                     crate::agent::verify::verify_tool::attach_post_mutation_verify(
                         out, &call.name, verify,
@@ -1422,12 +1437,7 @@ impl<'a> Agent<'a> {
                 "this tool operation does not support background execution; run it in the foreground",
             );
         }
-        if matches!(call.name.as_str(), "edit" | "write")
-            && call.arguments["verify"]
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty())
-            && !self.config.verification.enabled
-        {
+        if self.verification_option_disabled(call) {
             return denied(&format!(
                 "{} verify requires verification.enabled; no mutation was executed",
                 call.name
@@ -1537,7 +1547,11 @@ impl<'a> Agent<'a> {
                 Ok(request) => request,
                 Err(error) => return ToolOutput::err(error),
             };
-            match self.completion_decision(TurnOutcome::NeedsInput, &args.to_string(), ui) {
+            match self.completion_decision(
+                TurnOutcome::NeedsInput,
+                crate::agent::verify::completion::ReplyChannel::Explicit,
+                ui,
+            ) {
                 crate::agent::verify::completion::Decision::Continue(note)
                 | crate::agent::verify::completion::Decision::Incomplete(note) => {
                     return ToolOutput::err(note);
@@ -1824,7 +1838,11 @@ impl<'a> Agent<'a> {
                     }
                 }
 
-                match self.completion_decision(finish.outcome, &finish.summary, ui) {
+                match self.completion_decision(
+                    finish.outcome,
+                    crate::agent::verify::completion::ReplyChannel::Explicit,
+                    ui,
+                ) {
                     crate::agent::verify::completion::Decision::Continue(note) => {
                         return ToolOutput::ok(note)
                             .with_effects(crate::tools::surface::outcome::Effects::None);

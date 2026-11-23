@@ -1233,6 +1233,39 @@ fn a_lost_task_input_is_reported_with_its_retained_copy_and_no_upfront_note() {
 }
 
 #[test]
+fn one_response_runs_two_foreground_eval_cells_in_order() {
+    if let Err(reason) = crate::tools::exec::eval::prepare_containment() {
+        eprintln!("skipping: eval cells need OS containment: {reason}");
+        return;
+    }
+    let server = llm::fake::serve(vec![
+        calls(&[
+            (
+                "eval",
+                json!({"code":"var base = 17; base * 3", "background":false}),
+            ),
+            ("eval", json!({"code":"base + 25", "background":false})),
+        ]),
+        slots(),
+        response("Done.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent.activate_tools(&["eval".into()]).unwrap();
+            agent.turn("Run both cells.", &mut NullUi).unwrap()
+        },
+    );
+    let requests = completion_requests(&server);
+    let results = tool_results(&requests[1]);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].contains("51"), "{results:?}");
+    assert!(results[1].contains("42"), "{results:?}");
+}
+
+#[test]
 fn an_auto_backgrounded_eval_cell_does_not_stop_the_turn_as_uncertain() {
     if let Err(reason) = crate::tools::exec::eval::prepare_containment() {
         eprintln!("skipping: eval cells cannot run without OS containment: {reason}");

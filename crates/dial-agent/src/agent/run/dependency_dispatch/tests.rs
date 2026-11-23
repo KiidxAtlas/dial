@@ -737,7 +737,7 @@ struct Approvals(Vec<String>);
 impl Ui for Approvals {
     fn approve(&mut self, tool: &str, _summary: &str) -> crate::agent::ui::surface::Decision {
         self.0.push(tool.to_owned());
-        if tool == "fetch_denied" {
+        if matches!(tool, "fetch_denied" | "bash") {
             crate::agent::ui::surface::Decision::Deny
         } else {
             crate::agent::ui::surface::Decision::Allow
@@ -791,6 +791,44 @@ fn authorized_external_reads_run_together_and_a_denied_one_never_starts() {
         Some(tools::ToolStatus::Blocked)
     );
     assert_eq!(*arrived.0.lock().unwrap(), 2, "the denied call never ran");
+}
+
+#[test]
+fn gated_shell_reads_select_an_authorized_wave_and_declines_stay_blocked() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a"), "source").unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Ask;
+    let shell = |cmd: &str| ToolCall {
+        id: "shell".into(),
+        name: "bash".into(),
+        arguments: json!({"command":cmd}),
+        malformed_arguments: false,
+    };
+    let mut read = call("read", "a");
+    read.arguments = json!({"path":"a"});
+    let fast = agent.dependency_wave(&[shell("cat a"), read.clone()]);
+    assert_eq!(fast.calls.len(), 2);
+    assert!(
+        !fast.dispatchable(),
+        "ordinary shared reads keep their path"
+    );
+
+    let calls = [shell("cat a | head -1"), read];
+    let parent = agent.dependency_wave(&calls);
+    let child = plan(&agent.workspace, &agent.ext, WavePolicy::CHILD, &calls);
+    assert!(parent.dispatchable() && child.dispatchable());
+    let mut ui = Approvals::default();
+    let results = agent.dispatch_dependency_wave(&mut backend(), &parent.calls, &mut ui, None);
+    assert_eq!(ui.0, ["bash"]);
+    assert_eq!(
+        results[0].0.execution.status,
+        Some(tools::ToolStatus::Blocked)
+    );
+    assert!(!results[1].0.is_error, "{}", results[1].0.text);
+    assert!(results[1].0.text.contains("source"));
 }
 
 #[test]
@@ -861,6 +899,48 @@ fn literal_inspections_read_only_the_files_they_name() {
         (json!({"command":"cat -x a"}), "b", false),
         (json!({"command":"tail --follow=name a"}), "b", false),
         (json!({"command":"wc --total auto a"}), "b", false),
+        // `grep`: the first operand is the pattern unless `-e` gives it; patterns may hold any byte.
+        (json!({"command":"grep foo a"}), "b", true),
+        (json!({"command":"grep foo a"}), "a", false),
+        (json!({"command":"grep 'a*' b"}), "a", true),
+        (json!({"command":"grep -n -e foo a"}), "b", true),
+        (json!({"command":"grep -e foo a"}), "a", false),
+        (json!({"command":"grep --regexp=foo a b"}), "b", false),
+        (json!({"command":"grep -r foo sub"}), "b", true),
+        (json!({"command":"grep -r foo sub"}), "sub/c.txt", false),
+        (
+            json!({"command":"grep -r --include='*.txt' foo sub"}),
+            "b",
+            true,
+        ),
+        (json!({"command":"grep -m 1 foo a"}), "b", true),
+        (json!({"command":"grep foo"}), "b", false),
+        (json!({"command":"grep -e foo"}), "b", false),
+        (json!({"command":"grep -rn foo sub"}), "b", false),
+        (json!({"command":"grep -f a b"}), "a", false),
+        (json!({"command":"grep -f a b"}), "b", false),
+        (json!({"command":"grep -R foo sub"}), "b", false),
+        (json!({"command":"grep -C 3 foo a"}), "b", false),
+        // `ls` reads the directories and files it names; with none it lists the working directory.
+        (json!({"command":"ls -l sub"}), "b", true),
+        (json!({"command":"ls -R sub"}), "sub/c.txt", false),
+        (json!({"command":"ls"}), "b", false),
+        (json!({"command":"ls -L sub"}), "b", false),
+        // `find` reads only its starting points when the expression just filters and prints.
+        (json!({"command":"find sub -name '*.txt'"}), "b", true),
+        (json!({"command":"find sub -type f -print"}), "b", true),
+        (json!({"command":"find sub ! -name x"}), "b", true),
+        (
+            json!({"command":"find sub -name '*.txt'"}),
+            "sub/c.txt",
+            false,
+        ),
+        (json!({"command":"find . -name x"}), "b", false),
+        (json!({"command":"find -name x"}), "b", false),
+        (json!({"command":"find sub -newer a"}), "b", false),
+        (json!({"command":"find -L sub"}), "b", false),
+        (json!({"command":"find sub -name"}), "b", false),
+        (json!({"command":"find sub -exec cat {} +"}), "b", false),
         // One plain command only: a newline, `;`, `&&`, `&` or a trailing newline is a second
         // command or an operator, never a word that a literal read can absorb.
         (json!({"command":"cat a\nwc b"}), "b", false),
@@ -935,5 +1015,92 @@ fn literal_inspections_read_only_the_files_they_name() {
             );
             assert_eq!(wave.calls.len(), 1, "{arguments} keeps the broad read");
         }
+    }
+}
+
+#[test]
+fn read_only_shell_batches_join_waves_without_changing_approval() {
+    let root = tempfile::tempdir().unwrap();
+    for file in ["a", "b"] {
+        std::fs::write(root.path().join(file), "source").unwrap();
+    }
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::new();
+    let shell = |arguments: Value| ToolCall {
+        id: "shell".into(),
+        name: "bash".into(),
+        arguments,
+        malformed_arguments: false,
+    };
+    let read = |path: &str| ToolCall {
+        id: path.into(),
+        name: "read".into(),
+        arguments: json!({ "path": path }),
+        malformed_arguments: false,
+    };
+    // Writes nothing, but is not an approval-free plain inspection: it still asks, then runs
+    // beside reads. It reads every root, so it never runs beside a write.
+    for command in [
+        "git status",
+        "git status --porcelain",
+        "git diff --stat",
+        "git diff HEAD -- src",
+        "git grep -n foo",
+        "git rev-list --count HEAD",
+        "rg -n foo src | head -20",
+        "df -h .",
+        "du -sh target",
+        "jq .name a",
+        "diff a b",
+        "ls -la; git log --oneline | head -3",
+    ] {
+        let arguments = json!({ "command": command });
+        assert!(
+            !crate::agent::safety::approval::is_read_only(&registry, "bash", &arguments),
+            "{command} keeps its approval"
+        );
+        let wave = plan(
+            &workspace,
+            &registry,
+            WavePolicy::PARENT,
+            &[read("a"), shell(arguments.clone()), read("b")],
+        );
+        assert_eq!(wave.calls.len(), 3, "{command} joins reads");
+        let wave = plan(
+            &workspace,
+            &registry,
+            WavePolicy::PARENT,
+            &[call("write", "b"), shell(arguments)],
+        );
+        assert_eq!(wave.calls.len(), 1, "{command} reads every root");
+    }
+    // Builds, tests, writers, redirection, external programs and stateful forms stay barriers.
+    for arguments in [
+        json!({"command":"cargo test"}),
+        json!({"command":"make lint"}),
+        json!({"command":"cargo fmt && git diff"}),
+        json!({"command":"rg --pre cat foo"}),
+        json!({"command":"rg --pre=cat foo"}),
+        json!({"command":"git diff --ext-diff"}),
+        json!({"command":"git diff --output=x"}),
+        json!({"command":"git grep -O foo"}),
+        json!({"command":"git grep --open-files-in-pager foo"}),
+        json!({"command":"git -c diff.external=x diff"}),
+        json!({"command":"git branch new"}),
+        json!({"command":"rg foo > out"}),
+        json!({"command":"du -sh target | tee out"}),
+        json!({"command":"git status","background":true}),
+        json!({"command":"git status","pty":true}),
+        json!({"command":"git status","session":"s"}),
+    ] {
+        let wave = plan(
+            &workspace,
+            &registry,
+            WavePolicy::PARENT,
+            &[read("a"), shell(arguments.clone())],
+        );
+        assert_eq!(wave.calls.len(), 1, "{arguments} stays a barrier");
+        assert_eq!(wave.barrier, "unknown_resources", "{arguments}");
+        assert_eq!(wave.barrier_tool.as_deref(), Some("bash"), "{arguments}");
     }
 }

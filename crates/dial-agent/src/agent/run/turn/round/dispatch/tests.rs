@@ -106,6 +106,149 @@ fn tool_result<'a>(request: &'a Value, id: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no result for {id}: {request}"))
 }
 
+// Two independent writes make the guarded call the third member of an otherwise admissible
+// native wave. The earlier writes must still run when that call closes the prefix.
+fn mutation_batch(guarded: Value) -> llm::fake::Script {
+    calls(&[
+        ("write", json!({"path":"first.txt","content":"one"})),
+        ("write", json!({"path":"second.txt","content":"two"})),
+        ("write", guarded),
+    ])
+}
+
+fn with_mutation_scheduler(
+    waves: bool,
+    policy: &str,
+    server: &llm::fake::Fake,
+    test: impl FnOnce(&mut Agent<'_>),
+) {
+    let config = format!(
+        "approval='auto'\n[compaction]\nenabled=false\n[task]\nmax_concurrency=4\n[experimental]\ndependency_dispatch={waves}\n{policy}"
+    );
+    with_agent(&config, |agent| {
+        connect(agent, &server.url);
+        test(agent);
+        let groups = &agent.efficiency_metrics.scheduling.groups;
+        assert_eq!(groups.contains_key("native"), waves);
+    });
+}
+
+#[test]
+fn disabled_verify_refuses_before_mutation_with_either_scheduler() {
+    for waves in [false, true] {
+        let server = llm::fake::serve(vec![
+            mutation_batch(json!({"path":"target.txt","content":"after","verify":["probe"]})),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response(
+                "The target was not updated and its check did not run.",
+                None,
+            ),
+        ]);
+        with_mutation_scheduler(
+            waves,
+            "[verification]\nenabled=false\n[[verification.commands]]\nname='probe'\ncommand='touch checked'\ntimeout_secs=5\n",
+            &server,
+            |agent| {
+                let root = agent.workspace.root().to_owned();
+                std::fs::write(root.join("target.txt"), "before").unwrap();
+                let read =
+                    tools::execute(&agent.workspace, "read", &json!({"path":"target.txt"}), 20);
+                assert!(!read.is_error, "{}", read.text);
+                agent
+                    .turn("Write both notes and update target.txt.", &mut NullUi)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(root.join("target.txt")).unwrap(),
+                    "before"
+                );
+                assert!(!root.join("checked").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.join("first.txt")).unwrap(),
+                    "one"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("second.txt")).unwrap(),
+                    "two"
+                );
+            },
+        );
+        let requests = completion_requests(&server);
+        let refusal = tool_result(&requests[1], "call-2");
+        assert!(refusal.contains("verification.enabled"), "{refusal}");
+    }
+}
+
+#[test]
+fn repro_first_gate_is_delivered_before_retry_with_either_scheduler() {
+    for waves in [false, true] {
+        let write = json!({"path":"parser.py","content":"fixed = True\n","if_absent":true});
+        let server = llm::fake::serve(vec![
+            mutation_batch(write.clone()),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response("", Some(("write", write))),
+            response("The fix was applied on retry, but not verified.", None),
+        ]);
+        with_mutation_scheduler(
+            waves,
+            "repro_first='gate'\n[verification]\nautomatic_checks=false\n",
+            &server,
+            |agent| {
+                agent
+                    .turn("Fix the parser bug and verify it", &mut NullUi)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(agent.workspace.root().join("parser.py")).unwrap(),
+                    "fixed = True\n"
+                );
+            },
+        );
+        let requests = completion_requests(&server);
+        let refusal = tool_result(&requests[1], "call-2");
+        assert!(refusal.contains("repro_first gate"), "{refusal}");
+    }
+}
+
+#[test]
+fn repro_first_advice_reaches_only_the_first_applied_fix_with_either_scheduler() {
+    for waves in [false, true] {
+        let server = llm::fake::serve(vec![
+            calls(&[
+                (
+                    "write",
+                    json!({"path":"parser.py","content":"fixed = True\n"}),
+                ),
+                (
+                    "write",
+                    json!({"path":"lexer.py","content":"fixed = True\n"}),
+                ),
+            ]),
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response("The fix was applied, but not verified.", None),
+        ]);
+        with_mutation_scheduler(
+            waves,
+            "repro_first='advise'\n[verification]\nautomatic_checks=false\n",
+            &server,
+            |agent| {
+                agent
+                    .turn("Fix the parser bug and verify it", &mut NullUi)
+                    .unwrap();
+                for path in ["parser.py", "lexer.py"] {
+                    assert_eq!(
+                        std::fs::read_to_string(agent.workspace.root().join(path)).unwrap(),
+                        "fixed = True\n"
+                    );
+                }
+            },
+        );
+        let requests = completion_requests(&server);
+        let first = tool_result(&requests[1], "call-0");
+        let next = tool_result(&requests[1], "call-1");
+        assert!(first.contains("[repro_first:"), "{first}");
+        assert!(!next.contains("[repro_first:"), "{next}");
+    }
+}
+
 fn one_call_turn(batch: llm::fake::Script, answers: usize) -> (Vec<Value>, bool) {
     let slots = llm::fake::json(200, &json!({"total_slots":1}));
     // A refused batch earns a contract-repair round before the final answer.

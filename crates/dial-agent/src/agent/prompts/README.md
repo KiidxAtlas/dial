@@ -84,10 +84,16 @@ or changing approval/check enforcement. Tool loading does not rewrite these sect
 escalation can rebuild them at turn boundaries. Verification follows the selected delegation
 preference and existing check ownership, not merely tool availability.
 
-Custom-template deduplication recognizes complete normalized lines/blocks (including note bullets),
-not embedded substrings. Notes are filtered individually in both inline and message-band assembly.
-Transformed or inline-wrapped values may be repeated conservatively rather than silently omitted.
-Templates, replacement text and appended guidance remain operator-controlled.
+Custom-template deduplication uses render provenance recorded by `dial-core` `runtime/template.rs`
+(`Rendered`), not output text search. A harness value counts as rendered only when a direct data
+output (`{{path}}`, `{{{path}}}`, `{{&path}}`, or a bare name) emitted it from its own canonical
+origin (`soul`, `appendPrompt`, `memory`, `operatorGuidance`, `skillsCatalog`,
+`contextFiles.N.content`, `admittedNotes.N`, or `{{#each}}`/`{{#with}}` items of those) and it fills a
+complete line or a `- ` bullet. Partials and `{{#if}}`/`{{#each}}` bodies keep provenance; literal
+template text, helper or sub-expression results, `#list`/`#table`/`#codeblock`/`#xml` bodies,
+embedded substrings, and an equal value from a different source are not counted. Those values are
+repeated rather than silently omitted. Notes are filtered individually in both inline and
+message-band assembly. Templates, replacement text and appended guidance remain operator-controlled.
 
 The composition refactor was checked against legacy rendered assembly before wording changes.
 Request-contract precedence, verification wording, template deduplication and example eligibility

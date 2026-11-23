@@ -13,6 +13,7 @@ pub(in crate::agent) mod failure_guidance;
 pub(in crate::agent) mod guidance;
 pub(in crate::agent) mod intent;
 pub(in crate::agent) mod monitoring;
+pub(in crate::agent) mod notice_bus;
 pub mod outcome_gradient;
 pub(in crate::agent) mod reply_triage;
 pub mod scheduling_replay;

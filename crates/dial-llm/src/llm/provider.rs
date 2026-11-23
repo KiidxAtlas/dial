@@ -962,7 +962,7 @@ impl Backend {
             .or_else(|| self.steering_config.as_ref().map(|c| c.context_window))
             .or_else(|| context_window_hint(&self.kind))
             .filter(|n| *n > 0)
-            .unwrap_or(32768)
+            .unwrap_or(crate::config::types::DEFAULT_CONTEXT_WINDOW)
     }
 
     /// The window to send as an explicit Ollama `num_ctx` request. Only an operator-configured

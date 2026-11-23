@@ -629,9 +629,7 @@ fn with_child_role_backend<T>(
     let mut config = env.config.memory_role_config(role, model_override)?;
     let key = serde_json::to_string(&(role, config.selection()))?;
     if let Some(account) = children.accounts.borrow().get(&key) {
-        let mut selection = config.selection();
-        selection.account_id = Some(account.clone());
-        config = config.with_selection(&selection);
+        config = config.with_account_id(account);
     }
     if config.selection() == env.config.selection() {
         return with_usage_purpose(env.usage, main, purpose, |main| {
@@ -1818,9 +1816,7 @@ pub(in crate::agent) fn run(
     }
     let mut pinned = env.config.clone();
     if let Some(account) = backend.account_id() {
-        let mut selection = pinned.selection();
-        selection.account_id = Some(account.to_owned());
-        pinned = pinned.with_selection(&selection);
+        pinned = pinned.with_account_id(account);
     }
     let workspace = match env
         .workspace
