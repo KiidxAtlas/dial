@@ -8,6 +8,13 @@ fn config() -> Config {
         model: "main".into(),
         ..Config::default()
     };
+    config.providers.insert(
+        "acme".into(),
+        crate::llm::model_config::ProviderSpec {
+            base_url: "https://acme.example/v1".into(),
+            ..Default::default()
+        },
+    );
     config.model_favorites.push(ModelSelection {
         provider: "acme".into(),
         model: "fav".into(),
@@ -178,6 +185,15 @@ fn embedding_listing_offers_declared_embedding_models_with_the_id_a_role_saves()
     assert_eq!(rows[1]["provider"], "acme");
     assert_eq!(rows[1]["base_url"], "https://acme.example/v1");
     assert!(rows[1].get("image_api").is_none());
+}
+
+#[test]
+fn chat_picker_excludes_known_non_chat_even_when_configured() {
+    let home = tempfile::tempdir().unwrap();
+    save_listing(home.path(), &[("fav", catalog::ModelKind::Embedding, None)]);
+    let cfg = config();
+    let rows = list(&cfg, &cfg.selection(), home.path(), Some("acme"));
+    assert!(!rows.iter().any(|row| row["model_id"] == "fav"));
 }
 
 #[test]
@@ -391,4 +407,172 @@ fn list_skips_disabled_providers_stale_catalogs_and_account_scoped_bundled_ids()
         ["claude-live-only"],
         "live listing suppresses stale bundled catalog rows"
     );
+}
+
+#[test]
+fn refresh_lists_available_subscription_models_without_a_config_entry_or_saved_listing() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config.providers.insert(
+        "removed".into(),
+        crate::llm::model_config::ProviderSpec {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    let entry = |provider, model, kind, available| catalog::ModelEntry {
+        selection: selection(provider, model),
+        label: format!("{model} label"),
+        source: "subscription catalog".into(),
+        available,
+        metadata: catalog::ModelMetadata {
+            kind,
+            ..Default::default()
+        },
+    };
+    use catalog::ModelKind::{Chat, Embedding};
+    let discovered = vec![
+        entry("anthropic", "claude-sonnet-5", Chat, true),
+        entry("anthropic", "stale", Chat, false),
+        entry("anthropic", "vectors", Embedding, true),
+        entry("removed", "disabled", Chat, true),
+    ];
+    let rows = chat_list(
+        &config,
+        &config.selection(),
+        home.path(),
+        None,
+        Some(&discovered),
+    );
+    let offered: Vec<_> = rows
+        .iter()
+        .filter(|r| r["sources"] == json!(["listing"]))
+        .collect();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0]["provider"], "anthropic");
+    assert_eq!(offered[0]["model_id"], "claude-sonnet-5");
+    assert_eq!(offered[0]["label"], "claude-sonnet-5 label");
+    assert!(rows.iter().any(|row| row["current"] == true));
+    assert!(
+        select_chat(
+            &config,
+            &config.selection(),
+            home.path(),
+            "anthropic",
+            "claude-sonnet-5",
+            Some(&discovered)
+        )
+        .is_ok()
+    );
+}
+#[test]
+fn set_model_accepts_only_known_models() {
+    let mut config = Config::default();
+    config.model_favorites.push(ModelSelection {
+        provider: "lab".into(),
+        model: "pinned-1".into(),
+        ..Default::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let pick = |id| select_chat(&config, &config.selection(), dir.path(), "lab", id, None);
+    assert_eq!(pick("pinned-1").unwrap(), config.model_favorites[0]);
+    assert!(pick("zz-unlisted-9000").is_err());
+}
+
+#[test]
+fn antigravity_picker_model_is_known_only_to_the_grant_that_listed_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = "google-antigravity";
+    let model = "gemini-4-hydrogen-tiered-high";
+    let config = Config::default();
+    let grant = crate::llm::credential_store::oauth_path(dir.path(), provider);
+    let install =
+        |access: &str, refresh: &str, project: &str| {
+            crate::config::settings_store::write_private(&grant, &serde_json::to_vec(&json!({
+            "access":access, "refresh":refresh, "project_id":project, "expires_at_ms":u64::MAX
+        })).unwrap()).unwrap();
+        };
+    install("opaque-a", "grant-a", "project");
+    let rows =
+        crate::llm::catalog::test_antigravity_listing(dir.path(), &json!({"models":{(model):{}}}))
+            .unwrap();
+    assert_eq!(rows[0].selection.model, model);
+    let known = || {
+        let pick = |scan| {
+            select_chat(
+                &config,
+                &config.selection(),
+                dir.path(),
+                provider,
+                model,
+                scan,
+            )
+            .is_ok()
+        };
+        let cached = pick(None);
+        assert_eq!(
+            cached,
+            pick(Some(rows.as_slice())),
+            "an old scan cannot bypass the account cache"
+        );
+        cached
+    };
+    assert!(
+        known(),
+        "the picker must be able to switch to the ID it just offered"
+    );
+    install("renewed-a", "grant-a", "project");
+    assert!(known());
+    install("opaque-b", "grant-b", "project");
+    assert!(!known());
+    install("renewed-a", "grant-a", "different-project");
+    assert!(!known());
+}
+
+#[test]
+fn scan_replacement_withdraws_models_and_old_work_cannot_repopulate_it() {
+    let scan = ModelScan::default();
+    let older = scan.begin();
+    let newer = scan.begin();
+    assert!(scan.publish(newer, vec![]).is_ok());
+    assert!(scan.publish(older, vec![]).is_err());
+    let in_flight = scan.begin();
+    scan.reset();
+    assert!(scan.publish(in_flight, vec![]).is_err());
+    assert!(scan.snapshot().is_none());
+}
+
+#[test]
+fn offline_picker_does_not_restore_a_route_from_another_project() {
+    let home = tempfile::tempdir().unwrap();
+    save_listing(
+        home.path(),
+        &[("endpoint-only", catalog::ModelKind::Chat, None)],
+    );
+    let mut cfg = config();
+    let pick = |cfg: &Config| {
+        select_chat(
+            cfg,
+            &cfg.selection(),
+            home.path(),
+            "acme",
+            "endpoint-only",
+            None,
+        )
+    };
+    assert_eq!(
+        pick(&cfg).unwrap().base_url,
+        Some(cfg.providers["acme"].base_url.clone())
+    );
+    cfg.providers.get_mut("acme").unwrap().base_url = "https://other.example/v1".into();
+    assert!(pick(&cfg).is_err());
+}
+
+fn list_for(
+    config: &Config,
+    user_dir: &Path,
+    provider: Option<&str>,
+    purpose: Purpose,
+) -> Vec<Value> {
+    role_list(config, user_dir, provider, purpose, None)
 }

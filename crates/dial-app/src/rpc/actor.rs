@@ -110,6 +110,7 @@ pub(super) struct Actor {
     pub worker_fs: Arc<client_fs::ClientFsCalls>,
     /// The controller's copy of the configuration, replaced after a rebuild.
     pub admin_config: Arc<std::sync::RwLock<Config>>,
+    pub scan: Arc<models::ModelScan>,
     /// Published with the rebuilt configuration when the active project changes.
     pub admin_layout: Arc<std::sync::RwLock<Layout>>,
     pub sides: Arc<side_control::SideControl>,
@@ -190,6 +191,7 @@ impl Actor {
             queue,
             worker_fs,
             admin_config,
+            scan,
             admin_layout,
             sides,
         } = self;
@@ -223,7 +225,11 @@ impl Actor {
                 let mut reply: Option<(Value, Value)> = None;
                 loop {
                     let (store, serving) = serving_setup(&config)?;
-                    let backend = make_backend(&serving)?;
+                    let backend = if !acp && serving.model.trim().is_empty() {
+                        crate::agent::unconfigured_backend(&serving, "")
+                    } else {
+                        make_backend(&serving)?
+                    };
                     let image_input = backend.accepts_image_input();
                     let session = if acp || handoff.is_some() {
                         Session::ephemeral()
@@ -338,6 +344,7 @@ impl Actor {
                         let mut published_layout =
                             admin_layout.write().unwrap_or_else(|p| p.into_inner());
                         *published_config = config.clone();
+                        scan.reset();
                         *published_layout = layout.clone();
                     }
                     let _ = control_tx.send((
@@ -363,6 +370,7 @@ impl Actor {
                         layout: &layout,
                         config: &config,
                         overlay: &overlay,
+                        scan: scan.clone(),
                         acp,
                         rx: rx.take().context("RPC request channel already taken")?,
                         worker_out: &worker_out,
@@ -510,6 +518,7 @@ struct ActorRuntime<'a> {
     layout: &'a Layout,
     config: &'a Config,
     overlay: &'a toml::Table,
+    scan: Arc<models::ModelScan>,
     acp: bool,
     rx: mpsc::Receiver<Value>,
     worker_out: &'a Sender,
@@ -1100,22 +1109,15 @@ impl ActorRuntime<'_> {
                         "set_model requires params.model_id",
                     )
                 })?;
-                let selection = crate::agent::modes::switch::resolve(
-                    self.agent.effective_config(),
-                    &format!("{provider}/{model_id}"),
-                )?;
-                if !crate::agent::modes::switch::is_known_model(
-                    self.agent.effective_config(),
+                let discovered = self.scan.snapshot();
+                let selection = models::select_chat(
+                    self.config,
+                    &self.agent.effective_config().selection(),
                     &self.layout.user_dir,
-                    &selection,
-                ) {
-                    return Err(coded(
-                        ErrorCode::NotFound,
-                        format!(
-                            "unknown model {provider}/{model_id}: not in the catalog, configured models or downloaded local models"
-                        ),
-                    ));
-                }
+                    provider,
+                    model_id,
+                    discovered.as_deref(),
+                )?;
                 self.agent.switch_model(&selection, None)?;
                 Ok(json!({"model":self.agent.effective_config().model}))
             }

@@ -389,6 +389,8 @@ listing. You can change the level later with `/effort` without picking the model
 models such as Flash and Flash Lite stay separate. The group uses the smallest known input window
 across its efforts. If Google does not report one, Neon uses Dial's catalog value of **524,288
 tokens**, not the 32,768-token fallback for unknown models. An explicit smaller cap still applies.
+The refreshed listing is tied to the active sign-in and Google project, even if the token has no
+account ID. After changing accounts or signing in again, refresh the picker before switching models.
 
 If listing fails, Dial reports the provider as unavailable instead of offering bundled models as
 account models. Highlight **Google Antigravity** in `/providers` for the request error.

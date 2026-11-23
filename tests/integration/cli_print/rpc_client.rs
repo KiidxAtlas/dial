@@ -41,6 +41,19 @@ fn next(client: &mut Client) -> Message {
 }
 
 #[test]
+fn first_run_client_can_connect_and_list_sign_in_providers_without_a_model() {
+    let env = Env::new();
+    let launch = Launch::new(env!("CARGO_BIN_EXE_dial"))
+        .env("DIAL_HOME", env.home.path())
+        .current_dir(env.project.path());
+    let mut client = Client::connect(&launch, WAIT).unwrap();
+    assert!(client.ready().model.is_empty());
+    let list = client.call("auth_providers", json!({}), WAIT).unwrap();
+    assert!(list["providers"].as_array().is_some_and(|p| !p.is_empty()));
+    assert!(client.shutdown(WAIT).unwrap().success());
+}
+
+#[test]
 fn client_negotiates_and_drives_an_approved_turn_with_coded_refusals() {
     let env = Env::new();
     ask_before_writes(&env);
