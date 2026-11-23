@@ -49,9 +49,10 @@ fn stale_image_notices_do_not_repeat_or_mutate_request_history() {
 }
 
 #[test]
-fn explicit_image_path_is_paired_with_pixels_without_labeling_other_references() {
+fn explicit_filename_is_paired_with_pixels_without_labeling_other_references() {
     let root = tempfile::tempdir().unwrap();
-    let name = Path::new("image with spaces.png");
+    let name = Path::new("nested/image with spaces.png");
+    fs::create_dir(root.path().join("nested")).unwrap();
     fs::write(root.path().join(name), tiny_png()).unwrap();
     let mut explicit = attachment(root.path(), name).unwrap();
     let plain = explicit.clone();
@@ -70,10 +71,9 @@ fn explicit_image_path_is_paired_with_pixels_without_labeling_other_references()
     })
     .unwrap();
     let parts = prepared.messages[0]["content"].as_array().unwrap();
-    let path = root.path().canonicalize().unwrap().join(name);
     assert_eq!(
         parts[1]["text"],
-        format!("[Attached image file: {}]", json!(path))
+        r#"[Attached image file: "image with spaces.png"]"#
     );
     assert_eq!(parts[2]["type"], "image_url");
     assert_eq!(parts[3]["type"], "image_url");

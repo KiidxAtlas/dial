@@ -516,15 +516,13 @@ pub(crate) fn prepare_for_target(
             }
             match image_part(reference) {
                 Ok(part) => {
-                    // Only explicit user file attachments get reusable paths, not tool images,
-                    // inline bytes or internal artifacts.
+                    // Label explicit user files by filename, not by their local directory.
                     if message["role"] == "user"
                         && reference["show_path"] == true
-                        && let (Some(root), Some(path)) =
-                            (reference["root"].as_str(), reference["path"].as_str())
+                        && let Some(path) = reference["path"].as_str()
+                        && let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str())
                     {
-                        let absolute = Path::new(root).join(path);
-                        let label = json!(absolute.to_string_lossy());
+                        let label = json!(name);
                         parts.push(
                             json!({"type":"text","text":format!("[Attached image file: {label}]")}),
                         );
