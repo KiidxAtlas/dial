@@ -29,10 +29,7 @@ pub struct EndpointConfig {
     pub account_id: Option<String>,
 }
 
-pub use crate::llm::model_config::MAX_CONTEXT_WINDOW;
-
-/// Planning window when neither an operator cap nor model capacity is known.
-pub const DEFAULT_CONTEXT_WINDOW: u32 = 128 * 1024;
+pub use crate::llm::model_config::{DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW};
 
 /// Operator context budget. Auto follows model metadata; a number caps retained history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

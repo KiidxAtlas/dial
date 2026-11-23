@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Shared budget ceiling, large enough for decimal 1.05M and 2M model windows.
 pub const MAX_CONTEXT_WINDOW: u32 = 2_097_152;
 
+/// Planning window when neither an operator cap nor model capacity is known.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 128 * 1024;
+
 /// Wire protocol for operator-configured endpoints. Omission preserves the
 /// provider's built-in protocol; custom providers otherwise use Chat Completions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

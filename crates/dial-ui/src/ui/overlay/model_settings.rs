@@ -129,7 +129,7 @@ static FIELDS: &[Field] = &[
             2048.0,
             2_097_152.0,
             1024.0,
-            crate::config::types::DEFAULT_CONTEXT_WINDOW as f64,
+            crate::llm::model_config::DEFAULT_CONTEXT_WINDOW as f64,
         ),
         "This model's history/compaction cap, limited by model/server capacity. Reset follows shared defaults. Press d to change the local/cloud defaults for future model selections; this does not resize an external server.",
     ),
