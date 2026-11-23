@@ -21,6 +21,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Custom prompts use the template field that supplied a block, not a text match, to decide whether to repeat it. Request reminders use the admitted journal entry rather than comparing message bodies.
 - Diagnosis-only detection distinguishes a requested fix from a negated or quoted one. The adaptive editing phase uses committed paths; a successful no-op does not count as an edit. Repeat recovery follows the recorded call reference for new duplicate answers and retains a fallback for older histories.
 - Native RPC accepts optional Desktop Type metadata alongside `send.text`. The Type briefing supplies model context without becoming part of the user's request for classification or verification.
+- Native RPC starts without a selected model so Desktop can connect on first run and offer provider setup.
 
 - A final reply that admits the requested work is unfinished ("I'm stopping here without a working `out.html`", "I have not yet built the required circuit") is no longer accepted as `completed` on hosted routes. Dial asks once to continue, then ends the turn `Incomplete` if the next reply admits it again. Diagnosis-only requests are exempt (`docs/agent-loop.md`).
 

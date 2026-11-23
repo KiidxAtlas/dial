@@ -1396,7 +1396,10 @@ fn run_control(
     launch: crate::agent::modes::Launch,
     overlay: toml::Table,
 ) -> Result<()> {
-    config.require_model()?;
+    // Native clients can sign in and select their first model over this connection.
+    if acp {
+        config.require_model()?;
+    }
     layout.ensure_project_outside_storage()?;
     let interrupt = Arc::new(AtomicBool::new(false));
     let mut writer =

@@ -223,7 +223,11 @@ impl Actor {
                 let mut reply: Option<(Value, Value)> = None;
                 loop {
                     let (store, serving) = serving_setup(&config)?;
-                    let backend = make_backend(&serving)?;
+                    let backend = if !acp && serving.model.trim().is_empty() {
+                        crate::agent::unconfigured_backend(&serving, "")
+                    } else {
+                        make_backend(&serving)?
+                    };
                     let image_input = backend.accepts_image_input();
                     let session = if acp || handoff.is_some() {
                         Session::ephemeral()
