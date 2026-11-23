@@ -133,10 +133,8 @@ pub(in crate::llm) fn available_models(
 ) -> Result<(Option<(String, String)>, Value)> {
     let cancel = Arc::new(AtomicBool::new(false));
     // Catalog status displays only the outer message, never the OAuth error chain.
-    let access = oauth::access(user_dir, ID, &cancel)
+    let (access, identity) = oauth::antigravity_listing_access(user_dir, &cancel)
         .context("Could not load or refresh the saved Antigravity sign-in")?;
-    // The scope is the credential this listing was fetched with, not a later active account.
-    let identity = access.account_id.clone().zip(access.project_id.clone());
     model_listing(&access, &cancel).map(|(_, payload)| (identity, payload))
 }
 

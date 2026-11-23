@@ -1251,10 +1251,9 @@ impl Config {
         self.providers
             .get(provider)
             .map(|p| Cow::Borrowed(p.base_url.as_str()))
-            .or(match provider {
+            .or_else(|| match provider {
                 "chatgpt" => Some(Cow::Borrowed(crate::llm::chatgpt::BASE_URL)),
-                "ollama" => Some(Cow::Borrowed("http://127.0.0.1:11434")),
-                _ => None,
+                _ => crate::llm::catalog::local_server_endpoint(provider).map(Cow::Owned),
             })
             .or_else(|| {
                 // Templated bundled endpoints take their account from config. Unset values stay as

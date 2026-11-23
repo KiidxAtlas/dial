@@ -137,6 +137,7 @@ fn an_admin_read_routed_through_a_job_delivers_the_owner_answer() {
     let admin = Arc::new(super::super::Admin {
         layout: Arc::new(RwLock::new(layout)),
         config: Arc::new(RwLock::new(config)),
+        scan: Default::default(),
         overlay: toml::Table::new(),
     });
     let jobs = ReadJobs::new();

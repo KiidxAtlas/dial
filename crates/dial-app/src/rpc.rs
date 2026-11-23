@@ -1060,6 +1060,7 @@ fn schema_document() -> Result<Value> {
 struct Admin {
     layout: Arc<std::sync::RwLock<Layout>>,
     config: Arc<std::sync::RwLock<Config>>,
+    scan: Arc<models::ModelScan>,
     /// Command-line settings, kept when a method reads the saved configuration again.
     overlay: toml::Table,
 }
@@ -1159,25 +1160,44 @@ impl Admin {
                         coded(ErrorCode::InvalidParams, "refresh must be a boolean")
                     })?,
                 };
-                let list_with = |cfg: &Config| {
-                    if let Some(purpose) = purpose {
-                        models::list_for(cfg, &layout.user_dir, provider, purpose)
-                    } else if model.provider.is_empty() {
-                        models::list(cfg, &cfg.selection(), &layout.user_dir, provider)
-                    } else {
-                        models::list(cfg, &model, &layout.user_dir, provider)
-                    }
-                };
-                if refresh {
-                    let cloned = config.clone();
-                    drop(config);
-                    let checked = models::refresh_and_check(&layout, &cloned);
-                    let models = list_with(&cloned);
-                    Ok(json!({"models": models, "checked": checked}))
+                // Reserve the scan under the config lock, but perform provider I/O outside it.
+                let cfg = config.clone();
+                let ticket = refresh.then(|| self.scan.begin());
+                let previous = self.scan.snapshot();
+                drop(config);
+                let (checked, discovered) = if let Some(ticket) = ticket {
+                    let (checked, rows) = models::refresh_and_check(&layout, &cfg, purpose);
+                    (Some(checked), Some(self.scan.publish(ticket, rows)?))
                 } else {
-                    let models = list_with(&config);
-                    Ok(json!({"models": models}))
+                    (None, previous)
+                };
+                let models = if let Some(purpose) = purpose {
+                    models::role_list(
+                        &cfg,
+                        &layout.user_dir,
+                        provider,
+                        purpose,
+                        discovered.as_deref(),
+                    )
+                } else {
+                    let current = if model.provider.is_empty() {
+                        cfg.selection()
+                    } else {
+                        model
+                    };
+                    models::chat_list(
+                        &cfg,
+                        &current,
+                        &layout.user_dir,
+                        provider,
+                        discovered.as_deref(),
+                    )
+                };
+                let mut reply = json!({"models": models});
+                if let Some(checked) = checked {
+                    reply["checked"] = checked;
                 }
+                Ok(reply)
             }
             "image_settings" => {
                 drop(config);
@@ -1393,7 +1413,10 @@ fn run_control(
     launch: crate::agent::modes::Launch,
     overlay: toml::Table,
 ) -> Result<()> {
-    config.require_model()?;
+    // Native clients can sign in and select their first model over this connection.
+    if acp {
+        config.require_model()?;
+    }
     layout.ensure_project_outside_storage()?;
     let interrupt = Arc::new(AtomicBool::new(false));
     let mut writer =
@@ -1449,6 +1472,7 @@ fn run_control(
     let admin = Arc::new(Admin {
         layout: admin_layout.clone(),
         config: admin_config.clone(),
+        scan: Default::default(),
         overlay: overlay.clone(),
     });
     let read_jobs = read_jobs::ReadJobs::new();
@@ -1479,6 +1503,7 @@ fn run_control(
         worker_live,
         queue,
         admin_config,
+        scan: admin.scan.clone(),
         admin_layout,
         worker_fs,
         sides: sides.clone(),

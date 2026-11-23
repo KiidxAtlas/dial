@@ -20,8 +20,8 @@ mod probe;
 mod subscription;
 use crate::config::paths::Layout;
 use crate::llm::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
-pub use cache::saved_listing_models;
 use cache::{cached, persist_cache, probe_cache_key, same_model};
+pub use cache::{saved_listing_models, saved_subscription_models};
 pub(crate) use credentials::origin;
 pub use credentials::{
     EndpointSettings, credential_token, fill_endpoint_template, known_key_env, remove_credential,
@@ -215,6 +215,15 @@ fn local_server_url(id: &str, variable: &str, default: &str) -> String {
         })
         .unwrap_or_else(|| default.into())
 }
+
+/// Resolve a discovered server by provider ID when a picker sends only `provider/model`.
+pub fn local_server_endpoint(provider: &str) -> Option<String> {
+    LOCAL_SERVERS
+        .iter()
+        .find(|&&(id, ..)| id == provider)
+        .map(|&(id, _, variable, default)| local_server_url(id, variable, default))
+}
+
 /// Whether something accepts TCP connections at `base_url` within `timeout`.
 fn accepts_connections(base_url: &str, timeout: Duration) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};

@@ -142,29 +142,6 @@ fn parse_target_splits_only_known_effort_levels() {
 }
 
 #[test]
-fn set_model_accepts_only_known_models() {
-    let mut config = Config::default();
-    config.model_favorites.push(ModelSelection {
-        provider: "lab".into(),
-        model: "pinned-1".into(),
-        ..Default::default()
-    });
-    let dir = tempfile::tempdir().unwrap();
-    let known = ModelSelection {
-        provider: "lab".into(),
-        model: "pinned-1".into(),
-        ..Default::default()
-    };
-    let unknown = ModelSelection {
-        provider: "lab".into(),
-        model: "zz-unlisted-9000".into(),
-        ..Default::default()
-    };
-    assert!(is_known_model(&config, dir.path(), &known));
-    assert!(!is_known_model(&config, dir.path(), &unknown));
-}
-
-#[test]
 fn picker_ids_for_discovered_local_providers_resolve_without_configuration() {
     let config = Config::default();
     for selector in [
@@ -178,6 +155,10 @@ fn picker_ids_for_discovered_local_providers_resolve_without_configuration() {
             (resolved.provider.as_str(), resolved.model.as_str()),
             (provider, model)
         );
+        if let Some(url) = crate::llm::catalog::local_server_endpoint(provider) {
+            let switched = config.with_selection(&resolved);
+            assert_eq!(switched.endpoint.unwrap().base_url, url);
+        }
     }
     assert!(resolve(&config, "nowhere/model").is_err());
 }

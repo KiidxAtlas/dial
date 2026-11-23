@@ -293,8 +293,39 @@ pub fn identity(user_dir: &Path, id: &str) -> Option<String> {
 /// listing is usable only while this identity still matches the one it was fetched under.
 pub fn active_listing_identity(user_dir: &Path, id: &str) -> Option<(String, String)> {
     let grant = load(&path(user_dir, id)).ok()?;
-    let active = grant.active()?;
-    Some((active.account_id.clone()?, active.project_id.clone()?))
+    listing_identity(grant.active()?)
+}
+
+fn listing_identity(grant: &Credentials) -> Option<(String, String)> {
+    use sha2::{Digest, Sha256};
+    let project = grant.project_id.as_ref().filter(|id| !id.is_empty())?;
+    let account = match grant.account_id.as_ref().filter(|id| !id.is_empty()) {
+        Some(id) => id.clone(),
+        None => {
+            // Google's opaque tokens need not carry a subject. Bind the listing to the grant,
+            // not the reusable account slot or project alone. Never persist token material.
+            let token = if grant.refresh.is_empty() {
+                &grant.access
+            } else {
+                &grant.refresh
+            };
+            if token.is_empty() {
+                return None;
+            }
+            format!("grant:{:x}", Sha256::digest(token.as_bytes()))
+        }
+    };
+    Some((account, project.clone()))
+}
+
+/// Take the request and cache identity from the same grant snapshot, even across account switches.
+pub(super) fn antigravity_listing_access(
+    user_dir: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(Access, Option<(String, String)>)> {
+    let flow = require("google-antigravity")?;
+    let grant = fresh_credentials(user_dir, flow, None, cancel, false)?;
+    Ok(((flow.access)(&grant)?, listing_identity(&grant)))
 }
 
 /// Enterprise host recorded at login (Copilot GitHub Enterprise), when the active grant has one.
@@ -479,6 +510,17 @@ fn access_inner(
     force: bool,
 ) -> Result<Access> {
     let flow = require(id)?;
+    (flow.access)(&fresh_credentials(user_dir, flow, account, cancel, force)?)
+}
+
+fn fresh_credentials(
+    user_dir: &Path,
+    flow: &Flow,
+    account: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+    force: bool,
+) -> Result<Credentials> {
+    let id = flow.id;
     let path = path(user_dir, id);
     let grants = snapshot(&path, cancel)?;
     let key = match account {
@@ -494,7 +536,7 @@ fn access_inner(
         .cloned()
         .with_context(|| not_signed_in(flow))?;
     if !force && !loaded.expired(REFRESH_MARGIN_MS) {
-        return (flow.access)(&loaded);
+        return Ok(loaded);
     }
     // Refresh under this account's own lock: a process that waited reloads the grant and reuses
     // the refresh the other process made, rather than spending the refresh token a second time.
@@ -510,7 +552,7 @@ fn access_inner(
         !credentials.expired(REFRESH_MARGIN_MS)
     };
     if already_refreshed {
-        return (flow.access)(&credentials);
+        return Ok(credentials);
     }
     let Some(refresh) = flow.refresh else {
         ensure!(
@@ -518,7 +560,7 @@ fn access_inner(
             "{} sign-in expired; sign in again from /providers",
             flow.name
         );
-        return (flow.access)(&credentials);
+        return Ok(credentials);
     };
     let mut fresh = refresh(&credentials, cancel).with_context(|| {
         format!(
@@ -531,7 +573,7 @@ fn access_inner(
         fresh.refresh = std::mem::take(&mut credentials.refresh);
     }
     store_grant(&path, &key, &fresh, cancel)?;
-    (flow.access)(&fresh)
+    Ok(fresh)
 }
 
 fn not_signed_in(flow: &Flow) -> String {
