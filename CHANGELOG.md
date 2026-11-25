@@ -19,6 +19,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [0.3.18] - 2026-11-24
 
+- RPC clients can list lifecycle hooks with their effective failure mode, every addressable SSH host, the repository's worktrees, and Claude Code or Codex transcripts for the project, and import a listed transcript as a new session (`list_hooks`, `ssh_hosts`, `list_worktrees`, `import_candidates`, `import_session`). `/hooks` and `/ssh` are no longer terminal-only. [RPC operations](docs/rpc-and-acp.md#native-workflow-operations).
 - RPC clients can list, set, and remove API keys for custom endpoints saved in Dial’s provider configuration. Clients select the provider by ID rather than supplying a destination URL. [RPC authentication](docs/rpc-and-acp.md).
 - On Linux, a foreground `bash` pipeline whose reader stalls because a detached daemon outside the command's process group keeps the pipe write-end open (such as `postfix start | tail`) now stops only the stalled reader after 20 seconds of silence and appends a note explaining that the daemon is still running, instead of parking until timeout and auto-backgrounding.
 - Unattended runs now warn immediately when a session-scoped `bash background:true` or `bg start` job is launched (naming `persist=true name=<name>` without `ready`), and detached `setsid`/`disown` shell launches no longer trigger or retain the false "Dial stopped it when that call returned" completion deferral. [RPC and print mode](docs/rpc-and-acp.md).

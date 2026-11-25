@@ -29,6 +29,7 @@ mod extensions;
 mod host_tools;
 mod host_uris;
 mod images;
+mod integrations;
 mod jobs;
 mod live_snapshot;
 mod maintenance;
@@ -1125,6 +1126,10 @@ impl Admin {
                 | "get_schema"
                 | "code_history"
                 | "stats"
+                | "list_hooks"
+                | "ssh_hosts"
+                | "list_worktrees"
+                | "import_candidates"
         )
     }
 
@@ -1247,6 +1252,12 @@ impl Admin {
             "list_skills" => skills::list(&layout, &config.skills.registries, params),
             "code_history" => reports::code_history(&layout, &config, params),
             "stats" => reports::stats(&layout, params),
+            // Saved, not running, configuration: an edit made with `set_setting` shows at once.
+            "list_hooks" => integrations::hooks(&self.saved_config()?),
+            "ssh_hosts" => integrations::ssh_hosts(&self.saved_config()?),
+            "list_worktrees" => integrations::worktrees(&layout.project_root),
+            "import_candidates" => integrations::import_candidates(&layout, params),
+            "import_session" => integrations::import_session(&layout, params),
             _ => Err(unknown_method()),
         }
     }
@@ -2255,6 +2266,11 @@ fn run_control(
                 | "search_sessions"
                 | "code_history"
                 | "stats"
+                | "list_hooks"
+                | "ssh_hosts"
+                | "list_worktrees"
+                | "import_candidates"
+                | "import_session"
                 | "read_image_artifact"
                     if !acp =>
                 {

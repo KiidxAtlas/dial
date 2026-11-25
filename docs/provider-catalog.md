@@ -378,6 +378,9 @@ Anthropic API keys use `x-api-key` and `anthropic-version`. Other custom endpoin
 without an online check. Environment credentials take precedence over saved API keys. Saved keys are
 **owner-private plaintext** in `credentials.json`, not an OS keychain; they are never written into
 TOML or rendered back into the UI. Failed discovery keeps cached models marked unverified.
+RPC clients see custom endpoints saved in the configuration under `auth_providers.endpoint_keys`
+and save or remove their keys with `login`/`remove_api_key` using `api-key:<endpoint id>`; the
+destination URL always comes from the saved configuration, never from the client.
 Remote routes use the declared protocol: OpenAI-compatible chat completions, Responses, Anthropic
 Messages, Gemini or Ollama native streaming. Both **ChatGPT subscription** and **Claude subscription**
 have dedicated OAuth sign-in flows and use their respective official inference APIs.

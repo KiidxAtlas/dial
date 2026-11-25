@@ -110,12 +110,15 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
         "peers" => Method("list_peers"),
+        // `/ssh add|remove` and hook edits are `set_setting`/`reset_setting` writes.
+        "hooks" => Method("list_hooks"),
+        "ssh" => Method("ssh_hosts"),
         "relay" => Terminal(COLLAB),
         "compute" | "review" | "seance" | "tree" | "profile" | "todo" | "understanding"
         | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
-        | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug"
-        | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize" | "images"
-        | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
+        | "modelpreset" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule"
+        | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize" | "images"
+        | "marketplace" | "inbox" => Terminal(PANEL),
         _ => return None,
     })
 }

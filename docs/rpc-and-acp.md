@@ -259,6 +259,15 @@ turn rather than silently queueing a session change behind it.
   `collaboration_leave` also use the room owner. Joining means admission is pending, not that
   the guest can write. Guest prompts and aborts retain host admission checks and never fall back
   to local inference. Relay service administration remains outside this API.
+- **Hooks, SSH, worktrees and imports:** `list_hooks` returns the saved lifecycle hooks with
+  their effective `fails_closed` mode and the canonical `events`; `ssh_hosts` merges
+  `~/.ssh/config` aliases with `[ssh_hosts]` and marks each `origin` (`dial` or `ssh_config`).
+  Both read the saved configuration, so an edit made with `set_setting`/`reset_setting` (keys
+  `hooks` and `ssh_hosts.<name>`) is listed at once. `list_worktrees` returns the repository's
+  worktrees with `primary` and `current` flags. `import_candidates {source: claude|codex}` lists
+  the Claude Code or Codex transcripts recorded for this project; `import_session {source,
+  path}` converts one of exactly those paths into a new session (any other path is
+  `not_found`) without switching to it.
 
 `recovery_snapshot` returns a combined idle transcript and live-state snapshot with an event
 sequence fence. It refuses active workers and oversized histories rather than certifying a
