@@ -27,7 +27,7 @@ impl Agent<'_> {
             self.config.reasoning_guard.max_pre_action_secs
         };
         let mut selection = crate::adaptive::select(
-            self.config,
+            self.effective_config(),
             &self.request_phase,
             crate::adaptive::Request {
                 kind: self.task_policy.kind,

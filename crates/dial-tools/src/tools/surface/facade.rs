@@ -664,8 +664,18 @@ impl Tool for Facade {
     fn has_live_work(&self) -> bool {
         self.owners().any(|tool| tool.has_live_work())
     }
+    fn take_live_job_previews(&self) -> Vec<(String, String)> {
+        self.owners()
+            .flat_map(|tool| tool.take_live_job_previews())
+            .collect()
+    }
     fn awaited_work(&self) -> Vec<String> {
         self.owners().flat_map(|tool| tool.awaited_work()).collect()
+    }
+    fn requested_background_work(&self) -> Vec<String> {
+        self.owners()
+            .flat_map(|tool| tool.requested_background_work())
+            .collect()
     }
     fn session_work(&self) -> Vec<String> {
         self.owners().flat_map(|tool| tool.session_work()).collect()

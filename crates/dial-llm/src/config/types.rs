@@ -116,6 +116,8 @@ pub struct Config {
     /// `[message_routing]`: how a message typed during a running turn is routed.
     pub message_routing: config::message_routing::Config,
     pub local_runtime: crate::llm::local_runtime::LocalRuntime,
+    /// Per-downloaded-model engine selections, keyed by `LocalEngine::model_key`.
+    pub local_model_engines: BTreeMap<String, crate::llm::local_runtime::LocalEngine>,
     pub adaptive: config::adaptive::Config,
     pub reliability: config::reliability::Config,
     pub laya: crate::config::laya::Config,
@@ -285,6 +287,7 @@ impl Default for Config {
             weights: config::weights::Config::default(),
             message_routing: config::message_routing::Config::default(),
             local_runtime: Default::default(),
+            local_model_engines: Default::default(),
             adaptive: config::adaptive::Config::default(),
             reliability: config::reliability::Config::default(),
             isolation: Default::default(),

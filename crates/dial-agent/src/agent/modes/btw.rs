@@ -127,6 +127,29 @@ impl SideSnapshot {
 }
 
 impl SideRequest {
+    /// A tool-free request without an agent, journal, project context or usage ledger. The caller
+    /// owns the private conversation and supplies only exchanges from this private session.
+    pub fn private(config: &Config, prior: &[(String, String)], question: &str) -> Result<Self> {
+        ensure!(!question.trim().is_empty(), "private chat needs a question");
+        let mut messages = Vec::new();
+        for (asked, answered) in prior {
+            messages.push(json!({"role":"user","content":asked}));
+            messages.push(json!({"role":"assistant","content":answered}));
+        }
+        messages.push(json!({"role":"user","content":question}));
+        Ok(Self {
+            chat: Chat {
+                messages,
+                tools: Vec::new(),
+                temperature: config.harness.temperature,
+                max_tokens: config.harness.max_tokens,
+                seed: None,
+            },
+            config: config.clone(),
+            usage_scope: None,
+        })
+    }
+
     /// Charge an agent-initiated side question to the parent's shared worker ledger.
     pub(in crate::agent) fn with_usage_scope(mut self, scope: crate::llm::usage::Scope) -> Self {
         self.usage_scope = Some(scope);

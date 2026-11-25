@@ -113,6 +113,7 @@ pub(super) struct Actor {
     pub scan: Arc<models::ModelScan>,
     /// Published with the rebuilt configuration when the active project changes.
     pub admin_layout: Arc<std::sync::RwLock<Layout>>,
+    pub peers: Arc<peers::PeerControl>,
     pub sides: Arc<side_control::SideControl>,
 }
 
@@ -194,6 +195,7 @@ impl Actor {
             scan,
             admin_layout,
             sides,
+            peers,
         } = self;
         run_boundary(
             |in_flight| -> Result<()> {
@@ -325,6 +327,7 @@ impl Actor {
                         &mut worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()),
                     );
                     if !acp {
+                        peers.bind(&mut agent);
                         collaboration::hosting::sync(agent.session());
                         sides.bind(&agent, None)?;
                     }
@@ -391,6 +394,7 @@ impl Actor {
                         steering_cleanup,
                         parked: std::collections::HashMap::new(),
                         current: !acp,
+                        peers: peers.clone(),
                         sides: sides.clone(),
                     };
                     let (id, next, reconnect, moved) = match runtime.run(in_flight)? {
@@ -534,6 +538,7 @@ struct ActorRuntime<'a> {
     /// When the query projection was last rebuilt.
     projected_at: std::time::Instant,
     current: bool,
+    peers: Arc<peers::PeerControl>,
     sides: Arc<side_control::SideControl>,
 }
 
@@ -767,6 +772,7 @@ impl ActorRuntime<'_> {
         self.steering_cleanup.settle();
         let recovery_reply = self.recovery_reply.take();
         if !self.acp {
+            self.peers.bind(&mut self.agent);
             collaboration::hosting::sync(self.agent.session());
         }
         if self.acp && self.current && self.flag.load(Ordering::SeqCst) {
@@ -975,15 +981,23 @@ impl ActorRuntime<'_> {
                 None | Some("status" | "queue")
             );
         let goal_compute = method == "goal" && workflows::goal_has_prompt(&self.agent, params)?;
+        let prepare_local_model = method == "set_model" && params["prepare_local_model"] == true;
+        if prepare_local_model && params["provider"] != "mlx" {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                "prepare_local_model requires a managed local model",
+            ));
+        }
         if self.compute.is_none()
             && self.config.compute_locks
             && (memory_compute
-                || (self.config.requires_compute_lock()
+                || (self.agent.effective_config().requires_compute_lock()
                     && (goal_compute
                         || matches!(
                             request["method"].as_str(),
                             Some(
                                 "send"
+                                    | "private_ask"
                                     | "retry"
                                     | "live_listen"
                                     | "compact"
@@ -992,17 +1006,7 @@ impl ActorRuntime<'_> {
                             )
                         ))))
         {
-            self.compute = crate::learn::auto::compute_lock_cancellable(self.layout, || {
-                self.flag.load(Ordering::SeqCst) || self.worker_out.unavailable()
-            })?;
-            anyhow::ensure!(self.compute.is_some(), "compute wait cancelled");
-            crate::learn::compute::register(
-                &self.layout.user_dir,
-                "session",
-                &self.layout.project_root,
-                &self.config.state_dir,
-                &self.config.model,
-            )?;
+            self.acquire_foreground_compute(&self.agent.effective_config().model.clone())?;
         }
         if matches!(method, "send" | "retry" | "live_listen") || goal_compute {
             self.ui
@@ -1049,6 +1053,26 @@ impl ActorRuntime<'_> {
                 } else {
                     Ok(state)
                 }
+            }
+            "private_ask" => {
+                if params["confirm"] != true {
+                    return Err(coded(
+                        ErrorCode::Refused,
+                        "confirm sending this text to the selected provider; it may retain the request",
+                    ));
+                }
+                let text = params["text"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        coded(ErrorCode::InvalidParams, "private_ask needs nonblank text")
+                    })?;
+                let request = crate::agent::modes::btw::SideRequest::private(
+                    self.agent.effective_config(),
+                    &[],
+                    text,
+                )?;
+                Ok(json!({"answer":request.run(self.flag.clone(), &mut |_| {})?}))
             }
             "side_promote" => self.sides.promote(&self.agent, self.layout, params),
             "archive" => maintenance::archive(self.layout, params),
@@ -1118,8 +1142,36 @@ impl ActorRuntime<'_> {
                     model_id,
                     discovered.as_deref(),
                 )?;
-                self.agent.switch_model(&selection, None)?;
-                Ok(json!({"model":self.agent.effective_config().model}))
+                // Engine pins are load-time preferences, including in already-open sessions.
+                let pins = if provider == "mlx" && selection.base_url.is_none() {
+                    Some(
+                        crate::config::settings_store::load_config(self.layout, self.overlay)?
+                            .local_model_engines,
+                    )
+                } else {
+                    None
+                };
+                let acquire =
+                    prepare_local_model && self.compute.is_none() && self.config.compute_locks;
+                if acquire {
+                    self.acquire_foreground_compute(model_id)?;
+                }
+                if let Err(error) = self.agent.switch_model_with_preparation(
+                    &selection,
+                    None,
+                    prepare_local_model,
+                    pins,
+                ) {
+                    if acquire {
+                        self.release_foreground_compute()?;
+                    }
+                    return Err(error);
+                }
+                let mut result = json!({"model":self.agent.effective_config().model});
+                if prepare_local_model {
+                    result["local_ready"] = json!(true);
+                }
+                Ok(result)
             }
             "set_thinking" => {
                 let level = params["level"]
@@ -1213,6 +1265,21 @@ impl ActorRuntime<'_> {
             "set_host_tools" => self.set_host_tools(params),
             "set_host_uri_schemes" => self.set_host_uri_schemes(params),
             "new_session" => self.new_session(),
+            "checkpoint_diff" | "restore_checkpoint_files"
+                if params.get("session_id").is_some()
+                    && (params["session_id"].as_str() != Some(self.agent.session().id())
+                        || !self.agent.session().recorded_turns(50).iter().any(
+                            |(_, _, summary)| {
+                                params["turn"].is_u64()
+                                    && summary["checkpoint_turn"] == params["turn"]
+                            },
+                        )) =>
+            {
+                Err(coded(
+                    ErrorCode::Conflict,
+                    "Turn is no longer in this session’s review; reopen turn results",
+                ))
+            }
             "list_checkpoints" => Ok(checkpoints::list(self.agent.checkpoints())),
             "checkpoint_files" => checkpoints::files(self.agent.checkpoints(), params),
             "checkpoint_diff" => checkpoints::diff(self.agent.checkpoints(), params),
@@ -1351,6 +1418,22 @@ impl ActorRuntime<'_> {
         result
     }
 
+    fn acquire_foreground_compute(&mut self, model: &str) -> Result<()> {
+        let lock = crate::learn::auto::compute_lock_cancellable(self.layout, || {
+            self.flag.load(Ordering::SeqCst) || self.worker_out.unavailable()
+        })?
+        .context("compute wait cancelled")?;
+        crate::learn::compute::register(
+            &self.layout.user_dir,
+            "session",
+            &self.layout.project_root,
+            &self.config.state_dir,
+            model,
+        )?;
+        self.compute = Some(lock);
+        Ok(())
+    }
+
     fn release_foreground_compute(&mut self) -> Result<bool> {
         let Some(lock) = self.compute.take() else {
             return Ok(false);
@@ -1486,9 +1569,7 @@ impl ActorRuntime<'_> {
             speak_reply(&self.worker_live, self.worker_out, &report.text);
         }
         // The turn spent its whole step budget; clients need that distinct from other incomplete turns.
-        let step_limit = report.outcome == crate::runtime::Phase::Incomplete
-            && self.config.harness.max_steps > 0
-            && report.steps >= self.config.harness.max_steps;
+        let step_limit = report.reached_step_limit(self.config.harness.max_steps);
         let mut result = json!({"text":report.text,"outcome":report.outcome,"steps":report.steps,"interrupted":report.interrupted,"duration_ms":started.elapsed().as_millis(),"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode(),"metrics":self.agent.metrics(),"efficiency":self.agent.efficiency_report(),"speculation":self.agent.speculation_stats()});
         result["step_limit"] = json!(step_limit);
         if let Some(transcript) = transcript {

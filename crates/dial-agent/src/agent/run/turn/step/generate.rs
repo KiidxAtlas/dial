@@ -279,6 +279,7 @@ impl Agent<'_> {
             (!self.hermetic && self.fallback_ready())
                 .then_some(self.effective_config().retry.fallback_on),
         );
+        self.route.note_attempt(backend, provider_request);
         let result = if self.hermetic {
             crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
                 chat_with_ui(
@@ -372,6 +373,9 @@ impl Agent<'_> {
         }
         backend.next_request_profile(None);
         backend.next_request_failover(None);
+        if !self.hermetic {
+            self.observe_main_request(result.is_ok());
+        }
         match &result {
             Ok(reply) => {
                 self.observe_local_reply(reply, backend);

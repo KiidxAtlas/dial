@@ -6,6 +6,10 @@ The `bg` tool starts process-group-owned jobs with a bounded live output ring an
 
 Jobs are session-owned unless a call explicitly supplies `persist: true`: use `list`, `output`, `wait`, `input`, `resize`, and `kill` while the session is active. The `/bg` panel lists ordinary session jobs and their status, and shows a PTY job's rendered screen. Enter on a PTY job attaches the keyboard to it; Ctrl-] (or Ctrl-5) detaches. Pipe input and PTY input are explicit tool actions. Processes are stopped when their owning background tool is dropped.
 
+When `bg` is offered on a model request, Dial includes a short preview of new output from each running session process (the newest 1 KiB of pipe output or rendered PTY screen). This does not wake an idle model, consume `bg output`, or prove readiness. A bounded `bg wait` that times out also returns the unread output or current screen and leaves the job running. Use a bounded wait (default: five seconds) when the agent may need to inspect a diagnostic and decide whether to stop the job; an explicit unlimited wait still waits for its exit or requested condition. Stopping a job still goes through the normal `kill` approval.
+
+A `bg start` whose work matches a job that is still running (the same script, however it is launched or piped, or the same command text) succeeds and adds `Already running the same work: NAME (command)`, since two copies compete for CPU and write the same outputs. A foreground `bash` call that detaches a process with `setsid` or `disown` gets a `detached_job` notice that the process is untracked by Dial and should be checked before the work is started again; a `&` job beside a fixed `sleep` of 20 seconds or more gets an `async_sleep` notice that the sleep waits its full length even after the job finished or failed.
+
 The PTY viewer preserves the emulator's indexed/RGB foreground and background colours, bold,
 italic, underline and inverse attributes, styled blanks, wide characters and cursor visibility.
 It follows the child's application-cursor mode and sends xterm modifier parameters for navigation
@@ -22,6 +26,8 @@ inspection so quiet open pipes cannot defeat cleanup deadlines; queued input del
 wake waiting controllers rather than relying on another output event.
 
 PTY starts without explicit `ready` automatically observe the newly started job for up to one second after spawn, returning its rendered initial screen and controller-owned process/capture status. Observed exit ends the observation sooner; a nonzero or signal exit is reported as an error while retaining the job handle for inspection. The existing reader-settlement allowance can add up to 300 ms, plus spawn/scheduling overhead. The wait is interruptible and never sends input or starts a replacement process. A running screen is neither explicit readiness nor behavioral verification. Explicit readiness retains its existing wait path; ordinary pipe starts remain asynchronous. The same observation applies to `bash` with `pty: true`.
+
+`ready.port` counts a port as ready only when a socket listening on it belongs to the job's own process group, and a connection to it succeeds. On macOS and Linux ownership comes from `lsof`. Linux without `lsof`, as in minimal containers, uses the kernel's `/proc/net/tcp` and `/proc/net/tcp6` listener tables matched against the job's socket descriptors. Windows uses the IP Helper socket table. On macOS without `lsof`, port readiness reports that ownership cannot be verified; use `ready.log` instead.
 
 ## Structured tool jobs
 
@@ -88,9 +94,9 @@ Limits and differences:
 
 - Explicit name required; at most eight retained jobs per workspace, including completed records. Forget completed records with a named `kill` before admitting more.
 - Lifetime defaults to one hour and must be 1–86,400 seconds. Expiry stops the owned job and reports that effects may be partial. This is controller-restart survival, **not** reboot persistence, indefinite scheduling, or automatic recovery after owner failure. OS logout/session policies may terminate the owner. Abrupt supervisor death can prevent group cleanup, just as abrupt controller death can for ordinary jobs.
-- Pipe-only with closed stdin. Durable PTY/input/resize and `ready` are not implemented; these requests fail closed. Use `wait.until` for log matching. Durable output is a repeatable bounded snapshot, not a per-session delta. The ordinary `/bg` panel and heartbeat do not attach durable jobs; inspect them explicitly.
+- Pipe-only with closed stdin. Durable PTY/input/resize and `ready` fail closed. `/bg` lists retained project records read-only alongside this session's jobs. Owner availability is not a child exit status. `list_jobs` with `include_persistent:true` returns separate `persistent_jobs` (or `persistent_error`); neither listing attaches, reads output, or grants control. Use `persist:true` explicitly to inspect output or request control. The heartbeat stays session-scoped.
 - Durable wait is cancellable and capped at 300 seconds, including `timeout: 0`; cancelling a wait does not kill the surviving command. Explicit kill remains approval-requiring. A killed/expired job does not imply writes were rolled back.
-- A session (non-`persist`) `wait` that runs the full 300-second cap while the job is still running adds a hint to wait once with `timeout: 0`, which has no deadline and still ends on a new user message or an interrupt, instead of repeating bounded waits.
+- A session (non-`persist`) `wait` that runs the full 300-second cap while the job is still running adds a hint to wait once with `timeout: 0`, which has no deadline of its own and still ends on a new user message, an interrupt or the run's `--max-time`, instead of repeating bounded waits.
 - On Windows the owner listens on a loopback TCP port instead of a Unix socket. It publishes the port with a random token in an owner-only `control.json`, and drops connections that do not present the token first. Control authority is still being able to read your private job directory. The owner starts in a new process group without a console window, leaving the controller's job when the job allows breakaway.
 
 No command in the examples is run automatically, and no persistent services are installed or started at application startup.

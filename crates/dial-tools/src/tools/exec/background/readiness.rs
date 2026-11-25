@@ -1,5 +1,7 @@
 //! Port readiness requires both policy permission and a listening socket in the owned group.
-//! lsof is an explicit OS prerequisite, never a best-effort ownership guess.
+//! Ownership is proven, never guessed: lsof where installed, or on Linux the kernel's own
+//! `/proc/net/tcp*` listener table joined with the group's socket descriptors, so minimal
+//! containers without lsof still get a verified readiness probe.
 #[cfg(unix)]
 use super::wake::{self, Waker};
 #[cfg(unix)]
@@ -150,8 +152,20 @@ pub(super) fn port_ready(
     cancel: &AtomicBool,
     interrupt: &AtomicBool,
 ) -> Result<bool, String> {
-    let program = ["/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof"].into_iter().find(|path| Path::new(path).is_file())
-        .ok_or("port readiness requires operator-installed lsof at /usr/sbin/lsof, /usr/bin/lsof or /bin/lsof; ownership cannot be verified")?;
+    let Some(program) = ["/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+    else {
+        #[cfg(target_os = "linux")]
+        {
+            if !procfs_owned_listener(group_pid, address)? {
+                return Ok(false);
+            }
+            return Ok(tcp_probe(address, deadline));
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("port readiness requires lsof at /usr/sbin/lsof, /usr/bin/lsof or /bin/lsof; ownership cannot be verified".into());
+    };
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -262,13 +276,97 @@ pub(super) fn port_ready(
     }
     // Bounded TCP probe follows positive socket ownership evidence. Readiness is a point-in-time
     // observation, not a promise the process will remain healthy after returning.
-    let remaining = end
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_millis(100));
-    if remaining.is_zero() {
+    Ok(tcp_probe(address, Some(end)))
+}
+
+#[cfg(unix)]
+fn tcp_probe(address: SocketAddr, deadline: Option<Instant>) -> bool {
+    let local_end = Instant::now() + Duration::from_millis(100);
+    let end = deadline.map_or(local_end, |end| end.min(local_end));
+    let remaining = end.saturating_duration_since(Instant::now());
+    !remaining.is_zero() && TcpStream::connect_timeout(&address, remaining).is_ok()
+}
+
+/// Listening TCP sockets in a `/proc/net/tcp` or `/proc/net/tcp6` table as (address, port, inode).
+#[cfg(any(target_os = "linux", test))]
+fn proc_net_listeners(table: &str) -> Vec<(IpAddr, u16, u64)> {
+    const LISTEN: &str = "0A";
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != LISTEN {
+                return None;
+            }
+            let (ip, port) = fields[1].split_once(':')?;
+            let port = u16::from_str_radix(port, 16).ok()?;
+            // The kernel prints each 32-bit word of the address in host (little-endian) order.
+            let words = (0..ip.len() / 8)
+                .map(|i| u32::from_str_radix(ip.get(i * 8..i * 8 + 8)?, 16).ok())
+                .collect::<Option<Vec<u32>>>()?;
+            let ip = match words.as_slice() {
+                [word] => IpAddr::from(word.to_le_bytes()),
+                [a, b, c, d] => {
+                    let mut bytes = [0u8; 16];
+                    for (chunk, word) in bytes.chunks_mut(4).zip([a, b, c, d]) {
+                        chunk.copy_from_slice(&word.to_le_bytes());
+                    }
+                    IpAddr::from(bytes)
+                }
+                _ => return None,
+            };
+            Some((ip, port, fields[9].parse().ok()?))
+        })
+        .collect()
+}
+
+/// Whether a process in `group_pid`'s process group holds a socket listening on `address`'s
+/// port. A wildcard listener counts for either family, as lsof's `*:port` does.
+#[cfg(target_os = "linux")]
+fn procfs_owned_listener(group_pid: u32, address: SocketAddr) -> Result<bool, String> {
+    let mut inodes = std::collections::BTreeSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for (ip, port, inode) in proc_net_listeners(&text) {
+            if port == address.port() && (ip.is_unspecified() || ip == address.ip()) {
+                inodes.insert(format!("socket:[{inode}]"));
+            }
+        }
+    }
+    if inodes.is_empty() {
         return Ok(false);
     }
-    Ok(TcpStream::connect_timeout(&address, remaining).is_ok())
+    let processes = std::fs::read_dir("/proc").map_err(|e| {
+        format!("port readiness needs lsof or a readable /proc to verify ownership: {e}")
+    })?;
+    for entry in processes.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: getpgid only queries the parsed PID; it borrows no memory, and an absent or
+        // forbidden PID returns -1 rather than a matching group.
+        if (unsafe { libc::getpgid(pid) }) != group_pid as libc::pid_t {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path())
+                .is_ok_and(|target| inodes.contains(target.to_string_lossy().as_ref()))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

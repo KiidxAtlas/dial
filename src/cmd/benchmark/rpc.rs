@@ -716,6 +716,9 @@ pub fn run_configured(
                 "benchmark turn interrupted or empty"
             );
             metrics.turns_completed = completed_turns(&report, metrics.turns_completed)?;
+            metrics.last_turn_completed = report["outcome"]
+                .as_str()
+                .map(|outcome| outcome == "completed");
             metrics.response_sha256 = report["text"].as_str().map(response_sha256);
             if let Some(speculation) = report.get("speculation") {
                 for (name, target) in [

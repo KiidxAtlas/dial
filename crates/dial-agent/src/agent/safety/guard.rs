@@ -612,7 +612,7 @@ impl NarrationGuard {
                 *count = count.saturating_add(1);
                 if *count >= 3 && (*count).is_multiple_of(3) {
                     return Some(format!(
-                        "<dial-notice kind=\"repeated_promise\">\nYou have promised {category} {count} times without a confirmed edit or task closure; rewording the promise is not progress. Reuse returned evidence and take the concrete next action, or report the blocker.\n</dial-notice>"
+                        "<dial-notice kind=\"repeated_promise\">\nYou have announced {category} {count} times without doing it. Make that call now with the evidence you have, or report the blocker.\n</dial-notice>"
                     ));
                 }
             }

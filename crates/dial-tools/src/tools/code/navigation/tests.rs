@@ -213,6 +213,127 @@ fn finds_declarations_and_literal_multiline_deterministically() {
 }
 
 #[test]
+fn path_mode_matches_file_and_directory_names_without_content_or_policy_bypass() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let tmp = dir.path().join(".tmp");
+    fs::create_dir_all(tmp.join("PreviewTranscript")).unwrap();
+    fs::write(tmp.join("PreviewTranscript/unrelated.dat"), "").unwrap();
+    fs::create_dir_all(tmp.join("private")).unwrap();
+    fs::write(tmp.join("private/transcript-preview.secret"), "").unwrap();
+    fs::write(tmp.join("transcript-preview.bin"), [0xff, 0]).unwrap();
+    fs::write(tmp.join("notes.txt"), "transcript preview").unwrap();
+    fs::write(dir.path().join(".gitignore"), ".tmp/\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tmp.join("notes.txt"), tmp.join("transcript_preview_link")).unwrap();
+    let ws = ws.with_protected_paths(&[tmp.join("private")]);
+    let config = Config::default();
+    let tool = tools(&config).remove(0);
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let mut args = json!({"query":"transcript preview", "mode":"path"});
+    let unscoped = tool.call(&ctx, &args);
+    assert!(!unscoped.is_error && !unscoped.text.contains("transcript-preview.bin"));
+    assert!(
+        unscoped.text.contains("excluded_by_ignore_or_policy="),
+        "{}",
+        unscoped.text
+    );
+    assert!(unscoped.text.contains("path=\".tmp\""), "{}", unscoped.text);
+    args["path"] = json!(".tmp");
+    let scoped = tool.call(&ctx, &args);
+    let text = scoped.text.replace('\\', "/");
+    assert!(!scoped.is_error, "{text}");
+    assert!(
+        text.lines().any(|line| line == ".tmp/PreviewTranscript/"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == ".tmp/transcript-preview.bin"),
+        "{text}"
+    );
+    for absent in [
+        "secret",
+        "notes.txt",
+        "unrelated.dat",
+        "_link",
+        SOURCE_SECTION,
+    ] {
+        assert!(!text.contains(absent), "{text}");
+    }
+    args["limit"] = json!(1);
+    let limited = tool.call(&ctx, &args);
+    assert!(
+        limited.text.contains("results limited")
+            && !limited.text.contains("transcript-preview.bin")
+    );
+    for scope in [".tmp/private", ".git", "../"] {
+        args["path"] = json!(scope);
+        assert!(tool.call(&ctx, &args).is_error, "{args}");
+    }
+    args["path"] = json!(".;.tmp");
+    let multiple = tool.call(&ctx, &args);
+    assert!(
+        multiple.is_error && multiple.text.contains("one scope per call"),
+        "{}",
+        multiple.text
+    );
+}
+
+#[test]
+fn path_mode_resolves_literal_semicolons_and_keeps_primary_relative_names() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let nested = dir.path().join("vendor/pkg");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("adapter.rs"), "").unwrap();
+    fs::write(dir.path().join("adapter;semi.rs"), "").unwrap();
+    let ws = ws.with_read_only_roots(&[nested]).unwrap();
+    for (scope, query, expected) in [
+        ("vendor/pkg", "pkg adapter", "vendor/pkg/adapter.rs"),
+        ("adapter;semi.rs", "semi", "adapter;semi.rs"),
+    ] {
+        let args = json!({"query":query,"mode":"path","path":scope});
+        let text = path_find(&ws, &args).unwrap().replace('\\', "/");
+        assert!(text.lines().any(|line| line == expected), "{text}");
+    }
+}
+
+#[test]
+fn path_mode_refuses_content_routes_before_service_dispatch() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let config = Config::default();
+    let tool = tools(&config).remove(0);
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    for (key, value) in [
+        ("ranking", json!("semantic")),
+        ("ranking", json!("embedding")),
+        ("lsp_path", json!("a.rs")),
+        ("keywords", json!(["x"])),
+        ("related", json!(true)),
+    ] {
+        let mut args = json!({"query":"x", "mode":"path"});
+        args[key] = value;
+        assert!(semantic_request(&ws, &args).unwrap().is_none());
+        assert!(!tool.needs_approval(&args));
+        let out = tool.call(&ctx, &args);
+        assert!(
+            out.is_error && out.text.contains("path mode"),
+            "{}",
+            out.text
+        );
+    }
+}
+
+#[test]
 fn find_excerpts_witness_only_returned_rows_and_survive_resume() {
     let (dir, ws) = crate::tools::testkit::workspace();
     let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);

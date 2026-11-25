@@ -12,6 +12,8 @@ impl Agent<'_> {
             || (!matches!(name, "read" | "grep")
                 && self.ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native))
             || (matches!(name, "read" | "grep") && self.ext.get(name).is_some())
+            || !super::directory_access::pending_directories(&self.workspace, &self.ext, name, args)
+                .is_empty()
             || crate::agent::safety::approval::denied_by_rule(
                 &self.always,
                 &ToolCall {
@@ -390,6 +392,11 @@ impl Agent<'_> {
             let mut config = self.effective_config().clone();
             if foreground {
                 config.shell.auto_background_secs = 0;
+            } else if self.modes.launch.unattended && config.shell.auto_background_secs == 0 {
+                // Nobody can rerun a long command an unattended run killed at the default bash
+                // timeout, so it moves to `bg` then instead; an explicit shorter `timeout` still
+                // kills. Ending such a run is left to `--max-time`.
+                config.shell.auto_background_secs = config.shell.bash_timeout_secs;
             }
             let registry = self.ext.clone();
             let mutation_cancel = turn_cancel.mutation();
@@ -589,6 +596,7 @@ impl Agent<'_> {
             )
         });
         let mut outputs = vec![None; calls.len()];
+        let mut deadline_signalled = false;
         while outputs.iter().any(Option::is_none) {
             turn_cancel.sync();
             let queued = ui.take_steering();
@@ -611,6 +619,20 @@ impl Agent<'_> {
                 for signal in &signals {
                     signal.request_steering();
                     signal.interrupt_waits();
+                }
+            }
+            // A passed `--max-time` ends cooperative waits once, as in parallel groups.
+            if !deadline_signalled && self.modes.launch.expired() {
+                deadline_signalled = true;
+                for signal in &signals {
+                    signal.interrupt_waits();
+                }
+                for call in calls {
+                    if let Some(tool) = self.ext.get(&call.name)
+                        && tool.interruptible(&call.arguments)
+                    {
+                        tool.cancel_operation();
+                    }
                 }
             }
 

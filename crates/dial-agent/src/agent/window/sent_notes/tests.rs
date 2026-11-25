@@ -172,15 +172,23 @@ fn notes_are_reinserted_after_the_history_they_followed_and_repeats_are_dropped(
     assert_eq!(messages[3]["content"], "once");
     assert_eq!(messages[4]["content"], "a1");
     assert!(!messages.iter().any(|m| m["content"] == "stale"));
+    let mut after_reply = messages.clone();
+    drop_repeated(&mut after_reply);
+    // After an assistant reply the request must still end with a user-side message, so the
+    // identical mode notice stays rather than leaving the reply as a trailing prefill.
+    assert_eq!(after_reply.len(), 6);
+    assert_eq!(after_reply[5]["content"], "mode");
+    // After a tool result the identical notice is dropped; a changed one would be sent.
+    messages.insert(5, json!({"role":"tool","tool_call_id":"c1","content":"ok"}));
     drop_repeated(&mut messages);
-    // The trailing identical mode notice is dropped; a changed one would be sent.
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[5]["role"], "tool");
     let mut changed = messages.clone();
     changed.push(
         json!({"role":"user","content":"mode 2","dial_transient":true,"dial_mode_notice":true}),
     );
     drop_repeated(&mut changed);
-    assert_eq!(changed.len(), 6);
+    assert_eq!(changed.len(), 7);
     // Another history (a preview of a compacted one) receives nothing.
     let mut other = vec![
         json!({"role":"user","content":"summary"}),

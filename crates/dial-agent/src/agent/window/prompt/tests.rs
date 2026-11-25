@@ -168,11 +168,11 @@ fn builtin_profiles_share_priority_and_safety_contracts() {
             "`<dial-notice>` blocks are messages from Dial",
             "Dial enforces approvals, the sandbox and budgets",
             "investigation leaves an ambiguity",
-            "For implementation, continue",
+            "For implementation, deliver the working change and its checks",
             "narrowest useful check first",
             "optional follow-ups separate",
             "path:line",
-            "one-line notes between tool calls",
+            "meaningful findings, decisions or delays, not routine calls",
         ] {
             assert!(
                 policy.contains(phrase),
@@ -270,12 +270,12 @@ fn advisory_research_economy_is_carried_by_every_focused_profile() {
     let tools = names(&["read", "grep", "task"]);
     let full = guidance_for(&tools, false, false);
     let lean = guidance_for(&tools, true, false);
-    let grounding = "each claim about the project (exists, missing, works) rests on a lookup";
+    let grounding = "Ground project claims in current evidence; label inference";
     for (profile, guidance) in [("full", &full), ("lean", &lean)] {
         for phrase in [
-            "For an advisory question",
-            "For implementation, continue",
-            "a concrete question remains open or evidence conflicts",
+            "Answer questions directly when the evidence is sufficient",
+            "For comparisons, give the differences that matter",
+            "Stop exploring once you can act",
             "most precise tool available",
         ] {
             assert!(guidance.contains(phrase), "{profile} lost {phrase}");
@@ -300,9 +300,9 @@ fn supported_target_guidance_is_carried_by_every_focused_profile() {
         for phrase in [
             "instead of asking",
             "narrowest useful check first",
-            "search again only when a concrete question remains open or evidence conflicts",
+            "smallest check that distinguishes them",
             "materially changes correctness, scope or authorization",
-            "read-only investigation delivers findings",
+            "change course if the result contradicts your assumption",
         ] {
             assert!(guidance.contains(phrase), "lean={lean} lost {phrase:?}");
         }
@@ -332,7 +332,7 @@ fn planning_and_delivery_keep_optional_work_separate_in_every_profile() {
             "execution steps with `todo`",
             "finish or block each step",
             "optional follow-ups separate",
-            "keeps the unfinished work",
+            "preserve unfinished work and name the missing prerequisite",
             "not after each edit",
             "Wait only when progress or completion needs the result",
         ] {
@@ -363,7 +363,7 @@ fn response_format_guidance_applies_to_all_prompt_profiles() {
         for phrase in [
             "for an exact reply send only that",
             "failed/unverified check or safety gap",
-            "Otherwise end with a brief report",
+            "Lead with the answer or change",
         ] {
             assert!(
                 guidance.contains(phrase),
@@ -447,7 +447,9 @@ fn tool_specific_rules_follow_the_offered_tools() {
 fn cross_tool_rules_require_every_named_tool() {
     for (tools, rule) in [
         (&["read"][..], READ_BATCH_RULE),
+        (&["find"], FIND_RULE),
         (&["grep"], SEARCH_SCOPE_RULE),
+        (&["grep", "bash"], SEARCH_SHELL_RULE),
         (&["verify"], VERIFY_REPRO_RULE),
         (&["eval", "bash"], EVAL_SHELL_RULE),
     ] {
@@ -555,7 +557,6 @@ fn compact_guidance_names_only_offered_helpers_and_rules() {
     let full = guidance_for(&all, true, false);
     for rule in [
         LEAN_SIDE_REQUEST,
-        LEAN_TASK_START,
         LSP_RULE,
         PROJECT_MAP_RULE,
         EVIDENCE_DATA_RULE,
@@ -884,6 +885,11 @@ fn task_evidence_changes_leave_policy_bytes_and_tool_gating_stable() {
                         );
                         assert_ne!(before.last(), after.last());
                         let policy = before[0]["content"].as_str().unwrap();
+                        assert_eq!(policy.matches(DECISION_BOUNDARY).count(), 1);
+                        assert!(
+                            policy.find(FOCUSED_WORK).unwrap()
+                                < policy.find("# Tool policy").unwrap()
+                        );
                         assert_eq!(
                             policy.matches(TESTING_DECISIONS).count(),
                             1,

@@ -163,6 +163,7 @@ pub(super) fn with_runtime(
         projected_at: Instant::now(),
         recovery_reply: None,
         current: true,
+        peers: Default::default(),
         sides: Default::default(),
     };
     // Exercise runtime unwinding without poisoning the process-wide fixture isolation lock.
@@ -508,6 +509,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
                 admin_config: published_config.clone(),
                 scan: admin.scan.clone(),
                 admin_layout: published_layout.clone(),
+                peers: runtime.peers.clone(),
                 sides: runtime.sides.clone(),
             };
             actor.run().unwrap();
@@ -1362,6 +1364,7 @@ fn persistent_modes_rebuild_and_publish_effective_settings_without_resetting_ses
                 admin_config: published_config.clone(),
                 scan: Default::default(),
                 admin_layout: Arc::new(std::sync::RwLock::new(runtime.layout.clone())),
+                peers: runtime.peers.clone(),
                 sides: runtime.sides.clone(),
             };
             actor.run().unwrap();

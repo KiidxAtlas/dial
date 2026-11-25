@@ -1413,6 +1413,15 @@ impl Config {
             .or_else(|| self.family_context_limit(&self.selection()).tokens())
     }
 
+    pub fn local_engine(&self) -> crate::llm::local_runtime::LocalEngine {
+        self.local_model_engines
+            .get(&crate::llm::local_runtime::LocalEngine::model_key(
+                &self.model,
+            ))
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn resolve_context_window(&self) -> u32 {
         // Look up the effective route, including endpoint defaults, not the partial picker selection.
         let mut metadata = self.selection();
@@ -1422,6 +1431,14 @@ impl Config {
         }
         let capacity = crate::llm::catalog::model_context_window(&self.user_dir, &metadata);
         let requested = self.requested_context_window();
+        if self.endpoint.is_none()
+            && self.local_engine() == crate::llm::local_runtime::LocalEngine::Atomic
+            && crate::llm::local_format::gguf_file(std::path::Path::new(&self.model))
+                .and_then(|file| crate::llm::local_format::inkling_dspark(&file))
+                .is_some()
+        {
+            return requested.into_iter().chain(capacity).fold(4096, u32::min);
+        }
         match (requested, capacity) {
             (Some(limit), Some(capacity)) => limit.min(capacity),
             (Some(limit), None) => limit,

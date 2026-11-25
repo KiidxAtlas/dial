@@ -37,9 +37,36 @@ impl Runtime {
     pub fn executable(&self) -> &Path {
         &self.executable
     }
-    #[cfg(not(windows))]
     pub(crate) fn root(&self) -> &Path {
         self._tree.path()
+    }
+
+    /// The directory holding this interpreter as both `python3` and `python`, for a shell PATH.
+    /// The upstream tree ships `bin/python3` on Unix and `python.exe` on Windows; the missing
+    /// spelling is added beside it (a relative symlink on Unix, a copy on Windows).
+    pub(crate) fn shell_launchers(&self) -> Result<PathBuf> {
+        let dir = self
+            .executable
+            .parent()
+            .context("bundled CPython has no launcher directory")?
+            .to_owned();
+        #[cfg(unix)]
+        {
+            let alias = dir.join("python");
+            if !alias.exists() {
+                std::os::unix::fs::symlink("python3", &alias)
+                    .with_context(|| format!("creating {}", alias.display()))?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let alias = dir.join("python3.exe");
+            if !alias.exists() {
+                fs::copy(&self.executable, &alias)
+                    .with_context(|| format!("creating {}", alias.display()))?;
+            }
+        }
+        Ok(dir)
     }
 }
 

@@ -22,6 +22,21 @@ const MAX_LINEAGE_REFERENCES: usize = 16;
 pub(super) fn evidence(agent: &Agent<'_>, params: &Value) -> Result<Value> {
     let action = required_text(params, "action")?;
     match action.as_str() {
+        "model_request" => Ok(
+            json!({"session_id": agent.session().id(), "last_request": agent.last_main_request()}),
+        ),
+        "turns" => {
+            let session = agent.session();
+            let turns: Vec<_> = session.recorded_turns(50).into_iter().map(|(id, label, summary)| {
+                let report = crate::app::recorded_turn_outcome(summary, &Value::Null);
+                json!({"id":id, "label":redact_text(&label), "outcome":report.status, "details":report.handoff,
+                    "main_request_receipt":summary["main_request_receipt"],
+                    "step_limit":summary["step_limit"] == true, "turn":summary["checkpoint_turn"],
+                    "files":summary["changed_files"].as_array().into_iter().flatten().filter_map(Value::as_str)
+                        .filter(|path| crate::storage::experience::safe_path(path)).take(128).collect::<Vec<_>>()})
+            }).collect();
+            Ok(json!({"session_id":session.id(), "turns":turns}))
+        }
         "checks" => {
             let summary = &agent.session().control_state()["turn_summary"];
             Ok(json!({
@@ -56,7 +71,9 @@ pub(super) fn evidence(agent: &Agent<'_>, params: &Value) -> Result<Value> {
         }
         other => Err(coded(
             ErrorCode::InvalidParams,
-            format!("evidence action {other} is not one of checks, check, inspect, lineage"),
+            format!(
+                "evidence action {other} is not one of model_request, turns, checks, check, inspect, lineage"
+            ),
         )),
     }
 }

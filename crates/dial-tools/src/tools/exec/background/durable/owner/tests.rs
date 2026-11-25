@@ -38,6 +38,40 @@ fn fixture() -> (tempfile::TempDir, Workspace, PathBuf) {
     (temp, ws, registry)
 }
 
+#[test]
+fn discovery_never_creates_or_contacts_an_owner() {
+    let (_temp, ws, _) = fixture();
+    let home = ws.root.join("private");
+    assert!(discover(&home, &ws.root).unwrap().is_empty());
+    assert!(!home.exists());
+    create_dir(&home).unwrap();
+    let jobs = crate::config::paths::background_jobs_dir(&home);
+    create_dir(&jobs).unwrap();
+    let registry = project_registry(&jobs, &ws.root);
+    create_dir(&registry).unwrap();
+    let dir = registry.join("build");
+    create_dir(&dir).unwrap();
+    assert_eq!(
+        discover(&home, &ws.root).unwrap()[0].status,
+        "Owner unknown"
+    );
+    publish(
+        &dir.join("owner.json"),
+        &Record {
+            owner: ProcId::current().unwrap(),
+            root: ws.root.clone(),
+            lifetime_secs: Some(60),
+        },
+    )
+    .unwrap();
+    let rows = discover(&home, &ws.root).unwrap();
+    assert_eq!(
+        (rows[0].name.as_str(), rows[0].status, rows[0].lifetime_secs),
+        ("build", "Owner active", Some(60))
+    );
+    assert!(discover(&home, &ws.root.join("other")).unwrap().is_empty());
+}
+
 fn await_finished(directory: &Path) {
     let end = Instant::now() + Duration::from_secs(5);
     while !directory.join("finished.json").exists() {
@@ -153,6 +187,7 @@ fn rejects_unsafe_control_paths_and_stale_identities_without_signalling() {
         &Record {
             owner,
             root: ws.root.clone(),
+            lifetime_secs: None,
         },
     )
     .unwrap();
@@ -167,6 +202,7 @@ fn rejects_unsafe_control_paths_and_stale_identities_without_signalling() {
         &Record {
             owner: ProcId::current().unwrap(),
             root: ws.root.clone(),
+            lifetime_secs: None,
         },
     )
     .unwrap();
@@ -189,6 +225,21 @@ fn rejects_unsafe_control_paths_and_stale_identities_without_signalling() {
         request(&directory, &ws, &json!({"action":"output"})).is_err(),
         "public control directory must be rejected"
     );
+}
+
+#[test]
+fn refused_ready_names_the_supported_readiness_route() {
+    let (_temp, ws, registry) = fixture();
+    let args = json!({"action":"start","name":"svc","command":"touch should-not-run","ready":{"log":"ok"}});
+    let error = start(&ws, &args, &registry, &AtomicBool::new(false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nothing was started"), "{error}");
+    assert!(
+        error.contains("action=wait") && error.contains("until="),
+        "{error}"
+    );
+    assert!(!ws.root.join("should-not-run").exists());
 }
 
 #[test]

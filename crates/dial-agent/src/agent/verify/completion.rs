@@ -138,7 +138,7 @@ pub(in crate::agent) enum Decision {
     Incomplete(String),
 }
 
-pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For standalone files, an Eval cell can bind assertions to each saved file with dial.check(name, passed, dial.read receipt). A different engine gives only partial coverage; disclose an unavailable consumer.";
+pub(in crate::agent) const UNCHECKED_AFTER_LAUNCH_GAP: &str = "A validation command exited 127, and the current edits have no passing check. Test the saved artifact through its intended consumer with positive and negative cases (bash check:true or verify acceptance). For Python Eval, read the edited file with src = dial.read('path/to/file.py'), test that saved code, then use dial.check('behavior', actual == expected, src) in the same cell. The two-argument form is a local assertion; it does not verify an edited file. A different engine gives only partial coverage; disclose an unavailable consumer.";
 
 /// Nudge for a plain reply that asks the user a question while `finish` is offered: the typed pause is
 /// the supported protocol, so the model is asked to use it once before the question is accepted.
@@ -247,6 +247,70 @@ impl crate::agent::Agent<'_> {
             return Decision::Continue(format!("\n[Dial completion] {TYPED_PAUSE_NUDGE}"));
         }
         let delivery = matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered);
+        // A `bash &` process was stopped when its call returned. In an unattended run nobody can
+        // restart it afterwards, so ask once whether the task needed it before accepting.
+        if delivery
+            && self.modes.launch.unattended
+            && let Some(command) = self.step_checks.stopped_shell_job.take()
+        {
+            let reason = format!(
+                "This run started a background process with `&` in `bash` (`{command}`). Dial stopped it when that call returned, so it is not running now. If the task needs it running after you finish (a server or service), start it with `bg` action=start persist=true name=<name> (without `ready`) and confirm it serves; otherwise finish again."
+            );
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
+        // A check that pushed or posted to a service leaves its test data in the state the
+        // request's caller starts from; nobody can clean it up after an unattended run.
+        if delivery
+            && self.modes.launch.unattended
+            && !self.step_checks.service_write_noted
+            && let Some(command) = self.step_checks.service_write.take()
+        {
+            self.step_checks.service_write_noted = true;
+            let reason = format!(
+                "This run wrote to a service or repository through its client (`{command}`). A caller starts from the state you leave, so data your own checks added (test commits or branches, posted records, inserted rows) can conflict with theirs. Unless the request asks for that data, remove it and restore the state the request describes (for example re-create an empty repository and its hooks). Then rerun a check with check:true that confirms the setup still works without adding new test data (commands after a check make it stale), and finish again."
+            );
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
+        // A function the request names that only the model's own harness exercised: ask once,
+        // separately from the single verification nudge, for one call the way its caller would.
+        if delivery
+            && !self.step_checks.caller_interface_noted
+            && let Some(reason) = self.caller_interface_gap()
+        {
+            self.step_checks.caller_interface_noted = true;
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
+        // A request for speed: the model's usual self-check compares output, not time.
+        if delivery
+            && !self.step_checks.performance_noted
+            && let Some(reason) = self.performance_gap()
+        {
+            self.step_checks.performance_noted = true;
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
+        // A ground-truth tool the request names but no passing check ran.
+        if delivery
+            && !self.step_checks.reference_tool_noted
+            && let Some(reason) = self.reference_tool_gap()
+        {
+            self.step_checks.reference_tool_noted = true;
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
+        // A passing check that only restates values this run printed: asked once, independent of
+        // the single verification nudge, which often fires first and asks for exactly such a check.
+        if delivery
+            && !self.step_checks.self_confirming_noted
+            && let Some(reason) = self.self_confirming_gap()
+        {
+            self.step_checks.self_confirming_noted = true;
+            ui.notice(&format!("Completion deferred: {reason}"));
+            return Decision::Continue(format!("\n[Dial completion] {reason}"));
+        }
         let obligations =
             crate::agent::workflow::task_ledger::TaskLedger::obligations(&self.todo, &control);
         let has_open_steps = obligations.has_open_steps();

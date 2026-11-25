@@ -28,7 +28,8 @@ const PRESENTATION: &str = "presentation the client renders itself";
 const PANEL: &str = "terminal panel or workflow; not an RPC method yet";
 const GIT: &str = "git workflows run in the terminal or through `dial commit` / `git`";
 const LEARNING: &str = "learning and evaluation tooling runs from the terminal or the `dial` CLI";
-const COLLAB: &str = "relay administration and peer workflows remain terminal-only; use collaboration_status for room metadata";
+const COLLAB: &str =
+    "relay administration remains terminal-only; use collaboration_status for room metadata";
 
 /// The RPC surface of the canonical command `name`; `None` for a command not classified yet.
 pub(super) fn parity(name: &str) -> Option<Parity> {
@@ -108,7 +109,8 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "commit" | "git" | "wt" | "changes" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
-        "relay" | "peers" => Terminal(COLLAB),
+        "peers" => Method("list_peers"),
+        "relay" => Terminal(COLLAB),
         "compute" | "review" | "seance" | "tree" | "profile" | "todo" | "understanding"
         | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
         | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug"

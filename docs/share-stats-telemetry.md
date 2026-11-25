@@ -1,5 +1,11 @@
 # Sharing, statistics, and telemetry
 
+## Private chat and turn receipts
+
+Run `dial private` for a text-only conversation without a Dial transcript, memory capture or usage-statistics entry. Enter one message per line; `/exit` or EOF ends it. Piped stdin is one multiline question. Only your private exchanges are carried forward in RAM: no tools, project instructions or prior Dial sessions are attached. This is not an offline mode. The selected provider receives the conversation, and providers, terminal scrollback and clients can retain it independently. `--no-session` on a regular agent run disables its journal, not all other recording.
+
+For ordinary coding turns, the turn report counts main model attempts by route (local or LAN versus remote), messages, tool results and tool schemas, and identifies disk versus in-memory transcript storage. These are counts of the requests passed to the model backend, not a network trace: repeated context counts again, transport retries are not separate attempts, and an attempt may fail before delivery. It does not cover auxiliary models, tool traffic or anything a proxy forwards. The receipt retains no message bodies or paths.
+
 ## Encrypted sharing
 
 Set `[share].server_url` or `DIAL_SHARE_SERVER`, then run `dial share [session-prefix]` (or pass `--endpoint`). `dial share --gist` creates a secret GitHub gist using the `gh` CLI. The session is credential-redacted before serialization, gzip-compressed, encrypted with AES-256-GCM using a fresh random key, and uploaded as opaque bytes (gists store base64 ciphertext). The returned URL carries the key only in its fragment; HTTP requests never include the fragment/key. Upload endpoints must use HTTPS except for loopback development endpoints.

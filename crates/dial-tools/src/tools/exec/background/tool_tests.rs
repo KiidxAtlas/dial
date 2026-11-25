@@ -23,6 +23,29 @@ fn run(tool: &Background, ws: &Workspace, args: Value) -> ToolOutput {
 }
 
 #[test]
+fn live_previews_are_bounded_independent_deltas_or_rendered_screens() {
+    let mut ring = Ring::new(4096);
+    ring.push(&[b'x'; 2048]);
+    ring.push(b"diagnostic");
+    let preview = ring.take_preview().unwrap();
+    assert!(preview.starts_with("[…] ") && preview.ends_with("diagnostic"));
+    assert!(preview.len() < 1100);
+    assert_eq!(ring.cursor, 0);
+    assert_eq!(ring.take_preview(), None);
+    ring.push(&[0xc3]);
+    assert_eq!(ring.take_preview(), None);
+    ring.push(&[0xa9]);
+    assert_eq!(ring.take_preview().as_deref(), Some("é"));
+    ring.push(b"already read");
+    ring.cursor = ring.total;
+    assert_eq!(ring.take_preview(), None);
+    let mut terminal = Ring::terminal(1024, 2, 20);
+    terminal.push(b"old\r\x1b[Knew");
+    assert_eq!(terminal.take_preview().as_deref(), Some("new"));
+    assert_eq!(terminal.take_preview(), None);
+}
+
+#[test]
 fn oversized_terminal_is_refused_before_start_or_resize() {
     let (_dir, ws) = workspace();
     let tool = owner();

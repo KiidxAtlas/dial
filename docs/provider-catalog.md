@@ -240,7 +240,8 @@ TypeSafe System One is a judgment-only backend, not a chat provider. Assign it t
 
 **Local model formats.** Dial detects the format from the files in the model directory. Both formats share the local route
 (`provider = "mlx"` in configuration), but `/models` names GGUF entries `gguf/…` and its detail line names the serving
-runtime; a GGUF entry's source notes when `llama-server` is not installed yet.
+runtime. An Atomic-only GGUF names Atomic Engine instead of suggesting a llama.cpp installation;
+it is unavailable locally outside Apple Silicon macOS. Other GGUF entries note when `llama-server` is missing.
 - **MLX** (`config.json` + safetensors): served by `mlx_lm`/`mlx_vlm`; supports LoRA, steering and runtime tuning.
   Inkling-2-Mini (`model_type: inkling2_loop`) uses MLX-LM for both text and image input. If upgrading an existing install, review `/setup update mlx-runtime` before selecting the model.
 - **GGUF** (a `.gguf` file, or a directory holding one; sharded files load from the first shard): served by llama.cpp's `llama-server` (found via `DIAL_LLAMA_SERVER`, `PATH`, `/opt/homebrew/bin` or `/usr/local/bin`) with `--jinja` and one slot. Tool and reasoning support come from the chat template in the GGUF header; a sibling `mmproj*.gguf` is passed as `--mmproj` and marks the model as vision-capable. `--ctx-size` is the configured context window, or else the largest window the memory estimate below allows (never the full native window by default). Constrained repair uses llama.cpp's JSON-schema grammar, and sampling names are translated (`repeat_penalty`, `repeat_last_n`). `[local_runtime]` maps `draft_model` (a local GGUF) and `num_draft_tokens` to `--model-draft`/`--spec-draft-n-max`, and `kv_bits` 8 or 4 to a `q8_0`/`q4_0` KV cache; the MLX-only `kv_group_size` and `quantized_kv_start` are rejected. An adapter must be a GGUF LoRA (`--lora`); steering and LoRA training need MLX weights.
@@ -251,7 +252,7 @@ known physical memory, a model that cannot fit the minimum 256-token context wit
 serving budget is refused before launch with a smaller-model/quantization hint; it never falls back
 to allocating the full native window in that case. Unknown memory retains the native/requested fallback.
 
-The improvement pipeline probes capabilities per format: MLX runs the full gradient and adapter reload probe, GGUF is reported as inference-only (harness improvement and evaluation proceed, weight training is skipped), and Splash is reported unsupported with the LM Studio hint.
+The improvement pipeline probes capabilities per format: MLX runs the full gradient and adapter reload probe. For GGUF, Dial checks the selected loader's compatibility and executable before reporting inference and evaluation available; it does not load weights in this probe or enable LoRA training. Terminal setup offers llama.cpp only for models routed to it. Splash is reported unsupported with the LM Studio hint.
 
 **Local chat templates.** Dial combines leading system/developer instructions into one system
 message for its supervised local servers. Later instructions and request-local guidance stay at

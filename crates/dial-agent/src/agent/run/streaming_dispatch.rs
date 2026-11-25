@@ -195,6 +195,13 @@ impl StreamingDispatch {
                 call,
                 runner.workspace.root(),
             )
+            && super::directory_access::pending_directories(
+                &runner.workspace,
+                &runner.ext,
+                &call.name,
+                &call.arguments,
+            )
+            .is_empty()
             && image_question(call).is_none()
             && call_form_error(call, &admission.schemas, &admission.names).is_none()
     }

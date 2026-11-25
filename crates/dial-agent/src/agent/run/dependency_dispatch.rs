@@ -706,6 +706,16 @@ impl Agent<'_> {
             crate::agent::window::file_handles::expand(&self.workspace, &mut effective)
                 .map_err(|_| "file_reference")?;
             // Only serial dispatch delivers the refusal (and consumes the one-shot gate).
+            if !super::directory_access::pending_directories(
+                &self.workspace,
+                &self.ext,
+                &effective.name,
+                &effective.arguments,
+            )
+            .is_empty()
+            {
+                return Err(WavePolicy::PARENT.refusal);
+            }
             if self.verification_option_disabled(&effective)
                 || self.repro_first_pending(&effective, crate::config::types::ReproFirst::Gate)
             {

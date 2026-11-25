@@ -3,10 +3,102 @@
 use crate::agent::*;
 
 pub(in crate::agent) fn schema() -> Value {
-    json!({"type":"function","function":{"name":"request_directory","description":"Ask the user through a yes/no popup to add an existing directory, then retry the failed tool. No slash command is needed. Normal access preserves all tool approvals, sandbox and protected storage rules. For protected Dial storage, set sensitive=true to request a SECOND, separate native-file-only approval for that exact directory; shell protection and credential secrecy remain. Grants are never automatic, even in auto modes. Sensitive grants last only in this process.","parameters":{"type":"object","properties":{"path":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1},"sensitive":{"type":"boolean","default":false}},"required":["path","reason"],"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"request_directory","description":"Ask the user through a yes/no popup to add an existing directory. No slash command is needed. Normal access preserves all tool approvals, sandbox and protected storage rules. For protected Dial storage, set sensitive=true to request a SECOND, separate native-file-only approval for that exact directory; shell protection and credential secrecy remain. Grants are never automatic, even in auto modes. Sensitive grants last only in this process.","parameters":{"type":"object","properties":{"path":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1},"sensitive":{"type":"boolean","default":false}},"required":["path","reason"],"additionalProperties":false}}})
+}
+
+/// Only declared native filesystem targets can open a popup. Never infer a permission
+/// request from a tool's error text, command operands, or an extension's arguments.
+pub(in crate::agent) fn pending_directories(
+    workspace: &Workspace,
+    registry: &crate::tools::integrations::ext::Registry,
+    name: &str,
+    args: &Value,
+) -> Vec<(PathBuf, bool)> {
+    let mut directories = Vec::new();
+    if registry
+        .origin(name)
+        .is_some_and(|origin| origin != tools::surface::catalog::Origin::Native)
+    {
+        return directories;
+    }
+    let mut add = |path: &str| {
+        if let Some(request) = workspace.pending_directory_access(path, name)
+            && !directories.contains(&request)
+        {
+            directories.push(request);
+        }
+    };
+    match name {
+        "read" => {
+            for path in args["path"].as_str().into_iter().chain(
+                args["paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            ) {
+                add(path);
+            }
+        }
+        "grep" | "glob" | "find" => {
+            if let Some(scope) = args["path"].as_str() {
+                for path in scope.split(';') {
+                    add(path.trim());
+                }
+            }
+        }
+        "edit" | "write" => {
+            let paths = if name == "write" {
+                tools::declared_write_targets(args)
+            } else {
+                tools::editing_targets(workspace.edit_mode(), args)
+            };
+            if let Ok(paths) = paths {
+                for path in paths {
+                    add(&path);
+                }
+            }
+        }
+        "bash" | "bg" if name == "bash" || args["action"] == "start" => {
+            if let Some(cwd) = args["cwd"].as_str() {
+                add(cwd);
+            }
+        }
+        _ => {}
+    }
+    directories
 }
 
 impl Agent<'_> {
+    /// Run the existing capability prompt on the original call's id, before execution, not
+    /// in response to a failed operation (which could already have had partial effects).
+    pub(in crate::agent) fn approve_pending_directories(
+        &mut self,
+        backend: &mut Backend,
+        call: &ToolCall,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        for (directory, sensitive) in
+            pending_directories(&self.workspace, &self.ext, &call.name, &call.arguments)
+        {
+            let request = ToolCall {
+                id: call.id.clone(),
+                name: "ask".into(),
+                arguments: json!({"action":"directory", "path": directory, "reason":format!("Continue the pending {} call", call.name), "sensitive":sensitive}),
+                malformed_arguments: false,
+            };
+            // Go through the facade's normal dispatch: a hook veto, disabled controller
+            // operation or permission rule must block inline grants just like explicit ones.
+            let outcome = self.dispatch(backend, &request, ui);
+            ensure!(!outcome.is_error, "{}", outcome.text);
+            ensure!(
+                !self.interrupt.load(Ordering::SeqCst),
+                "directory approval cancelled"
+            );
+        }
+        Ok(())
+    }
+
     pub(in crate::agent) fn request_directory(
         &mut self,
         call: &ToolCall,
@@ -67,7 +159,7 @@ impl Agent<'_> {
                 ui,
                 "request_sensitive_directory",
                 &format!(
-                    "Separate sensitive access approval\nCanonical directory: {}\nReason: {}\nAllow native file tools to read AND write protected Dial storage inside ONLY this directory for this process? Shell commands remain blocked by sandbox storage protection. Credentials remain inaccessible. This grant is not restored on resume.",
+                    "Separate sensitive access approval\nCanonical directory: {}\nReason: {}\nAllow native file tools to read AND write protected Dial storage inside ONLY this directory for this process? Shell permissions do not change: sandboxed shells remain blocked; an unconfined shell is not protected. Native tools still exclude credentials. This grant is not restored on resume.",
                     canonical.display(),
                     reason
                 ),
@@ -97,7 +189,7 @@ impl Agent<'_> {
         }
         self.rebuild_system();
         Ok(format!(
-            "Added {}. Retry the original tool. {}",
+            "Added {}. {}",
             canonical.display(),
             if sensitive {
                 "Sensitive native-file access granted for this process only; shell protection and credential exclusions remain."

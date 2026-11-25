@@ -14,8 +14,7 @@ use crate::app::core::App;
 use crate::cli::watch::{
     self,
     state::{
-        self, ChatLine, ChatRole, Exchange, Job, JobKind, PeerMessage, PeerRow, Peers, Request,
-        Snapshot, Thread, Worker,
+        self, ChatLine, ChatRole, Exchange, Job, JobKind, Peers, Request, Snapshot, Thread, Worker,
     },
 };
 use crate::storage::side_thread::Outcome;
@@ -477,40 +476,7 @@ fn peers(
     };
     // The board already reports an unavailable registry; a chat that cannot be read stays empty.
     let messages = messages.unwrap_or_default();
-    Peers {
-        error: None,
-        scopes: board.scopes,
-        overlapping: board.overlapping,
-        queued: board.queued,
-        rows: board
-            .peers
-            .into_iter()
-            .map(|row| {
-                let mut chat: Vec<PeerMessage> = messages
-                    .iter()
-                    .filter(|message| message.peer == row.peer.id)
-                    .map(|message| PeerMessage {
-                        outgoing: message.outgoing,
-                        text: state::bounded(&message.text, state::TEXT_LIMIT),
-                        unread: message.unread,
-                        receipt_available: message.receipt_available,
-                        at_ms: message.at_ms,
-                        by_user: message.by_user,
-                    })
-                    .collect();
-                chat.drain(..chat.len().saturating_sub(state::PEER_MESSAGES));
-                PeerRow {
-                    id: row.peer.id,
-                    summary: row.peer.summary,
-                    phase: row.peer.phase,
-                    scopes: row.peer.scopes,
-                    model: row.peer.model,
-                    overlapping: row.overlapping,
-                    messages: chat,
-                }
-            })
-            .collect(),
-    }
+    Peers::from_board(board, &messages)
 }
 
 fn tail(lines: &[String]) -> Vec<String> {

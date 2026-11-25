@@ -510,7 +510,10 @@ pub(in crate::agent) fn final_pipe_filter(command: &str) -> Option<&'static str>
 }
 
 /// Whether a command starts an asynchronous job with a bare `&` (not `&&`, `2>&1` or `&>`).
+/// Here-document bodies are data, not commands, so an `&` inside one does not count.
 pub(in crate::agent) fn starts_async_job(command: &str) -> bool {
+    let command = without_heredoc_bodies(command);
+    let command = command.as_str();
     let Some(tokens) = shell::scan(command) else {
         return false;
     };
@@ -522,6 +525,50 @@ pub(in crate::agent) fn starts_async_job(command: &str) -> bool {
             && !matches!(text(&tokens[index - 1]), ">" | "<")
             && tokens.get(index + 1).is_none_or(|next| text(next) != ">")
     })
+}
+
+/// Whether a command leaves a `&` job running at its end: it starts one and never `wait`s.
+/// `cmd & … wait` keeps its jobs inside the call on purpose.
+pub(in crate::agent) fn leaves_async_job(command: &str) -> bool {
+    starts_async_job(command) && !command.split_whitespace().any(|word| word == "wait")
+}
+
+/// `command` with each here-document body (the lines after a `<<WORD` up to the line holding
+/// only `WORD`) removed. A body without its terminator runs to the end, as in the shell.
+fn without_heredoc_bodies(command: &str) -> String {
+    let mut kept = String::new();
+    let mut pending: Vec<String> = Vec::new();
+    for line in command.split_inclusive('\n') {
+        if let Some(delimiter) = pending.first() {
+            let body = line.trim_end_matches(['\n', '\r']);
+            if body.trim_start_matches('\t') == delimiter {
+                pending.remove(0);
+            }
+            continue;
+        }
+        kept.push_str(line);
+        let mut rest = line;
+        while let Some(at) = rest.find("<<") {
+            let after = &rest[at + 2..];
+            // `<<<` is a here-string; its operand is on this line.
+            if after.starts_with('<') {
+                rest = after.trim_start_matches('<');
+                continue;
+            }
+            let word = after
+                .trim_start_matches('-')
+                .trim_start()
+                .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | ')'))
+                .next()
+                .unwrap_or_default()
+                .replace(['\'', '"', '\\'], "");
+            if !word.is_empty() {
+                pending.push(word);
+            }
+            rest = after;
+        }
+    }
+    kept
 }
 
 /// True when a bash command may change the workspace without a checkpoint: it is neither one plain

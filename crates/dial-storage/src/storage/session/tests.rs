@@ -9,6 +9,41 @@ mod timing;
 mod tree;
 
 #[test]
+fn recorded_turns_follow_active_branch_and_do_not_link_a_forks_files() {
+    let e = env();
+    let mut session = new_session(&e);
+    for (turn, label) in [(1, "first"), (2, "second")] {
+        let mut message = user(label);
+        message["dial_checkpoint"] = json!({"session":session.id(),"turn":turn});
+        session.append(message).unwrap();
+        session
+            .set_control_state(
+                json!({"turn_summary":{"checkpoint_turn":turn,"outcome":"completed"}}),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .recorded_turns(2)
+            .iter()
+            .map(|(_, label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+    assert!(
+        session
+            .fork(&e.layout)
+            .unwrap()
+            .recorded_turns(2)
+            .is_empty()
+    );
+    session.rewind(1).unwrap();
+    let remaining = session.recorded_turns(2);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].1, "first");
+}
+
+#[test]
 fn writer_claim_rejects_a_replaced_inode() {
     let e = env();
     let mut session = new_session(&e);

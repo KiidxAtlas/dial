@@ -99,6 +99,8 @@ impl JobRow {
 #[derive(Default)]
 pub struct JobsOverlay {
     panel_keys: super::panel_keys::PanelKeys,
+    persistent: Vec<JobRow>,
+    discovered: Option<std::time::Instant>,
     jobs: Vec<JobRow>,
     cursor: usize,
     attached: Option<String>,
@@ -129,12 +131,37 @@ impl JobsOverlay {
         self.pending_selection = Some(name);
     }
 
+    pub fn refresh_persistent(&mut self, load: impl FnOnce() -> Result<Vec<JobRow>, String>) {
+        let now = std::time::Instant::now();
+        if self
+            .discovered
+            .is_some_and(|last| now.duration_since(last).as_secs() < 3)
+        {
+            return;
+        }
+        self.discovered = Some(now);
+        match load() {
+            Ok(rows) => self.persistent = rows,
+            Err(error) => {
+                self.persistent.clear();
+                self.banner(format!("Persistent jobs unavailable: {error}"), true);
+            }
+        }
+    }
+
     /// Replace the list, keeping the selection on the same job when it still exists.
-    pub fn set_jobs(&mut self, jobs: Vec<JobRow>) {
-        let selected = self.jobs.get(self.cursor).map(|job| job.name.clone());
+    pub fn set_jobs(&mut self, mut jobs: Vec<JobRow>) {
+        let selected = self
+            .jobs
+            .get(self.cursor)
+            .map(|job| (job.name.clone(), job.mode.clone()));
+        jobs.extend_from_slice(&self.persistent);
         self.jobs = jobs;
-        if let Some(name) = selected
-            && let Some(index) = self.jobs.iter().position(|job| job.name == name)
+        if let Some((name, mode)) = selected
+            && let Some(index) = self
+                .jobs
+                .iter()
+                .position(|job| job.name == name && job.mode == mode)
         {
             self.cursor = index;
         }
@@ -147,7 +174,10 @@ impl JobsOverlay {
             }
         }
         if let Some(name) = &self.attached
-            && !self.jobs.iter().any(|job| &job.name == name)
+            && !self
+                .jobs
+                .iter()
+                .any(|job| &job.name == name && job.mode == "session")
         {
             self.message = Some((format!("{name} is no longer in the job table"), true));
             self.attached = None;
@@ -273,20 +303,26 @@ impl JobsOverlay {
             && let Some(job) = self
                 .jobs
                 .get(self.cursor)
-                .filter(|job| job.running && !job.stop_requested)
+                .filter(|job| job.mode == "session" && job.running && !job.stop_requested)
         {
             return OverlayEvent::JobStop {
                 name: job.name.clone(),
             };
         } else if key.code == KeyCode::Char('d')
             && key.modifiers.is_empty()
-            && let Some(job) = self.jobs.get(self.cursor).filter(|job| !job.running)
+            && let Some(job) = self
+                .jobs
+                .get(self.cursor)
+                .filter(|job| job.mode == "session" && !job.running)
         {
             return OverlayEvent::JobDismiss {
                 name: job.name.clone(),
             };
         } else if keys.matches(Action::SelectConfirm, key)
-            && let Some(job) = self.jobs.get(self.cursor)
+            && let Some(job) = self
+                .jobs
+                .get(self.cursor)
+                .filter(|job| job.mode == "session")
         {
             self.attached = Some(job.name.clone());
             self.screen.clear();
@@ -325,7 +361,7 @@ impl JobsOverlay {
         if index >= self.jobs.len() {
             return OverlayEvent::None;
         }
-        if index == self.cursor {
+        if index == self.cursor && self.jobs[index].mode == "session" {
             let job = &self.jobs[index];
             self.attached = Some(job.name.clone());
             self.screen.clear();
@@ -356,13 +392,27 @@ impl JobsOverlay {
         let (title, extra) = match &self.attached {
             Some(name) => ("Output", text::one_line(name)),
             None => {
-                let running = self.jobs.iter().filter(|job| job.running).count();
-                let exited = self.jobs.len() - running;
-                let counts = match (running, exited) {
-                    (0, 0) => "none yet".to_owned(),
-                    (r, 0) => format!("{r} running"),
-                    (0, e) => format!("{e} finished"),
-                    (r, e) => format!("{r} running {} {e} finished", ctx.theme.sym(Sym::Dot)),
+                let persistent = self.jobs.iter().filter(|job| job.mode == "persist").count();
+                let running = self
+                    .jobs
+                    .iter()
+                    .filter(|job| job.mode != "persist" && job.running)
+                    .count();
+                let finished = self.jobs.len() - persistent - running;
+                let mut parts = Vec::new();
+                if running > 0 {
+                    parts.push(format!("{running} running"));
+                }
+                if finished > 0 {
+                    parts.push(format!("{finished} finished"));
+                }
+                if persistent > 0 {
+                    parts.push(format!("{persistent} persistent"));
+                }
+                let counts = if parts.is_empty() {
+                    "none yet".to_owned()
+                } else {
+                    parts.join(&format!(" {} ", ctx.theme.sym(Sym::Dot)))
                 };
                 let wide = "Background processes";
                 let title = if text::width(wide) + text::width(&counts) + 3
@@ -572,7 +622,11 @@ impl JobsOverlay {
         message(&mut out);
         out.truncate(h.saturating_sub(1));
         let mut segments = Vec::new();
-        if let Some(job) = self.jobs.get(self.cursor) {
+        if let Some(job) = self
+            .jobs
+            .get(self.cursor)
+            .filter(|job| job.mode == "session")
+        {
             // The action comes first: narrow footers drop hints from the middle.
             segments.push(hint(
                 ctx.keys,
@@ -592,6 +646,13 @@ impl JobsOverlay {
                 "{} select",
                 super::widgets::arrows(theme, super::widgets::Axis::Vertical)
             ));
+        }
+        if self
+            .jobs
+            .get(self.cursor)
+            .is_some_and(|j| j.mode == "persist")
+        {
+            segments.push("persistent · read only".into());
         }
         segments.push(hint(ctx.keys, Action::SelectCancel, "close"));
         out.push(hint_line(theme, &segments, w));

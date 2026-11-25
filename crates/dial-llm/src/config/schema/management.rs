@@ -145,6 +145,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Named role/model assignments and thinking levels. Also managed by /modelpreset."
     ),
     structured!(
+        "local_model_engines",
+        MO,
+        "Runtime",
+        "Local model engines",
+        "Remember an inference engine for each downloaded model. Use the Desktop model picker to change one model without changing the others."
+    ),
+    structured!(
         "local_runtime",
         MO,
         "Runtime",

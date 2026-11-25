@@ -51,6 +51,23 @@ fn selectors_parse_ranges_tail_and_raw() {
 }
 
 #[test]
+fn colon_separated_line_ranges_parse_like_hyphen_ranges() {
+    let (path, s) = split_selector("/app/bottle.py:1558:1572").unwrap();
+    assert_eq!(
+        (path, s.ranges, s.raw),
+        ("/app/bottle.py", vec![(1558, Some(1572))], false)
+    );
+    let (path, s) = split_selector("a.rs:raw:5:9").unwrap();
+    assert_eq!((path, s.ranges, s.raw), ("a.rs", vec![(5, Some(9))], true));
+    let (path, s) = split_selector("a.rs:5:9:raw").unwrap();
+    assert_eq!((path, s.ranges, s.raw), ("a.rs", vec![(5, Some(9))], true));
+    let (path, s) = split_selector("a.rs:L5:L9").unwrap();
+    assert_eq!((path, s.ranges), ("a.rs", vec![(5, Some(9))]));
+    assert!(split_selector("a.rs:0:5").is_err());
+    assert!(split_selector("a.rs:9:3").is_err());
+}
+
+#[test]
 fn malformed_numeric_selectors_report_syntax_not_missing_paths() {
     for suffix in ["25- fifty", "25+twenty", "25..end", "25-50,src"] {
         let error = split_selector(&format!("src/a.rs:{suffix}")).unwrap_err();

@@ -724,3 +724,14 @@ fn saved_watches_round_trip_and_restore_rearms_from_current_end() {
     );
     saved::FILE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
 }
+
+#[test]
+fn linux_process_identity_reads_name_and_start_time_from_proc_stat() {
+    let stat =
+        "4242 (my (odd) cmd) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+    assert_eq!(
+        super::process::linux_identity(stat),
+        Some(("my (odd) cmd".to_owned(), "987654".to_owned()))
+    );
+    assert_eq!(super::process::linux_identity("4242 (short) S 1"), None);
+}

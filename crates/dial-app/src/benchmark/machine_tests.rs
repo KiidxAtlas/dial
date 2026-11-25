@@ -60,6 +60,7 @@ fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigur
             evidence: Some(CaseEvidence {
                 categories: vec![],
                 outcome_checks: 1,
+                false_completion: None,
                 failed_check_indices: if *passed { vec![] } else { vec![0] },
                 unavailable_check_indices: vec![],
                 contract_sha256: "a".repeat(64),

@@ -188,6 +188,14 @@ pub(in crate::agent) struct LaunchSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SourceIdentity {
     File([u8; 32]),
+    LargeFile {
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        #[cfg(unix)]
+        dev: u64,
+        #[cfg(unix)]
+        ino: u64,
+    },
     Directory(inputs::Snapshot),
 }
 
@@ -379,9 +387,11 @@ impl Target {
             )
             .map(SourceIdentity::Directory);
         }
-        workspace
-            .read_identity(self.absolute.to_str()?)
-            .map(SourceIdentity::File)
+        let path = self.absolute.to_str()?;
+        if let Some(digest) = workspace.read_identity(path) {
+            return Some(SourceIdentity::File(digest));
+        }
+        large_file_identity(workspace, path)
     }
 
     /// Whether a command run from `cwd` runs something at this path. Each `;`/`&&`/newline
@@ -455,6 +465,31 @@ fn readiness_satisfied(output: &ToolOutput) -> bool {
 
 fn clip(command: &str) -> String {
     command.chars().take(MAX_COMMAND_CHARS).collect()
+}
+
+/// Confined metadata stamp for regular files above `Workspace::file_identity`'s 16 MiB content
+/// hashing cap (such as VM disk images or large binaries). Uses `Workspace::resolve_read` so
+/// missing files, external symlinks and protected storage still return `None`.
+fn large_file_identity(workspace: &Workspace, path: &str) -> Option<SourceIdentity> {
+    const LARGE_FILE_MIN: u64 = 16 * 1024 * 1024;
+    let resolved = workspace.resolve_read(path).ok()?;
+    let metadata = std::fs::symlink_metadata(&resolved).ok()?;
+    if !metadata.is_file() || metadata.len() <= LARGE_FILE_MIN {
+        return None;
+    }
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    Some(SourceIdentity::LargeFile {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        dev,
+        #[cfg(unix)]
+        ino,
+    })
 }
 
 impl Targets {
@@ -539,16 +574,30 @@ impl Targets {
         epoch: u64,
         sources: LaunchSnapshot,
     ) {
-        // Effects of driving a tracked job are attributed to that job, not to new code.
+        // Effects of driving a tracked job, or of a passing verification check (`bash check:true`)
+        // that neither launches a requested target nor records workspace edits, are attributed to
+        // observing the launch rather than modifying its code. Source identity is still re-checked
+        // at completion, so any edit to the target itself is still caught as `SourceChanged`.
         let advanced = epoch.saturating_sub(self.last_epoch);
         self.last_epoch = epoch;
         let action = args["action"].as_str();
-        if tool == "bg"
+        let driving_tracked_job = tool == "bg"
             && matches!(action, Some("input" | "close_stdin" | "resize" | "kill"))
             && args["name"]
                 .as_str()
-                .is_some_and(|name| self.jobs.iter().any(|job| job.name == name))
-        {
+                .is_some_and(|name| self.jobs.iter().any(|job| job.name == name));
+        let verifying_check = tool == "bash"
+            && args["check"] == true
+            && !output.is_error
+            && output.execution.changed_paths.is_empty()
+            && output.process_outcome().is_some_and(|p| {
+                p.started && p.exit_code == Some(0) && !p.timed_out && !p.cancelled
+            })
+            && args["command"].as_str().is_some_and(|command| {
+                self.matching(workspace, command, args["cwd"].as_str())
+                    .is_empty()
+            });
+        if driving_tracked_job || verifying_check {
             self.own_effects += advanced;
         }
         if self.requested.is_empty() {

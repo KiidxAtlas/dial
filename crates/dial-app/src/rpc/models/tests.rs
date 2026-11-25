@@ -38,6 +38,61 @@ fn selection(provider: &str, model: &str) -> ModelSelection {
 }
 
 #[test]
+fn local_engine_pin_is_exact_and_only_offers_compatible_engines() {
+    use crate::llm::{
+        local_format::LocalFormat,
+        local_runtime::{GgufEngines, LocalEngine},
+    };
+    let mut config = config();
+    let row = |id: &str, arch: &str| Row {
+        selection: selection("mlx", id),
+        label: id.into(),
+        sources: vec!["local".into()],
+        local: Some(catalog::ModelMetadata {
+            format: Some(LocalFormat::Gguf),
+            gguf_engines: GgufEngines::for_architecture(arch),
+            ..Default::default()
+        }),
+        image_output: None,
+    };
+    config
+        .local_model_engines
+        .insert(LocalEngine::model_key("one"), LocalEngine::LlamaCpp);
+    let one = describe(&config, row("one", "qwen2"), false);
+    let choices = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        json!(["auto", "llama-cpp", "atomic"])
+    } else {
+        json!(["auto", "llama-cpp"])
+    };
+    assert_eq!(one["local_engine"]["selected"], "llama-cpp");
+    assert_eq!(one["local_engine"]["choices"], choices);
+    let two = describe(&config, row("two", "qwen2"), false);
+    assert_eq!(two["local_engine"]["selected"], "auto");
+    assert_ne!(
+        one["local_engine"]["setting"],
+        two["local_engine"]["setting"]
+    );
+    let changed = describe(&config, row("one", "inkling2_loop"), false);
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert_eq!(changed["local_engine"]["choices"], json!(["atomic"]));
+        assert_eq!(changed["local_engine"]["selected"], "llama-cpp");
+    } else {
+        assert!(changed.get("local_engine").is_none());
+    }
+    for arch in ["", "future-loader", "dflash", "bert"] {
+        assert!(
+            describe(&config, row("one", arch), false)
+                .get("local_engine")
+                .is_none()
+        );
+    }
+    assert!(
+        !LocalEngine::choices(LocalFormat::Mlx, GgufEngines::Unknown)
+            .contains(&LocalEngine::Atomic)
+    );
+}
+
+#[test]
 fn list_merges_configured_sources_and_marks_the_current_model() {
     let home = tempfile::tempdir().unwrap();
     let config = config();
@@ -575,4 +630,45 @@ fn list_for(
     purpose: Purpose,
 ) -> Vec<Value> {
     role_list(config, user_dir, provider, purpose, None)
+}
+
+#[test]
+fn provider_status_reports_each_probe_and_narrows_to_the_requested_provider() {
+    let status = |id: &str, base_url: Option<&str>, state: &str| catalog::ProviderStatus {
+        id: id.into(),
+        label: id.to_uppercase(),
+        base_url: base_url.map(str::to_owned),
+        state: state.into(),
+        detail: format!("{id} detail"),
+        models: 2,
+    };
+    let providers = [
+        status("acme", Some("https://acme.example/v1"), "reachable"),
+        status("mlx", None, "reachable"),
+        // An environment override carrying credentials must not be echoed.
+        status(
+            "ollama",
+            Some("http://user:secret@localhost:11434"),
+            "unavailable",
+        ),
+    ];
+    let all = provider_status(&providers, None);
+    assert_eq!(
+        all[0],
+        json!({"id":"acme","label":"ACME","base_url":"https://acme.example/v1",
+            "state":"reachable","detail":"acme detail","models":2})
+    );
+    assert_eq!(all.as_array().unwrap().len(), 3);
+    assert_eq!(all[1]["base_url"], Value::Null);
+    assert_eq!(all[2]["base_url"], Value::Null);
+    assert!(!all.to_string().contains("secret"), "{all}");
+    for (filter, expected) in [(Some("mlx"), vec!["mlx"]), (Some("absent"), vec![])] {
+        let ids: Vec<Value> = provider_status(&providers, filter)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].clone())
+            .collect();
+        assert_eq!(ids, expected, "{filter:?}");
+    }
 }

@@ -40,9 +40,46 @@ pub(in crate::agent) struct ActiveRoute {
     generation: u64,
     /// Last bounded selection receipt in this process; never restored from current defaults.
     receipt: Option<Value>,
+    /// Last observed main request in this engine session; not a readiness guarantee.
+    last_request: Option<Value>,
+    turn_requests: MainRequestCounts,
+}
+
+/// Counts at the primary inference boundary, after request hooks. Attempts, not proof of delivery.
+#[derive(Default, serde::Serialize)]
+struct MainRequestCounts {
+    local_or_lan: u64,
+    remote: u64,
+    messages: usize,
+    tool_results: usize,
+    tool_schemas: usize,
 }
 
 impl ActiveRoute {
+    pub(in crate::agent) fn begin_turn(&mut self) {
+        self.turn_requests = MainRequestCounts::default();
+    }
+
+    pub(in crate::agent) fn note_attempt(&mut self, backend: &Backend, request: &Chat) {
+        let counts = &mut self.turn_requests;
+        if backend.local_inference() {
+            counts.local_or_lan += 1;
+        } else {
+            counts.remote += 1;
+        }
+        counts.messages += request.messages.len();
+        counts.tool_results += request
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count();
+        counts.tool_schemas += request.tools.len();
+    }
+
+    pub(in crate::agent) fn turn_receipt(&self, journaled: bool) -> Value {
+        json!({"attempts":self.turn_requests,"transcript":if journaled { "on_disk" } else { "in_memory" }})
+    }
+
     /// Forgets the route. Used when the primary itself is replaced (model switch, session change).
     pub(in crate::agent) fn reset(&mut self) {
         let generation = self.generation.wrapping_add(1);
@@ -78,6 +115,17 @@ impl Agent<'_> {
     /// The installed main route, which can differ from the configured primary during fallback.
     pub fn active_model_config(&self) -> &Config {
         &self.auth_config
+    }
+
+    pub fn last_main_request(&self) -> Option<&Value> {
+        self.route.last_request.as_ref()
+    }
+
+    pub(in crate::agent) fn observe_main_request(&mut self, succeeded: bool) {
+        let selection = self.auth_config.selection();
+        self.route.last_request = Some(json!({
+            "provider": selection.provider, "model": selection.model, "succeeded": succeeded
+        }));
     }
 
     /// Current-process recorded cause only. Legacy history is not reconstructed on load.

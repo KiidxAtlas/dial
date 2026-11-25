@@ -64,6 +64,100 @@ fn call(path: &Path, sensitive: bool) -> ToolCall {
 }
 
 #[test]
+fn outside_read_waits_for_decision_on_original_call() {
+    for allow in [false, true] {
+        with_agent(|agent, tmp| {
+            let other = tmp.join("other");
+            std::fs::create_dir(&other).unwrap();
+            let file = other.join("note.txt");
+            std::fs::write(&file, "approved payload\n").unwrap();
+            let read = ToolCall {
+                id: "pending-read".into(),
+                name: "read".into(),
+                arguments: json!({"path":format!("{}:1-1",file.display())}),
+                malformed_arguments: false,
+            };
+            let mut ui = Answers {
+                interactive: true,
+                decisions: vec![if allow {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                }],
+                ..Default::default()
+            };
+            let output = agent.dispatch(&mut endpoint(), &read, &mut ui);
+            assert_eq!(ui.asked.len(), 1, "{}", output.text);
+            assert!(
+                ui.asked[0]
+                    .1
+                    .contains(other.canonicalize().unwrap().to_str().unwrap())
+            );
+            assert_eq!(output.is_error, !allow, "{}", output.text);
+            assert_eq!(output.text.contains("approved payload"), allow);
+            assert_eq!(
+                agent.workspace.resolve_read(file.to_str().unwrap()).is_ok(),
+                allow
+            );
+        });
+    }
+}
+
+#[test]
+fn pending_batch_write_is_not_partially_executed_on_directory_denial() {
+    with_agent(|agent, tmp| {
+        let outside = tmp.join("other");
+        std::fs::create_dir(&outside).unwrap();
+        let external = outside.join("new");
+        let write = ToolCall {
+            id: "pending-write".into(),
+            name: "write".into(),
+            malformed_arguments: false,
+            arguments: json!({"files":[{"path":"local","content":"a"},{"path":external,"content":"b"}]}),
+        };
+        let mut ui = Answers {
+            interactive: true,
+            ..Default::default()
+        };
+        let result = agent.dispatch(&mut endpoint(), &write, &mut ui);
+        assert_eq!(ui.asked.len(), 1);
+        assert_eq!(
+            tools::ToolStatus::from_output(&result),
+            tools::ToolStatus::Blocked
+        );
+        assert!(!external.exists() && !agent.workspace.root().join("local").exists());
+    });
+}
+
+#[test]
+fn inline_directory_request_respects_permission_rule_for_facade_or_member() {
+    for tool in ["ask", "request_directory"] {
+        with_agent(|agent, tmp| {
+            agent
+                .always
+                .push(serde_json::from_value(json!({"effect":"deny", "tool":tool})).unwrap());
+            let read = ToolCall {
+                id: "denied".into(),
+                name: "read".into(),
+                arguments: json!({"path":tmp.join("other.txt")}),
+                malformed_arguments: false,
+            };
+            let mut ui = Answers {
+                interactive: true,
+                decisions: vec![Decision::Allow],
+                ..Default::default()
+            };
+            let result = agent.dispatch(&mut endpoint(), &read, &mut ui);
+            assert_eq!(
+                tools::ToolStatus::from_output(&result),
+                tools::ToolStatus::Blocked
+            );
+            assert!(ui.asked.is_empty() && agent.workspace.additional_roots().is_empty());
+        });
+    }
+}
+
+#[test]
 fn directory_access_auto_mode_still_requires_real_exact_allow_and_is_discoverable() {
     with_agent(|agent, tmp| {
         let other = tmp.join("other");
@@ -145,7 +239,7 @@ fn directory_access_sensitive_requires_second_approval_and_never_unlocks_sibling
                 .collect::<Vec<_>>(),
             vec!["request_directory", "request_sensitive_directory"]
         );
-        assert!(allow.asked[1].1.contains("Shell commands remain blocked"));
+        assert!(allow.asked[1].1.contains("sandboxed shells remain blocked"));
         assert!(
             agent
                 .workspace

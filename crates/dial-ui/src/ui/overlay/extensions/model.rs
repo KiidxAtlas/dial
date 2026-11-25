@@ -127,6 +127,8 @@ pub enum Intent {
     RemoveSkill {
         id: String,
     },
+    /// One read-only scan, with separate confirmation for importing any result.
+    DiscoverMcp,
     /// Copy a server that another coding agent has configured into Dial's config.
     ImportMcp {
         id: String,
@@ -163,7 +165,8 @@ impl Intent {
         match self {
             Intent::InstallCuratedMcp { id } => format!("Install MCP server `{id}`"),
             Intent::InstallMcp { id, .. } => format!("Install MCP server `{id}`"),
-            Intent::ImportMcp { id } => format!("Import MCP server `{id}` into Dial's config"),
+            Intent::DiscoverMcp => "Find MCP servers in other apps' settings".into(),
+            Intent::ImportMcp { id } => format!("Re-read MCP settings and import `{id}` into Dial"),
             Intent::ToggleMcp { id, enable: true } => format!("Enable MCP server `{id}`"),
             Intent::ToggleMcp { id, enable: false } => format!("Disable MCP server `{id}`"),
             Intent::RemoveMcp { id } => format!("Remove MCP server `{id}`"),
@@ -187,6 +190,7 @@ impl Intent {
         matches!(
             self,
             Intent::InstallCuratedMcp { .. }
+                | Intent::DiscoverMcp
                 | Intent::ImportMcp { .. }
                 | Intent::InstallMcp { .. }
                 | Intent::RemoveMcp { .. }
@@ -210,6 +214,7 @@ pub struct JobProgress {
     /// A form for the user to fill in. The overlay opens it on its next tick.
     pub form: Option<Form>,
     pub catalog: Option<CatalogUpdate>,
+    pub discovered: Option<Vec<Row>>,
 }
 
 /// A small form shown in place of the list: the Smithery key, a server's settings, or a registry search.

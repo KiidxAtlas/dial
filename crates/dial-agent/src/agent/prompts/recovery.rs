@@ -128,7 +128,9 @@ The response announced further action but stopped. If that action is still neede
 </dial-notice>"#;
 
 /// Compact failure feedback; controller-owned barriers and budgets enforce recovery.
-pub(in crate::agent) const FIRST_FAILURE: &str = "Correct causes; retries require new evidence and understood effects. Preserve requested targets and final acceptance.";
+pub(in crate::agent) const FIRST_FAILURE: &str =
+    "Correct the cause before retrying; keep the requested target.";
+pub(in crate::agent) const REPEATED_DIAGNOSTIC: &str = "If the diagnostic persists and the cause is unclear, test what distinguishes the possible causes.";
 /// Inference failed before the response could enter tool dispatch. This describes only that
 /// response, never earlier operations in the turn or billing at the provider.
 pub(in crate::agent) const PROVIDER_RECOVERY: &str = "Recovery state: inference failed; no tools were dispatched from this failed response. Earlier completed operations are retained, not rolled back. Next action: resolve the provider diagnostic, then continue this session when ready. Do not replay earlier tool operations merely because inference failed.";
@@ -152,7 +154,11 @@ pub(crate) const RETRY_BARRIER: &str = "This is not a permission boundary: the s
 /// A browser request that found no listener.
 pub(crate) const NOTHING_LISTENING: &str = "Nothing accepted the connection at that address, so the server is not running or not listening there yet. Start it as a `bg` job and wait until it listens (`bg` `wait` with `until` matching its listening line, or a `ready` port), then browse again. A server started with `&` inside `bash` is stopped when that call returns.";
 /// A `&` job inside a foreground `bash` call.
-pub(crate) const ASYNC_JOB: &str = "A `&` job inside `bash` belongs to this call: its process group is stopped when the call returns, so a server or watcher started this way is not running afterwards. Start long-running processes with `bg` (action `start`, with `ready` such as a port) instead.";
+pub(crate) const ASYNC_JOB: &str = "A `&`/nohup job inside `bash` belongs to this call: its process group was stopped when the call returned, so a server or watcher started this way is not running now, and a check in the same call that reached it does not show it is still up. Start long-running processes with `bg` (action `start`, with `ready` such as a port; `persist=true` when it must outlive this run) and check it in a later call.";
+/// A `&` job paired with a fixed `sleep` in a foreground `bash` call.
+pub(crate) const ASYNC_SLEEP: &str = "A fixed `sleep` next to a `&` job waits its full length even when the job finished or failed in the first seconds, and the job is stopped when the call returns. To wait for work, run it in the foreground with a `timeout`, or `bg start` it and `bg wait` with `until` matching its success or error output, so the wait ends as soon as the outcome is known.";
+/// A `setsid`/`disown` process started from a foreground `bash` call.
+pub(crate) const DETACHED_JOB: &str = "`setsid`/`disown` moved that process out of this call's process group, so it can keep running after the call, untracked by Dial: `bg` cannot list, wait for or stop it, and no completion is reported. Before starting the same work again, check whether it is still running (for example its log or output file), or the two copies will compete. Start long-running work with `bg` (action `start`) instead, so it can be waited for and stopped.";
 /// An `eval` cell that tried to start a program; kernels run under a mandatory process-fork fence.
 pub(crate) const EVAL_NO_SUBPROCESS: &str = "`eval` cells cannot start programs: Python and JavaScript kernels run under a process-creation block by design, so `subprocess`, `os.system`, `os.popen` or `child_process` fail the same way. Run the command (for example `git show`) with `bash`, which is the intended tool for programs and keeps its own approval and sandbox rules; then process its output in a cell if needed. Effects of earlier statements in this cell still need checking.";
 /// Exit status 1 from a final line filter in a pipeline.
@@ -170,7 +176,7 @@ pub(crate) const VERIFICATION_UNAVAILABLE: &str = "This result does not establis
 pub(crate) const EDIT_NOT_APPLIED: &str = "Treat the edit as not applied. Fix the named cause. Reuse the current header and complete numbered rows from the diagnostic; read only missing anchor ranges before retrying.";
 /// One cause-specific line for a failed write.
 pub(crate) const WRITE_NOT_APPLIED: &str = "Treat the write as not applied. Fix the cause named above before writing again or building on that file.";
-pub(crate) const TOOL_FAILURE: &str = "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying; if the cause is unknown, use one discriminating observation. A diagnostic workaround is not the deliverable: reconcile temporary alternatives with the requested final state. Do not invent a diagnosis or substitute acceptance criteria.";
+pub(crate) const TOOL_FAILURE: &str = "Fix the named argument, prerequisite or code; if the cause is unknown, make one observation that distinguishes causes. A workaround is not the deliverable.";
 
 pub(crate) fn shell_tool_mistake(name: &str, next: &str) -> String {
     format!(

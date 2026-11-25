@@ -151,6 +151,8 @@ struct Launch {
 struct Record {
     owner: ProcId,
     root: PathBuf,
+    #[serde(default)]
+    lifetime_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -244,13 +246,52 @@ fn registry(ws: &Workspace) -> Result<PathBuf> {
     private_dir(&home)?;
     let jobs = crate::config::paths::background_jobs_dir(&home);
     create_dir(&jobs)?;
-    let hash = format!(
-        "{:x}",
-        Sha256::digest(ws.root.as_os_str().as_encoded_bytes())
-    );
-    let project = jobs.join(&hash[..24]);
+    let project = project_registry(&jobs, &ws.root);
     create_dir(&project)?;
     Ok(project)
+}
+
+fn project_registry(jobs: &Path, root: &Path) -> PathBuf {
+    let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    jobs.join(&hash[..24])
+}
+
+pub(super) fn discover(home: &Path, root: &Path) -> Result<Vec<super::Discovery>> {
+    let jobs = crate::config::paths::background_jobs_dir(home);
+    let project = project_registry(&jobs, root);
+    for dir in [home, jobs.as_path(), project.as_path()] {
+        match fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            other => {
+                other?;
+                private_dir(dir)?;
+            }
+        }
+    }
+    job_dirs(&project)?
+        .into_iter()
+        .map(|dir| {
+            let name = dir
+                .file_name()
+                .context("job name")?
+                .to_string_lossy()
+                .into_owned();
+            let record = read_json::<Record>(&dir.join("owner.json"))
+                .ok()
+                .filter(|r| r.root == root);
+            let status = match &record {
+                None => "Owner unknown",
+                Some(_) if dir.join("finished.json").is_file() => "Final record available",
+                Some(r) if r.owner.alive() => "Owner active",
+                Some(_) => "Owner unavailable",
+            };
+            Ok(super::Discovery {
+                name,
+                status,
+                lifetime_secs: record.and_then(|r| r.lifetime_secs),
+            })
+        })
+        .collect()
 }
 
 fn name(args: &Value) -> Result<&str> {
@@ -514,6 +555,19 @@ fn start(ws: &Workspace, args: &Value, registry: &Path, cancel: &AtomicBool) -> 
     start_with_owner(ws, args, registry, cancel, &std::env::current_exe()?)
 }
 
+/// Name the supported route rather than only the refused field: a model that asked for `ready`
+/// still needs to confirm the service, and otherwise retries blind.
+fn durable_start_refusal(field: &str) -> String {
+    match field {
+        "ready" | "until" => format!(
+            "durable start does not accept {field}; nothing was started. Retry without {field}, then confirm readiness with `bg` action=wait name=<same name> until=<log regex> timeout=<seconds> (or probe the port with a short `bash` check)"
+        ),
+        _ => format!(
+            "durable start does not accept {field}; nothing was started. Use a pipe command with closed stdin"
+        ),
+    }
+}
+
 fn start_with_owner(
     ws: &Workspace,
     args: &Value,
@@ -524,10 +578,7 @@ fn start_with_owner(
     ensure!(!cancel.load(Ordering::Acquire), "cancelled before launch");
     let name = name(args)?;
     for field in ["pty", "stdin", "ready", "until", "all", "rows", "cols"] {
-        ensure!(
-            !present(args, field),
-            "durable start does not accept {field}; use a pipe command with closed stdin"
-        );
+        ensure!(!present(args, field), "{}", durable_start_refusal(field));
     }
     let lifetime = opt_u64(args, "lifetime")
         .map_err(anyhow::Error::msg)?
@@ -671,6 +722,7 @@ fn start_with_owner(
             &Record {
                 owner,
                 root: ws.root.clone(),
+                lifetime_secs: Some(lifetime),
             },
         )
     })();
@@ -794,6 +846,7 @@ pub(super) fn owner_main() -> Result<()> {
         &Record {
             owner,
             root: launch.root.clone(),
+            lifetime_secs: Some(launch.lifetime),
         },
     )?;
     let directory = launch.directory.clone();

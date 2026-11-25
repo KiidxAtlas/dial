@@ -52,6 +52,24 @@ fn hermetic_agent<'a>(config: &'a Config, workspace: &Path) -> Agent<'a> {
 }
 
 #[test]
+fn private_context_is_only_supplied_exchanges_and_has_no_tools_or_ledger() {
+    let config = Config::default();
+    assert!(SideRequest::private(&config, &[], " ").is_err());
+    let request =
+        SideRequest::private(&config, &[("first".into(), "reply".into())], "next").unwrap();
+    assert!(request.usage_scope.is_none());
+    assert!(request.chat.tools.is_empty());
+    assert_eq!(
+        request.chat.messages,
+        vec![
+            json!({"role":"user","content":"first"}),
+            json!({"role":"assistant","content":"reply"}),
+            json!({"role":"user","content":"next"})
+        ]
+    );
+}
+
+#[test]
 fn pending_prompt_is_the_last_context_before_the_side_question() {
     let dir = tempfile::tempdir().unwrap();
     let config = side_config("http://127.0.0.1:1", dir.path());

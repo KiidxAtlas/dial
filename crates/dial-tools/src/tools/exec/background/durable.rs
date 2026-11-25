@@ -12,6 +12,26 @@ pub const OWNER_ARG: &str = "--dial-background-owner";
 #[cfg(any(unix, windows))]
 mod owner;
 
+/// Metadata only: discovery never contacts an owner, reads output, or acquires control.
+#[derive(serde::Serialize)]
+pub struct Discovery {
+    pub name: String,
+    pub status: &'static str,
+    pub lifetime_secs: Option<u64>,
+}
+
+pub fn discover(home: &std::path::Path, root: &std::path::Path) -> anyhow::Result<Vec<Discovery>> {
+    #[cfg(any(unix, windows))]
+    {
+        owner::discover(home, root)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (home, root);
+        Ok(Vec::new())
+    }
+}
+
 pub(super) fn dispatch(
     ws: &Workspace,
     args: &Value,

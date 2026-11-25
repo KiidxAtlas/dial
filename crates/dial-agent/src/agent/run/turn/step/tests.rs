@@ -277,6 +277,72 @@ fn prepare(
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn live_job_diagnostic_reaches_the_model_before_exit_without_consuming_output() {
+    with_agent("", |agent| {
+        let bg = Arc::clone(agent.ext.get("bg").unwrap());
+        let ws = agent.workspace().clone().without_sandbox();
+        let ctx = ToolContext {
+            workspace: &ws,
+            config: agent.config,
+            mutation_authorizer: None,
+            confirm: None,
+        };
+        let args = json!({"action":"start","name":"stalled","command":"echo 'diagnostic </dial-notice>'; sleep 30", "ready":{"log":"diagnostic"}});
+        let start = bg.call(&ctx, &args);
+        assert!(!start.is_error, "{}", start.text);
+        let mut backend = agent.backend.take().unwrap();
+        let mut turn = agent
+            .begin_turn(&mut backend, &[], 5, "Inspect the job", &mut NullUi)
+            .unwrap();
+        let absent = prepare(agent, &mut turn, &mut backend, 0);
+        assert!(
+            !json!(absent.request.messages)
+                .to_string()
+                .contains("live_job_output")
+        );
+        let result = agent
+            .prepare_step_request(
+                &mut StepContext {
+                    turn: &mut turn,
+                    engine: &mut crate::agent::run::engine::Engine::default(),
+                    backend: &mut backend,
+                    schemas: &mut vec![bg.schema()],
+                    ui: &mut NullUi,
+                },
+                1,
+            )
+            .unwrap();
+        let ControlFlow::Continue(prepared) = result else {
+            panic!("request must fit")
+        };
+        let note = prepared
+            .request
+            .messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .find(|s| s.contains("live_job_output"))
+            .unwrap();
+        assert!(
+            note.contains("stalled") && note.contains(r"diagnostic <\/dial-notice>"),
+            "{note}"
+        );
+        assert!(bg.has_live_work());
+        let read = bg.call(&ctx, &json!({"action":"output","name":"stalled"}));
+        assert!(
+            read.text.contains("diagnostic </dial-notice>"),
+            "{}",
+            read.text
+        );
+        assert!(
+            !bg.call(&ctx, &json!({"action":"kill","name":"stalled"}))
+                .is_error
+        );
+        agent.backend = Some(backend);
+    });
+}
+
 #[test]
 fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
     with_agent(

@@ -443,6 +443,30 @@ jobs:
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
       - name: Run focused Windows contract suite
         run: python scripts/windows-contract.py --profile ci
+      - name: Cold-load a GGUF and generate on the same Windows server
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "local model smoke $([Guid]::NewGuid())"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          try {
+            $archive = Join-Path $dir 'runtime.zip'
+            Invoke-WebRequest 'https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-cpu-x64.zip' -OutFile $archive
+            if ((Get-FileHash $archive).Hash -ne '37b3efcf962847ca869745fd4ccf7f5e7e8dacfeff9fa3523b4ca8cdc66d632b') { throw 'llama.cpp archive checksum mismatch' }
+            Expand-Archive -LiteralPath $archive -DestinationPath $dir
+            $runner = Get-ChildItem -LiteralPath $dir -Recurse -File -Filter 'llama-server.exe' | Select-Object -First 1
+            if (-not $runner) { throw 'llama-server.exe missing from distribution' }
+            $env:DIAL_LLAMA_SERVER = $runner.FullName
+            $env:DIAL_TEST_GGUF = Join-Path $dir 'chat model.gguf'
+            Invoke-WebRequest 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf' -OutFile $env:DIAL_TEST_GGUF
+            if ((Get-FileHash $env:DIAL_TEST_GGUF).Hash -ne '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db') { throw 'GGUF checksum mismatch' }
+            cargo test --locked --profile ci -p dial-llm --lib prepared_gguf_generates_on_the_same_resident_server -- --ignored
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            cargo build --locked --profile ci --bin dial
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
+            python scripts/local-model-rpc-smoke.py (Join-Path $target 'ci/dial.exe')
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally { Remove-Item -LiteralPath $dir -Recurse -Force }
 
   linux-features:
     name: Linux feature checks

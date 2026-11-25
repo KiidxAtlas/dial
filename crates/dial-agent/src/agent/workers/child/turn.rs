@@ -2233,6 +2233,7 @@ impl<'a> ChildTurn<'a> {
                             interrupt: env.interrupt,
                             ui: &mut ui,
                             pending_steering: &mut round_messages,
+                            deadline: None,
                         },
                         group,
                         None,

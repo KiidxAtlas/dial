@@ -403,6 +403,7 @@ vision
 model_favorites
 model_profiles
 model_presets
+local_model_engines
 local_runtime
 harness
 request_recovery

@@ -1,11 +1,65 @@
 use super::*;
 
 #[test]
+fn inkling_capabilities_follow_the_exact_engine_pin() {
+    use crate::llm::local_runtime::LocalEngine;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("model.gguf");
+    // GGUF v3: no tensors, one string-valued architecture field.
+    let mut header = b"GGUF".to_vec();
+    header.extend(3u32.to_le_bytes());
+    header.extend(0u64.to_le_bytes());
+    header.extend(1u64.to_le_bytes());
+    let key = b"general.architecture";
+    let value = b"inkling2_loop";
+    header.extend((key.len() as u64).to_le_bytes());
+    header.extend(key);
+    header.extend(8u32.to_le_bytes());
+    header.extend((value.len() as u64).to_le_bytes());
+    header.extend(value);
+    std::fs::write(&file, header).unwrap();
+
+    let mut config = Config {
+        model: file.to_str().unwrap().into(),
+        ..Config::default()
+    };
+    let key = LocalEngine::model_key(&config.model);
+    let caps = capabilities(&config).unwrap();
+    assert_eq!(caps["inference"], false);
+    assert!(
+        caps["reason"].as_str().unwrap().contains("Atomic"),
+        "{caps}"
+    );
+
+    config
+        .local_model_engines
+        .insert(key.clone(), LocalEngine::LlamaCpp);
+    let caps = capabilities(&config).unwrap();
+    assert_eq!(caps["inference"], false);
+    assert!(
+        caps["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a known loader")
+    );
+
+    config.local_model_engines.insert(key, LocalEngine::Atomic);
+    let caps = capabilities_controlled(&config, &false.into()).unwrap();
+    assert_eq!(
+        caps["inference"],
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && crate::llm::local_format::atomic_server().is_some()
+    );
+    assert!(caps["reason"].as_str().unwrap().contains("Atomic"));
+    assert_eq!(caps["lora"], false);
+}
+
+#[test]
 fn gguf_and_splash_models_answer_capabilities_without_the_mlx_worker() {
     let root = tempfile::tempdir().unwrap();
     let gguf = root.path().join("m.gguf");
     std::fs::write(&gguf, b"GGUF\x03\0\0\0rest").unwrap();
-    let caps = non_mlx_capabilities(gguf.to_str().unwrap()).unwrap();
+    let caps = non_mlx_capabilities(gguf.to_str().unwrap(), LocalEngine::Auto).unwrap();
     assert_eq!(caps["lora"], false);
     assert_eq!(
         caps["inference"],
@@ -18,7 +72,7 @@ fn gguf_and_splash_models_answer_capabilities_without_the_mlx_worker() {
         std::fs::create_dir_all(splash.join(dir)).unwrap();
     }
     std::fs::write(splash.join("manifest.json"), "{}").unwrap();
-    let caps = non_mlx_capabilities(splash.to_str().unwrap()).unwrap();
+    let caps = non_mlx_capabilities(splash.to_str().unwrap(), LocalEngine::Auto).unwrap();
     assert_eq!(caps["inference"], false);
     assert!(caps["reason"].as_str().unwrap().contains("LM Studio"));
     validate_capabilities(caps).unwrap();
@@ -27,7 +81,7 @@ fn gguf_and_splash_models_answer_capabilities_without_the_mlx_worker() {
     std::fs::create_dir(&mlx).unwrap();
     std::fs::write(mlx.join("config.json"), "{}").unwrap();
     std::fs::write(mlx.join("model.safetensors"), b"x").unwrap();
-    assert!(non_mlx_capabilities(mlx.to_str().unwrap()).is_none());
+    assert!(non_mlx_capabilities(mlx.to_str().unwrap(), LocalEngine::Auto).is_none());
 }
 
 #[cfg(windows)]

@@ -45,6 +45,11 @@ Chromium or other toolchains. Node is extracted to Dial’s private cache and ve
 CPython is extracted to a fresh private directory held for the interpreter’s lifetime. A broken
 payload is an error, not a reason to silently switch interpreters.
 
+When no `python3` resolves on the `bash` PATH, Dial puts the bundled CPython (stdlib only) after
+every PATH entry for `bash` and `bg` commands, as `python3` and `python`, and the prompt's shell
+language line names it. A project or system Python always wins; builds without the bundled
+runtime are unchanged.
+
 `runtimes/node/manifest.json` pins Node's version, target archive and SHA-256. Release builds
 run `scripts/prepare-node.py --target <triple> --output <directory>` and set
 `DIAL_BUNDLED_NODE_DIR` to that directory before Cargo runs. Archive bytes are verified before

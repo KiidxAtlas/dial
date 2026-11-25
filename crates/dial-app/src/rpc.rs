@@ -34,6 +34,7 @@ mod live_snapshot;
 mod maintenance;
 mod models;
 mod parity;
+mod peers;
 mod permissions;
 mod read_jobs;
 mod reports;
@@ -98,6 +99,7 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "evidence"
                 | "diagnostics"
                 | "skills"
+                | "peer_coordination"
         ))
 }
 
@@ -140,7 +142,7 @@ pub(crate) fn ready_frame(
         "model":model,
         "tools":tools,
         "image_input":image_input,
-        "features":{"type_context":true},
+        "features":{"type_context":true,"prepare_local_model":true},
         "methods":methods,
         "capabilities":capabilities,
         "limits":{
@@ -720,6 +722,11 @@ impl Ui for RpcUi {
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
     }
+    fn received_message(&mut self, notice: &str, from: &str, text: &str) {
+        self.out.emit(json!({
+            "event":"notice", "message":notice, "received_message":{"from":from, "text":text}
+        }));
+    }
     /// Same `notice` event clients already read, plus the typed kind and lane for richer clients.
     fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.out.emit(typed_notice(event));
@@ -1167,12 +1174,16 @@ impl Admin {
                     })?,
                 };
                 // Reserve the scan under the config lock, but perform provider I/O outside it.
-                let cfg = config.clone();
+                let mut cfg = config.clone();
                 let ticket = refresh.then(|| self.scan.begin());
                 let previous = self.scan.snapshot();
                 drop(config);
+                if purpose.is_none() && provider.is_none_or(|p| p == "mlx") {
+                    cfg.local_model_engines = self.saved_config()?.local_model_engines;
+                }
                 let (checked, discovered) = if let Some(ticket) = ticket {
-                    let (checked, rows) = models::refresh_and_check(&layout, &cfg, purpose);
+                    let (checked, rows) =
+                        models::refresh_and_check(&layout, &cfg, purpose, provider);
                     (Some(checked), Some(self.scan.publish(ticket, rows)?))
                 } else {
                     (None, previous)
@@ -1469,6 +1480,7 @@ fn run_control(
     let worker_disconnected = input_disconnected.clone();
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let live: Arc<Mutex<LiveState>> = Arc::new(Mutex::new(LiveState::default()));
+    let peers = Arc::new(peers::PeerControl::default());
     let sides = Arc::new(side_control::SideControl::default());
     let worker_live = live.clone();
     let voice_env = crate::voice::VoiceEnv::from_config(&config);
@@ -1516,6 +1528,7 @@ fn run_control(
         scan: admin.scan.clone(),
         admin_layout,
         worker_fs,
+        peers: peers.clone(),
         sides: sides.clone(),
     };
     let worker = thread::spawn(move || actor.run());
@@ -1685,6 +1698,12 @@ fn run_control(
                 }
                 "collaboration_invite" if !acp => {
                     out.result(&id, collaboration::hosting::invite(&request["params"]));
+                }
+                "list_peers" if !acp => {
+                    out.result(&id, peers.list(&request["params"]));
+                }
+                "send_peer_message" if !acp => {
+                    out.result(&id, peers.send(&request["params"]));
                 }
                 "side_thread" if !acp => {
                     out.result(&id, sides.handle(&request["params"]));
@@ -2228,7 +2247,12 @@ fn run_control(
                     if matches!(method.as_str(), "list_jobs" | "stop_job") {
                         out.result(
                             &id,
-                            jobs::handle(background.as_ref(), &method, &request["params"]),
+                            jobs::handle(
+                                background.as_ref(),
+                                &method,
+                                &request["params"],
+                                &admin.layout(),
+                            ),
                         );
                         continue;
                     }
@@ -2325,6 +2349,21 @@ fn run_control(
                         prompt_queued.store(false, Ordering::SeqCst);
                         busy.store(false, Ordering::SeqCst);
                         break;
+                    }
+                    if !acp
+                        && matches!(
+                            request["method"].as_str(),
+                            Some(
+                                "new_session"
+                                    | "resume"
+                                    | "fork_session"
+                                    | "move_session"
+                                    | "set_mode"
+                                    | "apply_settings"
+                            )
+                        )
+                    {
+                        peers.suspend();
                     }
                     if commands.send(request).is_err() {
                         prompt_queued.store(false, Ordering::SeqCst);

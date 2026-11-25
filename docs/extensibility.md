@@ -407,11 +407,10 @@ the first page from the official MCP registry, Smithery, npm and GitHub in the b
 concurrently), even with no query. `/` filters loaded rows while typing; Enter searches every remote
 catalog. The list scrolls
 endlessly: moving the cursor within five rows of the end loads the next catalog page, and `n` still
-loads it on demand. A failed page stops automatic paging until `r` refreshes. Servers that other
-coding agents already configure (`.mcp.json`, `~/.claude.json`, `~/.codex/config.toml`, Cursor,
-Gemini and Windsurf files) appear as `found` rows; `i` copies one into Dial's config after a
-confirmation and a health check. Dial reads those files only to list them and never starts them on
-its own. Remote MCP results for the submitted query retain the provider's relevance matching instead
+loads it on demand. To find local servers configured by other apps, press `f` in the MCP tab.
+Review the project and home settings paths, then confirm to scan them once. Opening or refreshing
+the browser does not scan those files. `i` on a `found` row separately confirms a re-read and
+import into Dial. Remote MCP results for the submitted query retain the provider's relevance matching instead
 of being hidden by an additional literal-text filter; rows whose name equals the query come first,
 then rows whose name contains it, each group in listing order. The official registry requests latest versions
 and follows its cursors; browsing is not limited to ten pages. Its search matches listing names

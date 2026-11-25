@@ -1,6 +1,6 @@
 # Synthetic interpretation evaluation inputs
 
-`../interpretation.toml` is a version-1 Dial benchmark suite with nine independent
+`../interpretation.toml` is a version-1 Dial benchmark suite with independent
 cases. Each case requests `answer.json` and grades its **values, JSON types, and
 coverage**, not tool counts, phrasing, or a particular implementation. Object key
 order and whitespace do not matter; list order is specified where meaningful.
@@ -17,6 +17,7 @@ public fixtures in advance: this is a regression set, **not a held-out benchmark
 | Time units | Milliseconds, seconds, minutes and hours reverse raw-value rankings | Normalize units before comparing or totaling |
 | Money | Decimal fractions plus a value beyond binary64 integer precision | Exact USD total `9007199254740993.30` |
 | Contradictory quotes | Same-date unratified drafts; no authority order | Preserve both quotes, leave approval unresolved |
+| Ranked quotes | Same two drafts, but the register names the deciding source | Preserve both quotes and resolve approval using that source |
 | Nested JSON / JSONL | Nested batches/orders/lines; one null duration | Include nested records; missing is not observed zero |
 | Formula cache | Real small XLSX ZIP, `A1+A2`, cached 999, inputs 1 and 2, manual calculation | Independent arithmetic 3 does not verify the stored cache |
 | Audio ambiguity | Explicit synthetic transcription double, ambiguous weekday and interval | Preserve alternatives; do not claim live transcription |

@@ -796,6 +796,17 @@ fn launch(
     } else {
         None
     };
+    use llm::local_runtime::{GgufLoader, LocalEngine};
+    if gguf.is_none()
+        && runtime.engine != LocalEngine::Auto
+        && !format
+            .is_some_and(|f| LocalEngine::choices(f, Default::default()).contains(&runtime.engine))
+    {
+        return Err(Failure::Fatal(anyhow!(
+            "The selected {:?} engine is not a known loader for this model on this platform. Review the engine choice before loading it.",
+            runtime.engine
+        )));
+    }
     if embedding && gguf.is_some() {
         return Err(Failure::Fatal(anyhow!(
             "{model} is a GGUF file; local image embeddings need an MLX embedding checkpoint, or set an OpenAI-compatible embedding endpoint"
@@ -811,21 +822,29 @@ fn launch(
     let mut command = if let Some(file) = &gguf {
         if steering.is_some() {
             return Err(Failure::Fatal(anyhow!(
-                "activation steering needs an MLX checkpoint; GGUF models run on llama.cpp without it"
+                "activation steering needs an MLX checkpoint; GGUF models run without it"
             )));
         }
-        let program = llm::local_format::llama_server().ok_or_else(|| {
-            Failure::Fatal(anyhow!(
-                "GGUF models need llama.cpp's `llama-server`: run `/setup llama-cpp` to install it, or set DIAL_LLAMA_SERVER to an existing install"
-            ))
-        })?;
+        let loader = GgufLoader::resolve(file, runtime.engine).map_err(Failure::Fatal)?;
+        let atomic = loader == GgufLoader::Atomic;
+        let program = loader.program().map_err(Failure::Fatal)?;
         let requested = requested_context(context);
-        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
-            .map_err(Failure::Fatal)?;
+        let dspark = atomic
+            .then(|| llm::local_format::inkling_dspark(file))
+            .flatten()
+            .filter(|_| runtime.is_default() && adapter.is_none());
+        let context_tokens = if dspark.is_some() {
+            Some(requested.unwrap_or(4096).min(4096))
+        } else {
+            llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
+                .map_err(Failure::Fatal)?
+        };
         let projector = llm::local_format::gguf_projector(file);
-        let shared_pool = shared_pool(context_tokens, shared_slots_supported(&program), |pool| {
-            llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits)
-        });
+        let shared_pool = shared_pool(
+            context_tokens,
+            !atomic && shared_slots_supported(&program),
+            |pool| llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits),
+        );
         let launch = LlamaLaunch {
             model: file,
             projector: projector.as_deref(),
@@ -836,6 +855,67 @@ fn launch(
         };
         let mut command = Command::new(program);
         command.args(launch.args(runtime).map_err(Failure::Fatal)?);
+        if atomic {
+            command.args(["--alias", SERVER_MODEL]);
+            if let Some(draft) = dspark {
+                let depth = if file
+                    .file_name()
+                    .is_some_and(|n| n == "Inkling-2-Mini-AD-IQ2_M.gguf")
+                {
+                    "7"
+                } else {
+                    "3"
+                };
+                let budget = if llm::local_fit::physical_memory_bytes()
+                    .is_some_and(|bytes| bytes >= 24 << 30)
+                {
+                    "14436"
+                } else {
+                    "8292"
+                };
+                command.arg("-md").arg(draft).args([
+                    "--spec-type",
+                    "draft-dspark",
+                    "--spec-draft-n-max",
+                    depth,
+                    "--spec-draft-n-ubatch",
+                    "32",
+                    "--engine-budget-mib",
+                    budget,
+                    "-fit",
+                    "off",
+                    "-b",
+                    "1024",
+                    "-ub",
+                    "1024",
+                    "-fa",
+                    "on",
+                    "-ctk",
+                    "q4_0",
+                    "-ctv",
+                    "q4_0",
+                    "-ctkd",
+                    "q4_0",
+                    "-ctvd",
+                    "q4_0",
+                    "-ngl",
+                    "all",
+                    "-ngld",
+                    "99",
+                    "-t",
+                    "8",
+                    "-tb",
+                    "8",
+                    "--temp",
+                    "0",
+                    "--cache-ram",
+                    "0",
+                    "--ctx-checkpoints",
+                    "0",
+                    "--no-warmup",
+                ]);
+            }
+        }
         command
     } else {
         let mut command = Command::new(python);
@@ -906,7 +986,12 @@ fn launch(
             .stdout(Stdio::null())
             .stderr(Stdio::piped()),
     )
-    .context("starting local model server")
+    .with_context(|| {
+        format!(
+            "starting local model server {}",
+            Path::new(command.get_program()).display()
+        )
+    })
     .map_err(Failure::Fatal)?;
     let stderr = child.stderr.take();
     let mut process = Supervised {

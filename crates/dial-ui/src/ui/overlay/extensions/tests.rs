@@ -29,6 +29,35 @@ fn pending_confirmation_footer_describes_confirmation_not_browsing() {
     }
 }
 
+#[test]
+fn discovery_names_files_before_confirming_and_escape_does_not_dispatch() {
+    use crate::ui::overlay::settings::testkit::{Rig, key, render, screen, status_preview};
+    use crossterm::event::KeyCode;
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let mut overlay = ExtensionsOverlay::new();
+    for decision in [KeyCode::Esc, KeyCode::Enter] {
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Char('f')), &rig.keys),
+            OverlayEvent::None
+        ));
+        let shown = screen(&render(80, 24, |frame| overlay.draw(frame, &ctx)));
+        for path in dial_tools::tools::integrations::mcp::foreign::source_labels() {
+            assert!(shown.contains(&path), "{shown}");
+        }
+        let result = overlay.handle(&key(decision), &rig.keys);
+        assert_eq!(
+            matches!(result, OverlayEvent::Action(_)),
+            decision == KeyCode::Enter
+        );
+    }
+}
+
 fn row(id: &str, origin: Origin, state: State) -> Row {
     Row {
         id: id.into(),

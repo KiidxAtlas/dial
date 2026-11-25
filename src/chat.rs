@@ -165,6 +165,61 @@ pub(crate) fn chat(
     }
 }
 
+/// Plain stdin deliberately bypasses composer history, agent hooks and the session lifecycle.
+pub(crate) fn private(layout: &Layout, config: &Config) -> Result<()> {
+    use dial::agent::modes::btw::SideRequest;
+    config.require_model()?;
+    let tty = std::io::stdin().is_terminal();
+    eprintln!(
+        "Private chat: no Dial transcript, memory, tools or usage stats. Your selected provider receives the conversation and may retain it."
+    );
+    if tty {
+        eprintln!("One message per line; /exit to end.");
+    }
+    let _lease = config
+        .requires_compute_lock()
+        .then(|| dial::learn::auto::compute_lock(layout))
+        .transpose()?;
+    let _owner = _lease
+        .as_ref()
+        .map(|_| {
+            dial::learn::compute::owner_record(
+                &layout.user_dir,
+                "session",
+                &layout.project_root,
+                &config.state_dir,
+                &config.model,
+            )
+        })
+        .transpose()?;
+    let mut prior = Vec::new();
+    loop {
+        let mut input = String::new();
+        if tty {
+            if std::io::stdin().read_line(&mut input)? == 0 || input.trim() == "/exit" {
+                break;
+            }
+            if input.trim().is_empty() {
+                continue;
+            }
+        } else {
+            std::io::stdin().read_to_string(&mut input)?;
+        }
+        let request = SideRequest::private(config, &prior, &input)?;
+        let answer = request.run(Default::default(), &mut |_| {})?;
+        if std::io::stdout().is_terminal() {
+            println!("{}", dial::ui::text::sanitize(&answer));
+        } else {
+            println!("{answer}");
+        }
+        if !tty {
+            break;
+        }
+        prior.push((input, answer));
+    }
+    Ok(())
+}
+
 fn longest_backtick_run(text: &str) -> usize {
     let (mut longest, mut current) = (0, 0);
     for byte in text.bytes() {

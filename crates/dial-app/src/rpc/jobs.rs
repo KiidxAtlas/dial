@@ -12,6 +12,7 @@ pub(super) fn handle(
     background: Option<&Arc<dyn Tool>>,
     method: &str,
     params: &Value,
+    layout: &crate::config::paths::Layout,
 ) -> Result<Value> {
     let background = background.ok_or_else(|| {
         coded(
@@ -20,7 +21,20 @@ pub(super) fn handle(
         )
     })?;
     match method {
-        "list_jobs" => Ok(list(background.as_ref())),
+        "list_jobs" => {
+            let mut result = list(background.as_ref());
+            // Separate arrays keep older name-only stop controls scoped to session jobs.
+            if params["include_persistent"] == true {
+                match crate::tools::exec::background::durable::discover(
+                    &layout.user_dir,
+                    &layout.project_root,
+                ) {
+                    Ok(rows) => result["persistent_jobs"] = json!(rows),
+                    Err(error) => result["persistent_error"] = json!(error.to_string()),
+                }
+            }
+            Ok(result)
+        }
         "stop_job" => {
             let name = params["name"]
                 .as_str()

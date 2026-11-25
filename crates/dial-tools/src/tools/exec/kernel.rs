@@ -570,27 +570,7 @@ impl Launch {
     fn bundled(ws: &Workspace) -> Result<Self, String> {
         // No unconfined shim/version preflight: the launcher identity comes from the verified
         // build artifact. Its stdlib tree must be outside all editable and protected roots.
-        let parent = std::env::temp_dir()
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        let policy = ws.sandbox_policy();
-        let (super::sandbox::Policy::Strict {
-            extra_write,
-            deny_read,
-            ..
-        }
-        | super::sandbox::Policy::Dev {
-            extra_write,
-            deny_read,
-            ..
-        }) = &policy;
-        for path in std::iter::once(ws.root())
-            .chain(extra_write.iter().chain(deny_read).map(PathBuf::as_path))
-        {
-            if parent.starts_with(super::sandbox::resolve(path)?) {
-                return Err("bundled Python requires a host temp directory outside editable or protected paths".into());
-            }
-        }
+        let parent = bundled_python_parent(ws)?;
         let runtime = bundled_python::provision_in(&parent).map_err(|e| format!("{e:#}"))?;
         Ok(Self {
             python: runtime.executable().to_owned(),
@@ -599,6 +579,36 @@ impl Launch {
             bundle: Some(runtime),
         })
     }
+}
+
+/// The host temp directory bundled CPython is extracted under, refused when it lies inside the
+/// workspace or any editable or protected path of its sandbox policy.
+pub(super) fn bundled_python_parent(ws: &Workspace) -> Result<PathBuf, String> {
+    let parent = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let policy = ws.sandbox_policy();
+    let (super::sandbox::Policy::Strict {
+        extra_write,
+        deny_read,
+        ..
+    }
+    | super::sandbox::Policy::Dev {
+        extra_write,
+        deny_read,
+        ..
+    }) = &policy;
+    for path in
+        std::iter::once(ws.root()).chain(extra_write.iter().chain(deny_read).map(PathBuf::as_path))
+    {
+        if parent.starts_with(super::sandbox::resolve(path)?) {
+            return Err(
+                "bundled Python requires a host temp directory outside editable or protected paths"
+                    .into(),
+            );
+        }
+    }
+    Ok(parent)
 }
 
 /// Resolves the base interpreter a project environment runs on. Only a virtualenv contributes a

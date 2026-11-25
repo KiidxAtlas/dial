@@ -8,9 +8,7 @@ fn on_fallback_until(until: Instant) -> ActiveRoute {
             primary_cap: Some(8192),
             served: false,
         }),
-        promoted: None,
-        generation: 0,
-        receipt: None,
+        ..ActiveRoute::default()
     }
 }
 
@@ -35,9 +33,11 @@ fn primary_route_never_restores_and_reset_forgets_the_episode() {
     assert!(!route.restore_due_at(now));
     route = on_fallback_until(now);
     assert!(route.restore_due_at(now));
+    route.last_request = Some(json!({"provider":"endpoint", "model":"test", "succeeded":true}));
     route.reset();
     assert!(!route.on_fallback());
     assert_eq!(route.tried, 0);
+    assert!(route.last_request.is_none());
 }
 
 // ---- context promotion ----

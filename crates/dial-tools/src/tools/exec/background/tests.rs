@@ -37,6 +37,50 @@ fn tool() -> Background {
 }
 
 #[test]
+fn work_keys_match_the_same_script_however_it_is_launched() {
+    use super::table::work_key;
+    let key = |c: &str| work_key(c).unwrap();
+    assert_eq!(key("python3 /tmp/t2.py"), "script:/tmp/t2.py");
+    assert_eq!(
+        key("nohup python3 /tmp/t2.py > /tmp/t2.log 2>&1"),
+        key("python3 /tmp/t2.py 2>&1 | tr '\\r' '\\n' | grep -v Progress")
+    );
+    assert_eq!(key("python ./train.py --lr 0.1"), key("python train.py"));
+    assert_ne!(key("python3 a.py"), key("python3 b.py"));
+    assert_eq!(key("sleep   30"), "cmd:sleep 30");
+    assert_ne!(key("sleep 30"), key("sleep 31"));
+    assert!(work_key("   ").is_none());
+}
+
+#[test]
+fn starting_work_a_running_job_already_does_is_flagged() {
+    let (_dir, ws) = open_workspace();
+    fs::write(ws.root().join("job.sh"), "sleep 30\n").unwrap();
+    let tool = tool();
+    let first = start(&tool, &ws, "one", "sh job.sh");
+    assert!(!first.text.contains("Already running"), "{}", first.text);
+    let second = start(&tool, &ws, "two", "nohup sh ./job.sh > job.log 2>&1");
+    assert!(
+        second
+            .text
+            .contains("Already running the same work: one (sh job.sh)"),
+        "{}",
+        second.text
+    );
+    let other = start(&tool, &ws, "three", "sleep 31");
+    assert!(!other.text.contains("Already running"), "{}", other.text);
+    assert!(!bg(&tool, &ws, json!({"action":"kill","name":"one"})).is_error);
+    let after = start(&tool, &ws, "four", "sh job.sh");
+    assert!(
+        after.text.contains("Already running the same work: two"),
+        "{}",
+        after.text
+    );
+    assert!(!after.text.contains("one ("), "{}", after.text);
+    // Dropping the tool stops the remaining jobs.
+}
+
+#[test]
 fn default_wait_returns_control_while_the_job_keeps_running() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
@@ -478,7 +522,7 @@ fn wait_after_output_returns_only_unread_output() {
 fn wait_reports_timeout_and_early_exit_as_not_ready() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "idle", "sleep 30");
+    start(&tool, &ws, "idle", "echo waiting-for-input >&2; sleep 30");
     let timed = bg(
         &tool,
         &ws,
@@ -489,6 +533,11 @@ fn wait_reports_timeout_and_early_exit_as_not_ready() {
         "{}",
         timed.text
     );
+    assert!(timed.text.contains("waiting-for-input\n"), "{}", timed.text);
+    assert!(!timed.execution.observation.as_ref().unwrap().satisfied);
+    assert_eq!(timed.process_outcome().unwrap().exit_code, None);
+    let after = bg(&tool, &ws, json!({"action":"output", "name":"idle"}));
+    assert!(after.text.contains("(no new output)"), "{}", after.text);
     // A short bounded wait gives no hint; only a wait that used the whole cap points at timeout 0.
     assert!(!timed.text.contains("timeout: 0"), "{}", timed.text);
     assert_eq!(

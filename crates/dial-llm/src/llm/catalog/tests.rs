@@ -1524,20 +1524,37 @@ fn gguf_downloads_keep_the_local_route_but_are_named_by_their_format() {
     fs::write(mlx.join("model.safetensors"), "weights").unwrap();
     let studio_gguf = studio.path().join("lmstudio-community/Qwen-GGUF");
     fs::create_dir_all(&studio_gguf).unwrap();
-    fs::write(studio_gguf.join("model-Q4_K_M.gguf"), b"GGUF weights").unwrap();
+    use crate::llm::local_format::gguf_fixtures::{header, string};
+    use crate::llm::local_runtime::GgufEngines;
+    let weights = |arch| header(&[("general.architecture", string(arch))]);
+    fs::write(
+        studio_gguf.join("model-Q4_K_M.gguf"),
+        weights("inkling2_loop"),
+    )
+    .unwrap();
     let cache = tempfile::tempdir().unwrap();
     let repo = cache.path().join("models--org--Qwen-GGUF");
     let snapshot = repo.join("snapshots/abc123");
     fs::create_dir_all(&snapshot).unwrap();
     fs::create_dir_all(repo.join("refs")).unwrap();
     fs::write(repo.join("refs/main"), "abc123").unwrap();
-    fs::write(snapshot.join("model-Q4_K_M.gguf"), b"GGUF weights").unwrap();
+    fs::write(snapshot.join("model-Q4_K_M.gguf"), weights("qwen2")).unwrap();
+    fs::write(snapshot.join("config.json"), "{}").unwrap();
 
     let entries = [
         lmstudio_mlx_models(studio.path(), None).remove(0),
         lmstudio_gguf_models(studio.path()).remove(0),
         local_models(cache.path(), None).remove(0),
     ];
+    assert_eq!(entries[1].metadata.gguf_engines, GgufEngines::AtomicOnly);
+    assert_eq!(entries[2].metadata.gguf_engines, GgufEngines::Both);
+    assert!(entries[1].source.contains("Atomic Engine"));
+    assert!(!entries[1].source.contains("llama.cpp"));
+    assert_eq!(
+        entries[1].available,
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    );
+    assert!(entries[2].available);
     let shown: Vec<_> = entries
         .iter()
         .map(|e| {

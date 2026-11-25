@@ -132,7 +132,7 @@ const MAX_WAIT_SECS: u64 = 300;
 fn capped_wait_hint(name: &str, secs: u64, startup: bool, condition: bool) -> Option<String> {
     (!startup && secs >= MAX_WAIT_SECS).then(|| {
         format!(
-            "[hint] {name} outlasted the longest bounded wait. To keep waiting, call wait once with `timeout: 0`: it returns when {name} {} (a new user message or an interrupt still stops the wait), instead of repeating bounded waits.",
+            "[hint] {name} outlasted the longest bounded wait. To keep waiting, call wait once with `timeout: 0`: it returns when {name} {} (a new user message, an interrupt or the run's time limit still stops the wait), instead of repeating bounded waits.",
             if condition { "is ready or exits" } else { "exits" }
         )
     })
@@ -146,7 +146,7 @@ enum WaitFor {
     PtyStartup,
 }
 
-const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. Jobs end with the session; `wait` blocks until `until` matches or the job exits; output past 32 KiB stays in artifacts.";
+const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. A bounded wait returns live output on timeout; use output for new logs or kill to stop a job.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).
@@ -342,6 +342,7 @@ impl Background {
         if let Some(refusal) = crate::tools::exec::git_guard::guard(ws, command, &cwd) {
             return Ok(refusal);
         }
+        let duplicates = self.table().running_same_work(command);
         let (name, pid) = self.table().start(
             ws,
             opt_str(args, "name")?,
@@ -391,6 +392,9 @@ impl Background {
         } else {
             ToolOutput::ok(started)
         };
+        if let Some(note) = duplicate_note(&duplicates) {
+            output.text.push_str(&note);
+        }
         if let Some(data) = output.data.get_or_insert_with(|| json!({})).as_object_mut() {
             data.insert("job".into(), job);
         }
@@ -735,9 +739,20 @@ impl Background {
                     text.push('\n');
                     text.push_str(&hint);
                 }
+                // A pattern that can only appear in a redirected file never matches here.
+                if until.is_some()
+                    && let Some(note) =
+                        crate::tools::exec::shell::background_output_note(&snap.command)
+                {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
                 if lock(&snap.ring).tool_job {
                     return Ok(ToolOutput::ok(text).with_observation(ObservationKind::Wait, false));
                 }
+                let (body, lost, integrity) = take_presented(ws, &snap, None);
+                text.push('\n');
+                text.push_str(&render_body(&snap, body, lost, None));
                 return Ok(snap.with_launch(
                     ToolOutput::ok(text)
                         .with_observation(
@@ -748,7 +763,8 @@ impl Background {
                             },
                             false,
                         )
-                        .with_process(process_outcome(&snap)),
+                        .with_process(process_outcome(&snap))
+                        .with_output_integrity(integrity),
                 ));
             }
             let mut wake_at = deadline;
@@ -1516,6 +1532,21 @@ impl Tool for Background {
         table.running() != 0
     }
 
+    fn take_live_job_previews(&self) -> Vec<(String, String)> {
+        let mut table = self.table();
+        table.refresh();
+        table
+            .procs
+            .iter()
+            .filter(|p| p.is_running())
+            .filter_map(|p| {
+                lock(&p.ring)
+                    .take_preview()
+                    .map(|text| (p.name.clone(), text))
+            })
+            .collect()
+    }
+
     fn awaited_work(&self) -> Vec<String> {
         // A job that exited a moment ago queues its completion only once its reader closes. Let
         // it settle first, so a caller that sees no awaited work also finds the completion queued.
@@ -1535,9 +1566,25 @@ impl Tool for Background {
         table.awaited()
     }
 
+    fn requested_background_work(&self) -> Vec<String> {
+        let mut table = self.table();
+        table.refresh();
+        table.requested_background()
+    }
+
     fn session_work(&self) -> Vec<String> {
         let mut table = self.table();
         table.refresh();
         table.session_owned()
     }
+}
+
+/// Told when `bg start` begins work a running job is already doing.
+fn duplicate_note(running: &[String]) -> Option<String> {
+    (!running.is_empty()).then(|| {
+        format!(
+            "\nAlready running the same work: {}. Two copies compete for CPU and write the same outputs; `bg kill` one unless both are intended.",
+            running.join(", ")
+        )
+    })
 }

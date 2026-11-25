@@ -118,6 +118,7 @@ impl ExtensionsOverlay {
                     let snapshot = guard.clone();
                     guard.form = None;
                     guard.catalog = None;
+                    guard.discovered = None;
                     Some(snapshot)
                 }
                 Err(_) => None,
@@ -132,6 +133,13 @@ impl ExtensionsOverlay {
             if let Some(update) = snapshot.catalog {
                 catalog_job = true;
                 self.browser.apply_catalog(update);
+            }
+            if let Some(found) = snapshot.discovered {
+                catalog_job = true;
+                let mut rows = self.browser.rows(Tab::Mcp).to_vec();
+                rows.retain(|row| row.origin != Origin::Foreign);
+                rows.extend(found);
+                self.browser.set_rows(Tab::Mcp, rows);
             }
             match (snapshot.label, snapshot.result) {
                 (label, Some((ok, message))) => {
@@ -317,6 +325,10 @@ impl ExtensionsOverlay {
                 b.start_search();
                 OverlayEvent::None
             }
+            Some('f') if b.tab() == Tab::Mcp => {
+                b.request(Intent::DiscoverMcp);
+                OverlayEvent::None
+            }
             Some('a') if b.tab() == Tab::Mcp => OverlayEvent::Action("open:settings:mcp".into()),
             Some('d')
                 if b.tab() == Tab::Mcp
@@ -473,6 +485,11 @@ impl ExtensionsOverlay {
                     format!(" {}?", intent.describe()),
                     ctx.theme.fg(Tok::Warning),
                 )));
+                if matches!(intent, Intent::DiscoverMcp | Intent::ImportMcp { .. }) {
+                    for path in dial_tools::tools::integrations::mcp::foreign::source_labels() {
+                        lines.push(Line::from(format!("   {path}")));
+                    }
+                }
             } else {
                 lines.push(job_line(ctx.theme, &browser.job, &browser.message));
             }
@@ -579,6 +596,7 @@ impl ExtensionsOverlay {
                 let mut items = Vec::new();
                 if browser.tab() == Tab::Mcp {
                     items.push(("a".to_owned(), "add custom".to_owned()));
+                    items.push(("f".to_owned(), "find in other apps".to_owned()));
                     if browser
                         .selected()
                         .is_some_and(|row| row.origin == Origin::Installed)

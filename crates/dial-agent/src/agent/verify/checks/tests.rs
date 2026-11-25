@@ -70,6 +70,9 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "false | true; set -o pipefail",
         "set -o pipefail; false | true; echo done",
         "set -o pipefail; ! false | true",
+        "set -o pipefail; false | true; true",
+        "set -o pipefail; false | true || true",
+        "set -o pipefail; (false | true) && true",
     ] {
         assert!(exit_status_masked(command), "{command}");
     }
@@ -78,14 +81,171 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "# run a check\nset -euo pipefail\npytest -q 2>&1 |& tee log",
         "set -o pipefail && make test | tail -5 > summary",
         "make test || echo failed",
-        "python3 - <<'PY'\nflags = a | b\nPY\necho done",
+        "python3 - <<'PY'\nflags = a | b\nPY",
+        "cd /app && pytest -q > log 2>&1 && tail -5 log",
+        "cat notes.txt; pytest -q",
         "grep -E 'a|b' out.txt",
         "pytest -q # | tail",
         "echo yes >| out",
         "test \"$(cat out.csv | head -1)\" = value",
+        "set -o pipefail; cd /app && pytest -q | tail -20",
+        "set -o pipefail; chmod -R a+rX /tmp/t; su git -c 'git push' && [ \"$(curl -sk https://localhost:8443/index.html)\" = \"ok\" ] && ssh-keyscan -p 22 localhost 2>&1 | grep -q ssh-",
+        "set -o pipefail && cd /app && make test | tail -5 > summary",
+        "set -o pipefail; cmd1 | grep -q a && cmd2 | grep -q b",
     ] {
         assert!(!exit_status_masked(command), "{command}");
     }
+}
+
+#[test]
+fn a_trailing_display_command_masks_the_check_status() {
+    for command in [
+        "cd /app/pyknotid && python -m pytest tests -q >/tmp/o.txt 2>&1; echo exit=$?; tail -1 /tmp/o.txt",
+        "Rscript -e 'test()' > /tmp/out.txt 2>&1\necho exit=$?",
+        "python3 - <<'PY'\nflags = a | b\nPY\necho done",
+    ] {
+        assert!(exit_status_masked(command), "{command}");
+        assert!(masked_check_note(command).contains("ends with a display command"));
+    }
+}
+
+#[test]
+fn reference_tools_are_the_ones_the_request_calls_ground_truth() {
+    let dna = "Design primers.\n * The output of primer3's oligotm tool should be considered the ground truth for melting temperatures with the following flags: `-tp 1 -sc 1`\n * Output the minimum number of pairs.";
+    assert_eq!(reference_tools(dna), ["oligotm"]);
+    assert_eq!(
+        reference_tools("Treat `jq` as the source of truth for the output."),
+        ["jq"]
+    );
+    assert!(reference_tools("Use the oligotm tool to check primers.").is_empty());
+    assert!(reference_tools("Write a CLI tool in Rust.").is_empty());
+    assert!(names_word("cd /app; oligotm -tp 1 ACGT", "oligotm"));
+    assert!(!names_word("python3 my_oligotm_clone.py", "oligotm"));
+}
+
+#[test]
+fn requested_speed_is_how_the_request_asks_for_it() {
+    let query = "I implemented a sql query but it is not optimized. Please make the query as efficient as possible while ensuring that the same output is produced.";
+    assert_eq!(requested_speed(query).as_deref(), Some("optimized"));
+    assert_eq!(
+        requested_speed("Speed up the parser").as_deref(),
+        Some("speed up")
+    );
+    assert_eq!(
+        requested_speed("Make it faster than numpy").as_deref(),
+        Some("faster")
+    );
+    for plain in [
+        "Fix the failing test",
+        "Report the Python runtime version",
+        "Write the token count to answer.txt",
+    ] {
+        assert_eq!(requested_speed(plain), None, "{plain}");
+    }
+}
+
+#[test]
+fn requested_functions_are_names_the_request_asks_for() {
+    let ars = "The primary input should be a function (many of the \"d\" functions in R, such as \"dnorm\").\n- Include a primary function named \"ars\" that implements the sampler\n- Include a test function named \"test\" that performs formal testing\n- The \"ars\" function must validate inputs";
+    assert_eq!(requested_functions(ars), vec!["ars", "test"]);
+    assert_eq!(
+        requested_functions("Add a `parse_args()` function and a method called `run`."),
+        vec!["parse_args", "run"]
+    );
+    assert!(requested_functions("Write a function that sorts the list.").is_empty());
+    assert!(requested_functions("the \"d\" function family").is_empty());
+}
+
+#[test]
+fn display_only_and_test_excluding_checks_are_not_counted() {
+    let none = std::collections::BTreeSet::new();
+    for command in [
+        "cat /app/move.txt",
+        "cd /app && ls -la out/ && head -5 result.csv 2>&1",
+        "wc -l out.txt | cat",
+    ] {
+        assert!(
+            uncounted_pass_note(command, &none, "").is_some(),
+            "{command}"
+        );
+    }
+    for command in [
+        "cat out.txt | grep -q e2e4",
+        "test \"$(cat move.txt)\" = e2e4",
+        "python3 check.py",
+        "diff -u want.txt move.txt",
+    ] {
+        assert!(
+            uncounted_pass_note(command, &none, "").is_none(),
+            "{command}"
+        );
+    }
+    let failed = crate::agent::run::outcome_gradient::failing_tests(
+        "FAILED tests/test_spacecurve.py::test_reconstructed_space_curve - AssertionError\n",
+    );
+    for command in [
+        "cd /app/x && python -m pytest tests -q --deselect tests/test_spacecurve.py::test_reconstructed_space_curve",
+        "pytest -k 'not reconstructed_space_curve' tests",
+        "pytest --deselect=tests/test_spacecurve.py::test_reconstructed_space_curve",
+    ] {
+        let note = uncounted_pass_note(command, &failed, "").expect(command);
+        assert!(note.contains("reconstructed_space_curve"), "{note}");
+    }
+    let full = "python -m pytest tests -q --deselect tests/test_spacecurve.py::test_reconstructed_space_curve";
+    // Excluding a test that never failed, or one the request says to skip, is fine.
+    assert!(uncounted_pass_note(full, &none, "").is_none());
+    assert!(uncounted_pass_note(full, &failed, "skip test_reconstructed_space_curve").is_none());
+    assert!(uncounted_pass_note("python -m pytest tests -q", &failed, "").is_none());
+}
+
+#[test]
+fn self_confirming_values_are_expected_numbers_only_this_run_printed() {
+    let printed: std::collections::BTreeSet<String> =
+        super::distinctive_numbers("frame 55 dx 0.873 area 1203\nlanded 61 (t2.py v1_2)")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+    assert!(
+        !printed.contains("2") && !printed.contains("1_2"),
+        "{printed:?}"
+    );
+    let check = "python3 jump.py v.mp4 && grep -Eq '^takeoff = 55$' out.toml && grep -q 'land = 61' out.toml 2>&1";
+    assert_eq!(
+        self_confirming_values(check, &printed, "Find takeoff and landing frames."),
+        Some(vec!["55".to_owned(), "61".to_owned()])
+    );
+    // A value the request states is an independent expectation.
+    assert_eq!(
+        self_confirming_values(check, &printed, "The example lands at frame 61."),
+        None
+    );
+    // One expected value the run never printed is not a snapshot of its output.
+    let mixed = "python3 -c 'assert f(3)==55 and g()==0.874'";
+    assert_eq!(self_confirming_values(mixed, &printed, ""), None);
+    assert_eq!(
+        self_confirming_values("test $(wc -l < out) -eq 1203", &printed, ""),
+        Some(vec!["1203".to_owned()])
+    );
+    // Options, ports and paths are inputs, not expectations.
+    for check in [
+        "python3 train.py --epochs=55 && pytest -q",
+        "curl -sf localhost:1203/health",
+        "cargo test",
+    ] {
+        assert_eq!(self_confirming_values(check, &printed, ""), None, "{check}");
+    }
+}
+
+#[test]
+fn masked_check_note_names_the_accepted_pipefail_shape() {
+    let misplaced = "cd /app && set -o pipefail; python3 run.py | grep -c ok";
+    assert!(exit_status_masked(misplaced));
+    let note = masked_check_note(misplaced);
+    assert!(note.contains("very first statement"), "{note}");
+    assert!(note.contains("`cwd` argument"), "{note}");
+    let plain = masked_check_note("python3 run.py | tail -5");
+    assert!(plain.contains("Rerun without the pipe"), "{plain}");
+    assert!(!plain.contains("very first statement"), "{plain}");
 }
 
 #[test]
@@ -200,6 +360,20 @@ fn unrelated_eval_receipt_cannot_clear_a_validation_launch_gap() {
             "checks":[{"runtime":"python","name":"file contents","passed":passed,"source":{"path":path,"sha256":digest}}]
         })).with_observation(crate::runtime::execution::ObservationKind::Wait, true));
     };
+    agent.step_checks.eval_checks.observe(
+        &json!({"code":"..."}),
+        &ToolOutput::structured(json!({
+            "checks":[{"runtime":"python","name":"examples pass","passed":true}]
+        }))
+        .with_observation(crate::runtime::execution::ObservationKind::Wait, true),
+    );
+    let note = agent
+        .unbound_eval_check_note()
+        .expect("a passing two-argument check does not bind the edited file");
+    assert!(
+        note.contains("out.csv") && note.contains("dial.read"),
+        "{note}"
+    );
     observe(&mut agent, "reference.txt", true);
     assert!(
         agent.artifact_check_reminder().is_some(),
@@ -207,6 +381,7 @@ fn unrelated_eval_receipt_cannot_clear_a_validation_launch_gap() {
     );
     observe(&mut agent, "out.csv", true);
     assert!(agent.artifact_check_reminder().is_none());
+    assert!(agent.unbound_eval_check_note().is_none());
     std::fs::write(&output, "x,y").unwrap();
     assert!(
         agent.artifact_check_reminder().is_some(),
@@ -2085,4 +2260,75 @@ fn classify_check_source_distinguishes_explicit_receipts_from_heuristic_shell_co
     assert!(!h.is_explicit_receipt());
 
     assert!(classify_check_source(&plain, &configured).is_none());
+}
+
+#[test]
+fn a_deliverable_that_failed_to_parse_blocks_completion_until_that_consumer_passes() {
+    use crate::agent::verify::failed_runs::Run;
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    std::fs::write(
+        root.path().join("main.py.c"),
+        "#if 0\nprint(1)\n#endif\nint main(){}\n",
+    )
+    .unwrap();
+    let changed = vec!["main.py.c".to_owned()];
+    let traceback = "  File \"main.py.c\", line 4\nSyntaxError: invalid syntax\n";
+    let run = |failed, output| Run {
+        tool: "eval",
+        source: "exec(open('main.py.c').read())",
+        language: Some("py"),
+        failed,
+        output,
+    };
+    agent
+        .step_checks
+        .failed_runs
+        .observe(root.path(), &changed, &run(true, traceback));
+    let refusal = agent.completion_blockers().unwrap_err();
+    assert!(
+        refusal.contains("main.py.c") && refusal.contains("SyntaxError"),
+        "{refusal}"
+    );
+    agent
+        .step_checks
+        .failed_runs
+        .observe(root.path(), &changed, &run(false, "1\n"));
+    assert!(agent.completion_blockers().is_ok());
+}
+
+#[test]
+fn unattended_eval_evidence_must_be_bound_to_a_file_this_turn_changed() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.modes.launch.unattended = true;
+    agent.step_checks.mutations = 1;
+    let state = tempfile::tempdir().unwrap();
+    let checkpoints = Arc::new(
+        Checkpoints::new(state.path().join("session"), agent.workspace.root().into()).unwrap(),
+    );
+    agent.step_checks.turn = Some(checkpoints.begin_turn("unattended").unwrap());
+    let output = agent.workspace.root().join("solve.py");
+    checkpoints.before_write(&output).unwrap();
+    std::fs::write(&output, "print(1)\n").unwrap();
+    agent.checkpoints = Some(checkpoints);
+    std::fs::write(root.path().join("input.txt"), "data").unwrap();
+    let observe = |agent: &mut Agent<'_>, path: &str| {
+        let digest = crate::tools::exec::eval::check_source_digest(&agent.workspace, path).unwrap();
+        agent.step_checks.eval_checks.observe(&json!({"code":"..."}), &ToolOutput::structured(json!({
+            "checks":[{"runtime":"python","name":"bound","passed":true,"source":{"path":path,"sha256":digest}}]
+        })).with_observation(crate::runtime::execution::ObservationKind::Wait, true));
+    };
+    assert!(agent.unattended_verification_gap().is_some());
+    observe(&mut agent, "input.txt");
+    assert!(
+        agent.unattended_verification_gap().is_some(),
+        "a passing assertion about an unchanged input is not evidence for the delivered file"
+    );
+    observe(&mut agent, "solve.py");
+    assert!(agent.unattended_verification_gap().is_none());
 }

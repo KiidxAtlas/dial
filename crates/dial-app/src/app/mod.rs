@@ -62,6 +62,7 @@ mod resources;
 mod restore;
 mod selection;
 mod shell;
+pub(crate) use shell::turn_report::outcome as recorded_turn_outcome;
 mod side;
 
 pub struct Options {

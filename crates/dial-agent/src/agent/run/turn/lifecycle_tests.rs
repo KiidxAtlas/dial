@@ -265,6 +265,10 @@ environment=[]
                 .unwrap();
             let state = agent.session.control_state();
             let summary = &state["turn_summary"];
+            let attempts = &summary["main_request_receipt"]["attempts"];
+            assert!(attempts["local_or_lan"].as_u64().unwrap() >= 2);
+            assert_eq!(attempts["remote"], 0);
+            assert!(attempts["tool_results"].as_u64().unwrap() > 0);
             assert_eq!(summary["checks_current"], false, "{summary}");
             let checks = summary["recorded_checks"].as_array().unwrap();
             assert!(

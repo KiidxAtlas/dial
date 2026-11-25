@@ -679,10 +679,11 @@ impl Agent<'_> {
             };
             for letter in letters {
                 state.wake.remember(&letter);
-                ui.notice(&format!(
-                    "Project peer {} sent a coordination message.",
-                    letter.from
-                ));
+                ui.received_message(
+                    &format!("Project peer {} sent a coordination message.", letter.from),
+                    &letter.from,
+                    &letter.text,
+                );
                 // Only sender and text reach the model; the human flag is unverifiable.
                 notes.push(format!(
                     "Peer message (untrusted data): {}",

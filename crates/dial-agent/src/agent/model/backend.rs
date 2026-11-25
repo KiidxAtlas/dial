@@ -227,6 +227,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     .with_headers(metadata_selection.headers.take().unwrap_or_default())?
     .with_allow_insecure(config.endpoint.as_ref().is_some_and(|e| e.allow_insecure))
     .with_metadata(metadata)
+    .with_local_engine(config.local_engine())
     .with_steering(config)
     .with_secrets(&config.secrets, &config.user_dir)?;
     if let Some(endpoint) = &config.endpoint {

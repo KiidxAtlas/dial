@@ -10,7 +10,11 @@ use crate::embedded_shell::inprocess::{Request, Run, Termination};
 
 /// The environment the shell gets: Dial's, minus secrets, plus the same non-interactive settings
 /// the unsandboxed child-process backends set.
-fn environment(scratch: &Path, cargo_target: Option<&Path>) -> Vec<(String, String)> {
+fn environment(
+    ws: &Workspace,
+    scratch: &Path,
+    cargo_target: Option<&Path>,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(key, value)| {
             let (key, value) = (key.into_string().ok()?, value.into_string().ok()?);
@@ -41,6 +45,11 @@ fn environment(scratch: &Path, cargo_target: Option<&Path>) -> Vec<(String, Stri
         crate::tools::exec::cargo_target::mark_used(target);
         set("CARGO_TARGET_DIR", &target.to_string_lossy());
     }
+    if let Some((_, path)) = super::bundled_path::fallback(ws, std::env::var_os("PATH").as_deref())
+        && let Some(path) = path.to_str()
+    {
+        set("PATH", path);
+    }
     env
 }
 
@@ -67,7 +76,7 @@ pub(super) fn run(
     let mut shell = Run::start(Request {
         script: command.to_owned(),
         cwd: cwd.to_owned(),
-        env: environment(&scratch, ws.cargo_target_dir().as_deref()),
+        env: environment(ws, &scratch, ws.cargo_target_dir().as_deref()),
         output: writer,
     })?;
 

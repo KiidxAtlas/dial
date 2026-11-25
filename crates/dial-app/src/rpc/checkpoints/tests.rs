@@ -88,6 +88,57 @@ fn restore_needs_fresh_tokens_and_confirmed_overlap() {
 }
 
 #[test]
+fn conversation_review_restores_only_unchanged_file_after_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let open = || Arc::new(Checkpoints::new(state.path().into(), root.path().into()).unwrap());
+    let cp = open();
+    let turn = cp.begin_conversation_turn("pair", "s").unwrap();
+    for name in ["a", "b"] {
+        let path = root.path().join(name);
+        std::fs::write(&path, "my uncommitted work").unwrap();
+        cp.before_write(&path).unwrap();
+        std::fs::write(&path, "turn edit").unwrap();
+        cp.settle_changes();
+    }
+    cp.seal_review(turn).unwrap();
+    drop(cp);
+    let cp = open();
+    let review = |path| {
+        diff(
+            Some(&cp),
+            &json!({"turn":turn,"session_id":"s","path":path}),
+        )
+        .unwrap()
+    };
+    let restore_one = |path, token: &Value| {
+        restore(
+            Some(&cp),
+            &json!({"session_id":"s","turn":turn,"files":[{"path":path,"token":token}]}),
+        )
+    };
+    let b = review("b");
+    assert_eq!(b["safe_restore"], true);
+    std::fs::write(root.path().join("b"), "later user edit").unwrap();
+    assert_eq!(review("b")["safe_restore"], false);
+    assert_eq!(
+        code(restore_one("b", &b["token"]).unwrap_err()),
+        ErrorCode::Conflict
+    );
+    let a = review("a");
+    assert_eq!(a["safe_restore"], true);
+    restore_one("a", &a["token"]).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a")).unwrap(),
+        "my uncommitted work"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("b")).unwrap(),
+        "later user edit"
+    );
+}
+
+#[test]
 fn refusals_carry_codes() {
     let (_root, _state, cp, turn) = journal_with_turn();
     assert_eq!(

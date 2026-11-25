@@ -8,7 +8,7 @@ fn snapshot_offers_uninstalled_curated_servers_only() {
         ..Default::default()
     };
     config.mcp.insert("time".into(), McpServerConfig::default());
-    let rows = mcp_rows(&config, None);
+    let rows = mcp_rows(&config);
     assert!(
         rows.iter()
             .any(|r| r.id == "time" && r.origin == Origin::Installed)
@@ -37,7 +37,12 @@ fn servers_from_other_tools_are_offered_until_configured() {
         project_root: home.path().join("project"),
         ..Default::default()
     };
-    let rows = mcp_rows(&config, Some(home.path()));
+    assert!(
+        mcp_rows(&config)
+            .iter()
+            .all(|r| r.origin != Origin::Foreign)
+    );
+    let rows = discovered_mcp_rows(&config, Some(home.path()));
     let row = rows
         .iter()
         .find(|r| r.id == "codegraph")
@@ -47,7 +52,7 @@ fn servers_from_other_tools_are_offered_until_configured() {
     config
         .mcp
         .insert("codegraph".into(), McpServerConfig::default());
-    let rows = mcp_rows(&config, Some(home.path()));
+    let rows = discovered_mcp_rows(&config, Some(home.path()));
     assert!(
         rows.iter()
             .filter(|r| r.id == "codegraph")
@@ -254,7 +259,7 @@ fn smithery_platform_key_is_separate_from_unknown_server_credentials() {
 #[test]
 fn initial_and_searched_curated_rows_share_credential_labels() {
     let config = Config::default();
-    let rows = mcp_rows(&config, None);
+    let rows = mcp_rows(&config);
     for item in CURATED {
         let initial = rows.iter().find(|row| row.id == item.id).unwrap();
         let searched = candidate_row(&catalog::curated_candidate(

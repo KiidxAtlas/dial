@@ -101,6 +101,10 @@ impl run::engine::Terminal for TurnReport {
     }
 }
 impl TurnReport {
+    pub fn reached_step_limit(&self, max_steps: u32) -> bool {
+        self.outcome == TurnOutcome::Incomplete && max_steps > 0 && self.steps >= max_steps
+    }
+
     /// Whether automatic follow-up turns (goal continuations, `/loop` iterations) must stop and
     /// wait for the human: the turn was interrupted, asked a question, declared a blocker or
     /// failed. An incomplete turn keeps going; the callers' own stall and budget rules bound it.
@@ -203,6 +207,41 @@ struct StepChecks {
     evidence: verify::evidence::Ledger,
     /// Artifact-local Eval observations, kept separate from command and requirement evidence.
     eval_checks: verify::eval_checks::History,
+    /// Failed runs of files changed this turn, open until the file changes or the same consumer passes.
+    failed_runs: verify::failed_runs::FailedRuns,
+    /// The latest `bash` command that put a process in the background with `&` without waiting
+    /// for it. Its process group was stopped when the call returned; an unattended completion is
+    /// deferred once so a service the task needs can be restarted under `bg`.
+    stopped_shell_job: Option<String>,
+    /// Distinctive numbers (two or more digits, or decimals) printed by this turn's `bash` and
+    /// `eval` results, to recognize a check that only expects values the agent's own run printed.
+    printed_numbers: std::collections::BTreeSet<String>,
+    /// Failing test names seen in this turn's `bash`, `eval` and `verify` output, so a later check
+    /// that excludes one of them is not counted as passing.
+    failed_tests: std::collections::BTreeSet<String>,
+    /// The caller-interface deferral already fired this turn.
+    caller_interface_noted: bool,
+    /// The text-picture hint already fired this turn.
+    text_picture_noted: bool,
+    /// The latest `bash` command that wrote to a service or repository through its client
+    /// (`git push`, an HTTP write, a database write). An unattended completion is deferred once
+    /// so test data a check left there can be removed.
+    service_write: Option<String>,
+    /// The service-write deferral already fired this turn.
+    service_write_noted: bool,
+    /// The latest passing shell check whose expected values all came from this turn's own
+    /// output: its revision and those values. An unattended completion is deferred once for it.
+    self_confirming_check: Option<(verify::evidence::Revision, Vec<String>)>,
+    /// The self-confirming-check deferral already fired this turn.
+    self_confirming_noted: bool,
+    /// The unattended-check hint was appended to a tool result this turn.
+    unattended_check_noted: bool,
+    /// The request-asks-for-speed deferral already fired this turn.
+    performance_noted: bool,
+    /// The request-asks-for-speed hint was considered for a tool result this turn.
+    speed_hint_noted: bool,
+    /// The request-names-a-reference-tool deferral already fired this turn.
+    reference_tool_noted: bool,
     /// At most one local advisory awaiting a reply; never consulted by verification gates.
     repair_brief: Option<verify::checks::RepairBrief>,
     /// Revision of the latest successful foreground shell check explicitly declared or configured.
@@ -361,6 +400,11 @@ pub struct Agent<'a> {
     background_notices: Vec<String>,
     /// Session `bg` jobs an unattended run was already told end with it, so the notice is not repeated.
     exit_bound_jobs_noticed: std::collections::BTreeSet<String>,
+    /// Running `bash` jobs an unattended run already waited on for its bound. No user can steer
+    /// that run, so later completion waits skip them instead of parking until the run deadline.
+    unattended_wait_noticed: std::collections::BTreeSet<String>,
+    /// How long an unattended run awaits a running `bash` job before asking the model to act.
+    unattended_job_wait: std::time::Duration,
     /// Bounded `additional_context` notes from lifecycle hooks, delivered once as transient
     /// notes in the next request (see `queue_hook_context`).
     hook_context: Vec<String>,

@@ -208,7 +208,7 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
             ToolStatus::Error,
             Effects::None,
             Retry::AfterCorrection,
-            "Correct causes",
+            "Correct the cause",
         ),
         (
             ToolStatus::Blocked,
@@ -256,11 +256,20 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
         let facts = output.execution.clone();
         let (kind, advice) = classify(&call("bash"), &output).unwrap();
         let text = report(&call("bash"), &mut output, kind, advice, 1);
+        let repeated = report(&call("bash"), &mut output, kind, advice, 2);
+        assert!(!text.contains(policy::REPEATED_DIAGNOSTIC));
+        assert_eq!(
+            repeated.contains(policy::REPEATED_DIAGNOSTIC),
+            expected_retry == Retry::AfterCorrection,
+            "{repeated}"
+        );
         output.text.push_str(&text);
         assert!(output.text.starts_with(&original));
-        // A clean first correct-then-retry failure is one line; the others keep the state block.
+        // A clean correct-then-retry failure is one line, first or repeated; the others keep the
+        // state block.
         let block = expected_retry != Retry::AfterCorrection;
         assert_eq!(text.contains("\nRetry:"), block, "{text}");
+        assert_eq!(repeated.contains("\nRetry:"), block, "{repeated}");
         assert!(text.contains(requirement), "{text}");
         assert_eq!(output.execution, facts);
         assert_eq!(output.recovery(), Some(recovery));
@@ -323,6 +332,8 @@ fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
     // A repeat of the same routine exit stays one compact line that carries the streak count.
     let repeat = compact(127, 2);
     assert!(!repeat.contains("\nRetry:"), "{repeat}");
+    assert!(!first.contains(policy::REPEATED_DIAGNOSTIC));
+    assert!(repeat.contains(policy::REPEATED_DIAGNOSTIC));
     assert!(
         repeat.contains("Failed 2 times in a row.")
             && repeat.contains("only this operation, not the turn"),
@@ -793,6 +804,35 @@ fn command_shape_hints_name_filter_exits_async_jobs_and_absent_listeners() {
     let job = hint("PORT=3519 node server.mjs &", &started).unwrap();
     assert!(job.contains("async_job") && job.contains("`bg`"), "{job}");
     assert!(hint("node a.js & node b.js & wait", &started).is_none());
+    let detached = hint(
+        "setsid nohup python3 /tmp/train.py > /tmp/t.log 2>&1 < /dev/null &",
+        &started,
+    )
+    .unwrap();
+    assert!(
+        detached.contains("detached_job") && detached.contains("untracked"),
+        "{detached}"
+    );
+    assert!(
+        hint("python3 x.py & disown", &started)
+            .unwrap()
+            .contains("detached_job")
+    );
+    let slept = hint(
+        "cd /app && (make -j4 > build.log 2>&1) & sleep 240; tail build.log",
+        &started,
+    )
+    .unwrap();
+    assert!(
+        slept.contains("async_sleep") && slept.contains("full length"),
+        "{slept}"
+    );
+    assert!(
+        hint("server & sleep 2; curl localhost:8000", &started)
+            .unwrap()
+            .contains("async_job")
+    );
+    assert!(hint("sleep 240", &started).is_none());
     for command in [
         "make && make test",
         "cargo test 2>&1",

@@ -60,7 +60,7 @@ pub struct WelcomeInfo {
 
 /// Starter requests shown to a project with no history, so the first message is never a blank page.
 const STARTERS: [&str; 3] = [
-    "explain this project",
+    "explain this code without editing it",
     "find and fix a failing test",
     "review my uncommitted changes",
 ];

@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn background_output_note_flags_file_redirects_and_fixed_sleeps_only() {
+    let build = "cd /tmp/h; (make -j4 > /tmp/build.log 2>&1; echo done >> /tmp/build.log) & sleep 90; tail -5 /tmp/build.log";
+    let note = background_output_note(build).unwrap();
+    assert!(note.contains("`/tmp/build.log`"), "{note}");
+    assert_eq!(note.matches("/tmp/build.log").count(), 1, "{note}");
+    assert!(note.contains("`sleep 90`"), "{note}");
+    for quiet in [
+        "python3 server.py",
+        "make test 2>&1",
+        "make 2>/dev/null >/dev/null",
+        "server >&2",
+        "sleep 30",
+        "make && sleep 30",
+        "python3 - <<'EOF'\nif a > b: print(1)\nEOF",
+        "echo 'a > b'",
+        "python3 server.py & sleep 2",
+    ] {
+        assert_eq!(background_output_note(quiet), None, "{quiet}");
+    }
+    let plain = background_output_note("./run > out.txt").unwrap();
+    assert!(
+        plain.contains("`out.txt`") && !plain.contains("sleep"),
+        "{plain}"
+    );
+}
+
+#[test]
 fn directory_delta_reports_disappearing_and_shrinking_sources() {
     let (dir, _ws) = workspace();
     fs::write(dir.path().join("main.db-wal"), b"original WAL").unwrap();
@@ -284,6 +311,29 @@ fn bash_names_entries_a_command_left_in_its_working_directory() {
         "{note}"
     );
     assert_eq!(created_entries_note(None, dir.path()), None);
+    drop(ws);
+}
+
+#[test]
+fn bash_names_build_products_left_beside_a_nested_deliverable() {
+    let (dir, ws) = workspace();
+    fs::create_dir_all(dir.path().join("polyglot")).unwrap();
+    fs::write(dir.path().join("polyglot/main.py.c"), "source").unwrap();
+    fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+    let before = directory_entries(dir.path());
+    // `gcc polyglot/main.py.c -o polyglot/cmain` run from the parent directory.
+    fs::write(dir.path().join("polyglot/cmain"), "binary").unwrap();
+    fs::create_dir_all(dir.path().join("dist/wheels")).unwrap();
+    fs::write(dir.path().join("dist/wheels/a.whl"), "w").unwrap();
+    fs::write(dir.path().join("node_modules/pkg/index.js"), "x").unwrap();
+    fs::remove_file(dir.path().join("polyglot/main.py.c")).unwrap();
+    let note = created_entries_note(before.as_ref(), dir.path()).unwrap();
+    assert!(note.contains("polyglot/cmain"), "{note}");
+    // A new tree is named once, and dependency trees are not walked.
+    assert!(note.contains("dist") && !note.contains("a.whl"), "{note}");
+    assert!(!note.contains("index.js"), "{note}");
+    // Nested removal is not reported as a lost task input.
+    assert!(!note.contains("disappeared"), "{note}");
     drop(ws);
 }
 
@@ -1906,6 +1956,15 @@ fn interpreter_guidance_lists_available_and_missing_helper_languages() {
     fs::create_dir(bin.path().join("node")).unwrap();
     fs::write(bin.path().join("python3"), "").unwrap();
     let guidance = interpreter_guidance_for(&ws, Some(bin.path().as_os_str()));
+    if crate::setup::deps::bundled_python::available() {
+        // Builds that embed CPython offer it to bash instead of reporting python3 missing.
+        assert!(
+            guidance.contains("python3 (Dial's bundled CPython"),
+            "{guidance}"
+        );
+        assert!(!guidance.contains("not found: python3"), "{guidance}");
+        return;
+    }
     assert!(
         guidance.contains("Shell PATH languages: perl, C compiler (gcc); not found: python3, node, ruby, go, rustc, java."),
         "{guidance}"

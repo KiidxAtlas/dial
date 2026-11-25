@@ -90,6 +90,37 @@ impl Session {
             .collect()
     }
 
+    /// Newest settled turns on this branch, bound to the engine's admitted prompt, not a
+    /// transcript row number. Copied history must not link back to another session's files.
+    pub fn recorded_turns(&self, limit: usize) -> Vec<(&str, String, &Value)> {
+        let mut turns = Vec::new();
+        let mut summary = None;
+        for &i in self.branch().iter().rev() {
+            let Kind::Message(m) = &self.entries[i].kind else {
+                continue;
+            };
+            if role_of(m) == "dial_state" && summary.is_none() {
+                summary = control_entry_field(m, "turn_summary");
+            } else if role_of(m) == "user" && m["dial_checkpoint"].is_object() {
+                if let Some(s) = summary.take()
+                    && m["dial_checkpoint"]["session"] == self.id()
+                    && s["checkpoint_turn"] == m["dial_checkpoint"]["turn"]
+                    && s["outcome"].is_string()
+                {
+                    turns.push((
+                        self.entries[i].id.as_str(),
+                        truncate_chars(&content_text(m), 100),
+                        s,
+                    ));
+                    if turns.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        turns
+    }
+
     /// Full immutable conversation evidence on the active branch, before compaction view cuts.
     pub fn archived_messages(&self) -> Vec<Value> {
         self.active

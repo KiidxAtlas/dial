@@ -101,6 +101,8 @@ pub(in crate::agent) struct TurnState<'a> {
     turn_cost_warn: cost_warn::Crossing,
     /// The model was told once that most of the time or cost budget is used.
     wrap_up_noted: bool,
+    /// `--max-time` marks already announced to the model (see `begin::time_left_notice`).
+    time_marks: u8,
     /// The current step is the round's last: it must answer, not start tools.
     final_step: bool,
     max_tokens: u32,
@@ -436,6 +438,7 @@ impl Agent<'_> {
             unpriced_cap_noted: false,
             turn_cost_warn: cost_warn::Crossing::new(true),
             wrap_up_noted: false,
+            time_marks: 0,
             final_step: false,
             max_tokens,
             recovering_output: false,

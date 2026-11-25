@@ -147,7 +147,7 @@ fn a_check_outlasting_the_auto_background_threshold_finishes_in_the_foreground()
     let root = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.shell.auto_background_secs = 1;
-    let command = "sleep 2; echo 'test result: ok. 1 passed'";
+    let command = "sleep 2 && echo 'test result: ok. 1 passed'";
     config
         .verification
         .commands

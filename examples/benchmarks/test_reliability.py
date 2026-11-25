@@ -37,6 +37,23 @@ def summarize_input_cases(payload):
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_false_completions_report_trial_ids_and_unknown_coverage(self):
+        payload = machine((True, False, False))
+        cases = summarize_input_cases(payload)
+        self.assertIsNone(summarize(payload)["configurations"][0]["false_completions"])
+        cases[0]["evidence"]["false_completion"] = False
+        cases[1]["evidence"]["false_completion"] = True
+        result = summarize(payload)["configurations"][0]
+        self.assertEqual(result["false_completions"], 1)
+        self.assertEqual(result["false_completion_assessed_trials"], 2)
+        self.assertEqual(result["tasks"][0]["false_completion_trials"], [1])
+        self.assertEqual(result["first_trial_passed_fraction"], 1)
+        cases.reverse()  # Trial IDs, not input order, determine the first attempt.
+        self.assertTrue(summarize(payload)["configurations"][0]["tasks"][0]["first_trial_passed"])
+        cases[-1]["evidence"]["false_completion"] = True  # Contradicts a passing trial.
+        with self.assertRaisesRegex(ValueError, "invalid false_completion"):
+            summarize(payload)
+
     def test_pass_estimators_match_unbiased_definitions(self):
         # n=5, c=3: pass@2 = 1 - C(2,2)/C(5,2); pass^2 = C(3,2)/C(5,2).
         self.assertAlmostEqual(pass_at_k(5, 3, 2), 1 - 1 / 10)

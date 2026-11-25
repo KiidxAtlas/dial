@@ -395,6 +395,9 @@ impl Ui for StateUi<'_> {
     fn notice(&mut self, v: &str) {
         self.inner.notice(v)
     }
+    fn received_message(&mut self, notice: &str, from: &str, text: &str) {
+        self.inner.received_message(notice, from, text)
+    }
     fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.inner.event(event)
     }

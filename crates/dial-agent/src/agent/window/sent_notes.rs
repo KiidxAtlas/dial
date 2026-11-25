@@ -69,11 +69,13 @@ fn sent_tail(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Drop trailing notes whose kind and text equal the latest re-sent note of that kind.
+/// Drop trailing notes whose kind and text equal the latest re-sent note of that kind. When the
+/// history ends with an assistant reply, the last note is kept even if repeated: a request must
+/// end with a user-side message, and providers refuse a trailing assistant message as a prefill.
 pub(in crate::agent) fn drop_repeated(messages: &mut Vec<Value>) {
     let tail = crate::agent::run::guidance::tail_start(messages);
     let (sent, notes) = messages.split_at(tail);
-    let repeated: Vec<bool> = notes
+    let mut repeated: Vec<bool> = notes
         .iter()
         .map(|note| {
             let kind = kind(note);
@@ -83,6 +85,13 @@ pub(in crate::agent) fn drop_repeated(messages: &mut Vec<Value>) {
                 .is_some_and(|previous| previous["content"] == note["content"])
         })
         .collect();
+    let ends_with_reply = sent.last().is_some_and(|last| last["role"] == "assistant");
+    if ends_with_reply
+        && repeated.iter().all(|dropped| *dropped)
+        && let Some(last) = repeated.last_mut()
+    {
+        *last = false;
+    }
     let mut index = 0;
     messages.retain(|_| {
         let keep = index < tail || !repeated[index - tail];

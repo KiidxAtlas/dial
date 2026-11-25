@@ -87,3 +87,39 @@ fn ready_without_a_log_or_port_names_both_probes_and_an_example() {
     }
     assert!(Ready::parse(&json!({"ready": {"log": "listening", "timeout": 30}})).is_ok());
 }
+
+#[test]
+fn proc_net_tables_yield_only_listening_sockets_with_decoded_addresses() {
+    // Header, 127.0.0.1:5328 LISTEN, 0.0.0.0:8080 LISTEN, an ESTABLISHED socket.
+    let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:14D0 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0 100 0 0 10 0\n\
+   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4343 1 0 100 0 0 10 0\n\
+   2: 0100007F:14D0 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 4444 1 0 20 4 30 10 -1\n";
+    assert_eq!(
+        proc_net_listeners(tcp),
+        vec![
+            (IpAddr::V4(Ipv4Addr::LOCALHOST), 5328, 4242),
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080, 4343),
+        ]
+    );
+    // ::1 is printed as four little-endian words.
+    let tcp6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 5151 1 0 100 0 0 10 0\n";
+    assert_eq!(
+        proc_net_listeners(tcp6),
+        vec![(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080, 5151)]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn procfs_proves_a_listener_belongs_to_the_group_without_lsof() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    // SAFETY: getpgid(0) queries this process's own group and borrows no memory.
+    let own_group = unsafe { libc::getpgid(0) } as u32;
+    assert!(procfs_owned_listener(own_group, address).unwrap());
+    assert!(!procfs_owned_listener(own_group.wrapping_add(1_000_000), address).unwrap());
+    drop(listener);
+    assert!(!procfs_owned_listener(own_group, address).unwrap());
+}

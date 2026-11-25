@@ -40,10 +40,14 @@ pub mod fs;
 /// Process groups: a leader and every descendant, signalled and killed together.
 pub mod process;
 
+/// Blanking free-text arguments so commands matching the process list do not match Dial itself.
+pub mod argv;
 pub mod atomic;
 /// Environment variables a child needs when it starts with a cleared environment.
 pub mod env;
 pub mod interrupt;
+/// Commands stuck on a pipe that only a detached daemon keeps open.
+pub mod pipe_stall;
 pub mod power;
 pub mod process_record;
 /// Windows process listing, PEB-backed command line/cwd/environment reads and socket owners.

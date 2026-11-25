@@ -153,6 +153,9 @@ pub struct RunMetrics {
     pub truncated_recoveries: u64,
     #[serde(default)]
     pub turns_completed: u64,
+    /// Last RPC send's explicit settlement, not the cumulative multi-turn completion count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_completed: Option<bool>,
     /// True only when the runner observed provider usage, not an estimated token count.
     #[serde(default)]
     pub token_usage_observed: bool,
@@ -450,6 +453,10 @@ pub struct CaseEvidence {
     pub outcome_checks: usize,
     pub failed_check_indices: Vec<usize>,
     pub unavailable_check_indices: Vec<usize>,
+    /// A completed final turn contradicted by an available independent outcome check.
+    /// Unknown for legacy reports, unavailable grading or missing settlement evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub false_completion: Option<bool>,
     pub contract_sha256: String,
     /// Redacted, bounded reason the agent run failed (error chain plus a tail of child
     /// diagnostics). Absent for successful runs and legacy reports.
@@ -1568,8 +1575,17 @@ impl BenchmarkSuite {
             let mut checks_passed = 0;
             let mut failed_check_indices = Vec::new();
             let mut unavailable_check_indices = Vec::new();
+            let mut outcome_checks = 0;
+            let mut failed_outcome = false;
+            let mut unavailable_outcome = false;
             for (index, assertion) in case.checks.iter().enumerate() {
+                let outcome = !matches!(
+                    assertion,
+                    Assertion::Metric { .. } | Assertion::ToolInvoked { .. }
+                );
+                outcome_checks += usize::from(outcome);
                 if agent_unavailable {
+                    unavailable_outcome |= outcome;
                     unavailable_check_indices.push(index);
                     failed_check_indices.push(index);
                     continue;
@@ -1641,6 +1657,13 @@ impl BenchmarkSuite {
                 };
                 checks_passed += usize::from(passed);
                 if !passed {
+                    if outcome {
+                        if unavailable_check_indices.last() == Some(&index) {
+                            unavailable_outcome = true;
+                        } else {
+                            failed_outcome = true;
+                        }
+                    }
                     failed_check_indices.push(index);
                 }
             }
@@ -1653,6 +1676,19 @@ impl BenchmarkSuite {
                 && completed_turns
                 && metrics.compactions >= forced_compactions
                 && checks_passed == case.checks.len();
+            let false_completion = metrics
+                .last_turn_completed
+                .filter(|_| {
+                    metrics.agent_succeeded
+                        && !metrics.agent_error
+                        && outcome_checks > 0
+                        && (failed_outcome || !unavailable_outcome)
+                        && !case
+                            .categories
+                            .iter()
+                            .any(|category| category == "answer_requires_manual_review")
+                })
+                .map(|completed| completed && failed_outcome);
             results.push(CaseResult {
                 id: case.id.clone(),
                 passed,
@@ -1661,16 +1697,8 @@ impl BenchmarkSuite {
                 metrics,
                 evidence: Some(CaseEvidence {
                     categories: case.categories.clone(),
-                    outcome_checks: case
-                        .checks
-                        .iter()
-                        .filter(|check| {
-                            !matches!(
-                                check,
-                                Assertion::Metric { .. } | Assertion::ToolInvoked { .. }
-                            )
-                        })
-                        .count(),
+                    outcome_checks,
+                    false_completion,
                     failed_check_indices,
                     unavailable_check_indices,
                     contract_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(case)?)),

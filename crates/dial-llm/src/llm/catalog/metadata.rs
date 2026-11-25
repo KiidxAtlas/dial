@@ -113,6 +113,9 @@ pub struct ModelMetadata {
     /// On-disk format of a downloaded local model; `None` for served and hosted models.
     #[serde(default)]
     pub format: Option<LocalFormat>,
+    /// Known chat loaders for the architecture in the GGUF header, not the model label.
+    #[serde(default)]
+    pub gguf_engines: crate::llm::local_runtime::GgufEngines,
     /// Thinking mode and effort levels the live listing declares for this exact model.
     #[serde(default)]
     pub declared_reasoning: Option<DeclaredReasoning>,

@@ -154,7 +154,7 @@ fn a_first_visit_suggests_requests_and_a_return_visit_says_how_to_resume() {
     }
     assert!(!text.contains("/resume"));
     let back = plain(&rows(&info(), 120, &Theme::dark())).join("\n");
-    assert!(back.contains("/resume to continue one") && !back.contains("explain this project"));
+    assert!(back.contains("/resume to continue one") && !back.contains(STARTERS[0]));
     let ascii = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
     assert!(
         plain(&rows(&first, 120, &ascii))

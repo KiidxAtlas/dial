@@ -6,6 +6,16 @@ not evidence that a model, OCR engine, spreadsheet calculator or transcriber was
 import json
 
 
+def approval_case(case_id, register, approved):
+    prompt = (f"Using source-a.txt, source-b.txt and {register}, decide whether the supplied sources establish launch approval. "
+              "Write answer.json with status (resolved or unresolved), approved (boolean or null), and quotes: a list in source filename order of objects with source and exact quote. "
+              "Preserve both opposing launch sentences verbatim. Do not choose an authority absent from the register.")
+    answer = {"status": "unresolved" if approved is None else "resolved", "approved": approved, "quotes": [
+        {"source": "source-a.txt", "quote": "The launch is approved for March 4."},
+        {"source": "source-b.txt", "quote": "The launch is not approved for March 4."}]}
+    return case_id, prompt, answer, ["evidence", "ambiguity", "contradiction"]
+
+
 CASES = [
     ("requirements-revisions",
      "Compare requirements-v1.md against requirements-format.md and requirements-v2.md. Classify each revision and report changed requirement IDs. Write answer.json with keys format_only (boolean), format_changed_ids (list), substantive_changed_ids (list), retention_days_before and retention_days_after (integers).",
@@ -24,12 +34,8 @@ CASES = [
      "Sum all amounts in money.csv exactly without binary floating point. Write answer.json with currency and total strings, preserving exactly two decimal places; include rows_examined as an integer.",
      {"currency": "USD", "total": "9007199254740993.30", "rows_examined": 4},
      ["data", "decimal", "money"]),
-    ("contradictory-quotes",
-     "Using source-a.txt, source-b.txt and source-register.json, decide whether the supplied sources establish launch approval. Write answer.json with status (resolved or unresolved), approved (boolean or null), and quotes: a list in source filename order of objects with source and exact quote. Preserve both opposing launch sentences verbatim. Do not choose an authority absent from the register.",
-     {"status": "unresolved", "approved": None, "quotes": [
-         {"source": "source-a.txt", "quote": "The launch is approved for March 4."},
-         {"source": "source-b.txt", "quote": "The launch is not approved for March 4."}]},
-     ["evidence", "ambiguity", "contradiction"]),
+    approval_case("contradictory-quotes", "source-register.json", None),
+    approval_case("ranked-quotes", "source-register-ranked.json", True),
     ("nested-json-jsonl",
      "Analyze nested.json and events.jsonl. Sum quantity for SKU X across every nested batch/order/line. Normalize non-null event durations to milliseconds; null means missing, not zero. Write answer.json with integer keys x_quantity, orders_examined, events_examined, events_with_duration, total_duration_ms and a missing_duration_ids list.",
      {"x_quantity": 5, "orders_examined": 2, "events_examined": 3,

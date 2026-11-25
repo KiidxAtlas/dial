@@ -381,6 +381,8 @@ pub(in crate::agent) struct ParallelToolContext<'a> {
     pub(in crate::agent) interrupt: &'a AtomicBool,
     pub(in crate::agent) ui: &'a mut dyn Ui,
     pub(in crate::agent) pending_steering: &'a mut Vec<String>,
+    /// The run's `--max-time`; once it passes, interruptible waits end so the step boundary can stop.
+    pub(in crate::agent) deadline: Option<Instant>,
 }
 
 /// Run only a prevalidated consecutive group. No agent/session/UI state enters a worker.
@@ -585,6 +587,7 @@ fn parallel_tools_inner(
         interrupt,
         ui,
         pending_steering,
+        deadline,
     } = ctx;
     let signals = crate::tools::exec::signals::CallSignals::new();
     thread::scope(|scope| {
@@ -720,6 +723,7 @@ fn parallel_tools_inner(
             (0..first_calls.len()).map(|_| None).collect();
         let mut outstanding = results.len();
         let mut input_signalled = false;
+        let mut deadline_signalled = false;
         while outstanding > 0 {
             while let Ok((index, tool, paths, unbounded, reply)) = requests.try_recv() {
                 let result = match mutation_controller.as_deref_mut() {
@@ -751,6 +755,20 @@ fn parallel_tools_inner(
                 signals.interrupt_waits();
                 for call in calls {
                     if let Some(tool) = ext.get(&call.name) {
+                        tool.cancel_operation();
+                    }
+                }
+            }
+            // A passed `--max-time` ends cooperative waits (an unbounded `bg wait`, readiness
+            // probes) once; the step boundary then stops the turn with the deadline reason.
+            if !deadline_signalled && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                deadline_signalled = true;
+                signals.interrupt_waits();
+                for call in calls {
+                    if let Some(tool) = ext
+                        .get(&call.name)
+                        .filter(|tool| tool.interruptible(&call.arguments))
+                    {
                         tool.cancel_operation();
                     }
                 }
@@ -1514,6 +1532,29 @@ impl<'a> Agent<'a> {
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
         }
+        let supplied_image = call.arguments["path"]
+            .as_str()
+            .filter(|path| {
+                call.name == "read"
+                    && !self.hermetic
+                    && llm::images::may_reference_user_image(Path::new(path))
+            })
+            .and_then(|path| {
+                llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
+                    .map(|reference| (path, reference))
+            });
+        if !self.hermetic
+            && ui.interactive_input()
+            && supplied_image.is_none()
+            && image_question(call).is_none()
+            && let Err(error) = self.approve_pending_directories(backend, call, ui)
+        {
+            *approval_denied = true;
+            return denied(&format!(
+                "{error:#}; the pending {} call was not executed",
+                call.name
+            ));
+        }
         if let DispatchMode::Background { name } = mode {
             return self.launch_background_tool(call, name);
         }
@@ -1625,13 +1666,7 @@ impl<'a> Agent<'a> {
                 args,
             );
         }
-        if name == "read"
-            && !self.hermetic
-            && let Some(path) = args["path"].as_str()
-            && llm::images::may_reference_user_image(Path::new(path))
-            && let Some(reference) =
-                llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
-        {
+        if let Some((path, reference)) = supplied_image {
             if args["offset"].as_u64().is_some() {
                 return denied("images do not support line offsets");
             }
@@ -2523,6 +2558,13 @@ impl<'a> Agent<'a> {
             && call.name != crate::tools::exec::eval::BATCH_CALLBACK
             && names.contains(&call.name)
             && crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
+            && super::directory_access::pending_directories(
+                &self.workspace,
+                &self.ext,
+                &call.name,
+                &call.arguments,
+            )
+            .is_empty()
             && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
                 !crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, &call.name)
             })
@@ -2591,6 +2633,7 @@ impl<'a> Agent<'a> {
                     interrupt: &self.interrupt,
                     ui,
                     pending_steering: &mut steering,
+                    deadline: self.modes.launch.deadline,
                 },
                 &admitted,
                 None,
@@ -2759,7 +2802,9 @@ impl<'a> Agent<'a> {
         // Running jobs are listed before notifications are drained. In the other order a job that
         // exits between the drain and the listing is in neither: its completion stays queued and
         // the turn ends without reporting it. Here such a job is at worst both listed and reported.
-        let jobs = self.awaited_background_jobs();
+        // An unattended run already told about a job it waited on for its bound is not woken again
+        // by it: re-announcing the same running job at every reply would loop until the deadline.
+        let jobs = self.waitable_background_jobs();
         self.pump_subagents(ui);
         let questions = self.side_questions.running_ids();
         if !questions.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
@@ -2797,17 +2842,27 @@ impl<'a> Agent<'a> {
         if !self.modes.launch.unattended {
             return None;
         }
+        let mut jobs = self.exit_bound_session_jobs();
+        jobs.retain(|job| self.exit_bound_jobs_noticed.insert(job.clone()));
+        (!jobs.is_empty()).then(|| format!(
+            "[Background jobs end with this run]\n{}\nThis is an unattended run: when it ends, Dial kills these session jobs. If the task needs one after you finish (a server, index or service that a user or check will connect to), stop it with `bg kill`, start it again with `bg` action=start persist=true name=<name> (without `ready`; it survives this run until `lifetime`, default 3600 s), confirm it serves, then finish. Otherwise stop jobs you no longer need. Never report a session job as still running after the run.",
+            jobs.join("\n")
+        ))
+    }
+
+    /// Running `bg` session jobs that an unattended run kills when it exits, as `name (command)`;
+    /// empty outside unattended runs. Durable (`persist=true`) jobs are not session jobs.
+    pub(in crate::agent) fn exit_bound_session_jobs(&self) -> Vec<String> {
+        if !self.modes.launch.unattended {
+            return Vec::new();
+        }
         let mut jobs = Vec::new();
         for name in self.ext.names() {
             if let Some(tool) = self.ext.get(name) {
                 jobs.extend(tool.session_work());
             }
         }
-        jobs.retain(|job| self.exit_bound_jobs_noticed.insert(job.clone()));
-        (!jobs.is_empty()).then(|| format!(
-            "[Background jobs end with this run]\n{}\nThis is an unattended run: when it ends, Dial kills these session jobs. If the task needs one after you finish (a server, index or service that a user or check will connect to), stop it with `bg kill`, start it again with `bg` action=start and persist=true (named; it survives this run until `lifetime`, default 3600 s), confirm it serves, then finish. Otherwise stop jobs you no longer need. Never report a session job as still running after the run.",
-            jobs.join("\n")
-        ))
+        jobs
     }
 }
 

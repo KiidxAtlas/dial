@@ -1,4 +1,5 @@
 use crate::config::types::{Config, Version};
+use crate::llm::local_runtime::{GgufLoader, LocalEngine};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -479,9 +480,9 @@ pub fn current_lora_probe(caps: &Value) -> bool {
 }
 
 /// Capabilities of GGUF and Splash models, answered without the MLX-only Python worker: GGUF serves
-/// inference through `llama-server` but cannot be LoRA-trained (training needs MLX weights), and a
+/// inference through its selected loader but cannot be LoRA-trained (training needs MLX weights), and a
 /// Splash bundle can only be run by LM Studio. `None` for MLX checkpoints and unresolved models.
-fn non_mlx_capabilities(model: &str) -> Option<Value> {
+fn non_mlx_capabilities(model: &str, engine: LocalEngine) -> Option<Value> {
     use crate::llm::local_format::{self, LocalFormat};
     let resolved = crate::llm::catalog::resolve_local_model(model).ok();
     let path = std::path::absolute(resolved.as_deref().unwrap_or(model)).ok()?;
@@ -493,14 +494,19 @@ fn non_mlx_capabilities(model: &str) -> Option<Value> {
     ];
     let (inference, reason) = match local_format::detect(&path)? {
         LocalFormat::Mlx => return None,
-        LocalFormat::Gguf if local_format::llama_server().is_some() => (
-            true,
-            "GGUF model served by llama.cpp: inference and evaluation are supported; LoRA training needs MLX weights".to_owned(),
-        ),
-        LocalFormat::Gguf => (
-            false,
-            "GGUF models need llama.cpp's `llama-server`: install llama.cpp or set DIAL_LLAMA_SERVER".to_owned(),
-        ),
+        LocalFormat::Gguf => {
+            let result = local_format::gguf_file(&path)
+                .context("GGUF weights no longer available")
+                .and_then(|file| GgufLoader::resolve(&file, engine))
+                .and_then(|loader| loader.program().map(|_| loader));
+            match result {
+                Ok(loader) => {
+                    let name = match loader { GgufLoader::Atomic => "Atomic Engine", GgufLoader::LlamaCpp => "llama.cpp" };
+                    (true, format!("{name} is available for GGUF inference and evaluation; LoRA training needs MLX weights"))
+                }
+                Err(error) => (false, error.to_string()),
+            }
+        }
         LocalFormat::Splash => (
             false,
             "Splash bundles can only be run by LM Studio: select the model under the LM Studio provider".to_owned(),
@@ -517,7 +523,7 @@ fn non_mlx_capabilities(model: &str) -> Option<Value> {
 }
 
 pub fn capabilities(config: &Config) -> Result<Value> {
-    if let Some(result) = non_mlx_capabilities(&config.model) {
+    if let Some(result) = non_mlx_capabilities(&config.model, config.local_engine()) {
         return validate_capabilities(result);
     }
     let result = call(
@@ -531,7 +537,7 @@ pub fn capabilities_controlled(
     config: &Config,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Value> {
-    if let Some(result) = non_mlx_capabilities(&config.model) {
+    if let Some(result) = non_mlx_capabilities(&config.model, config.local_engine()) {
         return validate_capabilities(result);
     }
     crate::setup::refresh_worker(config)?;

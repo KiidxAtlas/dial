@@ -40,7 +40,7 @@ pub(crate) struct Snapshot {
 
 pub(crate) fn snapshot(layout: &Layout, config: &Config) -> Snapshot {
     Snapshot {
-        mcp: mcp_rows(config, foreign::home_dir().as_deref()),
+        mcp: mcp_rows(config),
         skills: skill_rows(layout),
     }
 }
@@ -192,7 +192,7 @@ fn skill_row(marketplace: &str, entry: &SkillEntry) -> Row {
     }
 }
 
-fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
+fn mcp_rows(config: &Config) -> Vec<Row> {
     let mut rows: Vec<Row> = config
         .mcp
         .iter()
@@ -238,6 +238,11 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
             details,
         });
     }
+    rows
+}
+
+fn discovered_mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
+    let mut rows = Vec::new();
     let configured: BTreeSet<&str> = config.mcp.keys().map(String::as_str).collect();
     for entry in foreign::not_configured(foreign::discover(home, &config.project_root), &configured)
     {
@@ -574,6 +579,22 @@ fn run_at(
     match intent {
         Intent::InstallCuratedMcp { id } => {
             install_mcp(endpoints, config, id, &BTreeMap::new(), progress)
+        }
+        Intent::DiscoverMcp => {
+            let rows = discovered_mcp_rows(config, foreign::home_dir().as_deref());
+            let message = format!(
+                "Found {} MCP servers not configured in Dial. Nothing was imported.",
+                rows.len()
+            );
+            progress
+                .lock()
+                .map_err(|_| anyhow!("extension progress unavailable"))?
+                .discovered = Some(rows);
+            Ok(Outcome {
+                ok: true,
+                message,
+                changes: Vec::new(),
+            })
         }
         Intent::ImportMcp { id } => {
             import_mcp(config, foreign::home_dir().as_deref(), id, progress)

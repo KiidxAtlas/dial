@@ -520,6 +520,23 @@ impl<'a> Agent<'a> {
         } else {
             verdict
         };
+        // A display-only command, or one that excludes a test seen failing this turn, is not
+        // evidence that the work is right.
+        let verdict = if verdict == verify::verification::CheckStatus::Passed
+            && source != CheckReceiptSource::FocusedCheck
+            && uncounted_pass_note(
+                command,
+                &self.step_checks.failed_tests,
+                self.session.control_state()["current_instruction"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+            .is_some()
+        {
+            verify::verification::CheckStatus::Unverified
+        } else {
+            verdict
+        };
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
         if passed {
@@ -1743,6 +1760,15 @@ impl<'a> Agent<'a> {
                 awaited.join("\n")
             ));
         }
+        // An unattended run kills its session jobs on exit. Accepting completion while one runs
+        // would let the answer describe a service that is gone before anyone can use it.
+        let exit_bound = self.exit_bound_session_jobs();
+        if !exit_bound.is_empty() {
+            return Err(format!(
+                "cannot complete while session jobs are running in an unattended run:\n{}\nDial kills these jobs when this run exits. If the task needs one afterwards (a server or service), stop it with `bg kill`, start it again with `bg` action=start persist=true name=<name> (without `ready`), and confirm it serves; otherwise stop it with `bg kill`. Then try again.",
+                exit_bound.join("\n")
+            ));
+        }
         let jobs = match self.live_tasks.status(None) {
             Ok(jobs) => jobs,
             Err(error) => {
@@ -1787,6 +1813,24 @@ impl<'a> Agent<'a> {
                 return Err(format!(
                     "Cannot complete: focused checks failed and have not passed since. After repairing the cause, start with the retained checks below; additional failures may remain.\nRecovery call: verify {recovery}\nBlocking checks: {}. A check registered under another name does not discharge them. Do not replace a valid check with a weaker one; report a blocker if it cannot be rerun.",
                     blocking.join(", ")
+                ));
+            }
+        }
+        if !self.hermetic {
+            let open = self
+                .step_checks
+                .failed_runs
+                .unresolved(self.workspace.root());
+            if !open.is_empty() {
+                let lines = open
+                    .iter()
+                    .map(|(path, run)| {
+                        format!("- {path}: {} failed with {}", run.consumer, run.summary)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(format!(
+                    "Cannot complete: a file changed this turn failed to parse or compile for one of its consumers, and since then the file has not changed and that consumer has not run it successfully:\n{lines}\nA different consumer passing (for example compiling it another way) does not cover this failure. Fix the file and rerun the same consumer; if it cannot be fixed, finish as blocked and name the failure."
                 ));
             }
         }
@@ -1929,6 +1973,26 @@ impl<'a> Agent<'a> {
     /// When no normal test applies, require evidence for a failed validation launch or a newly
     /// generated standalone output. Ordinary source edits do not invent test obligations.
     pub(in crate::agent) fn artifact_check_reminder(&self) -> Option<&'static str> {
+        self.unchecked_artifacts().map(|(_, reminder)| reminder)
+    }
+
+    /// Immediate feedback for a passing Eval cell whose assertions still leave the pending
+    /// artifacts without a source binding, so recovery happens before the completion gate.
+    pub(in crate::agent) fn unbound_eval_check_note(&self) -> Option<String> {
+        let (paths, _) = self.unchecked_artifacts()?;
+        let shown = paths.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+        let more = paths.len().saturating_sub(4);
+        let more = if more == 0 {
+            String::new()
+        } else {
+            format!(" and {more} more")
+        };
+        Some(format!(
+            "[Unbound Eval checks] These passing assertions do not verify the edited file(s): {shown}{more}. In one cell, read each with src = dial.read(path), test that saved code, and pass src as dial.check's third argument."
+        ))
+    }
+
+    fn unchecked_artifacts(&self) -> Option<(Vec<String>, &'static str)> {
         if !self.config.verification.enabled
             || self.hermetic
             || self.plan_mode
@@ -1983,7 +2047,7 @@ impl<'a> Agent<'a> {
                     .step_checks
                     .eval_checks
                     .covers_artifacts(&self.workspace, &paths)))
-        .then_some(reminder)
+        .then_some((paths, reminder))
     }
 
     /// An unattended delivery after a recorded effect needs current verification evidence.
@@ -1998,10 +2062,101 @@ impl<'a> Agent<'a> {
             return None;
         }
         let revision = self.step_checks.revision();
+        // An Eval receipt counts only when it is bound to a file this turn changed; a passing
+        // assertion about an unrelated input file is not evidence for the delivered work.
+        let eval_pass = match self.step_checks.turn.zip(self.checkpoints.as_ref()) {
+            Some((turn, checkpoints)) => {
+                let changed = checkpoints.changed_files(turn);
+                if changed.is_empty() {
+                    self.step_checks.eval_checks.current_pass(&self.workspace)
+                } else {
+                    self.step_checks
+                        .eval_checks
+                        .current_pass_for(&self.workspace, &changed)
+                }
+            }
+            None => self.step_checks.eval_checks.current_pass(&self.workspace),
+        };
         let verified = self.step_checks.shell_check_passed == Some(revision)
-            || self.step_checks.evidence.current_focused_pass(revision)
-            || self.step_checks.eval_checks.current_pass(&self.workspace);
+            || self
+                .step_checks
+                .evidence
+                .current_focused_behavior_pass(revision)
+            || eval_pass;
         (!verified).then_some(UNATTENDED_UNVERIFIED)
+    }
+
+    /// The values of a passing self-confirming shell check, when it is the only current evidence
+    /// of an unattended run.
+    pub(in crate::agent) fn self_confirming_gap(&self) -> Option<String> {
+        if !self.modes.launch.unattended || self.hermetic || self.plan_mode {
+            return None;
+        }
+        let revision = self.step_checks.revision();
+        let (at, values) = self.step_checks.self_confirming_check.as_ref()?;
+        (*at == revision
+            && self.step_checks.shell_check_passed == Some(revision)
+            && !self
+                .step_checks
+                .evidence
+                .current_focused_behavior_pass(revision))
+        .then(|| self_confirming_reason(values))
+    }
+
+    /// The functions the request names, once per turn in an unattended run with effects: the
+    /// model's own harness calls them its own way, which can differ from the request's caller.
+    pub(in crate::agent) fn caller_interface_gap(&self) -> Option<String> {
+        if !self.modes.launch.unattended
+            || self.hermetic
+            || self.plan_mode
+            || self.step_checks.effect_epoch() == 0
+        {
+            return None;
+        }
+        let control = self.session.control_state();
+        let instruction = control["current_instruction"].as_str().unwrap_or_default();
+        let names = requested_functions(instruction);
+        (!names.is_empty()).then(|| caller_interface_reason(&names))
+    }
+
+    /// Once per turn in an unattended run with effects, when the request asks for speed: output
+    /// equality, the usual self-check, says nothing about it.
+    pub(in crate::agent) fn performance_gap(&self) -> Option<String> {
+        if !self.modes.launch.unattended
+            || self.hermetic
+            || self.plan_mode
+            || self.step_checks.effect_epoch() == 0
+        {
+            return None;
+        }
+        let control = self.session.control_state();
+        let instruction = control["current_instruction"].as_str().unwrap_or_default();
+        requested_speed(instruction).map(performance_reason)
+    }
+
+    /// Once per turn in an unattended run with effects, when the request names a tool as the
+    /// ground truth and no passing check ran it: a value computed another way can differ.
+    pub(in crate::agent) fn reference_tool_gap(&self) -> Option<String> {
+        if !self.modes.launch.unattended
+            || self.hermetic
+            || self.plan_mode
+            || self.step_checks.effect_epoch() == 0
+        {
+            return None;
+        }
+        let control = self.session.control_state();
+        let instruction = control["current_instruction"].as_str().unwrap_or_default();
+        let unrun: Vec<String> = reference_tools(instruction)
+            .into_iter()
+            .filter(|tool| {
+                !self
+                    .step_checks
+                    .shell_check_runs
+                    .iter()
+                    .any(|(command, passed, _)| *passed && names_word(command, tool))
+            })
+            .collect();
+        (!unrun.is_empty()).then(|| reference_tool_reason(&unrun))
     }
 
     /// Describe each applicable check from one selection and one refreshed evidence snapshot.
@@ -2269,16 +2424,415 @@ impl<'a> Agent<'a> {
 }
 
 /// Shared by the completed and answered delivery paths.
-pub(in crate::agent) const UNATTENDED_UNVERIFIED: &str = "This unattended run recorded workspace or environment effects, but no declared check has passed on the current state. Verify the deliverable with a configured check, `verify`, `bash` with check:true, or a file-bound Eval assertion. Report a concrete blocker if verification cannot proceed.";
+pub(in crate::agent) const UNATTENDED_UNVERIFIED: &str = "This unattended run recorded workspace or environment effects, but no declared check has passed on the current state. Verify the deliverable with a configured check, `verify`, `bash` with check:true, or a file-bound Eval assertion that fails when the content is wrong; showing or listing the file does not count. Report a concrete blocker if verification cannot proceed.";
 
-/// Appended when an aggregate zero exit cannot establish that the checked pipeline passed.
-pub(in crate::agent) const MASKED_CHECK_NOTE: &str = "\n[Dial check] Not counted as a passing check: the shell's zero exit does not establish that every pipeline stage passed. Rerun without the pipe, or run `set -o pipefail;` followed directly by the foreground check pipeline.";
+/// Told once per unattended turn, on the first tool result after which verification is owed.
+pub(in crate::agent) const UNATTENDED_CHECK_HINT: &str = "[Dial] This run is unattended: finishing is accepted only after a check passes on the final state. When you verify the result, run that command as a foreground `bash` call with check:true (no pipe, or start it with `set -o pipefail;`), written to exit non-zero when the deliverable is wrong; a separate display or listing does not count.";
+
+/// Why a zero-exit check is not counted, or `None` when it is real evidence: it only displays or
+/// lists files, or it excludes a test seen failing earlier in this turn (and not named by the
+/// request). The returned note is appended to the check's result.
+pub(in crate::agent) fn uncounted_pass_note(
+    command: &str,
+    failed_tests: &std::collections::BTreeSet<String>,
+    instruction: &str,
+) -> Option<String> {
+    if display_only(command) {
+        return Some(DISPLAY_ONLY_CHECK.to_owned());
+    }
+    let excluded: Vec<String> = excluded_tests(command)
+        .into_iter()
+        .filter(|name| {
+            let last = name.rsplit("::").next().unwrap_or(name);
+            !instruction.contains(last) && seen_failing(name, failed_tests)
+        })
+        .collect();
+    (!excluded.is_empty()).then(|| {
+        format!(
+            "\n[Dial check] Not counted as a passing check: it excludes {}, which failed earlier in this turn. Excluding a failing test hides the failure rather than fixing it. Fix the cause and run the check with that test included, or report it as a remaining failure.",
+            excluded.join(", ")
+        )
+    })
+}
+
+const DISPLAY_ONLY_CHECK: &str = "\n[Dial check] Not counted as a passing check: this command only displays or lists files, so it shows the deliverable exists, not that it is right. Check the content with a command that fails when it is wrong, such as a test, an assertion or a computation that derives the expected result independently.";
+
+/// Commands that only show files or text and cannot fail on wrong content.
+const DISPLAY_PROGRAMS: &[&str] = &[
+    "cat", "head", "tail", "ls", "wc", "stat", "file", "echo", "printf", "pwd", "du", "xxd", "od",
+    "hexdump", "tree", "realpath", "readlink", "true", "less", "more", "nl",
+];
+
+/// Whether every stage of `command` is a display command (after a leading `cd DIR`), with no
+/// substitution or comparison that could make it fail on content.
+fn display_only(command: &str) -> bool {
+    if command.contains("$(") || command.contains('`') || command.trim().is_empty() {
+        return false;
+    }
+    let mut stages = command
+        .split(['\n', ';', '|', '&'])
+        .map(str::trim)
+        .filter(|stage| !stage.is_empty() && !stage.starts_with('#'))
+        .peekable();
+    if stages.peek().is_some_and(|first| first.starts_with("cd ")) {
+        stages.next();
+    }
+    let mut any = false;
+    for stage in stages {
+        let program = stage
+            .split_whitespace()
+            .find(|word| !word.contains('='))
+            .unwrap_or_default();
+        let program = program.rsplit('/').next().unwrap_or(program);
+        // `2>&1` splits into a `1` stage.
+        if program.chars().all(|c| c.is_ascii_digit() || c == '>') {
+            continue;
+        }
+        if !DISPLAY_PROGRAMS.contains(&program) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Shell words of `command`, honoring single and double quotes.
+fn words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started || !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                started = false;
+            }
+            None => current.push(c),
+        }
+    }
+    if started || !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Tests a check command leaves out: pytest `--deselect ID` and `-k "not NAME"`, libtest
+/// `--skip NAME`.
+fn excluded_tests(command: &str) -> Vec<String> {
+    let words = words(command);
+    let mut excluded = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index].as_str();
+        let (flag, inline) = match word.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => (flag, Some(value.to_owned())),
+            _ => (word, None),
+        };
+        if matches!(flag, "--deselect" | "--skip" | "-k") {
+            let value = inline.or_else(|| {
+                index += 1;
+                words.get(index).cloned()
+            });
+            if let Some(value) = value {
+                if flag == "-k" {
+                    let tokens: Vec<&str> = value
+                        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
+                        .filter(|token| !token.is_empty())
+                        .collect();
+                    excluded.extend(
+                        tokens
+                            .windows(2)
+                            .filter(|pair| pair[0] == "not")
+                            .map(|pair| pair[1].to_owned()),
+                    );
+                } else {
+                    excluded.push(value);
+                }
+            }
+        }
+        index += 1;
+    }
+    excluded
+}
+
+/// Whether `name` (a test id, a name or a `-k` substring) matches a test that failed this turn.
+fn seen_failing(name: &str, failed: &std::collections::BTreeSet<String>) -> bool {
+    let last = name.rsplit("::").next().unwrap_or(name);
+    failed.iter().any(|test| {
+        test == name
+            || test.rsplit("::").next() == Some(last)
+            || (last.len() >= 4 && test.contains(last))
+    })
+}
+
+/// Distinctive numbers in `text`: digit runs of two or more digits, or decimals, standing alone
+/// (not part of a name such as `t2.py` or `v1_2`).
+pub(in crate::agent) fn distinctive_numbers(text: &str) -> Vec<(usize, String)> {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() || (at > 0 && (word(bytes[at - 1]) || bytes[at - 1] == b'.'))
+        {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && (bytes[at].is_ascii_digit() || bytes[at] == b'.') {
+            at += 1;
+        }
+        let token = text[start..at].trim_end_matches('.');
+        let standalone = bytes.get(at).is_none_or(|&b| !word(b));
+        let decimal = token.contains('.') && token.split('.').count() == 2;
+        if standalone && (decimal || (!token.contains('.') && token.len() >= 2)) {
+            found.push((start, token.to_owned()));
+        }
+    }
+    found
+}
+
+/// Numbers a check compares against: distinctive literals right after `=`, `==`, `<`, `>` or a
+/// `test` comparison (`-eq` …), outside `--option=value` arguments.
+fn expected_literals(command: &str) -> Vec<String> {
+    let mut values: Vec<String> = distinctive_numbers(command)
+        .into_iter()
+        .filter(|(start, _)| {
+            let before = command[..*start].trim_end_matches([' ', '\t', '\'', '"', '(', '[']);
+            let last = before
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or_default();
+            let option = last.starts_with('-') && last.contains('=');
+            !option
+                && (before.ends_with(['=', '<', '>'])
+                    || ["-eq", "-ne", "-gt", "-ge", "-lt", "-le"].contains(&last))
+        })
+        .map(|(_, value)| value)
+        .collect();
+    values.dedup();
+    values
+}
+
+/// The expected values of a passing check when every one of them was printed earlier in this
+/// turn and none comes from the request: the check then confirms the program reproduces its own
+/// earlier output, not that the output is right.
+pub(in crate::agent) fn self_confirming_values(
+    command: &str,
+    printed: &std::collections::BTreeSet<String>,
+    instruction: &str,
+) -> Option<Vec<String>> {
+    let expected = expected_literals(command);
+    let requested: Vec<String> = distinctive_numbers(instruction)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    (!expected.is_empty()
+        && expected
+            .iter()
+            .all(|value| printed.contains(value) && !requested.contains(value)))
+    .then_some(expected)
+}
+
+/// Told once, in an unattended run, when the only passing check is self-confirming.
+pub(in crate::agent) fn self_confirming_reason(values: &[String]) -> String {
+    format!(
+        "The passing check only expects values this run's own program printed earlier ({}), so it shows the output is reproducible, not that it is right. Before finishing, compare those values with independent evidence: the input itself, the task's own examples or tests, a worked case, or a second method. If they are already established, finish again.",
+        values.join(", ")
+    )
+}
+
+/// Told once, in an unattended run, when the request names functions: a harness the model wrote
+/// itself calls them its own way, which can differ from how the request's caller will.
+pub(in crate::agent) fn caller_interface_reason(names: &[String]) -> String {
+    let list = names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "The request names {list}. Its caller will use only what the request says, and will usually pass the leading arguments by position. Before finishing, write down the call a reader of the request would most likely make: the input the request calls primary as the first positional argument, then the other inputs in the order the request introduces them, each in the request's terms (a range or domain it describes as one thing is one argument, such as a two-element vector, not two). Run exactly that call once in a fresh process, outside your own test helpers, and make it fail if the result is wrong. If it is refused or misread, change the signature so it works (the primary input first; accept a range both as one value and as separate bounds), then finish again. If this is already established, finish again."
+    )
+}
+
+/// Tools the request names as the ground truth or reference (`primer3's oligotm tool should be
+/// considered the ground truth`, `` `jq` is the reference ``): in a sentence that says so, the word
+/// before `tool`, `program`, `command`, `binary` or `utility`, and single backticked command
+/// names. Bounded to a few names.
+pub(in crate::agent) fn reference_tools(instruction: &str) -> Vec<String> {
+    let mut tools: Vec<String> = Vec::new();
+    let mut add = |name: &str| {
+        let name = name
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .trim_end_matches("'s");
+        let plain = !name.is_empty()
+            && name.len() <= 40
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && !matches!(name, "the" | "a" | "an" | "this" | "that" | "your" | "its");
+        if plain && tools.len() < 3 && !tools.iter().any(|tool| tool == name) {
+            tools.push(name.to_owned());
+        }
+    };
+    for sentence in instruction
+        .split(['\n', ';'])
+        .flat_map(|line| line.split(". "))
+    {
+        let lower = sentence.to_ascii_lowercase();
+        if ![
+            "ground truth",
+            "source of truth",
+            "reference implementation",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        {
+            continue;
+        }
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        for pair in words.windows(2) {
+            let kind = pair[1].trim_matches(|c: char| !c.is_ascii_alphabetic());
+            if matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "tool" | "program" | "command" | "binary" | "utility"
+            ) {
+                add(pair[0]);
+            }
+        }
+        for (index, quoted) in sentence.split('`').enumerate() {
+            if index % 2 == 1 && !quoted.contains(char::is_whitespace) && !quoted.starts_with('-') {
+                add(quoted);
+            }
+        }
+    }
+    tools
+}
+
+/// Whether `command` contains `word` as a whole shell word or path component.
+pub(in crate::agent) fn names_word(command: &str, word: &str) -> bool {
+    command
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .any(|part| part == word)
+}
+
+/// Told once, in an unattended run, when the request names a ground-truth tool no check ran.
+pub(in crate::agent) fn reference_tool_reason(tools: &[String]) -> String {
+    let list = tools
+        .iter()
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "The request names {list} as the ground truth, and no passing check ran it, so values you computed another way (a reimplementation or a formula) may differ from it. Before finishing, run that tool itself on your final result, with the options the request gives (install it if it is missing, for example from the package or source that provides it), in a check:true that fails when its output breaks the request's limits. Leave margin rather than landing at a limit. If the tool cannot be run here, say so in your answer."
+    )
+}
+
+/// The word or phrase by which the request asks for speed (`as efficient as possible`,
+/// `optimize`, `faster`, `speed up`), or `None`.
+pub(in crate::agent) fn requested_speed(instruction: &str) -> Option<String> {
+    let lower = instruction.to_ascii_lowercase();
+    for phrase in ["speed up", "speedup", "as fast as"] {
+        if lower.contains(phrase) {
+            return Some(phrase.to_owned());
+        }
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|word| {
+            word.starts_with("optimiz")
+                || word.starts_with("optimis")
+                || word.starts_with("efficien")
+                || matches!(*word, "faster" | "fastest" | "performant")
+        })
+        .map(str::to_owned)
+}
+
+/// Told once, in an unattended run, when the request asks for speed.
+pub(in crate::agent) fn performance_reason(word: String) -> String {
+    format!(
+        "The request asks for speed (\"{word}\"), and matching output does not show that. Before finishing, time the delivered version on the request's own input in a fresh process, print the time, and make a check:true fail unless it is clearly faster than the original (if there is one), or within any limit the request states. Run a slow original only once: save its output and time to files, then compare each later version against those files instead of running the original again. Make sure the timed command really runs the work (for example the query against its database, not an empty input). If yours is slow, find the repeated or quadratic work (correlated subqueries, nested scans, missing indexes it may use) and rework it, then check again. When the request asks for the fastest result (\"as efficient as possible\", \"optimize\"), beating the original is not the bar, since a reference solution may be timed against yours: try at least one alternative formulation, time each a few times on the real input, and keep the fastest. If speed is not what the request asks, finish again."
+    )
+}
+
+/// Function names the request asks for: `function named "ars"`, `function called ars`,
+/// ``a `parse()` function``. Bounded to a few names; quotes, backticks and `()` are stripped.
+pub(in crate::agent) fn requested_functions(instruction: &str) -> Vec<String> {
+    let words: Vec<&str> = instruction.split_whitespace().collect();
+    let ident = |word: &str| {
+        let name = word
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | '.' | ':' | ';'))
+            .trim_end_matches("()");
+        let name = name.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+        let quoted = word.starts_with(['"', '\'', '`']);
+        (quoted
+            && !name.is_empty()
+            && name.len() <= 64
+            && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.')))
+        .then(|| name.to_owned())
+    };
+    let mut names = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        if !matches!(lower.as_str(), "function" | "method") {
+            continue;
+        }
+        // `function named "x"`, `function `x``, or `"x()" function`; a bare quoted word before
+        // `function` (`the "d" function family`) is description, not a name.
+        let after = match words.get(index + 1).map(|w| w.to_ascii_lowercase()) {
+            Some(w) if w == "named" || w == "called" => words.get(index + 2).copied(),
+            _ => words.get(index + 1).copied().filter(|w| w.starts_with('`')),
+        };
+        let before = index
+            .checked_sub(1)
+            .and_then(|i| words.get(i).copied())
+            .filter(|w| w.contains("()"));
+        for name in [after, before].into_iter().flatten().filter_map(ident) {
+            if !names.contains(&name) && names.len() < 4 {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Appended when an aggregate zero exit cannot establish that the checked pipeline passed. The
+/// note names the accepted shape, because a model that already wrote `pipefail` somewhere else
+/// (after `cd dir &&`, or before several commands) cannot tell from a generic note what is wrong.
+pub(in crate::agent) fn masked_check_note(command: &str) -> String {
+    let fix = if trailing_display_masks(command) {
+        "The command ends with a display command (`echo`, `tail`, `cat` ...) after the check, so its exit status is that command's, not the check's. End with the check itself (put any display before it, or use `cmd > log 2>&1 && tail log`), or run the check alone."
+    } else if command.contains("pipefail") {
+        "`set -o pipefail` counts only as the very first statement, unconditional (no `cd dir &&` or other command before it), with every pipeline inside the final `&&`-chain (no `||`, `!`, `&`, or later `set`). Set the directory with the bash `cwd` argument instead of a leading `cd`, or redirect output to a file and check that file without a pipe."
+    } else {
+        "Rerun without the pipe (redirect output to a file and check that file), or start the command with `set -o pipefail;` followed by the checked pipeline (or `&&`-chain ending in it). Set the directory with the bash `cwd` argument instead of a leading `cd`."
+    };
+    format!(
+        "\n[Dial check] Not counted as a passing check: the shell's zero exit does not establish that the checked command passed. {fix}"
+    )
+}
 
 /// Only a literal, unconditional setup followed by the checked foreground pipeline makes an
 /// aggregate zero reliable here. Do not try to simulate shell option state across other commands.
 pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
     use ast_grep_language::{LanguageExt, SupportLang};
 
+    if trailing_display_masks(command) {
+        return true;
+    }
     if !command.contains('|') {
         return false;
     }
@@ -2288,7 +2842,7 @@ pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
         return true;
     }
     // A predicate comparing a substitution's output checks its value, not its exit.
-    let mut pipelines = root
+    let pipelines = root
         .dfs()
         .filter(|n| n.kind() == "pipeline")
         .filter(|node| {
@@ -2305,65 +2859,169 @@ pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
                     || n.field("name").is_some_and(|name| name.text() == "test")
             })
         });
-    let Some(pipeline) = pipelines.next() else {
+    let checked_pipelines: Vec<usize> = pipelines.map(|node| node.node_id()).collect();
+    if checked_pipelines.is_empty() {
         return false;
-    };
-    if pipelines.next().is_some() {
-        return true;
     }
 
-    // Keep operators (including background `&`) when matching the two-statement program.
+    let is_enable_pipefail = |text: &str, kind: &str| -> bool {
+        let mut words = text.split([' ', '\t']).filter(|word| !word.is_empty());
+        kind == "command"
+            && words.next() == Some("set")
+            && words
+                .next()
+                .and_then(|w| w.strip_prefix('-')?.strip_suffix('o'))
+                .is_some_and(|flags| flags.bytes().all(|b| matches!(b, b'e' | b'u' | b'x')))
+            && words.next() == Some("pipefail")
+            && words.next().is_none()
+    };
+
+    // Keep operators (including background `&`) when inspecting top-level statements.
     let statements: Vec<_> = root
         .children()
         .filter(|n| !matches!(n.kind().as_ref(), "comment" | ";"))
         .collect();
-    let (setup, check) = match statements.as_slice() {
-        [setup, check] => (setup.clone(), check.clone()),
-        [statement] => {
-            // A trailing file redirect can wrap the whole `set ... && cmd | filter` list.
-            let list = statement
-                .field("body")
-                .filter(|_| statement.kind() == "redirected_statement")
-                .unwrap_or_else(|| statement.clone());
-            if list.kind() != "list" {
-                return true;
-            }
-            let items: Vec<_> = list.children().filter(|n| n.kind() != "comment").collect();
-            let [setup, operator, check] = items.as_slice() else {
+    if statements.is_empty() || statements.iter().any(|node| node.kind() == "&") {
+        return true;
+    }
+    let (setup_id, chain_root, drop_first) = if statements.len() == 1 {
+        (None, statements[0].clone(), true)
+    } else {
+        let setup = &statements[0];
+        if !is_enable_pipefail(&setup.text(), setup.kind().as_ref()) {
+            return true;
+        }
+        (
+            Some(setup.node_id()),
+            statements.last().unwrap().clone(),
+            false,
+        )
+    };
+
+    // Flatten the final statement's `&&`-chain in left-to-right order; any `||` fails closed.
+    let mut chain = Vec::new();
+    let mut stack = vec![chain_root];
+    while let Some(node) = stack.pop() {
+        let node = node
+            .field("body")
+            .filter(|_| node.kind() == "redirected_statement")
+            .unwrap_or(node);
+        if node.kind() == "list" {
+            let items: Vec<_> = node.children().filter(|n| n.kind() != "comment").collect();
+            let [left, operator, right] = items.as_slice() else {
                 return true;
             };
             if operator.kind() != "&&" {
                 return true;
             }
-            (setup.clone(), check.clone())
+            stack.push(right.clone());
+            stack.push(left.clone());
+        } else {
+            chain.push(node);
         }
-        _ => return true,
+    }
+    let (setup_id, checked_items) = if drop_first {
+        let Some((first, rest)) = chain.split_first() else {
+            return true;
+        };
+        if rest.is_empty() || !is_enable_pipefail(&first.text(), first.kind().as_ref()) {
+            return true;
+        }
+        (first.node_id(), rest)
+    } else {
+        (setup_id.unwrap(), chain.as_slice())
     };
-    let text = setup.text();
-    let mut words = text.split([' ', '\t']).filter(|word| !word.is_empty());
-    let enables = setup.kind() == "command"
-        && words.next() == Some("set")
-        && words
-            .next()
-            .and_then(|w| w.strip_prefix('-')?.strip_suffix('o'))
-            .is_some_and(|flags| flags.bytes().all(|b| matches!(b, b'e' | b'u' | b'x')))
-        && words.next() == Some("pipefail")
-        && words.next().is_none();
-    let check = check
-        .field("body")
-        .filter(|_| check.kind() == "redirected_statement")
-        .unwrap_or(check);
-    !enables
-        || check.node_id() != pipeline.node_id()
-        || !pipeline.named_children().all(|stage| {
-            matches!(
-                stage.kind().as_ref(),
-                "command" | "test_command" | "comment"
-            ) || stage.kind() == "redirected_statement"
-                && stage
-                    .field("body")
-                    .is_some_and(|body| matches!(body.kind().as_ref(), "command" | "test_command"))
-        })
+
+    // Reject any second `set` command anywhere in the script (e.g. `set +o pipefail`).
+    if root.dfs().any(|node| {
+        node.node_id() != setup_id
+            && node.kind() == "command"
+            && node.field("name").is_some_and(|name| name.text() == "set")
+    }) {
+        return true;
+    }
+
+    let mut covered_pipelines = Vec::new();
+    for item in checked_items {
+        match item.kind().as_ref() {
+            "command" | "test_command" => {}
+            "pipeline" => {
+                // tree-sitter-bash can associate a preceding `&&`-list inside a redirected
+                // pipeline stage (`a && b 2>&1 | c`); accept an `&&`-only chain of simple
+                // commands/tests there too, still failing closed on `||`, `!` or subshells.
+                let mut simple = true;
+                let mut stage_stack: Vec<_> = item.named_children().collect();
+                while let Some(stage) = stage_stack.pop() {
+                    let stage = stage
+                        .field("body")
+                        .filter(|_| stage.kind() == "redirected_statement")
+                        .unwrap_or(stage);
+                    match stage.kind().as_ref() {
+                        "command" | "test_command" | "comment" => {}
+                        "list" => {
+                            let items: Vec<_> =
+                                stage.children().filter(|n| n.kind() != "comment").collect();
+                            let [left, operator, right] = items.as_slice() else {
+                                simple = false;
+                                break;
+                            };
+                            if operator.kind() != "&&" {
+                                simple = false;
+                                break;
+                            }
+                            stage_stack.push(right.clone());
+                            stage_stack.push(left.clone());
+                        }
+                        _ => {
+                            simple = false;
+                            break;
+                        }
+                    }
+                }
+                if !simple {
+                    return true;
+                }
+                covered_pipelines.push(item.node_id());
+            }
+            _ => return true,
+        }
+    }
+    !checked_pipelines
+        .iter()
+        .all(|id| covered_pipelines.contains(id))
+}
+
+/// `cmd > log 2>&1; echo exit=$?; tail log`: the shell exits with the trailing display command's
+/// status, so a failing `cmd` still yields zero. Leading `cd`/`set`/`export` setup and an earlier
+/// display-only statement do not count as the checked work.
+fn trailing_display_masks(command: &str) -> bool {
+    use ast_grep_language::{LanguageExt, SupportLang};
+
+    let ast = SupportLang::Bash.ast_grep(command);
+    let root = ast.root();
+    if root.get_inner_node().has_error() {
+        return false;
+    }
+    let statements: Vec<String> = root
+        .children()
+        .filter(|n| !matches!(n.kind().as_ref(), "comment" | ";" | "&"))
+        .map(|n| n.text().to_string())
+        .collect();
+    let Some((last, earlier)) = statements.split_last() else {
+        return false;
+    };
+    let setup = |text: &str| {
+        !text.contains("&&")
+            && !text.contains("||")
+            && matches!(
+                text.split_whitespace().next(),
+                Some("cd" | "set" | "export" | "source" | ".")
+            )
+    };
+    display_only(last)
+        && earlier
+            .iter()
+            .any(|statement| !setup(statement) && !display_only(statement))
 }
 
 #[cfg(test)]

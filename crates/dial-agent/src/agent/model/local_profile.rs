@@ -419,7 +419,7 @@ impl Agent<'_> {
         harness_temperature: f64,
     ) -> Option<&'static str> {
         host_default_sampling(
-            self.config,
+            self.effective_config(),
             &self.auth_config,
             self.hermetic,
             profile,

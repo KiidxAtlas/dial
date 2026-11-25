@@ -84,6 +84,12 @@ class InterpretationFixtureTests(unittest.TestCase):
         self.assertIsNone(json.loads((FIXTURE / "source-register.json").read_text())["authority_order"])
         self.assertIsNone(answer["approved"])
         self.assertNotEqual(answer["quotes"][0]["quote"], answer["quotes"][1]["quote"])
+        ranked = EXPECTED["ranked-quotes"]
+        self.assertEqual(ranked["quotes"], answer["quotes"])
+        order = json.loads((FIXTURE / "source-register-ranked.json").read_text())["authority_order"]
+        self.assertEqual(order[0], ranked["quotes"][0]["source"])
+        self.assertIs(ranked["approved"], True)
+        self.assertEqual((answer["status"], ranked["status"]), ("unresolved", "resolved"))
 
     def test_nested_records_and_missing_jsonl_duration(self):
         nested = json.loads((FIXTURE / "nested.json").read_text())

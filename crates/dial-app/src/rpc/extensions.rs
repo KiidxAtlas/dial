@@ -36,6 +36,7 @@ pub(super) fn list(layout: &Layout, config: &Config) -> Value {
     let snapshot = crate::app::extensions_snapshot(layout, config);
     json!({
         "mcp": snapshot.mcp.iter().map(row).collect::<Vec<_>>(),
+        "discovery_paths": crate::tools::integrations::mcp::foreign::source_labels().collect::<Vec<_>>(),
         "skills": snapshot.skills.iter().map(row).collect::<Vec<_>>(),
     })
 }
@@ -61,7 +62,7 @@ fn intent(params: &Value) -> Result<Intent> {
         return Err(coded(
             ErrorCode::InvalidParams,
             format!(
-                "{}: this changes files, runs a downloaded command, or removes or disables something; ask the user, then send it again with confirm: true",
+                "{}: ask the user, then send it again with confirm: true",
                 intent.describe()
             ),
         ));
@@ -119,6 +120,7 @@ pub(super) fn start(
                     "saved_scope": saved.map(settings::scope_name),
                     "apply_settings": saved.is_some(),
                     "form": shown.form.as_ref().map(form),
+                    "discovered": shown.discovered.as_ref().map(|rows| rows.iter().map(row).collect::<Vec<_>>()),
                     "catalog": shown.catalog.as_ref().map(catalog),
                 })
             });

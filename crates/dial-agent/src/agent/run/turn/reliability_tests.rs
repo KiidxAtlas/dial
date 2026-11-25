@@ -226,6 +226,38 @@ fn a_deadline_passing_during_a_tool_round_skips_the_unstarted_calls_and_stops() 
     );
 }
 
+#[test]
+fn a_deadline_ends_an_unbounded_background_wait_and_stops_the_turn() {
+    // A `bg wait` with `timeout: 0` waits until the job exits; a run whose `--max-time` passed
+    // during such a wait used to keep waiting until an outer harness killed it.
+    let server = llm::fake::serve(vec![
+        calls(&[
+            (
+                "bg",
+                json!({"action":"start","name":"slow","command":"sleep 60"}),
+            ),
+            ("bg", json!({"action":"wait","name":"slow","timeout":0})),
+        ]),
+        llm::fake::json(200, &json!({"total_slots":1})),
+    ]);
+    let started = std::time::Instant::now();
+    let report = with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        // Print runs are not hermetic; match their dispatch path.
+        agent.hermetic = false;
+        agent.modes.launch.deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        agent.turn("Start it and wait", &mut NullUi).unwrap()
+    });
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the wait outlived the deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert!(report.text.contains("--max-time"), "{}", report.text);
+}
+
 /// Interrupts only once both parallel reads have visibly completed, before the write can run.
 struct InterruptAfterParallelReads {
     interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -348,6 +380,47 @@ fn request_timeouts_are_clamped_to_the_time_left() {
     assert_eq!(clamp_to_deadline(0, Some(Duration::from_secs(40))), 40);
     assert_eq!(clamp_to_deadline(5, Some(Duration::from_secs(40))), 5);
     assert_eq!(clamp_to_deadline(600, Some(Duration::ZERO)), 1);
+}
+
+#[test]
+fn the_time_left_is_announced_at_the_start_and_at_half_time_once_each() {
+    use super::begin::time_left_notice;
+    use std::time::Duration;
+    let total = Duration::from_secs(880);
+    let (mark, first) = time_left_notice(total, total, 0).unwrap();
+    assert_eq!(mark, 1);
+    assert!(
+        first.contains("About 14 min of this run's --max-time remains"),
+        "{first}"
+    );
+    assert!(first.contains("timeouts and waits"), "{first}");
+    assert!(time_left_notice(total, Duration::from_secs(600), 1).is_none());
+    let (mark, half) = time_left_notice(total, Duration::from_secs(430), 1).unwrap();
+    assert_eq!(mark, 2);
+    assert!(half.contains("About 7 min"), "{half}");
+    assert!(half.contains("working deliverable"), "{half}");
+    assert!(time_left_notice(total, Duration::from_secs(100), 2).is_none());
+    // A turn that starts with under half left skips straight to the second note, in seconds.
+    let (mark, late) = time_left_notice(total, Duration::from_secs(90), 0).unwrap();
+    assert_eq!(mark, 2);
+    assert!(late.contains("About 90 s"), "{late}");
+    assert!(time_left_notice(Duration::ZERO, Duration::ZERO, 0).is_none());
+}
+
+#[test]
+fn calls_whose_limit_reaches_past_the_deadline_are_told_the_time_left() {
+    use super::begin::deadline_overrun_note;
+    use std::time::Duration;
+    let left = Duration::from_secs(300);
+    let note = deadline_overrun_note("bash", &json!({"command":"x","timeout":3500}), left).unwrap();
+    assert!(note.contains("a 3500 s timeout"), "{note}");
+    assert!(note.contains("about 5 min"), "{note}");
+    assert!(deadline_overrun_note("bash", &json!({"command":"x","timeout":120}), left).is_none());
+    assert!(deadline_overrun_note("bash", &json!({"command":"x"}), left).is_none());
+    let wait = deadline_overrun_note("bg", &json!({"action":"wait","timeout":0}), left).unwrap();
+    assert!(wait.contains("no time limit"), "{wait}");
+    assert!(deadline_overrun_note("bg", &json!({"action":"output","timeout":0}), left).is_none());
+    assert!(deadline_overrun_note("read", &json!({"timeout":9999}), left).is_none());
 }
 
 #[test]
@@ -734,6 +807,74 @@ fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
         "the reminder carries the gate's own check output"
     );
     assert!(!mentions(&requests[1], "no passing applicable check"));
+}
+
+#[test]
+fn an_unattended_run_is_told_once_up_front_that_finishing_needs_a_passing_check() {
+    let server = llm::fake::serve(vec![
+        calls(&[("bash", json!({"command":"printf 'one\\n' > out.txt"}))]),
+        slots(),
+        calls(&[("bash", json!({"command":"printf 'two\\n' >> out.txt"}))]),
+        calls(&[(
+            "bash",
+            json!({"command":"grep -q two out.txt","check":true}),
+        )]),
+        response("Wrote out.txt.", None),
+    ]);
+    let report = with_agent(
+        "approval=\"auto\"\n[compaction]\nenabled=false\n[harness]\ntools=['bash']\n",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent.turn("Write out.txt", &mut NullUi).unwrap()
+        },
+    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    let hint = "This run is unattended: finishing is accepted only after a check passes";
+    assert_eq!(requests.len(), 4, "no completion deferral round");
+    assert!(!mentions(&requests[0], hint));
+    assert!(mentions(&requests[1], hint));
+    // Repeated history carries the first result's hint; no later result adds another.
+    let count = |request: &Value| request.to_string().matches(hint).count();
+    assert_eq!(count(&requests[3]), 1);
+}
+
+#[test]
+fn an_unattended_request_for_speed_is_told_up_front_and_asked_once_to_time_it() {
+    let server = llm::fake::serve(vec![
+        calls(&[("bash", json!({"command":"printf 'one\\n' > out.txt"}))]),
+        slots(),
+        calls(&[(
+            "bash",
+            json!({"command":"grep -q one out.txt","check":true}),
+        )]),
+        response("Made it faster.", None),
+        response("Timed it; it is faster.", None),
+    ]);
+    let report = with_agent(
+        "approval=\"auto\"\n[compaction]\nenabled=false\n[harness]\ntools=['bash']\n",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent
+                .turn("Make out.txt faster to produce", &mut NullUi)
+                .unwrap()
+        },
+    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    let hint = "Run a slow original only once";
+    assert_eq!(requests.len(), 4, "one speed deferral round");
+    assert!(!mentions(&requests[0], hint));
+    assert!(mentions(&requests[1], hint));
+    assert!(mentions(&requests[3], "time the delivered version"));
+    let count = |request: &Value| request.to_string().matches(hint).count();
+    assert_eq!(
+        count(&requests[3]),
+        2,
+        "the hint once, plus the deferral's own wording"
+    );
 }
 
 #[test]
@@ -1189,6 +1330,52 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
             && !result.contains("tool_load"),
         "{result}"
     );
+}
+
+/// Unattended, a command that reaches the default bash timeout moves to `bg` instead of being
+/// killed: nobody is there to rerun work an expired timeout threw away.
+#[test]
+fn an_unattended_command_at_the_default_timeout_moves_to_bg_instead_of_being_killed() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"until test -f release-job; do sleep 0.01; done; echo done"}),
+            )),
+        ),
+        slots(),
+        response("Started.", None),
+        response("Finished.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[shell]\nbash_timeout_secs=1",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            struct Release(PathBuf);
+            impl Ui for Release {
+                fn text_delta(&mut self, text: &str) {
+                    if text.contains("Started") {
+                        std::fs::write(&self.0, "release").unwrap();
+                    }
+                }
+            }
+            let mut ui = Release(agent.workspace.root().join("release-job"));
+            agent.turn("Run the slow command.", &mut ui).unwrap();
+        },
+    );
+    let requests = completion_requests(&server);
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .to_string();
+    assert!(result.contains("background job"), "{result}");
+    assert!(!result.contains("timed out"), "{result}");
 }
 
 /// Unattended runs copy task inputs silently: the first request carries no preservation note,

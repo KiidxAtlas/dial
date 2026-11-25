@@ -1,0 +1,37 @@
+version = 1
+name = "discovery-routing-v1"
+
+# Outcome checks only. Grade tool choice separately on the resulting direct report
+# with discovery_routing.py: an accurate answer via a different route is still accurate.
+[[cases]]
+id = "transcript-preview-path"
+project = "examples/benchmarks/discovery-routing-fixture"
+prompt = "Where is the desktop transcript preview fixture? I remember 'transcript' and 'preview' from the filename but not the directory. Reply with just its project-relative path."
+checks = [{kind="response_equals",content="samples/desktop/transcript-preview-wide.json"}]
+
+[[cases]]
+id = "bounded-total-owner"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "What function sums ledger rows but caps the result even if the rows add up to more? Reply with just its source filename and function name, separated by a colon."
+checks = [{kind="response_equals",content="ledger.py:bounded_total"}]
+
+[[cases]]
+id = "literal-label-source"
+project = "examples/benchmarks/registry-discovery-fixture"
+prompt = "Which file contains the exact UI label 'Browse the session tree'? Reply with just its project-relative path."
+checks = [{kind="response_equals",content="src/command_registry.rs"}]
+
+[[cases]]
+id = "focused-preview-test"
+project = "examples/benchmarks/discovery-routing-fixture"
+prompt = "Before I ship the desktop preview, run its existing desktop sample test in test_samples.py. I only need that result, not the mobile test. Leave the source and tests alone."
+checks = [
+  {kind="file_equals",path="desktop.checked",content="cedar\n"},
+  {kind="command",command="python3 -c 'from pathlib import Path; assert not Path(\"mobile.checked\").exists()'"},
+]
+
+[[cases]]
+id = "build-preview-catalog"
+project = "examples/benchmarks/discovery-routing-fixture"
+prompt = "Please build the sample catalog using this project's build_catalog.py, so the generated catalog is ready to hand off. No source changes or package installs needed."
+checks = [{kind="file_equals",path="catalog.txt",content="desktop: cedar\nmobile: hazel\n"}]

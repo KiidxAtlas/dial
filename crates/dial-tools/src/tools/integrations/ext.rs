@@ -247,9 +247,20 @@ pub trait Tool: Send + Sync {
     fn has_live_work(&self) -> bool {
         false
     }
+    /// Bounded new output from this session's running jobs, for the next model request only.
+    /// Independent of UI delivery; previews never consume explicit `bg output` reads.
+    fn take_live_job_previews(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Names of `bash`-started jobs this session still awaits. A turn ending while any remain
     /// waits for them (see `await_work`), and `finish completed` is refused.
     fn awaited_work(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The subset of [`awaited_work`](Self::awaited_work) the caller explicitly sent to the
+    /// background (`bash background: true`). An unattended run reports these at once instead of
+    /// waiting on them: the caller already chose not to block on them.
+    fn requested_background_work(&self) -> Vec<String> {
         Vec::new()
     }
     /// Running jobs this session owns but does not await, as `name (command)`: named services

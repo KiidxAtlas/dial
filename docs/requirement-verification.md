@@ -11,10 +11,11 @@ It includes recorded evidence statuses at the current effect revision; it does *
 external input freshness, record a pass, or establish that the declared checks cover the task.
 
 For shell checks, exit 0 from a trailing filter does not prove that an earlier pipeline stage
-passed. Run the check directly, or put `set -o pipefail` immediately before the foreground
-check pipeline. A comment mentioning `pipefail`, a disabled option, or a setting confined
-to another shell is not evidence. An ambiguous pipeline can still produce useful output, but
-its aggregate zero does not earn a passing receipt.
+passed. Run the check directly, or put `set -o pipefail` as the unconditional first statement
+with every checked pipeline inside the final `&&`-chain (no `||`, `!`, `&`, or later `set`).
+A comment mentioning `pipefail`, a disabled option, or a setting confined to another shell is
+not evidence. An ambiguous pipeline can still produce useful output, but its aggregate zero does
+not earn a passing receipt.
 
 The latest 32 source-bound Eval checks in the turn are reported separately under
 `artifact_local_checks`. The plan and completion evidence compare each source's current bytes
@@ -58,8 +59,14 @@ command = "python3 -m unittest tests.test_errors"
 file_extensions = ["py"]
 
 [verification.requirements.input-domain]
-checks = ["input-boundaries", "error-contract"]
+checks = ["input-boundaries"]
 # Optional: enforce this contract when this working-state deliverable is claimed satisfied.
+deliverables = ["boundary-handling"]
+
+# A change can accept the new input but break the existing error contract.
+# Track that invariant separately on the same deliverable; one pass cannot cover both.
+[verification.requirements.preserved-errors]
+checks = ["error-contract"]
 deliverables = ["boundary-handling"]
 
 # Optional: needs current native rendered pixels delivered to a model request.
@@ -176,6 +183,14 @@ current passing evidence or an explicitly supported disclosure; one passing chec
 different stale, unobserved or undisclosed failed check. The reminder names only the checks that
 remain unverified. An earlier failure does not block once a later current pass or valid disclosure
 supersedes it.
+
+A run that names a file changed in this turn and fails with a parse or compile error located in
+that file also refuses completion. Examples are a Python traceback frame `File "main.py", line 3`
+followed by `SyntaxError`, or a compiler `main.c:3:5: error:`. The refusal holds until the file
+changes or the same consumer runs it successfully: the same Eval language, or the same program
+for `bash`. A different consumer passing does not discharge it. For example, `gcc` compiling a
+polyglot file says nothing about its Python half. Runtime exceptions are not gated. If the file
+cannot be fixed, finish as blocked and name the failure.
 
 Focused Rust source checks explicitly select their owning package, including a root package
 excluded by workspace `default-members`. Deleted declaration files still leave obligations to

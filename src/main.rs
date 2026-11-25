@@ -101,6 +101,15 @@ fn main() {
     if let Some(suggestion) = args::mistyped_subcommand(&cli, std::env::args_os()) {
         args::mistyped_subcommand_error(&cli.prompt[0], &suggestion).exit();
     }
+    // A print-mode prompt given as an argument is part of this process's command line, so a
+    // command the agent runs (`pkill -f qemu`) would match and kill Dial when the prompt mentions
+    // it. The parsed prompt is all that is needed from here on.
+    if cli.print && !cli.prompt.is_empty() {
+        let texts: Vec<&str> = cli.prompt.iter().map(String::as_str).collect();
+        if let Err(error) = dial::platform::argv::blank_arguments(&texts) {
+            eprintln!("dial: the prompt stays visible in the process list: {error}");
+        }
+    }
     if cli.build_info {
         println!(
             "{}",

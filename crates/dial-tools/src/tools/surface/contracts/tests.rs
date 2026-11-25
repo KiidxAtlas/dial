@@ -1029,6 +1029,7 @@ fn registry_contracts_accept_each_intermediate_additive_release_shape() {
         .chain(crate::tools::exec::eval::tools(&config))
         .chain(crate::tools::knowledge::data::tools(&config))
         .chain(crate::tools::exec::background::tools(&config))
+        .chain(crate::tools::code::navigation::tools(&config))
         .chain(crate::tools::code::lsp::tools(&config))
         .chain(crate::tools::code::dap::tools(&BTreeMap::new()))
     {
@@ -1205,6 +1206,7 @@ fn history_recorded_under_pre_rename_parameter_names_projects_onto_the_simpler_n
         .unwrap()
         .schema();
     let mut before = current.clone();
+    before["function"]["parameters"]["properties"]["mode"]["enum"] = json!(["behavior", "exact"]);
     legacy_schema(&mut before);
     let history = old_names_history("find", before, r#"{"query":"q","grep_keywords":["a"]}"#);
     let projected = project_history(&history, std::slice::from_ref(&current), &registry)

@@ -94,16 +94,20 @@ def summarize_configuration(entry, repetitions):
         if any(value is not None and (type(value) is not int or value < 0) for value in repairs):
             raise ValueError(f"invalid repair attempts: {task}")
         successful_ms = [case["metrics"]["elapsed_ms"] for case in cases if checked_success(case)]
+        false_completions = {trial: evidence(case).get("false_completion") for trial, case in trials.items()}
         any_curve, all_curve = consistency_curves(repetitions, successes) if eligible else (None, None)
         tasks.append({
             "id": task,
             "checked": eligible,
             "trials": repetitions,
             "checked_successes": successes,
+            "first_trial_passed": checked_success(trials[0]) if eligible else None,
             "checked_success_rate": successes / repetitions if eligible else None,
             "success_rate_wilson_95": wilson_interval(successes, repetitions) if eligible else None,
             "all_trials_passed": successes == repetitions if eligible else None,
             "any_trial_passed": successes > 0 if eligible else None,
+            "false_completion_trials": sorted(i for i, value in false_completions.items() if value is True),
+            "false_completion_assessed_trials": sum(value is not None for value in false_completions.values()),
             "unavailable_check_trials": sum(bool(evidence(case)["unavailable_check_indices"]) for case in cases),
             "agent_error_trials": sum(case["metrics"].get("agent_error") is True for case in cases),
             "all_trial_median_ms": statistics.median(case["metrics"]["elapsed_ms"] for case in cases),
@@ -127,6 +131,10 @@ def summarize_configuration(entry, repetitions):
         "run_contract": report["contract"],
         "checked_tasks": len(checked),
         "excluded_tasks": [task["id"] for task in tasks if not task["checked"]],
+        "false_completions": sum(len(task["false_completion_trials"]) for task in checked)
+                             if any(task["false_completion_assessed_trials"] for task in checked) else None,
+        "false_completion_assessed_trials": sum(task["false_completion_assessed_trials"] for task in checked),
+        "first_trial_passed_fraction": sum(task["first_trial_passed"] for task in checked) / len(checked) if checked else None,
         "checked_trial_success_rate": sum(task["checked_successes"] for task in checked) / (len(checked) * repetitions) if checked else None,
         "observed_all_trials_passed_fraction": sum(task["all_trials_passed"] for task in checked) / len(checked) if checked else None,
         "observed_any_trial_passed_fraction": sum(task["any_trial_passed"] for task in checked) / len(checked) if checked else None,

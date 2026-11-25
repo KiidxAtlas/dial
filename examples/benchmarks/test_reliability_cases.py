@@ -1,7 +1,7 @@
 """Adversarial grader regressions for reliability.toml: wrong or partial fixes must fail.
 
 Each wrong implementation is a plausible partial fix. Mutants that pass the visible unit tests
-are the false-success traps; the acceptance command (the first check) must still reject them.
+are the false-success traps; at least one independent acceptance check must still reject them.
 Offline only: no model, network or service is involved."""
 import pathlib
 import shutil
@@ -84,7 +84,7 @@ def apply(workspace, edits):
 
 
 def run_checks(case, workspace):
-    """Per-check outcomes in declaration order; the first check is the acceptance command."""
+    """Per-check outcomes in declaration order; visible unit tests run last."""
     results = []
     for check in case["checks"]:
         completed = subprocess.run(check["command"], cwd=workspace, shell=True,
@@ -109,7 +109,7 @@ class ReliabilityFixtureTests(unittest.TestCase):
                 workspace = self.workspace(case_id)
                 self.assertFalse(all(run_checks(case, workspace)))
                 apply(workspace, FIXES[case_id])
-                self.assertEqual(run_checks(case, workspace), [True, True])
+                self.assertEqual(run_checks(case, workspace), [True] * len(case["checks"]))
 
     def test_wrong_fixes_fail_acceptance_even_when_visible_tests_pass(self):
         for case_id, name, filename, anchor, replacement, visible_passes, base in MUTANTS:
@@ -118,8 +118,11 @@ class ReliabilityFixtureTests(unittest.TestCase):
                 if base == "fix":
                     apply(workspace, FIXES[case_id])
                 apply(workspace, [(filename, anchor, replacement)])
-                acceptance, visible = run_checks(CASES[case_id], workspace)
-                self.assertFalse(acceptance)
+                *acceptance, visible = run_checks(CASES[case_id], workspace)
+                self.assertFalse(all(acceptance))
+                if case_id == "ledger-export-keeps-refunds":
+                    broke_totals = name == "export-fixed-total-sign-flipped"
+                    self.assertEqual(acceptance, [broke_totals, not broke_totals])
                 self.assertEqual(visible, visible_passes)
 
     def test_exponent_mutant_is_rejected_only_for_exponent_notation(self):

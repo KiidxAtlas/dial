@@ -693,7 +693,11 @@ fn parse_anchor(target: &str) -> Result<Anchor, String> {
         let n = parse_line_number(target, "line")?;
         return Ok(Anchor::Range(n, n));
     }
-    if let Some((a, b)) = target.split_once(".=").or_else(|| target.split_once(',')) {
+    if let Some((a, b)) = target
+        .split_once(".=")
+        .or_else(|| target.split_once(','))
+        .or_else(|| target.split_once(':'))
+    {
         let (a, b) = (
             parse_line_number(a, "range start")?,
             parse_line_number(b, "range end").map_err(|error| {

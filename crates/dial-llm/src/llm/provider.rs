@@ -379,6 +379,7 @@ pub struct Backend {
     /// A fallback model is ready for the next request; see [`Backend::next_request_failover`].
     next_failover: Option<crate::config::types::FallbackOn>,
     steering_config: Option<crate::config::types::Config>,
+    local_engine: llm::local_runtime::LocalEngine,
     /// Explicit retry limits for a bounded caller (diagnostics); kept by [`Backend::without_steering`].
     retry_override: Option<crate::config::types::RetryConfig>,
     steering_runtime: serde_json::Value,
@@ -485,6 +486,7 @@ impl Backend {
             next_reasoning_guard: None,
             next_failover: None,
             steering_config: None,
+            local_engine: Default::default(),
             retry_override: None,
             steering_runtime: serde_json::json!({"state":"disabled","uses":0}),
             usage_scope: None,
@@ -879,6 +881,11 @@ impl Backend {
         } else {
             worker_timeout_secs
         }
+    }
+
+    pub fn with_local_engine(mut self, engine: llm::local_runtime::LocalEngine) -> Self {
+        self.local_engine = engine;
+        self
     }
 
     pub fn with_steering(mut self, config: &crate::config::types::Config) -> Self {
@@ -1377,6 +1384,122 @@ impl Backend {
         }
     }
 
+    /// Start the selected managed server, without constructing a turn or sending user text.
+    pub fn prepare_local_model(&mut self, interrupt: Arc<AtomicBool>) -> Result<()> {
+        let ProviderKind::Local { model_dir } = &self.kind else {
+            anyhow::bail!("model preparation requires a Dial-managed local model");
+        };
+        let model_dir = model_dir.clone();
+        let profile = self.profile.clone();
+        self.ensure_local_server(
+            &model_dir,
+            None,
+            profile.as_ref(),
+            interrupt,
+            &mut |_| {},
+            &mut |_| true,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_local_server(
+        &mut self,
+        model_dir: &str,
+        adapter: Option<&Path>,
+        profile: Option<&llm::profiles::ModelProfile>,
+        interrupt: Arc<AtomicBool>,
+        on_notice: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
+    ) -> Result<bool> {
+        *self.adapter_monitor.lock() = AdapterRuntime {
+            adapter: adapter.map(Path::to_path_buf),
+            phase: AdapterPhase::Loading,
+        };
+        let steering = self.steering_config.as_ref().and_then(|config| {
+            if let Some(reason) = crate::llm::steering::local_unsupported_reason(model_dir) {
+                if (config.steering.enabled || config.steering.automatic)
+                    && config.steering.strength > 0.0
+                {
+                    let state = serde_json::json!({"state":"unsupported","reason":reason,"uses":0});
+                    let changed = self.steering_runtime != state;
+                    self.steering_runtime = state;
+                    if config.steering.enabled && changed {
+                        on_notice(&format!("Activation steering unavailable: {reason}"));
+                    }
+                } else {
+                    self.steering_runtime = serde_json::json!({"state":"disabled","uses":0});
+                }
+                return None;
+            }
+            match crate::llm::steering::specification(config, model_dir) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    if let Some(notice) =
+                        Self::steering_bypass(&mut self.steering_runtime, format!("{error:#}"))
+                    {
+                        on_notice(&notice);
+                    }
+                    None
+                }
+            }
+        });
+        let mut runtime = profile
+            .as_ref()
+            .and_then(|p| p.local_runtime.clone())
+            .or_else(|| {
+                self.steering_config
+                    .as_ref()
+                    .map(|config| config.local_runtime.clone())
+            })
+            .unwrap_or_default();
+        runtime.engine = self.local_engine;
+        if steering.is_some() && runtime.draft_model.is_some() {
+            let reason = "steering does not support speculative inference".to_string();
+            if let Some(notice) = Self::steering_bypass(&mut self.steering_runtime, reason) {
+                on_notice(&notice);
+            }
+        }
+        let phase = if self.server.as_ref().is_some_and(|server| {
+            server.ready_for(
+                model_dir,
+                adapter,
+                steering.as_ref(),
+                &runtime,
+                self.steering_config.as_ref(),
+            )
+        }) {
+            llm::InferencePhase::Processing
+        } else {
+            llm::InferencePhase::Loading
+        };
+        if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(phase))) {
+            return Err(llm::Interrupted.into());
+        }
+        let started = {
+            // Startup's 1-token warmup is not an attempt of the user's logical request.
+            let _startup_accounting = llm::usage::Transport::suspend();
+            server::ensure_profile_tracked(
+                &mut self.server,
+                server::ServerProfile {
+                    python: &self.python,
+                    model: model_dir,
+                    adapter,
+                    steering: steering.as_ref(),
+                    runtime: &runtime,
+                    context: self.steering_config.as_ref(),
+                },
+                self.startup_timeout_secs,
+                Some(Arc::clone(&interrupt)),
+            )
+        };
+        if let Err(error) = started {
+            self.adapter_monitor.lock().phase = AdapterPhase::Failed;
+            return Err(error);
+        }
+        self.adapter_monitor.lock().phase = AdapterPhase::Loaded;
+        Ok(steering.is_some())
+    }
+
     /// Stop the local server (if any) to free its memory. A later `chat`
     /// starts a new one.
     pub fn release(&mut self) {
@@ -1793,99 +1916,19 @@ impl Backend {
                 if interrupted() {
                     return Err(llm::Interrupted.into());
                 }
-                *self.adapter_monitor.lock() = AdapterRuntime {
-                    adapter: adapter.map(Path::to_path_buf),
-                    phase: AdapterPhase::Loading,
-                };
-                let steering = self.steering_config.as_ref().and_then(|config| {
-                    if let Some(reason) = crate::llm::steering::local_unsupported_reason(model_dir)
-                    {
-                        if (config.steering.enabled || config.steering.automatic)
-                            && config.steering.strength > 0.0
-                        {
-                            let state =
-                                serde_json::json!({"state":"unsupported","reason":reason,"uses":0});
-                            let changed = self.steering_runtime != state;
-                            self.steering_runtime = state;
-                            if config.steering.enabled && changed {
-                                on_notice(&format!("Activation steering unavailable: {reason}"));
-                            }
-                        } else {
-                            self.steering_runtime =
-                                serde_json::json!({"state":"disabled","uses":0});
-                        }
-                        return None;
-                    }
-                    match crate::llm::steering::specification(config, model_dir) {
-                        Ok(spec) => spec,
-                        Err(error) => {
-                            if let Some(notice) = Self::steering_bypass(
-                                &mut self.steering_runtime,
-                                format!("{error:#}"),
-                            ) {
-                                on_notice(&notice);
-                            }
-                            None
-                        }
-                    }
-                });
-                let runtime = profile
-                    .as_ref()
-                    .and_then(|p| p.local_runtime.clone())
-                    .or_else(|| {
-                        self.steering_config
-                            .as_ref()
-                            .map(|config| config.local_runtime.clone())
-                    })
-                    .unwrap_or_default();
-                if steering.is_some() && runtime.draft_model.is_some() {
-                    let reason = "steering does not support speculative inference".to_string();
-                    if let Some(notice) = Self::steering_bypass(&mut self.steering_runtime, reason)
-                    {
-                        on_notice(&notice);
-                    }
-                }
-                let phase = if self.server.as_ref().is_some_and(|server| {
-                    server.ready_for(
-                        model_dir,
-                        adapter,
-                        steering.as_ref(),
-                        &runtime,
-                        self.steering_config.as_ref(),
-                    )
-                }) {
-                    llm::InferencePhase::Processing
-                } else {
-                    llm::InferencePhase::Loading
-                };
-                if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(phase))) {
-                    return Err(llm::Interrupted.into());
-                }
-                let started = {
-                    // Startup's 1-token warmup is not an attempt of the user's logical request.
-                    let _startup_accounting = llm::usage::Transport::suspend();
-                    server::ensure_profile_tracked(
-                        &mut self.server,
-                        server::ServerProfile {
-                            python: &self.python,
-                            model: model_dir,
-                            adapter,
-                            steering: steering.as_ref(),
-                            runtime: &runtime,
-                            context: self.steering_config.as_ref(),
-                        },
-                        self.startup_timeout_secs,
-                        Some(Arc::clone(&interrupt)),
-                    )
-                };
-                let server = match started {
-                    Ok(server) => server,
-                    Err(error) => {
-                        self.adapter_monitor.lock().phase = AdapterPhase::Failed;
-                        return Err(error);
-                    }
-                };
-                self.adapter_monitor.lock().phase = AdapterPhase::Loaded;
+                let model_dir = model_dir.clone();
+                let steering = self.ensure_local_server(
+                    &model_dir,
+                    adapter,
+                    profile.as_ref(),
+                    Arc::clone(&interrupt),
+                    on_notice,
+                    on_event,
+                )?;
+                let server = self
+                    .server
+                    .as_mut()
+                    .context("local model server was not started")?;
                 if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(
                     llm::InferencePhase::Processing,
                 ))) {
@@ -1920,7 +1963,7 @@ impl Backend {
                 };
                 let result = result.and_then(|reply| server.phase("loaded").map(|()| reply));
                 let result = result.map_err(|error| server.abort_request(error));
-                if result.is_ok() && steering.is_some() {
+                if result.is_ok() && steering {
                     let previous = self.steering_runtime["state"].clone();
                     self.steering_runtime = crate::llm::steering::runtime(server.base_url())
                         .unwrap_or_else(
