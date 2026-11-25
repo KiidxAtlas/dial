@@ -1,5 +1,4 @@
 use super::*;
-use std::fs;
 
 fn workspace() -> (tempfile::TempDir, Workspace) {
     let dir = tempfile::tempdir().unwrap();
@@ -9,6 +8,7 @@ fn workspace() -> (tempfile::TempDir, Workspace) {
 
 #[cfg(unix)]
 fn install(dir: &Path, name: &str) {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
     fs::write(&path, "#!/bin/sh\n").unwrap();
