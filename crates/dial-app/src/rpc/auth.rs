@@ -211,17 +211,20 @@ pub(super) fn ensure_v2(out: &Sender) -> Result<()> {
 
 /// Starts `login`. The request is answered by the worker thread when the flow finishes. Flows
 /// that need typed input (`needs_terminal` in `auth_providers`) ask through `auth_prompt`.
+/// `configured` loads the saved configuration, and is called only for an `api-key:` ID the
+/// catalog does not have.
 pub(super) fn start_login(
     state: &Arc<AuthState>,
     out: &Sender,
     user_dir: &Path,
+    configured: impl FnOnce() -> Result<Config>,
     id: &Value,
     params: &Value,
 ) -> Result<()> {
     let provider = params["provider"].as_str().context("provider required")?;
     let user_dir = user_dir.to_owned();
     if provider.starts_with("api-key:") {
-        let p = key_endpoint(provider)?;
+        let p = key_endpoint(provider, configured)?;
         let provider = provider.to_owned();
         return spawn_flow(state, out, id, provider.clone(), move |ui, cancel| {
             let mut key = ui.prompt_secret(&format!("API key for {}", p.label), None, false)?;
@@ -352,15 +355,64 @@ pub(super) fn cancel_login(state: &AuthState, params: &Value) -> Result<Value> {
     Ok(json!({"provider": provider, "cancelling": true}))
 }
 
-/// Resolve only the opaque inventory IDs used by login and removal, never a caller's URL.
-fn key_endpoint(provider: &str) -> Result<&'static catalog::BuiltinProvider> {
-    let id = provider.strip_prefix("api-key:");
-    catalog::key_providers()
-        .find(|p| Some(p.id.as_str()) == id)
-        .ok_or_else(|| coded(ErrorCode::InvalidParams, "unknown API-key provider"))
+/// Where a key entered for an `api-key:<id>` provider is saved.
+struct KeyEndpoint {
+    id: String,
+    label: String,
+    base_url: String,
 }
 
-pub(super) fn remove_api_key(state: &AuthState, user_dir: &Path, params: &Value) -> Result<Value> {
+/// Custom endpoints saved as `providers.<id>` that take an API key: not reset, not sign-in only,
+/// with a literal base URL, and not an ID the catalog already offers a key for.
+fn configured_endpoints(config: &Config) -> impl Iterator<Item = KeyEndpoint> + '_ {
+    config
+        .providers
+        .iter()
+        .filter(|(id, spec)| {
+            !spec.is_reset()
+                && !spec.base_url.is_empty()
+                && !spec.base_url.contains('<')
+                && spec.auth != crate::llm::model_config::AuthMethod::OAuth
+                && catalog::key_providers().all(|known| &known.id != *id)
+        })
+        .map(|(id, spec)| KeyEndpoint {
+            id: id.clone(),
+            label: if spec.label.is_empty() {
+                id.clone()
+            } else {
+                spec.label.clone()
+            },
+            base_url: spec.base_url.clone(),
+        })
+}
+
+/// Resolve only the opaque inventory IDs used by login and removal, never a caller's URL: a
+/// catalog endpoint, else the custom endpoint saved under that ID, whose URL comes from the
+/// saved configuration.
+fn key_endpoint(
+    provider: &str,
+    configured: impl FnOnce() -> Result<Config>,
+) -> Result<KeyEndpoint> {
+    let unknown = || coded(ErrorCode::InvalidParams, "unknown API-key provider");
+    let id = provider.strip_prefix("api-key:").ok_or_else(unknown)?;
+    if let Some(p) = catalog::key_providers().find(|p| p.id == id) {
+        return Ok(KeyEndpoint {
+            id: p.id.clone(),
+            label: p.label.clone(),
+            base_url: p.base_url.clone(),
+        });
+    }
+    configured_endpoints(&configured()?)
+        .find(|endpoint| endpoint.id == id)
+        .ok_or_else(unknown)
+}
+
+pub(super) fn remove_api_key(
+    state: &AuthState,
+    user_dir: &Path,
+    configured: impl FnOnce() -> Result<Config>,
+    params: &Value,
+) -> Result<Value> {
     if params["confirm"].as_bool() != Some(true) {
         return Err(coded(
             ErrorCode::InvalidParams,
@@ -368,7 +420,7 @@ pub(super) fn remove_api_key(state: &AuthState, user_dir: &Path, params: &Value)
         ));
     }
     let provider = params["provider"].as_str().unwrap_or_default();
-    let endpoint = key_endpoint(provider)?;
+    let endpoint = key_endpoint(provider, configured)?;
     if locked(&state.job).is_some() {
         return Err(coded(
             ErrorCode::Busy,
@@ -408,8 +460,9 @@ pub(super) fn logout(state: &AuthState, user_dir: &Path, params: &Value) -> Resu
     Ok(json!({"provider": flow.id, "message": message}))
 }
 
-/// `auth_providers`: sign-in providers with their signed-in state.
-pub(super) fn providers(user_dir: &Path) -> Value {
+/// `auth_providers`: sign-in providers with their signed-in state, catalog key providers, and
+/// (given the saved configuration) the custom endpoints that take a key.
+pub(super) fn providers(user_dir: &Path, config: Option<&Config>) -> Value {
     let dir = crate::config::paths::subscription_auth_dir(user_dir).ok();
     let mut providers = vec![
         json!({"provider":"anthropic","name":"Claude subscription","signed_in":dir.as_ref().is_some_and(|d| anthropic_oauth::signed_in(d)),"needs_terminal":false}),
@@ -432,7 +485,17 @@ pub(super) fn providers(user_dir: &Path) -> Value {
             })
         })
         .collect();
-    json!({ "providers": providers, "key_providers": key_providers })
+    let endpoint_keys: Vec<_> = config
+        .into_iter()
+        .flat_map(configured_endpoints)
+        .map(|endpoint| {
+            json!({
+                "provider": format!("api-key:{}", endpoint.id), "name": endpoint.label,
+                "key_saved": saved.contains(&endpoint.base_url), "can_remove": true
+            })
+        })
+        .collect();
+    json!({ "providers": providers, "key_providers": key_providers, "endpoint_keys": endpoint_keys })
 }
 
 #[cfg(test)]

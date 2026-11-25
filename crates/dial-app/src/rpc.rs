@@ -1924,7 +1924,10 @@ fn run_control(
                 "auth_providers" => {
                     let result = (|| -> Result<Value> {
                         auth::ensure_v2(&out)?;
-                        Ok(auth::providers(&auth_dir))
+                        Ok(auth::providers(
+                            &auth_dir,
+                            admin.saved_config().ok().as_ref(),
+                        ))
                     })();
                     out.result(&id, result);
                 }
@@ -1945,7 +1948,14 @@ fn run_control(
                 }
                 "login" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {
-                        auth::start_login(&auth_state, &out, &auth_dir, &id, &request["params"])
+                        auth::start_login(
+                            &auth_state,
+                            &out,
+                            &auth_dir,
+                            || admin.saved_config(),
+                            &id,
+                            &request["params"],
+                        )
                     });
                     if let Err(error) = result {
                         out.result(&id, Err(error));
@@ -1967,7 +1977,12 @@ fn run_control(
                 }
                 "remove_api_key" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {
-                        auth::remove_api_key(&auth_state, &auth_dir, &request["params"])
+                        auth::remove_api_key(
+                            &auth_state,
+                            &auth_dir,
+                            || admin.saved_config(),
+                            &request["params"],
+                        )
                     });
                     out.result(&id, result);
                 }
