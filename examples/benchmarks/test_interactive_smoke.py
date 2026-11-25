@@ -230,7 +230,8 @@ class ScriptedProviderTests(unittest.TestCase):
         self.assertEqual((arguments["action"], arguments["name"]), ("start", "pty-os-job"))
         self.assertIn("exec sleep 120", arguments["command"])
         result = self.post(prompt + [first["message"], {"role": "tool", "tool_call_id": call["id"],
-                           "content": "pty-os-job: running; OS-JOB-OUTPUT-KEPT"}], offered)
+                           "content": "pty-os-job: running; OS-JOB-OUTPUT-KEPT"},
+                           {"role": "user", "content": '<dial-notice kind="live_job_output">\nRunning bg jobs\n</dial-notice>'}], offered)
         self.assertEqual(result.respond.call_args.args[0]["choices"][0]["message"]["content"], "OS-JOB-STARTED")
         self.assertEqual(self.server.job_starts, 1)
 

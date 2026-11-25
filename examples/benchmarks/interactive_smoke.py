@@ -144,8 +144,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.chat_requests += 1
             index = self.server.chat_requests
         messages = request["messages"]
-        # The request-tail latest-user note is runtime context, not the scenario prompt.
-        last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user" and "Latest admitted user request" not in str(m.get("content", ""))), "")
+        # Runtime notices (including live bg output) can follow the actual scenario prompt.
+        last_user = next((m.get("content") for m in reversed(messages)
+                          if m["role"] == "user" and not str(m.get("content", "")).startswith("<dial-notice ")
+                          and "Latest admitted user request" not in str(m.get("content", ""))), "")
         if any(tool.get("function", {}).get("name") == "dial_diagnostic_echo"
                for tool in request.get("tools", [])):
             message = self.coding_diagnostic(index, messages)
