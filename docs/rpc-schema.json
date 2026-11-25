@@ -2296,7 +2296,7 @@
         },
         {
           "type": "object",
-          "description": "Remove only the local saved credential for a catalog API-key provider, without signing out or revoking the key at its issuer.",
+          "description": "Remove only the local saved credential for an API-key provider that auth_providers lists (a catalog provider in key_providers, or a configured custom endpoint in endpoint_keys), without signing out or revoking the key at its issuer.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "remove_api_key"},
