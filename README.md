@@ -58,6 +58,7 @@ On first launch Dial asks which model to use. Then you tell it what you want.
 You don't need Rust or bash: the installer is plain `sh` and checks release signatures with the
 `ssh-keygen` already on your machine. Homebrew, Nix, Docker and source
 builds are also supported. To update, run `dial update`. On Linux the optional sandbox needs `bubblewrap`.
+Step-by-step commands for your platform are at [dial.rootatlas.dev/install](https://dial.rootatlas.dev/install?cli).
 For all options and requirements, see [docs/release-and-install.md](docs/release-and-install.md).
 
 ## Use it
