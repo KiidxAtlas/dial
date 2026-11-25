@@ -100,9 +100,9 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "activity" | "controls" | "help" | "theme" | "hotkeys" | "copy" | "queue" | "draft"
         | "attachments" | "watch" => Client(PRESENTATION),
         "restart" => Client("restart the `dial rpc` process; `resume` reopens the session"),
-        "computer" => Terminal(
-            "enable it with set_setting `integrations` and apply_settings; OS permission checks are terminal-only",
-        ),
+        // `/computer on|off` is a set_setting `integrations` write followed by apply_settings.
+        "computer" => Method("computer_status"),
+        "tree" => Method("session_tree"),
         "doctor" | "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
         "update" => Terminal("installs a new binary; use `dial update`"),
         "providers" => Terminal("provider setup wizard; use set_setting, login and remove_api_key"),
@@ -114,11 +114,12 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "hooks" => Method("list_hooks"),
         "ssh" => Method("ssh_hosts"),
         "relay" => Terminal(COLLAB),
-        "compute" | "review" | "seance" | "tree" | "profile" | "todo" | "understanding"
-        | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
-        | "modelpreset" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule"
-        | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize" | "images"
-        | "marketplace" | "inbox" => Terminal(PANEL),
+        "compute" | "review" | "seance" | "profile" | "todo" | "understanding" | "accounts"
+        | "share" | "dump" | "trace" | "security" | "graphify" | "image" | "modelpreset"
+        | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule" | "plan-review"
+        | "contract" | "cleanse" | "gc" | "anonymize" | "images" | "marketplace" | "inbox" => {
+            Terminal(PANEL)
+        }
         _ => return None,
     })
 }

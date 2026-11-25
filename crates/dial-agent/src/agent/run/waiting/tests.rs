@@ -237,7 +237,7 @@ fn unattended_run_reports_an_explicitly_backgrounded_job_without_waiting_for_it(
             &mut ui,
         );
         agent.backend = Some(backend);
-        assert!(!started.is_error, "{}", started.text);
+        assert!(!started.is_error, "background job failed to start");
         assert_eq!(agent.awaited_background_jobs().len(), 1);
         let clock = Instant::now();
         assert!(agent.wait_for_background_event(&mut ui).unwrap());

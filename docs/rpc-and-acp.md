@@ -268,6 +268,13 @@ turn rather than silently queueing a session change behind it.
   the Claude Code or Codex transcripts recorded for this project; `import_session {source,
   path}` converts one of exactly those paths into a new session (any other path is
   `not_found`) without switching to it.
+- **Session tree and computer use:** `session_tree` lists the open session's `/tree` nodes (user
+  messages and labeled entries, abandoned branches included) with `depth`, `current` and
+  `on_active_branch`. `tree_navigate {entry_id}` continues from one of them with the same
+  appended branch marker as `/tree`; a user message comes back as `prefill` for the composer and
+  is not sent. `computer_status` reports whether computer use is enabled in the saved
+  configuration and the native backend's permission probe, or why it is unavailable; turning it
+  on or off is a `set_setting` write of `integrations` followed by `apply_settings`.
 
 `recovery_snapshot` returns a combined idle transcript and live-state snapshot with an event
 sequence fence. It refuses active workers and oversized histories rather than certifying a

@@ -44,6 +44,7 @@ mod sessions;
 mod settings;
 mod side_control;
 mod skills;
+mod tree;
 mod workflows;
 /// Wire vocabulary shared with clients: versions, the method table and error codes.
 pub use dial_protocol::PROTOCOL_VERSION;
@@ -1130,6 +1131,7 @@ impl Admin {
                 | "ssh_hosts"
                 | "list_worktrees"
                 | "import_candidates"
+                | "computer_status"
         )
     }
 
@@ -1258,6 +1260,7 @@ impl Admin {
             "list_worktrees" => integrations::worktrees(&layout.project_root),
             "import_candidates" => integrations::import_candidates(&layout, params),
             "import_session" => integrations::import_session(&layout, params),
+            "computer_status" => Ok(integrations::computer_status(&self.saved_config()?)),
             _ => Err(unknown_method()),
         }
     }
@@ -2271,6 +2274,7 @@ fn run_control(
                 | "list_worktrees"
                 | "import_candidates"
                 | "import_session"
+                | "computer_status"
                 | "read_image_artifact"
                     if !acp =>
                 {

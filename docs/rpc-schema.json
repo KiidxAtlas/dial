@@ -746,6 +746,8 @@
           ],
           "additionalProperties": false
         },
+        {"type": "object", "description": "Native RPC only. The open session's navigable nodes, as /tree lists them: every real user message and labeled entry, abandoned branches included, in depth-first order. depth grows only where the conversation forks; current marks where the conversation stands and on_active_branch the path the model sees. Read-only; answered on the agent actor. Result: {session_id, nodes: [{id, parent?, depth, kind: user|assistant|summary|other, text, label?, ts, on_active_branch, current, children}]}.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "session_tree"}, "params": {"type": "object", "properties": {}, "additionalProperties": false}}, "required": ["method"], "additionalProperties": false},
+{"type": "object", "description": "Native RPC only. Continue the open session from a session_tree node, as /tree does: the move appends a branch marker, so nothing is deleted and the branch being left stays in the tree. A user message is entered from just before it and its text returns as prefill for the client's composer; it is not sent. A node not in the tree is refused with not_found. Result: {session_id, moved, prefill?}; moved is false when the conversation already stands there.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "tree_navigate"}, "params": {"type": "object", "properties": {"entry_id": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["entry_id"]}}, "required": ["method", "params"], "additionalProperties": false},
         {
           "type": "object",
           "description": "Native RPC only. Transactionally relocate the active session to a project using the shared relocation owner. Target configuration is validated before mutation; the actor adopts the new layout and rebuilds runtime owners. A session-change gate can refuse the operation.",
@@ -3365,7 +3367,7 @@
         },
         {
           "type": "object",
-          "description": "Convert one transcript that import_candidates lists for this project into a new Dial session; any other path is refused with not_found. The active session is unchanged; open the new one with switch_session. Result: {session_id, source_id?, skipped?} where skipped names content that could not be carried over.",
+          "description": "Convert one transcript that import_candidates lists for this project into a new Dial session; any other path is refused with not_found. The active session is unchanged; open the new one with resume. Result: {session_id, source_id?, skipped?} where skipped names content that could not be carried over.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },
             "method": { "const": "import_session" },
@@ -3382,6 +3384,7 @@
           "required": ["method", "params"],
           "additionalProperties": false
         },
+        {"type": "object", "description": "Computer use as /computer status reports it: whether the saved configuration enables it (turn it on or off with set_setting key integrations, then apply_settings), the screenshot size limit, and the native backend's probe, capabilities {backend, capturePermission, inputPermission, axPermission, ...}, or unavailable with the reason. Read-only; runs off the agent. Result: {enabled, max_width, max_height, capabilities?, unavailable?}.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "computer_status"}, "params": {"type": "object", "properties": {}, "additionalProperties": false}}, "required": ["method"], "additionalProperties": false},
         {
           "type": "object",
           "description": "Tool reliability for this session, as /reliability shows it: whether it is enabled, measured results, the route, this session's counters and the contract-failure limit. Read-only; answered on the agent actor. Result: {enabled, measured, route, session, max_contract_failures, strict_tools}.",

@@ -173,5 +173,27 @@ pub(super) fn import_session(layout: &Layout, params: &Value) -> Result<Value> {
     }))
 }
 
+/// `computer_status`: whether computer use is on in the saved configuration, the screenshot size
+/// limit, and the native backend's probe (`capabilities`: backend and permission states) or why
+/// it is unavailable on this machine, as `/computer status` reports them.
+pub(super) fn computer_status(config: &Config) -> Value {
+    use crate::computer;
+    let enabled = config
+        .integrations
+        .iter()
+        .any(|name| name == computer::NAME);
+    let (capabilities, unavailable) = match computer::capabilities() {
+        Ok(caps) => (caps, None),
+        Err(reason) => (Value::Null, Some(reason)),
+    };
+    json!({
+        "enabled": enabled,
+        "max_width": computer::MAX_WIDTH,
+        "max_height": computer::MAX_HEIGHT,
+        "capabilities": capabilities,
+        "unavailable": unavailable,
+    })
+}
+
 #[cfg(test)]
 mod tests;

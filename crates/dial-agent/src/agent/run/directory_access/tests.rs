@@ -87,13 +87,13 @@ fn outside_read_waits_for_decision_on_original_call() {
                 ..Default::default()
             };
             let output = agent.dispatch(&mut endpoint(), &read, &mut ui);
-            assert_eq!(ui.asked.len(), 1, "{}", output.text);
+            assert_eq!(ui.asked.len(), 1, "expected one directory access prompt");
             assert!(
                 ui.asked[0]
                     .1
                     .contains(other.canonicalize().unwrap().to_str().unwrap())
             );
-            assert_eq!(output.is_error, !allow, "{}", output.text);
+            assert_eq!(output.is_error, !allow, "read outcome for allow={allow}");
             assert_eq!(output.text.contains("approved payload"), allow);
             assert_eq!(
                 agent.workspace.resolve_read(file.to_str().unwrap()).is_ok(),

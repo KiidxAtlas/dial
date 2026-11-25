@@ -1081,6 +1081,8 @@ impl ActorRuntime<'_> {
                 maintenance::branch(self.config, &self.flag, &mut self.agent, params)
             }
             "label_session" => maintenance::label(&mut self.agent, params),
+            "session_tree" => Ok(super::tree::tree(&self.agent)),
+            "tree_navigate" => super::tree::navigate(&mut self.agent, params),
             "list_schedules" => maintenance::schedule_list(self.layout, params),
             "add_schedule" => maintenance::schedule_add(self.layout, params),
             "remove_schedule" => maintenance::schedule_remove(self.layout, params),

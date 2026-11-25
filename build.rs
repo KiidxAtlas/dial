@@ -23,6 +23,13 @@ const INPUTS: &[&str] = &[
 ];
 
 fn main() {
+    // Windows executables otherwise start with a 1 MiB main stack under MSVC.
+    // RPC setup exceeds that reserve in unoptimized builds before it emits `ready`.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg-bin=dial=/STACK:8388608");
+    }
     for path in INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
