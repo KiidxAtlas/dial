@@ -101,20 +101,20 @@ impl Session {
             };
             if role_of(m) == "dial_state" && summary.is_none() {
                 summary = control_entry_field(m, "turn_summary");
-            } else if role_of(m) == "user" && m["dial_checkpoint"].is_object() {
-                if let Some(s) = summary.take()
-                    && m["dial_checkpoint"]["session"] == self.id()
-                    && s["checkpoint_turn"] == m["dial_checkpoint"]["turn"]
-                    && s["outcome"].is_string()
-                {
-                    turns.push((
-                        self.entries[i].id.as_str(),
-                        truncate_chars(&content_text(m), 100),
-                        s,
-                    ));
-                    if turns.len() >= limit {
-                        break;
-                    }
+            } else if role_of(m) == "user"
+                && m["dial_checkpoint"].is_object()
+                && let Some(s) = summary.take()
+                && m["dial_checkpoint"]["session"] == self.id()
+                && s["checkpoint_turn"] == m["dial_checkpoint"]["turn"]
+                && s["outcome"].is_string()
+            {
+                turns.push((
+                    self.entries[i].id.as_str(),
+                    truncate_chars(&content_text(m), 100),
+                    s,
+                ));
+                if turns.len() >= limit {
+                    break;
                 }
             }
         }
