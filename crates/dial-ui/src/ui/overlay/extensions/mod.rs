@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 pub struct ExtensionsOverlay {
     pub browser: Browser,
+    /// Config paths the app would inspect after the user confirms discovery.
+    pub discovery_paths: Vec<String>,
     /// Keep every admitted request subscribed until its result arrives, including when a
     /// later request is rejected while an earlier install is still running.
     progress: Vec<(SharedProgress, bool)>,
@@ -52,6 +54,7 @@ impl ExtensionsOverlay {
     pub fn new() -> Self {
         Self {
             browser: Browser::new(),
+            discovery_paths: Vec::new(),
             progress: Vec::new(),
             catalogs: Vec::new(),
             catalog_job: false,
@@ -486,7 +489,7 @@ impl ExtensionsOverlay {
                     ctx.theme.fg(Tok::Warning),
                 )));
                 if matches!(intent, Intent::DiscoverMcp | Intent::ImportMcp { .. }) {
-                    for path in dial_tools::tools::integrations::mcp::foreign::source_labels() {
+                    for path in &self.discovery_paths {
                         lines.push(Line::from(format!("   {path}")));
                     }
                 }

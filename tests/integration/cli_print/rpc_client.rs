@@ -419,6 +419,7 @@ fn events_are_numbered_and_attributed_and_undo_restores_files_and_history() {
 #[test]
 fn reopened_turn_keeps_its_check_and_refuses_to_restore_later_work() {
     let env = Env::new();
+    const CHECK: &str = "test \"$(cat a.txt)\" = alpha && test \"$(cat b.txt)\" = beta";
     let server = Server::new(vec![
         call(
             "write",
@@ -426,7 +427,7 @@ fn reopened_turn_keeps_its_check_and_refuses_to_restore_later_work() {
         ),
         call(
             "bash",
-            json!({"command":"cat a.txt b.txt", "check":true, "check_paths":["a.txt","b.txt"]}),
+            json!({"command":CHECK, "check":true, "check_paths":["a.txt","b.txt"]}),
         ),
         text("Checked both files."),
     ]);
@@ -472,7 +473,11 @@ fn reopened_turn_keeps_its_check_and_refuses_to_restore_later_work() {
     let record = &evidence["turns"][0];
     assert_eq!(record["files"].as_array().unwrap().len(), 2, "{record}");
     assert!(
-        record["details"].to_string().contains("cat a.txt b.txt"),
+        record["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains(CHECK))),
         "{record}"
     );
     for (path, eligible) in [("b.txt", false), ("a.txt", true)] {

@@ -53,6 +53,7 @@ pub(crate) fn overlay(
     running: Option<&InstallJob>,
 ) -> ExtensionsOverlay {
     let mut panel = ExtensionsOverlay::new();
+    panel.discovery_paths = foreign::source_labels().collect();
     refresh(&mut panel, layout, config);
     if let Some(job) = running {
         panel.attach(job.progress.clone());

@@ -1367,7 +1367,12 @@ fn persistent_modes_rebuild_and_publish_effective_settings_without_resetting_ses
                 peers: runtime.peers.clone(),
                 sides: runtime.sides.clone(),
             };
-            actor.run().unwrap();
+            // Production runs the actor on its own thread, not on a stack already
+            // holding the fixture's Agent and ActorRuntime.
+            std::thread::spawn(move || actor.run())
+                .join()
+                .unwrap()
+                .unwrap();
             let config = published_config.read().unwrap();
             assert!(config.experimental.turn_optimizer);
             assert!(config.extended_context);

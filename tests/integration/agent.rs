@@ -4675,6 +4675,9 @@ fn window_too_small_for_the_full_set_offers_a_lean_tool_set() {
         .harness
         .tools
         .retain(|tool| tool.as_str() != "task");
+    // Removing task pins this harness. Explicitly include the optional tool whose
+    // removal under context pressure is being exercised.
+    e.config.harness.tools.push("find".into());
     // Sandbox instructions and path lengths differ by platform. Measure the full request
     // instead of assuming that a fixed window overflows on every supported host.
     let full_tokens = {

@@ -41,14 +41,15 @@ fn discovery_names_files_before_confirming_and_escape_does_not_dispatch() {
         preview_status: &status_preview,
     };
     let mut overlay = ExtensionsOverlay::new();
+    overlay.discovery_paths = vec!["./.mcp.json".into(), "~/.claude.json".into()];
     for decision in [KeyCode::Esc, KeyCode::Enter] {
         assert!(matches!(
             overlay.handle(&key(KeyCode::Char('f')), &rig.keys),
             OverlayEvent::None
         ));
         let shown = screen(&render(80, 24, |frame| overlay.draw(frame, &ctx)));
-        for path in dial_tools::tools::integrations::mcp::foreign::source_labels() {
-            assert!(shown.contains(&path), "{shown}");
+        for path in &overlay.discovery_paths {
+            assert!(shown.contains(path), "{shown}");
         }
         let result = overlay.handle(&key(decision), &rig.keys);
         assert_eq!(
