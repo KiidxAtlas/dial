@@ -56,6 +56,10 @@ optional tiers (`make test-mlx`, `make test-smoke`); never present a skipped tie
 
 ## Working conventions
 
+- Implement features and fixes for Windows, Linux, and macOS, not just the development host.
+  Prefer portable APIs. When a capability requires a specific OS or hardware, isolate that code
+  and keep Dial usable elsewhere with a supported alternative or a clear unavailable state.
+  Verify affected behavior on all three platforms where possible and report any platform not tested.
 - Reuse existing owners and helpers; do not add a parallel pipeline for an existing concern.
 - Keep changes focused. Preserve unrelated uncommitted work in the checkout.
 - Keep the engine frontend-neutral. A feature's behaviour and validation live in its engine owner,

@@ -208,7 +208,7 @@ fn chat_rows(
             non_chat.insert(key(&entry.selection));
             continue;
         }
-        if discovered.is_some() && !entry.available {
+        if !entry.available && (discovered.is_some() || source == "local") {
             continue;
         }
         add(
@@ -452,11 +452,13 @@ pub(super) fn role_list(
 
 /// Probe configured/signed-in providers via `catalog::discover` and refresh the persistent
 /// provider listing caches and image-capability cache (`image-capabilities.json`).
-/// An explicit image refresh also retries previously refused hosted image routes.
+/// An explicit image refresh also retries previously refused hosted image routes. `provider`
+/// narrows the reported `provider_status` (never the shared scan).
 pub(super) fn refresh_and_check(
     layout: &crate::config::paths::Layout,
     config: &Config,
     purpose: Option<Purpose>,
+    provider: Option<&str>,
 ) -> (Value, Vec<catalog::ModelEntry>) {
     if matches!(purpose, Some(Purpose::Image)) {
         crate::tools::net::image_gen::clear_refusals(&layout.user_dir);
@@ -488,8 +490,34 @@ pub(super) fn refresh_and_check(
         "capable": capable,
         "candidates": candidates,
         "checked_at": catalog::image_capabilities::last_updated_at(&layout.user_dir),
+        "provider_status": provider_status(&discovery.providers, provider),
     });
     (checked, discovery.models)
+}
+
+/// Each probed provider's outcome as the terminal provider picker shows it. Probe details are
+/// fixed descriptions (or HTTP status codes); an endpoint URL that carries credentials or a
+/// query (possible through an environment override) is reported as null, so nothing here is
+/// secret. `provider` keeps only that provider.
+fn provider_status(providers: &[catalog::ProviderStatus], provider: Option<&str>) -> Value {
+    providers
+        .iter()
+        .filter(|status| provider.is_none_or(|id| status.id == id))
+        .map(|status| {
+            let base_url = status
+                .base_url
+                .as_deref()
+                .filter(|url| crate::llm::provider::endpoint_url(url, true).is_ok());
+            json!({
+                "id": status.id,
+                "label": status.label,
+                "base_url": base_url,
+                "state": status.state,
+                "detail": status.detail,
+                "models": status.models,
+            })
+        })
+        .collect()
 }
 
 fn describe(config: &Config, row: Row, current: bool) -> Value {
@@ -528,6 +556,17 @@ fn describe(config: &Config, row: Row, current: bool) -> Value {
         value["pricing"] = json!(bundled.pricing);
     }
     if let Some(metadata) = &row.local {
+        if provider == "mlx"
+            && row.sources.iter().any(|source| source == "local")
+            && let Some(format) = metadata.format
+        {
+            use crate::llm::local_runtime::LocalEngine;
+            let key = LocalEngine::model_key(model);
+            let choices = LocalEngine::choices(format, metadata.gguf_engines);
+            if !choices.is_empty() {
+                value["local_engine"] = json!({"choices": choices, "selected": config.local_model_engines.get(&key).copied().unwrap_or_default(), "setting": format!("local_model_engines.{key}")});
+            }
+        }
         if let Some(limit) = metadata.max_output_tokens {
             value["max_output_tokens"] = json!(limit);
         }

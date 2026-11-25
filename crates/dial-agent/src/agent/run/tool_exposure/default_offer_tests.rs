@@ -381,7 +381,7 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
 
 #[test]
 fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
-    let helpers = ["task", "message", "todo", "find"];
+    let helpers = ["task", "message", "todo"];
     with_agent("[assistance]\nlean_local=false", |agent| {
         let attended = agent.offered();
         for helper in helpers {
@@ -393,7 +393,7 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
         for helper in helpers {
             assert!(!offered.iter().any(|name| name == helper), "{offered:?}");
         }
-        for loadable in ["task", "todo", "find", "bg", "finish", "verify"] {
+        for loadable in ["task", "todo", "bg", "finish", "verify"] {
             assert!(
                 !offered.iter().any(|name| name == loadable),
                 "{loadable}: {offered:?}"
@@ -410,6 +410,7 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
             "bash",
             "grep",
             "glob",
+            "find",
             "tool_search",
         ] {
             assert!(
@@ -1301,6 +1302,46 @@ fn pending_background_work_returns_to_the_model_without_a_hidden_wait() {
 }
 
 #[test]
+fn unattended_run_is_not_woken_again_by_a_job_it_already_waited_on() {
+    struct Daemon;
+    impl crate::tools::integrations::ext::Tool for Daemon {
+        fn name(&self) -> &str {
+            "daemon_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"daemon_probe","description":"daemon fixture","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            ToolOutput::ok("unused".into())
+        }
+        fn awaited_work(&self) -> Vec<String> {
+            vec!["bg1 (mailman start)".into()]
+        }
+    }
+    with_agent("", |agent| {
+        struct Quiet;
+        impl Ui for Quiet {}
+        agent.ext.try_register(Arc::new(Daemon)).unwrap();
+        agent.modes.launch.unattended = true;
+        assert!(agent.await_background_jobs(&mut Quiet));
+        agent.background_notices.clear();
+        // Once the unattended wait bound reported it, each later reply must not restate the same
+        // running job and continue the turn; that looped until the run's deadline.
+        agent
+            .unattended_wait_noticed
+            .insert("bg1 (mailman start)".into());
+        assert!(!agent.await_background_jobs(&mut Quiet));
+        assert!(agent.background_notices.is_empty());
+        // An attended session still keeps the running job in view.
+        agent.modes.launch.unattended = false;
+        assert!(agent.await_background_jobs(&mut Quiet));
+    });
+}
+
+#[test]
 fn unattended_run_is_told_once_that_session_services_end_with_it() {
     struct Service;
     impl crate::tools::integrations::ext::Tool for Service {
@@ -1324,18 +1365,26 @@ fn unattended_run_is_told_once_that_session_services_end_with_it() {
         struct Quiet;
         impl Ui for Quiet {}
         agent.ext.try_register(Arc::new(Service)).unwrap();
-        // An attended session keeps its services for the next turn: nothing to say.
+        // An attended session keeps its services for the next turn: nothing to say or refuse.
         assert!(!agent.await_background_jobs(&mut Quiet));
         assert!(agent.background_notices.is_empty());
+        assert!(agent.exit_bound_session_jobs().is_empty());
         agent.modes.launch.unattended = true;
         assert!(agent.await_background_jobs(&mut Quiet));
         let notice = agent.background_notices.join("\n");
         assert!(notice.contains("api (python server.py)"), "{notice}");
         assert!(notice.contains("persist=true"), "{notice}");
-        // Reported once: the next turn end, or `finish`, is not held again by the same job.
+        // The notice is not repeated, so turn ends do not keep waking on the same job.
         agent.background_notices.clear();
         assert!(!agent.await_background_jobs(&mut Quiet));
         assert!(agent.exit_bound_jobs_notice().is_none());
+        // But completion stays refused while the job runs: an answer must not describe a
+        // service that this run's exit is about to kill.
+        let refused = agent.completion_blockers().unwrap_err();
+        assert!(
+            refused.contains("api (python server.py)") && refused.contains("persist=true"),
+            "{refused}"
+        );
     });
 }
 
@@ -1419,6 +1468,20 @@ fn a_worker_message_to_an_idle_parent_is_surfaced_and_queued_for_its_next_reques
             self.0.push(message.to_owned());
         }
     }
+
+    #[derive(Default)]
+    struct Deliveries {
+        plain: Notices,
+        letters: Vec<(String, String)>,
+    }
+    impl Ui for Deliveries {
+        fn received_message(&mut self, notice: &str, from: &str, text: &str) {
+            self.letters.push((from.to_owned(), text.to_owned()));
+            // Exercise the unmodified plain-UI fallback with the same delivery.
+            self.plain.received_message(notice, from, text);
+        }
+    }
+
     with_agent("", |agent| {
         agent
             .live_tasks
@@ -1433,11 +1496,18 @@ fn a_worker_message_to_an_idle_parent_is_surfaced_and_queued_for_its_next_reques
         assert_eq!(receipt.queued, ["parent"]);
         // No turn runs: the idle controller's pump is what surfaces the message.
         assert!(agent.background_notices.is_empty());
-        let mut ui = Notices::default();
+        let mut ui = Deliveries::default();
         agent.pump_subagents(&mut ui);
         assert_eq!(
-            ui.0,
+            ui.plain.0,
             ["Message from task-1 (scout) to parent: found the bug"]
+        );
+        assert_eq!(
+            ui.letters,
+            [(
+                "task-1 (scout)".to_owned(),
+                "found the bug\nsecond line".to_owned()
+            )]
         );
         assert_eq!(agent.background_notices.len(), 1);
         assert!(
@@ -1446,7 +1516,8 @@ fn a_worker_message_to_an_idle_parent_is_surfaced_and_queued_for_its_next_reques
         );
         // No request was started and the letter is delivered once.
         agent.pump_subagents(&mut ui);
-        assert_eq!(ui.0.len(), 1);
+        assert_eq!(ui.plain.0.len(), 1);
+        assert_eq!(ui.letters.len(), 1);
         assert_eq!(agent.background_notices.len(), 1);
     });
 }

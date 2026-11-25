@@ -1343,6 +1343,46 @@ impl Workspace {
         }
     }
 
+    /// Existing directory a controller can ask to attach for this explicit local path. This is
+    /// discovery only: tools must still resolve the original argument after any human decision.
+    /// Never widen a read-only launch grant, follow a workspace escape, or propose a sensitive
+    /// exception for a command. Sensitive native access must pass the ordinary two decisions.
+    pub fn pending_directory_access(&self, input: &str, tool: &str) -> Option<(PathBuf, bool)> {
+        let expanded = self.expand_path_prefixes(input);
+        let path = Path::new(expanded.as_ref());
+        if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            return None;
+        }
+        let path = if tool == "read" {
+            Path::new(fs::select::split_target(self, expanded.as_ref()).ok()?.0)
+        } else {
+            path
+        };
+        let canonical = Self::canonical_prefix(path);
+        let sensitive = self.is_protected(&canonical);
+        if self
+            .read_only_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
+            return None;
+        }
+        if sensitive && !matches!(tool, "read" | "grep" | "glob" | "find" | "edit" | "write") {
+            return None;
+        }
+        // A symlink that points out of an existing root is not an invitation to attach its target.
+        if self
+            .read_roots()
+            .any(|root| path.starts_with(root) && !canonical.starts_with(root))
+            || (!sensitive && self.read_roots().any(|root| canonical.starts_with(root)))
+        {
+            return None;
+        }
+        let directory = if path.is_dir() { path } else { path.parent()? };
+        self.directory_request(directory, sensitive).ok()?;
+        Some((directory.to_owned(), sensitive))
+    }
+
     /// Resolve a native read path, including selectors, even when its target is missing.
     /// Missing targets remain confined paths; this does not grant read access or a witness.
     pub fn resolve_read_target(&self, input: &str) -> Result<PathBuf, String> {

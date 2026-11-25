@@ -53,33 +53,33 @@ fn repeated_failure_keeps_feedback_compact_and_success_resets_the_counter() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     let mut engine = Engine::default();
-    let mut settle = |name: &str, output: ToolOutput| {
-        let mut output = output;
-        engine.settle(
-            &workspace,
-            &failing(name),
-            &mut output,
-            Default::default(),
-            |_| false,
-        );
+    let mut settle = |name: &str, path: &str, mut output: ToolOutput| {
+        let mut call = failing(name);
+        call.arguments = serde_json::json!({"path": path});
+        engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+            false
+        });
         output.text
     };
-    let first = settle("read", ToolOutput::err("missing file: a.rs"));
+    let first = settle("read", "a.rs", ToolOutput::err("missing file"));
     assert!(first.contains("<dial-notice kind=\"tool_failure\">") && first.contains(FIRST_FAILURE));
     // Another tool's failure is its own first failure.
-    assert!(settle("grep", ToolOutput::err("bad regex")).contains(FIRST_FAILURE));
-    let second = settle("read", ToolOutput::err("missing file: b.rs"));
+    assert!(settle("grep", "src", ToolOutput::err("bad regex")).contains(FIRST_FAILURE));
+    let second = settle("read", "b.rs", ToolOutput::err("missing file"));
     assert!(
         second.contains("<dial-notice kind=\"tool_failure\">"),
         "{second}"
     );
     assert!(second.contains(FIRST_FAILURE));
     assert!(second.contains("2 times in a row"), "{second}");
-    assert!(settle("read", ToolOutput::err("missing")).contains("3 times in a row"));
+    let probe = crate::agent::prompts::recovery::REPEATED_DIAGNOSTIC;
+    assert!(!first.contains(probe) && second.contains(probe));
+    assert!(settle("read", "c.rs", ToolOutput::err("missing")).contains("3 times in a row"));
     // A success of the tool ends its streak.
-    settle("read", ToolOutput::ok("1:fn main() {}".into()));
-    let again = settle("read", ToolOutput::err("missing file: c.rs"));
+    settle("read", "c.rs", ToolOutput::ok("1:fn main() {}".into()));
+    let again = settle("read", "d.rs", ToolOutput::err("missing file"));
     assert!(again.contains(FIRST_FAILURE) && !again.contains("times in a row"));
+    assert!(!again.contains(probe));
 }
 
 #[test]

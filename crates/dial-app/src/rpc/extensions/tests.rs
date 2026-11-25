@@ -26,6 +26,10 @@ fn intents_parse_by_op_and_risky_ones_need_confirmation() {
         intent(&confirmed).unwrap(),
         Intent::RemoveMcp { id: "a".into() }
     );
+    let mut discover = json!({"intent":{"op":"discover_mcp"}});
+    assert!(intent(&discover).is_err());
+    discover["confirm"] = json!(true);
+    assert_eq!(intent(&discover).unwrap(), Intent::DiscoverMcp);
     for bad in [
         json!({}),
         json!({"intent":{"op":"nope"}}),

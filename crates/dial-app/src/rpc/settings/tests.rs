@@ -110,3 +110,43 @@ fn malformed_settings_requests_are_invalid_params() {
         "invalid_params"
     );
 }
+
+#[test]
+fn get_reports_the_most_specific_layer_that_sets_each_key() {
+    let (_project, _home, layout) = layout();
+    set(&layout, &json!({"key":"harness.max_steps","value":7})).unwrap();
+    set(&layout, &json!({"key":"model","value":"global-model"})).unwrap();
+    set(
+        &layout,
+        &json!({"key":"model","value":"project-model","scope":"project"}),
+    )
+    .unwrap();
+    let all = get(&layout, &json!({})).unwrap();
+    let entry = |key: &str| {
+        all["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("{key} missing from {all}"))
+    };
+    // Project overrides global; a global-only key reports global.
+    for (key, scope) in [("model", "project"), ("harness.max_steps", "global")] {
+        assert_eq!(entry(key)["scope"], scope, "{key}");
+        assert_eq!(
+            get(&layout, &json!({"key": key})).unwrap()["scope"],
+            scope,
+            "{key}"
+        );
+    }
+    assert_eq!(entry("model")["value"], "project-model");
+    // A key neither layer sets carries no scope.
+    let unset = all["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] != "model" && entry["key"] != "harness.max_steps");
+    let unset = unset.expect("defaults list keys neither layer sets");
+    assert!(unset.get("scope").is_none(), "{unset}");
+}

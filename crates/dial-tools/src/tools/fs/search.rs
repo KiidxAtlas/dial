@@ -20,6 +20,8 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+mod names;
+pub(in crate::tools) use names::find_paths;
 mod preview;
 
 const DEFAULT_GREP_MATCHES: usize = 400;
@@ -265,9 +267,23 @@ fn resolve_scopes(ws: &Workspace, args: &Value, glob: Option<&Glob>) -> Result<S
         .and_then(Path::to_str)
         .unwrap_or(".");
     let input = opt_str(args, "path")?.unwrap_or(default);
+    resolve_scope_input(ws, input, true)
+}
+
+fn resolve_scope_input(
+    ws: &Workspace,
+    input: &str,
+    allow_multiple: bool,
+) -> Result<Scopes, String> {
     // A pair of absolute roots joined by ';' need not itself resolve under either root.
     // A readable literal still wins, and every split scope must pass resolution below.
     let inputs = if input.contains(';') && !ws.resolve_read(input).is_ok_and(|p| p.exists()) {
+        if !allow_multiple {
+            return Err(
+                "path mode accepts one scope per call; set path to a single file or directory"
+                    .into(),
+            );
+        }
         input.split(';').map(str::trim).collect()
     } else {
         vec![input]

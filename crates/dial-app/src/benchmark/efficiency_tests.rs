@@ -56,6 +56,7 @@ fn case(passed: bool, outcome_checks: usize, tokens: u64) -> CaseResult {
         evidence: Some(CaseEvidence {
             categories: vec![],
             outcome_checks,
+            false_completion: None,
             failed_check_indices: vec![],
             unavailable_check_indices: vec![],
             contract_sha256: String::new(),
@@ -109,10 +110,13 @@ checks = [{kind="response_equals",content="4"},{kind="metric",metric="tool_calls
     )
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    for (answer, passed, unavailable) in [
-        (Some(" 4\n"), true, false),
-        (Some("5"), false, false),
-        (None, false, true),
+    for (answer, completed, tools, passed, false_completion) in [
+        (Some(" 4\n"), Some(true), 0, true, Some(false)),
+        (Some("5"), Some(true), 0, false, Some(true)),
+        (None, Some(true), 0, false, None),
+        (Some("4"), Some(true), 1, false, Some(false)), // Only the metric failed.
+        (Some("5"), Some(false), 0, false, Some(false)), // Answered, not completed.
+        (Some("5"), None, 0, false, None),              // No explicit settlement.
     ] {
         let report = suite
             .run(
@@ -120,6 +124,8 @@ checks = [{kind="response_equals",content="4"},{kind="metric",metric="tool_calls
                 |_, _| {
                     Ok(RunMetrics {
                         agent_succeeded: true,
+                        last_turn_completed: completed,
+                        tool_calls: tools,
                         response_sha256: answer.map(response_sha256),
                         ..RunMetrics::default()
                     })
@@ -130,7 +136,11 @@ checks = [{kind="response_equals",content="4"},{kind="metric",metric="tool_calls
         assert_eq!(report.cases[0].passed, passed);
         let evidence = report.cases[0].evidence.as_ref().unwrap();
         assert_eq!(evidence.outcome_checks, 1);
-        assert_eq!(evidence.unavailable_check_indices.contains(&0), unavailable);
+        assert_eq!(evidence.false_completion, false_completion);
+        assert_eq!(
+            evidence.unavailable_check_indices.contains(&0),
+            answer.is_none()
+        );
         assert!(
             !serde_json::to_string(&report.cases[0].metrics)
                 .unwrap()

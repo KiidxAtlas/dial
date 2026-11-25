@@ -73,6 +73,10 @@ pub trait Ui {
     fn tool_call(&mut self, _name: &str, _summary: &str) {}
     fn tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
     fn notice(&mut self, _message: &str) {}
+    /// Incoming coordination mail. Plain surfaces retain the brief delivery notice.
+    fn received_message(&mut self, notice: &str, _from: &str, _text: &str) {
+        self.notice(notice);
+    }
     /// A typed controller event. Plain surfaces show its sentence as a notice; rich surfaces
     /// place it in a lane (context line, divider, alert) by its kind.
     fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {

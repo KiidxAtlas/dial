@@ -73,17 +73,16 @@ fn snapcompact_requires_layer_recovery_not_notebook_tools() {
 #[test]
 fn enabled_interactive_questions_fit_without_crowding_out_hosted_core_capabilities() {
     with_agent(&format!("{HOSTED}\n[ask]\nenabled=true"), |agent| {
-        let offered = agent.offered();
+        // Exercise the largest ordinary hosted offer regardless of the test host's runtimes.
+        let offered = agent.offered_with_eval_readiness(false, || true);
         for name in [
-            "ask", "read", "write", "edit", "bash", "bg", "task", "message",
+            "ask", "read", "write", "edit", "bash", "find", "grep", "glob", "eval", "bg", "task",
+            "message",
         ] {
             assert!(
                 offered.iter().any(|tool| tool == name),
                 "{name}: {offered:?}"
             );
-        }
-        if agent.automatic_eval_ready() {
-            assert!(offered.iter().any(|tool| tool == "eval"), "{offered:?}");
         }
         assert!(
             serde_json::to_vec(&agent.schemas(&offered).unwrap())
@@ -91,7 +90,27 @@ fn enabled_interactive_questions_fit_without_crowding_out_hosted_core_capabiliti
                 .len()
                 <= Agent::HOSTED_CORE_SCHEMA_BYTES
         );
+        agent.modes.launch.tools = Some(["read".to_owned(), "grep".to_owned()].into());
+        assert!(!agent.offered().iter().any(|name| name == "find"));
     });
+}
+
+#[test]
+fn automatic_find_respects_harness_selection_and_initial_budget() {
+    for (overlay, expect_find) in [
+        ("[harness]\ntools=['read','grep','glob']", false),
+        ("[harness]\ntools=['read','find']", true),
+        ("[assistance]\ninitial_tool_limit=3", false),
+    ] {
+        with_agent(&format!("{HOSTED}\n{overlay}"), |agent| {
+            let offered = agent.offered();
+            assert_eq!(
+                offered.iter().any(|name| name == "find"),
+                expect_find,
+                "{overlay}: {offered:?}"
+            );
+        });
+    }
 }
 
 #[test]
@@ -275,6 +294,7 @@ fn unattended_hosted_runs_defer_session_helpers_but_keep_them_loadable() {
             "bash",
             "grep",
             "glob",
+            "find",
             "tool_search",
         ] {
             assert!(offered.iter().any(|name| name == core), "{offered:?}");

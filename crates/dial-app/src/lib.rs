@@ -5,6 +5,7 @@ pub mod changelog;
 pub(crate) mod checks;
 pub mod cli;
 pub mod collab;
+pub(crate) mod peer_board;
 pub mod release;
 pub mod repl;
 pub(crate) mod rewind;

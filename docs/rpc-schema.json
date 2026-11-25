@@ -746,6 +746,8 @@
           ],
           "additionalProperties": false
         },
+        {"type": "object", "description": "Native RPC only. The open session's navigable nodes, as /tree lists them: every real user message and labeled entry, abandoned branches included, in depth-first order. depth grows only where the conversation forks; current marks where the conversation stands and on_active_branch the path the model sees. Read-only; answered on the agent actor. Result: {session_id, nodes: [{id, parent?, depth, kind: user|assistant|summary|other, text, label?, ts, on_active_branch, current, children}]}.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "session_tree"}, "params": {"type": "object", "properties": {}, "additionalProperties": false}}, "required": ["method"], "additionalProperties": false},
+{"type": "object", "description": "Native RPC only. Continue the open session from a session_tree node, as /tree does: the move appends a branch marker, so nothing is deleted and the branch being left stays in the tree. A user message is entered from just before it and its text returns as prefill for the client's composer; it is not sent. A node not in the tree is refused with not_found. Result: {session_id, moved, prefill?}; moved is false when the conversation already stands there.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "tree_navigate"}, "params": {"type": "object", "properties": {"entry_id": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["entry_id"]}}, "required": ["method", "params"], "additionalProperties": false},
         {
           "type": "object",
           "description": "Native RPC only. Transactionally relocate the active session to a project using the shared relocation owner. Target configuration is validated before mutation; the actor adopts the new layout and rebuilds runtime owners. A session-change gate can refuse the operation.",
@@ -874,6 +876,17 @@
             "method",
             "params"
           ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Tool-free private question, separate from the active transcript, memory and stats. Confirm the selected provider may retain the question. Returns {answer}; no prior session context is included.",
+          "properties": {
+            "id": {"$ref":"#/$defs/id"},
+            "method": {"const":"private_ask"},
+            "params": {"type":"object", "properties":{"text":{"type":"string", "pattern":"\\S"}, "confirm":{"const":true}}, "required":["text","confirm"], "additionalProperties":false}
+          },
+          "required": ["method","params"],
           "additionalProperties": false
         },
         {
@@ -2020,6 +2033,7 @@
               "type": "object",
               "properties": {
                 "session_id": {"type": "string", "minLength": 1},
+                "prepare_local_model": {"type": "boolean", "description": "When ready.features.prepare_local_model is true, wait for the managed local server to be ready before switching. A successful preparation returns local_ready: true."},
                 "provider": {"type": "string", "minLength": 1},
                 "model_id": {"type": "string", "minLength": 1}
               },
@@ -2284,7 +2298,7 @@
         },
         {
           "type": "object",
-          "description": "Remove only the local saved credential for a catalog API-key provider, without signing out or revoking the key at its issuer.",
+          "description": "Remove only the local saved credential for an API-key provider that auth_providers lists (a catalog provider in key_providers, or a configured custom endpoint in endpoint_keys), without signing out or revoking the key at its issuer.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "remove_api_key"},
@@ -2374,6 +2388,7 @@
         },
         {
           "type": "object",
+          "description": "Compatible downloaded chat model rows include local_engine: {choices, selected, setting}. Offer only choices; for GGUF these depend on the architecture in the header and the platform. If selected is not in choices, prompt for a new preference. Save the runtime ID to that per-model setting before loading the model. With refresh: true the reply also carries checked: {providers, capable, candidates, checked_at, provider_status: [{id, label, base_url, state, detail, models}]}, narrowed to provider when given.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_models"},
@@ -2415,6 +2430,7 @@
         },
         {
           "type": "object",
+          "description": "Effective settings as {settings: [{key, value, redacted, scope?}]}, or {key, value, scope?} for one key. scope is project or global, the saved layer that sets that exact key (project first); absent for built-in defaults.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "get_settings"},
@@ -2471,7 +2487,7 @@
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "checkpoint_diff"},
-            "params": {"type": "object", "properties": {"turn": {"type": "integer", "minimum": 1}, "path": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["turn", "path"]}
+            "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}, "turn": {"type": "integer", "minimum": 1}, "path": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["turn", "path"]}
           },
           "required": ["method", "params"],
           "additionalProperties": false
@@ -2482,7 +2498,7 @@
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "restore_checkpoint_files"},
-            "params": {"type": "object", "properties": {"turn": {"type": "integer", "minimum": 1}, "files": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "token": {"type": "string"}}, "required": ["path", "token"], "additionalProperties": false}}, "overlap_confirmed": {"type": "boolean", "default": false}}, "additionalProperties": false, "required": ["turn", "files"]}
+            "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}, "turn": {"type": "integer", "minimum": 1}, "files": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "token": {"type": "string"}}, "required": ["path", "token"], "additionalProperties": false}}, "overlap_confirmed": {"type": "boolean", "default": false}}, "additionalProperties": false, "required": ["turn", "files"]}
           },
           "required": ["method", "params"],
           "additionalProperties": false
@@ -2500,7 +2516,7 @@
         },
         {
           "type": "object",
-          "description": "Extension rows shown by /extensions: configured and curated MCP servers and skill packages, read from the saved configuration. Result: {mcp:[row],skills:[row]} where row is {id,title,summary,tags,origin,state,details}.",
+          "description": "Extension rows shown by /extensions: {mcp:[row],skills:[row],discovery_paths:[string]}. Only configured and curated MCP servers appear. Show discovery_paths before asking the user to discover or import a foreign server; listing the paths does not read them.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_extensions"},
@@ -2524,7 +2540,7 @@
               "properties": {
                 "intent": {
                   "type": "object",
-                  "description": "An /extensions intent, tagged by op: install_curated_mcp{id}, install_mcp{id,values?}, toggle_mcp{id,enable}, remove_mcp{id}, test_mcp{id}, remove_skill{id}, import_mcp{id}, smithery_install{name}, smithery_key{name,key}, smithery_deploy{name,values}, catalog_browse{tab:'Mcp'|'Skills'|'Tools'|'Hooks',query,page}, install_skill{source}.",
+                  "description": "An /extensions intent, tagged by op: install_curated_mcp{id}, install_mcp{id,values?}, toggle_mcp{id,enable}, remove_mcp{id}, test_mcp{id}, remove_skill{id}, discover_mcp (requires confirm:true before reading other apps' MCP settings; returns discovered rows), import_mcp{id}, smithery_install{name}, smithery_key{name,key}, smithery_deploy{name,values}, catalog_browse{tab:'Mcp'|'Skills'|'Tools'|'Hooks',query,page}, install_skill{source}.",
                   "properties": {
                     "op": {
                       "enum": [
@@ -2534,6 +2550,7 @@
                         "remove_mcp",
                         "test_mcp",
                         "remove_skill",
+                        "discover_mcp",
                         "import_mcp",
                         "smithery_install",
                         "smithery_key",
@@ -2926,6 +2943,80 @@
         },
         {
           "type": "object",
+          "description": "Read the active native session's same-checkout project peer board, also during a turn; never drains mail. Result: {session_id, error:null, scopes, overlapping, queued, rows:[{id,summary,phase,scopes,model,overlapping,messages:[{outgoing,text,at_ms,by_user,unread,receipt_available}]}]}. Up to 50 recent messages per live peer.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "list_peers"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Expected active session (journal) ID; stale IDs are refused."
+                }
+              },
+              "required": [
+                "session_id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Queue a human message for an exact live project peer, even during a turn. Result: {session_id,to,queued:true}. Queue admission does not confirm delivery to a model or user.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "send_peer_message"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Expected active session (journal) ID; stale IDs are refused."
+                },
+                "to": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{32}$"
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 8192,
+                  "description": "Nonblank; at most 8192 UTF-8 bytes."
+                }
+              },
+              "required": [
+                "session_id",
+                "to",
+                "text"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "The session's background (`bg`) jobs. Result: {jobs:[{name, command, status, running, stop_requested, terminal}]}. Answered by the controller, also during a turn.",
           "properties": {
             "id": {
@@ -2936,7 +3027,7 @@
             },
             "params": {
               "type": "object",
-              "properties": {},
+              "properties": {"include_persistent": {"type": "boolean", "default": false}},
               "additionalProperties": false
             }
           },
@@ -3119,14 +3210,14 @@
         },
         {
           "type": "object",
-          "description": "Read-only evidence workbench, as /evidence shows it. checks lists the checks recorded at turn completion (exact logs are not rerun; checks_current says whether they match the final edits); check inspects the retained log of one recorded check by exact name (name); inspect shows one citation (reference, an artifact:// or evidence reference); lineage walks up to sixteen citations (references). It writes no evidence. Comparing two citations is the separate write method evidence_compare. Text is redacted. Answered on the agent actor, so it waits for a running turn. Result: {action, text} or {checks_current, recorded_checks}.",
+          "description": "Read-only evidence workbench. turns returns retained active-branch turn summaries. model_request returns {session_id,last_request}, the last main-route request observed in this engine session (provider, model, succeeded), or null; never sends a request. checks lists checks recorded at turn completion (checks_current is relative to the final edits); check inspects one retained check by name; inspect shows one citation; lineage walks up to sixteen citations. Text is redacted. Answered on the agent actor.",
           "properties": {
             "id": { "$ref": "#/$defs/id" },
             "method": { "const": "evidence" },
             "params": {
               "type": "object",
               "properties": {
-                "action": { "enum": ["checks", "check", "inspect", "lineage"] },
+                "action": { "enum": ["model_request", "turns", "checks", "check", "inspect", "lineage"] },
                 "name": { "type": "string", "minLength": 1 },
                 "reference": { "type": "string", "minLength": 1 },
                 "references": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1 } },
@@ -3225,6 +3316,75 @@
           "required": ["method"],
           "additionalProperties": false
         },
+        {
+          "type": "object",
+          "description": "Lifecycle hooks from the saved configuration, in order, as /hooks lists them, with the canonical event names a hook may use. Each hook is {event, matcher?, command, timeout_secs, fail_closed?, fails_closed}; fails_closed is the effective mode. Edit the list with set_setting/reset_setting key hooks. Read-only; runs off the agent. Result: {hooks, events}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "list_hooks" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Every SSH host Dial can address, as /ssh list shows them: ~/.ssh/config aliases merged with the saved [ssh_hosts] table (a configured entry wins). Each host is {name, host, user?, port?, key?, origin, source?}; origin is dial (add or remove with set_setting/reset_setting key ssh_hosts.<name>) or ssh_config. Read-only; runs off the agent. Result: {hosts}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "ssh_hosts" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The git worktrees of the project's repository, as /wt list shows them: the primary checkout first, current marks the one this engine runs in. Outside a repository repository is false and the list is empty. Read-only; runs off the agent. Result: {repository, worktrees: [{path, branch?, head, primary, current, bare, detached, locked}]}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "list_worktrees" },
+            "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Claude Code or Codex transcripts recorded for this project, newest first, as dial --from-claude/--from-codex lists them. modified is Unix seconds. Read-only; runs off the agent. Result: {source, candidates: [{id, title?, path, modified}]}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "import_candidates" },
+            "params": {
+              "type": "object",
+              "properties": { "source": { "enum": ["claude", "codex"] } },
+              "required": ["source"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Convert one transcript that import_candidates lists for this project into a new Dial session; any other path is refused with not_found. The active session is unchanged; open the new one with resume. Result: {session_id, source_id?, skipped?} where skipped names content that could not be carried over.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "import_session" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "source": { "enum": ["claude", "codex"] },
+                "path": { "type": "string", "minLength": 1 }
+              },
+              "required": ["source", "path"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {"type": "object", "description": "Computer use as /computer status reports it: whether the saved configuration enables it (turn it on or off with set_setting key integrations, then apply_settings), the screenshot size limit, and the native backend's probe, capabilities {backend, capturePermission, inputPermission, axPermission, ...}, or unavailable with the reason. Read-only; runs off the agent. Result: {enabled, max_width, max_height, capabilities?, unavailable?}.", "properties": {"id": {"$ref": "#/$defs/id"}, "method": {"const": "computer_status"}, "params": {"type": "object", "properties": {}, "additionalProperties": false}}, "required": ["method"], "additionalProperties": false},
         {
           "type": "object",
           "description": "Tool reliability for this session, as /reliability shows it: whether it is enabled, measured results, the route, this session's counters and the contract-failure limit. Read-only; answered on the agent actor. Result: {enabled, measured, route, session, max_contract_failures, strict_tools}.",
@@ -3894,6 +4054,7 @@
               "type": "object",
               "description": "Optional request features this engine accepts; a missing key means unsupported.",
               "properties": {
+                "prepare_local_model": {"type": "boolean"},
                 "type_context": {"type": "boolean"}
               }
             }
@@ -4199,6 +4360,16 @@
             "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {
               "type": "string"
+            },
+            "received_message": {
+              "type": "object",
+              "description": "Incoming worker or project-peer delivery. The message field remains the short notice; text is the complete delivered message, untrusted plain text.",
+              "properties": {
+                "from": {"type": "string"},
+                "text": {"type": "string"}
+              },
+              "required": ["from", "text"],
+              "additionalProperties": true
             },
             "kind": {},
             "lane": {

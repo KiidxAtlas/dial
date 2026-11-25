@@ -384,17 +384,20 @@ impl Ledger {
         }
     }
 
-    /// Controller-run checks (including acceptance and reproduction) on the current revision.
-    /// Direct shell calls have their own declared-check receipt; conventional runner names alone
-    /// can inform diagnostics but cannot satisfy unattended verification.
-    pub fn current_focused_pass(&self, revision: Revision) -> bool {
+    /// Controller-run checks (including acceptance and reproduction) passing on the current
+    /// revision, other than parse- or compile-only checks (`python AST:`, `cargo check:`), which
+    /// show the file loads, not that it does what was asked. Direct shell calls have their own
+    /// declared-check receipt; conventional runner names alone can inform diagnostics but cannot
+    /// satisfy unattended verification.
+    pub fn current_focused_behavior_pass(&self, revision: Revision) -> bool {
         self.latest.values().any(|o| {
-            o.call_id.starts_with(FOCUSED_CHECK_CALL)
+            o.call_id
+                .strip_prefix(FOCUSED_CHECK_CALL)
+                .is_some_and(|name| !is_syntax_only_check(name))
                 && o.current(revision)
                 && o.status == CheckStatus::Passed
         })
     }
-
     pub fn snapshot(&self, revision: Revision) -> serde_json::Value {
         let current: Vec<_> = self
             .latest
@@ -423,6 +426,13 @@ impl Ledger {
             "baseline": self.baseline,
         })
     }
+}
+
+/// Automatic focused checks that only parse or compile the changed files.
+fn is_syntax_only_check(name: &str) -> bool {
+    ["python AST:", "cargo check:"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 #[cfg(test)]

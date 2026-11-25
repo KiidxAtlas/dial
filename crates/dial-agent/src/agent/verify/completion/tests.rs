@@ -378,3 +378,204 @@ fn comparison_wording_does_not_spend_the_recovery_for_actual_open_work() {
         assert!(matches!(decide(agent), Decision::Incomplete(_)));
     });
 }
+
+#[test]
+fn unattended_completion_after_a_stopped_shell_job_is_deferred_once() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        // An attended session keeps the conversation: nothing is deferred.
+        agent.step_checks.stopped_shell_job = Some("python3 -m http.server 8080 &".into());
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+        agent.modes.launch.unattended = true;
+        agent.step_checks.stopped_shell_job = Some("python3 -m http.server 8080 &".into());
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("http.server") && reason.contains("persist=true"),
+                "{reason}"
+            ),
+            _ => panic!("expected one deferral"),
+        }
+        // Said once: finishing again is accepted.
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}
+
+#[test]
+fn unattended_completion_after_a_service_write_is_deferred_once() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        let push = "cd /tmp/t && git push git@localhost:/git/project dev";
+        agent.step_checks.service_write = Some(push.into());
+        // An attended session keeps the user as the judge.
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+        agent.modes.launch.unattended = true;
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("git push")
+                    && reason.contains("remove it")
+                    && reason.contains("rerun a check with check:true"),
+                "{reason}"
+            ),
+            _ => panic!("expected one deferral"),
+        }
+        // A cleanup that pushes again is not asked about a second time.
+        agent.step_checks.service_write = Some(push.into());
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}
+
+#[test]
+fn unattended_completion_on_a_self_confirming_check_is_deferred_once() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        let revision = agent.step_checks.revision();
+        agent.step_checks.shell_check_passed = Some(revision);
+        agent.step_checks.self_confirming_check = Some((revision, vec!["55".into(), "61".into()]));
+        // Attended runs keep the user as the judge.
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+        agent.modes.launch.unattended = true;
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("(55, 61)") && reason.contains("independent evidence"),
+                "{reason}"
+            ),
+            _ => panic!("expected one deferral"),
+        }
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}
+#[test]
+fn unattended_completion_for_a_request_asking_for_speed_is_deferred_once() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        agent
+            .session
+            .set_control_state(
+                json!({"current_instruction": "Make the query as efficient as possible."}),
+            )
+            .unwrap();
+        agent.step_checks.uncheckpointed_shell_commands = 2;
+        agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+        // Attended runs keep the user as the judge.
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+        agent.modes.launch.unattended = true;
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("\"efficient\"") && reason.contains("time the delivered version"),
+                "{reason}"
+            ),
+            _ => panic!("expected one deferral"),
+        }
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}
+
+#[test]
+fn self_confirming_check_after_the_verification_nudge_is_still_deferred_once() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        agent.modes.launch.unattended = true;
+        agent.step_checks.uncheckpointed_shell_commands = 5;
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED),
+                "{reason}"
+            ),
+            _ => panic!("expected the verification nudge"),
+        }
+        // The check written in answer to that nudge only restates a printed value.
+        let revision = agent.step_checks.revision();
+        agent.step_checks.shell_check_passed = Some(revision);
+        agent.step_checks.self_confirming_check = Some((revision, vec!["79566".into()]));
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("(79566)") && reason.contains("independent evidence"),
+                "{reason}"
+            ),
+            _ => panic!("expected the self-confirming deferral after the nudge"),
+        }
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}
+
+#[test]
+fn unattended_completion_for_a_request_naming_functions_is_deferred_once_before_other_gates() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    let instruction = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/agent/verify/completion/tests/named_function_request.txt"
+    ))
+    .unwrap();
+    with_agent("[compaction]\nenabled=false", |agent| {
+        let decide = |agent: &mut crate::agent::Agent<'_>| {
+            agent.completion_decision(
+                TurnOutcome::Completed,
+                ReplyChannel::Explicit,
+                &mut crate::agent::NullUi,
+            )
+        };
+        agent
+            .session
+            .set_control_state(json!({"current_instruction": instruction}))
+            .unwrap();
+        agent.step_checks.uncheckpointed_shell_commands = 5;
+        // Attended runs keep the user as the judge.
+        agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+        // Unattended and still unverified: the interface question comes first, then the
+        // verification nudge still gets its own turn.
+        agent.modes.launch.unattended = true;
+        agent.step_checks.shell_check_passed = None;
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains("`ars`, `test`") && reason.contains("one argument"),
+                "{reason}"
+            ),
+            _ => panic!("expected the interface deferral"),
+        }
+        match decide(agent) {
+            Decision::Continue(reason) => assert!(
+                reason.contains(crate::agent::verify::checks::UNATTENDED_UNVERIFIED),
+                "{reason}"
+            ),
+            _ => panic!("expected the verification nudge"),
+        }
+        agent.step_checks.shell_check_passed = Some(agent.step_checks.revision());
+        assert!(matches!(decide(agent), Decision::Accept(_)));
+    });
+}

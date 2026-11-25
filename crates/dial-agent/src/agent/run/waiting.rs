@@ -8,6 +8,9 @@ const HOST_TICK: Duration = crate::agent::ui::chat::HEARTBEAT;
 /// How long a settled wait waits for a finished job's trailing completion notification.
 const SETTLE_GRACE: Duration = Duration::from_millis(500);
 const SETTLE_POLL: Duration = Duration::from_millis(10);
+/// An unattended run has nobody to steer a wait, so a running `bash` job (often a service that
+/// never exits) is awaited this long at most before the model must decide what to do with it.
+pub(in crate::agent) const UNATTENDED_JOB_WAIT: Duration = Duration::from_secs(60);
 
 impl Agent<'_> {
     /// Returns true when a continuation is needed, including user steering, peer mail or a stop
@@ -21,7 +24,29 @@ impl Agent<'_> {
         if self.background_result_ready() {
             return Ok(true);
         }
-        let jobs = self.awaited_background_jobs();
+        // A job the model itself sent to the background (`bash background: true`, often a server
+        // that never exits) was not expected to finish within this turn. With no user to steer the
+        // wait, report it now instead of spending the whole unattended bound on it.
+        if self.modes.launch.unattended {
+            let requested: Vec<String> = self
+                .requested_background_jobs()
+                .into_iter()
+                .filter(|job| !self.unattended_wait_noticed.contains(job))
+                .collect();
+            if !requested.is_empty() {
+                self.unattended_wait_noticed
+                    .extend(requested.iter().cloned());
+                self.background_notices
+                    .push(unattended_running_notice(&requested));
+                self.record(
+                    self.cur_step,
+                    "background_wait_skipped",
+                    json!({"reason":"requested_background","jobs":requested}),
+                )?;
+                return Ok(true);
+            }
+        }
+        let jobs = self.waitable_background_jobs();
         let workers = self.live_tasks.running_ids();
         let questions = self.side_questions.running_ids();
         if jobs.is_empty() && workers.is_empty() && questions.is_empty() {
@@ -30,6 +55,8 @@ impl Agent<'_> {
             return Ok(self.background_result_ready());
         }
         let started = Instant::now();
+        let job_bound = (self.modes.launch.unattended && !jobs.is_empty())
+            .then(|| started + self.unattended_job_wait);
         self.record(
             self.cur_step,
             "background_wait_started",
@@ -63,7 +90,7 @@ impl Agent<'_> {
                 if self.peer_mail_ready() {
                     break "peer_message";
                 }
-                if self.awaited_background_jobs().is_empty()
+                if self.waitable_background_jobs().is_empty()
                     && self.live_tasks.running_ids().is_empty()
                     && self.side_questions.running_ids().is_empty()
                 {
@@ -91,9 +118,23 @@ impl Agent<'_> {
                     self.background_notices.push("[Awaited work is no longer running] Inspect its terminal results before reporting success; the end of a wait is not verification.".into());
                     break "settled";
                 }
-                let timeout = self.modes.launch.deadline.map_or(HOST_TICK, |deadline| {
+                if let Some(bound) = job_bound
+                    && Instant::now() >= bound
+                {
+                    let running = self.waitable_background_jobs();
+                    if !running.is_empty() {
+                        self.unattended_wait_noticed.extend(running.iter().cloned());
+                        self.background_notices
+                            .push(unattended_running_notice(&running));
+                        break "unattended_bound";
+                    }
+                }
+                let mut timeout = self.modes.launch.deadline.map_or(HOST_TICK, |deadline| {
                     HOST_TICK.min(deadline.saturating_duration_since(Instant::now()))
                 });
+                if let Some(bound) = job_bound {
+                    timeout = timeout.min(bound.saturating_duration_since(Instant::now()));
+                }
                 waiter.wait::<std::io::PipeReader>(None, None, Some(timeout))?;
             })
         })();
@@ -126,6 +167,33 @@ impl Agent<'_> {
             || !self.live_tasks.undelivered().is_empty()
             || self.side_questions.has_undelivered()
     }
+
+    /// Awaited `bash` jobs, minus those an unattended run already waited on for its bound.
+    pub(in crate::agent) fn waitable_background_jobs(&self) -> Vec<String> {
+        let mut jobs = self.awaited_background_jobs();
+        if self.modes.launch.unattended {
+            jobs.retain(|job| !self.unattended_wait_noticed.contains(job));
+        }
+        jobs
+    }
+
+    /// Running awaited jobs the caller explicitly sent to the background.
+    fn requested_background_jobs(&self) -> Vec<String> {
+        let mut jobs = Vec::new();
+        for name in self.ext.names() {
+            if let Some(tool) = self.ext.get(name) {
+                jobs.extend(tool.requested_background_work());
+            }
+        }
+        jobs
+    }
+}
+
+fn unattended_running_notice(running: &[String]) -> String {
+    format!(
+        "[Unattended run: background work is still running]\n{}\nNo user can steer this run, so Dial stopped waiting for it. If a server or service must stay up after you finish, stop it and start it with `bg` action=start persist=true name=<name> (without `ready`), then confirm it serves. If you need a result, use a bounded `bg wait`. Otherwise stop it with `bg kill`. Later completion waits skip these jobs.",
+        running.join("\n")
+    )
 }
 
 #[cfg(test)]

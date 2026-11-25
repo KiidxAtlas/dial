@@ -238,6 +238,7 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ),
     ("eval", "language", &["py"]),
     ("find", "ranking", &["embedding"]),
+    ("find", "mode", &["path"]),
     ("monitor", "action", &["saved", "restore", "forget"]),
     ("bg", "action", &["saved", "restore", "forget"]),
     ("codebase_memory", "action", &["navigate"]),

@@ -614,10 +614,16 @@ fn assembled_delegation_requests_deduplicate_background_without_losing_contracts
                 .as_str()
                 .is_some_and(|text| text.contains("private temporary journal"))
         }));
+        // The child keeps the focused-work guidance; compare against the constant itself so a
+        // wording change cannot silently drop it or break this check.
+        let focused = crate::agent::prompts::system::FOCUSED_WORK
+            .lines()
+            .next()
+            .unwrap();
         assert!(with_journal.iter().any(|m| {
             m["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("advisory"))
+                .is_some_and(|text| text.contains(focused))
         }));
         // Reconstruct the pre-dedup initial request with identical system messages
         // and tool schemas: this measures assembled request bytes, not a template.

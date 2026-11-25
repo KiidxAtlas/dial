@@ -29,6 +29,10 @@ Run `dial` in a project directory. First launch asks for **Hosted provider** or 
 Small local models (under about 7B) often produce broken tool calls; see
 [Model downloads](model-downloads.md) and `dial models recommend` for what fits your machine.
 
+Want to understand the code before changing it? Start with `dial --approval readonly` and ask
+“Where does this behavior come from? Cite the files and lines.” This uses Dial's enforced read-only
+approval mode, rather than relying on a prompt alone.
+
 ## 3. Ask for a fix
 
 Type a concrete request with its limits and press Enter:

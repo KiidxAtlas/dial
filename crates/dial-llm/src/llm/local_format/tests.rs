@@ -5,6 +5,16 @@ fn gguf(path: &Path) {
 }
 
 #[test]
+fn package_fallbacks_are_native_to_the_target() {
+    assert!(package_bin_dirs("windows").is_empty());
+    assert_eq!(package_bin_dirs("linux"), ["/usr/local/bin"]);
+    assert_eq!(
+        package_bin_dirs("macos"),
+        ["/opt/homebrew/bin", "/usr/local/bin"]
+    );
+}
+
+#[test]
 fn detects_each_format_from_layout() {
     let root = tempfile::tempdir().unwrap();
     let mlx = root.path().join("mlx");

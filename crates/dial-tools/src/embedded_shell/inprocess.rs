@@ -307,9 +307,33 @@ fn discovery_output(
     Ok(result.stdout)
 }
 
-/// Direct children of Dial that lead their own process group.
+/// Direct children of Dial that lead their own process group. Linux reads `/proc` directly, so
+/// cleanup works in minimal containers without `ps`; other Unix systems use `ps`.
 #[cfg(unix)]
 fn group_leaders(deadline: Instant, budget: &mut usize) -> Result<Vec<u32>, String> {
+    if cfg!(target_os = "linux") {
+        let entries = std::fs::read_dir("/proc").map_err(|e| format!("listing processes: {e}"))?;
+        let mut rows = String::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            else {
+                continue;
+            };
+            // A process that exits between listing and reading is simply gone.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            if let Some(row) = proc_stat_row(&stat) {
+                rows.push_str(&row);
+                rows.push('\n');
+            }
+        }
+        remaining(deadline)?;
+        return Ok(parse_leaders(&rows, std::process::id()));
+    }
     let mut command = std::process::Command::new("ps");
     command.args(["-A", "-o", "pid=,ppid=,pgid="]);
     let output = discovery_output(command, deadline, budget)?;
@@ -317,6 +341,18 @@ fn group_leaders(deadline: Instant, budget: &mut usize) -> Result<Vec<u32>, Stri
         &String::from_utf8_lossy(&output),
         std::process::id(),
     ))
+}
+
+/// `pid ppid pgid` from one `/proc/<pid>/stat` line, in the shape `parse_leaders` reads. The
+/// command name may contain spaces and parentheses, so fields resume after the last `)`.
+#[cfg(unix)]
+pub(crate) fn proc_stat_row(stat: &str) -> Option<String> {
+    let pid = stat.split_whitespace().next()?;
+    let mut rest = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let _state = rest.next()?;
+    let ppid = rest.next()?;
+    let pgid = rest.next()?;
+    Some(format!("{pid} {ppid} {pgid}"))
 }
 
 /// Leaders among `ps -o pid=,ppid=,pgid=` rows: processes whose parent is `parent` and that lead

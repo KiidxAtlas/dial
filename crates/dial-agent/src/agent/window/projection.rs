@@ -196,14 +196,14 @@ impl<'a> Agent<'a> {
         let mut packet = self.task_packet.clone();
         let mut superseded = self.superseded.clone();
         let selection = crate::adaptive::select(
-            self.config,
+            self.effective_config(),
             &self.request_phase,
             crate::adaptive::Request {
                 kind: self.task_policy.kind,
                 temperature: self.version.harness.temperature,
                 tokens: self.version.harness.max_tokens,
                 pre_action_secs: self.task_policy.initial_reasoning_secs,
-                base_profile: self.config.active_model_profile(),
+                base_profile: self.effective_config().active_model_profile(),
                 recovering_output: false,
                 hermetic: self.hermetic,
             },

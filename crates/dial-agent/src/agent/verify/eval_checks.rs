@@ -137,6 +137,22 @@ impl History {
         })
     }
 
+    /// Like [`Self::current_pass`], restricted to receipts bound to one of `paths`: a passing
+    /// assertion about an unrelated input says nothing about the files this turn changed.
+    pub(in crate::agent) fn current_pass_for(
+        &self,
+        workspace: &Workspace,
+        paths: &[String],
+    ) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        self.recent.iter().rev().any(|r| {
+            seen.insert(r.path.as_str())
+                && r.passed
+                && paths.iter().any(|path| path == &r.path)
+                && eval::check_source_digest(workspace, &r.path).is_some_and(|sha| sha == r.sha256)
+        })
+    }
+
     /// Called to render a report; read each distinct source at most once per report.
     pub(in crate::agent) fn snapshot(&self, workspace: &Workspace) -> Value {
         if self.recent.is_empty() {

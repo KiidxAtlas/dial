@@ -82,11 +82,11 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Locate code by behavior (default) or exact text. Related evidence automatically maps literal name methods and string-array constants across source groups; bounded lexical references, not confirmed owners. Complete numbered excerpts are editable. ranking=semantic adds one model rerank; ranking=embedding uses the embedding model; lsp_path adds language-server symbols.",
+            "Locate code by behavior (default), exact text, or file/directory names (mode=path). Behavior can add related lexical references, model reranking or LSP symbols. Complete numbered excerpts are editable; path results are names only.",
             json!({
-                "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
+                "query": {"type":"string", "description":"Behavior, quoted phrases, exact text, or path words: all match the path, at least one overlaps the basename; case/order ignored"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
-                "mode": {"type":"string", "enum":["behavior", "exact"]},
+                "mode": {"type":"string", "enum":["behavior", "exact", "path"]},
                 "ranking": {"type":"string", "enum":["lexical", "semantic", "embedding"], "description":"Behavior mode only (default lexical)."},
                 "keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
                 "lsp_path": {"type":"string", "description":"Source file selecting a language server for symbol metadata; startup needs approval"},
@@ -98,6 +98,9 @@ impl Tool for Find {
         )
     }
     fn needs_approval(&self, args: &Value) -> bool {
+        if args["mode"] == "path" {
+            return false; // Name lookup cannot invoke a model or language server.
+        }
         // Embedding search sends file contents to the embedding endpoint: off-machine needs approval.
         (embedding_ranking(args) && !self.embedding.local)
             || lsp_args(args)
@@ -106,6 +109,12 @@ impl Tool for Find {
                 .is_some_and(|args| self.lsp.needs_approval(&args))
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
+        if args["mode"] == "path" {
+            return match path_find(ctx.workspace, args) {
+                Ok(text) => ToolOutput::ok(text),
+                Err(error) => ToolOutput::err(error),
+            };
+        }
         if embedding_ranking(args) {
             if let Some(error) = &self.embedding.error {
                 return ToolOutput::err(error.clone());
@@ -468,20 +477,38 @@ fn snippet(lines: &[&str], start: usize, end: usize) -> String {
         .take(300)
         .collect()
 }
-fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, String> {
+fn query_and_limit(args: &Value) -> Result<(&str, u64), String> {
     let query = req_str(args, "query")?;
     if query.trim().is_empty() || query.len() > 4096 {
         return Err("query must be 1..=4096 bytes and nonblank".into());
     }
+    let limit = opt_u64(args, "limit")?.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err("limit must be 1..=100".into());
+    }
+    Ok((query, limit))
+}
+
+fn path_find(ws: &Workspace, args: &Value) -> Result<String, String> {
+    if opt_str(args, "ranking")?.is_some_and(|value| value != "lexical") {
+        return Err("path mode matches names only; omit ranking or use lexical".into());
+    }
+    for key in ["related", "keywords", "lsp_path", "lsp_query"] {
+        if !args[key].is_null() {
+            return Err(format!("{key} is not used in path mode; omit it"));
+        }
+    }
+    let (query, limit) = query_and_limit(args)?;
+    crate::tools::fs::search::find_paths(ws, args, query, limit, MAX_OUTPUT)
+}
+
+fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, String> {
+    let (query, limit) = query_and_limit(args)?;
     let exact = match opt_str(args, "mode")?.unwrap_or("behavior") {
         "exact" => true,
         "behavior" => false,
         _ => return Err("mode must be behavior or exact".into()),
     };
-    let limit = opt_u64(args, "limit")?.unwrap_or(20);
-    if !(1..=100).contains(&limit) {
-        return Err("limit must be 1..=100".into());
-    }
     let terms = tokens(query);
     let phrases = if exact { vec![] } else { quoted(query)? };
     let keywords: Vec<String> = match args.get("keywords") {
@@ -917,6 +944,9 @@ fn append_sections(
 /// Source-excerpt files in an authentic retained find result, bounded to the original search
 /// scope. The hashline rehydrator still verifies the raw digest, tag and every numbered row.
 pub(crate) fn source_targets(ws: &Workspace, args: &Value, text: &str) -> Vec<String> {
+    if args["mode"] == "path" {
+        return Vec::new(); // Names are never source evidence, including on resume.
+    }
     let Ok(scope) = ws.resolve_read(args["path"].as_str().unwrap_or(".")) else {
         return Vec::new();
     };

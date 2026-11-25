@@ -36,6 +36,41 @@ impl Fixture {
     }
 }
 #[test]
+fn sealed_review_requires_session_and_unchanged_journaled_content_after_reopen() {
+    let f = Fixture::new();
+    let cp = f.open();
+    let t = cp.begin_conversation_turn("edit", "s").unwrap();
+    f.write("a", "before");
+    cp.before_write(&f.path("a")).unwrap();
+    f.write("a", "after");
+    cp.settle_changes();
+    assert!(!cp.conversation_diff("s", t, "a").unwrap().2);
+    cp.seal_review(t).unwrap();
+    drop(cp);
+    let cp = f.open();
+    assert!(cp.conversation_diff("s", t, "a").unwrap().2);
+    assert!(cp.conversation_diff("other", t, "a").is_err());
+    f.write("a", "later user work");
+    assert!(!cp.conversation_diff("s", t, "a").unwrap().2);
+}
+
+#[test]
+fn sealed_review_never_crosses_an_unjournaled_edit_after_a_noop() {
+    let f = Fixture::new();
+    let cp = f.open();
+    let t = cp.begin_conversation_turn("edit", "s").unwrap();
+    f.write("a", "original");
+    cp.before_write(&f.path("a")).unwrap();
+    cp.settle_changes();
+    f.write("a", "user edit");
+    cp.before_write(&f.path("a")).unwrap();
+    f.write("a", "user edit plus Dial");
+    cp.settle_changes();
+    cp.seal_review(t).unwrap();
+    assert!(!cp.conversation_diff("s", t, "a").unwrap().2);
+}
+
+#[test]
 fn changed_paths_are_relative_and_scoped_to_their_turn() {
     let fixture = Fixture::new();
     let checkpoint = fixture.open();

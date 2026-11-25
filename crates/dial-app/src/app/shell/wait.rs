@@ -313,8 +313,20 @@ impl Shell {
         if app.model_deferred || !app.config.runs_dial_mlx() {
             return Ok(true);
         }
-        if crate::llm::local_format::serves_with_llama_cpp(&app.config.model) {
-            return self.prepare_llama_cpp(app);
+        let model = Path::new(&app.config.model);
+        let cached = (!model.exists())
+            .then(|| crate::llm::catalog::resolve_local_model(&app.config.model).ok())
+            .flatten();
+        let model = cached.as_deref().map(Path::new).unwrap_or(model);
+        use crate::llm::local_format::{LocalFormat, detect, gguf_file};
+        use crate::llm::local_runtime::GgufLoader;
+        if detect(model) == Some(LocalFormat::Gguf) {
+            let file = gguf_file(model)
+                .ok_or_else(|| anyhow::anyhow!("GGUF weights no longer available"))?;
+            return match GgufLoader::resolve(&file, app.config.local_engine())? {
+                GgufLoader::LlamaCpp => self.prepare_llama_cpp(app),
+                GgufLoader::Atomic => Ok(true), // Atomic setup belongs to Desktop.
+            };
         }
         if !app.config.python.is_file() || !app.config.worker.is_file() {
             let choice = self.ask("Set up local models",

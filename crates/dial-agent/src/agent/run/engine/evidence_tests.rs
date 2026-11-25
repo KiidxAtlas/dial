@@ -335,3 +335,67 @@ fn compaction_retains_read_reuse_for_visible_tail_and_drops_summarized_entries()
             .is_some_and(investigation::is_unchanged_read)
     );
 }
+
+fn bash(id: &str, command: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: json!({ "command": command }),
+        malformed_arguments: false,
+    }
+}
+
+fn shell_round(engine: &mut Engine, workspace: &Workspace, round: u32) -> bool {
+    let mut out = output(&format!("offset {round}: bytes {}", round * 7919));
+    engine.settle(
+        workspace,
+        &bash(
+            &format!("inspect-{round}"),
+            &format!("od -A d -j {round} image.dat"),
+        ),
+        &mut out,
+        Default::default(),
+        |_| true,
+    );
+    let progress = engine.take_round_progress();
+    matches!(
+        engine.record_progress(progress),
+        super::super::turn::progress::Rung::Stop(_)
+    )
+}
+
+#[test]
+fn read_only_shell_investigation_with_new_output_is_evidence_until_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let mut engine = Engine::default();
+    engine.set_evidence_stall_limit(4);
+    // A forensic investigation run entirely in the shell learns something new every round.
+    for round in 0..12 {
+        assert!(
+            !shell_round(&mut engine, &workspace, round),
+            "round {round} of new read-only shell output was treated as a stall"
+        );
+    }
+    // After an edit, new shell output may only be the edited program's output: it no longer
+    // repays the evidence debt, so an edit-and-rerun loop still stops.
+    let mut edit = output("edited");
+    edit.execution.changed_paths = vec!["solve.py".into()];
+    let write = ToolCall {
+        id: "write".into(),
+        name: "write".into(),
+        arguments: json!({ "path": "solve.py" }),
+        malformed_arguments: false,
+    };
+    engine.settle(&workspace, &write, &mut edit, Default::default(), |_| true);
+    let progress = engine.take_round_progress();
+    assert!(!matches!(
+        engine.record_progress(progress),
+        super::super::turn::progress::Rung::Stop(_)
+    ));
+    let stopped = (100..110).any(|round| shell_round(&mut engine, &workspace, round));
+    assert!(
+        stopped,
+        "shell output after an edit must be grounded before it counts"
+    );
+}

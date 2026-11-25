@@ -95,6 +95,22 @@ fn complete_gguf_file(path: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{prefix}-00001-of-{total:05}.gguf")))
 }
 
+pub(crate) const INKLING_DRAFT: &str = "dspark-Inkling-2-Mini-Q8_0.gguf";
+
+/// Only opt into DSpark for explicitly qualified targets with the matching local companion.
+pub fn inkling_dspark(target: &Path) -> Option<PathBuf> {
+    if !matches!(
+        target.file_name()?.to_str()?,
+        "Inkling-2-Mini-AD-IQ2_M.gguf"
+            | "Inkling-2-Mini-AD-IQ3_S.gguf"
+            | "Inkling-2-Mini-AD-Q4_K.gguf"
+    ) {
+        return None;
+    }
+    let draft = target.with_file_name(INKLING_DRAFT);
+    is_gguf_file(&draft).then_some(draft)
+}
+
 /// The GGUF file `llama-server` should load for `path`: the file itself, or the weights inside a
 /// directory. Multimodal projectors (`mmproj*`) are never the model; for split models the first shard
 /// is chosen only when every sibling shard is present. Ambiguous directories require an explicit file.
@@ -105,6 +121,9 @@ pub fn gguf_file(path: &Path) -> Option<PathBuf> {
     let mut models = std::collections::BTreeSet::new();
     for entry in fs::read_dir(path).ok()?.filter_map(Result::ok) {
         let file = entry.path();
+        if file.file_name().is_some_and(|name| name == INKLING_DRAFT) {
+            continue; // A DSpark companion is a draft, not another selectable target.
+        }
         if file
             .file_name()
             .and_then(|name| name.to_str())
@@ -179,6 +198,11 @@ pub fn llama_server() -> Option<PathBuf> {
     find_server("DIAL_LLAMA_SERVER", "llama-cpp", "llama-server")
 }
 
+/// Never fall back to stock `llama-server` for an explicit Atomic selection.
+pub fn atomic_server() -> Option<PathBuf> {
+    find_server("DIAL_ATOMIC_SERVER", "atomic-engine", "atomic-llama-server")
+}
+
 /// stable-diffusion.cpp's `sd-server`, which serves downloaded image checkpoints:
 /// `DIAL_SD_SERVER`, else Dial's own install (`/setup sd-cpp`, at `tools/sd-cpp`), else `PATH` or a
 /// common package-manager location.
@@ -214,10 +238,19 @@ fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> 
 /// Search PATH first; graphical launches may omit the package-manager directories.
 pub(super) fn find_server_on_path(name: &str) -> Option<PathBuf> {
     platform_fs::find_program(Path::new(name), std::env::var_os("PATH").as_deref()).or_else(|| {
-        ["/opt/homebrew/bin", "/usr/local/bin"]
+        package_bin_dirs(std::env::consts::OS)
             .iter()
             .find_map(|dir| platform_fs::executable_candidate(&Path::new(dir).join(name)))
     })
+}
+
+/// A slash-rooted Unix path is relative to the current drive on Windows.
+fn package_bin_dirs(os: &str) -> &'static [&'static str] {
+    match os {
+        "macos" => &["/opt/homebrew/bin", "/usr/local/bin"],
+        "linux" => &["/usr/local/bin"],
+        _ => &[],
+    }
 }
 
 /// Whether the local model `model` (a path) is served by a Dial-launched `llama-server`.
@@ -252,6 +285,15 @@ pub struct GgufInfo {
     pub sampling_top_p: Option<f64>,
     pub sampling_top_k: Option<u64>,
     pub sampling_min_p: Option<f64>,
+}
+
+impl GgufInfo {
+    pub fn engines(&self) -> super::local_runtime::GgufEngines {
+        self.architecture
+            .as_deref()
+            .map(super::local_runtime::GgufEngines::for_architecture)
+            .unwrap_or_default()
+    }
 }
 
 /// Header metadata of the GGUF model at `path` (a file or a directory holding one).

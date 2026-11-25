@@ -84,15 +84,27 @@ pub(super) fn diff(
         .as_str()
         .filter(|path| !path.is_empty())
         .ok_or_else(|| invalid("checkpoint_diff requires params.path"))?;
-    if !review(checkpoints, turn)?
+    let review = review(checkpoints, turn)?;
+    let file = review
         .files
         .iter()
-        .any(|f| f.path == path)
-    {
-        return Err(coded(
-            ErrorCode::NotFound,
-            format!("{path} is not in turn {turn}'s checkpoint"),
-        ));
+        .find(|f| f.path == path)
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::NotFound,
+                format!("{path} is not in turn {turn}'s checkpoint"),
+            )
+        })?;
+    if let Some(session) = params["session_id"].as_str() {
+        let (diff, token, unchanged) = checkpoints.conversation_diff(session, turn, path)?;
+        let reason = file.overlap().or_else(|| {
+            (!unchanged).then(|| {
+                "The current file does not match a known final edit from this turn.".into()
+            })
+        });
+        return Ok(
+            json!({"turn":turn,"path":path,"diff":diff,"token":token,"safe_restore":reason.is_none(),"conflict":reason}),
+        );
     }
     let (diff, token) = checkpoints.review_file(turn, path)?;
     Ok(json!({"turn":turn,"path":path,"diff":diff,"token":token}))
@@ -124,6 +136,17 @@ pub(super) fn restore(
         items.push((path.to_owned(), token.to_owned()));
     }
     let review = review(checkpoints, turn)?;
+    if let Some(session) = params["session_id"].as_str() {
+        for (path, token) in &items {
+            let (_, current, unchanged) = checkpoints.conversation_diff(session, turn, path)?;
+            if overlap_confirmed || !unchanged || current != *token {
+                return Err(coded(
+                    ErrorCode::Conflict,
+                    "File changed or final edit unknown; nothing restored",
+                ));
+            }
+        }
+    }
     for (path, token) in &items {
         let file = review
             .files

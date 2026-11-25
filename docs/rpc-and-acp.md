@@ -21,14 +21,29 @@ emits newline-delimited system, text, tool, todo, notice and usage events follow
 JSON modes reserve stdout for JSON. Results include session ID, answer, tool outcomes, usage and duration.
 Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-only mode and deny rules
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
+On Linux, a print run blanks its prompt argument in its own command line once it has been read, so
+`ps`, `pgrep -f` and `pkill -f` no longer show or match it. A command the agent runs, such as
+`pkill -f qemu` when the prompt mentions qemu, therefore no longer kills Dial itself. Other platforms
+still show the prompt; pass it on stdin to keep it out of the process list there.
 Print runs offer a smaller tool set than the terminal: `ask` is disabled, and `task`/`message`,
 `todo`, `find` and `memory` are listed as loadable instead of offered,
 unless `task.prefer_subagents=true` keeps `task`. The model can still `tool_load` any of them.
 `eval` stays in the initial offer whenever containment and a cell runtime are available and it
 fits the route's core budget (always on hosted routes).
-Session `bg` jobs end when a print run exits. Before the run ends, Dial tells the model once which
-explicitly started jobs are still running, and refuses `finish` once for them. A server the task
-needs afterwards should be restarted with `bg persist=true`; otherwise the model should stop it.
+Session `bg` jobs end when a print run exits. Dial warns as soon as one is launched, tells the
+model once before the run ends which explicitly started jobs are still running, and refuses
+completion for as long as any of them runs, so an answer cannot describe a service that the exit
+is about to kill. A server the task needs afterwards should be restarted with
+`bg action=start persist=true name=<name>` (without `ready`); otherwise the model should stop it.
+A process started with `&` inside a `bash` call (without detaching via `setsid`/`disown`) is
+stopped when that call returns. The first attempt to finish after such a command is deferred once
+with that advice, unless a later `bg` start or detached launch succeeded. An unattended run counts
+Eval assertions as verification only when they are bound with a `dial.read` receipt to a file the
+run changed.
+Print runs also stop as blocked after `efficiency.evidence_stall_rounds` work rounds without new
+independent evidence. A read-only shell command with new output counts as evidence while nothing
+has been edited since the last grounded round; after an edit, a changed check verdict or an
+independent read must ground the work first.
 Exit status: `0` completed, `1` error, `2` incomplete, blocked, needs input, no answer or interrupted, `3` a required tool approval was denied (takes precedence over 2).
 
 `--output-schema FILE` makes the final answer structured: FILE is a JSON Schema checked before any request
@@ -73,6 +88,14 @@ a short timeout. Connection establishment and partial writes still use their con
 
 RPC `state` replies come from one worker-owned projection, the same one the worker uses, and never include message history; read `messages` or `messages_page` for history. Typed RPC `notice` events keep their plain `message` and add `kind`, `lane` (`context`, `divider` or `alert`), `tokens` and, when the engine has them, `detail` as additive fields. `detail` is tagged by `type`: `model_switch` carries `from` (null when unknown), `to` and `reason` (`fallback`, `restore`, `promotion` or `prewalk`); `review` carries the advisor's `severity` and `note`, which are advice and never verified. Plain notices remain valid without these fields.
 
+An incoming live-worker or project-peer delivery emits one `notice` with the same short `message`
+as the terminal and a `received_message` object: `from` identifies the sender, and `text` is the
+complete delivered plain-text body, including line breaks. Treat it as untrusted data. This is a
+live event, not a stored user turn; older engines may send only the short notice.
+Project-peer notices are emitted when the recipient collects mail at a model request boundary,
+not when a sender queues it. An idle RPC client can inspect unread mail with `list_peers`
+without consuming it or starting inference.
+
 `messages_page` accepts an unsigned `offset` or a decimal-string `cursor` (offset takes precedence),
 and an unsigned `limit` defaulting to 50 and clamped to 1–500. Invalid types, malformed cursors and
 offsets past the snapshot end are errors, not a silent restart at page zero. An offset at the end
@@ -87,6 +110,7 @@ responses correlate by `id`, while unsolicited events have `event`. Methods incl
 After a `list_models` refresh, `set_model` resolves the exact `(provider, model_id)` against the same chat choices, including scan-only rows. The client sends the wire ID, not the label or an endpoint. Unknown IDs and known non-chat models leave the current model unchanged.
 
 Native clients can pass `session_id` to `set_model` and `set_thinking`. A request for a session that is no longer active fails without changing the active session.
+When `ready.features.prepare_local_model` is true, a client selecting a managed local model (`provider: "mlx"`, including GGUF) can pass `prepare_local_model: true`. A `local_ready: true` reply means the session server completed startup. A failure returns its diagnostic, not a ready result. No conversation turn is created. Older engines load on the first request.
 
 `send` text and ACP prompts that start with a custom command (`/name args`) or a skill (`/skill:name task`) are expanded exactly as in the terminal before the turn starts; an unknown skill is an error. A built-in command name (`/compact`, `/model`, …) is refused with an error naming the alternative, rather than sent to the model as if the command had run; clients use the matching method. Text that only happens to start with a slash (a pasted path) is sent as typed.
 
@@ -108,7 +132,9 @@ Sign-in (`auth` capability, protocol 2 and native `dial rpc` only): `auth_provid
 
 `auth_providers` includes the Claude and ChatGPT subscriptions (`anthropic` and `openai`); ChatGPT sign-out affects the active account. The optional `key_providers` list gives `{provider, name, key_saved}` for supported hosted endpoints. Pass its opaque `api-key:…` provider ID to `login` to receive a masked API-key prompt. The engine chooses the catalog endpoint, performs its normal provider-specific verification and saves the key. No client-supplied destination is accepted.
 
-A key-provider entry advertising `can_remove: true` supports `remove_api_key` (`provider`, `confirm: true`). After confirming with the user, pass the same opaque ID. The engine removes only its catalog endpoint’s locally saved key across projects and replies `{provider}`. Environment variables, subscription sign-ins and the key at its issuer remain unchanged. Older engines omit `can_remove`; do not fall back to `logout`.
+For custom providers in the saved configuration, `endpoint_keys` lists `{provider, name, key_saved, can_remove}`. Use the returned ID with `login`; the destination comes from the saved configuration. OAuth-only providers are not listed here. Older engines may omit `endpoint_keys`.
+
+A key-provider entry advertising `can_remove: true` supports `remove_api_key` (`provider`, `confirm: true`). After confirming with the user, pass the same opaque ID. The engine removes only the resolved endpoint’s locally saved key across projects and replies `{provider}`. Environment variables, subscription sign-ins and the key at its issuer remain unchanged. Older engines omit `can_remove`; do not fall back to `logout`.
 
 MCP sign-in uses the same events: `mcp_login` (`server`) runs `/mcp login` for a configured remote server, with `provider` set to `mcp:<server>` on its events and for `auth_cancel`. It replies `{server, message}` when the flow ends (a local program has no sign-in and is refused; an unknown server is `not_found`). The grant applies when the server reconnects: `apply_settings {reconnect: true}`. `mcp_logout` (`server`) cancels a running sign-in and removes the stored grant, replying `{server, removed}`.
 
@@ -128,11 +154,13 @@ Session administration, models and settings (native `dial rpc` only for the `ses
 - `fork_session` (optional `session_id`, default the active session): an actor method like `resume`, refused while a turn runs. It forks the session into a new one and switches to it, running the same branch and switch hooks as `/fork`. Returns `session_id`, `forked_from` and `plan_mode`.
 - `list_models` (optional `provider`, optional `purpose` `chat` (default), `image` or `embedding`): every model `set_model` accepts without a network round trip. That covers the main, current, role, favorite and profile models, the bundled catalog of the providers they and `[providers]` name, downloaded local models, and the saved `/models` listings of those providers. Models whose metadata declares a non-chat kind (embedding, rerank, image, audio) are left out. Each row has `provider`, `model_id`, `label`, `sources`, `current` and `thinking_levels`, plus catalog or local metadata when known (`context_window`, `max_output_tokens`, `vision`, `reasoning`, `default_thinking`, `pricing`, `kind`, and `image_output`, true when the model also generates images). Live provider listings are not queried.
   With `purpose: "image"` the reply lists the models that generate images instead, for `image.model`: downloaded local models and saved `/models` listings of any provider whose metadata declares image output (the same test as the terminal's `/settings` picker; names are never guessed, and an explicit `disabled` excludes a model). Each row has `provider` (the id a role assignment saves), `provider_label` (the name to show, e.g. `gguf` for a local GGUF file on `mlx`), `model_id`, `label`, `sources`, `current` (it is the configured `image.model`), `base_url` and `image_api` (the `image.base_url` and `image.api` values that model needs). With `purpose: "embedding"` the reply lists, from the same sources, the models whose metadata declares the embedding kind (the terminal's embedding role rule), for the `embedding` role; rows have the same fields without `image_api`, and `current` marks the assigned `model_roles.embedding`. Another `purpose` is `invalid_params`.
-  Set `refresh: true` to scan providers. All three purposes use that scan, including models without a disk listing. Subsequent lists and switches reuse the scan on this connection without contacting providers. A newer refresh replaces it; rebuilding the configuration or changing projects clears it. Listing a model does not verify inference access or quota.
+  Set `refresh: true` to scan providers. All three purposes use that scan, including models without a disk listing. Subsequent lists and switches reuse the scan on this connection without contacting providers. A newer refresh replaces it; rebuilding the configuration or changing projects clears it. Listing a model does not verify inference access or quota. A refresh reply also carries `checked`: `providers` (how many providers were probed), `capable` and `candidates` (image-capable and image-candidate models), `checked_at`, and `provider_status`, one `{id, label, base_url, state, detail, models}` per scanned provider (only the requested `provider` when one is given) so a client can show why a provider listed nothing. `state` is the provider picker's state (for example `reachable`, `unavailable`, `not-set-up`, `auth-required` or `disabled`), `detail` its readable reason, and `base_url` is null when unknown or when it would carry credentials.
+  Compatible downloaded chat models also carry `local_engine: {selected, choices, setting}`. `choices` lists compatible runtime IDs, not installed binaries; `auto` keeps the format default. Save a choice using `set_setting` on the supplied key. Local `set_model` reads the saved pin on load; no settings rebuild is required.
+  For GGUF, explicit choices require a known chat loader for the architecture in the file header. Inkling GGUF offers only Atomic on Apple Silicon; `auto` is not offered when the format default cannot load it. Unknown headers get no engine picker. `selected` is the saved preference (initially `auto`), not proof of compatibility: if absent from `choices`, prompt for a new choice without silently rewriting it.
 - `image_settings` (no params): the image route `image_gen` resolves from the saved settings, for a client's image settings page. `ok: true` brings `model`, `api` (display name of the image protocol), `settings` (the `image.models` fields that protocol receives), `edits`, and `key` and `entry`: the `image.models.<key>` entry `/image settings` edits for that model (an empty one under a derived key when none exists). `ok: false` brings `error`, the reason generation would fail. Both carry `role` (the assigned `model_roles.image`, or null) and `options`: `sizes`, `qualities`, `backgrounds`, `moderations`, `max_steps`, `lora_scale_limit` and the installed MLX-Serve `loras`. Save changes with `set_setting` on `image.models.<key>` (the whole entry), then `apply_settings`.
 - `delete_local_model` (`model`, optional `dry_run`): deletes a downloaded local model as Ctrl+D in `/models` → Get models does. `model` is a local model path or label that local discovery lists (Hugging Face cache, LM Studio, MLX-Serve); its whole folder in that store is removed. Replies `{label, model, folder, bytes, source, deleted}`; `dry_run: true` only reports. An unknown or out-of-store model is `not_found`, one the saved configuration or the session selects is `refused`, and a failed delete is `failed`.
 - `settings_schema`: the settings reference (`dial config reference`): each setting's `path`, `label`, `description`, `kind`, `constraints`, `default` and `restart`.
-- `get_settings` (optional `key`): every effective setting as `{key, value, redacted}`, or `{key, value}` for one key. Credentials are redacted.
+- `get_settings` (optional `key`): every effective setting as `{key, value, redacted}`, or `{key, value}` for one key. Credentials are redacted. Each entry also carries `scope`, the saved layer that sets that exact key: `project` when the project layer sets it (it overrides the global layer), else `global`; a key neither layer sets (a built-in default) has no `scope`.
 - `set_setting` (`key`, non-null `value`, `scope` `global` or `project`, default `global`) and `reset_setting` (`key`, `scope`) use the same validation and locked write as `dial config set`/`reset`. They change the saved files only (`restart_required`): the running engine keeps its configuration until `apply_settings`. Values are never echoed.
 - `apply_settings` (`settings` group, actor method): reloads the saved settings with the process's command-line flags and applies them to the running session, as the terminal does after `/settings` or `/reload`. An approval change applies in place; when nothing else changed the reply is `{applied: "live", rebuilt: false, approval}`. Any other change rebuilds the agent around the same session, keeping the conversation, todo list, plan mode, approval, permission rules, cost, a model chosen with `set_model`, the resident local model and background processes; MCP servers whose configuration is unchanged stay connected. The reply is `{applied: "rebuild", rebuilt: true, host_tools_reset, tools, model, image_input}`. `{reconnect: true}` rebuilds even when nothing changed and reconnects every MCP server instead of keeping its connection, as `/mcp reconnect` does; the reply adds `reconnected: true`. Host tools and URI schemes are dropped on a rebuild (`host_tools_reset`) and must be declared again; parked sessions must be `resume`d again. Invalid saved settings or an unreachable model fail with `invalid_params` and leave the agent unchanged; running workers fail it with `busy`. Engines without `apply_settings` can restart into the same session instead: `dial-client`'s `Client::restart_and_resume` does that.
 
@@ -144,11 +172,17 @@ Checkpoints and undo (native `dial rpc` only, `checkpoints` group). These call t
 - `checkpoint_files` (`turn`): the files that turn changed, each with `path`, `writers`, `later_turns` and `overlap` (a reason string when another writer or a later turn touched the file, else null). Also returns `label` and `skipped`.
 - `checkpoint_diff` (`turn`, `path`): the diff restoring that file would apply, and a `token` binding it to the file's current bytes.
 - `restore_checkpoint_files` (`turn`, `files: [{path, token}]`, optional `overlap_confirmed`): restores the reviewed files, all or none. A stale token, or an overlapping file without `overlap_confirmed`, is `conflict`, and nothing is written.
+- Pass `session_id` to `checkpoint_diff` and `restore_checkpoint_files` for conversation review: the session must still be active, and restore requires an unchanged final edit with no overlap. The diff compares the pre-turn file with its current contents; `safe_restore` and `conflict` describe eligibility. `evidence {action:"turns"}` lists the latest 50 retained turn results on the active branch with their checkpoint numbers, files and recorded handoff, newest first.
+- `evidence {action:"model_request"}` reads the last main request observed by the active engine session (`provider`, `model`, `succeeded`), or `null` if unavailable. It does not contact a provider. Compare both identifiers before displaying the result for a selection; a previous success is not a health check.
 - `undo` (optional `turns`, default 1): an actor method like `/undo`, refused while a turn runs. Restores the files of the dropped turns, then rewinds the conversation, keeping a summary of the abandoned branch. Returns `files` (`restored`, `removed`, `warnings`), `dropped`, `note`, `rollback_error`, `rewind_error`, `cleanup_error` and `conversation_kept` (true when a file rollback failed and the conversation was left intact). A session-change hook veto is `refused`. Nothing left to undo returns `dropped: 0`.
 
 Extensions (native `dial rpc` only, `extensions` group): `list_extensions` returns the rows `/extensions` shows, read from the saved configuration, `{mcp: [row], skills: [row]}`, where each row has `id`, `title`, `summary`, `tags`, `origin` (`installed`, `curated`, `remote`, `foreign`), `state` (`connected`, `needssignin`, `failing`, `disabled`, `enabled`, `available`) and `details`.
+Listing also returns `discovery_paths`, the paths a scan would read, without opening them. Show these paths before asking permission. For a one-time scan send `extension_action` with `intent: {op: "discover_mcp"}` and `confirm: true`. Its `discovered` array lists available imports; discovery starts and saves nothing. Import requires separate consent to re-read the settings and import a server.
 
 `extension_action` (`intent`, optional `scope` `global`/`project`, optional `confirm`) runs one `/extensions` action through the overlay's own owner, including its health check and its rule for which config layer an existing server is changed in. `intent` is tagged by `op`: `install_curated_mcp {id}`, `install_mcp {id, values?}`, `toggle_mcp {id, enable}`, `remove_mcp {id}`, `test_mcp {id}`, `import_mcp {id}`, `remove_skill {id}`, `install_skill {source}`, `smithery_install {name}`, `smithery_key {name, key}`, `smithery_deploy {name, values}` and `catalog_browse {tab, query, page}`. Actions that change files, run a downloaded command, or remove or disable something need `confirm: true` (the overlay's confirm step) and are otherwise refused with `invalid_params`. The reply comes when the action finishes: `{ok, message, action, saved_scope, apply_settings, form, catalog}`. Progress lines arrive meanwhile as `extension_progress` (`action`, `message`). A saved change applies to the running session on `apply_settings`. When the owner needs values (a Smithery key, a server's settings, required inputs), `form` is `{submit, target, title, note, error, fields: [{key, label, hint, required, secret}]}`: ask the user, then send the intent named by `submit` with `target` and the answers. Typed values are never echoed. `catalog` is a browse page (`tab`, `query`, `page`, `rows`, `more`, `message`, `error`). One action runs at a time; another is refused with `busy`.
+
+- `private_ask` (`text`, `confirm: true`, `side_threads` group) asks one tool-free question without including or changing the active conversation, memory or usage stats. Returns `{answer}`. A client must disclose that the selected provider receives the question; without confirmation the engine returns `refused`. Client storage and RPC transport buffering remain outside the chat retention promise.
+- `evidence` with `action: "turns"` includes the `main_request_receipt` on newly recorded turns. Older turns have no receipt; do not infer zero traffic from its absence.
 
 Session control (native `dial rpc` only, `session_control` group; actor methods, refused while a turn runs):
 
@@ -161,6 +195,7 @@ Permission rules (native RPC): `list_permission_rules` returns the active `rules
 Workspace directories (native `dial rpc` only, `workspace` group): `list_dirs` (controller method, answers during a turn) returns `{root, dirs}`, also reported as `state.workspace`. `add_dir` and `remove_dir` (`path`: absolute, `~`, or relative to the primary root; actor methods) change the workspace as `/add-dir` and `/remove-dir` do, persist it, and return `{changed, path, dirs}`.
 
 Background jobs (native `dial rpc` only, `jobs` group; controller methods, answer during a turn): `list_jobs` returns the session's `bg` jobs, each `{name, command, status, running, stop_requested, terminal}`. `stop_job` (`name`) stops one and returns `{name, stopped}`; an unknown job is `not_found`. Attaching to a job's terminal stays terminal-only.
+Pass `include_persistent: true` to also discover this project’s restart-surviving jobs. `persistent_jobs` is a separate, read-only list of `{name, status, lifetime_secs}` (or `persistent_error` if unavailable). Names may coincide across lists; `stop_job` only addresses session jobs.
 
 Usage (native `dial rpc` only, `usage` group; controller method, answers during a turn): `usage` returns `{providers: [{provider, plan, report, error}]}` for every signed-in provider with a usage endpoint, as `/usage` shows. `plan` is the account's readable plan or tier (`Plus`, `Pro`, `Max 20x`, a Copilot or Z.AI plan, a Gemini tier) or `null` when the provider does not report one; `report` is the provider's limits, notes and metadata. One provider's failure is its `error`; the others still report. Spending a saved reset (`/usage reset`) stays terminal-only.
 
@@ -214,6 +249,7 @@ turn rather than silently queueing a session change behind it.
   gates. Responses distinguish unchanged evaluation, next-turn adoption when improvement is
   enabled, stored admission while improvement is disabled, and steering's next-model-load
   activation when enabled. No request silently enables improvement or steering.
+- **Project peers (native `peer_coordination` capability):** `list_peers {session_id}` reads the same-checkout `/watch` board without draining mail, including live peer instance IDs, recent messages and observed inbox status. `send_peer_message {session_id,to,text}` queues a human letter for the exact live peer instance and returns `{session_id,to,queued:true}` only after acceptance. `to` is a peer instance ID from the board, not a session journal ID or worker label. Both methods work during an active turn without making model requests. The required `session_id` identifies **your active session**: requests during a switch/rebuild can return `busy`, stale session IDs return `conflict`, and disabled coordination or denied sends return `refused`. A queued message is not a read receipt; a recipient sees it at its next model-request boundary. These are not relay room or child-task operations.
 - **Collaboration:** `collaboration_start {confirm:true,read_only?:bool}` hosts the current
   conversation using the existing encrypted room owner; read-only is the default.
   `collaboration_invite {confirm:true}` deliberately returns a secret bearer link; clients must
@@ -223,6 +259,22 @@ turn rather than silently queueing a session change behind it.
   `collaboration_leave` also use the room owner. Joining means admission is pending, not that
   the guest can write. Guest prompts and aborts retain host admission checks and never fall back
   to local inference. Relay service administration remains outside this API.
+- **Hooks, SSH, worktrees and imports:** `list_hooks` returns the saved lifecycle hooks with
+  their effective `fails_closed` mode and the canonical `events`; `ssh_hosts` merges
+  `~/.ssh/config` aliases with `[ssh_hosts]` and marks each `origin` (`dial` or `ssh_config`).
+  Both read the saved configuration, so an edit made with `set_setting`/`reset_setting` (keys
+  `hooks` and `ssh_hosts.<name>`) is listed at once. `list_worktrees` returns the repository's
+  worktrees with `primary` and `current` flags. `import_candidates {source: claude|codex}` lists
+  the Claude Code or Codex transcripts recorded for this project; `import_session {source,
+  path}` converts one of exactly those paths into a new session (any other path is
+  `not_found`) without switching to it.
+- **Session tree and computer use:** `session_tree` lists the open session's `/tree` nodes (user
+  messages and labeled entries, abandoned branches included) with `depth`, `current` and
+  `on_active_branch`. `tree_navigate {entry_id}` continues from one of them with the same
+  appended branch marker as `/tree`; a user message comes back as `prefill` for the composer and
+  is not sent. `computer_status` reports whether computer use is enabled in the saved
+  configuration and the native backend's permission probe, or why it is unavailable; turning it
+  on or off is a `set_setting` write of `integrations` followed by `apply_settings`.
 
 `recovery_snapshot` returns a combined idle transcript and live-state snapshot with an event
 sequence fence. It refuses active workers and oversized histories rather than certifying a

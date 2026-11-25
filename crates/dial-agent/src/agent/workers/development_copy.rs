@@ -99,6 +99,17 @@ fn copy_tree(
             }
             return Ok(());
         }
+        // A macOS framework interpreter loads its runtime relative to its own location
+        // (`@executable_path/../Python3`), so a copy outside that installation cannot start.
+        // Keep a link to it instead, but only when this user cannot write the interpreter, so
+        // the link never gives the copy write access to the installation.
+        #[cfg(target_os = "macos")]
+        if interpreter && relative_framework_loader(&target) && !user_writable(&target) {
+            ensure!(*files < 500_000, "isolated dependency entry limit exceeded");
+            *files += 1;
+            std::os::unix::fs::symlink(&target, dest)?;
+            return Ok(());
+        }
         return copy_tree(&target, dest, root, dest_root, remaining, files, depth + 1);
     }
 
@@ -137,6 +148,28 @@ fn copy_tree(
     Ok(())
 }
 
+/// The Mach-O executable loads a library relative to its own path, as framework builds do.
+#[cfg(target_os = "macos")]
+fn relative_framework_loader(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(64 * 1024).read_to_end(&mut head))
+        .is_ok()
+        && head
+            .windows(b"@executable_path/../".len())
+            .any(|window| window == b"@executable_path/../")
+}
+
+#[cfg(target_os = "macos")]
+fn user_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string; access(2) only reads it.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
 fn executable_interpreter(path: &Path) -> bool {
     use std::io::Read;
     if !path

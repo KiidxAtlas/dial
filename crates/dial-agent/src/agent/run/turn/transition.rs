@@ -54,6 +54,7 @@ impl TurnState<'_> {
             unpriced_cap_noted: _,
             turn_cost_warn: _,
             wrap_up_noted: _,
+            time_marks: _,
             turn_effort: _,
             pending_thinking: _,
             measured: _,

@@ -91,6 +91,8 @@ pub(super) struct Ring {
     pub(super) total: u64,
     /// Absolute offset the next `output` call starts from.
     pub(super) cursor: u64,
+    /// Last request-boundary preview. Previews must not consume explicit output or UI events.
+    preview_cursor: u64,
     /// The output reader has finished, including artifact finalization.
     pub(super) closed: bool,
     pub(super) artifact: Option<String>,
@@ -155,6 +157,7 @@ impl Ring {
             cap,
             total: 0,
             cursor: 0,
+            preview_cursor: 0,
             closed: false,
             artifact: None,
             spool_path: None,
@@ -209,6 +212,34 @@ impl Ring {
         let screen = self.screen.as_ref()?.screen();
         let text = screen.contents();
         Some(text.trim_end_matches([' ', '\n']).to_owned())
+    }
+
+    pub(super) fn take_preview(&mut self) -> Option<String> {
+        const LIMIT: usize = 1024;
+        let from = self.preview_cursor.max(self.cursor);
+        if self.tool_job || self.total <= from {
+            return None;
+        }
+        let (text, clipped) = if let Some(screen) = self.screen_text() {
+            let start = screen.ceil_char_boundary(screen.len().saturating_sub(LIMIT));
+            self.preview_cursor = self.total;
+            (screen[start..].to_owned(), start != 0)
+        } else {
+            let (bytes, lost) = self.recent_since(from, LIMIT);
+            let end = super::super::shell::complete_utf8_prefix(&bytes);
+            self.preview_cursor = self.total - (bytes.len() - end) as u64;
+            (
+                String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                lost != 0,
+            )
+        };
+        (!text.trim().is_empty()).then(|| {
+            if clipped {
+                format!("[…] {text}")
+            } else {
+                text
+            }
+        })
     }
 
     /// Project the existing emulator without reparsing escape sequences in the frontend.
@@ -475,6 +506,38 @@ fn describe(status: ExitStatus) -> String {
     }
 }
 
+/// What a command runs, for duplicate detection: its first script argument (`python3 train.py
+/// --x` and `nohup python3 ./train.py > log` both run `train.py`), else its whitespace-normalized
+/// text. Script paths compare by file name and parent so `./a.py` and `a.py` match.
+pub(super) fn work_key(command: &str) -> Option<String> {
+    const SCRIPTS: &[&str] = &[
+        "py", "sh", "bash", "js", "mjs", "cjs", "ts", "rb", "pl", "r", "jl", "lua", "php",
+    ];
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    let script = words.iter().find_map(|word| {
+        let word = word.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')'));
+        if word.starts_with('-') || word.contains('=') || word.contains('>') {
+            return None;
+        }
+        let path = std::path::Path::new(word);
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        SCRIPTS.contains(&extension.as_str()).then(|| {
+            path.components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect::<std::path::PathBuf>()
+                .display()
+                .to_string()
+        })
+    });
+    Some(script.map_or_else(
+        || format!("cmd:{}", words.join(" ")),
+        |s| format!("script:{s}"),
+    ))
+}
+
 enum ManagedProcess {
     Group(ProcessGroup),
     #[cfg(windows)]
@@ -562,6 +625,9 @@ pub(super) struct Proc {
     /// Started by a `bash` call that moved to the background (not an explicit `bg start`).
     /// Only these are awaited at turn end and block `finish`.
     adopted: bool,
+    /// An adopted job the caller explicitly sent to the background (`bash background: true`).
+    /// An unattended run does not wait on these at turn end; it reports them at once.
+    requested: bool,
     /// Named shell session this job holds busy; settled when the process exits or is removed.
     session: Option<SessionClaim>,
 }
@@ -772,6 +838,7 @@ impl Proc {
             notice_cursor: 0,
             completion_notified: false,
             adopted: false,
+            requested: false,
             session: None,
         })
     }
@@ -1103,6 +1170,15 @@ impl Table {
             .collect()
     }
 
+    /// The running [`awaited`](Self::awaited) jobs the caller explicitly backgrounded.
+    pub(super) fn requested_background(&self) -> Vec<String> {
+        self.procs
+            .iter()
+            .filter(|p| p.is_running() && p.adopted && p.requested)
+            .map(|p| format!("{} ({})", p.name, p.command))
+            .collect()
+    }
+
     /// `bash`-adopted jobs that have exited but whose output capture has not closed, so their
     /// completion is not queued yet. Callers settle them (outside the table lock) before deciding
     /// that nothing is left to wait for.
@@ -1121,6 +1197,19 @@ impl Table {
         self.procs
             .iter()
             .filter(|p| p.is_running() && !p.adopted)
+            .map(|p| format!("{} ({})", p.name, p.command))
+            .collect()
+    }
+
+    /// Running jobs, as `name (command)`, doing the same work as `command`: the same script file
+    /// or the same command text. A second copy competes for CPU and writes the same outputs.
+    pub(super) fn running_same_work(&self, command: &str) -> Vec<String> {
+        let Some(key) = work_key(command) else {
+            return Vec::new();
+        };
+        self.procs
+            .iter()
+            .filter(|p| p.is_running() && work_key(&p.command).as_ref() == Some(&key))
             .map(|p| format!("{} ({})", p.name, p.command))
             .collect()
     }
@@ -1204,6 +1293,7 @@ impl Table {
             captured_total,
             spool,
             mut session,
+            requested,
             ..
         } = job.into_parts();
         let group = ManagedProcess::Group(ProcessGroup::new(child));
@@ -1218,6 +1308,8 @@ impl Table {
         // Output read before adoption is part of this process's output and artifact.
         ring.push(&captured);
         ring.total = captured_total;
+        // The foreground handoff already reported the captured prefix to the model.
+        ring.preview_cursor = captured_total;
         let ring = Arc::new(Mutex::new(ring));
         let stop = Arc::new(AtomicBool::new(false));
         let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())
@@ -1249,6 +1341,7 @@ impl Table {
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
+            requested,
             session,
         };
         self.prune_finished();
@@ -1308,6 +1401,7 @@ impl Table {
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
+            requested: false,
             session: None,
         };
         self.prune_finished();
@@ -1397,6 +1491,7 @@ impl Table {
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
+            requested: false,
             session: None,
         });
         self.notice(ToolEvent {

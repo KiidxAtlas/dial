@@ -71,6 +71,11 @@ def indexed(report):
                     raise ValueError(f"invalid {field}: {key}")
             if len(recorded["failed_check_indices"]) != case["checks_total"] - case["checks_passed"] or not set(recorded["unavailable_check_indices"]).issubset(recorded["failed_check_indices"]):
                 raise ValueError(f"verification evidence disagrees: {key}")
+            claim = recorded.get("false_completion")
+            if claim is not None and (type(claim) is not bool or not count or
+                    "answer_requires_manual_review" in recorded.get("categories", []) or
+                    (claim and not set(recorded["failed_check_indices"]).difference(recorded["unavailable_check_indices"]))):
+                raise ValueError(f"invalid false_completion evidence: {key}")
             contract = recorded["contract_sha256"]
             if not isinstance(contract, str) or len(contract) != 64 or any(c not in "0123456789abcdef" for c in contract):
                 raise ValueError(f"invalid verification contract: {key}")

@@ -5,6 +5,7 @@ use super::metadata::{ModelEntry, ModelKind, ModelMetadata, metadata};
 use super::probe::context;
 use super::{MAX_MODELS, MAX_RESPONSE};
 use crate::llm::local_format::LocalFormat;
+use crate::llm::local_runtime::{GgufEngines, LocalEngine};
 use crate::llm::model_config::ModelSelection;
 use anyhow::Result;
 use serde_json::Value;
@@ -34,11 +35,13 @@ pub fn local_model_metadata(model: &Path) -> ModelMetadata {
             ..Default::default()
         };
     }
-    if !model.join("config.json").is_file()
+    if (!model.join("config.json").is_file()
+        || crate::llm::local_format::detect(model) == Some(LocalFormat::Gguf))
         && let Some(info) = crate::llm::local_format::gguf_info(model)
     {
         let mut metadata = ModelMetadata {
             vision: Some(crate::llm::local_format::gguf_projector(model).is_some()),
+            gguf_engines: info.engines(),
             ..Default::default()
         };
         if info
@@ -358,6 +361,12 @@ pub(super) fn local_models_where(
                 None if crate::llm::local_format::gguf_file(&path).is_some() => (None, true),
                 None => continue,
             };
+            let metadata = local_model_metadata(&path);
+            let (source, available) = if gguf {
+                gguf_listing("Hugging Face cache", metadata.gguf_engines)
+            } else {
+                ("Hugging Face cache (MLX)".into(), true)
+            };
             models.push(ModelEntry {
                 selection: ModelSelection {
                     model: path.to_string_lossy().into_owned(),
@@ -365,12 +374,8 @@ pub(super) fn local_models_where(
                     ..ModelSelection::default()
                 },
                 label: label.clone(),
-                source: if gguf {
-                    gguf_source("Hugging Face cache")
-                } else {
-                    "Hugging Face cache (MLX)".into()
-                },
-                available: true,
+                source,
+                available,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
                     format: Some(if gguf {
@@ -378,7 +383,7 @@ pub(super) fn local_models_where(
                     } else {
                         LocalFormat::Mlx
                     }),
-                    ..local_model_metadata(&path)
+                    ..metadata
                 },
             });
             break;
@@ -386,13 +391,26 @@ pub(super) fn local_models_where(
     }
     models
 }
-/// Source text for a GGUF listing. A missing `llama-server` is named here; Dial offers to install it
-/// before the first turn on the model.
-fn gguf_source(origin: &str) -> String {
+/// Availability is platform compatibility, not proof that the executable is installed.
+fn gguf_listing(origin: &str, loaders: GgufEngines) -> (String, bool) {
+    let label = format!("{origin} (GGUF)");
+    if loaders == GgufEngines::AtomicOnly {
+        let supported =
+            LocalEngine::choices(LocalFormat::Gguf, loaders).contains(&LocalEngine::Atomic);
+        let note = if supported {
+            "requires Atomic Engine"
+        } else {
+            "not runnable locally: Atomic Engine requires Apple Silicon macOS"
+        };
+        return (format!("{label} · {note}"), supported);
+    }
     if crate::llm::local_format::llama_server().is_some() {
-        format!("{origin} (GGUF)")
+        (label, true)
     } else {
-        format!("{origin} (GGUF) · llama.cpp not installed; Dial offers to install it on first use")
+        (
+            format!("{label} · llama.cpp not installed; Dial offers to install it on first use"),
+            true,
+        )
     }
 }
 /// Resolve local inference without asking Hugging Face to look up a revision.
@@ -440,6 +458,21 @@ pub(crate) fn hf_cache() -> Option<PathBuf> {
             std::env::var_os("HF_HOME")
                 .filter(|s| !s.is_empty())
                 .map(|s| PathBuf::from(s).join("hub"))
+        })
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .filter(|s| !s.is_empty())
+                .map(|cache| PathBuf::from(cache).join("huggingface/hub"))
+        })
+        // Match huggingface_hub's expanduser on Windows, even in a Git shell with another HOME.
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+                    .filter(|s| !s.is_empty())
+                    .map(|s| PathBuf::from(s).join(".cache/huggingface/hub"))
+            } else {
+                None
+            }
         })
         .or_else(|| {
             crate::config::paths::home_dir().map(|home| home.join(".cache/huggingface/hub"))
@@ -575,18 +608,19 @@ pub(super) fn lmstudio_gguf_models_where(
             let Some(file) = crate::llm::local_format::gguf_file(&repo.path()) else {
                 continue;
             };
+            let metadata = local_model_metadata(&file);
+            let (source, available) = gguf_listing("LM Studio download", metadata.gguf_engines);
             models.push(ModelEntry {
                 selection: ModelSelection {
                     model: file.to_string_lossy().into_owned(),
                     ..ModelSelection::default()
                 },
                 label,
-                source: gguf_source("LM Studio download"),
-                available: true,
+                source,
+                available,
                 metadata: ModelMetadata {
-                    vision: Some(false),
                     format: Some(LocalFormat::Gguf),
-                    ..ModelMetadata::default()
+                    ..metadata
                 },
             });
         }

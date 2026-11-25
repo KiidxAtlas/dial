@@ -215,6 +215,104 @@ pub(in crate::agent) fn large_read_hint(
     ))
 }
 
+/// Rows of mostly drawing characters that make an output read as a picture in text.
+const TEXT_PICTURE_ROWS: usize = 8;
+
+/// A one-line `[hint]` for command output that draws a picture with text characters (an ASCII
+/// rendering of a plot, toolpath or image), for a model that accepts image input: text art is
+/// lossy, and `read` shows an image file as a picture.
+pub(in crate::agent) fn text_picture_hint(text: &str) -> Option<&'static str> {
+    let rows = text
+        .lines()
+        .filter(|line| {
+            let ink = line.chars().filter(|c| !c.is_whitespace()).count();
+            ink >= 4
+                && line.trim().chars().count() >= 16
+                // Separator rules (`-----`, `=====`) have no gaps; drawings do.
+                && line.trim().contains(char::is_whitespace)
+                && line.chars().all(|c| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '#' | '@' | '*' | '.' | ':' | '+' | '=' | '-' | '%' | 'o' | 'O'
+                        )
+                        || ('\u{2580}'..='\u{259f}').contains(&c)
+                })
+        })
+        .count();
+    (rows >= TEXT_PICTURE_ROWS).then_some(
+        "[hint] This output draws a picture with text characters, which loses detail. `read` shows an image file to you as a picture: draw it to a PNG (for example with matplotlib or Pillow, installing one if needed), `read` the PNG, and crop or zoom into parts you cannot make out.",
+    )
+}
+
+/// Whether a shell command writes to a service or repository through its client: `git push`,
+/// `curl`/`wget` sending data or a write method, or a database client running a write statement.
+/// A check that does this leaves its test data in the state a later caller starts from.
+pub(in crate::agent) fn writes_service_state(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let split = |text: &str| -> Vec<String> {
+        text.split(|c: char| {
+            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '"' | '\'')
+        })
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+    };
+    let words = split(&lower);
+    let has = |word: &str| words.iter().any(|w| w == word);
+    // `git push`, also with leading options (`git -C dir push`).
+    let git_push = words
+        .iter()
+        .enumerate()
+        .any(|(at, w)| w == "push" && words[at.saturating_sub(3)..at].iter().any(|w| w == "git"));
+    // Case matters for curl's short options (`-T` uploads, `-f` only fails on errors).
+    let cased = split(command);
+    let write_method = |w: &str| matches!(w, "post" | "put" | "patch" | "delete");
+    let http_write = (has("curl") || has("wget"))
+        && (cased.iter().any(|w| {
+            matches!(
+                w.as_str(),
+                "-d" | "--data"
+                    | "--data-raw"
+                    | "--data-binary"
+                    | "--data-urlencode"
+                    | "--json"
+                    | "-F"
+                    | "--form"
+                    | "-T"
+                    | "--upload-file"
+                    | "--post-data"
+                    | "--post-file"
+            ) || w.starts_with("--data=")
+                || w.starts_with("--post-data=")
+                || w.strip_prefix("-X")
+                    .is_some_and(|m| write_method(&m.to_ascii_lowercase()))
+                || w.strip_prefix("--method=")
+                    .is_some_and(|m| write_method(&m.to_ascii_lowercase()))
+        }) || words.windows(2).any(|pair| {
+            matches!(pair[0].as_str(), "-x" | "--request" | "--method") && write_method(&pair[1])
+        }));
+    let sql_write = ["psql", "mysql", "mariadb", "sqlite3", "mongosh"]
+        .iter()
+        .any(|client| has(client))
+        && ["insert into", "update ", "delete from", "drop table"]
+            .iter()
+            .any(|statement| lower.contains(statement));
+    // Only the words after `redis-cli` are its command: a shell `set -o pipefail` is not `SET`.
+    let redis_write = words
+        .iter()
+        .position(|w| w == "redis-cli")
+        .is_some_and(|at| {
+            words[at + 1..].iter().any(|w| {
+                matches!(
+                    w.as_str(),
+                    "set" | "hset" | "del" | "lpush" | "rpush" | "sadd" | "flushall" | "flushdb"
+                )
+            })
+        });
+    git_push || http_write || sql_write || redis_write
+}
+
 /// Opening of the pointer that answers an identical re-read whose earlier full result is still shown.
 pub(in crate::agent) const UNCHANGED_READ: &str = "[Unchanged read]";
 

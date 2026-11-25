@@ -42,6 +42,7 @@ impl<'a> Agent<'a> {
         "bash",
         "grep",
         "glob",
+        "find",
         "ask",
         "todo",
         "verify",
@@ -151,15 +152,13 @@ impl<'a> Agent<'a> {
     const LEAN_INITIAL_TOOL_LIMIT: usize = 8;
 
     /// Helpers for a long, steerable session that an unattended run (`Launch::unattended`) keeps
-    /// loadable: delegation (`message` follows `task`), the compaction-surviving working record,
-    /// progress bookkeeping, `find` (which `grep`/`glob` cover), cross-session `memory`, background
-    /// job control (`bash` backgrounds on its own and names `bg` as loadable), the optional
+    /// loadable: delegation (`message` follows `task`), progress bookkeeping, cross-session
+    /// `memory`, background job control (`bash` names `bg` as loadable), the optional
     /// structured `finish` (a plain answer ends the turn), on-demand `verify` (the completion gate
     /// still runs its checks) and `git` (`bash` covers it). In native Harbor print runs (94
     /// requests) none of these was called. A run that needs one pays a single `tool_load` round.
-    const UNATTENDED_DEFERRED: &[&str] = &[
-        "task", "todo", "find", "memory", "bg", "finish", "verify", "git",
-    ];
+    const UNATTENDED_DEFERRED: &[&str] =
+        &["task", "todo", "memory", "bg", "finish", "verify", "git"];
 
     /// Lean local profile (`assistance.lean_local`): compact tool interface, a bounded initial tool
     /// budget, omitted optional prompt sections and, on a single-request server, no up-front delegation.
@@ -579,7 +578,7 @@ impl<'a> Agent<'a> {
     const ESSENTIAL_INTEGRATIONS: &'static [&'static str] = &[
         // Clarifying questions are in the catalog only when `ask` is enabled; when it is, the
         // model should not have to load it first (a failed call is a confusing card).
-        "ask", "find", "bg", "eval",
+        "ask", "bg", "eval",
     ];
 
     /// Tools actually offered: the harness selection, explicitly loaded tools and the essential
@@ -798,9 +797,14 @@ impl<'a> Agent<'a> {
         {
             names.retain(|name| name != "eval" || prepare_eval());
         }
+        // Offer native code discovery on ordinary legacy routes and to eligible children, but
+        // don't silently extend a pinned harness or hermetic selection. Explicit loads stay above.
+        if !pinned && !self.hermetic && catalog.iter().any(|name| name == "find") {
+            names.push("find".into());
+        }
         // `task` and `skill` are offered whenever the harness selects them; explicit profile
         // allowlists still gate them through the profile tool filter.
-        for tool in ["find", "task", "skill"] {
+        for tool in ["task", "skill"] {
             if catalog.iter().any(|name| name == tool) {
                 names.push(tool.into());
             }

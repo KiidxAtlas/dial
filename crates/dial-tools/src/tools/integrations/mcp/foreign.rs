@@ -93,6 +93,13 @@ const SOURCES: &[Source] = &[
     },
 ];
 
+/// Display paths for informed consent, derived from the same list the scan actually reads.
+pub fn source_labels() -> impl Iterator<Item = String> {
+    SOURCES
+        .iter()
+        .map(|s| format!("{}{}", if s.project { "./" } else { "~/" }, s.rel))
+}
+
 /// The user's home directory: `HOME`, or `USERPROFILE` on Windows.
 pub fn home_dir() -> Option<PathBuf> {
     crate::config::paths::home_dir()

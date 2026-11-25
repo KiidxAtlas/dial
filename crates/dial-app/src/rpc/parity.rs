@@ -28,7 +28,8 @@ const PRESENTATION: &str = "presentation the client renders itself";
 const PANEL: &str = "terminal panel or workflow; not an RPC method yet";
 const GIT: &str = "git workflows run in the terminal or through `dial commit` / `git`";
 const LEARNING: &str = "learning and evaluation tooling runs from the terminal or the `dial` CLI";
-const COLLAB: &str = "relay administration and peer workflows remain terminal-only; use collaboration_status for room metadata";
+const COLLAB: &str =
+    "relay administration remains terminal-only; use collaboration_status for room metadata";
 
 /// The RPC surface of the canonical command `name`; `None` for a command not classified yet.
 pub(super) fn parity(name: &str) -> Option<Parity> {
@@ -99,21 +100,26 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "activity" | "controls" | "help" | "theme" | "hotkeys" | "copy" | "queue" | "draft"
         | "attachments" | "watch" => Client(PRESENTATION),
         "restart" => Client("restart the `dial rpc` process; `resume` reopens the session"),
-        "computer" => Terminal(
-            "enable it with set_setting `integrations` and apply_settings; OS permission checks are terminal-only",
-        ),
+        // `/computer on|off` is a set_setting `integrations` write followed by apply_settings.
+        "computer" => Method("computer_status"),
+        "tree" => Method("session_tree"),
         "doctor" | "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
         "update" => Terminal("installs a new binary; use `dial update`"),
         "providers" => Terminal("provider setup wizard; use set_setting, login and remove_api_key"),
         "commit" | "git" | "wt" | "changes" => Terminal(GIT),
         "learn" | "improve" | "weights" | "steering" | "experience" | "autoresearch"
         | "ratchet" | "outcome" | "laya" => Terminal(LEARNING),
-        "relay" | "peers" => Terminal(COLLAB),
-        "compute" | "review" | "seance" | "tree" | "profile" | "todo" | "understanding"
-        | "accounts" | "share" | "dump" | "trace" | "security" | "graphify" | "image"
-        | "modelpreset" | "ssh" | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug"
-        | "rule" | "plan-review" | "contract" | "cleanse" | "gc" | "anonymize" | "images"
-        | "hooks" | "marketplace" | "inbox" => Terminal(PANEL),
+        "peers" => Method("list_peers"),
+        // `/ssh add|remove` and hook edits are `set_setting`/`reset_setting` writes.
+        "hooks" => Method("list_hooks"),
+        "ssh" => Method("ssh_hosts"),
+        "relay" => Terminal(COLLAB),
+        "compute" | "review" | "seance" | "profile" | "todo" | "understanding" | "accounts"
+        | "share" | "dump" | "trace" | "security" | "graphify" | "image" | "modelpreset"
+        | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule" | "plan-review"
+        | "contract" | "cleanse" | "gc" | "anonymize" | "images" | "marketplace" | "inbox" => {
+            Terminal(PANEL)
+        }
         _ => return None,
     })
 }

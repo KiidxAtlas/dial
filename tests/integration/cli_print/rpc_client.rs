@@ -41,6 +41,32 @@ fn next(client: &mut Client) -> Message {
 }
 
 #[test]
+fn private_ask_requires_consent_and_leaves_messages_unchanged() {
+    let env = Env::new();
+    let server = Server::new(vec![text("private reply")]);
+    let mut client = Client::connect(&launch(&env, &server), WAIT).unwrap();
+    let before = client.call("messages", json!({}), WAIT).unwrap();
+    assert_eq!(
+        code(
+            client
+                .call("private_ask", json!({"text":"private question"}), WAIT)
+                .unwrap_err()
+        ),
+        "refused"
+    );
+    assert!(server.requests.lock().is_empty());
+    let result = client
+        .call(
+            "private_ask",
+            json!({"text":"private question","confirm":true}),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(result["answer"], "private reply");
+    assert_eq!(client.call("messages", json!({}), WAIT).unwrap(), before);
+}
+
+#[test]
 fn first_run_client_can_connect_and_list_sign_in_providers_without_a_model() {
     let env = Env::new();
     let launch = Launch::new(env!("CARGO_BIN_EXE_dial"))
@@ -391,6 +417,89 @@ fn events_are_numbered_and_attributed_and_undo_restores_files_and_history() {
 }
 
 #[test]
+fn reopened_turn_keeps_its_check_and_refuses_to_restore_later_work() {
+    let env = Env::new();
+    const CHECK: &str = "test \"$(cat a.txt)\" = alpha && test \"$(cat b.txt)\" = beta";
+    let server = Server::new(vec![
+        call(
+            "write",
+            json!({"files":[{"path":"a.txt","content":"alpha"},{"path":"b.txt","content":"beta"}]}),
+        ),
+        call(
+            "bash",
+            json!({"command":CHECK, "check":true, "check_paths":["a.txt","b.txt"]}),
+        ),
+        text("Checked both files."),
+    ]);
+    let launch = launch(&env, &server);
+    let mut client = Client::connect(&launch, WAIT).unwrap();
+    let session = client.ready().session_id.clone();
+    let id = client
+        .send("Write a.txt and b.txt, then check their contents")
+        .unwrap();
+    loop {
+        match next(&mut client) {
+            Message::Response {
+                id: got, result, ..
+            } if got == id => {
+                result.unwrap();
+                break;
+            }
+            Message::Event(e) if e.kind == "tool_result" => {
+                assert_eq!(e.body["status"], "ok", "{:?}", e.body)
+            }
+            Message::Event(e) if e.kind == "approval_request" => {
+                client
+                    .approve(
+                        e.body["approval_id"].as_str().unwrap(),
+                        Decision::Allow,
+                        WAIT,
+                    )
+                    .unwrap();
+            }
+            Message::Event(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(client.shutdown(WAIT).unwrap().success());
+    std::fs::write(env.project.path().join("b.txt"), "later work").unwrap();
+    let mut client = Client::connect(&launch, WAIT).unwrap();
+    client
+        .call("resume", json!({"session_id":session}), WAIT)
+        .unwrap();
+    let evidence = client
+        .call("evidence", json!({"action":"turns"}), WAIT)
+        .unwrap();
+    let record = &evidence["turns"][0];
+    assert_eq!(record["files"].as_array().unwrap().len(), 2, "{record}");
+    assert!(
+        record["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains(CHECK))),
+        "{record}"
+    );
+    for (path, eligible) in [("b.txt", false), ("a.txt", true)] {
+        let params = json!({"session_id":session,"turn":record["turn"],"path":path});
+        let diff = client.call("checkpoint_diff", params, WAIT).unwrap();
+        assert_eq!(diff["safe_restore"], eligible, "{diff}");
+        let restore = client.call("restore_checkpoint_files", json!({"session_id":session,"turn":record["turn"],"files":[{"path":path,"token":diff["token"]}]}), WAIT);
+        if eligible {
+            restore.unwrap();
+        } else {
+            assert_eq!(code(restore.unwrap_err()), "conflict");
+        }
+    }
+    assert!(!env.project.path().join("a.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(env.project.path().join("b.txt")).unwrap(),
+        "later work"
+    );
+    assert!(client.shutdown(WAIT).unwrap().success());
+}
+
+#[test]
 fn saved_settings_apply_by_restarting_into_the_same_session() {
     let env = Env::new();
     let server = Server::new(vec![text("hello")]);
@@ -562,4 +671,147 @@ fn an_engine_whose_stdout_is_not_read_queues_events_without_loss() {
     );
     drop(stdin);
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn native_peer_board_and_human_mail_are_session_bound_even_during_inference() {
+    let env = Env::new();
+    let server = Server::new(vec![json!({"wait_for_interrupt":true})]);
+    let launch = launch(&env, &server);
+    let mut sender = Client::connect(&launch, WAIT).unwrap();
+    let mut recipient = Client::connect(&launch, WAIT).unwrap();
+    let from = sender.ready().session_id.clone();
+    let old = recipient.ready().session_id.clone();
+    let board = |client: &mut Client, session: &str| {
+        client
+            .call("list_peers", json!({"session_id":session}), WAIT)
+            .unwrap()
+    };
+    let old_peer = board(&mut sender, &from)["rows"][0]["id"].clone();
+    let session = recipient.call("new_session", json!({}), WAIT).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let roster = board(&mut sender, &from);
+    assert_eq!(roster["rows"].as_array().unwrap().len(), 1, "{roster}");
+    let live = &roster["rows"][0]["id"];
+    assert_ne!(live, &old_peer);
+    let my_peer = board(&mut recipient, &session)["rows"][0]["id"].clone();
+    for (method, params, expected) in [
+        ("list_peers", json!({}), "invalid_params"),
+        ("list_peers", json!({"session_id":old}), "conflict"),
+        (
+            "send_peer_message",
+            json!({"session_id":old,"to":my_peer,"text":"stale"}),
+            "conflict",
+        ),
+        (
+            "send_peer_message",
+            json!({"session_id":session,"to":"../fake","text":"invalid"}),
+            "refused",
+        ),
+        (
+            "send_peer_message",
+            json!({"session_id":session,"to":live,"text":"self"}),
+            "refused",
+        ),
+    ] {
+        assert_eq!(
+            code(recipient.call(method, params, WAIT).unwrap_err()),
+            expected
+        );
+    }
+    assert_eq!(
+        code(
+            sender
+                .call(
+                    "send_peer_message",
+                    json!({"session_id":from,"to":old_peer,"text":"departed"}),
+                    WAIT
+                )
+                .unwrap_err()
+        ),
+        "refused"
+    );
+    // Sharing a Dial home must not let a different project inspect or write this inbox.
+    let foreign_project = tempfile::tempdir().unwrap();
+    let mut outsider =
+        Client::connect(&launch.clone().current_dir(foreign_project.path()), WAIT).unwrap();
+    let foreign = outsider.ready().session_id.clone();
+    assert_eq!(board(&mut outsider, &foreign)["rows"], json!([]));
+    assert_eq!(
+        code(
+            outsider
+                .call(
+                    "send_peer_message",
+                    json!({"session_id":foreign,"to":live,"text":"cross-project"}),
+                    WAIT,
+                )
+                .unwrap_err()
+        ),
+        "refused"
+    );
+    assert!(outsider.shutdown(WAIT).unwrap().success());
+    assert!(server.requests.lock().is_empty());
+
+    sender.request("send", json!({"text":"wait"})).unwrap();
+    server.wait_for_request(WAIT).expect("turn owns the agent");
+    let text = "Human message\nwith the entire second line";
+    let receipt = sender
+        .call(
+            "send_peer_message",
+            json!({"session_id":from,"to":live,"text":text}),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(receipt, json!({"session_id":from,"to":live,"queued":true}));
+    let sent = &board(&mut sender, &from)["rows"][0]["messages"][0];
+    assert_eq!(
+        (
+            sent["by_user"].as_bool(),
+            sent["outgoing"].as_bool(),
+            sent["text"].as_str()
+        ),
+        (Some(true), Some(true), Some(text))
+    );
+    // Inspecting the same inbox twice does not consume the letter or start a turn.
+    for _ in 0..2 {
+        let incoming = board(&mut recipient, &session);
+        assert_eq!(incoming["queued"], 1);
+        let msg = &incoming["rows"][0]["messages"][0];
+        assert_eq!(msg["text"], text);
+        assert_eq!(msg["unread"], true);
+        assert_eq!(msg["outgoing"], false);
+    }
+    assert_eq!(server.requests.lock().len(), 1);
+    sender.kill().unwrap();
+    // Let the single-threaded fixture finish serving the interrupted sender.
+    server.stopped.send(()).unwrap();
+    let turn = recipient.send("read queued mail").unwrap();
+    let mut deliveries = Vec::new();
+    loop {
+        match next(&mut recipient) {
+            Message::Event(event) if event.body.get("received_message").is_some() => {
+                assert_eq!(event.kind, "notice");
+                assert_eq!(event.session_id(), Some(session.as_str()));
+                assert_eq!(event.request_id(), Some(turn));
+                assert_eq!(
+                    event.body["message"],
+                    format!(
+                        "Project peer {} sent a coordination message.",
+                        my_peer.as_str().unwrap()
+                    )
+                );
+                deliveries.push(event.body["received_message"].clone());
+            }
+            Message::Event(_) => {}
+            Message::Response { id, result, .. } if id == turn => {
+                result.unwrap();
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(deliveries, [json!({"from":my_peer,"text":text})]);
+    assert!(recipient.shutdown(WAIT).unwrap().success());
 }

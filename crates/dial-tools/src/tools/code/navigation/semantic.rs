@@ -133,7 +133,8 @@ pub(super) fn enabled(args: &Value) -> Result<bool, String> {
     let exact = match opt_str(args, "mode")?.unwrap_or("behavior") {
         "behavior" => false,
         "exact" => true,
-        _ => return Err("mode must be behavior or exact".into()),
+        "path" => return Ok(false), // Names never enter the model reranking route.
+        _ => return Err("mode must be behavior, exact or path".into()),
     };
     // Lexical is the default: semantic reranking costs an extra model request per call, so the
     // model opts into it only when lexical candidates are not enough.

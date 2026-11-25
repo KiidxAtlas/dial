@@ -29,11 +29,13 @@ mod extensions;
 mod host_tools;
 mod host_uris;
 mod images;
+mod integrations;
 mod jobs;
 mod live_snapshot;
 mod maintenance;
 mod models;
 mod parity;
+mod peers;
 mod permissions;
 mod read_jobs;
 mod reports;
@@ -42,6 +44,7 @@ mod sessions;
 mod settings;
 mod side_control;
 mod skills;
+mod tree;
 mod workflows;
 /// Wire vocabulary shared with clients: versions, the method table and error codes.
 pub use dial_protocol::PROTOCOL_VERSION;
@@ -98,6 +101,7 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "evidence"
                 | "diagnostics"
                 | "skills"
+                | "peer_coordination"
         ))
 }
 
@@ -140,7 +144,7 @@ pub(crate) fn ready_frame(
         "model":model,
         "tools":tools,
         "image_input":image_input,
-        "features":{"type_context":true},
+        "features":{"type_context":true,"prepare_local_model":true},
         "methods":methods,
         "capabilities":capabilities,
         "limits":{
@@ -720,6 +724,11 @@ impl Ui for RpcUi {
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
     }
+    fn received_message(&mut self, notice: &str, from: &str, text: &str) {
+        self.out.emit(json!({
+            "event":"notice", "message":notice, "received_message":{"from":from, "text":text}
+        }));
+    }
     /// Same `notice` event clients already read, plus the typed kind and lane for richer clients.
     fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.out.emit(typed_notice(event));
@@ -1118,6 +1127,11 @@ impl Admin {
                 | "get_schema"
                 | "code_history"
                 | "stats"
+                | "list_hooks"
+                | "ssh_hosts"
+                | "list_worktrees"
+                | "import_candidates"
+                | "computer_status"
         )
     }
 
@@ -1167,12 +1181,16 @@ impl Admin {
                     })?,
                 };
                 // Reserve the scan under the config lock, but perform provider I/O outside it.
-                let cfg = config.clone();
+                let mut cfg = config.clone();
                 let ticket = refresh.then(|| self.scan.begin());
                 let previous = self.scan.snapshot();
                 drop(config);
+                if purpose.is_none() && provider.is_none_or(|p| p == "mlx") {
+                    cfg.local_model_engines = self.saved_config()?.local_model_engines;
+                }
                 let (checked, discovered) = if let Some(ticket) = ticket {
-                    let (checked, rows) = models::refresh_and_check(&layout, &cfg, purpose);
+                    let (checked, rows) =
+                        models::refresh_and_check(&layout, &cfg, purpose, provider);
                     (Some(checked), Some(self.scan.publish(ticket, rows)?))
                 } else {
                     (None, previous)
@@ -1236,6 +1254,13 @@ impl Admin {
             "list_skills" => skills::list(&layout, &config.skills.registries, params),
             "code_history" => reports::code_history(&layout, &config, params),
             "stats" => reports::stats(&layout, params),
+            // Saved, not running, configuration: an edit made with `set_setting` shows at once.
+            "list_hooks" => integrations::hooks(&self.saved_config()?),
+            "ssh_hosts" => integrations::ssh_hosts(&self.saved_config()?),
+            "list_worktrees" => integrations::worktrees(&layout.project_root),
+            "import_candidates" => integrations::import_candidates(&layout, params),
+            "import_session" => integrations::import_session(&layout, params),
+            "computer_status" => Ok(integrations::computer_status(&self.saved_config()?)),
             _ => Err(unknown_method()),
         }
     }
@@ -1469,6 +1494,7 @@ fn run_control(
     let worker_disconnected = input_disconnected.clone();
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let live: Arc<Mutex<LiveState>> = Arc::new(Mutex::new(LiveState::default()));
+    let peers = Arc::new(peers::PeerControl::default());
     let sides = Arc::new(side_control::SideControl::default());
     let worker_live = live.clone();
     let voice_env = crate::voice::VoiceEnv::from_config(&config);
@@ -1516,6 +1542,7 @@ fn run_control(
         scan: admin.scan.clone(),
         admin_layout,
         worker_fs,
+        peers: peers.clone(),
         sides: sides.clone(),
     };
     let worker = thread::spawn(move || actor.run());
@@ -1685,6 +1712,12 @@ fn run_control(
                 }
                 "collaboration_invite" if !acp => {
                     out.result(&id, collaboration::hosting::invite(&request["params"]));
+                }
+                "list_peers" if !acp => {
+                    out.result(&id, peers.list(&request["params"]));
+                }
+                "send_peer_message" if !acp => {
+                    out.result(&id, peers.send(&request["params"]));
                 }
                 "side_thread" if !acp => {
                     out.result(&id, sides.handle(&request["params"]));
@@ -1905,7 +1938,10 @@ fn run_control(
                 "auth_providers" => {
                     let result = (|| -> Result<Value> {
                         auth::ensure_v2(&out)?;
-                        Ok(auth::providers(&auth_dir))
+                        Ok(auth::providers(
+                            &auth_dir,
+                            admin.saved_config().ok().as_ref(),
+                        ))
                     })();
                     out.result(&id, result);
                 }
@@ -1926,7 +1962,14 @@ fn run_control(
                 }
                 "login" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {
-                        auth::start_login(&auth_state, &out, &auth_dir, &id, &request["params"])
+                        auth::start_login(
+                            &auth_state,
+                            &out,
+                            &auth_dir,
+                            || admin.saved_config(),
+                            &id,
+                            &request["params"],
+                        )
                     });
                     if let Err(error) = result {
                         out.result(&id, Err(error));
@@ -1948,7 +1991,12 @@ fn run_control(
                 }
                 "remove_api_key" => {
                     let result = auth::ensure_v2(&out).and_then(|()| {
-                        auth::remove_api_key(&auth_state, &auth_dir, &request["params"])
+                        auth::remove_api_key(
+                            &auth_state,
+                            &auth_dir,
+                            || admin.saved_config(),
+                            &request["params"],
+                        )
                     });
                     out.result(&id, result);
                 }
@@ -2221,6 +2269,12 @@ fn run_control(
                 | "search_sessions"
                 | "code_history"
                 | "stats"
+                | "list_hooks"
+                | "ssh_hosts"
+                | "list_worktrees"
+                | "import_candidates"
+                | "import_session"
+                | "computer_status"
                 | "read_image_artifact"
                     if !acp =>
                 {
@@ -2228,7 +2282,12 @@ fn run_control(
                     if matches!(method.as_str(), "list_jobs" | "stop_job") {
                         out.result(
                             &id,
-                            jobs::handle(background.as_ref(), &method, &request["params"]),
+                            jobs::handle(
+                                background.as_ref(),
+                                &method,
+                                &request["params"],
+                                &admin.layout(),
+                            ),
                         );
                         continue;
                     }
@@ -2325,6 +2384,21 @@ fn run_control(
                         prompt_queued.store(false, Ordering::SeqCst);
                         busy.store(false, Ordering::SeqCst);
                         break;
+                    }
+                    if !acp
+                        && matches!(
+                            request["method"].as_str(),
+                            Some(
+                                "new_session"
+                                    | "resume"
+                                    | "fork_session"
+                                    | "move_session"
+                                    | "set_mode"
+                                    | "apply_settings"
+                            )
+                        )
+                    {
+                        peers.suspend();
                     }
                     if commands.send(request).is_err() {
                         prompt_queued.store(false, Ordering::SeqCst);

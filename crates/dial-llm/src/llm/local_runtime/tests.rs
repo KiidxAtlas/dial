@@ -21,6 +21,7 @@ fn builds_draft_and_kv_flags_in_order() {
         kv_bits: Some(4),
         kv_group_size: Some(32),
         quantized_kv_start: Some(2048),
+        ..Default::default()
     };
     value.validate().unwrap();
     assert_eq!(

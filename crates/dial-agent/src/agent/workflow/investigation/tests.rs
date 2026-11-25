@@ -11,6 +11,43 @@ fn call(name: &str, args: serde_json::Value) -> ToolCall {
 }
 
 #[test]
+fn text_pictures_and_service_writes_are_recognized() {
+    let art = (0..10)
+        .map(|row| format!("{}######   ###  #####", " ".repeat(row)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text_picture_hint(&art).unwrap().contains("`read` the PNG"));
+    let prose = "test result: ok. 12 passed\n".repeat(20);
+    let rule = format!("{}\n", "-".repeat(40)).repeat(12);
+    assert!(text_picture_hint(&prose).is_none());
+    assert!(text_picture_hint(&rule).is_none());
+
+    for command in [
+        "cd /tmp/t && git push origin main dev",
+        "git -C /tmp/t push -q",
+        "curl -sk -X POST https://localhost/api -d '{}'",
+        "curl -XPUT localhost:8080/x",
+        "curl --json '{\"a\":1}' localhost:9000",
+        "wget --post-data=a=1 http://localhost/form",
+        "psql -c \"INSERT INTO users VALUES (1)\"",
+        "redis-cli SET key value",
+    ] {
+        assert!(writes_service_state(command), "{command}");
+    }
+    for command in [
+        "curl -sfk https://localhost:8443/index.html",
+        "curl -sk -o out.html https://localhost/",
+        "git log --oneline; git status",
+        "psql -c 'SELECT count(*) FROM users'",
+        "echo push",
+        "cd /app; set -o pipefail; sqlite3 db.sqlite < query.sql > out.txt",
+        "set -e; redis-cli GET key",
+    ] {
+        assert!(!writes_service_state(command), "{command}");
+    }
+}
+
+#[test]
 fn unchanged_reads_redirect_but_changed_results_and_mutations_do_not() {
     let mut guard = InvestigationGuard::default();
     let read = call("read", json!({"path":"src/main.rs", "i":"inspect"}));

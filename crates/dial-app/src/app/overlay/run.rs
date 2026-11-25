@@ -147,6 +147,35 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
     if let (Some(background), ActiveOverlay::Jobs(panel)) = (env.background_control, &mut *overlay)
     {
         let attached = panel.attached().map(str::to_owned);
+        panel.refresh_persistent(|| {
+            let layout = env.app.layout();
+            crate::tools::exec::background::durable::discover(
+                &layout.user_dir,
+                &layout.project_root,
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| crate::ui::overlay::jobs::JobRow {
+                        name: r.name,
+                        command: format!(
+                            "{} · {}",
+                            r.status,
+                            r.lifetime_secs.map_or_else(
+                                || "lifetime unknown".into(),
+                                |s| format!("{s}s lifetime")
+                            )
+                        ),
+                        status: r.status.into(),
+                        process_outcome: None,
+                        running: false,
+                        stop_requested: false,
+                        terminal: false,
+                        mode: "persist".into(),
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+        });
         if let Some(view) = background.jobs_view(attached.as_deref()) {
             panel.set_jobs(job_rows(view.jobs));
             panel.set_screen(view.screen, view.cursor);

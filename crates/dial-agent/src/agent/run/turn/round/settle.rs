@@ -1,6 +1,9 @@
 //! Settle committed effects, evidence and recovery before history publication.
 use super::*;
 
+/// Distinct printed numbers kept per turn for recognizing self-confirming checks.
+const PRINTED_NUMBERS_CAP: usize = 20_000;
+
 impl Agent<'_> {
     pub(super) fn settle_call<'reply>(
         &mut self,
@@ -173,7 +176,47 @@ impl Agent<'_> {
             turn.reliability.failing_checks += failed;
             check_ran |= passed + failed > 0;
             eval_passed = passed > 0;
+            if passed > 0
+                && failed == 0
+                && let Some(note) = self.unbound_eval_check_note()
+            {
+                output.text.push_str(&format!("\n{note}"));
+            }
         }
+        if matches!(call.name.as_str(), "eval" | "bash")
+            && output.execution.effects != crate::runtime::execution::Effects::Unknown
+            && let Some(changed) = self
+                .step_checks
+                .turn
+                .zip(self.checkpoints.as_ref())
+                .map(|(turn, checkpoints)| checkpoints.changed_files(turn))
+                .filter(|changed| !changed.is_empty())
+        {
+            let source = call.arguments[if call.name == "eval" {
+                "code"
+            } else {
+                "command"
+            }]
+            .as_str()
+            .unwrap_or_default();
+            let failed = output.is_error
+                || output
+                    .process_outcome()
+                    .is_some_and(|process| process.exit_code.is_some_and(|code| code != 0));
+            let root = self.workspace.root().to_path_buf();
+            self.step_checks.failed_runs.observe(
+                &root,
+                &changed,
+                &crate::agent::verify::failed_runs::Run {
+                    tool: &call.name,
+                    source,
+                    language: call.arguments["language"].as_str(),
+                    failed,
+                    output: &output.text,
+                },
+            );
+        }
+        track_stopped_shell_job(&mut self.step_checks.stopped_shell_job, call, &output);
         let mut shell_check_passed = false;
         let mut shell_check_run = None;
         let check_failed = is_check && crate::agent::verify::verification::check_failed(&output);
@@ -190,14 +233,25 @@ impl Agent<'_> {
                 || !process.output_complete);
             // A zero exit through `cmd | tail` is the filter's status, not a verdict; a nonzero
             // exit is still a real failure.
-            let masked_pass = passed
-                && call.arguments["command"]
-                    .as_str()
-                    .is_some_and(crate::agent::verify::checks::exit_status_masked);
+            let command = call.arguments["command"].as_str();
+            let masked_pass =
+                passed && command.is_some_and(crate::agent::verify::checks::exit_status_masked);
             if masked_pass {
                 output
                     .text
-                    .push_str(crate::agent::verify::checks::MASKED_CHECK_NOTE);
+                    .push_str(&crate::agent::verify::checks::masked_check_note(
+                        command.unwrap_or_default(),
+                    ));
+            } else if passed
+                && let Some(note) = crate::agent::verify::checks::uncounted_pass_note(
+                    command.unwrap_or_default(),
+                    &self.step_checks.failed_tests,
+                    self.session.control_state()["current_instruction"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
+            {
+                output.text.push_str(&note);
             } else if passed {
                 turn.reliability.passing_checks += 1;
                 shell_check_passed = true;
@@ -206,6 +260,57 @@ impl Agent<'_> {
                 turn.reliability.failing_checks += 1;
                 shell_check_run = Some(false);
             }
+        }
+        let self_confirming =
+            if shell_check_passed && let Some(command) = call.arguments["command"].as_str() {
+                let control = self.session.control_state();
+                let instruction = control["current_instruction"].as_str().unwrap_or_default();
+                crate::agent::verify::checks::self_confirming_values(
+                    command,
+                    &self.step_checks.printed_numbers,
+                    instruction,
+                )
+            } else {
+                None
+            };
+        if matches!(call.name.as_str(), "bash" | "eval")
+            && self.step_checks.printed_numbers.len() < PRINTED_NUMBERS_CAP
+        {
+            self.step_checks.printed_numbers.extend(
+                crate::agent::verify::checks::distinctive_numbers(&output.text)
+                    .into_iter()
+                    .map(|(_, value)| value),
+            );
+        }
+        if matches!(call.name.as_str(), "bash" | "eval" | "verify")
+            && self.step_checks.failed_tests.len() < PRINTED_NUMBERS_CAP
+        {
+            self.step_checks.failed_tests.extend(
+                crate::agent::run::outcome_gradient::failing_tests(&output.text),
+            );
+        }
+        if matches!(call.name.as_str(), "bash" | "eval")
+            && !output.is_error
+            && !self.hermetic
+            && !self.step_checks.text_picture_noted
+            && context.backend.accepts_image_input()
+            && let Some(hint) =
+                crate::agent::workflow::investigation::text_picture_hint(&output.text)
+        {
+            self.step_checks.text_picture_noted = true;
+            output.text.push_str(&format!("\n{hint}"));
+        }
+        if call.name == "bash"
+            && output
+                .process_outcome()
+                .is_some_and(|process| process.started)
+            && let Some(command) = call.arguments["command"].as_str()
+            && crate::agent::workflow::investigation::writes_service_state(command)
+        {
+            self.step_checks.service_write = Some(crate::agent::safety::guard::clip_middle(
+                command.trim(),
+                160,
+            ));
         }
         outcome.observed_check_failure |= check_failed;
         self.step_checks.reproduced |= check_failed;
@@ -368,10 +473,48 @@ impl Agent<'_> {
         if shell_receipt && check_ran {
             self.step_checks.shell_check_passed =
                 shell_check_passed.then(|| self.step_checks.revision());
+            self.step_checks.self_confirming_check =
+                self_confirming.map(|values| (self.step_checks.revision(), values));
         }
         if committed && let Some(reminder) = self.artifact_check_reminder() {
             output.text.push('\n');
             output.text.push_str(reminder);
+        }
+        // Say once, as soon as an unattended run owes verification, what finishing will require,
+        // so the model marks its own verification run as the check instead of being sent back.
+        if !self.step_checks.unattended_check_noted
+            && !output.is_error
+            && matches!(call.name.as_str(), "bash" | "eval" | "edit" | "write")
+            && self.unattended_verification_gap().is_some()
+        {
+            self.step_checks.unattended_check_noted = true;
+            output.text.push('\n');
+            output
+                .text
+                .push_str(crate::agent::verify::checks::UNATTENDED_CHECK_HINT);
+        }
+        // Warn immediately when an unattended run launches a session-scoped background job so the
+        // model does not spend minutes configuring state inside a process Dial will kill on exit.
+        if let Some(note) = unattended_session_job_note(self.modes.launch.unattended, call, &output)
+        {
+            output.text.push_str(&note);
+        }
+        // A request for speed: say at the start how to measure it without rerunning a slow
+        // original, since the completion deferral comes only after that cost is paid.
+        if !self.step_checks.speed_hint_noted
+            && self.modes.launch.unattended
+            && !self.hermetic
+            && !output.is_error
+            && matches!(call.name.as_str(), "bash" | "eval")
+        {
+            self.step_checks.speed_hint_noted = true;
+            let control = self.session.control_state();
+            let instruction = control["current_instruction"].as_str().unwrap_or_default();
+            if let Some(word) = crate::agent::verify::checks::requested_speed(instruction) {
+                output.text.push_str(&format!(
+                    "\n[Dial] The request asks for speed (\"{word}\"). Run a slow original only once, saving its output and time to files, and compare each later version against those files; time the final version on the real input in a check:true."
+                ));
+            }
         }
         if let Some(passed) = shell_check_run {
             let command = call.arguments["command"]
@@ -441,6 +584,15 @@ impl Agent<'_> {
         }
         if let Some(hint) = crate::agent::run::failure_guidance::command_shape_hint(call, &output) {
             output.text.push_str(&hint);
+        }
+        if let Some(deadline) = self.modes.launch.deadline
+            && let Some(note) = crate::agent::run::turn::begin::deadline_overrun_note(
+                &call.name,
+                &call.arguments,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+        {
+            output.text.push_str(&note);
         }
         if let Some(notice) = crate::agent::run::failure_guidance::directory_request_unavailable(
             &output,
@@ -753,3 +905,61 @@ impl Agent<'_> {
         None
     }
 }
+
+/// Records or clears `stopped_shell_job` for `&`-backgrounded commands. Detached launches
+/// (`setsid`/`disown`) leave Dial's process group and are not stopped on return, so they neither
+/// set nor keep an earlier stopped-job reminder.
+pub(in crate::agent) fn track_stopped_shell_job(
+    slot: &mut Option<String>,
+    call: &ToolCall,
+    output: &ToolOutput,
+) {
+    if call.name == "bash"
+        && let Some(command) = call.arguments["command"].as_str()
+        && output.execution.process.as_ref().is_some_and(|p| p.started)
+    {
+        if crate::agent::run::failure_guidance::detaches(command) {
+            if !output.is_error {
+                *slot = None;
+            }
+        } else if crate::agent::safety::approval::leaves_async_job(command) {
+            let shown = crate::agent::safety::guard::clip_middle(command.trim(), 160);
+            *slot = Some(shown);
+        }
+    } else if call.name == "bg" && call.arguments["action"] == "start" && !output.is_error {
+        *slot = None;
+    }
+}
+
+/// Immediate warning appended when an unattended run starts a non-durable session job.
+pub(in crate::agent) fn unattended_session_job_note(
+    unattended: bool,
+    call: &ToolCall,
+    output: &ToolOutput,
+) -> Option<String> {
+    if !unattended || output.is_error {
+        return None;
+    }
+    let job_id = if call.name == "bash" {
+        output
+            .data
+            .as_ref()
+            .and_then(|data| data["background_job"].as_str())
+    } else if call.name == "bg"
+        && call.arguments["action"] == "start"
+        && call.arguments["persist"] != true
+    {
+        output
+            .data
+            .as_ref()
+            .and_then(|data| data["job"]["name"].as_str())
+    } else {
+        None
+    }?;
+    Some(format!(
+        "\n[Dial] Session job `{job_id}` stops when this unattended run exits. If the task needs it to stay running afterwards (a server, service or VM), stop it with `bg` action=kill name={job_id} and start it with `bg` action=start persist=true name=<name> (without `ready`), then verify it."
+    ))
+}
+
+#[cfg(test)]
+mod tests;

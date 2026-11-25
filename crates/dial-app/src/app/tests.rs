@@ -1064,6 +1064,20 @@ fn coding_model_catalog_ignores_learning_records_and_never_starts_python() {
     let (_home, project, layout, mut config) = config();
     config.endpoint = None;
     config.provider = Some("mlx".into());
+    // This scan exercises local files, not credentials or servers on the developer's host.
+    for id in crate::llm::catalog::key_providers()
+        .map(|p| p.id.as_str())
+        .chain([
+            "lm-studio",
+            "ollama",
+            "mlx-serve",
+            "llama-cpp",
+            "docker-model-runner",
+            "osaurus",
+        ])
+    {
+        config.providers.entry(id.to_owned()).or_default().enabled = false;
+    }
     let python = project.path().join("unexpected-python");
     std::fs::write(&python, "#!/bin/sh\nprintf ran > \"$0.called\"\nexit 1\n").unwrap();
     std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();

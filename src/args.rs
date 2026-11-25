@@ -682,6 +682,8 @@ pub(crate) enum ReliabilityCommand {
 pub(crate) enum Command {
     // Declaration order is `dial --help` order: everyday work first, then integrations,
     // inspection and maintenance, and the learning/experimental tooling last.
+    /// Chat via stdin without Dial transcript, memory, tools or usage stats. Hosted providers still receive the conversation.
+    Private,
     /// List recent sessions in this project; export, rename, pack or unpack one.
     #[command(alias = "session")]
     Sessions {

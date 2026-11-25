@@ -6,7 +6,7 @@
 use super::coded;
 use crate::cli::config_models;
 use crate::config::paths::Layout;
-use crate::config::settings_store::Scope;
+use crate::config::settings_store::{self, Scope};
 use anyhow::Result;
 use dial_protocol::ErrorCode;
 use serde_json::{Value, json};
@@ -73,16 +73,61 @@ pub(super) fn schema() -> Value {
     crate::config::settings::reference()
 }
 
-/// One saved setting (`key`) or every saved setting, with credentials redacted.
+/// One saved setting (`key`) or every saved setting, with credentials redacted. Each result
+/// names the layer that sets the key (`scope`: `project` over `global`); a key set by neither
+/// layer (a built-in default) carries no `scope`.
 pub(super) fn get(layout: &Layout, params: &Value) -> Result<Value> {
     let overlay = toml::Table::new();
+    let layers = Layers::load(layout)?;
     match params.get("key").filter(|value| !value.is_null()) {
         Some(_) => {
             let key = key(params, "get_settings")?;
             let value = config_models::setting_value(layout, &overlay, &key)?;
-            Ok(json!({"key": key, "value": value}))
+            let mut result = json!({"key": key, "value": value});
+            layers.annotate(&mut result, &key);
+            Ok(result)
         }
-        None => Ok(json!({"settings": config_models::setting_entries(layout, &overlay)?})),
+        None => {
+            let mut entries = config_models::setting_entries(layout, &overlay)?;
+            for entry in &mut entries {
+                if let Some(key) = entry["key"].as_str().map(str::to_owned) {
+                    layers.annotate(entry, &key);
+                }
+            }
+            Ok(json!({"settings": entries}))
+        }
+    }
+}
+
+/// The saved project and global layers, loaded once per `get_settings` call.
+struct Layers {
+    project: toml::Table,
+    global: toml::Table,
+}
+
+impl Layers {
+    fn load(layout: &Layout) -> Result<Self> {
+        Ok(Self {
+            project: settings_store::load_layer(layout, Scope::Project)?,
+            global: settings_store::load_layer(layout, Scope::Global)?,
+        })
+    }
+
+    /// The most specific layer that sets exactly `key`, if any.
+    fn scope_of(&self, key: &str) -> Option<Scope> {
+        if config_models::lookup(&self.project, key).is_some() {
+            Some(Scope::Project)
+        } else if config_models::lookup(&self.global, key).is_some() {
+            Some(Scope::Global)
+        } else {
+            None
+        }
+    }
+
+    fn annotate(&self, entry: &mut Value, key: &str) {
+        if let (Some(scope), Some(fields)) = (self.scope_of(key), entry.as_object_mut()) {
+            fields.insert("scope".to_owned(), json!(scope_name(scope)));
+        }
     }
 }
 

@@ -203,6 +203,12 @@ fn interpreter_guidance_for(ws: &Workspace, path: Option<&std::ffi::OsStr>) -> S
         match programs.iter().copied().find(|program| found(program)) {
             Some(program) if program == *language => available.push((*language).to_owned()),
             Some(program) => available.push(format!("{language} ({program})")),
+            None if *language == "python3" && bundled_path::offered(ws, path) => {
+                available.push(format!(
+                    "python3 (Dial's bundled CPython {}, standard library only; after every PATH entry)",
+                    crate::setup::deps::bundled_python::version().unwrap_or("3")
+                ));
+            }
             None => missing.push(*language),
         }
     }
@@ -230,41 +236,102 @@ fn interpreter_guidance_for(ws: &Workspace, path: Option<&std::ffi::OsStr>) -> S
     format!("- Shell PATH languages: {available}{missing}.{validation}\n")
 }
 
-/// Entries directly in `dir`, or `None` when it is unreadable or too large to compare.
-type DirectoryEntries = std::collections::BTreeMap<std::ffi::OsString, Option<u64>>;
+/// Entries under `dir` keyed by relative path, or `None` when it is unreadable or too large to
+/// compare. Nested directories are walked a few levels deep so a command that leaves a build
+/// product beside a deliverable (`gcc main.c -o out/cmain`) is noticed, not only top-level files.
+struct DirectoryEntries {
+    /// Levels walked; the later snapshot uses the same depth so the two compare like for like.
+    depth: usize,
+    entries: std::collections::BTreeMap<std::path::PathBuf, Option<u64>>,
+}
+
+/// Levels below the working directory whose new entries are reported.
+const ENTRY_DEPTH: usize = 3;
+/// Total entries compared before the delta is abandoned as too large to be useful.
+const ENTRY_LIMIT: usize = 4096;
 
 fn directory_entries(dir: &Path) -> Option<DirectoryEntries> {
-    let mut names = DirectoryEntries::new();
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        if entry.file_name() == crate::workspace_copy::SCRATCH_DIR {
-            continue;
-        }
-        let size = entry
-            .file_type()
-            .ok()
-            .filter(|kind| kind.is_file())
-            .and_then(|_| entry.metadata().ok())
-            .map(|meta| meta.len());
-        names.insert(entry.file_name(), size);
-        if names.len() > 4096 {
-            return None;
+    // A large tree keeps the top-level comparison rather than losing the note entirely.
+    entries_to_depth(dir, ENTRY_DEPTH).or_else(|| entries_to_depth(dir, 1))
+}
+
+fn entries_to_depth(dir: &Path, max_depth: usize) -> Option<DirectoryEntries> {
+    let mut names = std::collections::BTreeMap::new();
+    let mut pending = vec![(std::path::PathBuf::new(), 1_usize)];
+    while let Some((relative, depth)) = pending.pop() {
+        let read = fs::read_dir(dir.join(&relative));
+        // Only the working directory itself must be readable; an unreadable subdirectory is
+        // still listed as an entry, just not descended into.
+        let entries = match read {
+            Ok(entries) => entries,
+            Err(_) if depth > 1 => continue,
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            if depth == 1 && name == crate::workspace_copy::SCRATCH_DIR {
+                continue;
+            }
+            let kind = entry.file_type().ok();
+            let size = kind
+                .filter(|kind| kind.is_file())
+                .and_then(|_| entry.metadata().ok())
+                .map(|meta| meta.len());
+            let path = relative.join(&name);
+            if depth < max_depth
+                && kind.is_some_and(|kind| kind.is_dir())
+                && !UNWALKED_DIRS.contains(&name.to_string_lossy().as_ref())
+            {
+                pending.push((path.clone(), depth + 1));
+            }
+            names.insert(path, size);
+            if names.len() > ENTRY_LIMIT {
+                return None;
+            }
         }
     }
-    Some(names)
+    Some(DirectoryEntries {
+        depth: max_depth,
+        entries: names,
+    })
 }
+
+/// Dependency, VCS and cache trees: their creation is reported, their contents are not walked.
+const UNWALKED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+];
 
 /// Bounded directory deltas are observations, never proof that removal was unintended.
 fn created_entries_note(before: Option<&DirectoryEntries>, dir: &Path) -> Option<String> {
-    let before = before?;
-    let after = directory_entries(dir)?;
+    let (before, after) = (
+        &before?.entries,
+        entries_to_depth(dir, before?.depth)?.entries,
+    );
+    // Name a new directory once rather than every file inside it.
     let created: Vec<_> = after
         .keys()
-        .filter(|name| !before.contains_key(*name))
-        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|path| !before.contains_key(*path))
+        .filter(|path| {
+            path.parent()
+                .is_none_or(|parent| parent.as_os_str().is_empty() || before.contains_key(parent))
+        })
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
         .collect();
+    // Removal and shrinkage are reported for the working directory's own entries only: nested
+    // deletions are usually deliberate cleanup, and this note warns about lost task inputs.
     let lost: Vec<_> = before
         .iter()
+        .filter(|(path, _)| path.components().count() == 1)
         .filter_map(|(name, size)| match after.get(name) {
             None => Some(format!("{} disappeared", name.to_string_lossy())),
             Some(Some(now)) if size.is_some_and(|old| *now < old) => Some(format!(
@@ -318,6 +385,9 @@ pub struct ForegroundJob {
     pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
     /// Named session this command runs in; the claim keeps it busy until an adopted job settles.
     pub(crate) session: Option<SessionClaim>,
+    /// The caller asked for the background (`background: true`), rather than a threshold or
+    /// steering moving a command it expected to finish in the foreground.
+    pub(crate) requested: bool,
 }
 
 /// The last lines of output captured before adoption, bounded so the adoption notice stays small.
@@ -329,6 +399,71 @@ fn output_tail(bytes: &[u8]) -> String {
     lines[lines.len().saturating_sub(MAX_LINES)..].join("\n")
 }
 
+/// Advice for a command sent to `bg`: when it sends its stdout to a file, `bg wait until=` only
+/// sees what the job itself prints, so a pattern echoed into that file never matches; and a fixed
+/// `sleep N` beside forked work delays the job's own exit and output by N seconds. Both make a
+/// wait last far longer than the work. A hint only: heredoc bodies and quoted text are skipped.
+pub(crate) fn background_output_note(command: &str) -> Option<String> {
+    let script = command.split("<<").next().unwrap_or(command);
+    let mut unquoted = String::with_capacity(script.len());
+    let mut quote = None;
+    for ch in script.chars() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (None, _) => unquoted.push(ch),
+            _ => {}
+        }
+    }
+    let bytes = unquoted.as_bytes();
+    let mut files = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = unquoted[at..].find('>') {
+        let index = at + offset;
+        at = index + 1;
+        let before = index.checked_sub(1).map(|i| bytes[i]);
+        // `2>`, `>&2`, `&>` stays on the job's output only for stdout; `>>` is handled once.
+        if matches!(before, Some(b'2' | b'>' | b'<')) {
+            continue;
+        }
+        let rest = unquoted[at..].trim_start_matches('>');
+        if rest.starts_with('&') || rest.starts_with('|') {
+            continue;
+        }
+        let target = rest.split_whitespace().next().unwrap_or("");
+        let target = target.trim_end_matches([';', ')', '&']);
+        if target.is_empty() || target == "/dev/null" || files.iter().any(|f| f == target) {
+            continue;
+        }
+        files.push(target.to_owned());
+    }
+    let mut notes = Vec::new();
+    if !files.is_empty() {
+        let shown: Vec<String> = files.iter().take(3).map(|f| format!("`{f}`")).collect();
+        notes.push(format!(
+            "It writes output to {}; `bg wait until=` matches only what the job itself prints, never that file's contents, so wait for its exit (no `until`) or read the file.",
+            shown.join(", ")
+        ));
+    }
+    let forks = unquoted.replace("&&", "").contains('&');
+    if forks {
+        let words: Vec<&str> = unquoted
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if let Some(seconds) = words
+            .windows(2)
+            .filter(|pair| pair[0] == "sleep")
+            .filter_map(|pair| pair[1].trim_end_matches('s').parse::<u64>().ok())
+            .find(|seconds| *seconds >= 10)
+        {
+            notes.push(format!(
+                "Its fixed `sleep {seconds}` delays the job's own exit and output by {seconds}s even if the forked work ends sooner; `bg wait` already blocks without polling."
+            ));
+        }
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
 /// The moment a foreground command is handed to the background owner, or `None` when it may not be.
 /// A zero threshold disables automatic backgrounding, so it gets no deadline. Otherwise the deadline
 /// is the configured threshold, or the command's explicit `timeout` when that is longer: a caller
@@ -355,6 +490,42 @@ fn adoption_due(
     deadline: Option<Duration>,
 ) -> bool {
     asynchronous || steering || deadline.is_some_and(|deadline| elapsed >= deadline)
+}
+
+/// Silence before a foreground command is checked for a reader stuck on a daemon's pipe, and the
+/// interval between checks; each check reads the process table. The silence is long enough that a
+/// reader deliberately watching a detached server's output (`setsid server | grep -m1 Ready`)
+/// usually sees it first; a daemon's start-up command prints within seconds or not at all.
+const PIPE_STALL_IDLE: Duration = Duration::from_secs(20);
+const PIPE_STALL_EVERY: Duration = Duration::from_secs(5);
+
+/// Stops a reader that only a detached process keeps waiting. Unix only; other platforms never
+/// report one.
+fn stop_reader(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        crate::platform::process::signal_pid(pid, 15).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn pipe_stall_note(stall: &crate::platform::pipe_stall::PipeStall, elapsed: Duration) -> String {
+    let writers = stall
+        .writers
+        .iter()
+        .map(|(pid, name)| format!("`{name}` (pid {pid})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[after {}s Dial stopped `{}` (pid {}): it was waiting for the end of a pipe that only {writers} keeps open, a process that left this command's process group and so outlives it. That process keeps running; the rest of the command went on. Output the stopped reader would have printed is lost: send a daemon's start-up output to a file, not through a pipe.]\n",
+        elapsed.as_secs(),
+        stall.reader_name,
+        stall.reader,
+    )
 }
 
 /// Takes over a foreground command that should keep running in the background.
@@ -388,6 +559,7 @@ pub(crate) struct ForegroundParts {
     pub(crate) captured_total: u64,
     pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
     pub(crate) session: Option<SessionClaim>,
+    pub(crate) requested: bool,
 }
 
 impl ForegroundJob {
@@ -409,6 +581,7 @@ impl ForegroundJob {
                 captured_total: job.captured_total,
                 spool: std::ptr::read(&job.spool),
                 session: std::ptr::read(&job.session),
+                requested: job.requested,
             }
         }
     }
@@ -1271,6 +1444,10 @@ fn run_bash(
     // Set once no background owner could take the command (none registered, or every slot in use).
     // It then stays here under its own timeout: a refused hand-off would drop, and so stop, it.
     let mut adoption_refused = false;
+    // Readers stopped because only a detached process held their input pipe, with the note for each.
+    let mut stall_checked = started;
+    let mut stalled_readers = std::collections::BTreeSet::new();
+    let mut stall_notes = String::new();
     let waiter = crate::platform::wake::Waiter::new()
         .map_err(|e| format!("creating command wait channel: {e}"))?;
     loop {
@@ -1309,6 +1486,7 @@ fn run_bash(
                 session: session
                     .zip(exchange)
                     .map(|(name, exchange)| SessionClaim::new(ws, name, exchange)),
+                requested: asynchronous,
             };
             return on_adopt.adopt(job).map(|id| {
                 let so_far = if so_far.is_empty() {
@@ -1329,8 +1507,11 @@ fn run_bash(
                 } else {
                     " No polling."
                 };
+                let advice = background_output_note(&command)
+                    .map(|note| format!(" {note}"))
+                    .unwrap_or_default();
                 let mut output = ToolOutput::ok(format!(
-                    "command is running as background job {id} (after {}s): {command}\n{so_far}You are notified when it finishes.{manage}",
+                    "command is running as background job {id} (after {}s): {command}\n{so_far}You are notified when it finishes.{manage}{advice}",
                     started.elapsed().as_secs()
                 ));
                 // Structured so the controller can follow the job without parsing this prose.
@@ -1372,6 +1553,17 @@ fn run_bash(
             .map_err(|e| format!("observing command exit: {e}"))?
         {
             break;
+        }
+        // A reader whose input pipe only a detached daemon holds open (`postfix start | tail`)
+        // waits until that daemon exits, which for a service is never, and the shell waits for the
+        // reader. Stopping the reader lets the rest of the command run; the daemon keeps running.
+        if last_output.elapsed() >= PIPE_STALL_IDLE && stall_checked.elapsed() >= PIPE_STALL_EVERY {
+            stall_checked = Instant::now();
+            for stall in crate::platform::pipe_stall::detached_pipe_stalls(group.child().id()) {
+                if stalled_readers.insert(stall.reader) && stop_reader(stall.reader) {
+                    stall_notes.push_str(&pipe_stall_note(&stall, started.elapsed()));
+                }
+            }
         }
         if timeout_kills(timeout, started.elapsed(), adopt_after) {
             timed_out = true;
@@ -1445,6 +1637,7 @@ fn run_bash(
     } else if let Some(signal) = crate::platform::process::exit_signal(&status) {
         text.push_str(&format!("[terminated by signal {signal}]\n"));
     }
+    text.push_str(&stall_notes);
     if !success && text.contains("Operation not permitted") && text.contains("/tmp/") {
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
@@ -1925,6 +2118,11 @@ fn shell_command_with_state(
                 }
             }
         };
+        if bundle.is_none()
+            && let Some((_, path)) = bundled_path::fallback(ws, std::env::var_os("PATH").as_deref())
+        {
+            spawn.env("PATH", path);
+        }
         crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());
         spawn
             .current_dir(cwd)
@@ -1959,6 +2157,18 @@ fn shell_command_with_state(
         } else {
             script
         };
+        // Without a resolvable `python3`, bash falls back to Dial's bundled CPython (eval
+        // launches carry their own bundle and keep their exact interpreter).
+        let shell_path: Option<std::ffi::OsString> = if !ws.unsandboxed && strict {
+            Some(bash_path_for(ws).into())
+        } else {
+            std::env::var_os("PATH")
+        };
+        let python = match bundle {
+            None if !fork_fence => bundled_path::fallback(ws, shell_path.as_deref()),
+            _ => None,
+        };
+        let bundle = bundle.or(python.as_ref().map(|(runtime, _)| *runtime));
         let (program, args) = match runner {
             Runner::Bash(bash) => (
                 bash.to_str().ok_or("bash path is not UTF-8")?.to_owned(),
@@ -2047,6 +2257,9 @@ fn shell_command_with_state(
                 ));
             }
         }
+        if let Some((_, path)) = &python {
+            spawn.env("PATH", path);
+        }
         crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());
         spawn
             .current_dir(cwd)
@@ -2059,6 +2272,7 @@ fn shell_command_with_state(
     }
 }
 
+mod bundled_path;
 mod inprocess;
 mod missing_program;
 mod trace;

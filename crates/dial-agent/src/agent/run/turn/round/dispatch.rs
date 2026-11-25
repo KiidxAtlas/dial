@@ -318,6 +318,7 @@ impl Agent<'_> {
                             interrupt: &self.interrupt,
                             ui,
                             pending_steering: &mut steering,
+                            deadline: self.modes.launch.deadline,
                         },
                         group,
                         Some(&call.id),
@@ -575,6 +576,13 @@ impl Agent<'_> {
                 self.workspace.root(),
             )
             && call_form_error(call, schemas, names).is_none()
+            && crate::agent::run::directory_access::pending_directories(
+                &self.workspace,
+                &self.ext,
+                &call.name,
+                &call.arguments,
+            )
+            .is_empty()
             && !self.speculative_pending(call)
             && engine.rejection_at(&self.workspace, call).is_none()
     }

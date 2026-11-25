@@ -107,6 +107,9 @@ struct Manifest {
     skipped: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<String>,
+    /// Last journaled file state (digest and mode), sealed at turn end. Missing means unknown.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    post_edits: std::collections::BTreeMap<String, (Option<[u8; 32]>, u32)>,
     /// Restoration completed, but the linked conversation rewind has not committed yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     restored: bool,
@@ -367,8 +370,24 @@ impl Checkpoints {
         self.review_with(&manifest, path)
     }
 
+    /// Read-only review for a conversation. Compare the very bytes used to generate the token.
+    pub fn conversation_diff(
+        &self,
+        session: &str,
+        turn: u64,
+        path: &str,
+    ) -> Result<(String, String, bool)> {
+        let manifest = self.manifest(turn)?;
+        ensure!(
+            manifest.session.as_deref() == Some(session),
+            "checkpoint belongs to another session"
+        );
+        let (diff, token, unchanged) = self.review_parts(&manifest, path, true)?;
+        Ok((diff.unwrap_or_default(), token, unchanged))
+    }
+
     fn review_with(&self, manifest: &Manifest, path: &str) -> Result<(String, String)> {
-        let (diff, token) = self.review_parts(manifest, path, true)?;
+        let (diff, token, _) = self.review_parts(manifest, path, true)?;
         Ok((diff.unwrap_or_default(), token))
     }
 
@@ -377,7 +396,7 @@ impl Checkpoints {
     /// while the checkpoint lock is held.
     fn review_token(&self, manifest: &Manifest, path: &str) -> Result<String> {
         self.review_parts(manifest, path, false)
-            .map(|(_, token)| token)
+            .map(|(_, token, _)| token)
     }
 
     fn review_parts(
@@ -385,7 +404,7 @@ impl Checkpoints {
         manifest: &Manifest,
         path: &str,
         with_diff: bool,
-    ) -> Result<(Option<String>, String)> {
+    ) -> Result<(Option<String>, String, bool)> {
         use sha2::{Digest, Sha256};
         let turn = manifest.turn;
         ensure!(
@@ -399,11 +418,7 @@ impl Checkpoints {
             .find(|(_, entry)| entry.display() == path)
             .context("file is not in this checkpoint")?;
         let before = if entry.existed {
-            fs::read(
-                turn_dir(&self.dir, turn)
-                    .join("files")
-                    .join(index.to_string()),
-            )?
+            read_saved(&self.dir, turn, index, entry)?
         } else {
             Vec::new()
         };
@@ -425,6 +440,8 @@ impl Checkpoints {
         );
         let before_hash: [u8; 32] = Sha256::digest(&before).into();
         let after_hash: [u8; 32] = Sha256::digest(&after).into();
+        let unchanged =
+            manifest.post_edits.get(path) == Some(&(exists.then_some(after_hash), mode));
         let identity = serde_json::to_vec(&(
             turn,
             path,
@@ -441,7 +458,7 @@ impl Checkpoints {
         let after_text =
             std::str::from_utf8(&after).context("binary file requires manual review")?;
         if !with_diff {
-            return Ok((None, token));
+            return Ok((None, token, unchanged));
         }
         // Myers diff is O((N+M)·D); a dense rewrite of a multi-megabyte file could take minutes.
         // Past the deadline `similar` returns a coarser but still correct diff.
@@ -455,7 +472,7 @@ impl Checkpoints {
             diff.len() <= 24 * 1024,
             "diff exceeds interactive review limit; inspect and restore manually"
         );
-        Ok((Some(diff), token))
+        Ok((Some(diff), token, unchanged))
     }
 
     /// Compare-before-restore; other checkpoint files and later unrelated work are untouched.

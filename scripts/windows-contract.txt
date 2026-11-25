@@ -32,6 +32,10 @@ test-lib dial-tools tools::edit::document_transaction
 
 # Startup state resolution and first-run model/provider navigation must work without Unix HOME.
 test-lib dial-llm config::paths::tests::
+test-lib dial-llm llm::local_format::tests::
+test-lib dial-llm llm::catalog::tests::gguf_downloads_keep_the_local_route_but_are_named_by_their_format
+test-lib dial-agent learn::worker::tests::inkling_capabilities_follow_the_exact_engine_pin
+test-lib dial-app rpc::models::tests::local_engine_pin_is_exact_and_only_offers_compatible_engines
 test-lib dial-app app::tests::onboarding_
 test-lib dial-ui ui::overlay::models::tests::empty_catalog_can_rescan
 test-lib dial-ui ui::overlay::providers::tests::a_local_server_that_is_not_running

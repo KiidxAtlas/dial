@@ -1,11 +1,16 @@
 # Agent-requested directory access
 
-When a tool reports a path outside the workspace, the agent can call
-`request_directory` with an existing `path` and a short `reason`. Dial shows a real
-**Yes / No** approval popup; the user does not need to type `/add-dir`. After an
-approval the agent retries the original tool. Relative directory requests resolve
-against the primary workspace, not the shell's current directory. Use an absolute
-path rather than a shell expression such as `~`.
+In an interactive parent session, Dial pauses a native `read`, `grep`, `glob`, `find`,
+`write`, or `edit` that names an external absolute path with a grantable directory.
+The same applies to an explicit `bash` or `bg start` working directory. The popup names
+the requested directory and the pending tool. **Yes** continues the original call;
+**No** blocks it before it runs, including a multi-file write. No model retry or
+`/add-dir` is needed. Ordinary action approvals remain separate from directory grants.
+
+The agent can also ask in advance with `ask` (`action: "directory"`, `path`, `reason`).
+Relative directory requests resolve against the primary workspace, not the shell's
+current directory. Dial does not infer grants from command text or retry a sandboxed
+process that has already started.
 A refusal for a system temp path such as `/tmp/...` also suggests a workspace scratch path
 (`.tmp/<name>`), which needs no approval.
 
@@ -60,15 +65,16 @@ directory with `--add-dir`.
 ## Separate sensitive access
 
 Adding a normal directory (even a home directory) does **not** unlock protected
-Dial storage. To request a directory inside that storage the agent must set
-`sensitive: true`. Dial first asks for normal directory access, then shows a
+Dial storage. For a protected native file target, or an explicit directory request with
+`sensitive: true`, Dial first asks for normal directory access, then shows a
 **second, separate** sensitive access popup for the exact canonical directory.
 Both approvals must be Yes before any change is applied. A protected storage
 ancestor such as home is not a valid sensitive request. Request the smallest
 needed subdirectory, not the whole Dial user directory.
 
 The sensitive popup explicitly grants **native file-tool read and write access
-only**. **Shell commands remain subject to protected-storage sandbox denies.**
+only**. It does not change shell permissions. With `sandbox.mode = "dev"` or
+`"strict"`, protected-storage sandbox denies still apply; with `"off"`, the shell is unconfined.
 The existing cross-platform sandbox policy cannot safely express a subtree
 exception to a denied storage ancestor; removing that deny would expose sibling
 storage. Dial does not do that. Full sensitive shell access is not implemented.

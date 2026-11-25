@@ -193,6 +193,10 @@ pub(in crate::agent) fn report(
     let Some(recovery) = output.recovery() else {
         return feedback(kind, advice, consecutive);
     };
+    // A streak counts a tool and failure kind, not identical diagnostics. Let the model
+    // compare the actual results; this advice never grants or withholds a retry.
+    let probe = (consecutive > 1 && recovery.retry == Retry::AfterCorrection)
+        .then_some(policy::REPEATED_DIAGNOSTIC);
     // An ordinary nonzero shell exit (missing program, failed build step) whose process ran to
     // completion is routine: the exit code and output above already say what happened. The full
     // recovery block cost about 900 bytes of history on every such failure in benchmark runs, so
@@ -207,34 +211,33 @@ pub(in crate::agent) fn report(
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
     if routine_exit {
-        let streak = if consecutive > 1 {
-            format!("Failed {consecutive} times in a row. ")
-        } else {
-            String::new()
-        };
-        return recovery_notice(
-            kind,
-            &format!(
-                "{streak}Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state."
+        // The exit status and output above already say what failed; repeats add only the streak.
+        let body = match probe {
+            Some(probe) => format!(
+                "Failed {consecutive} times in a row. {probe} Correct only this operation, not the turn."
             ),
-        );
+            None => "Command failed; no committed paths recorded (not proof that nothing changed). Correct the cause, then retry only this operation, not the turn.".to_owned(),
+        };
+        return recovery_notice(kind, &body);
     }
-    // Any other first failure with known effects, no committed work, complete capture and a plain
-    // correct-then-retry decision gets the same one line: the diagnostic above plus the
-    // cause-specific advice. The multi-line state block is kept for cases where it adds facts.
-    let clean_first = consecutive == 1
-        && output.execution.effects != Effects::Unknown
+    // Any other failure with known effects, no committed work, complete capture and a plain
+    // correct-then-retry decision gets one line: the diagnostic above plus the cause-specific
+    // advice, with the streak count on repeats. The multi-line state block is kept for cases where
+    // it adds facts (uncertain effects, committed work, partial capture, withheld retries).
+    let clean = output.execution.effects != Effects::Unknown
         && recovery.committed_paths == 0
         && recovery.retry == Retry::AfterCorrection
         && output.process_outcome().is_none_or(|p| {
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
-    if clean_first {
-        let body = advice_body(kind, advice, 1);
-        return recovery_notice(
-            kind,
-            &format!("{body} No committed file paths recorded (not proof that nothing changed)."),
-        );
+    if clean {
+        let mut body = advice_body(kind, advice, consecutive);
+        if let Some(probe) = probe {
+            body.push(' ');
+            body.push_str(probe);
+        }
+        body.push_str(" No committed file paths recorded (not proof that nothing changed).");
+        return recovery_notice(kind, &body);
     }
     let changed = match recovery.committed_paths {
         0 => "No committed file paths recorded (not proof that nothing changed).".to_owned(),
@@ -271,13 +274,17 @@ pub(in crate::agent) fn report(
             "The original diagnostic and any captured output remain available above; earlier completed work is retained."
         }
     };
+    let mut next = advice_body(kind, advice, consecutive);
+    if let Some(probe) = probe {
+        next.push(' ');
+        next.push_str(probe);
+    }
     recovery_notice(
         kind,
         &format!(
-            "Recovery state: tool `{}`; status {}. {effects} {changed}\nRetry: {retry}\nRetained: {retained}\nNext action: {}",
+            "Recovery state: tool `{}`; status {}. {effects} {changed}\nRetry: {retry}\nRetained: {retained}\nNext action: {next}",
             call.name,
             recovery.status.as_str(),
-            advice_body(kind, advice, consecutive),
         ),
     )
 }
@@ -536,11 +543,17 @@ pub(in crate::agent) fn command_shape_hint(call: &ToolCall, output: &ToolOutput)
         return None;
     }
     let command = call.arguments["command"].as_str()?;
-    // `cmd & … wait` keeps its jobs inside the call on purpose.
-    if crate::agent::safety::approval::starts_async_job(command)
-        && !command.split_whitespace().any(|word| word == "wait")
-        && output.execution.process.as_ref().is_some_and(|p| p.started)
+    let started = output.execution.process.as_ref().is_some_and(|p| p.started);
+    if started
+        && crate::agent::safety::approval::starts_async_job(command)
+        && fixed_sleep_secs(command).is_some_and(|secs| secs >= 20)
     {
+        return Some(notice("async_sleep", policy::ASYNC_SLEEP.to_owned()));
+    }
+    if started && detaches(command) {
+        return Some(notice("detached_job", policy::DETACHED_JOB.to_owned()));
+    }
+    if started && crate::agent::safety::approval::leaves_async_job(command) {
         return Some(notice("async_job", policy::ASYNC_JOB.to_owned()));
     }
     let process = output.execution.process.as_ref()?;
@@ -554,6 +567,34 @@ pub(in crate::agent) fn command_shape_hint(call: &ToolCall, output: &ToolOutput)
         .then(|| crate::agent::safety::approval::final_pipe_filter(command))
         .flatten()?;
     Some(notice("filter_exit", policy::filter_exit(filter)))
+}
+
+/// The longest literal `sleep N` (seconds, optional `s`/`m` suffix) in `command`.
+fn fixed_sleep_secs(command: &str) -> Option<u64> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "sleep")
+        .filter_map(|pair| {
+            let (digits, scale) = match pair[1].strip_suffix('m') {
+                Some(minutes) => (minutes, 60),
+                None => (pair[1].strip_suffix('s').unwrap_or(pair[1]), 1),
+            };
+            digits.parse::<u64>().ok().map(|n| n * scale)
+        })
+        .max()
+}
+
+/// A command that starts a process outside its own process group (`setsid`, `disown`), so it
+/// survives the call untracked by Dial. Quoted text and here-document words count too; the
+/// notice only describes what such a process does.
+pub(in crate::agent) fn detaches(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .any(|word| matches!(word, "setsid" | "disown") || word.ends_with("/setsid"))
 }
 
 /// A cell error from the process-fork fence: Python's `PermissionError` raised while forking or

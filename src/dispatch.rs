@@ -312,6 +312,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     let config = dial::cli::model_flags::apply(config, &cli.model_flags)?;
     let config = mode.apply_plan_model(config)?;
     dial::cli::model_flags::capture_overlay(&mut table, &before_model_flags, &config)?;
+    if matches!(cli.command, Some(Command::Private)) {
+        return crate::chat::private(&layout, &config);
+    }
     let route = dial::cli::cli_modes::resolve(cli.mode.as_deref(), cli.no_ui)
         .map_err(anyhow::Error::msg)?
         .map(|mode| mode.route);

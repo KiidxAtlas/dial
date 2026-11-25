@@ -108,6 +108,29 @@ classifier or proof of task quality. Independent outcome checks remain necessary
 and system bytes, settled check reuse and zero default self-review. They establish controller
 behavior, not live-model improvement. No live baseline result is implied by the suite's presence.
 
+### Replay: workspace lookup versus execution
+
+`examples/benchmarks/discovery-routing.toml` replays five small tasks without telling the model
+which tool to choose: locate a transcript preview by filename, find code by behavior, search for a
+literal label, run one regression test, and build a catalog. Each case grades the answer or the
+resulting files independently of tool choice. To measure the updated engine with a configured
+model, run from this checkout using a `dial` binary built from it:
+
+```sh
+dial benchmark examples/benchmarks/discovery-routing.toml --report discovery-routing-report.json
+python3 examples/benchmarks/discovery_routing.py discovery-routing-report.json
+```
+
+The scorer reports main-agent dispatch, not first-call choice or proof of which call produced an
+artifact. A complete trace must show the preferred tool (Find or Glob for filenames, Find for
+behavior, Search for literal text, Verify for the focused test, Bash for the build); the first four
+must not dispatch Bash. Missing or partial traces have an unknown route. To check the fixtures and
+grader **without a model** (Python 3.11+):
+
+```sh
+python3 -m unittest discover -s examples/benchmarks -p 'test_discovery_routing.py'
+```
+
 For the source directory map, offline checks and fixture ownership, start with
 [the benchmark tooling index](../examples/benchmarks/README.md). Runnable non-benchmark samples
 are listed in [the examples index](../examples/README.md).
@@ -541,6 +564,17 @@ list, a case count or the repetitions changes the denominator: bump `name` and d
 against reports recorded under the old name. Report `pass_hat_k` at `k = 3` (all three trials
 pass) next to pass@1; a single-attempt result, such as the Harbor comparison sheets, is not a
 reliability estimate and must not be worded as one. No release-slice run has been recorded yet.
+
+For a prompt comparison, build both variants with the **same benchmark instrumentation** and
+grade the same fixtures with the same provider, model, context, and repetition count. In each
+`reliability.py` summary compare `first_trial_passed_fraction` (repetition zero, not estimated
+pass@1), `observed_all_trials_passed_fraction`, then `false_completions` alongside
+`false_completion_assessed_trials`. A false completion requires a successful run whose final
+RPC turn explicitly reported `completed` and an available independent outcome check failed.
+Failing only a metric or tool-use check does not qualify. Missing settlement, legacy reports,
+or unavailable-only grading cannot establish zero false completions. Inspect the named task
+and zero-based trial IDs before attributing misses to interpretation, execution, verification,
+or reporting. Compare time and requests only after comparing those outcomes.
 
 ### Core-reliability acceptance protocol
 

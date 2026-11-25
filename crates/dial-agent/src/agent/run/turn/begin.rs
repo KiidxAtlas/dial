@@ -99,6 +99,15 @@ impl Agent<'_> {
         {
             turn.wrap_up_noted = true;
             turn.notices.push_protocol(format!("<dial-notice kind=\"turn_budget\">\nAbout 80% of this turn's {budget} is used. Prioritize finishing: complete the change in progress, run the most relevant check, and report; leave optional work for later.\n</dial-notice>"));
+        } else if let Some(deadline) = self.modes.launch.deadline
+            && let Some((mark, note)) = time_left_notice(
+                deadline.saturating_duration_since(turn.turn_started),
+                deadline.saturating_duration_since(Instant::now()),
+                turn.time_marks,
+            )
+        {
+            turn.time_marks = mark;
+            turn.notices.push_protocol(note);
         }
         self.pump_subagents(ui);
         self.cur_step = step;
@@ -273,4 +282,74 @@ pub(super) fn clamp_to_deadline(timeout: u64, remaining: Option<std::time::Durat
     } else {
         timeout.min(left)
     }
+}
+
+/// The `--max-time` budget as the model sees it: once at the start of the turn, then again when
+/// half of it is left. The 80%-used wrap-up note follows separately. `noted` counts the marks
+/// already announced; the result is the new count with its note.
+pub(super) fn time_left_notice(
+    total: std::time::Duration,
+    remaining: std::time::Duration,
+    noted: u8,
+) -> Option<(u8, String)> {
+    if total.is_zero() {
+        return None;
+    }
+    let fraction = remaining.as_secs_f64() / total.as_secs_f64();
+    let mark = if fraction <= 0.5 { 2 } else { 1 };
+    if mark <= noted {
+        return None;
+    }
+    let left = minutes(remaining);
+    let advice = if mark == 1 {
+        "Choose command timeouts and waits that fit inside it; work still running at the deadline is cut off and the run ends."
+    } else {
+        "Plan the remaining work to fit. Keep a working deliverable in place before trying a slower improvement, and do not start runs or waits longer than the time left."
+    };
+    Some((
+        mark,
+        format!(
+            "<dial-notice kind=\"time_left\">\nAbout {left} of this run's --max-time remains. {advice}\n</dial-notice>"
+        ),
+    ))
+}
+
+/// Whole minutes, or seconds below two minutes.
+fn minutes(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 120 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs / 60)
+    }
+}
+
+/// Calls whose own limit reaches past `--max-time`: a `bash`/`eval` timeout, or a `bg` wait
+/// (timeout 0 waits without bound). Reported after the call so the next ones are sized to fit.
+pub(in crate::agent::run) fn deadline_overrun_note(
+    tool: &str,
+    arguments: &serde_json::Value,
+    remaining: std::time::Duration,
+) -> Option<String> {
+    let timeout = arguments.get("timeout").and_then(serde_json::Value::as_u64);
+    let unbounded = match tool {
+        "bash" | "eval" => false,
+        "bg" if arguments.get("action").and_then(serde_json::Value::as_str) == Some("wait") => {
+            timeout == Some(0)
+        }
+        _ => return None,
+    };
+    let allowed = if unbounded {
+        "no time limit".to_owned()
+    } else {
+        let secs = timeout?;
+        if secs <= remaining.as_secs() {
+            return None;
+        }
+        format!("a {secs} s timeout")
+    };
+    Some(format!(
+        "\n[Time] This call allowed {allowed}, but only about {} of this run's --max-time remains. Size later timeouts and waits to fit; work still running at the deadline is cut off.",
+        minutes(remaining)
+    ))
 }

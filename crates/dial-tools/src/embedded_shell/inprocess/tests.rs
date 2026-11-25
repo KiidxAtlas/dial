@@ -11,6 +11,25 @@ fn leaders_are_direct_children_that_lead_their_group() {
 
 #[cfg(unix)]
 #[test]
+fn proc_stat_rows_feed_the_same_leader_parse_as_ps() {
+    // A command name with spaces and parentheses must not shift the fields after it.
+    let row = proc_stat_row("4242 (my (odd) cmd) S 10 4242 4242 0 -1 4194560").unwrap();
+    assert_eq!(row, "4242 10 4242");
+    assert_eq!(parse_leaders(&row, 10), vec![4242]);
+    assert!(proc_stat_row("garbage").is_none());
+    #[cfg(target_os = "linux")]
+    {
+        let own = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let row = proc_stat_row(&own).unwrap();
+        assert_eq!(
+            row.split_whitespace().next().unwrap(),
+            std::process::id().to_string()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn token_discovery_ignores_disappeared_candidates_and_other_rows() {
     let rows = "10 dial DIAL_INPROCESS_RUN=token\n11 command DIAL_INPROCESS_RUN=token-extra\n12 command DIAL_INPROCESS_RUN=token\n";
     assert!(!token_in_ps(rows, 99, "DIAL_INPROCESS_RUN=token"));

@@ -40,6 +40,9 @@ struct Revision {
 struct PathRevisions {
     settled: Option<Revision>,
     open: Option<Revision>,
+    first: Option<(State, u32)>,
+    gap: bool,
+    mode: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +84,17 @@ fn state_of(path: &Path) -> (State, Option<Vec<u8>>) {
     }
 }
 
+fn observed_mode(path: &Path, state: State) -> Option<u32> {
+    match state {
+        State::Absent => Some(0),
+        State::Present(_) => fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| platform_fs::mode(&m)),
+        State::Unavailable => None,
+    }
+}
+
 impl Journal {
     /// Forget every revision and its saved bytes; the next record starts `turn`'s journal.
     pub(super) fn reset(&mut self, dir: &Path, turn: Option<u64>) {
@@ -116,6 +130,13 @@ impl Checkpoints {
             return;
         }
         let (before, bytes) = state_of(resolved);
+        let mode = observed_mode(resolved, before);
+        if slot.first.is_none() {
+            slot.first = mode.map(|m| (before, m));
+        }
+        if let Some(previous) = &slot.settled {
+            slot.gap |= previous.after != Some(before) || slot.mode != mode;
+        }
         let blob = bytes.and_then(|bytes| {
             let blob = turn_dir(&self.dir, turn)
                 .join("revisions")
@@ -142,15 +163,64 @@ impl Checkpoints {
             let Some(mut open) = slot.open.take() else {
                 continue;
             };
-            let (after, _) = state_of(&added.as_ref().unwrap_or(&root).join(rel));
+            let path = added.as_ref().unwrap_or(&root).join(rel);
+            let (after, _) = state_of(&path);
             if after == open.before && after != State::Unavailable {
                 remove_blob(Some(open));
                 continue;
             }
             open.after = Some(after);
+            slot.mode = observed_mode(&path, after);
             remove_blob(slot.settled.replace(open));
         }
         inner.journal.paths.retain(|_, slot| slot.settled.is_some());
+    }
+
+    /// Persist only states observed by edit settlement, never sample the working tree on review.
+    pub fn seal_review(&self, turn: u64) -> Result<()> {
+        let mut inner = self.lock();
+        let Inner {
+            journal, current, ..
+        } = &mut *inner;
+        let Some(manifest) = current.as_mut().filter(|m| m.turn == turn) else {
+            return Ok(());
+        };
+        let mut sealed = std::collections::BTreeMap::new();
+        for (index, entry) in manifest.entries.iter().enumerate() {
+            let Some(slot) = journal.paths.get(&(entry.root.clone(), entry.rel.clone())) else {
+                continue;
+            };
+            if slot.gap || slot.open.is_some() {
+                continue;
+            }
+            // A no-op or unjournaled write can precede the first settled revision. Never
+            // restore across that gap, even when the final bytes still match.
+            let first = if entry.existed {
+                let Ok(bytes) = read_saved(&self.dir, turn, index, entry) else {
+                    continue;
+                };
+                State::Present(Sha256::digest(bytes).into())
+            } else {
+                State::Absent
+            };
+            if !slot.first.is_some_and(|(observed, mode)| {
+                observed == first && (!entry.existed || mode & 0o7777 == entry.mode)
+            }) {
+                continue;
+            }
+            let Some(mode) = slot.mode else { continue };
+            let digest = match slot.settled.as_ref().and_then(|rev| rev.after) {
+                Some(State::Present(hash)) => Some(hash),
+                Some(State::Absent) => None,
+                _ => continue,
+            };
+            sealed.insert(entry.display(), (digest, mode));
+        }
+        if manifest.post_edits != sealed {
+            manifest.post_edits = sealed;
+            self.write_manifest_deferred(manifest)?;
+        }
+        Ok(())
     }
 
     /// Close revisions opened since the last settle, recording what each committed. Call after

@@ -178,6 +178,130 @@ fn deadline_stops_suspension_without_marking_running_work_complete() {
 }
 
 #[test]
+fn unattended_wait_is_bounded_and_not_repeated_for_a_job_that_keeps_running() {
+    with_agent("", |agent| {
+        let (_name, release) = pending_cell(agent, "service stopped");
+        agent.modes.launch.unattended = true;
+        agent.unattended_job_wait = Duration::from_millis(200);
+        let mut ui = ReleaseOnWait {
+            release: None,
+            waits: 0,
+            input: false,
+        };
+        let started = Instant::now();
+        assert!(agent.wait_for_background_event(&mut ui).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the wait is bounded"
+        );
+        assert_eq!(
+            agent.awaited_background_jobs().len(),
+            1,
+            "the job is untouched"
+        );
+        let notices = std::mem::take(&mut agent.background_notices);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Unattended run") && n.contains("persist=true")),
+            "{notices:?}"
+        );
+        assert!(
+            !agent.wait_for_background_event(&mut ui).unwrap(),
+            "a job already waited on for its bound does not park the run again"
+        );
+        assert_eq!(ui.waits, 1);
+        release.send(()).unwrap();
+    });
+}
+
+#[test]
+fn unattended_run_reports_an_explicitly_backgrounded_job_without_waiting_for_it() {
+    with_agent("", |agent| {
+        agent.modes.launch.unattended = true;
+        agent.unattended_job_wait = Duration::from_secs(30);
+        let mut ui = ReleaseOnWait {
+            release: None,
+            waits: 0,
+            input: false,
+        };
+        let mut backend = agent.backend.take().unwrap();
+        let started = agent.dispatch(
+            &mut backend,
+            &ToolCall {
+                id: "serve".into(),
+                name: "bash".into(),
+                arguments: json!({"command":"sleep 30","background":true}),
+                malformed_arguments: false,
+            },
+            &mut ui,
+        );
+        agent.backend = Some(backend);
+        assert!(!started.is_error, "background job failed to start");
+        assert_eq!(agent.awaited_background_jobs().len(), 1);
+        let clock = Instant::now();
+        assert!(agent.wait_for_background_event(&mut ui).unwrap());
+        assert!(
+            clock.elapsed() < Duration::from_secs(5),
+            "a job the model chose to background is reported, not awaited"
+        );
+        assert_eq!(ui.waits, 0, "no wait was started");
+        let notices = std::mem::take(&mut agent.background_notices);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Unattended run") && n.contains("sleep 30")),
+            "{notices:?}"
+        );
+        assert_eq!(agent.awaited_background_jobs().len(), 1, "job untouched");
+        assert!(
+            !agent.wait_for_background_event(&mut ui).unwrap(),
+            "the job is reported once"
+        );
+        let mut backend = agent.backend.take().unwrap();
+        agent.dispatch(
+            &mut backend,
+            &ToolCall {
+                id: "stop".into(),
+                name: "bg".into(),
+                arguments: json!({"action":"kill","all":true}),
+                malformed_arguments: false,
+            },
+            &mut ui,
+        );
+        agent.backend = Some(backend);
+    });
+}
+
+#[test]
+fn attended_wait_is_not_bounded_by_the_unattended_limit() {
+    with_agent("", |agent| {
+        let (_name, release) = pending_cell(agent, "finished later");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            release.send(()).unwrap();
+        });
+        let mut ui = ReleaseOnWait {
+            release: None,
+            waits: 0,
+            input: false,
+        };
+        assert!(agent.wait_for_background_event(&mut ui).unwrap());
+        releaser.join().unwrap();
+        assert!(
+            agent.awaited_background_jobs().is_empty(),
+            "waited for the result"
+        );
+        assert!(
+            !agent
+                .background_notices
+                .iter()
+                .any(|n| n.contains("Unattended run"))
+        );
+    });
+}
+
+#[test]
 fn completion_tool_defers_acceptance_until_the_new_result_is_incorporated() {
     with_agent("", |agent| {
         let (_name, release) = pending_cell(agent, "worker evidence");

@@ -44,7 +44,7 @@ fn label(raw: &str) -> String {
 
 /// Project retained facts into the compact receipt and its expanded handoff. A plain answer
 /// has neither; an absent completion record never borrows facts from an earlier turn.
-pub(in crate::app) fn outcome(summary: &Value, latency: &Value) -> TurnOutcome {
+pub(crate) fn outcome(summary: &Value, latency: &Value) -> TurnOutcome {
     let status = summary["outcome"].as_str().unwrap_or("unknown");
     let mut files = summary["changed_files"]
         .as_array()
@@ -83,6 +83,15 @@ pub(in crate::app) fn outcome(summary: &Value, latency: &Value) -> TurnOutcome {
         count("uncheckpointed_shell_commands"),
         count("uncheckpointed_extension_calls"),
     );
+    if let Some(attempts) = summary["main_request_receipt"].get("attempts") {
+        let count = |key: &str| attempts[key].as_u64().unwrap_or(0);
+        let journal = if summary["main_request_receipt"]["transcript"] == "on_disk" {
+            "disk"
+        } else {
+            "memory"
+        };
+        outcome.handoff.push(format!("Main model attempts: {} local/LAN, {} remote · {} messages ({} tool results), {} tool schemas · transcript: {journal}", count("local_or_lan"), count("remote"), count("messages"), count("tool_results"), count("tool_schemas")));
+    }
     if outcome.changed_files == 0
         && !stopped
         && !effects_unknown
@@ -94,7 +103,7 @@ pub(in crate::app) fn outcome(summary: &Value, latency: &Value) -> TurnOutcome {
     {
         return outcome;
     }
-    let mut lines = Vec::new();
+    let mut lines = std::mem::take(&mut outcome.handoff);
     if let Some(class) = summary["error_class"].as_str() {
         lines.push(format!("Failure: {}", label(&class.replace('_', " "))));
     }

@@ -7,6 +7,9 @@ impl Shell {
     pub(super) fn draft_command(&mut self, app: &App, args: &str) {
         self.poll_input_recovery(app);
         if matches!(args, "" | "preview" | "restore" | "replace") {
+            // The modal stops the regular checkpoint timer. Flush the composer after the
+            // slash command was consumed so dismissing the preview cannot publish stale input.
+            self.checkpoint_input(true);
             let preview = match self.preview_input_recovery() {
                 Ok(preview) => preview,
                 Err(error) => {

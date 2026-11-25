@@ -126,51 +126,9 @@ pub(crate) struct Exchange {
     pub outcome: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Peers {
-    /// Why the board is unavailable; the rows below are then empty.
-    pub error: Option<String>,
-    pub scopes: Vec<String>,
-    pub overlapping: Vec<String>,
-    pub queued: usize,
-    pub rows: Vec<PeerRow>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PeerRow {
-    pub id: String,
-    pub summary: String,
-    pub phase: String,
-    pub scopes: Vec<String>,
-    /// The model that peer runs; empty when it does not say.
-    #[serde(default)]
-    pub model: String,
-    pub overlapping: Vec<String>,
-    /// The recent conversation with this peer, oldest first, bounded to [`PEER_MESSAGES`].
-    #[serde(default)]
-    pub messages: Vec<PeerMessage>,
-}
-
-/// Messages published per peer; older ones stay out of the pane.
-pub(crate) const PEER_MESSAGES: usize = 50;
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PeerMessage {
-    /// Sent by this session; otherwise received from the peer.
-    pub outgoing: bool,
-    pub text: String,
-    /// Still queued in the recipient's inbox, not evidence of acknowledgment.
-    pub unread: bool,
-    /// Whether the recipient inbox could be observed. Old snapshots have no receipt evidence.
-    #[serde(default)]
-    pub receipt_available: bool,
-    /// When it was sent, in Unix milliseconds; 0 when unknown.
-    #[serde(default)]
-    pub at_ms: u64,
-    /// Typed by the human in this pane rather than by this session's model.
-    #[serde(default)]
-    pub by_user: bool,
-}
+#[cfg(test)]
+pub(crate) use crate::peer_board::PeerMessage;
+pub(crate) use crate::peer_board::{PeerRow, Peers};
 
 /// One pane request. Unknown fields or actions are refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

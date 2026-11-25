@@ -138,11 +138,37 @@ pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
             continue;
         }
         if !sel.selects_lines()
-            && let Some((ranges, tail)) = parse_ranges(seg)?
+            && let Some((mut ranges, tail)) = parse_ranges(seg)?
         {
+            rest = &rest[..i];
+            // Accept `path:START:END` (colon-separated line range) as an alias for `path:START-END`.
+            // Literal existing filenames still win in `split_target` before we get here.
+            if tail.is_none()
+                && let [(end, None)] = ranges.as_slice()
+                && let Some(prev) = rest.rfind(':')
+                && prev > 0
+            {
+                let start_seg = &rest[prev + 1..];
+                let parsed = start_seg
+                    .strip_prefix('L')
+                    .unwrap_or(start_seg)
+                    .parse::<usize>()
+                    .ok();
+                if let Some(start) = parsed {
+                    if start == 0 {
+                        return Err(
+                            "line selector 0 is invalid; lines are 1-based. Use :1".to_owned()
+                        );
+                    }
+                    if *end < start {
+                        return Err(format!("range \"{start}:{end}\" ends before it starts"));
+                    }
+                    ranges = vec![(start, Some(*end))];
+                    rest = &rest[..prev];
+                }
+            }
             sel.ranges = ranges;
             sel.tail = tail;
-            rest = &rest[..i];
             continue;
         }
         // A numeric start followed by range punctuation is an attempted selector, not

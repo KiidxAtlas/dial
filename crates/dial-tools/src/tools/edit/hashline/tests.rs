@@ -389,7 +389,13 @@ fn stale_remove_names_the_fresh_tag_and_the_range_to_read() {
 
 #[test]
 fn parser_accepts_unambiguous_line_and_comma_range_aliases() {
-    for (alias, canonical) in [("2", "2.=2"), ("2,3", "2.=3"), ("2, 3", "2.=3")] {
+    for (alias, canonical) in [
+        ("2", "2.=2"),
+        ("2,3", "2.=3"),
+        ("2, 3", "2.=3"),
+        ("2:2", "2.=2"),
+        ("2:3", "2.=3"),
+    ] {
         assert_eq!(
             parse_anchor(alias).unwrap(),
             parse_anchor(canonical).unwrap()
@@ -404,7 +410,9 @@ fn parser_accepts_unambiguous_line_and_comma_range_aliases() {
             );
         }
     }
-    for invalid in ["0", "0,2", "3,2", "2,3,4", "2,3=2", "2.=3=2"] {
+    for invalid in [
+        "0", "0,2", "3,2", "2,3,4", "2,3=2", "2.=3=2", "0:2", "3:2", "2:3:4",
+    ] {
         assert!(parse_anchor(invalid).is_err(), "{invalid}");
     }
 }

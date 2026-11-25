@@ -3,7 +3,7 @@
 //! semantic memory uses). Vectors are cached in memory by route and window content. Each call
 //! embeds a bounded number of missing windows, rotating through repeated scopes independently of
 //! vector residency. Results report this call's coverage, including any cache eviction gaps.
-use super::{MAX_FILE, MAX_OUTPUT, MAX_TOTAL, Workspace, opt_str, opt_u64, req_str};
+use super::{MAX_FILE, MAX_OUTPUT, MAX_TOTAL, Workspace, opt_str, query_and_limit};
 use crate::storage::memory_backend::Embedder;
 use crate::tools::fs::walk::Walk;
 use serde_json::Value;
@@ -243,16 +243,9 @@ pub(super) struct Prepared {
     capped: bool,
 }
 pub(super) fn prepare(ws: &Workspace, args: &Value) -> Result<Prepared, String> {
-    let query = req_str(args, "query")?;
-    if query.trim().is_empty() || query.len() > 4096 {
-        return Err("query must be 1..=4096 bytes and nonblank".into());
-    }
+    let (query, limit) = query_and_limit(args)?;
     if opt_str(args, "mode")?.is_some_and(|mode| mode != "behavior") {
         return Err("ranking=embedding works in behavior mode only".into());
-    }
-    let limit = opt_u64(args, "limit")?.unwrap_or(20);
-    if !(1..=100).contains(&limit) {
-        return Err("limit must be 1..=100".into());
     }
     let start = ws.resolve_read(opt_str(args, "path")?.unwrap_or("."))?;
     if !start.exists() {

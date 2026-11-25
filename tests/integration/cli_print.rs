@@ -235,6 +235,54 @@ fn events(output: &Output) -> Vec<Value> {
 }
 
 #[test]
+fn private_chat_uses_stdin_and_never_journals_the_exchange() {
+    let env = Env::new();
+    let server = Server::new(vec![text("private-answer-marker")]);
+    let out = env.run(&server, &["private"], "private-question-marker");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "private-answer-marker"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("may retain"));
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["messages"],
+        json!([{"role":"user","content":"private-question-marker"}])
+    );
+    assert!(
+        requests[0]
+            .get("tools")
+            .is_none_or(|tools| tools == &json!([]))
+    );
+    let mut dirs = vec![env.home.path().to_owned(), env.project.path().to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for item in std::fs::read_dir(dir).unwrap() {
+            let item = item.unwrap();
+            let kind = item.file_type().unwrap();
+            if kind.is_dir() {
+                dirs.push(item.path());
+            } else if kind.is_file() {
+                assert_ne!(item.file_name(), "stats.sqlite3");
+                let bytes = std::fs::read(item.path()).unwrap();
+                for marker in ["private-question-marker", "private-answer-marker"] {
+                    assert!(
+                        !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                        "saved exchange in {:?}",
+                        item.path()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn print_results_distinguish_completed_blocked_and_unfinished_work() {
     for (outcome, expected_code, expected_text) in [
         ("completed", 0, "Finished."),

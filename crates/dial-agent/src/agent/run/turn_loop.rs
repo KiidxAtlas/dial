@@ -111,6 +111,7 @@ impl<'a> Agent<'a> {
         // remain separately labelled and must still pass freshness checks before reuse.
         self.drain_background_check(ui, true);
         self.step_checks = StepChecks::default();
+        self.route.begin_turn();
         self.verifications.clear();
         self.behavioral_checks.clear();
         let mut control = self.session.control_state();
@@ -197,6 +198,11 @@ impl<'a> Agent<'a> {
                     .map(|checkpoints| checkpoints.changed_files(turn))
             })
             .unwrap_or_default();
+        if let (Some(cp), Some(turn)) = (&self.checkpoints, self.step_checks.turn)
+            && let Err(error) = cp.seal_review(turn)
+        {
+            observed.diagnostic(&format!("Checkpoint review not sealed: {error:#}"));
+        }
         if let (Some(history), Some(checkpoints), Some(turn)) =
             (&self.history, &self.checkpoints, self.step_checks.turn)
             && !changed_files.is_empty()
@@ -280,6 +286,13 @@ impl<'a> Agent<'a> {
             json!(recorded_checks)
         };
         let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":recorded_checks,"checks_current":checks_current,"effects_unknown":self.step_checks.effects_unknown,"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
+        let mut summary = summary;
+        summary["main_request_receipt"] = self.route.turn_receipt(self.session.path().is_some());
+        summary["step_limit"] = json!(
+            result
+                .as_ref()
+                .is_ok_and(|r| r.reached_step_limit(self.config.harness.max_steps))
+        );
         observed.completion(&summary);
         let mut control = self.session.control_state();
         control["turn_summary"] = summary;

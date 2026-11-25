@@ -67,6 +67,26 @@ fn row(name: &str, running: bool) -> JobRow {
 }
 
 #[test]
+fn persistent_row_with_same_name_never_controls_the_session_job() {
+    let mut overlay = JobsOverlay::new();
+    let mut persistent = row("same", true);
+    persistent.mode = "persist".into();
+    overlay.refresh_persistent(|| Ok(vec![persistent]));
+    overlay.set_jobs(vec![row("same", true)]);
+    overlay.cursor = 1;
+    overlay.set_jobs(vec![row("same", true)]);
+    assert_eq!(overlay.cursor, 1);
+    for code in [KeyCode::Enter, KeyCode::Char('s'), KeyCode::Char('d')] {
+        let event = overlay.handle(
+            &Event::Key(key(code, KeyModifiers::NONE)),
+            &Keymap::defaults(),
+        );
+        assert!(matches!(event, OverlayEvent::None));
+        assert!(overlay.attached().is_none());
+    }
+}
+
+#[test]
 fn compact_audit_jobs_help_never_selects_or_attaches_hidden_jobs() {
     let keys = Keymap::defaults();
     let theme = crate::ui::theme::Theme::dark();

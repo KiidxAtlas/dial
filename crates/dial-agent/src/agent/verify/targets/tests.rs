@@ -703,3 +703,54 @@ fn a_conclusive_failed_run_answers_a_diagnosis_request() {
     assert!(targets.blocker(&workspace, 1, false, true).is_some());
     assert!(targets.conclusive_failures(&workspace, 1, false).is_empty());
 }
+
+#[test]
+fn passing_verification_check_does_not_stale_a_launched_target() {
+    let (_root, workspace) = workspace();
+    let mut targets = Targets::resolve(&workspace, "start local testing/snake.py");
+    let launch = json!({"command": "setsid python3 'local testing/snake.py' >/dev/null 2>&1 &"});
+    targets.observe_prepared(&workspace, "bash", &launch, &exited(0, false), 1);
+    assert_eq!(targets.blocker(&workspace, 1, false, false), None);
+    // A passing `bash check:true` probe advances the effect epoch without modifying code.
+    let probe = json!({"command": "python3 -c 'import socket'", "check": true});
+    targets.observe_prepared(&workspace, "bash", &probe, &exited(0, false), 2);
+    assert_eq!(targets.blocker(&workspace, 2, false, false), None);
+    // A failing check or an ordinary non-check command still stales the launch.
+    let non_check = json!({"command": "python3 -c 'open(\"other\", \"w\")'"});
+    targets.observe_prepared(&workspace, "bash", &non_check, &exited(0, false), 3);
+    assert!(
+        targets
+            .blocker(&workspace, 3, false, false)
+            .unwrap()
+            .contains("before a later edit or effectful command")
+    );
+}
+
+#[test]
+fn large_file_targets_use_confined_metadata_identity_instead_of_unknown() {
+    let (root, workspace) = workspace();
+    let image = root.path().join("alpine.iso");
+    let file = std::fs::File::create(&image).unwrap();
+    file.set_len(17 * 1024 * 1024).unwrap();
+    drop(file);
+    let mut targets = Targets::resolve(&workspace, "Start alpine.iso in qemu");
+    let launch = json!({"command": "qemu-system-x86_64 -cdrom alpine.iso"});
+    targets.observe_prepared(&workspace, "bash", &launch, &exited(0, false), 1);
+    assert_eq!(targets.blocker(&workspace, 1, false, false), None);
+    assert_eq!(
+        targets.evidence(&workspace, 1)["targets"][0]["status"],
+        "process_succeeded"
+    );
+    // Changing the image invalidates the launch as `source_changed`.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap();
+    file.set_len(17 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+    assert_eq!(
+        targets.evidence(&workspace, 1)["targets"][0]["status"],
+        "source_changed"
+    );
+    assert!(targets.blocker(&workspace, 1, false, false).is_some());
+}

@@ -202,11 +202,38 @@ impl Agent<'_> {
         selection: &ModelSelection,
         effort: Option<ReasoningEffort>,
     ) -> Result<()> {
+        self.switch_model_with_preparation(selection, effort, false, None)
+    }
+
+    pub fn switch_model_with_preparation(
+        &mut self,
+        selection: &ModelSelection,
+        effort: Option<ReasoningEffort>,
+        prepare_local_model: bool,
+        saved_engines: Option<BTreeMap<String, crate::llm::local_runtime::LocalEngine>>,
+    ) -> Result<()> {
         ensure!(
             self.backend.is_some(),
             "a turn is in progress; switch models between turns"
         );
-        let config = switched_config(self.effective_config(), selection, effort)?;
+        let current = self.effective_config().selection();
+        let same_model = current.provider == selection.provider && current.model == selection.model;
+        let pin_changed = saved_engines.as_ref().is_some_and(|pins| {
+            let key = crate::llm::local_runtime::LocalEngine::model_key(&selection.model);
+            pins.get(&key).copied().unwrap_or_default() != self.effective_config().local_engine()
+        });
+        if prepare_local_model && same_model && !pin_changed {
+            return self
+                .backend
+                .as_mut()
+                .context("session backend is busy")?
+                .prepare_local_model(self.interrupt.clone());
+        }
+        let mut base = self.effective_config().clone();
+        if let Some(pins) = saved_engines {
+            base.local_model_engines = pins;
+        }
+        let config = switched_config(&base, selection, effort)?;
         let backend = make_session_backend(&config, &self.session)?;
         let mut backend = if self.hermetic {
             backend.without_steering()
@@ -215,6 +242,19 @@ impl Agent<'_> {
         };
         backend.bind_session(&config, &mut self.session)?;
         let auth = session_auth_config(&config, &backend, &mut self.session)?;
+        // Transfer ownership before startup: never hold two sets of weights during a switch.
+        // The server owner checks the full launch identity before reusing a resident server.
+        if (prepare_local_model || same_model)
+            && let Some(server) = self
+                .backend
+                .as_mut()
+                .and_then(|backend| backend.take_resident_server())
+        {
+            backend.adopt_resident_server(server);
+        }
+        if prepare_local_model {
+            backend.prepare_local_model(self.interrupt.clone())?;
+        }
         self.backend = Some(backend);
         self.auth_config = auth;
         self.cache_warm = None;

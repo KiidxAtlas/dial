@@ -376,7 +376,13 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
     assert!(!capability(&acp, "questions") && !capability(&acp, "live_voice"));
     assert!(capability(&acp, "prompt"));
     // The new workflow capabilities are native-only: ACP never announces or serves them.
-    for capability_name in ["checks", "evidence", "diagnostics", "skills"] {
+    for capability_name in [
+        "checks",
+        "evidence",
+        "diagnostics",
+        "skills",
+        "peer_coordination",
+    ] {
         assert!(!capability(&acp, capability_name), "{capability_name}");
         assert!(capability(&rpc, capability_name), "{capability_name}");
     }
@@ -393,6 +399,8 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
         "list_skills",
         "skill_action",
         "live_speak",
+        "list_peers",
+        "send_peer_message",
     ] {
         assert!(!acp_methods.contains(&json!(method)), "{method}");
         assert!(

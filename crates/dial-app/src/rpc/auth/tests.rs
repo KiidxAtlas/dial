@@ -69,13 +69,93 @@ fn cancel_without_a_running_sign_in_is_refused() {
 
 #[test]
 fn provider_listing_is_keyed_by_provider_id() {
-    let listing = providers(Path::new("/nonexistent-dial-user-dir"));
+    let listing = providers(Path::new("/nonexistent-dial-user-dir"), None);
     let entries = listing["providers"].as_array().unwrap();
     assert!(!entries.is_empty());
     for entry in entries {
         assert!(entry["provider"].as_str().is_some());
         assert_eq!(entry["signed_in"], json!(false));
     }
+}
+
+#[test]
+fn a_custom_endpoint_takes_a_key_by_its_saved_id_and_never_a_callers_url() {
+    use crate::llm::model_config::{AuthMethod, ProviderSpec};
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = |base_url: &str, auth| ProviderSpec {
+        label: "Work proxy".into(),
+        base_url: base_url.into(),
+        auth,
+        ..ProviderSpec::default()
+    };
+    let mut config = Config::default();
+    config.providers.insert(
+        "work".into(),
+        endpoint("https://proxy.example/v1", AuthMethod::Auto),
+    );
+    config.providers.insert(
+        "sso".into(),
+        endpoint("https://sso.example/v1", AuthMethod::OAuth),
+    );
+    let saved = || Ok(config.clone());
+
+    let found = key_endpoint("api-key:work", saved).unwrap();
+    assert_eq!(
+        (found.label.as_str(), found.base_url.as_str()),
+        ("Work proxy", "https://proxy.example/v1")
+    );
+    for refused in [
+        "api-key:sso",
+        "api-key:missing",
+        "api-key:https://proxy.example/v1",
+        "work",
+    ] {
+        assert!(key_endpoint(refused, saved).is_err(), "{refused}");
+    }
+    // A catalog ID never reads the configuration.
+    let catalog_id = catalog::key_providers().next().unwrap().id.clone();
+    key_endpoint(&format!("api-key:{catalog_id}"), || {
+        bail!("configuration read")
+    })
+    .unwrap();
+
+    let entry = |listing: &Value| listing["endpoint_keys"].as_array().unwrap().clone();
+    assert_eq!(
+        entry(&providers(home.path(), Some(&config))),
+        [
+            json!({"provider":"api-key:work","name":"Work proxy","key_saved":false,"can_remove":true})
+        ]
+    );
+    assert!(entry(&providers(home.path(), None)).is_empty());
+    catalog::save_credential(home.path(), "https://proxy.example/v1", "sk-work").unwrap();
+    assert_eq!(
+        entry(&providers(home.path(), Some(&config)))[0]["key_saved"],
+        true
+    );
+    let state = AuthState::default();
+    let request = json!({"provider":"api-key:work","confirm":true});
+    assert!(
+        remove_api_key(
+            &state,
+            home.path(),
+            saved,
+            &json!({"provider":"api-key:work"})
+        )
+        .is_err()
+    );
+    assert_eq!(
+        remove_api_key(&state, home.path(), saved, &request).unwrap(),
+        json!({"provider":"api-key:work"})
+    );
+    assert_eq!(
+        entry(&providers(home.path(), Some(&config)))[0]["key_saved"],
+        false
+    );
+    assert!(
+        !providers(home.path(), Some(&config))
+            .to_string()
+            .contains("sk-work")
+    );
 }
 
 #[test]

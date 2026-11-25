@@ -222,6 +222,18 @@ impl<'a> SearchWalk<'a> {
         prefix: &Path,
         visit: &mut dyn FnMut(&Path) -> bool,
     ) {
+        self.run_entries(start, prefix, &mut |path, directory| {
+            directory || visit(path)
+        });
+    }
+
+    /// Visit admitted names, including directories, without opening file contents.
+    pub fn run_entries(
+        &mut self,
+        start: &Path,
+        prefix: &Path,
+        visit: &mut dyn FnMut(&Path, bool) -> bool,
+    ) {
         let kind = match std::fs::symlink_metadata(start) {
             Ok(meta) => meta.file_type(),
             Err(_) => {
@@ -320,7 +332,7 @@ impl<'a> SearchWalk<'a> {
         prefix: &Path,
         depth: usize,
         rules: &mut Vec<ignore::gitignore::Gitignore>,
-        visit: &mut dyn FnMut(&Path) -> bool,
+        visit: &mut dyn FnMut(&Path, bool) -> bool,
     ) -> bool {
         if self.ws.is_protected(path) {
             self.excluded += 1;
@@ -378,7 +390,7 @@ impl<'a> SearchWalk<'a> {
             return true;
         }
         if kind.is_file() {
-            return visit(path);
+            return visit(path, false);
         }
         if !directory {
             return true;
@@ -397,6 +409,9 @@ impl<'a> SearchWalk<'a> {
             self.unreadable_directories += 1;
             self.omit(path, "unconfined or changed directory");
             return true;
+        }
+        if !visit(path, true) {
+            return false;
         }
         let children = match bounded_directory(path, MAX_WALK_ENTRIES, &mut self.directory_entries)
         {

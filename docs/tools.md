@@ -187,12 +187,12 @@ Their descriptions name each other, and automatic task routing offers the matchi
 Routing only offers a schema. It grants no permission and never answers from a store.
 
 **Tools** (file edits confined to the project; shell access follows the chosen sandbox)
-- The default core is stable across ordinary requests. Hosted routes get 25 KiB of schemas;
+- The default core is stable across ordinary requests. Hosted routes get 27 KiB of schemas;
   lean and local routes keep 12 KiB, and lean local routes also cap the count at eight. Core
-  priority is `tool_search`, `finish`, `read`, `edit`, `write`, `bash`, `grep`,
-  `glob`, `todo`, `verify`, `eval` (when containment is available and a cell runtime resolves,
-  including the embedded JavaScript engine), `bg`, then `task` with `message` (hosted routes
-  only), then `ask` when a human can answer; each joins while it fits the route's budget.
+  priority is `tool_search`, `finish`, `read`, `edit`, `write`, `bash`, `grep`, `glob`, `find`,
+  `ask` (when a human can answer), `todo`, `verify`, `eval` (when containment is available
+  and a cell runtime resolves, including the embedded JavaScript engine), `bg`, then `task`
+  with `message` (hosted routes only); each joins while it fits the route's budget.
   Unattended runs (`dial -p`, benchmarks) leave `todo`, `verify`, `bg`, `finish` and `task`
   out of this core on every route (`task` stays with `task.prefer_subagents`); they remain
   loadable through `tool_search`, and a command that becomes a background job still loads `bg`.
@@ -228,6 +228,7 @@ Routing only offers a schema. It grants no permission and never answers from a s
   `tool_search` rejects overlapping load/unload names before changing selections and reports each
   tool's effective next-request offering. Unpinning a core schema may leave it offered; persistence
   errors are not successful loading receipts.
+- A native file operation that needs a grantable directory, or a shell launch that names it as `cwd`, pauses at the directory popup **before execution**. Allow continues the same call; Deny leaves it unexecuted. No model retry is needed.
 - **Directory access** (`ask action=directory`): the agent requests an existing directory with a reason; Dial shows a mandatory Yes/No popup, including in auto modes. Normal grants preserve tool approvals and sandbox/credential restrictions. Protected Dial storage requires a second separate, exact-directory approval for **native file tools only**; shell commands remain protected. Sensitive grants are process-local and never unlock credentials. See [Directory access and sensitive approvals](directory-access.md).
 - **Policy explanations:** approval decisions expose a typed observational reason and, for saved rules, the winning rule scope. Explicit denies, readonly/plan restrictions, automatic allowances, safe calls, operator responses, cancellation and hook refusals retain existing authority. The TUI approval card includes the reason; plain output and RPC/stream JSON use the same formatter (`policy_explanation`). These events are not approvals, grants or proof that a tool executed; only an actual pending approval request can be answered. See [client contracts](client-contracts.md).
 - **Independent sessions** (`peers`): list live sessions in the same checkout, send bounded messages and declare advisory relative-path claims. Peer data never grants permissions or substitutes for verification. This is distinct from delegated subagents; see [Session coordination](session-coordination.md).
@@ -288,6 +289,23 @@ Routing only offers a schema. It grants no permission and never answers from a s
   When `glob` is offered, built-in guidance recommends previews for discovering a few code files
   that will be inspected, not for path-only lookup. This recommendation does not enable previews
   by default; missing source ranges still require a read.
+- For discovery, choose by what you know, not by which shell pipeline you could write:
+
+  | You know… | Use | Example |
+  | --- | --- | --- |
+  | Words in a file or directory name | `find` with `mode="path"` | `{"mode":"path","path":"src","query":"transcript preview"}` |
+  | A filename pattern | `glob` | `{"path":"src","pattern":"*.vue"}` |
+  | What the code does, but not its name | `find` (default behavior mode) | `{"query":"keeps the status label visible during tool calls"}` |
+  | Text that occurs **inside** a file | Search (`grep`), with `literal=true` for exact text | `{"path":"src","pattern":"Show reasoning","literal":true}` |
+
+  Path mode uses one file or directory scope and returns names only (`/` marks a directory).
+  Query words can match in any order, ignoring case; at least one must match the entry's own
+  name, so a matching directory doesn't fill the results with unrelated children. For example,
+  `{"mode":"path","path":".tmp","query":"transcript preview"}` searches an explicitly named
+  fixture directory even if a workspace-wide search would skip it under ignore rules. This does
+  not override protected paths. Check the coverage note before treating an empty result as absence.
+  Use `verify` to **run** a regression check and `bash` to **build** an artifact; no lookup proves
+  either succeeded.
 - `grep` lowers a `limit` or `context` above its maximum instead of refusing it, and says so at the
   end of the result (`[context=50 is above the maximum 10; used 10]`).
 - `grep` also accepts `preview=true` for local `output="lines"` searches. After the normal
@@ -557,7 +575,7 @@ Routing only offers a schema. It grants no permission and never answers from a s
     at most 50 with `limit`), including abandoned detached-HEAD commits. Use this evidence to
     identify the user's work rather than assuming a larger dangling commit chain is the target.
     The action is read-only and retains the normal Git configuration safety guards.
-  - `bash` runs in the project root (`cwd` selects a subdirectory; no `cd <root> &&` prefix needed). `background: true` starts a job at once. By default (`[shell] auto_background_secs = 0`) a foreground command returns its result when it finishes or is killed at its `timeout`, so a long build or test costs one round instead of an adoption notice plus `bg wait` calls. Setting `auto_background_secs` to a positive number opts into automatic adoption: a command still running after that many seconds becomes a background job, an explicit `timeout` longer than the threshold keeps it in the foreground until that timeout and then moves it to `bg` rather than killing it, and a shorter `timeout` kills it as before. When `bg` is loadable but not yet offered (lean and local routes whose core budget leaves it out), a command that becomes a background job, including one started with `background: true`, loads `bg` for the next request, so no separate `tool_load` call is needed. Completion is delivered to the model in the next request, and a `bg wait` that sees the job exit returns its unread output, so no separate `bg output` call is needed. A non-service job that exits successfully before an `until` pattern or port is established is reported as finished, not as a failed wait; a nonzero exit or a service exit is still not ready. A foreground command's result names entries it created directly in its working directory (Dial's scratch directory excluded), so build products and scratch files left behind are visible. Pending bash jobs return control to the model rather than silently blocking completion; continue independent work or explain what is pending and use a bounded `bg wait`. Waits and readiness checks default to 5 seconds (explicit `timeout: 0` remains unlimited). Job output has its own live transcript panel; `bg output` and artifacts retain the captured output. Read-only job waits do not hold the workspace mutation lock. `bg` remains available subject to the session's mode and tool allowlist.
+  - `bash` runs in the project root (`cwd` selects a subdirectory; no `cd <root> &&` prefix needed). `background: true` starts a job at once; when the command sends its output to a file, or runs a fixed `sleep` of 10 seconds or more beside forked work, the start notice (and a timed-out `bg wait until=`) says that `until` matches only the job's own output and that the sleep delays its exit. An unattended print run (`dial -p`, piped input, `dial review`) reports a still-running job started with `background: true` at once, and waits at most 60 seconds for a command Dial itself moved to the background, before asking the model to keep it with `bg` persist=true, wait for it with a bound, or stop it; a service that never exits no longer holds the run until `--max-time`. After that notice, a later reply is not sent back to the model just to restate the same running job, so the run moves on to its completion checks instead of repeating its answer until the deadline. By default (`[shell] auto_background_secs = 0`) a foreground command returns its result when it finishes or is killed at its `timeout`, so a long build or test costs one round instead of an adoption notice plus `bg wait` calls. Setting `auto_background_secs` to a positive number opts into automatic adoption: a command still running after that many seconds becomes a background job, an explicit `timeout` longer than the threshold keeps it in the foreground until that timeout and then moves it to `bg` rather than killing it, and a shorter `timeout` kills it as before. In an unattended print run with `auto_background_secs = 0`, the command's `timeout` (default `bash_timeout_secs`) is the adoption threshold instead, so long work reaching it becomes a `bg` job rather than being killed. When `bg` is loadable but not yet offered (lean and local routes whose core budget leaves it out), a command that becomes a background job, including one started with `background: true`, loads `bg` for the next request, so no separate `tool_load` call is needed. Completion is delivered to the model in the next request, and a `bg wait` that sees the job exit returns its unread output, so no separate `bg output` call is needed. A non-service job that exits successfully before an `until` pattern or port is established is reported as finished, not as a failed wait; a nonzero exit or a service exit is still not ready. A foreground command's result names entries it created directly in its working directory (Dial's scratch directory excluded), so build products and scratch files left behind are visible. Pending bash jobs return control to the model rather than silently blocking completion; continue independent work or explain what is pending and use a bounded `bg wait`. Waits and readiness checks default to 5 seconds (explicit `timeout: 0` remains unlimited). Job output has its own live transcript panel; `bg output` and artifacts retain the captured output. Read-only job waits do not hold the workspace mutation lock. `bg` remains available subject to the session's mode and tool allowlist.
     `pty: true` allocates a terminal at launch and immediately returns a managed `bg` job handle, reusing the existing terminal runner. Use `bg input/output/wait/resize/kill` with its name. PTY mode rejects explicit `timeout` and `session`, has no implicit process deadline, and honors `--no-pty`; it never retries or converts an existing pipe command. Omitted or false `pty` retains ordinary captured execution. See [shell interactive programs](shell.md#interactive-programs).
     Background observation success is separate from child execution success: a successful wait
     can report a nonzero child exit, and a readiness deadline can return an unsatisfied observation

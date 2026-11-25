@@ -1034,3 +1034,17 @@ fn concurrent_project_updates_keep_every_saved_rule() {
         assert!(saved.contains(&grant), "lost grant for session {index}");
     }
 }
+
+#[test]
+fn an_ampersand_inside_a_heredoc_body_is_data_not_an_async_job() {
+    assert!(starts_async_job(
+        "server --port 8080 &\ncurl localhost:8080"
+    ));
+    assert!(!starts_async_job(
+        "cat >> tests.rs <<'EOF'\nfoo(&changed, &run);\nEOF\ncargo test"
+    ));
+    assert!(!starts_async_job("python3 - <<PY\nx = a & b\nPY"));
+    // A job started after the heredoc still counts.
+    assert!(starts_async_job("cat > a <<EOF\n&\nEOF\nsleep 30 &"));
+    assert!(!starts_async_job("grep x <<< \"a & b\""));
+}

@@ -170,6 +170,10 @@ style suggestion; one-call, trust, disclosure and capability-scoping rules remai
 request counts, elapsed time and token-use effects are unmeasured pending controlled evaluation.
 Rebuild/restart Dial to use the source changes; an existing binary is not patched in place.
 
+The built-in prompt puts the requested outcome and its success condition before tool selection. Answer from sufficient evidence; investigate when the answer or next action depends on a missing fact. If explanations compete, choose a check whose result would distinguish them. Progress notes communicate meaningful findings, decisions or delays rather than narrating each call. Final answers lead with the result and disclose material verification gaps.
+
+Dial is guided to group known work, including independent checks, up to the point where a result could change the next action. Each check must still expose its outcome. This is a scheduling decision within the offered call limit, not a reason to skip verification or launch speculative work.
+
 Request-efficient execution is guided at the shared policy owner. For a new generated artifact
 with known inputs and a clear output contract, Dial is guided to read, compute, write, and check
 the written artifact in one run. Separate inspection is useful when it could change the approach;
@@ -344,10 +348,15 @@ end a turn with a stop report and keep completed work, instead of failing it:
   or that the requested task is correct.
 - `--max-time` and `[budget]` cost caps are checked when a step is admitted, between the calls of
   one tool round, before settlement makes further model calls and while a reply streams; a
-  request's timeout is clamped to the time left. A capped model that reports no price gets a
+  request's timeout is clamped to the time left. A running `bg` wait, including `timeout: 0`, ends
+  when the deadline passes; the job keeps running. A capped model that reports no price gets a
   one-time notice that the cap cannot stop it.
 - With a finite step limit, the last step asks for a report and runs no tools. At 80% of the
-  `--max-time` window or a cost cap, the model is asked once to prioritize finishing.
+  `--max-time` window or a cost cap, the model is asked once to prioritize finishing. With
+  `--max-time`, a `time_left` notice gives the minutes left at the start and again at half time,
+  and a `bash`/`eval` call whose `timeout` reaches past the deadline, or a `bg wait` with
+  `timeout: 0`, gets a `[Time]` note with the time left, so long work is planned to leave a usable
+  result before the run ends.
 - The `portable_rules.max_regenerations` limit and a refusal to continue after uncertain effects.
 
 ### Answer delivery and work completion
@@ -385,8 +394,66 @@ without preventing delivery and are listed in the outstanding-work notice.
 With verification enabled, an unattended turn that recorded a workspace or environment effect
 needs current evidence before either `completed` or `answered`. Use a configured foreground
 check, `bash` with `check:true`, `verify`, or a passing Eval assertion bound to the current file
-contents. A command that prints `assert` or mentions a test runner is not a check receipt. Pure
+contents. A command that prints `assert` or mentions a test runner is not a check receipt, and
+neither is Dial's automatic parse or compile check of a changed file (`python AST:`, `cargo
+check:`), which shows the file loads but not that it does what was asked. Pure
 lookups owe no post-edit check; diagnostic wording does not waive the gate after an effect.
+In an unattended run, the first successful `bash`, `eval`, `edit` or `write` result after which
+verification is owed carries a one-time `[Dial]` line saying that finishing is accepted only
+after a check passes on the final state (a foreground `bash` check:true without an unchecked
+pipe). The model can mark its own verification run as that check, instead of trying to finish,
+being deferred, and spending a request on a separate check.
+In an unattended run, a passing shell check whose expected values (the numbers after `=`, `==`,
+`<`, `>` or `-eq`) were all printed earlier in the turn by the run's own commands, and none of
+which the request states, shows only that the output is reproducible. When it is the only current
+evidence, completion is deferred once and the model is asked to compare those values with
+independent evidence (the input, the task's examples or tests, a worked case or a second method);
+finishing again is accepted. This deferral is its own once-per-turn step, so it still applies
+when the check was written in answer to the generic unverified-completion nudge.
+In an unattended run with effects, when the request names a function (`function named "ars"`, a
+`` `parse()` `` function, a method called `` `run` ``), completion is deferred once, before the
+other completion checks: the model is asked to write down the call a reader of the request would
+most likely make (the primary input as the first positional argument, then each input the request
+names as one argument in the request's terms) and to run exactly that call once in a fresh process,
+outside its own test helpers. A harness the model wrote calls the function its own way, so it
+cannot show the interface a caller reading the request will use.
+In an unattended run with effects, when the request asks for speed (`as efficient as possible`,
+`optimize`, `faster`, `speed up`), completion is deferred once: the model is asked to time the
+delivered version on the request's own input in a fresh process, to make a check:true fail unless
+it is clearly faster than the original (if there is one) or within a stated limit, and to run a
+slow original only once, saving its output and time to files that later versions are compared
+against. When the request asks for the fastest result, the model is also asked to time at least
+one alternative formulation and keep the fastest, since beating the original is not the bar. A
+matching-output check, the usual self-check, does not show speed. Because that
+deferral comes only after a slow original may have been rerun, the first successful `bash` or
+`eval` result of such a run also carries a one-time `[Dial]` line with the same advice.
+In an unattended run with effects, when the request names a tool as the ground truth or source of
+truth (`primer3's oligotm tool should be considered the ground truth`) and no passing check ran
+that tool, completion is deferred once: the model is asked to run the tool itself on its final
+result with the request's options, in a check:true that fails outside the request's limits, since
+a value computed another way can differ from the tool's.
+In an unattended run, when a `bash` command wrote to a service or repository through its client
+(`git push`, `curl`/`wget` sending data or a write method, or a database client running
+`INSERT`, `UPDATE`, `DELETE` or `DROP TABLE`, or `redis-cli` running a write such as `SET`), completion is
+deferred once: the model is asked to remove test data its own checks left there (test commits or
+branches, posted records, inserted rows) and restore the state the request describes, unless the
+request asks for that data, then to rerun a check with check:true, since the cleanup commands make
+an earlier check stale. A caller starts from the state the run leaves, and test data can conflict
+with theirs. A shell `set -o pipefail` is not a Redis `SET`.
+
+When a `bash` or `eval` result draws a picture with text characters (eight or more rows of only
+drawing characters such as `#`, `@`, `*` and block elements) and the model accepts image input,
+the result gets a `[hint]`, at most once per turn: `read` shows an image file as a picture, so
+drawing it to a PNG and reading that file shows detail that text art loses.
+
+Some zero exits are not counted as a passing check, and the result says why:
+
+- a command that only displays or lists files (`cat`, `head`, `tail`, `ls`, `wc`, `echo` ...),
+  which shows a deliverable exists but cannot fail when it is wrong;
+- a command that ends with a display command after the checked work
+  (`pytest > log 2>&1; echo exit=$?; tail log`), so its exit status is the display command's;
+- a test run that excludes a test seen failing earlier in the turn (pytest `--deselect` or
+  `-k "not NAME"`, libtest `--skip`), unless the request names that test.
 
 Some check failures say nothing about this turn's code. They are disclosed with the accepted answer
 ("Accepted with disclosed gaps") and in `completion_evidence.disclosed_gaps` instead of ending the
@@ -486,6 +553,7 @@ checks declare `check: true` and must preserve nonzero failure statuses.
 Eval cells that repeat one code shape three times in a row, with no passing check or committed source change in between, get an advisory note at each third repeat, as edited files do. Whitespace and digit values do not change the shape, so `print(1)` and `print( 2 )` count as one attempt. A failing cell counts as no progress; a passing eval callback, a passing check or a committed change resets the streak. Nothing is refused. Three failed `edit` or `write` calls to one file that commit nothing also raise the rewrite-pressure signal for the experimental adaptive output-effort setting (`experimental.adaptive_output_effort`, Anthropic reasoning models only); they add no checkpoint and withhold no write.
 
 A repeated routine nonzero `bash` exit (the process ran to completion, output is complete, no paths were committed) gets one compact recovery line with its streak count, not the full state block. Uncertain effects, committed work and partial capture keep the full report.
+On repeated correctable failures, Dial asks the model to compare the diagnostics and, if the same problem remains unexplained, make an observation that distinguishes possible causes. The streak counts failures by tool and kind; it does not establish a common cause. The nudge changes neither retry admission nor permission boundaries.
 
 Completion refusals for retained failed checks include a JSON `verify` call with the exact
 check names (bounded by the tool's target limit). Repair the cause before rerunning it;
@@ -1356,8 +1424,9 @@ limits, reasoning budgets, approvals or verification requirements:
 
 - Ordinary hosted and local routes default to a stable core, with separate serialized-schema
   budgets (27 KiB hosted, 12 KiB local). `tool_search`, `finish`, `read`, `edit`, `write` and
-  `bash` have first priority; eligibility, the byte ceiling and `initial_tool_limit` can narrow
-  it. Lean local routes retain their eight-tool count limit. `tool_search` loads eligible
+  `bash` have first priority, followed by `grep`, `glob` and `find` for workspace discovery.
+  Eligibility, the byte ceiling and `initial_tool_limit` can narrow the offer. Lean local routes
+  retain their eight-tool count limit. `tool_search` loads eligible
   specialists on explicit request; listing alone does not load a schema. Explicit pins survive
   resume. If pre-dispatch context accounting leaves too little room, Dial can drop optional
   schemas rather than rebuilding the oversized prefix on the wire. Eligible explicit loads

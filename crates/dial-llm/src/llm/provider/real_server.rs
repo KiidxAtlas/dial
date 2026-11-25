@@ -32,6 +32,25 @@ fn ask(content: &str, tools: Vec<serde_json::Value>, max_tokens: u32) -> Chat {
 }
 
 #[test]
+#[ignore = "requires a real single-file chat GGUF and llama-server on PATH or DIAL_LLAMA_SERVER"]
+fn prepared_gguf_generates_on_the_same_resident_server() {
+    let model_dir = std::env::var("DIAL_TEST_GGUF").expect("path to local GGUF");
+    let mut backend = Backend::new(ProviderKind::Local { model_dir }, python(), 120);
+    backend
+        .prepare_local_model(Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    let origin = backend.server.as_ref().unwrap().base_url().to_owned();
+    let reply = backend
+        .chat(None, &ask("Tell me a story.", vec![], 32), 60, None)
+        .unwrap();
+    assert!(
+        !reply.text.trim().is_empty(),
+        "no generated text: {reply:?}"
+    );
+    assert_eq!(backend.server.as_ref().unwrap().base_url(), origin);
+}
+
+#[test]
 #[ignore = "loads a downloaded vision model; set DIAL_TEST_VISION_MODEL and DIAL_TEST_VISION_IMAGE (a red square)"]
 fn sees_images_and_streams_tools_from_the_real_vlm_server() {
     let model = std::env::var("DIAL_TEST_VISION_MODEL").expect("downloaded vision model path");

@@ -19,6 +19,7 @@ def fixture_bytes():
         "source-a.txt": b"Draft planning note, 2026-01-08.\nOwner: Mira.\nThe launch is approved for March 4.\n",
         "source-b.txt": b"Draft planning note, 2026-01-08.\nOwner: Jules.\nThe launch is not approved for March 4.\n",
         "source-register.json": b'{"authority_order": null, "status": "two unratified drafts; no deciding source supplied"}\n',
+        "source-register-ranked.json": b'{"authority_order": ["source-a.txt", "source-b.txt"], "status": "first source decides"}\n',
         "nested.json": b'{"batches":[{"id":"B1","orders":[{"id":"O1","lines":[{"sku":"X","quantity":2},{"sku":"Y","quantity":1}]}]},{"id":"B2","orders":[{"id":"O2","lines":[{"sku":"X","quantity":3}]}]}]}\n',
         "events.jsonl": b'{"event_id":"E1","payload":{"duration":{"value":250,"unit":"ms"}}}\n{"event_id":"E2","payload":{"duration":{"value":2,"unit":"s"}}}\n{"event_id":"E3","payload":{"duration":null}}\n',
         "transcript-double.json": b'{"kind":"synthetic_transcription_double","live_audio_processed":false,"segments":[{"id":"S1","start_seconds":1.0,"end_seconds":2.5,"text":"Ship on [Tuesday / Thursday].","alternatives":["Tuesday","Thursday"]}],"recording_available":false}\n',

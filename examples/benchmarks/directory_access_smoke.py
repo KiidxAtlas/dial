@@ -15,6 +15,7 @@ import pathlib
 import shlex
 import tempfile
 import threading
+import time
 
 from interactive_smoke import Handler as BaseHandler, Terminal, fixture, unsupported_probe
 
@@ -63,7 +64,7 @@ class Handler(BaseHandler):
                     assert call["function"]["name"] == name, (case, call)
                     result = results[call["id"]]
                     assert expected.lower() in result.lower(), f"{case} {name}: expected {expected!r}, got {result}"
-                    if name == "read" and expected in ("outside the workspace", "protected"):
+                    if name == "read" and "denied" in expected:
                         assert "DIRECTORY-SEED-" not in result, f"denied read leaked fixture data: {result}"
                     observed.append({"tool": name, "arguments": arguments, "result": result})
                 self.server.results[case] = observed
@@ -78,18 +79,15 @@ class Handler(BaseHandler):
             self.respond({"error": str(error)}, 500)
 
 
-def request(path, sensitive=False):
-    return ("request_directory", {"path": str(path), "reason": "Test only this isolated temporary fixture",
-                                  "sensitive": sensitive}, "Added")
-
-
 def popup(terminal, sensitive=False):
-    text = terminal.wait("Allow request_sensitive_directory?" if sensitive else "Allow request_directory?")
-    assert "Yes" in text and "No" in text, text
+    text = terminal.wait("Allow request_sensitive_directory?" if sensitive else "Allow request_directory?", history=False)
+    assert "y  Allow once" in text and "n  Deny" in text, text
     assert "Allow for this session" not in text and "Allow for this project" not in text, text
     if sensitive:
         normalized = " ".join(text.replace("│", " ").split())
-        assert "native file tools" in normalized and "Shell commands remain blocked" in normalized, text
+        assert "native file tools" in normalized and "sandboxed shells remain blocked" in normalized, text
+    # Approval hotkeys and Enter are intentionally ignored for 350 ms after first paint.
+    time.sleep(0.4)
     return text
 
 
@@ -109,31 +107,28 @@ def main():
             root = pathlib.Path(directory).resolve()
             project, home = fixture(root, server.server_port)
             config = home / "config.toml"
-            config.write_text(config.read_text().replace("max_steps=8", "max_steps=16"))
+            # This check asserts shell confinement as well as native access. An unconfined
+            # shell has no storage deny to preserve; ask for the actual policy under test.
+            config.write_text(config.read_text().replace("max_steps=8", "max_steps=16")
+                              + '\n[sandbox]\nmode="strict"\n')
             normal = root / "added"
             private = home / "fixture-private"
             sibling = home / "fixture-sibling"
             for path in (normal, private, sibling):
                 path.mkdir()
                 (path / "seed.txt").write_text("DIRECTORY-SEED-" + path.name)
-            normal_denied = list(request(normal))
-            normal_denied[2] = "directory access denied"
-            sensitive_denied = list(request(private, True))
-            sensitive_denied[2] = "sensitive directory access denied"
+            normal_read = {"path": str(normal / "seed.txt")}
+            private_read = {"path": str(private / "seed.txt")}
             server.plans = {
-                "DIRECTORY-DENY": [tuple(normal_denied),
-                    ("read", {"path": str(normal / "seed.txt")}, "outside the workspace")],
-                "DIRECTORY-ALLOW": [request(normal),
-                    ("read", {"path": str(normal / "seed.txt")}, "DIRECTORY-SEED-added"),
+                "DIRECTORY-DENY": [("read", normal_read, "directory access denied")],
+                "DIRECTORY-ALLOW": [("read", normal_read, "DIRECTORY-SEED-added"),
                     ("write", {"path": str(normal / "native.txt"), "content": "native-write"}, ""),
                     ("bash", {"cwd": str(normal), "command": "cat seed.txt; mkdir -p nested; printf shell-write > nested/shell.txt"}, "DIRECTORY-SEED-added")],
-                "DIRECTORY-SENSITIVE-DENY": [tuple(sensitive_denied),
-                    ("read", {"path": str(private / "seed.txt")}, "protected")],
-                "DIRECTORY-SENSITIVE-ALLOW": [request(private, True),
-                    ("read", {"path": str(private / "seed.txt")}, "DIRECTORY-SEED-fixture-private"),
+                "DIRECTORY-SENSITIVE-DENY": [("read", private_read, "sensitive directory access denied")],
+                "DIRECTORY-SENSITIVE-ALLOW": [("read", private_read, "DIRECTORY-SEED-fixture-private"),
                     ("write", {"path": str(private / "native.txt"), "content": "sensitive-native-write"}, ""),
                     ("bash", {"cwd": str(project), "command": "cat " + shlex.quote(str(private / "seed.txt"))}, ""),
-                    ("read", {"path": str(sibling / "seed.txt")}, "protected")],
+                    ("read", {"path": str(sibling / "seed.txt")}, "directory access denied")],
             }
             # Never inherit an optional shared authentication store from the operator.
             shared_auth = os.environ.pop("DIAL_SUBSCRIPTION_AUTH_HOME", None)
@@ -153,11 +148,14 @@ def main():
                         ["tmux", "-L", terminal.socket, "attach-session", "-t", "smoke"]), flush=True)
                     input("Press Enter here to resume automated checks (detach tmux with Ctrl-b d): ")
                     args.hold = False
-                terminal.key(answers[0])
+                terminal.key("Enter" if answers[0] == "y" else "Escape")
                 if len(answers) == 2:
                     popup(terminal, sensitive=True)
                     terminal.capture(case.lower() + "-sensitive-popup")
-                    terminal.key(answers[1])
+                    terminal.key("Enter" if answers[1] == "y" else "Escape")
+                if case == "DIRECTORY-SENSITIVE-ALLOW":
+                    popup(terminal)  # The first grant must not unlock its sibling.
+                    terminal.key("Escape")
                 try:
                     terminal.wait(case + "-VERIFIED")
                 except AssertionError:
@@ -168,14 +166,14 @@ def main():
             assert (normal / "native.txt").read_text() == "native-write"
             assert (normal / "nested/shell.txt").read_text() == "shell-write"
             assert (private / "native.txt").read_text() == "sensitive-native-write"
-            shell = server.results["DIRECTORY-SENSITIVE-ALLOW"][3]["result"]
+            shell = server.results["DIRECTORY-SENSITIVE-ALLOW"][2]["result"]
             assert "DIRECTORY-SEED-fixture-private" not in shell, shell
             assert any(word in shell.lower() for word in ("denied", "not permitted", "blocked", "sandbox")), shell
             assert not (sibling / "native.txt").exists()
             if args.captures:
                 (args.captures / "provider-results.json").write_text(json.dumps(server.results, indent=2))
             print(json.dumps({"kind": "real-pty-directory-access-regression", "cases": 4,
-                              "normal_popups": 4, "sensitive_popups": 2,
+                              "normal_popups": 5, "sensitive_popups": 2,
                               "tool_result_checks": server.checks, "chat_requests": server.requests,
                               "typed_add_dir_commands": 0, "pixel_screenshot_verification": False,
                               "model_quality_evidence": False}))

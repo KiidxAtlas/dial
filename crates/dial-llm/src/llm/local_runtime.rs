@@ -7,6 +7,9 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 
+mod gguf;
+pub use gguf::{GgufEngines, GgufLoader};
+
 /// `mlx_lm.server --num-draft-tokens` default, used when a draft model is set without a count.
 pub const DEFAULT_NUM_DRAFT_TOKENS: u32 = 3;
 pub const MAX_NUM_DRAFT_TOKENS: u32 = 16;
@@ -15,9 +18,45 @@ pub const KV_BITS: &[u8] = &[2, 3, 4, 6, 8];
 /// Quantization group sizes MLX supports for affine-quantized tensors.
 pub const KV_GROUP_SIZES: &[u32] = &[32, 64, 128];
 
+/// A choice of executable, independent of sampling and model format. Auto preserves Dial's
+/// original format routing. A pin is never silently replaced by a different runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalEngine {
+    #[default]
+    Auto,
+    Mlx,
+    LlamaCpp,
+    Atomic,
+}
+
+impl LocalEngine {
+    pub fn model_key(model: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(model.as_bytes()))
+    }
+
+    pub fn choices(format: super::local_format::LocalFormat, gguf: GgufEngines) -> &'static [Self] {
+        use super::local_format::LocalFormat;
+        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        match (format, gguf) {
+            (LocalFormat::Mlx, _) if apple => &[Self::Auto, Self::Mlx],
+            (LocalFormat::Gguf, GgufEngines::AtomicOnly) if apple => &[Self::Atomic],
+            (LocalFormat::Gguf, GgufEngines::Both) if apple => {
+                &[Self::Auto, Self::LlamaCpp, Self::Atomic]
+            }
+            (LocalFormat::Gguf, GgufEngines::Both) => &[Self::Auto, Self::LlamaCpp],
+            _ => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalRuntime {
+    /// Resolved by the backend from the selected model, not inherited as a global tuning flag.
+    #[serde(skip)]
+    pub engine: LocalEngine,
     /// Draft model id or local path for speculative decoding; `""` or `"auto"` disables it.
     #[serde(
         deserialize_with = "blank_as_none",
@@ -48,7 +87,11 @@ pub struct LocalRuntime {
 
 impl LocalRuntime {
     pub fn is_default(&self) -> bool {
-        self == &Self::default()
+        self.draft_model.is_none()
+            && self.num_draft_tokens.is_none()
+            && self.kv_bits.is_none()
+            && self.kv_group_size.is_none()
+            && self.quantized_kv_start.is_none()
     }
 
     /// Rejects values and combinations the pinned mlx-lm server cannot honor.

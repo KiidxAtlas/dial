@@ -105,6 +105,8 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     } else {
         policy.push_str(LEAN_BATCHING);
     }
+    policy.push_str("\n- ");
+    policy.push_str(DECISION_BOUNDARY);
     // Each optional rule names its tools; it appears only when all of them are offered.
     let mut optional: Vec<&str> = [
         (&["skill"][..], SKILL_RULE),
@@ -112,8 +114,10 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         (&["codebase_memory"], PROJECT_MAP_RULE),
         (&["lsp"], LSP_RULE),
         (&["glob"], SOURCE_PREVIEW_RULE),
+        (&["find"], FIND_RULE),
         (&["read"], READ_BATCH_RULE),
         (&["grep"], SEARCH_SCOPE_RULE),
+        (&["grep", "bash"], SEARCH_SHELL_RULE),
         (&["eval", "bash"], EVAL_SHELL_RULE),
         (&["verify"], VERIFY_REPRO_RULE),
     ]
@@ -156,24 +160,13 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         rules.push_str(TODO_RULE);
     }
     rules.push_str(CHANGE_RULES);
-    if !compact {
-        return format!(
-            "{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{LEAN_WAITING}{rules}{TESTING_DECISIONS}{visual}{DELIVERY}"
-        );
-    }
-    let mut focused = String::from(FOCUSED_WORK);
-    focused.push_str(LEAN_WAITING);
-    // Name a parallel helper only when it is offered, never a deferred one.
-    let helpers: Vec<&str> = [("task", LEAN_SIDE_REQUEST), ("task", LEAN_TASK_START)]
-        .into_iter()
-        .filter(|(tool, _)| has(tool))
-        .map(|(_, clause)| clause)
-        .collect();
-    if !helpers.is_empty() {
-        focused.push_str(&format!("\n- Meanwhile you may {}.", helpers.join(", or ")));
-    }
+    let helper = if compact && has("task") {
+        format!("\n- {LEAN_SIDE_REQUEST}")
+    } else {
+        String::new()
+    };
     format!(
-        "{HEADER}{policy}\n\n# Execution\n{focused}{rules}{TESTING_DECISIONS}{visual}{DELIVERY}"
+        "{HEADER}\n\n# Execution\n{FOCUSED_WORK}{policy}{rules}{LEAN_WAITING}{helper}{TESTING_DECISIONS}{visual}{DELIVERY}"
     )
 }
 

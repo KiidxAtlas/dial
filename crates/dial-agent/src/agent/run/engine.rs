@@ -98,6 +98,10 @@ pub(in crate::agent) struct Engine {
     progress: super::turn::progress::ProgressLedger,
     evidence_stall_limit: u32,
     evidence_this_round: bool,
+    /// A file changed since the last round with independent evidence. Until a check verdict or an
+    /// independent read grounds it, new shell output may just be the edited program's new output,
+    /// so it does not count as evidence.
+    mutation_since_evidence: bool,
     convergence_notice: bool,
     authored_paths: std::collections::BTreeSet<std::path::PathBuf>,
     observed_verdict: Option<String>,
@@ -215,6 +219,9 @@ impl Engine {
     pub fn record_progress(&mut self, progress: RoundProgress) -> super::turn::progress::Rung {
         use super::turn::progress::Rung;
         let grounded = std::mem::take(&mut self.evidence_this_round);
+        if grounded {
+            self.mutation_since_evidence = false;
+        }
         if let rung @ Rung::Stop(_) = self.progress.evidence_round(
             progress != RoundProgress::Neutral,
             grounded,
@@ -642,6 +649,7 @@ impl Engine {
                 || crate::agent::verify::verification::classify_output(None, output, false)
                     == crate::agent::verify::verification::CheckStatus::Passed);
         if mutated {
+            self.mutation_since_evidence = true;
             // A new committed version permits real verification of that version, even if a check
             // returns the same success text. A revert/no-op does not reopen the evidence window.
             self.progress_observations.clear();
@@ -703,7 +711,14 @@ impl Engine {
                 .as_str()
                 .and_then(|path| workspace.resolve(path).ok())
                 .is_some_and(|path| self.authored_paths.contains(&path));
-        self.evidence_this_round |= captured || (observed && call.name != "bash" && !authored_read);
+        // A read-only shell inspection (no check, no file change, novel output) is independent
+        // evidence while nothing has been edited since the last grounded round: investigating
+        // a disk image or a process with `od`/`grep` learns something new every round. After an
+        // edit, new shell output may only reflect that edit, so it must be grounded first.
+        let independent_shell =
+            call.name == "bash" && !shell_check && !self.mutation_since_evidence;
+        self.evidence_this_round |=
+            captured || (observed && (call.name != "bash" || independent_shell) && !authored_read);
         self.authored_paths
             .extend(output.execution.changed_paths.iter().cloned());
         let verdict = if shell_check {

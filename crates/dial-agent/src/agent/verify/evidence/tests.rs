@@ -58,6 +58,31 @@ fn call_settlement_covers_only_that_call_not_unrelated_later_effects() {
     assert_eq!(ledger.passing_behavioral([1, 1, 0]), 0);
 }
 
+#[test]
+fn a_parse_or_compile_only_focused_check_is_not_a_behavior_pass() {
+    let mut ledger = Ledger::default();
+    let ast = "focused-check:python AST: filter.py";
+    ledger.observe(
+        "python3 -c ast.parse",
+        ast,
+        CheckStatus::Passed,
+        [1, 0, 0],
+        false,
+    );
+    ledger.observe(
+        "cargo check",
+        "focused-check:cargo check: .",
+        CheckStatus::Passed,
+        [1, 0, 0],
+        false,
+    );
+    assert!(!ledger.current_focused_behavior_pass([0, 0, 0]));
+    assert!(!ledger.current_focused_behavior_pass([1, 0, 0]));
+    let tests = "focused-check:related Python tests: filter";
+    ledger.observe("pytest", tests, CheckStatus::Passed, [1, 0, 0], false);
+    assert!(ledger.current_focused_behavior_pass([1, 0, 0]));
+}
+
 fn repro(name: &str, command: &str) -> FocusedCheck {
     FocusedCheck {
         name: name.into(),

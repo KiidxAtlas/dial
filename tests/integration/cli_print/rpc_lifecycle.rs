@@ -446,6 +446,11 @@ fn apply_settings_rebuilds_around_the_same_session_and_gui_reads_answer_during_a
     assert_eq!(rpc.result(8)["text"], "after rebuild");
     rpc.send(9, "state", json!({}));
     assert_eq!(rpc.result(9)["session_id"], session.as_str());
+    rpc.send(19, "evidence", json!({"action":"model_request"}));
+    let observation = rpc.result(19);
+    assert_eq!(observation["session_id"], session.as_str());
+    assert_eq!(observation["last_request"]["model"], "scripted");
+    assert_eq!(observation["last_request"]["succeeded"], true);
 
     rpc.send(10, "send", json!({"text":"wait"}));
     for _ in 0..3 {
@@ -454,6 +459,14 @@ fn apply_settings_rebuilds_around_the_same_session_and_gui_reads_answer_during_a
     // Controller reads a GUI polls while the turn holds the actor.
     rpc.send(11, "list_jobs", json!({}));
     assert!(rpc.result(11)["jobs"].is_array());
+    rpc.send(17, "list_jobs", json!({"include_persistent":true}));
+    let listed = rpc.result(17);
+    assert_eq!(listed["persistent_jobs"], json!([]), "{listed}");
+    // An unreadable registry does not hide the session namespace.
+    std::fs::write(env.home.path().join("background-jobs"), "not a directory").unwrap();
+    rpc.send(18, "list_jobs", json!({"include_persistent":true}));
+    let unavailable = rpc.result(18);
+    assert!(unavailable["jobs"].is_array() && unavailable["persistent_error"].is_string());
     rpc.send(12, "list_dirs", json!({}));
     assert!(rpc.result(12)["dirs"].is_array());
     rpc.send(13, "get_schema", json!({}));

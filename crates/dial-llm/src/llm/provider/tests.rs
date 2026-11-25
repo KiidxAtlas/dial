@@ -1643,6 +1643,10 @@ fn local_chat_projects_system_messages_without_rewriting_the_request() {
         server::fixtures::fake_python(root.path()),
         30,
     );
+    local
+        .prepare_local_model(Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    let origin = local.server.as_ref().unwrap().base_url().to_owned();
     let mut req = request();
     req.messages = vec![
         json!({"role":"system","content":"policy"}),
@@ -1657,6 +1661,7 @@ fn local_chat_projects_system_messages_without_rewriting_the_request() {
             .chat(None, &req, 5, streaming.then_some(&mut on_text))
             .unwrap();
     }
+    assert_eq!(local.server.as_ref().unwrap().base_url(), origin);
     let info: serde_json::Value =
         serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
     let requests = info["requests"].as_array().unwrap();

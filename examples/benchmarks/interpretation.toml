@@ -39,6 +39,13 @@ categories = ["evidence", "ambiguity", "contradiction"]
 checks = [{kind="command",command="python3 -c 'import json; from pathlib import Path; actual=json.loads(Path('\"'\"'answer.json'\"'\"').read_text()); expected=json.loads('\"'\"'{\"status\": \"unresolved\", \"approved\": null, \"quotes\": [{\"source\": \"source-a.txt\", \"quote\": \"The launch is approved for March 4.\"}, {\"source\": \"source-b.txt\", \"quote\": \"The launch is not approved for March 4.\"}]}'\"'\"'); assert json.dumps(actual,sort_keys=True)==json.dumps(expected,sort_keys=True), '\"'\"'answer does not meet value/type/coverage contract'\"'\"''"}]
 
 [[cases]]
+id = "ranked-quotes"
+project = "examples/benchmarks/interpretation-fixture"
+prompt = "Using source-a.txt, source-b.txt and source-register-ranked.json, decide whether the supplied sources establish launch approval. Write answer.json with status (resolved or unresolved), approved (boolean or null), and quotes: a list in source filename order of objects with source and exact quote. Preserve both opposing launch sentences verbatim. Do not choose an authority absent from the register. Do not modify input fixtures."
+categories = ["evidence", "ambiguity", "contradiction"]
+checks = [{kind="command",command="python3 -c 'import json; from pathlib import Path; actual=json.loads(Path('\"'\"'answer.json'\"'\"').read_text()); expected=json.loads('\"'\"'{\"status\": \"resolved\", \"approved\": true, \"quotes\": [{\"source\": \"source-a.txt\", \"quote\": \"The launch is approved for March 4.\"}, {\"source\": \"source-b.txt\", \"quote\": \"The launch is not approved for March 4.\"}]}'\"'\"'); assert json.dumps(actual,sort_keys=True)==json.dumps(expected,sort_keys=True), '\"'\"'answer does not meet value/type/coverage contract'\"'\"''"}]
+
+[[cases]]
 id = "nested-json-jsonl"
 project = "examples/benchmarks/interpretation-fixture"
 prompt = "Analyze nested.json and events.jsonl. Sum quantity for SKU X across every nested batch/order/line. Normalize non-null event durations to milliseconds; null means missing, not zero. Write answer.json with integer keys x_quantity, orders_examined, events_examined, events_with_duration, total_duration_ms and a missing_duration_ids list. Do not modify input fixtures."

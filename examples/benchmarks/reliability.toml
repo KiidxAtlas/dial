@@ -29,11 +29,15 @@ project = "examples/benchmarks/reliability-fixture"
 prompt = "The ledger export drops refunds, so downstream reports undercount. export_lines must include every entry in input order, writing refunds as negative cents. total_cents must keep netting refunds exactly as before. Verify both behaviors."
 categories = ["reliability", "serialization", "preserved_behavior", "verification"]
 checks = [{kind="command",command='''python3 -c '
-from ledger import export_lines, total_cents
+from ledger import export_lines
 entries = [{"kind": "charge", "cents": 500}, {"kind": "refund", "cents": 300}, {"kind": "charge", "cents": 25}]
 assert export_lines(entries) == ["charge:500", "refund:-300", "charge:25"], export_lines(entries)
 assert export_lines([]) == []
-assert total_cents(entries) == 225, total_cents(entries)
+'
+'''}, {kind="command",command='''python3 -c '
+from ledger import total_cents
+assert total_cents([{"kind": "charge", "cents": 500}, {"kind": "refund", "cents": 300}, {"kind": "charge", "cents": 25}]) == 225
+assert total_cents([]) == 0
 '
 '''}, {kind="command",command="python3 -m unittest test_ledger"}]
 
