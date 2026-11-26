@@ -201,7 +201,10 @@ fn npm_recipes_use_the_npm_of_a_dial_installed_node() {
         .iter()
         .find(|(key, _)| key == "PATH")
         .unwrap();
-    assert!(path.1.starts_with(&bin.display().to_string()));
+    // Compare the first PATH entry as a file, not as text: Windows may spell the same
+    // directory with other separators or a short (8.3) temp-directory name.
+    let first = std::env::split_paths(&path.1).next().unwrap();
+    assert_eq!(first.canonicalize().unwrap(), bin.canonicalize().unwrap());
     // Language servers must not acquire an implicit prefix under Dial's downloaded Node.
     assert_eq!(
         plan(recipe("pyright-langserver").unwrap(), &env),

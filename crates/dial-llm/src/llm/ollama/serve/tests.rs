@@ -32,6 +32,8 @@ fn a_client_reopens_the_managed_job_and_owns_it_after_the_creator_leaves() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
+    // Production state lives under Dial's private user directory; the lock refuses other parents.
+    crate::platform::atomic::private_dir(dir.path()).unwrap();
     let (mut child, creator) = process::spawn_shared_group(Command::new("powershell.exe").args([
         "-NoProfile",
         "-NonInteractive",
