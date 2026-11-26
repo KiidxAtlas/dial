@@ -801,9 +801,10 @@ impl FileDacl {
                     "invalid DACL size",
                 ));
             }
-            Some(std::sync::Arc::from(unsafe {
-                std::slice::from_raw_parts(acl.cast::<u32>(), len / 4)
-            }))
+            // SAFETY: the validated AclSize covers `len / 4` DWORD-aligned words inside the
+            // descriptor, which stays live until the slice is copied into the Arc below.
+            let words = unsafe { std::slice::from_raw_parts(acl.cast::<u32>(), len / 4) };
+            Some(std::sync::Arc::from(words))
         };
         Ok(Self {
             acl,
