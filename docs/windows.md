@@ -96,6 +96,17 @@ empty model list, Enter opens Providers, where you can inspect connection detail
 Test connection. These navigation and test actions keep setup open; Esc from a setup subpage
 returns to Models. Esc again from Models without choosing a model exits setup.
 
+## Computer use in Dial Desktop
+
+Run the native Windows engine in your signed-in, unlocked desktop session. In Dial Desktop,
+open **Settings → Integrations → Computer use**. For a read-only check, ask Dial to report
+the computer backend and available displays. The native backend is `win32`; the Browser
+panel and WSL are not tests of Windows desktop control.
+
+Enabling the tool does not elevate Dial or grant control over UAC prompts. To check input,
+open a disposable text document in a non-elevated app and ask Dial to type a short phrase
+there. Review the approval before allowing it and check the text in that window.
+
 ## Terminal and Administrator shells
 
 Dial's interface uses virtual terminal sequences. Windows Terminal supports them by default, and

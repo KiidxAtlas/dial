@@ -443,6 +443,10 @@ jobs:
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
       - name: Run focused Windows contract suite
         run: python scripts/windows-contract.py --profile ci
+      - name: Exercise computer use over RPC on a disposable WinForms window
+        run: >-
+          cargo test --locked --profile ci -p dial --test integration cli_print::rpc_computer::
+          -- --include-ignored --test-threads=1
       - name: Cold-load a GGUF and generate on the same Windows server
         shell: pwsh
         run: |
