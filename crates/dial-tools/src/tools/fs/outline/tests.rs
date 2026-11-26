@@ -141,3 +141,35 @@ fn directory_outline_lists_top_level_declarations_per_file() {
         out.text
     );
 }
+
+#[test]
+fn directory_outline_puts_the_most_referenced_files_first() {
+    let (dir, ws) = workspace();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/a_main.rs"),
+        "fn main() { let c = Config::load(); save_config(c); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/b_store.rs"),
+        "pub fn save_config(c: Config) {}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("src/c_config.rs"), "pub struct Config {}\n").unwrap();
+    let out = run(&ws, "read", json!({"path": "src:outline"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text
+            .contains("files most referenced by the others first"),
+        "{}",
+        out.text
+    );
+    let at = |name: &str| {
+        out.text
+            .find(name)
+            .unwrap_or_else(|| panic!("{name}: {}", out.text))
+    };
+    assert!(at("src/c_config.rs") < at("src/b_store.rs"), "{}", out.text);
+    assert!(at("src/b_store.rs") < at("src/a_main.rs"), "{}", out.text);
+}

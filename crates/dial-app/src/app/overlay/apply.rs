@@ -18,6 +18,9 @@ use anyhow::{Result, ensure};
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 
+const WAITING_FOR_LOGIN: &str =
+    "No browser? Close this panel for the sign-in URL. Sign-in stays active.";
+
 impl OverlayEnv<'_> {
     /// Returns true when the overlay should close.
     pub(super) fn apply(&mut self, event: OverlayEvent, overlay: &mut ActiveOverlay) -> bool {
@@ -146,7 +149,8 @@ impl OverlayEnv<'_> {
                     // OS models and Laya's typed service do not use chat-weight acquisition.
                     if crate::config::selection::requires_local_preparation(&config, &selection) {
                         let model = selection.model.clone();
-                        let python = config.python.clone();
+                        let python =
+                            crate::llm::download::hub_python(&config.user_dir, &config.python);
                         let started =
                             start_streaming_job(self.auth_job, "Model", move |cancel, progress| {
                                 let progress = RefCell::new(progress);
@@ -242,7 +246,7 @@ impl OverlayEnv<'_> {
                     )?;
                     let message = format!("{path} set to {value}");
                     let model = value.clone();
-                    let python = config.python.clone();
+                    let python = crate::llm::download::hub_python(&config.user_dir, &config.python);
                     let started =
                         start_streaming_job(self.auth_job, "Model", move |cancel, progress| {
                             let progress = RefCell::new(progress);
@@ -542,8 +546,10 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::ChatGptLogin { client_id } => {
                 let dir = self.app.layout.user_dir.clone();
-                self.start_auth(overlay, "ChatGPT", move |cancel| {
-                    crate::llm::chatgpt::login(&dir, client_id.as_deref(), cancel)
+                self.start_auth(overlay, "ChatGPT", WAITING_FOR_LOGIN, move |cancel| {
+                    let ui = crate::llm::oauth::BannerInteraction { id: "openai" };
+                    let login = crate::llm::oauth::Login { ui: &ui, cancel };
+                    crate::llm::chatgpt::login(&dir, client_id.as_deref(), &login)
                 });
             }
             OverlayEvent::ChatGptCancel => {
@@ -555,7 +561,7 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::ChatGptSelect { client_id } => {
                 let dir = self.app.layout.user_dir.clone();
-                self.start_auth(overlay, "ChatGPT", move |_| {
+                self.start_auth(overlay, "ChatGPT", "Selecting account…", move |_| {
                     crate::llm::chatgpt::select_account(&dir, &client_id).map(|_| {
                         "ChatGPT account selected; choose an available model in /models".into()
                     })
@@ -563,14 +569,16 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::ChatGptSignOut { client_id } => {
                 let dir = self.app.layout.user_dir.clone();
-                self.start_auth(overlay, "ChatGPT", move |cancel| {
+                self.start_auth(overlay, "ChatGPT", "Signing out…", move |cancel| {
                     crate::llm::chatgpt::sign_out(&dir, &client_id, cancel)
                 });
             }
             OverlayEvent::AnthropicLogin => {
                 let dir = self.app.layout.user_dir.clone();
-                self.start_auth(overlay, "Claude", move |cancel| {
-                    crate::llm::anthropic_oauth::login(&dir, cancel)
+                self.start_auth(overlay, "Claude", WAITING_FOR_LOGIN, move |cancel| {
+                    let ui = crate::llm::oauth::BannerInteraction { id: "anthropic" };
+                    let login = crate::llm::oauth::Login { ui: &ui, cancel };
+                    crate::llm::anthropic_oauth::login(&dir, &login)
                 });
             }
             OverlayEvent::AnthropicSignOut => {
@@ -594,7 +602,7 @@ impl OverlayEnv<'_> {
             OverlayEvent::OAuthLogin { id } => match crate::llm::oauth::flow(&id) {
                 Some(flow) => {
                     let dir = self.app.layout.user_dir.clone();
-                    self.start_auth(overlay, flow.name, move |cancel| {
+                    self.start_auth(overlay, flow.name, WAITING_FOR_LOGIN, move |cancel| {
                         let ui = crate::llm::oauth::BannerInteraction { id: flow.id };
                         crate::llm::oauth::login(&dir, flow.id, &ui, cancel)
                     });

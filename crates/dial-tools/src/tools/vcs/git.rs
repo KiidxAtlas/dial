@@ -262,17 +262,12 @@ const OBJECT_ONLY_READS: &[&str] = &["log", "reflog", "show", "branch", "rev-par
 
 fn filter_config_query(root: &Path, pattern: &str) -> Command {
     let mut query = Command::new("git");
+    crate::tools::exec::sandbox::inherit_allowed_env(&mut query);
     query
         .args(hooks_off_args())
         .args(SAFE_GIT_ARGS)
         .args(["config", "--null", "--get-regexp", pattern])
         .current_dir(root)
-        .env_clear()
-        .envs(
-            std::env::vars().filter(|(name, value)| {
-                crate::tools::exec::sandbox::child_env_allowed(name, value)
-            }),
-        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -354,11 +349,7 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
             .first()
             .is_some_and(|arg| OBJECT_ONLY_READS.contains(&arg.as_str()));
         disabled_drivers = read_filter_drivers(root, cancel, object_only)?;
-        command.env_clear().envs(
-            std::env::vars().filter(|(name, value)| {
-                crate::tools::exec::sandbox::child_env_allowed(name, value)
-            }),
-        );
+        crate::tools::exec::sandbox::inherit_allowed_env(&mut command);
     }
     if program == "git" {
         // Repository config is untrusted. Read-specific driver flags are added below.

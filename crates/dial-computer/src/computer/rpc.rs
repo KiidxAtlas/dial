@@ -320,8 +320,9 @@ fn clipboard_candidates(write: bool) -> Vec<(&'static str, Vec<&'static str>)> {
 
 #[cfg(target_os = "linux")]
 fn clipboard_candidates(write: bool) -> Vec<(&'static str, Vec<&'static str>)> {
+    use super::linux_display::DisplayServer;
     let mut list = Vec::new();
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if DisplayServer::current() == DisplayServer::Wayland {
         list.push(if write {
             ("wl-copy", vec![])
         } else {
@@ -341,29 +342,37 @@ fn clipboard_candidates(write: bool) -> Vec<(&'static str, Vec<&'static str>)> {
     list
 }
 
-#[cfg(target_os = "windows")]
+// Do not use the PowerShell object formatter or the console code page for text transport:
+// both pipe ends carry raw UTF-8 without a BOM, and neither end rewrites line separators.
+#[cfg(windows)]
+const WINDOWS_CLIPBOARD_WRITE: &str = "\
+    $buf = New-Object IO.MemoryStream; [Console]::OpenStandardInput().CopyTo($buf); \
+    $text = [Text.Encoding]::UTF8.GetString($buf.ToArray()); \
+    if ($text.Contains([char]0)) { throw 'Windows clipboard text cannot contain NUL' }; \
+    if ($text.Length -eq 0) { $clip::Clear() } else { $clip::SetText($text) }";
+#[cfg(windows)]
+const WINDOWS_CLIPBOARD_READ: &str = "\
+    $bytes = [Text.Encoding]::UTF8.GetBytes($clip::GetText()); \
+    [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)";
+
+#[cfg(windows)]
 fn clipboard_candidates(write: bool) -> Vec<(&'static str, Vec<&'static str>)> {
-    vec![if write {
-        (
-            "powershell",
-            vec![
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Console]::In.ReadToEnd() | Set-Clipboard",
-            ],
-        )
-    } else {
-        (
-            "powershell",
-            vec![
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-Clipboard -Raw",
-            ],
-        )
-    }]
+    vec![(
+        "powershell.exe",
+        vec![
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; \
+             $clip = [System.Windows.Forms.Clipboard];",
+            if write {
+                WINDOWS_CLIPBOARD_WRITE
+            } else {
+                WINDOWS_CLIPBOARD_READ
+            },
+        ],
+    )]
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -402,7 +411,9 @@ fn run_clipboard(
             .args(args)
             .stdin(piped_if(!reading))
             .stdout(piped_if(reading))
-            .stderr(piped_if(reading)),
+            // Unix selection owners can fork and keep stderr open. Windows PowerShell
+            // exits after the write, so capture its failure (e.g. text containing NUL).
+            .stderr(piped_if(reading || cfg!(windows))),
     )
     .map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => ClipboardFailure::Missing(format!("{program}: {error}")),

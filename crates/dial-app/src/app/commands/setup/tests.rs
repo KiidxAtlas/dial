@@ -228,7 +228,8 @@ fn review_preserves_full_existing_plan_and_skips_installed_targets() {
         review_plan("ollama", &env).unwrap(),
         run::preview_text("ollama", &env)
     );
-    let artifact = deps::install_dir(&env.user_dir, "bun").join("node_modules/.bin/bun");
+    let artifact =
+        deps::install_dir(&env.user_dir, "bun").join(deps::recipe("bun").unwrap().artifact);
     std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     std::fs::write(artifact, "").unwrap();
     assert!(

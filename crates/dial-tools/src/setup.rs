@@ -69,7 +69,12 @@ pub fn ensure_runtime_with(
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
     settings_store::write_private(&dir.join("dial_weights.py"), WEIGHTS.as_bytes())?;
     write_runtime_manifest(&dir)?;
-    let mut command = std::process::Command::new("uv");
+    let uv = deps::locate(
+        deps::recipe("uv").expect("registered uv"),
+        &deps::Env::current(&layout.user_dir),
+    )
+    .context("install uv (or use /setup uv) before setting up the MLX runtime")?;
+    let mut command = std::process::Command::new(uv);
     command
         .args(["sync", "--locked", "--no-dev", "--project"])
         .arg(&dir)
@@ -137,13 +142,40 @@ pub fn run(
     capabilities: impl Fn(&Config) -> Result<serde_json::Value>,
 ) -> Result<()> {
     let prepare = |config: &Config| {
-        eprintln!(
-            "installing mlx-lm into {} (uv)…",
-            crate::config::paths::python_dir(&layout.user_dir).display()
-        );
-        ensure_runtime(layout)?;
-        eprintln!("verifying {} (first run downloads weights)…", config.model);
-        crate::llm::download::ensure_local_model(&config.python, &config.model)?;
+        use crate::llm::{
+            catalog, download,
+            local_format::{self, LocalFormat},
+        };
+        let resolved = match catalog::resolve_local_model(&config.model) {
+            Ok(local) => local,
+            Err(_)
+                if !std::path::Path::new(&config.model).exists()
+                    && download::is_repo_id(&config.model) =>
+            {
+                let mut python = download::hub_python(&layout.user_dir, &config.python);
+                if !python.is_file() {
+                    python = deps::run::install_with_requirements(
+                        download::HUB_HELPER,
+                        &deps::Env::current(&layout.user_dir),
+                        &AtomicBool::new(false),
+                        &mut |line| eprintln!("{line}"),
+                    )?;
+                }
+                eprintln!("preparing {} (first run downloads weights)…", config.model);
+                download::ensure_local_model_with(
+                    &python,
+                    &config.model,
+                    &download::Choice::Setup,
+                    &AtomicBool::new(false),
+                    &|line| eprintln!("{line}"),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        if local_format::detect(std::path::Path::new(&resolved)) != Some(LocalFormat::Gguf) {
+            eprintln!("preparing local MLX runtime…");
+            ensure_runtime(layout)?;
+        }
         capabilities(config)
     };
     if let Some(model) = model {

@@ -1051,6 +1051,8 @@ impl Default for QueryProjection {
 fn state_projection(agent: &Agent<'_>) -> Value {
     let (usage_total, usage_turn) = agent.usage();
     let workspace = agent.workspace();
+    let mut current_model = models::current(agent.effective_config());
+    current_model["context_window"] = json!(agent.context_window());
     json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
         "plan_mode":agent.plan_mode(),"approval":agent.approval(),"cost":agent.session_cost(),
         "working_modes":workflows::modes(agent),
@@ -1058,7 +1060,7 @@ fn state_projection(agent: &Agent<'_>) -> Value {
         "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
         "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree(),
         "workspace":{"root":workspace.root(),"dirs":workspace.additional_roots()},
-        "current_model":models::current(agent.effective_config())})
+        "current_model":current_model})
 }
 
 /// The schema clients generate bindings from: `docs/rpc-schema.json` as built into this engine.
@@ -1121,6 +1123,7 @@ impl Admin {
                 | "image_settings"
                 | "settings_schema"
                 | "get_settings"
+                | "get_default_thinking"
                 | "list_extensions"
                 | "list_checks"
                 | "list_skills"
@@ -1229,10 +1232,10 @@ impl Admin {
             }
             "delete_local_model" => {
                 drop(config);
-                let mut in_use = crate::llm::catalog::models_in_use(&self.saved_config()?);
-                if !model.model.is_empty() {
-                    in_use.push(model.model.clone());
-                }
+                let in_use = crate::llm::catalog::models_in_use_with_current(
+                    &self.saved_config()?,
+                    Some(&model),
+                );
                 let result = models::delete_local(params, &in_use)?;
                 if result["deleted"] == true {
                     self.scan.reset();
@@ -1241,6 +1244,8 @@ impl Admin {
             }
             "settings_schema" => Ok(settings::schema()),
             "get_settings" => settings::get(&layout, params),
+            "get_default_thinking" => settings::default_thinking(&layout, params, false),
+            "set_default_thinking" => settings::default_thinking(&layout, params, true),
             "set_setting" => settings::set(&layout, params),
             "reset_setting" => settings::reset(&layout, params),
             "list_extensions" => {
@@ -1271,8 +1276,10 @@ fn query_snapshot(agent: &Agent<'_>, projection: &mut QueryProjection) {
     refresh_messages(agent.session(), projection);
 }
 
+/// History for clients is the active branch's conversation as it happened, not the model's
+/// compacted view: compaction summaries and carried context never replace what the user said.
 fn refresh_messages(session: &Session, projection: &mut QueryProjection) {
-    let delta = session.message_delta(&mut projection.cursor, false);
+    let delta = session.message_delta(&mut projection.cursor, true);
     let messages = projection
         .messages
         .as_array_mut()
@@ -2258,6 +2265,8 @@ fn run_control(
                 | "delete_local_model"
                 | "settings_schema"
                 | "get_settings"
+                | "get_default_thinking"
+                | "set_default_thinking"
                 | "set_setting"
                 | "reset_setting"
                 | "list_extensions"

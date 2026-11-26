@@ -149,6 +149,8 @@ struct BrowserTool {
 struct BrowserSession {
     process: JsonProcess,
     _state: tempfile::TempDir,
+    #[cfg(windows)]
+    _node_dir: Option<tempfile::TempDir>,
     allowed_hosts: Vec<String>,
     last_used: Instant,
     /// Storage-state profile file saved on shutdown and idle reap.
@@ -799,6 +801,14 @@ fn relay_enabled(config: &BrowserConfig) -> bool {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn linux_launch_mode(headless: bool, attached: bool) -> Result<(), String> {
+    if !headless && !attached {
+        return Err("Linux browser containment does not expose your desktop display. Set browser.headless = true to launch isolated Chromium, or explicitly attach to a visible operator browser using the loopback CDP or browser relay settings.".into());
+    }
+    Ok(())
+}
+
 const IDLE: Duration = Duration::from_secs(600);
 const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -841,6 +851,8 @@ fn start(
         }
         None => None,
     };
+    #[cfg(target_os = "linux")]
+    linux_launch_mode(config.headless, cdp.is_some())?;
     let profile_file = match config.profile.as_deref() {
         Some(name) => {
             profile::validate_profile_name(name)?;
@@ -978,22 +990,48 @@ fn start(
     if let Some(cdp) = &cdp {
         env.push(("DIAL_CDP_URL", OsString::from(cdp)));
     }
+    // Keep this executable separate from the low-integrity writable browser state. The
+    // ordinary verified cache is used for preflight, but is deliberately hidden at launch.
+    #[cfg(windows)]
+    let node_dir = if !ctx.workspace.unsandboxed
+        && config.node == "node"
+        && crate::setup::deps::bundled_node::available()
+    {
+        let parent = crate::tools::exec::kernel::bundled_runtime_parent(ctx.workspace)?;
+        Some(
+            tempfile::Builder::new()
+                .prefix("dial-browser-node-")
+                .tempdir_in(parent)
+                .map_err(|e| format!("creating browser Node.js directory: {e}"))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let node = match &node_dir {
+        Some(dir) => crate::setup::deps::bundled_node::stage_browser_driver(dir)?,
+        None => node,
+    };
     let mut command = driver_command(ctx, &node, &reads, &state_path, cdp.is_some())?;
     command
         .env_clear()
         .envs(crate::tools::exec::sandbox::windows_system_env())
         .envs(env)
         .current_dir(ctx.workspace.root());
-    let process = JsonProcess::start(command, pid.clone())?;
+    let process = JsonProcess::start(command, pid.clone())
+        .map_err(|e| format!("starting browser driver with Node {node:?}: {e}"))?;
     let driver_pid = pid.load(Ordering::Acquire);
     let owner =
         ProcId::current().ok_or("cannot record browser process ownership for orphan cleanup")?;
-    let driver =
-        ProcId::of(driver_pid).ok_or("browser driver exited before it could be recorded")?;
+    let driver = ProcId::of(driver_pid).ok_or_else(|| {
+        format!("browser driver using Node {node:?} exited before it could be recorded")
+    })?;
     orphans::write(&orphan_dir, owner, driver)?;
     let mut session = BrowserSession {
         process,
         _state: state,
+        #[cfg(windows)]
+        _node_dir: node_dir,
         allowed_hosts: config.allowed_hosts.clone(),
         last_used: Instant::now(),
         profile: profile_file,
@@ -1008,20 +1046,23 @@ fn start(
     if !timeout.is_zero() && remaining.is_zero() {
         return Err("browser startup exceeded deadline".into());
     }
-    let initialized = session.process.request(
-        json!({
-            "action":"initialize",
-            "timeout_ms":remaining.as_millis() as u64,
-            "headless":config.headless,
-            "record_video":config.record_video,
-            "ignore_https_errors":ignore_https_errors,
-            "storage_state":storage_state,
-            "websocket_endpoints":ws::websocket_endpoints(&config.allowed_hosts),
-            "stealth":stealth_request
-        }),
-        remaining,
-        |_| Err("unexpected startup network".into()),
-    )?;
+    let initialized = session
+        .process
+        .request(
+            json!({
+                "action":"initialize",
+                "timeout_ms":remaining.as_millis() as u64,
+                "headless":config.headless,
+                "record_video":config.record_video,
+                "ignore_https_errors":ignore_https_errors,
+                "storage_state":storage_state,
+                "websocket_endpoints":ws::websocket_endpoints(&config.allowed_hosts),
+                "stealth":stealth_request
+            }),
+            remaining,
+            |_| Err("unexpected startup network".into()),
+        )
+        .map_err(|e| format!("initializing browser driver with Node {node:?}: {e}"))?;
     if let Some(error) = initialized["browser_error"].as_str() {
         return Err(error.to_owned());
     }

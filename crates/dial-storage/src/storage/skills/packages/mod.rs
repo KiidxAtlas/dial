@@ -232,7 +232,7 @@ fn plan(spec: &str, registries: &BTreeMap<String, String>, base: &Path) -> Resul
     let local =
         source.url.contains("://") || source.url.contains(':') || base.join(&source.url).exists();
     ensure!(
-        spec.contains(['/', ':']) && local,
+        spec.contains(|c| c == ':' || std::path::is_separator(c)) && local,
         "{spec:?} is neither a Git URL nor a registry reference. Use <registry>/<skill>[@ref] with a registry configured under Settings → Skills, a Git URL such as https://host/owner/repo.git, or a local path such as ./repo"
     );
     let name = source::default_name(&source).ok_or_else(|| {

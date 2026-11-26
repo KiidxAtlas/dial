@@ -32,7 +32,9 @@ mod tests;
 pub use base::helpers::{json_text, truncate};
 pub use compact::compaction;
 pub use memory::selfplay::{check_case, check_case_measured, selfplay_run};
-pub use model::backend::{Runtime, make_backend, make_session_backend, unconfigured_backend};
+pub use model::backend::{
+    LocalWeightsUnavailable, Runtime, make_backend, make_session_backend, unconfigured_backend,
+};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
 pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage, PeerSender};

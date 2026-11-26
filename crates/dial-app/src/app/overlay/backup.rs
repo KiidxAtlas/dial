@@ -9,7 +9,7 @@ use crate::ui::{
     theme::Tok,
 };
 use anyhow::{Result, ensure};
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     text::Line,
@@ -233,6 +233,10 @@ impl BackupOverlay {
         let Event::Key(key) = event else {
             return OverlayEvent::None;
         };
+        // Windows reports every key's release too; only presses (and repeats) act.
+        if key.kind == KeyEventKind::Release {
+            return OverlayEvent::None;
+        }
         if self.reviewing {
             return match key.code {
                 KeyCode::Esc => {

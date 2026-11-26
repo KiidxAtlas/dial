@@ -14,18 +14,47 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// build cannot self-update and does not check for releases.
 pub const SIGNING_KEY: Option<&str> = option_env!("DIAL_RELEASE_PUBLIC_KEY");
 
-/// Who owns the installed executable, judged from its path.
+/// Who owns the installed executable, judged from its path and, for /usr/bin/dial, package ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Installation {
     Homebrew,
     Cargo,
     Nix,
+    Pacman,
     /// The release installer (`install.sh` / `install.ps1`) or a manual copy.
     Script,
 }
 
+const SYSTEM_DIAL: &str = "/usr/bin/dial";
+
+/// `-Qo` exits 1 both for an unowned file and for a broken database/configuration. Only the
+/// explicit no-owner answer permits a release swap; an inconclusive query is a manual update.
+fn pacman_may_own_dial(pacman: &Path) -> bool {
+    match std::process::Command::new(pacman)
+        .args(["-Qqo", "--color", "never", "--", SYSTEM_DIAL])
+        .env("LC_ALL", "C")
+        .output()
+    {
+        Ok(reply) => {
+            reply.status.code() != Some(1)
+                || reply.stderr != b"error: No package owns /usr/bin/dial\n"
+        }
+        // No pacman installed is normal on other Linux distributions. An installed pacman
+        // with a missing interpreter or loader must not be confused with an absent program.
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound || pacman.exists(),
+    }
+}
+
 impl Installation {
     pub fn of(path: &Path) -> Self {
+        // Only system pacman may speak for its database; never search PATH.
+        Self::detect(
+            path,
+            cfg!(target_os = "linux").then(|| Path::new("/usr/bin/pacman")),
+        )
+    }
+
+    fn detect(path: &Path, pacman: Option<&Path>) -> Self {
         let text = path.to_string_lossy().replace('\\', "/");
         if text.contains("/Cellar/") || text.contains("/homebrew/") {
             Self::Homebrew
@@ -33,6 +62,8 @@ impl Installation {
             Self::Cargo
         } else if text.contains("/nix/store/") {
             Self::Nix
+        } else if path == Path::new(SYSTEM_DIAL) && pacman.is_some_and(pacman_may_own_dial) {
+            Self::Pacman
         } else {
             Self::Script
         }
@@ -49,6 +80,7 @@ impl Installation {
             Self::Homebrew => "Homebrew",
             Self::Cargo => "Cargo",
             Self::Nix => "Nix",
+            Self::Pacman => "pacman",
             Self::Script => "the release installer",
         }
     }
@@ -59,6 +91,7 @@ impl Installation {
             Self::Homebrew => "homebrew",
             Self::Cargo => "cargo",
             Self::Nix => "nix",
+            Self::Pacman => "pacman",
             Self::Script => "installer",
         }
     }
@@ -70,7 +103,7 @@ impl Installation {
         let words: &[&str] = match self {
             Self::Homebrew => &["brew", "upgrade", "dial"],
             Self::Cargo => &["cargo", "install", "--locked", "--git"],
-            Self::Nix | Self::Script => return None,
+            Self::Nix | Self::Pacman | Self::Script => return None,
         };
         let mut argv: Vec<String> = words.iter().map(|&word| word.to_owned()).collect();
         if self == Self::Cargo {
@@ -88,6 +121,9 @@ impl Installation {
         match self.package_manager_argv(None) {
             Some(argv) => argv.join(" "),
             None if self == Self::Nix => "update the dial flake input and rebuild".into(),
+            None if self == Self::Pacman => {
+                "upgrade the owning package (for AUR dial-bin, use your AUR helper or rebuild with makepkg -si)".into()
+            }
             None => "dial update".into(),
         }
     }
@@ -128,7 +164,7 @@ pub struct UpdateStatus {
     pub latest: Option<String>,
     /// Whether `latest` is strictly newer than `current`.
     pub update_available: bool,
-    /// Who owns this executable: `installer`, `homebrew`, `cargo` or `nix`.
+    /// Who owns this executable: `installer`, `homebrew`, `cargo`, `nix` or `pacman`.
     pub installation: &'static str,
     /// How `dial update` would update it: `release`, `package_manager`, `checkout` or `manual`.
     pub method: &'static str,
@@ -175,12 +211,21 @@ pub fn status(
 pub fn plan(installation: Installation, verified: bool, checkout: Option<&Path>) -> UpdatePlan {
     match (installation, checkout) {
         (Installation::Homebrew, _) => UpdatePlan::PackageManager(installation),
-        (Installation::Nix, _) => UpdatePlan::Manual(installation.update_command()),
+        (Installation::Nix | Installation::Pacman, _) => {
+            UpdatePlan::Manual(installation.update_command())
+        }
         (Installation::Script, _) if verified => UpdatePlan::Release,
         // `make update` also refreshes `~/.cargo/bin/dial`, so a source build found there is
         // rebuilt from its checkout rather than replaced by `cargo install`.
         (Installation::Script | Installation::Cargo, Some(root)) => {
-            UpdatePlan::Checkout(root.to_owned())
+            if cfg!(windows) {
+                UpdatePlan::Manual(format!(
+                    "close Dial, then from {} in a POSIX shell (e.g. Git Bash with GNU Make and Python 3), run `git pull --ff-only && make update`",
+                    root.display()
+                ))
+            } else {
+                UpdatePlan::Checkout(root.to_owned())
+            }
         }
         (Installation::Cargo, None) => UpdatePlan::PackageManager(installation),
         (Installation::Script, None) => UpdatePlan::Manual(format!(

@@ -43,7 +43,7 @@ class WindowsContractTests(unittest.TestCase):
 
     def test_repository_update_filter_selects_the_binary_module(self):
         tests, skips = contract.parse(contract.CONTRACT)
-        update = [test for test in tests if "update" in test[1]]
+        update = [test for test in tests if test[1].startswith("cmd::update::")]
         self.assertEqual(update, [(["--package", "dial", "--bin", "dial"],
                                    "cmd::update::tests::")])
         result, run, _, _ = self.run_fixture(summary(3), tests=update, skips=skips)

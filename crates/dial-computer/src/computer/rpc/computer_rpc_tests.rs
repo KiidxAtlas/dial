@@ -43,6 +43,55 @@ fn clipboard_helpers_are_bounded_and_failures_are_classified() {
     ));
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_clipboard_text_transport_is_exact() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Exercise Windows PowerShell and its redirected pipes, never the user's clipboard.
+    let fixture = r"class MemoryClipboard {
+        static [string] $value = 'previous contents'
+        static [void] Clear() { [MemoryClipboard]::value = '' }
+        static [void] SetText([string] $s) { [MemoryClipboard]::value = $s }
+        static [string] GetText() { return [MemoryClipboard]::value }
+    }
+    $ErrorActionPreference = 'Stop'; $clip = [MemoryClipboard];";
+    let script = format!("{fixture} {WINDOWS_CLIPBOARD_WRITE}; {WINDOWS_CLIPBOARD_READ}");
+    for text in [
+        "\u{feff}café🙂\rfirst\nsecond\r\n\r\n",
+        "no newline",
+        "",
+        "a\0b",
+    ] {
+        let mut child = crate::platform::process::spawn(
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Sta", "-Command", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        if text.contains('\0') {
+            assert!(!output.status.success());
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, text.as_bytes());
+        }
+    }
+}
+
 #[test]
 fn delayed_admitted_requests_cannot_cross_lifecycle_boundaries() {
     for method in ["retire", "cancel", "releaseControl"] {

@@ -268,8 +268,7 @@ fn write_archive(
     member_limit: u64,
 ) -> Result<Manifest> {
     // Opening is outside the cleanup path: a refused open means the archive was never ours to remove.
-    let file = platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), out)
-        .with_context(|| {
+    let file = platform_fs::create_new_owner_only(out).with_context(|| {
         format!(
             "creating {} (an existing archive is never overwritten)",
             out.display()

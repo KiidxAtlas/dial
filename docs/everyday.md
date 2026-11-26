@@ -38,7 +38,8 @@ not necessarily a passing check; inspect the expanded report for the recorded re
 Choose what you want to keep before restoring anything:
 
 - **Keep the conversation:** `/undo files` restores files from the most recent checkpoint.
-- **Rewind the conversation too:** `/undo` restores checkpointed edits and rewinds the turn.
+- **Rewind the conversation too:** `/undo 1` restores checkpointed edits and rewinds the turn.
+  Bare `/undo` opens a chooser with both, so you can pick without remembering the spelling.
 - **Decide file by file:** `/review files` lets you inspect the changes before choosing.
 
 Shell commands and extensions can have effects outside checkpoints. For example, neither form of

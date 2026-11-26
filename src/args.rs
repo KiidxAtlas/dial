@@ -693,7 +693,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: Option<SessionCommand>,
     },
-    /// Create the Python/MLX environment, save the model chosen with -m as your default, verify it loads.
+    /// Prepare a local MLX or GGUF model with -m and save it only after verification.
     Setup,
     /// Explicit paid native API batches (never runs automatically).
     ProviderBatch(dial::cli::provider_batches::Args),
@@ -923,12 +923,128 @@ fn mentions_flag(text: &str, long: &str) -> bool {
     })
 }
 
-/// Parse the process arguments through [`command`], exiting with clap's message on error.
+/// `dial --help` lists commands by what they are for, not as one long column. Every visible
+/// command appears exactly once: one missing from these groups lands under "More commands".
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Everyday commands",
+        &[
+            "sessions", "review", "commit", "models", "config", "setup", "doctor", "update",
+        ],
+    ),
+    (
+        "Share and automate",
+        &[
+            "share", "search", "watch", "run", "schedule", "skills", "stats", "ps", "images",
+        ],
+    ),
+    (
+        "Sign-in and integrations",
+        &[
+            "auth",
+            "private",
+            "provider-batch",
+            "rpc",
+            "acp",
+            "browser-relay",
+            "relay",
+            "completions",
+        ],
+    ),
+    (
+        "Inspect and research",
+        &["understanding", "experience", "annotate", "dev", "help"],
+    ),
+];
+
+/// The visible root commands as grouped help text, from their live descriptions.
+fn grouped_commands(root: &clap::Command) -> String {
+    let h = HELP_STYLES.get_header();
+    let l = HELP_STYLES.get_literal();
+    let visible: Vec<(&str, String)> = root
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| {
+            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            let first = about
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('.');
+            (sub.get_name(), first.to_owned())
+        })
+        .chain(std::iter::once((
+            "help",
+            "Print this message or the help of the given subcommand(s)".to_owned(),
+        )))
+        .collect();
+    let width = visible
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut groups: Vec<(&str, Vec<&(&str, String)>)> = COMMAND_GROUPS
+        .iter()
+        .map(|(title, names)| {
+            let rows = names
+                .iter()
+                .filter_map(|name| visible.iter().find(|(n, _)| n == name))
+                .collect();
+            (*title, rows)
+        })
+        .collect();
+    let rest: Vec<_> = visible
+        .iter()
+        .filter(|(name, _)| !COMMAND_GROUPS.iter().any(|(_, names)| names.contains(name)))
+        .collect();
+    groups.push(("More commands", rest));
+    let mut out = String::new();
+    for (title, rows) in groups.into_iter().filter(|(_, rows)| !rows.is_empty()) {
+        out.push_str(&format!("{h}{title}:{h:#}\n"));
+        for (name, about) in rows {
+            out.push_str(&format!("  {l}{name:<width$}{l:#}  {about}\n"));
+        }
+        out.push('\n');
+    }
+    // Braces would read as template tags.
+    out.replace('{', "{{").replace('}', "}}")
+}
+
+/// [`command`] with the grouped command list for `--help`. Completions keep [`command`], where
+/// the commands stay visible to the generator.
+pub(crate) fn help_command() -> clap::Command {
+    let root = command();
+    let grouped = grouped_commands(&root);
+    let names: Vec<String> = root
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    names
+        .iter()
+        .fold(root, |root, name| root.mut_subcommand(name, |sub| sub.hide(true)))
+        .disable_help_subcommand(true)
+        .override_usage("dial [OPTIONS] [PROMPT]... [COMMAND]")
+        .help_template(format!(
+            "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{grouped}{{all-args}}{{after-help}}"
+        ))
+}
+
+/// `dial help [command…]` reads as `dial [command…] --help`; the grouped help replaces clap's
+/// generated `help` subcommand, which would otherwise be the only entry under "Commands:".
+fn help_spelling(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    if args.get(1).is_some_and(|arg| arg == "help") {
+        args.remove(1);
+        args.push("--help".into());
+    }
+    args
+}
+
+/// Parse the process arguments through [`help_command`], exiting with clap's message on error.
 /// [`crate::dispatch::real_main`] folds `dev` into [`Command::Developer`].
 pub(crate) fn parse() -> Cli {
     use clap::FromArgMatches;
-    let matches = command().get_matches();
-    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.format(&mut command()).exit())
+    let matches = help_command().get_matches_from(help_spelling(std::env::args_os().collect()));
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.format(&mut help_command()).exit())
 }
 
 #[derive(Subcommand)]

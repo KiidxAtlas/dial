@@ -1294,7 +1294,7 @@ impl Backend {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(model_dir);
-                format!("local mlx_lm.server ({name})")
+                format!("managed local model ({name})")
             }
             ProviderKind::Endpoint {
                 base_url, model, ..
@@ -1375,11 +1375,17 @@ impl Backend {
             | ProviderKind::AnthropicEndpoint { model, .. } => model,
         }
     }
+    pub fn is_managed_local(&self) -> bool {
+        matches!(self.kind, ProviderKind::Local { .. })
+    }
+
     /// Whether prefix warming can use this local route without downloading model files.
     /// This inspects only the selected route and filesystem; it never starts inference.
     pub fn local_prefix_available(&self) -> bool {
         match &self.kind {
-            ProviderKind::Local { model_dir } => Path::new(model_dir).is_dir(),
+            ProviderKind::Local { model_dir } => {
+                llm::catalog::local_weights_present(Path::new(model_dir))
+            }
             _ => self.local_inference(),
         }
     }

@@ -229,6 +229,7 @@ impl OverlayEnv<'_> {
         &mut self,
         overlay: &mut ActiveOverlay,
         label: &'static str,
+        pending: &str,
         action: impl FnOnce(Arc<AtomicBool>) -> Result<String> + Send + 'static,
     ) {
         if self.auth_job.is_some() {
@@ -256,7 +257,7 @@ impl OverlayEnv<'_> {
         if let ActiveOverlay::Providers(providers) = overlay {
             providers.set_chatgpt_pending(label == "ChatGPT");
         }
-        self.report(overlay, Ok(format!("Waiting for {label} sign-in in your browser; sign-in continues if you close this panel")));
+        self.report(overlay, Ok(pending.to_owned()));
     }
 
     pub(super) fn collect_auth(&mut self, overlay: &mut ActiveOverlay) {

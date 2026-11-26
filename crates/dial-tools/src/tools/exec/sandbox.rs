@@ -1063,7 +1063,7 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
 }
 
 /// Build the child environment from scratch; never accidentally inherit an unlisted variable.
-pub(super) fn inherit_allowed_env(command: &mut std::process::Command) {
+pub fn inherit_allowed_env(command: &mut std::process::Command) {
     command
         .env_clear()
         .envs(std::env::vars_os().filter(|(key, value)| {

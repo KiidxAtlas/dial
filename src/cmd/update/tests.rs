@@ -39,7 +39,6 @@ fn a_source_build_is_current_only_when_clean_and_built_from_head() {
     assert!(!built_from(head, "", "false"));
 }
 
-#[cfg(unix)]
 mod activation_fixtures {
     use super::*;
     use std::path::PathBuf;
@@ -67,7 +66,8 @@ mod activation_fixtures {
     fn success_keeps_the_previous_executable_as_a_verified_backup() {
         let root = tempfile::tempdir().unwrap();
         let (exe, staged, backup, staging) = fixture(root.path());
-        activate_unix(&exe, &staged, &backup, &staging, &accept).unwrap();
+        fs::write(&backup, "older").unwrap();
+        activate(&exe, &staged, &backup, &staging, &accept).unwrap();
         assert_eq!(fs::read_to_string(&exe).unwrap(), "new");
         assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
         assert!(!staged.exists());
@@ -77,7 +77,7 @@ mod activation_fixtures {
     fn failed_post_check_restores_the_previous_executable() {
         let root = tempfile::tempdir().unwrap();
         let (exe, staged, backup, staging) = fixture(root.path());
-        let error = activate_unix(&exe, &staged, &backup, &staging, &reject).unwrap_err();
+        let error = activate(&exe, &staged, &backup, &staging, &reject).unwrap_err();
         assert!(format!("{error:#}").contains("previous version restored"));
         assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
         assert!(!backup.exists());
@@ -92,7 +92,7 @@ mod activation_fixtures {
             fs::remove_file(&backup)?;
             reject(path)
         };
-        let error = activate_unix(&exe, &staged, &backup, &staging, &sabotage).unwrap_err();
+        let error = activate(&exe, &staged, &backup, &staging, &sabotage).unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("post-install check rejected the update"),
@@ -110,8 +110,9 @@ mod activation_fixtures {
         let root = tempfile::tempdir().unwrap();
         let (exe, staged, backup, staging) = fixture(root.path());
         fs::remove_file(&staged).unwrap();
-        assert!(activate_unix(&exe, &staged, &backup, &staging, &accept).is_err());
+        assert!(activate(&exe, &staged, &backup, &staging, &accept).is_err());
         assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+        #[cfg(unix)]
         assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
     }
 
@@ -120,7 +121,7 @@ mod activation_fixtures {
         let root = tempfile::tempdir().unwrap();
         let (exe, staged, backup, staging) = fixture(root.path());
         fs::create_dir_all(backup.join("occupied")).unwrap();
-        assert!(activate_unix(&exe, &staged, &backup, &staging, &accept).is_err());
+        assert!(activate(&exe, &staged, &backup, &staging, &accept).is_err());
         assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
         assert!(
             staged.exists(),
@@ -128,6 +129,7 @@ mod activation_fixtures {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_interruption_after_backup_leaves_the_original_executable_active() {
         let root = tempfile::tempdir().unwrap();
@@ -149,6 +151,78 @@ mod activation_fixtures {
         assert!(lock_install_dir(root.path()).is_ok());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_deny_delete_handle_blocks_replacement_without_losing_the_install() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let root = tempfile::tempdir().unwrap();
+        let (exe, staged, backup, staging) = fixture(root.path());
+        let _busy = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&exe)
+            .unwrap();
+        assert!(activate(&exe, &staged, &backup, &staging, &accept).is_err());
+        assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_partial_replace_restores_the_displaced_image_without_clobbering_a_new_owner() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+        for occupied in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, _, backup, _) = fixture(root.path());
+            fs::rename(&exe, &backup).unwrap();
+            if occupied {
+                fs::write(&exe, "another installer").unwrap();
+            }
+            let os_error =
+                std::io::Error::from_raw_os_error(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32);
+            let error = windows::recover_failed_replace(os_error, &exe, &backup).unwrap_err();
+            if occupied {
+                assert!(error.to_string().contains("restoring it also failed"));
+                assert_eq!(fs::read_to_string(exe).unwrap(), "another installer");
+                assert_eq!(fs::read_to_string(backup).unwrap(), "old");
+            } else {
+                assert!(error.to_string().contains("previous version restored"));
+                assert_eq!(fs::read_to_string(exe).unwrap(), "old");
+                assert!(!backup.exists());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacing_a_running_image_keeps_the_process_alive_and_publishes_the_candidate() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let (path, staged, backup, staging) = fixture(root.path());
+        let exe = path.with_extension("exe");
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+        fs::copy(&shell, &exe).unwrap();
+        // A temporary copy, not the actual system shell. Keep its image mapped until the swap
+        // completes; piped stdin also ensures EOF if the test unwinds.
+        let mut old = Command::new(&exe)
+            .arg("/d")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = activate(&exe, &staged, &backup, &staging, &accept);
+        old.stdin.take().unwrap().write_all(b"exit 17\r\n").unwrap();
+        assert_eq!(old.wait().unwrap().code(), Some(17));
+        result.unwrap();
+        assert_eq!(fs::read_to_string(exe).unwrap(), "new");
+        assert_eq!(fs::read(backup).unwrap(), fs::read(shell).unwrap());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn dropping_the_install_lock_releases_inherited_descriptors() {
         let root = tempfile::tempdir().unwrap();

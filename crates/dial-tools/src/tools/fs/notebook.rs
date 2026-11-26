@@ -514,6 +514,17 @@ impl Notebook {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> Result<(), String> {
+            #[cfg(windows)]
+            let dacl =
+                crate::platform::fs::FileDacl::read(&loaded.file).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            let mut staged = crate::platform::fs::create_project_file_beneath(
+                &loaded.dir,
+                &stage_name,
+                Some(&dacl),
+            )
+            .map_err(|e| format!("staging notebook: {e}"))?;
+            #[cfg(unix)]
             let mut staged =
                 crate::platform::fs::create_new_beneath(&loaded.dir, &stage_name, true)
                     .map_err(|e| format!("staging notebook: {e}"))?;
@@ -557,11 +568,15 @@ impl Notebook {
                 ));
                 crate::platform::fs::rename_beneath(&loaded.dir, &loaded.name, &backup)
                     .map_err(|e| e.to_string())?;
-                let captured = crate::platform::fs::open_beneath_handle(&loaded.dir, &backup)
-                    .map_err(|e| e.to_string())?;
-                if crate::platform::fs::identity(&captured).map_err(|e| e.to_string())?
-                    != loaded.identity
-                {
+                let captured_matches =
+                    crate::platform::fs::open_beneath_handle(&loaded.dir, &backup).is_ok_and(
+                        |file| {
+                            crate::platform::fs::identity(&file).ok() == Some(loaded.identity)
+                                && crate::platform::fs::FileDacl::read(&file)
+                                    .is_ok_and(|current| current == dacl)
+                        },
+                    );
+                if !captured_matches {
                     if let Err(restore) =
                         crate::platform::fs::rename_beneath(&loaded.dir, &backup, &loaded.name)
                     {

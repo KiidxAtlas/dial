@@ -455,10 +455,11 @@ fn digits_pick_visible_rows_until_a_search_or_picker_needs_them() {
         panic!("1 runs the first row")
     };
     assert_eq!(action, "command:/undo");
-    palette.handle(&plain(KeyCode::Char('3')), &keys);
+    // Rows: the recent /undo, then "Start" with /model under it, then the other goals.
+    palette.handle(&plain(KeyCode::Char('4')), &keys);
     assert!(
         matches!(palette.view, View::Goal(1)),
-        "3 opens the second goal"
+        "4 opens the second goal"
     );
     palette.handle(&plain(KeyCode::Char('9')), &keys);
     assert!(

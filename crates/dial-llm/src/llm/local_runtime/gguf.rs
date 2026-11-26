@@ -64,13 +64,13 @@ impl GgufLoader {
         let choices = LocalEngine::choices(LocalFormat::Gguf, engines);
         if engine == LocalEngine::Auto {
             if engines == GgufEngines::AtomicOnly {
+                // Atomic is the only loader for this architecture, so Auto uses it. Whether it
+                // is installed is reported by `program`, never replaced by another runtime.
                 anyhow::ensure!(
-                    !choices.is_empty(),
+                    choices.contains(&LocalEngine::Atomic),
                     "No supported local engine for this GGUF on this platform. It requires Atomic Engine on Apple Silicon; choose another GGUF or a hosted endpoint."
                 );
-                anyhow::bail!(
-                    "This GGUF architecture requires Atomic Engine on Apple Silicon. Select Atomic for this model before loading it."
-                );
+                return Ok(Self::Atomic);
             }
             // Keep the historical automatic path for unrecognized architectures.
             return Ok(Self::LlamaCpp);

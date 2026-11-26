@@ -81,6 +81,12 @@ const LOCAL_BINS: &[(&[&str], &str)] = &[
         ],
         "node_modules/.bin",
     ),
+    #[cfg(windows)]
+    (PYTHON_MARKERS, ".venv/Scripts"),
+    #[cfg(windows)]
+    (PYTHON_MARKERS, "venv/Scripts"),
+    #[cfg(windows)]
+    (PYTHON_MARKERS, ".env/Scripts"),
     (PYTHON_MARKERS, ".venv/bin"),
     (PYTHON_MARKERS, "venv/bin"),
     (PYTHON_MARKERS, ".env/bin"),
@@ -689,3 +695,6 @@ impl Servers {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests;

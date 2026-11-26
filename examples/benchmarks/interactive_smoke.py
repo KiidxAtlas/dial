@@ -1183,7 +1183,7 @@ def main():
             terminal.wait("Changed files", history=False)
             terminal.key("Escape")
             terminal.wait_panel(False)
-            terminal.command("/undo")
+            terminal.command("/undo 1")
             terminal.wait("unrelated newer file checkpoint blocks undo; conversation kept")
             assert (project / "a.txt").read_text() == "original-a"
             assert (project / "b.txt").read_text() == "edited-b"

@@ -302,13 +302,10 @@ impl Attempt {
             .iter()
             .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
             .collect::<Vec<_>>();
-        if let Some(account) = hints {
-            if let Some(tokens) = &account.tokens {
-                values.push(format!("id_token_hint={}", encode(&tokens.id_token)));
-            }
-            if !account.email.is_empty() {
-                values.push(format!("login_hint={}", encode(&account.email)));
-            }
+        // This URL is also shown for manual sign-in. Never put a saved ID token in it;
+        // the selected workspace is checked against the exchanged credentials below.
+        if let Some(account) = hints.filter(|account| !account.email.is_empty()) {
+            values.push(format!("login_hint={}", encode(&account.email)));
         }
         format!("{AUTHORIZE_URL}?{}", values.join("&"))
     }
@@ -703,15 +700,22 @@ fn tokens(value: &Value, previous: Option<&Tokens>) -> Result<Tokens> {
     })
 }
 /// Browser authorization occurs outside storage locks and activates an account only after validation.
-pub fn login(dir: &Path, selected: Option<&str>, cancel: Arc<AtomicBool>) -> Result<String> {
-    login_at(dir, selected, cancel, TOKEN_URL, CALLBACK_PORT, |url| {
-        let opened = super::oauth::util::open_browser(url);
-        ensure!(
-            opened,
-            "could not open the system browser for ChatGPT sign-in"
-        );
-        Ok(())
-    })
+pub fn login(
+    dir: &Path,
+    selected: Option<&str>,
+    login: &super::oauth::Login<'_>,
+) -> Result<String> {
+    login_at(
+        dir,
+        selected,
+        login.cancel.clone(),
+        TOKEN_URL,
+        CALLBACK_PORT,
+        |url| {
+            login.open(url, None);
+            Ok(())
+        },
+    )
 }
 fn login_at(
     dir: &Path,

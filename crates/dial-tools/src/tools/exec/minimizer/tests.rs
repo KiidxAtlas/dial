@@ -262,6 +262,57 @@ fn small_savings_and_plain_output_are_left_alone() {
 }
 
 #[test]
+fn identical_line_runs_fold_after_a_command_filter_but_numbered_lines_stay() {
+    let mut text = String::from("starting\n");
+    text.push_str(&"waiting for the registry lock\n".repeat(40));
+    text.push_str("\n\n\n\n\n\n");
+    text.push_str(&"retry\n".repeat(4));
+    text.push_str("added 3 packages\n");
+    let out = minimize("npm install", &text).expect("folds");
+    assert_eq!(out.filter, "package install");
+    assert_eq!(
+        out.text,
+        "starting\nwaiting for the registry lock\n[... 39 more identical lines folded by the output filter ...]\n\n\n\n\n\n\nretry\nretry\nretry\nretry\nadded 3 packages\n",
+        "blank lines and runs shorter than five stay"
+    );
+
+    // Unrecognized and content commands are never folded, even when lines repeat exactly.
+    for command in [
+        "./scripts/build.sh",
+        "cat log.txt",
+        "git diff",
+        "npm install | tee log",
+    ] {
+        assert!(minimize(command, &text).is_none(), "{command}");
+    }
+
+    // Lines that differ only in numbers are data (file names, line numbers, rows): never folded.
+    let numbered = big((0..200).map(|i| format!("added package-{i}")));
+    assert!(minimize("npm install", &numbered).is_none());
+
+    // Diagnostic lines repeat in full, even when identical.
+    let warnings = "npm warn deprecated call\n".repeat(60);
+    assert!(minimize("npm install", &warnings).is_none());
+}
+
+#[test]
+fn folding_follows_a_command_filter() {
+    let mut text = big((0..30).map(|i| format!("   Compiling crate{i} v0.1.0")));
+    text.push_str(&"note: waiting for file lock on package cache\n".repeat(30));
+    text.push_str("    Finished `dev` profile in 3.0s\n");
+    let out = minimize("cargo build", &text).unwrap();
+    assert_eq!(out.filter, "cargo");
+    assert!(
+        out.text.contains(
+            "note: waiting for file lock on package cache\n[... 29 more identical lines folded"
+        ),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("Finished"));
+}
+
+#[test]
 fn git_hints_and_transport_progress_are_dropped() {
     let mut text =
         big((0..30).map(|i| format!("hint: long advice line number {i} about branch names")));

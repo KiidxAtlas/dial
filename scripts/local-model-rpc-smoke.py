@@ -38,7 +38,8 @@ def smoke(binary, weights, server, root, missing):
                         return msg
                 raise RuntimeError('RPC closed without answering ' + method)
 
-            result = request(1, 'set_model', provider='mlx', model_id=str(snapshot), prepare_local_model=True)
+            # The picker lists each cached GGUF file, not its snapshot directory.
+            result = request(1, 'set_model', provider='mlx', model_id=str(snapshot / 'stories.gguf'), prepare_local_model=True)
             if missing:
                 assert 'missing-llama-server.exe' in result['error']['message'], result
                 return

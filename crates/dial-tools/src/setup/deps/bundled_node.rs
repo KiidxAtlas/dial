@@ -49,6 +49,18 @@ pub fn provision() -> Result<Option<PathBuf>, String> {
         .map_err(|e| format!("bundled Node.js runtime: {e:#}"))
 }
 
+/// Publish only the embedded executable into a fresh, session-owned directory. The confined
+/// driver can execute this copy without gaining read access to Dial's private cache.
+#[cfg(windows)]
+pub(crate) fn stage_browser_driver(dir: &tempfile::TempDir) -> Result<PathBuf, String> {
+    let bundle = embedded().ok_or("no embedded Node.js payload")?;
+    let target = dir.path().join("node.exe");
+    atomic::private_dir(dir.path())
+        .and_then(|()| extract(dir.path(), &target, &bundle))
+        .map_err(|e| format!("staging verified browser Node.js runtime: {e:#}"))?;
+    Ok(target)
+}
+
 /// Resolve a Dial-owned program for an operator-facing label, such as `node` for `eval.node`.
 /// Identical to the crate-internal resolver: the bundled runtime is preferred for the default
 /// `node` only, and the outside-workspace identity check still applies.

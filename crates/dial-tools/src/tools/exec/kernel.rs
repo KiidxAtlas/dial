@@ -570,7 +570,7 @@ impl Launch {
     fn bundled(ws: &Workspace) -> Result<Self, String> {
         // No unconfined shim/version preflight: the launcher identity comes from the verified
         // build artifact. Its stdlib tree must be outside all editable and protected roots.
-        let parent = bundled_python_parent(ws)?;
+        let parent = bundled_runtime_parent(ws)?;
         let runtime = bundled_python::provision_in(&parent).map_err(|e| format!("{e:#}"))?;
         Ok(Self {
             python: runtime.executable().to_owned(),
@@ -581,9 +581,9 @@ impl Launch {
     }
 }
 
-/// The host temp directory bundled CPython is extracted under, refused when it lies inside the
+/// The host temp directory bundled runtimes can be staged under, refused when it lies inside the
 /// workspace or any editable or protected path of its sandbox policy.
-pub(super) fn bundled_python_parent(ws: &Workspace) -> Result<PathBuf, String> {
+pub(crate) fn bundled_runtime_parent(ws: &Workspace) -> Result<PathBuf, String> {
     let parent = std::env::temp_dir()
         .canonicalize()
         .map_err(|e| e.to_string())?;
@@ -603,7 +603,7 @@ pub(super) fn bundled_python_parent(ws: &Workspace) -> Result<PathBuf, String> {
     {
         if parent.starts_with(super::sandbox::resolve(path)?) {
             return Err(
-                "bundled Python requires a host temp directory outside editable or protected paths"
+                "bundled runtime requires a host temp directory outside editable or protected paths"
                     .into(),
             );
         }

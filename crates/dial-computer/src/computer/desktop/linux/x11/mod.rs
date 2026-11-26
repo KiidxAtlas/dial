@@ -59,9 +59,7 @@ impl Backend for X11Backend {
             menus: self.ax.is_some(),
             held_input: true,
             spaces: false,
-            global_escape: std::env::var_os("WAYLAND_DISPLAY").is_none()
-                && !std::env::var("XDG_SESSION_TYPE")
-                    .is_ok_and(|session| session.eq_ignore_ascii_case("wayland")),
+            global_escape: !crate::computer::linux_display::DisplayServer::in_wayland_session(),
             capture_permission: if displays.is_ok() {
                 "granted"
             } else {

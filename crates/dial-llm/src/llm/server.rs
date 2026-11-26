@@ -980,6 +980,12 @@ fn launch(
             .env("PYTHONUNBUFFERED", "1");
         command
     };
+    // Free memory a GGUF server left resident when an earlier Dial process died without
+    // stopping it; servers owned by a live Dial process are never touched.
+    #[cfg(unix)]
+    if let Some(config) = context {
+        crate::platform::process_record::stop_abandoned(&config.user_dir, "models");
+    }
     let mut child = crate::platform::process::spawn_group(
         command
             .stdin(Stdio::null())

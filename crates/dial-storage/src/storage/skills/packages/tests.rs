@@ -72,7 +72,10 @@ fn plan_uses_registry_only_when_configured_and_rejects_bare_words() {
     )
     .unwrap();
     let mut registries = BTreeMap::new();
-    registries.insert("team".to_owned(), format!("file://{}", index.display()));
+    registries.insert(
+        "team".to_owned(),
+        url::Url::from_file_path(&index).unwrap().into(),
+    );
 
     let planned = plan("team/pdf@v2", &registries, &root).unwrap();
     assert_eq!(planned.name, "pdf");
@@ -92,6 +95,24 @@ fn plan_uses_registry_only_when_configured_and_rejects_bare_words() {
     let git = plan("https://example.com/org/tools.git@main#pdf", &none, &root).unwrap();
     assert_eq!(git.name, "pdf");
     let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn plans_native_local_paths_with_spaces_and_refs() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join(r"team skills\tools.git");
+    fs::create_dir_all(&repo).unwrap();
+    for location in [
+        r"team skills\tools.git",
+        r".\team skills\tools.git",
+        repo.to_str().unwrap(),
+    ] {
+        let planned = plan(&format!("{location}@main"), &BTreeMap::new(), root.path()).unwrap();
+        assert_eq!(planned.name, "tools");
+        assert_eq!(planned.source.url, location);
+        assert_eq!(planned.source.reference.as_deref(), Some("main"));
+    }
 }
 
 #[test]
@@ -300,7 +321,7 @@ fn install_update_and_remove_a_local_repository_end_to_end() {
     git(&["commit", "--quiet", "-m", "one"], &remote);
     let registries = BTreeMap::new();
     let cancel = AtomicBool::new(false);
-    let spec = "../remote#pdf".to_owned();
+    let spec = format!("{}#pdf", Path::new("..").join("remote").display());
 
     let installed = install(
         &layout,

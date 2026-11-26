@@ -107,6 +107,20 @@ fn workspace_and_checkpoint_modes_remain_distinct_from_private_state() {
     assert!(platform_fs::is_owner_only(&File::open(&path).unwrap()).unwrap());
 }
 
+#[cfg(windows)]
+#[test]
+fn workspace_replacement_keeps_a_protected_dacl() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    fs::write(&path, "old").unwrap();
+    platform_fs::set_owner_only(&path).unwrap();
+    let acl = || platform_fs::FileDacl::read(&File::open(&path).unwrap()).unwrap();
+    let before = acl();
+    write_replacing(&path, b"new").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert_eq!(acl(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_publication_does_not_require_directory_read_permission() {

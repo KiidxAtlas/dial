@@ -1088,7 +1088,13 @@ impl Config {
         }
         if config.endpoint.is_none() && !config.model.is_empty() {
             let candidate = Path::new(&config.model);
-            if candidate.exists() {
+            // A file keeps its own name: Hugging Face snapshot GGUFs link to extensionless blobs,
+            // and the filename selects the format, projector and split-shard siblings.
+            if candidate.is_file() {
+                config.model = std::path::absolute(candidate)?
+                    .to_string_lossy()
+                    .into_owned();
+            } else if candidate.exists() {
                 config.model = fs::canonicalize(candidate)?.to_string_lossy().into_owned();
             }
         }

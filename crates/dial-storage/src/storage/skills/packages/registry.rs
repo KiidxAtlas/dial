@@ -61,15 +61,27 @@ pub fn parse_index(bytes: &[u8]) -> Result<Vec<Entry>> {
     Ok(index.skills)
 }
 
+/// Convert the URL before any I/O. On Windows `to_file_path` also accepts remote UNC hosts,
+/// but `file://` registries are local; network registries must use the HTTP fetch path.
+fn local_index_path(location: &str) -> Result<std::path::PathBuf> {
+    let url = url::Url::parse(location).context("invalid file URL for registry index")?;
+    ensure!(url.host().is_none(), "a file registry URL must be local");
+    url.to_file_path()
+        .map_err(|()| anyhow::anyhow!("registry URL is not an absolute local file path"))
+}
+
 /// Loads an index from `file://` or `http(s)://`. Redirects are not followed and responses are size-capped.
 pub fn fetch_index(location: &str) -> Result<Vec<Entry>> {
-    if let Some(path) = location.strip_prefix("file://") {
-        let meta = fs::metadata(path).with_context(|| format!("reading registry index {path}"))?;
+    if location.starts_with("file://") {
+        let path = local_index_path(location)?;
+        let meta = fs::metadata(&path)
+            .with_context(|| format!("reading registry index {}", path.display()))?;
         ensure!(
             meta.len() <= MAX_INDEX_BYTES,
             "registry index is larger than 1 MiB"
         );
-        let bytes = fs::read(path).with_context(|| format!("reading registry index {path}"))?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("reading registry index {}", path.display()))?;
         return parse_index(&bytes);
     }
     ensure!(

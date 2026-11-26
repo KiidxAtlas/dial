@@ -5,8 +5,7 @@
 //! Dial-native.
 
 use std::{
-    fmt,
-    fs::{self, File},
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -206,10 +205,7 @@ pub fn dump_session(
     let subagents = workers.len();
     members.append(&mut workers);
 
-    let file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&archive)
+    let file = crate::platform::fs::create_new_owner_only(&archive)
         .with_context(|| format!("failed to create {}", archive.display()))?;
     let mut zip = zip::ZipWriter::new(file);
     let mut entries = Vec::with_capacity(members.len());

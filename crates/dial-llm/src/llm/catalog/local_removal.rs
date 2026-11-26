@@ -8,6 +8,7 @@
 
 use super::metadata::ModelEntry;
 use crate::config::types::Config;
+use crate::llm::model_config::ModelSelection;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::fs;
@@ -95,11 +96,34 @@ pub fn remove_local_model(model: &str, in_use: &[String]) -> Result<LocalRemoval
     Ok(removal)
 }
 
-/// The local model paths `config` selects: the main model and every assigned role.
+/// Local paths and repository labels protected by the saved main model and role assignments.
 pub fn models_in_use(config: &Config) -> Vec<String> {
-    std::iter::once(config.selection().model)
-        .chain(config.model_roles.values().map(|role| role.model.clone()))
-        .filter(|model| !model.is_empty())
+    models_in_use_with_current(config, None)
+}
+
+/// Include an unsaved session selection in the same removal check. A remote model ID
+/// is not an alias for the local repository just because the two names match.
+pub fn models_in_use_with_current(
+    config: &Config,
+    current: Option<&ModelSelection>,
+) -> Vec<String> {
+    std::iter::once(&config.selection())
+        .chain(config.model_roles.values())
+        .chain(current)
+        .filter(|s| !s.model.is_empty())
+        .filter_map(|s| {
+            let path = Path::new(&s.model);
+            if path.is_absolute() || crate::config::selection::requires_local_preparation(config, s)
+            {
+                Some(s.model.clone())
+            } else {
+                // Preserve the snapshot path: a GGUF file may link to a blob outside the folder.
+                path.exists()
+                    .then(|| std::path::absolute(path).ok())
+                    .flatten()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }
+        })
         .collect()
 }
 
@@ -202,9 +226,19 @@ fn folder_bytes(folder: &Path) -> u64 {
 /// refuse before asking to confirm a delete that would be refused anyway.
 pub fn ensure_not_in_use(removal: &LocalRemoval, in_use: &[String]) -> Result<(), ModelInUse> {
     let folder = &removal.folder;
+    // Deletion removes the repository folder, not just this quant. Configurations can
+    // name the repository or a qualified sibling label instead of an absolute path.
+    let repo = removal
+        .label
+        .split_once(" · ")
+        .map_or(removal.label.as_str(), |(repo, _)| repo);
     match in_use.iter().find(|model| {
         let path = Path::new(model.as_str());
-        path.starts_with(folder)
+        model.as_str() == repo
+            || model
+                .strip_prefix(repo)
+                .is_some_and(|s| s.starts_with(" · "))
+            || path.starts_with(folder)
             || fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(folder))
     }) {
         Some(selected) => Err(ModelInUse {

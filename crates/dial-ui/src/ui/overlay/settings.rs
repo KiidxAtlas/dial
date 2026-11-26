@@ -141,7 +141,19 @@ const LINKS: &[(&str, &str, &str)] = &[
         "Shell commands Dial may run without asking, and ones it refuses. Add or remove rules in the permissions picker.",
         "command:/permissions",
     ),
+    (
+        "Learning settings",
+        "Self-improvement, training and decision-service settings, in their own view (/improve settings).",
+        "open:improve-settings",
+    ),
 ];
+
+/// Index in [`LINKS`] of the launcher for the dedicated learning view.
+const LEARNING_SETTINGS: usize = 9;
+/// Tabs ordinary Settings leaves out of its strip. Their settings stay reachable through search
+/// and focus; Learning has its own view, Experimental appears once something in it is set.
+const LEARNING_TAB: &str = "Learning";
+const EXPERIMENTAL_TAB: &str = "Experimental";
 
 /// Index in [`LINKS`] of the Common launcher that opens the `/permissions` picker.
 const ALLOWED_COMMANDS: usize = 8;
@@ -509,8 +521,17 @@ impl SettingsOverlay {
         }
     }
 
-    /// Compatibility entry point: settings includes persistent learning preferences too.
-    pub fn coding_only(self) -> Self {
+    /// Ordinary Settings: the everyday tabs. Learning moves behind a launcher in Advanced (its own
+    /// view lists it fully), and Experimental shows only once one of its values is saved.
+    pub fn coding_only(mut self) -> Self {
+        let experimenting = crate::config::schema::registry().iter().any(|def| {
+            def.tab == EXPERIMENTAL_TAB
+                && (crate::config::schema::get(&self.global, def.path).is_some()
+                    || crate::config::schema::get(&self.project, def.path).is_some())
+        });
+        self.tabs
+            .retain(|(tab, _)| *tab != LEARNING_TAB && (*tab != EXPERIMENTAL_TAB || experimenting));
+        self.tab = self.tab.min(self.tabs.len().saturating_sub(1));
         self
     }
     pub fn learning_only(mut self) -> Self {
@@ -850,8 +871,13 @@ impl SettingsOverlay {
     fn source_detail(&self, def: &SettingDef) -> String {
         let source = self.source(def.path);
         let owned = crate::config::schema::get(self.layer_ref(self.scope), def.path).is_some();
-        let action = if matches!(source, "env" | "CLI flag") {
-            format!("{source} wins over saved settings; reset keeps this runtime value")
+        let restart = if def.restart { " · restart" } else { "" };
+        // Lead with the key; say where the value comes from only when it is not the default.
+        let detail = if matches!(source, "env" | "CLI flag") {
+            format!(
+                "{} · {source} wins over saved settings; reset keeps this runtime value{restart}",
+                def.path
+            )
         } else if owned {
             let fallback_source =
                 if crate::config::schema::get(self.layer_ref(other_scope(self.scope)), def.path)
@@ -864,22 +890,22 @@ impl SettingsOverlay {
             let fallback = self
                 .after_unset(def, self.scope)
                 .map_or_else(|| "(not set)".to_owned(), |value| value_text(def, &value));
-            format!("Delete: {fallback_source} ({fallback})")
+            format!(
+                "{} · {source} · Delete: {fallback_source} ({fallback}){restart}",
+                def.path
+            )
+        } else if source == "default" {
+            format!("{} · default{restart}", def.path)
         } else {
-            format!("Inherited; edit adds a {} override", scope_name(self.scope))
+            format!(
+                "{} · from {source}; editing saves a {} override{restart}",
+                def.path,
+                scope_name(self.scope)
+            )
         };
-        let source_detail = format!(
-            "Using {source} value · {action} · {}{}",
-            def.path,
-            if def.restart {
-                " · Restart required"
-            } else {
-                ""
-            }
-        );
         match self.application_detail(def) {
-            Some(timing) => format!("{timing} · {source_detail}"),
-            None => source_detail,
+            Some(timing) => format!("{timing} · {detail}"),
+            None => detail,
         }
     }
 
@@ -1039,6 +1065,9 @@ impl SettingsOverlay {
                     "Memory" => &[6, 7],
                     "Keys" => &[2],
                     "Learning" => &[3],
+                    "Advanced" if !self.tabs.iter().any(|(t, _)| *t == LEARNING_TAB) => {
+                        &[3, LEARNING_SETTINGS]
+                    }
                     _ => &[],
                 };
                 rows.extend(launchers.iter().copied().map(Row::Link));

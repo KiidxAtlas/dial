@@ -39,6 +39,27 @@ pub(in crate::app) fn picker(name: &str, args: &str) -> Option<ChoiceSpec> {
         return None;
     }
     let (title, rows): (&str, &[(&str, &str, &str)]) = match name {
+        // One chooser for every way back; the first row is the old bare `/undo`, so Enter repeats it.
+        "undo" => (
+            "Undo",
+            &[
+                (
+                    "1",
+                    "Undo the last turn",
+                    "Restore the files it changed and remove it from the conversation.",
+                ),
+                (
+                    "2",
+                    "Undo the last 2 turns",
+                    "The same, for the two latest turns.",
+                ),
+                (
+                    "files",
+                    "Restore files only",
+                    "Put back the files the last turn changed; keep the conversation.",
+                ),
+            ],
+        ),
         "mode" => (
             "Working mode",
             &[

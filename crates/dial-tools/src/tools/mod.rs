@@ -1023,9 +1023,8 @@ impl Workspace {
 
     fn expand_path_prefixes<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
         if (input == "~" || input.starts_with("~/"))
-            && let Some(home) = std::env::var_os("HOME")
+            && let Some(home) = crate::config::paths::home_dir()
         {
-            let home = PathBuf::from(home);
             let rest = input.strip_prefix("~/").unwrap_or("");
             let joined = if rest.is_empty() {
                 home
@@ -2171,9 +2170,7 @@ pub fn apply_sandbox_config(
             serial_ports: config.serial_ports,
         }),
         SandboxMode::Dev => {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE").filter(|_| cfg!(windows)))
-                .map(PathBuf::from);
+            let home = crate::config::paths::home_dir();
             let mut deny_read: Vec<PathBuf> = Vec::new();
             if let Some((state, user)) = protected {
                 deny_read.push(state.to_owned());

@@ -9,14 +9,15 @@ use super::{
 };
 use crate::config::voice::{SttBackendChoice, TtsBackendChoice};
 use crate::runtime::fingerprint::sha256_file;
+use crate::runtime::process::{self, Stream};
 use anyhow::ensure;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Hard stop for one install step; npm and uv can take minutes on a cold cache.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(900);
@@ -30,91 +31,55 @@ pub fn run_step(step: &Step, cancel: &AtomicBool, progress: &mut dyn FnMut(&str)
     let mut command = Command::new(&step.program);
     command
         .args(&step.args)
-        .envs(step.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Own process group, so cancel and timeout also stop what npm, uv and brew spawned.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("starting {}; is it installed?", step.program))?;
-    let (send, lines) = std::sync::mpsc::channel::<String>();
-    if let Some(stdout) = child.stdout.take() {
-        spawn_reader(stdout, send.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_reader(stderr, send.clone());
-    }
-    drop(send);
-    let started = Instant::now();
+        .envs(step.env.iter().map(|(k, v)| (k, v)));
+    let mut pending = [Vec::new(), Vec::new()];
     let mut last = String::new();
-    loop {
-        let finished = child.try_wait()?;
-        while let Ok(line) = lines.try_recv() {
-            progress(&line);
-            last = line;
+    let mut emit = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        let line = text.trim_end();
+        if !line.is_empty() {
+            progress(line);
+            last.clear();
+            last.push_str(line);
         }
-        if let Some(status) = finished {
-            // Reader threads may still hold output the child wrote before it exited; wait for
-            // them so the failure tail and progress are complete.
-            while let Ok(line) = lines.recv_timeout(Duration::from_millis(500)) {
-                progress(&line);
-                last = line;
-            }
-            if !status.success() {
-                let tail = if last.is_empty() {
-                    String::new()
+    };
+    // Keep stdout and stderr line fragments separate; an installer emitting no newlines
+    // must not grow an unbounded buffer or delay cancellation.
+    let result = process::run(
+        command,
+        None,
+        STEP_TIMEOUT,
+        0,
+        cancel,
+        &mut |stream, bytes| {
+            let line = &mut pending[usize::from(matches!(stream, Stream::Stderr))];
+            for &byte in bytes {
+                if byte == b'\n' {
+                    emit(line);
+                    line.clear();
                 } else {
-                    format!(": {last}")
-                };
-                bail!("{} failed ({status}){tail}", step.display());
+                    line.push(byte);
+                    if line.len() >= 16 * 1024 {
+                        emit(line);
+                        line.clear();
+                    }
+                }
             }
-            return Ok(());
-        }
-        if cancel.load(Ordering::Relaxed) {
-            kill_step(&mut child);
-            bail!("cancelled");
-        }
-        if started.elapsed() > STEP_TIMEOUT {
-            kill_step(&mut child);
-            bail!(
-                "{} timed out after {}s",
-                step.display(),
-                STEP_TIMEOUT.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        },
+    )
+    .map_err(anyhow::Error::msg)
+    .with_context(|| format!("starting {}; is it installed?", step.program))?;
+    for line in pending {
+        emit(&line);
     }
-}
-
-/// Kills a step and everything it spawned (its process group), then reaps the direct child.
-fn kill_step(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-            // SAFETY: the child leads its own process group (`process_group(0)` at spawn), so
-            // this signals only that group, and the child is not reaped yet, so the id is valid.
-            unsafe { libc::killpg(pid, libc::SIGKILL) };
+    if !result.success() {
+        let error = result.failure(&step.display(), STEP_TIMEOUT);
+        if !last.is_empty() && result.stderr.is_empty() && !result.cancelled && !result.timed_out {
+            bail!("{error}: {last}");
         }
+        bail!("{error}");
     }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn spawn_reader(stream: impl Read + Send + 'static, send: std::sync::mpsc::Sender<String>) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            let line = line.trim_end().to_owned();
-            if !line.is_empty() && send.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    Ok(())
 }
 
 /// Runs a plan's steps in order and stops at the first failure. Creates Dial's install
@@ -134,66 +99,30 @@ pub fn run_plan(plan: &Plan, cancel: &AtomicBool, progress: &mut dyn FnMut(&str)
 }
 
 /// Runs a short probe bounded by [`PROBE_TIMEOUT`] and returns its trimmed stdout.
-fn probe(program: &Path, args: &[&str]) -> Result<String> {
+fn probe(program: &Path, args: &[&str], cancel: &AtomicBool) -> Result<String> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Own process group, so the timeout kill also reaches anything the probe spawned.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("starting {}", program.display()))?;
-    let mut stdout = child.stdout.take().context("probe stdout unavailable")?;
-    let mut stderr = child.stderr.take().context("probe stderr unavailable")?;
-    // Readers report over channels so the probe can bound the wait: a grandchild that inherited
-    // the pipe keeps it open after the probe exits, and a plain join would block forever.
-    let (err_send, err_recv) = std::sync::mpsc::channel::<String>();
-    let (out_send, out_recv) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut err = String::new();
-        let _ = stderr.read_to_string(&mut err);
-        let _ = err_send.send(err);
-    });
-    std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        let _ = out_send.send(out);
-    });
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let out = out_recv.recv_timeout(PROBE_TIMEOUT).with_context(|| {
-                format!("{} kept its output open after exiting", program.display())
-            })?;
-            if !status.success() {
-                let err = err_recv.recv_timeout(PROBE_TIMEOUT).unwrap_or_default();
-                let tail = err
-                    .lines()
-                    .rev()
-                    .find(|line| !line.trim().is_empty())
-                    .map(|line| format!(": {}", line.trim()))
-                    .unwrap_or_default();
-                bail!("{} exited with {status}{tail}", program.display());
-            }
-            return Ok(out.trim().to_owned());
-        }
-        if started.elapsed() > PROBE_TIMEOUT {
-            kill_step(&mut child);
-            bail!(
-                "{} did not answer within {}s",
-                program.display(),
-                PROBE_TIMEOUT.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    command.args(args);
+    let result = process::run(
+        command,
+        None,
+        PROBE_TIMEOUT,
+        1024 * 1024,
+        cancel,
+        &mut |_, _| {},
+    )
+    .map_err(anyhow::Error::msg)
+    .with_context(|| format!("starting {}", program.display()))?;
+    ensure!(
+        result.success(),
+        "{}",
+        result.failure(&program.display().to_string(), PROBE_TIMEOUT)
+    );
+    ensure!(
+        result.stdout.len() == result.stdout_total && !result.output_incomplete,
+        "incomplete probe output from {}",
+        program.display()
+    );
+    Ok(String::from_utf8_lossy(&result.stdout).trim().to_owned())
 }
 
 /// Parses `1.3.14` or `bun 1.3.14` into a comparable triple.
@@ -218,6 +147,16 @@ pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 /// Confirms a dependency works, not just that a file exists. Probes are short and bounded so a
 /// stuck tool cannot hang the UI. Returns a one-line description of what answered.
 pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String> {
+    health_with_cancel(id, location, model, &AtomicBool::new(false))
+}
+
+pub(in crate::setup) fn health_with_cancel(
+    id: &str,
+    location: &Path,
+    model: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let probe = |program: &Path, args: &[&str]| probe(program, args, cancel);
     match id {
         "bun" => {
             let version = parse_version(&probe(location, &["--version"])?)
@@ -257,6 +196,15 @@ pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String>
         "piper" | "mlx-whisper" => {
             probe(location, &["--help"]).map(|_| format!("{id} CLI available"))
         }
+        crate::llm::download::HUB_HELPER => probe(
+            location,
+            &[
+                "-I",
+                "-c",
+                "from huggingface_hub import list_repo_files, hf_hub_download, snapshot_download",
+            ],
+        )
+        .map(|_| "Hugging Face client imports".into()),
         "mlx-runtime" => probe(location, &["-c", "import mlx"]).map(|_| "MLX imports".into()),
         "whisper-cpp" => {
             let model = model.context("whisper.cpp needs its model; run setup again")?;
@@ -291,6 +239,15 @@ pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String>
 /// Resolve standard package-manager bins absent from PATH. Executes package managers, so callers
 /// must obtain installation/start authorization first.
 pub(crate) fn standard_location(target: &Recipe, env: &Env) -> Result<Option<PathBuf>> {
+    standard_location_with_cancel(target, env, &AtomicBool::new(false))
+}
+
+fn standard_location_with_cancel(
+    target: &Recipe,
+    env: &Env,
+    cancel: &AtomicBool,
+) -> Result<Option<PathBuf>> {
+    let probe = |program: &Path, args: &[&str]| probe(program, args, cancel);
     for method in target.methods {
         let bin = match method {
             super::Method::NpmGlobal(_) => {
@@ -327,6 +284,7 @@ pub(crate) fn standard_location(target: &Recipe, env: &Env) -> Result<Option<Pat
                 // proxy for them on PATH, so ask rustup where the program is; `rustup which`
                 // fails while the component is not installed, which means "not found" here.
                 let Ok(program) = probe(&rustup, &["which", target.program]) else {
+                    ensure!(!cancel.load(Ordering::Relaxed), "cancelled");
                     continue;
                 };
                 match Path::new(&program).parent() {
@@ -376,7 +334,7 @@ pub fn install(
     let planned = plan(target, env).map_err(|blocked| anyhow::anyhow!("{blocked}"))?;
     run_plan(&planned, cancel, progress)?;
     let location = if planned.expected.as_os_str().is_empty() {
-        standard_location(target, env)?.or_else(|| locate(target, env))
+        standard_location_with_cancel(target, env, cancel)?.or_else(|| locate(target, env))
     } else {
         planned.expected.is_file().then(|| planned.expected.clone())
     }
@@ -385,7 +343,7 @@ pub fn install(
         .then(|| ensure_whisper_model(&env.user_dir, cancel, progress))
         .transpose()?;
     progress("checking that it works");
-    let detail = health(id, &location, model.as_deref())?;
+    let detail = health_with_cancel(id, &location, model.as_deref(), cancel)?;
     progress(&format!("ok: {detail}"));
     Ok(location)
 }

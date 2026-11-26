@@ -43,12 +43,14 @@ impl LocalFormat {
 
 /// Whether `path` is a regular file starting with the GGUF magic.
 fn is_gguf_file(path: &Path) -> bool {
+    if !fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
     let mut magic = [0u8; 4];
     fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut magic))
         .is_ok()
         && &magic == b"GGUF"
-        && fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// Standard llama.cpp split filename, shared by cache validation and download planning.
@@ -72,6 +74,11 @@ impl GgufShard {
             index,
         })
     }
+
+    fn filename(&self, index: u32) -> String {
+        let (prefix, total) = &self.set;
+        format!("{prefix}-{index:05}-of-{total:05}.gguf")
+    }
 }
 
 fn complete_gguf_file(path: &Path) -> Option<PathBuf> {
@@ -85,14 +92,13 @@ fn complete_gguf_file(path: &Path) -> Option<PathBuf> {
     let Some(shard) = GgufShard::parse(name) else {
         return Some(path.to_path_buf());
     };
-    let (prefix, total) = shard.set;
     let parent = path.parent()?;
-    for index in 1..=total {
-        if !is_gguf_file(&parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf"))) {
+    for index in 1..=shard.set.1 {
+        if !is_gguf_file(&parent.join(shard.filename(index))) {
             return None;
         }
     }
-    Some(parent.join(format!("{prefix}-00001-of-{total:05}.gguf")))
+    Some(parent.join(shard.filename(1)))
 }
 
 pub(crate) const INKLING_DRAFT: &str = "dspark-Inkling-2-Mini-Q8_0.gguf";
@@ -118,28 +124,46 @@ pub fn gguf_file(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return complete_gguf_file(path);
     }
-    let mut models = std::collections::BTreeSet::new();
-    for entry in fs::read_dir(path).ok()?.filter_map(Result::ok) {
-        let file = entry.path();
-        if file.file_name().is_some_and(|name| name == INKLING_DRAFT) {
-            continue; // A DSpark companion is a draft, not another selectable target.
-        }
-        if file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(GgufShard::parse)
-            .is_some_and(|shard| shard.index != 1)
-        {
+    let mut models = fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| gguf_target(&entry.path()));
+    let first = models.next()?;
+    models.next().is_none().then_some(first)
+}
+
+fn gguf_target(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    if name == INKLING_DRAFT || GgufShard::parse(name).is_some_and(|s| s.index != 1) {
+        return None;
+    }
+    complete_gguf_file(path)
+}
+
+/// Discover independently selectable targets in a snapshot. Follow file links to Hub blobs
+/// for validation, never descend through directory links, and bound work per snapshot.
+pub(super) fn snapshot_ggufs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_owned()];
+    let mut models = Vec::new();
+    let mut remaining = 8192;
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
             continue;
-        }
-        if let Some(model) = complete_gguf_file(&file) {
-            models.insert(model);
-            if models.len() > 1 {
-                return None;
+        };
+        for entry in entries.filter_map(Result::ok).take(remaining) {
+            remaining -= 1;
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(entry.path());
+            } else if let Some(model) = gguf_target(&entry.path()) {
+                models.push(model);
             }
         }
+        if remaining == 0 {
+            break;
+        }
     }
-    models.into_iter().next()
+    models.sort();
+    models
 }
 
 /// The multimodal projector (`mmproj*.gguf`) next to the GGUF model at `path`, if any.
@@ -327,21 +351,13 @@ pub fn gguf_info(path: &Path) -> Option<GgufInfo> {
 /// Bytes of GGUF weights `llama-server` loads for `path`: the selected file plus its sibling shards.
 pub fn gguf_weight_bytes(path: &Path) -> Option<u64> {
     let file = gguf_file(path)?;
-    let name = file.file_name()?.to_string_lossy().into_owned();
-    let Some(prefix) = name.find("-00001-of-").map(|at| name[..at].to_owned()) else {
+    let Some(shard) = GgufShard::parse(file.file_name()?.to_str()?) else {
         return Some(fs::metadata(&file).ok()?.len());
     };
-    let mut total = 0;
-    for entry in fs::read_dir(file.parent()?).ok()?.filter_map(Result::ok) {
-        let shard = entry.file_name().to_string_lossy().into_owned();
-        if shard.starts_with(&format!("{prefix}-"))
-            && shard.contains("-of-")
-            && shard.ends_with(".gguf")
-        {
-            total += entry.metadata().ok()?.len();
-        }
-    }
-    Some(total)
+    let parent = file.parent()?;
+    (1..=shard.set.1).try_fold(0u64, |total, index| {
+        total.checked_add(fs::metadata(parent.join(shard.filename(index))).ok()?.len())
+    })
 }
 
 const GGUF_MAX_KEYS: u64 = 1 << 16;

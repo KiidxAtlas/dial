@@ -159,6 +159,55 @@ pub fn load(user: &Path, pid: u32) -> Result<Option<Value>> {
         .transpose()
 }
 
+/// Stop `kind` processes whose recording Dial process is gone, and drop their records. A process
+/// stops only while its recorded kernel identity still matches, so a recycled PID is never
+/// signalled. Detached records (`ps restart`, parent 1) and processes whose owner is still
+/// running are kept. Third-party model servers cannot watch their parent the way Dial's Python
+/// server does (`DIAL_PARENT_PID`), so a Dial process that died without cleanup (SIGKILL, an
+/// unhandled SIGTERM, a crash) would otherwise leave its whole model resident. Returns how many
+/// processes were signalled.
+#[cfg(unix)]
+pub fn stop_abandoned(user: &Path, kind: &str) -> usize {
+    let Ok(entries) = fs::read_dir(user.join("compute-processes")) else {
+        return 0;
+    };
+    let mut stopped = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(record) = crate::platform::atomic::read_private(&path)
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        let parent = record["parent_pid"].as_i64().unwrap_or(0);
+        // An unreadable parent, a detached record, or a running owner keeps the process.
+        if record["kind"] != kind
+            || parent <= 1
+            || i32::try_from(parent).ok().and_then(ProcId::of).is_some()
+        {
+            continue;
+        }
+        match proc_id(&record) {
+            Some(server) if server.alive() => {
+                if server.signal_group(libc::SIGTERM) {
+                    stopped += 1;
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            // The process already exited (or never verified): only the stale record remains.
+            _ => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    stopped
+}
+
 /// The kernel identity recorded when the process was created. Missing or unverifiable identities
 /// (including records written before identities were recorded) read as `None`, so the record can
 /// never be attached to a recycled PID.

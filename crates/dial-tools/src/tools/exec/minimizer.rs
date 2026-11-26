@@ -14,7 +14,10 @@
 //!   a single `test result: ok.` line with the summed counts ([`passing_summary`]);
 //! - the caller applies it only when the complete raw output is recoverable from an artifact.
 //!
-//! Terminal escape sequences and carriage-return redraws are stripped for every command.
+//! Terminal escape sequences and carriage-return redraws are stripped for every command. After a
+//! command filter, long runs of identical lines fold to one copy and a count ([`fold_repeats`]);
+//! lines that differ only in their numbers are not folded, and unrecognized commands are never
+//! folded, so file content, diffs and listings stay intact.
 
 use super::bash_interceptor;
 use regex::Regex;
@@ -24,6 +27,8 @@ use std::sync::LazyLock;
 const MIN_SAVED_BYTES: usize = 256;
 /// Shorter runs of passing lines stay as they are: a marker would not be shorter.
 const MIN_RUN: usize = 3;
+/// Shorter runs of identical lines stay as they are.
+const FOLD_RUN: usize = 5;
 
 /// A minimized output and the accounting for the note that tells the model about it.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,7 +67,7 @@ pub fn minimize(command: &str, text: &str) -> Option<Minimized> {
     let summarized = summary.is_some();
     let text_out = match (summary, filter) {
         (Some(summary), _) => summary,
-        (None, Some(filter)) => apply(&cleaned, filter.classify),
+        (None, Some(filter)) => fold_repeats(&apply(&cleaned, filter.classify)),
         (None, None) => cleaned.clone(),
     };
     if !summarized && diagnostic_lines(&text_out) != diagnostic_lines(&cleaned) {
@@ -123,6 +128,60 @@ fn apply(text: &str, classify: fn(&str) -> Class) -> String {
                 out.push_str(line);
             }
         }
+    }
+    flush(&mut out, &mut run);
+    out
+}
+
+/// Tail of the line that replaces the middle of a folded run.
+const FOLD_NOTE: &str = "lines folded by the output filter ...]";
+
+/// The folding key of `line`: the line without trailing whitespace, or `None` for blank lines,
+/// which are never folded.
+fn shape(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Folds each run of at least [`FOLD_RUN`] consecutive identical lines to one copy followed by a
+/// count of the rest. Diagnostic lines are never folded.
+fn fold_repeats(text: &str) -> String {
+    fn flush(out: &mut String, run: &mut Vec<&str>) {
+        if run.len() >= FOLD_RUN {
+            let first = run[0];
+            out.push_str(first);
+            if !first.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "[... {} more identical {FOLD_NOTE}\n",
+                run.len() - 1
+            ));
+        } else {
+            run.iter().for_each(|line| out.push_str(line));
+        }
+        run.clear();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut run: Vec<&str> = Vec::new();
+    let mut run_shape: Option<&str> = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches('\n');
+        let line_shape = if is_diagnostic(body) {
+            None
+        } else {
+            shape(body)
+        };
+        if line_shape.is_some() && line_shape == run_shape {
+            run.push(line);
+            continue;
+        }
+        flush(&mut out, &mut run);
+        match line_shape {
+            Some(_) => run.push(line),
+            None => out.push_str(line),
+        }
+        run_shape = line_shape;
     }
     flush(&mut out, &mut run);
     out

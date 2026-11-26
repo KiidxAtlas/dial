@@ -224,6 +224,32 @@ impl Env {
         child.wait_with_output().unwrap()
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn commit_dry_run_tolerates_non_unicode_environment() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let env = Env::new();
+    assert!(
+        Command::new("git")
+            .current_dir(env.project.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_dial"))
+        .current_dir(env.project.path())
+        .env("HOME", env.home.path())
+        .env("DIAL_HOME", env.home.path())
+        .env("DIAL_TEST_UNUSED", OsStr::from_bytes(b"\xff"))
+        .args(["commit", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("No changes to commit"));
+}
 fn events(output: &Output) -> Vec<Value> {
     String::from_utf8(output.stdout.clone())
         .unwrap()
@@ -768,6 +794,8 @@ impl RpcChild {
                 "off",
             ])
             .env("DIAL_HOME", env.home.path())
+            .env_remove("DIAL_SUBSCRIPTION_AUTH_HOME")
+            .env("DIAL_NO_BROWSER", "1")
             .current_dir(env.project.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use std::process::Command;
 use std::{fs, path::Path, time::Duration};
 
+#[cfg(windows)]
+mod windows;
+
 fn target() -> Result<&'static str> {
     // The libc is fixed at compile time: a musl build must fetch the musl archive, never the glibc one.
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -91,13 +94,16 @@ pub fn run(version: Option<&str>) -> Result<()> {
         UpdatePlan::Release => install_release(&executable, version),
         UpdatePlan::PackageManager(installation) => run_package_manager(installation, version),
         UpdatePlan::Checkout(root) => update_checkout(&root, version),
-        UpdatePlan::Manual(how) if installation == Installation::Nix => {
-            println!("This installation is managed by Nix: {how}.");
+        UpdatePlan::Manual(how)
+            if matches!(installation, Installation::Nix | Installation::Pacman) =>
+        {
+            println!(
+                "This installation is managed by {}: {how}.",
+                installation.name()
+            );
             Ok(())
         }
-        UpdatePlan::Manual(how) => bail!(
-            "this build has no embedded release verification key and its source checkout is gone, so it cannot update itself; {how}"
-        ),
+        UpdatePlan::Manual(how) => bail!("automatic update unavailable: {how}"),
     }
 }
 
@@ -263,6 +269,10 @@ fn install_release(executable: &Path, version: Option<&str>) -> Result<()> {
             latest
         }
     };
+    let install_dir = executable
+        .parent()
+        .context("running executable has no parent directory")?;
+    let _install_lock = lock_install_dir(install_dir)?;
     let platform = target()?;
     let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
     let archive_name = format!("dial-{tag}-{platform}.{extension}");
@@ -275,20 +285,13 @@ fn install_release(executable: &Path, version: Option<&str>) -> Result<()> {
     let actual = format!("{:x}", Sha256::digest(&archive));
     ensure!(actual == expected, "release archive checksum mismatch");
 
-    let install_dir = executable
-        .parent()
-        .context("running executable has no parent directory")?;
-    let _install_lock = lock_install_dir(install_dir)?;
     let temp = tempfile::tempdir_in(install_dir)
         .context("creating same-filesystem update staging directory")?;
-    let staged = if cfg!(windows) {
-        executable.with_file_name("dial.update.new.exe")
+    let staged = temp.path().join(if cfg!(windows) {
+        "dial.new.exe"
     } else {
-        temp.path().join("dial.new")
-    };
-    // Only a staged file outside `temp` needs its own cleanup (Windows stages beside the exe).
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut _staged_cleanup = StagedCleanup(cfg!(windows).then(|| staged.clone()));
+        "dial.new"
+    });
     #[cfg(windows)]
     {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive))?;
@@ -332,87 +335,14 @@ fn install_release(executable: &Path, version: Option<&str>) -> Result<()> {
             fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
         }
     }
-    let output = run_version_check(&staged).context("checking downloaded executable")?;
-    ensure!(
-        output.success,
-        "downloaded executable failed its --version check"
-    );
-    let actual_version = &output.stdout;
     let expected = tag.trim_start_matches('v');
-    ensure!(
-        actual_version
-            .lines()
-            .any(|line| dial_version_token(line) == Some(expected)),
-        "downloaded executable version does not match {tag}"
-    );
+    verify_version(&staged, expected).context("checking downloaded executable")?;
     let backup = executable.with_extension("dial.bak");
-    #[cfg(windows)]
-    {
-        let script = r#"
-$current = $env:DIAL_UPDATE_CURRENT
-$staged = $env:DIAL_UPDATE_STAGED
-$backup = $env:DIAL_UPDATE_BACKUP
-Wait-Process -Id ([int]$env:DIAL_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
-if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
-Move-Item -LiteralPath $current -Destination $backup
-try {
-  Move-Item -LiteralPath $staged -Destination $current
-  $output = & $current --version 2>&1
-  if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -notmatch [regex]::Escape($env:DIAL_UPDATE_VERSION)) { throw "new binary failed version check" }
-} catch {
-  if (Test-Path -LiteralPath $current) { Remove-Item -LiteralPath $current -Force }
-  Move-Item -LiteralPath $backup -Destination $current
-  Write-Error $_
-  exit 1
-}
-"#;
-        std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ])
-            .env("DIAL_UPDATE_CURRENT", executable)
-            .env("DIAL_UPDATE_STAGED", &staged)
-            .env("DIAL_UPDATE_BACKUP", &backup)
-            .env("DIAL_UPDATE_PARENT_PID", std::process::id().to_string())
-            .env("DIAL_UPDATE_VERSION", tag.trim_start_matches('v'))
-            .spawn()
-            .context("starting atomic Windows installer")?;
-        // The installer script now owns the staged file.
-        _staged_cleanup.0 = None;
-        println!(
-            "Verified Dial {}. It will activate after this process exits; previous binary is backed up at {}.",
-            tag.trim_start_matches('v'),
-            backup.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        activate_unix(executable, &staged, &backup, temp.path(), &|path: &Path| {
-            verify_version(path, tag.trim_start_matches('v'))
-        })?;
-        println!(
-            "Updated Dial to {} (backup: {})",
-            tag.trim_start_matches('v'),
-            backup.display()
-        );
-    }
+    activate(executable, &staged, &backup, temp.path(), &|path| {
+        verify_version(path, expected)
+    })?;
+    println!("Updated Dial to {expected} (backup: {})", backup.display());
     Ok(())
-}
-
-/// Removes a staged executable that lives outside the staging directory unless the update took
-/// ownership of it, so a failed check does not leave an unverified binary beside the install.
-struct StagedCleanup(Option<std::path::PathBuf>);
-
-impl Drop for StagedCleanup {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
 }
 
 /// What a `--version` probe reported; stdout is capped by `run_version_check`.
@@ -465,13 +395,28 @@ impl Drop for InstallLock {
 
 fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
     let path = dir.join(".dial-update.lock");
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening update lock {}", path.display()))?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Also interoperate with the PowerShell installer: FileShare.None excludes both
+        // readers and writers, and prevents renaming the lock file out from under the owner.
+        options.share_mode(0);
+    }
+    let file = match options.open(&path) {
+        #[cfg(windows)]
+        Err(error)
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32) =>
+        {
+            bail!(
+                "another Dial installer or update is changing {}; wait for it to finish and retry",
+                dir.display()
+            )
+        }
+        result => result.with_context(|| format!("opening update lock {}", path.display()))?,
+    };
     match file.try_lock().map_err(std::io::Error::from) {
         Ok(()) => Ok(InstallLock { _file: file }),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
@@ -482,29 +427,34 @@ fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
     }
 }
 
-/// Crash-safe activation of a verified staged executable (Unix). The active name is only ever
-/// renamed over, never removed, so an interruption leaves a complete previous or complete new
-/// executable at `executable`:
-/// 1. copy the current executable to `backup`, verified by digest, without touching the active name;
-/// 2. rename the staged file over the active name (atomic on the same filesystem);
-/// 3. fsync the install directory and run `verify` on the active name.
-///
-/// A failure in 3 renames the verified backup back. If that rollback also fails, both errors are
-/// reported and the backup stays at `backup` for manual recovery.
-#[cfg(unix)]
-fn activate_unix(
+/// Publish the verified candidate and confirm the *installed* name before releasing the lock
+/// or reporting success. Unix preserves a digest-checked rollback copy first; Windows asks the
+/// filesystem to preserve the old (possibly mapped) image as part of the replacement.
+fn activate(
     executable: &Path,
     staged: &Path,
     backup: &Path,
-    staging: &Path,
+    _staging: &Path,
     verify: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<()> {
-    let dir = executable
-        .parent()
-        .context("running executable has no parent directory")?;
-    preserve_backup(executable, backup, staging)?;
-    fs::rename(staged, executable).context("replacing the executable with the verified update")?;
-    if let Err(error) = sync_dir(dir).and_then(|()| verify(executable)) {
+    #[cfg(unix)]
+    {
+        preserve_backup(executable, backup, _staging)?;
+        fs::rename(staged, executable)
+            .context("replacing the executable with the verified update")?;
+    }
+    #[cfg(windows)]
+    windows::replace(executable, staged, backup)?;
+    let check = || {
+        #[cfg(unix)]
+        sync_dir(
+            executable
+                .parent()
+                .context("running executable has no parent directory")?,
+        )?;
+        verify(executable)
+    };
+    if let Err(error) = check() {
         if let Err(restore) = fs::rename(backup, executable) {
             bail!(
                 "{error:#}; restoring the previous executable also failed ({restore}); the previous executable is kept at {}",
@@ -552,7 +502,6 @@ fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Runs the candidate executable and requires it to report exactly `expected` as its version.
-#[cfg(unix)]
 fn verify_version(path: &Path, expected: &str) -> Result<()> {
     let output = run_version_check(path)?;
     ensure!(

@@ -36,7 +36,16 @@ const IGNORED_DIRECTORIES: &[&str] = &[
 ];
 
 /// Project-local bin directories searched before `PATH`.
-const LOCAL_BIN_DIRS: &[&str] = &["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin"];
+const LOCAL_BIN_DIRS: &[&str] = &[
+    "node_modules/.bin",
+    #[cfg(windows)]
+    ".venv/Scripts",
+    #[cfg(windows)]
+    "venv/Scripts",
+    ".venv/bin",
+    "venv/bin",
+    "vendor/bin",
+];
 
 /// ShellCheck receives at most this many files per invocation.
 const SHELLCHECK_BATCH_SIZE: usize = 200;
@@ -285,14 +294,12 @@ pub fn custom(root: &Path, specs: Vec<CustomSpec>) -> Suite {
                 }
             },
         };
-        let program_path = if program.contains('/') {
-            let candidate = cwd.join(&program);
-            candidate
-                .is_file()
-                .then(|| candidate.to_string_lossy().into_owned())
+        let program_path = if Path::new(&program).components().count() > 1 {
+            crate::platform::fs::executable_candidate(&cwd.join(&program))
         } else {
-            path_binary(&program).then(|| program.clone())
-        };
+            path_binary(&program)
+        }
+        .map(|path| path.to_string_lossy().into_owned());
         let Some(program_path) = program_path else {
             skip(
                 &mut suite,
@@ -1118,7 +1125,7 @@ fn topmost_roots(mut roots: Vec<String>) -> Vec<String> {
 }
 
 /// Resolves a checker executable. Project-local bin directories win over `PATH`, and any
-/// name matches before `PATH` is consulted. Returns `(name, program)`, where `program` is a path or the name.
+/// name matches before `PATH` is consulted. Retain the executable path, including any native suffix.
 fn resolve_binary(names: &[&str], cwd: &Path, root: &Path) -> Option<(String, String)> {
     for name in names {
         if let Some(path) = local_binary(name, cwd, root) {
@@ -1126,8 +1133,8 @@ fn resolve_binary(names: &[&str], cwd: &Path, root: &Path) -> Option<(String, St
         }
     }
     for name in names {
-        if path_binary(name) {
-            return Some(((*name).to_owned(), (*name).to_owned()));
+        if let Some(path) = path_binary(name) {
+            return Some(((*name).to_owned(), path.to_string_lossy().into_owned()));
         }
     }
     None
@@ -1138,8 +1145,8 @@ fn local_binary(name: &str, cwd: &Path, root: &Path) -> Option<String> {
     while let Some(current) = dir {
         for bin_dir in LOCAL_BIN_DIRS {
             let candidate = current.join(bin_dir).join(name);
-            if crate::platform::fs::is_executable(&candidate) {
-                return Some(candidate.to_string_lossy().into_owned());
+            if let Some(path) = crate::platform::fs::executable_candidate(&candidate) {
+                return Some(path.to_string_lossy().into_owned());
             }
         }
         if current == root {
@@ -1150,9 +1157,8 @@ fn local_binary(name: &str, cwd: &Path, root: &Path) -> Option<String> {
     None
 }
 
-fn path_binary(name: &str) -> bool {
+fn path_binary(name: &str) -> Option<PathBuf> {
     crate::platform::fs::find_program(Path::new(name), std::env::var_os("PATH").as_deref())
-        .is_some()
 }
 
 /// Shell-quotes arguments that contain anything beyond a safe character set.

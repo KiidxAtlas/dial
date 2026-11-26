@@ -62,19 +62,32 @@ fn locate_prefers_dial_install_then_path() {
     let tmp = tempfile::tempdir().unwrap();
     let user = tmp.path().join("user");
     let path_dir = tmp.path().join("path");
-    fake_bin(&path_dir, "bun");
+    let program = if cfg!(windows) { "bun.exe" } else { "bun" };
+    fake_bin(&path_dir, program);
     let env = Env {
         path: vec![path_dir.clone()],
         user_dir: user.clone(),
     };
     let bun = recipe("bun").unwrap();
-    assert_eq!(locate(bun, &env), Some(path_dir.join("bun")));
+    let from_path = || locate(bun, &env).unwrap().canonicalize().unwrap();
+    assert_eq!(from_path(), path_dir.join(program).canonicalize().unwrap());
 
-    fake_bin(&install_dir(&user, "bun").join("node_modules/.bin"), "bun");
-    assert_eq!(
-        locate(bun, &env),
-        Some(install_dir(&user, "bun").join("node_modules/.bin/bun"))
-    );
+    let private = install_dir(&user, "bun");
+    fake_bin(&private.join("node_modules/.bin"), "bun");
+    if cfg!(windows) {
+        // A leftover POSIX shim alone must not shadow a working Bun on PATH.
+        assert_eq!(from_path(), path_dir.join(program).canonicalize().unwrap());
+        fake_bin(&private.join("node_modules/bun/bin"), "bun.exe");
+        assert_eq!(
+            locate(bun, &env),
+            Some(private.join("node_modules/bun/bin/bun.exe"))
+        );
+    } else {
+        assert_eq!(
+            locate(bun, &env),
+            Some(private.join("node_modules/.bin/bun"))
+        );
+    }
 }
 
 #[test]

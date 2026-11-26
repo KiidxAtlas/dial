@@ -291,7 +291,17 @@ async function initialize(request) {
     } else {
       browser = await chromium.launch({ headless: request.headless !== false, executablePath: process.env.DIAL_CHROMIUM, timeout: request.timeout_ms ?? 0,
         args: ['--use-gl=angle', '--use-angle=swiftshader', '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-features=WebRtcHideLocalIpsWithMdns', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', ...(request.stealth?.args ?? [])],
-        ...(request.stealth ? { ignoreDefaultArgs: request.stealth.ignoreDefaultArgs } : {}) });
+        ...(request.stealth ? { ignoreDefaultArgs: request.stealth.ignoreDefaultArgs } : {}) }).catch(error => {
+          // Playwright appends argv and process logs to launch errors. Report the binary
+          // and an actionable category without echoing those details out of the sandbox.
+          const message = String(error.message || error);
+          const cause = /not a valid Win32 application|os error 193|ENOEXEC|Exec format error/i.test(message)
+            ? 'incompatible executable format; select a native Chromium for this OS and CPU'
+            : /EACCES|EPERM|permission denied|access is denied/i.test(message) ? 'permission denied'
+            : /ENOENT|not found|shared librar/i.test(message) ? 'executable or required library missing'
+            : /timeout/i.test(message) ? 'launch timed out' : 'check the executable and its OS dependencies';
+          throw new Error(`Cannot launch Chromium ${JSON.stringify(process.env.DIAL_CHROMIUM)}: ${cause}`);
+        });
       context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: true, viewport, ignoreHTTPSErrors: request.ignore_https_errors === true,
         storageState: request.storage_state || undefined,
         recordVideo: request.record_video ? { dir: artifactsDir() } : undefined });

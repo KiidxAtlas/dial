@@ -184,41 +184,57 @@ pub(in crate::tools) fn read(
     Ok(out)
 }
 
-/// Top-level declarations of every source file under `dir`, one indented block per file.
+/// One source file of a directory outline: its text (`None` when unreadable or too large).
+struct DirFile {
+    path: std::path::PathBuf,
+    rel: String,
+    text: Option<String>,
+}
+
+/// Top-level declarations of every source file under `dir`, one indented block per file, most
+/// referenced files first ([`rank`]), so the budget keeps the files the rest depend on.
 fn read_directory(ws: &Workspace, dir: &Path, budget: usize) -> Result<String, String> {
     let rel_dir = display_path(ws.rel(dir));
     let row_limit = budget.saturating_sub(READ_FOOTER_RESERVE);
-    let mut body = String::new();
-    let (mut files, mut without_parser, mut omitted) = (0usize, 0usize, 0usize);
-    let mut full = false;
+    let (mut without_parser, mut omitted) = (0usize, 0usize);
+    let mut paths = Vec::new();
     let mut walk = super::walk::Walk::new(ws);
     walk.run(dir, &mut |path| {
         if SupportLang::from_path(path).is_none() {
             without_parser += 1;
-            return true;
-        }
-        if full || files == MAX_DIR_FILES {
+        } else if paths.len() == MAX_DIR_FILES {
             omitted += 1;
-            return true;
+        } else {
+            paths.push(path.to_path_buf());
         }
-        let rel = display_path(ws.rel(path));
-        let block = file_block(ws, path, &rel);
+        true
+    });
+    let sources: Vec<DirFile> = paths.iter().map(|path| dir_file(ws, path)).collect();
+    let order = central_first(&sources);
+    let ranked = order.iter().enumerate().any(|(at, &index)| at != index);
+    let mut body = String::new();
+    let mut files = 0usize;
+    for (at, &index) in order.iter().enumerate() {
+        let block = file_block(&sources[index]);
         if body.len() + block.len() > row_limit {
-            full = true;
-            omitted += 1;
-            return true;
+            omitted += order.len() - at;
+            break;
         }
         body.push_str(&block);
         files += 1;
-        true
-    });
+    }
     if files == 0 && omitted == 0 {
         return Ok(format!(
             "{rel_dir} outline: no source files with a syntax parser ({without_parser} other files); list it with `read {rel_dir}`"
         ));
     }
+    let order_note = if ranked {
+        "files most referenced by the others first"
+    } else {
+        "files by path"
+    };
     let mut out = format!(
-        "{rel_dir} outline ({files} source files; top-level `start-end kind first line` per file; summaries only, not edit witnesses: read a file or `path:sym=NAME` before editing):\n{body}"
+        "{rel_dir} outline ({files} source files, {order_note}; top-level `start-end kind first line` per file; summaries only, not edit witnesses: read a file or `path:sym=NAME` before editing):\n{body}"
     );
     let mut notes = Vec::new();
     if omitted > 0 {
@@ -240,43 +256,90 @@ fn read_directory(ws: &Workspace, dir: &Path, budget: usize) -> Result<String, S
     Ok(out)
 }
 
-/// One file's block of a directory outline: its line count and top-level declarations.
-fn file_block(ws: &Workspace, path: &Path, rel: &str) -> String {
+/// Reads one file of a directory outline. Declarations are parsed only for the files that are
+/// listed ([`file_block`]); ranking reads names from the text alone.
+fn dir_file(ws: &Workspace, path: &Path) -> DirFile {
+    let rel = display_path(ws.rel(path));
     let too_large = std::fs::metadata(path).map_or(true, |meta| meta.len() > MAX_DIR_FILE_BYTES);
-    let text = if too_large {
-        None
-    } else {
-        hashline::load_text(ws, path, rel).ok()
-    };
-    let Some(text) = text else {
+    let text = (!too_large)
+        .then(|| hashline::load_text(ws, path, &rel).ok())
+        .flatten();
+    DirFile {
+        path: path.to_path_buf(),
+        rel,
+        text,
+    }
+}
+
+/// Whether `rel` names a test file, whose helpers are not dependencies of the code it tests.
+fn test_file(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = name.split('.').next().unwrap_or(name);
+    rel.contains("/tests/")
+        || rel.contains("/test/")
+        || rel.contains("__tests__/")
+        || matches!(stem, "tests" | "test" | "conftest")
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
+/// Indexes of `sources`, highest [`rank::ranks`] first; equal ranks keep path order. A file's
+/// declared names come from its unindented lines (top-level declarations in common languages),
+/// so ranking needs no syntax parse; test files declare nothing.
+fn central_first(sources: &[DirFile]) -> Vec<usize> {
+    let inputs: Vec<(Vec<&str>, &str)> = sources
+        .iter()
+        .map(|file| {
+            let text = file.text.as_deref().unwrap_or("");
+            let names = if test_file(&file.rel) {
+                Vec::new()
+            } else {
+                text.lines()
+                    .filter(|line| line.starts_with(|c: char| !c.is_whitespace()))
+                    .filter_map(rank::declared_name)
+                    .collect()
+            };
+            (names, text)
+        })
+        .collect();
+    let ranks = rank::ranks(&inputs);
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    // Ranks are rounded so float noise cannot reorder files of equal rank; the stable sort keeps
+    // those in path order.
+    order.sort_by_key(|&index| std::cmp::Reverse((ranks[index] * 1e9).round() as i64));
+    order
+}
+
+/// One file's block of a directory outline: its line count and top-level declarations.
+fn file_block(file: &DirFile) -> String {
+    let rel = &file.rel;
+    let Some(text) = &file.text else {
         return format!("{rel} (not outlined: unreadable or larger than 512 KiB)\n");
     };
     let lines: Vec<&str> = text.lines().collect();
-    let declarations = navigation::declarations(path, &text);
-    let mut block = format!("{rel} ({} lines)\n", lines.len());
+    let mut top = Vec::new();
     let mut outer_end = 0;
-    let mut listed = 0;
-    let mut top = 0;
-    for (start, end, kind) in &declarations {
-        if *start <= outer_end {
-            continue;
+    for (start, end, kind) in navigation::declarations(&file.path, text) {
+        if start > outer_end {
+            outer_end = end;
+            top.push((start, end, kind));
         }
-        outer_end = *end;
-        top += 1;
-        if listed == MAX_DIR_DECLARATIONS {
-            continue;
-        }
+    }
+    let mut block = format!("{rel} ({} lines)\n", lines.len());
+    for (start, end, kind) in top.iter().take(MAX_DIR_DECLARATIONS) {
         block.push_str(&format!(
             "  {start}-{end} {} {}\n",
             kind_label(kind),
             signature(&lines, *start, 80)
         ));
-        listed += 1;
     }
-    if top > listed {
+    if top.len() > MAX_DIR_DECLARATIONS {
         block.push_str(&format!(
             "  [{} more; `read {rel}:outline`]\n",
-            top - listed
+            top.len() - MAX_DIR_DECLARATIONS
         ));
     }
     block
@@ -539,6 +602,8 @@ fn leading_context(lines: &[&str], start: usize) -> usize {
     }
     first
 }
+
+mod rank;
 
 #[cfg(test)]
 mod tests;

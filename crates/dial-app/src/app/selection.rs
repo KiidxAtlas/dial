@@ -147,9 +147,19 @@ pub(super) fn role_thinking_changes(
     }])
 }
 
+/// Never edit a named profile belonging to a previous default model.
+fn active_profile_name(config: &Config) -> Option<String> {
+    let active = config.active_model_profile()?;
+    config
+        .model_profiles
+        .iter()
+        .find(|(_, profile)| std::ptr::eq(*profile, active))
+        .map(|(name, _)| name.clone())
+}
+
 /// Settings writes for the main model's thinking `level`: `default` drops an explicit level (and
 /// `auto`), `auto` judges each turn, anything else is checked against the model's reasoning levels.
-pub(super) fn main_thinking_changes(config: &Config, level: &str) -> Result<Vec<Change>> {
+pub(crate) fn main_thinking_changes(config: &Config, level: &str) -> Result<Vec<Change>> {
     if level != "default" {
         return Ok(reasoning_changes(config, level)?.0);
     }
@@ -157,16 +167,7 @@ pub(super) fn main_thinking_changes(config: &Config, level: &str) -> Result<Vec<
         path: "thinking_auto".into(),
         value: toml::Value::Boolean(false),
     }];
-    let selection = config.selection();
-    let named = config.model_profile.clone().or_else(|| {
-        config
-            .model_profiles
-            .iter()
-            .find(|(_, saved)| {
-                saved.provider == selection.provider && saved.model == selection.model
-            })
-            .map(|(name, _)| name.clone())
-    });
+    let named = active_profile_name(config);
     if let Some(name) = named.filter(|name| {
         config
             .model_profiles
@@ -304,30 +305,16 @@ pub(super) fn reasoning_changes(config: &Config, args: &str) -> Result<(Vec<Chan
         effort.as_str().to_owned()
     };
     profile.validate()?;
-    let name = config
-        .model_profile
-        .clone()
-        .or_else(|| {
-            config.active_model_profile().and_then(|_| {
-                config
-                    .model_profiles
-                    .iter()
-                    .find(|(_, saved)| {
-                        saved.provider == profile.provider && saved.model == profile.model
-                    })
-                    .map(|(name, _)| name.clone())
-            })
-        })
-        .unwrap_or_else(|| {
-            use sha2::{Digest, Sha256};
-            format!(
-                "reasoning_{}",
-                &format!(
-                    "{:x}",
-                    Sha256::digest(format!("{}/{}", profile.provider, profile.model))
-                )[..16]
-            )
-        });
+    let name = active_profile_name(config).unwrap_or_else(|| {
+        use sha2::{Digest, Sha256};
+        format!(
+            "reasoning_{}",
+            &format!(
+                "{:x}",
+                Sha256::digest(format!("{}/{}", profile.provider, profile.model))
+            )[..16]
+        )
+    });
     Ok((
         vec![
             Change::Set {

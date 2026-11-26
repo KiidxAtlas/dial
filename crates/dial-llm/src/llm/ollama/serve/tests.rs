@@ -19,6 +19,53 @@ fn only_loopback_http_addresses_are_started() {
     assert_eq!(local_address("http://ollama.example.com"), None);
 }
 
+#[cfg(windows)]
+#[test]
+fn a_client_reopens_the_managed_job_and_owns_it_after_the_creator_leaves() {
+    struct Running;
+    impl Host for Running {
+        fn reachable(&self, _: Duration) -> bool {
+            true
+        }
+        fn spawn(&self, _: &Path) -> Result<(ProcId, Lease)> {
+            panic!("server already running")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // Production state lives under Dial's private user directory; the lock refuses other parents.
+    crate::platform::atomic::private_dir(dir.path()).unwrap();
+    let (mut child, creator) = process::spawn_shared_group(Command::new("powershell.exe").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 30",
+    ]))
+    .unwrap();
+    let server = ProcId::of(child.id() as i32).unwrap();
+    fs::write(
+        dir.path().join(SERVER_FILE),
+        serde_json::to_vec(&server).unwrap(),
+    )
+    .unwrap();
+    let client = ProcId::current().unwrap();
+    assert_eq!(
+        ensure_with(
+            dir.path(),
+            client,
+            &Running,
+            Instant::now() + Duration::from_secs(5),
+            None
+        )
+        .unwrap(),
+        Ready::Running
+    );
+    drop(creator); // same kernel handle close as the starting Dial exiting or crashing
+    assert!(!process::wait_exited(&child, Duration::from_millis(200)).unwrap());
+    assert!(release(dir.path(), client).unwrap());
+    assert!(process::wait_exited(&child, Duration::from_secs(5)).unwrap());
+    child.wait().unwrap();
+}
+
 #[cfg(unix)]
 mod lifecycle {
     use super::*;
@@ -38,13 +85,13 @@ mod lifecycle {
         fn reachable(&self, _timeout: Duration) -> bool {
             self.up.load(Ordering::SeqCst)
         }
-        fn spawn(&self, _dir: &Path) -> Result<ProcId> {
+        fn spawn(&self, _dir: &Path) -> Result<(ProcId, Lease)> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             let id = sleeper();
             if !self.silent {
                 self.up.store(true, Ordering::SeqCst);
             }
-            Ok(id)
+            Ok((id, Lease::default()))
         }
     }
 

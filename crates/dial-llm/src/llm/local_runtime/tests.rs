@@ -138,3 +138,26 @@ fn auto_and_blank_mean_unset_in_toml() {
         "unset fields must not serialize: {text}"
     );
 }
+
+/// Auto picks the only loader that can run an architecture instead of demanding a manual pin;
+/// architectures both runtimes load keep the historical llama.cpp default.
+#[test]
+fn auto_uses_the_only_capable_gguf_loader() {
+    use crate::llm::local_format::gguf_fixtures::{header, string};
+    let dir = tempfile::tempdir().unwrap();
+    let file = |arch: &str| {
+        let path = dir.path().join(format!("{arch}.gguf"));
+        std::fs::write(&path, header(&[("general.architecture", string(arch))])).unwrap();
+        path
+    };
+    let atomic_only = GgufLoader::resolve(&file("inkling2"), LocalEngine::Auto);
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert!(atomic_only.is_ok_and(|loader| loader == GgufLoader::Atomic));
+    } else {
+        assert!(atomic_only.is_err(), "no capable loader off Apple Silicon");
+    }
+    assert!(
+        GgufLoader::resolve(&file("qwen2"), LocalEngine::Auto)
+            .is_ok_and(|loader| loader == GgufLoader::LlamaCpp)
+    );
+}

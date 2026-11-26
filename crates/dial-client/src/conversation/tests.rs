@@ -818,3 +818,46 @@ fn completed_inference_keeps_earlier_rounds_out_of_later_retry_discard() {
         );
     }
 }
+
+#[test]
+fn harness_written_user_records_never_show_as_the_users_words() {
+    let mut view = Conversation::default();
+    let summary = json!({"role":"user","dial_compaction_summary":true,
+        "content":"<summary>\nSummary of the earlier conversation (older messages were compacted away):\nold\n</summary>"});
+    let legacy = json!({"role":"user",
+        "content":"<summary>\nSummary of the earlier conversation (older messages were compacted away):\nold\n</summary>"});
+    let carry = json!({"role":"user","dial_compaction_critical":true,"content":"Exact session-control carry"});
+    let files =
+        json!({"role":"user","dial_compaction_files":true,"content":"Current content of files"});
+    let hidden = json!({"role":"user","dial_portable_rules":true,"content":"rules"});
+    let reminder = json!({"role":"user","dial_reminder":true,
+        "content":"<dial-notice kind=\"x\">Check the build</dial-notice>"});
+    let typed = json!({"role":"user","content":"fix the bug"});
+    let messages = [summary, legacy, carry, files, hidden, reminder, typed];
+    view.load_history(None, &messages);
+    let users: Vec<&str> = view
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::User(user) => Some(user.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["fix the bug"]);
+    let notices: Vec<(&str, Option<&str>)> = view
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Notice(notice) => Some((notice.message.as_str(), notice.lane.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 5, "{notices:?}");
+    assert_eq!(
+        notices[0],
+        ("Earlier conversation was compacted", Some("divider"))
+    );
+    assert_eq!(notices[4], ("Check the build", Some("context")));
+    let harness: Vec<bool> = messages.iter().map(is_harness_message).collect();
+    assert_eq!(harness, [true, true, true, true, true, true, false]);
+}

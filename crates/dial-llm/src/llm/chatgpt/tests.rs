@@ -278,7 +278,8 @@ fn browser_codex_oauth_activates_account_and_preserves_workspace_isolation() {
     );
     let (result, _, second_url) = login_fixture(dir.path(), Some(account_id), "first-person");
     assert!(result.is_ok());
-    assert!(second_url.contains("id_token_hint=") && second_url.contains("login_hint="));
+    assert!(second_url.contains("login_hint="));
+    assert!(!second_url.contains("id_token_hint="));
     let before = std::fs::read(credential_path(dir.path())).unwrap();
     let (result, _, _) = login_fixture(dir.path(), Some(account_id), "different-person");
     assert!(result.is_err());

@@ -79,6 +79,7 @@ function Get-BaseEnvironment {
         DIAL_RELEASE_PUBLIC_KEY_PEM  = $null
         DIAL_VERSION                 = $null
         DIAL_INSTALL_DIR             = $null
+        DIAL_NO_MODIFY_PATH          = '1'
     }
 }
 
@@ -296,6 +297,39 @@ try {
         Assert-True $rejected 'unsupported archive target was accepted'
     }
 
+    # Invoke the same activation operation as the signed installer, without having to time
+    # a disappearing staged file or a competing update during a real release download.
+    Test-Case 'activation failures preserve the installed bytes and do not consume a stale backup' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:InstallerPath, [ref]$null, [ref]$null)
+        $operation = $ast.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-DialStagedExecutable'
+        }, $true).Body.GetScriptBlock()
+        $cases = @('missing-stage', 'update-lock')
+        if ($script:IsWindowsHost) { $cases += 'locked-install' }
+        foreach ($case in $cases) {
+            $dir = Join-Path $script:WorkRoot $case
+            $null = New-Item -ItemType Directory -Path $dir
+            $installed = Join-Path $dir 'dial.exe'
+            $staged = Join-Path $dir 'candidate.exe'
+            [IO.File]::WriteAllText($installed, 'current')
+            [IO.File]::WriteAllText("$installed.bak", 'older')
+            if ($case -ne 'missing-stage') { [IO.File]::WriteAllText($staged, 'candidate') }
+            $held = $null
+            $failure = $null
+            try {
+                if ($case -eq 'update-lock') { $held = [IO.File]::Open((Join-Path $dir '.dial-update.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+                if ($case -eq 'locked-install') { $held = [IO.File]::Open($installed, 'Open', 'Read', 'Read') }
+                try { & $operation $staged $installed } catch { $failure = $_ }
+            } finally {
+                if ($held) { $held.Dispose() }
+            }
+            Assert-True ($null -ne $failure) "${case}: activation unexpectedly succeeded"
+            if ($case -eq 'update-lock') { Assert-Contains $failure.Exception.Message '.dial-update.lock' }
+            Assert-Equal 'current' ([IO.File]::ReadAllText($installed)) "${case}: lost active version"
+            Assert-Equal 'older' ([IO.File]::ReadAllText("$installed.bak")) "${case}: changed stale backup"
+        }
+    }
+
     Assert-True ([bool] $script:OpenSsl) 'openssl is required to run the installer tests'
 
     $keyA = New-SigningKey -Name 'key-a'
@@ -408,12 +442,17 @@ try {
         Assert-True (-not ($run.Output -match 'Add .* to PATH')) 'output still tells the user to add to PATH'
     }
 
-    Test-Case 'reinstall over an existing version keeps dial.exe.bak' {
+    Test-Case 'reinstall replaces a stale backup with the previous active version' {
+        $pathBin = Join-Path $script:WorkRoot 'bin-reinstall'
+        $null = New-Item -ItemType Directory -Path $pathBin
+        $installed = Join-Path $pathBin 'dial.exe'
+        [IO.File]::WriteAllText($installed, 'previous')
+        [IO.File]::WriteAllText("$installed.bak", 'stale')
         $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'ok')
         $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
         $run = Invoke-Installer @('-Version', 'v0.1.0', '-InstallDir', $pathBin) $envMap
         Assert-Equal 0 $run.Code "reinstall exit code. Output: $($run.Output)"
-        Assert-True (Test-Path -LiteralPath (Join-Path $pathBin 'dial.exe.bak')) 'backup was not kept'
+        Assert-Equal 'previous' ([IO.File]::ReadAllText("$installed.bak")) 'wrong rollback version'
     }
 
     Test-Case 'installs the native aarch64 Windows build on ARM64 Windows' {
@@ -553,24 +592,31 @@ try {
     }
 
     Test-Case 'scriptblock form installs a pinned version and leaves no function or preference behind' {
+        $sessionPath = $env:Path
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $envMap = Get-BaseEnvironment $dirOk
         $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
         $dir = Join-Path $script:WorkRoot 'bin-sb'
         $before = $ErrorActionPreference
         $sb = [scriptblock]::Create([IO.File]::ReadAllText($script:InstallerPath))
         Invoke-InProcess -Environment $envMap -Body { & $sb -Version 'v0.1.0' -InstallDir $dir }
+        Assert-Equal $sessionPath $env:Path 'DIAL_NO_MODIFY_PATH changed session PATH'
+        Assert-Equal $userPath ([Environment]::GetEnvironmentVariable('Path', 'User')) 'DIAL_NO_MODIFY_PATH changed user PATH'
         Assert-Equal $before $ErrorActionPreference 'ErrorActionPreference leaked'
         Assert-True (-not (Test-Path -LiteralPath Function:\Install-DialRelease)) 'installer function was not removed'
         Assert-True (Test-Path -LiteralPath (Join-Path $dir 'dial.exe')) 'dial.exe was not installed'
     }
 
-    Test-Case 'Invoke-Expression form uses DIAL_VERSION and updates the session PATH' {
+    # Only exercise persistent PATH writes on disposable hosted Windows runners, not on a developer account.
+    Test-Case 'Invoke-Expression form uses DIAL_VERSION and honors PATH policy' {
+        $testDefaultPath = $script:IsWindowsHost -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted'
         $origSessionPath = $env:Path
         $origUserPath = $null
         if ($script:IsWindowsHost) { $origUserPath = [Environment]::GetEnvironmentVariable('Path', 'User') }
         $dir = Join-Path $script:WorkRoot 'bin-iex'
         try {
             $envMap = Get-BaseEnvironment $dirOk
+            if ($testDefaultPath) { $envMap['DIAL_NO_MODIFY_PATH'] = $null }
             $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
             $envMap['DIAL_VERSION'] = 'v0.1.0'
             $envMap['DIAL_INSTALL_DIR'] = $dir
@@ -580,15 +626,18 @@ try {
             Assert-Equal $before $ErrorActionPreference 'ErrorActionPreference leaked'
             Assert-True (-not (Test-Path -LiteralPath Function:\Install-DialRelease)) 'installer function was not removed'
             Assert-True (Test-Path -LiteralPath (Join-Path $dir 'dial.exe')) 'dial.exe was not installed'
-            $sessionEntries = @($env:Path -split ';' | Where-Object { $_ })
-            Assert-True (@($sessionEntries | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') }).Count -gt 0) 'session PATH does not contain the install directory'
-            if ($script:IsWindowsHost) {
+            if ($testDefaultPath) {
+                $sessionEntries = @($env:Path -split ';' | Where-Object { $_ })
+                Assert-True (@($sessionEntries | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') }).Count -gt 0) 'session PATH does not contain the install directory'
                 $userEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
                 Assert-True (@($userEntries | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') }).Count -gt 0) 'user PATH does not contain the install directory'
+            } else {
+                Assert-Equal $origSessionPath $env:Path 'session PATH changed'
+                if ($script:IsWindowsHost) { Assert-Equal $origUserPath ([Environment]::GetEnvironmentVariable('Path', 'User')) 'user PATH changed' }
             }
         } finally {
             $env:Path = $origSessionPath
-            if ($script:IsWindowsHost) { [Environment]::SetEnvironmentVariable('Path', $origUserPath, 'User') }
+            if ($testDefaultPath) { [Environment]::SetEnvironmentVariable('Path', $origUserPath, 'User') }
         }
     }
 

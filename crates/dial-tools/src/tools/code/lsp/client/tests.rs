@@ -153,3 +153,57 @@ fn cancellation_interrupts_the_post_initialize_configuration_write() {
     });
     server.join().unwrap();
 }
+
+#[test]
+fn push_diagnostics_match_the_open_document_path() {
+    let (requests, to_server) = io::pipe().unwrap();
+    let (from_server, mut replies) = io::pipe().unwrap();
+    let server = thread::spawn(move || {
+        let mut input = BufReader::new(requests);
+        while let Some(message) = read_message(&mut input).unwrap() {
+            let reply = match message["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"jsonrpc":"2.0", "id":message["id"], "result":{"capabilities":{}}})
+                }
+                "textDocument/didOpen" => {
+                    let doc = &message["params"]["textDocument"];
+                    json!({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{
+                        "uri":doc["uri"], "version":doc["version"], "diagnostics":[{"message": doc["text"]}]
+                    }})
+                }
+                "shutdown" => json!({"jsonrpc":"2.0", "id":message["id"], "result":null}),
+                "exit" => break,
+                _ => continue,
+            };
+            write_message(&mut replies, &reply).unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let client = Client::connect_cancellable(
+        "push",
+        &root,
+        Box::new(from_server),
+        Box::new(to_server),
+        None,
+        Timeouts {
+            settle: Duration::ZERO,
+            diagnostics: Duration::from_secs(2),
+            ..Timeouts::default()
+        },
+        ServerOptions::default(),
+        &|| false,
+    )
+    .unwrap();
+    let unc = cfg!(windows).then(|| std::path::PathBuf::from(r"\\?\UNC\server\share\a b.rs")); // lexical only; no remote access
+    for path in std::iter::once(root.join("a b.rs")).chain(unc) {
+        let items = Some(vec![json!({"message": "problem"})]);
+        let mark = client.diagnostics_mark(&path);
+        client.sync_document(&path, "rust", "problem").unwrap();
+        assert_eq!(client.diagnostics(&path, mark, true), items);
+        assert!(client.diagnostics_mark(&path) > mark);
+        assert_eq!(client.last_diagnostics(&path), items);
+    }
+    drop(client);
+    server.join().unwrap();
+}

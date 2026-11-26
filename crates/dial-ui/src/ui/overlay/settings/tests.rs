@@ -166,7 +166,12 @@ fn goto(o: &mut SettingsOverlay, keys: &Keymap, path: &str) {
     if crate::config::schema::is_advanced(path) {
         o.advanced_open.insert((def.tab, def.section));
     }
-    o.tab = o.tabs.iter().position(|(t, _)| *t == def.tab).unwrap();
+    // A tab ordinary Settings leaves out (Learning, unset Experimental) is reached by focusing.
+    let Some(tab) = o.tabs.iter().position(|(t, _)| *t == def.tab) else {
+        assert!(o.focus_path(path), "cannot focus {path}");
+        return;
+    };
+    o.tab = tab;
     let at = o
         .visible()
         .iter()

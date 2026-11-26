@@ -154,7 +154,7 @@ With `shell.minimize_output = true` (default), foreground `bash` output of a rec
 | `pip install`, `python -m pip install`, `uv pip install`, `uv sync`, `uv add` | `Collecting`, `Downloading`, `Using cached`, `Requirement already satisfied`, wheel-build and progress-bar lines | |
 | `jest`, `vitest`, `npx`/`bunx jest`/`vitest` | | `PASS` / `✓` lines |
 
-For every command, ANSI escape sequences are stripped and carriage-return progress redraws are reduced to their last frame.
+For every command, ANSI escape sequences are stripped and carriage-return progress redraws are reduced to their last frame. After one of the filters above, a run of five or more identical lines (a lock wait or retry message printed over and over) is folded to one copy and `[... N more identical lines folded by the output filter ...]`. Lines that differ in any character, numbers included, are never folded, and output of commands without a filter (file contents, diffs, listings) is never folded.
 
 Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed by the minimizer (a frame overwritten by a carriage return that carries one is kept on its own line), with one exception: a test run (`cargo test`/`nextest`, `pytest`, `jest`/`vitest`, `go test`) whose only such lines are passing runner summaries is replaced by one line, for example `test result: ok. 412 passed; 0 failed; 3 ignored (9 suites; passing run summarized by the output filter)`. Any warning, failure, panic or error keeps the line-by-line filter. The exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `read`. The foreground shell's inline preview keeps 4 KiB from the beginning and 4 KiB from the end, plus bounded middle diagnostics and explicit omission counts. Complete artifact spooling is independent of this preview bound. Longer output is filtered from the complete copy in its artifact (up to 4 MiB) when nothing was elided, and the filtered text is used only if it fits the inline view; otherwise the head-and-tail view, with its middle diagnostics, is shown. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is minimized only when a finished job's complete output is read at once. A failed recognised command starts with a `[failure digest: …]` block: for test runs, each failing test (up to 10) with up to 8 lines of its panic or assertion detail, otherwise the first error lines with their locations. The digest is omitted only when every one of its lines is already visible near the top of the shown output.
 
@@ -192,7 +192,8 @@ Tool edits are checkpointed before they happen; a shell command's effects are no
 Not covered: files matched by `.gitignore`, dependency and build directories (`target`,
 `node_modules`, `build`, `dist`, `vendor`, virtual environments), `.git`, `.dial`, credential-like
 files (`.env`, keys), symlinks, directories added with `/add-dir`, and anything outside the project.
-A file over 8 MiB is not copied; if a command changes it, the undo report names it as keeping the turn's content, and the rest of the undo goes on.
+A file over 8 MiB is tracked by metadata, not copied. If Dial detects a change to it, the undo
+report names it as keeping the turn's content, and the rest of the undo goes on.
 The copy is taken only before the main agent's own `bash` commands. Changes that `eval`, extension
 tools or delegated workers make outside checkpoints are captured only when they follow such a
 command in the same turn. Because the comparison is against the whole project, a file you edit in
@@ -202,7 +203,8 @@ earlier content; `/review-file` shows the difference first.
 A project with more than 20,000 source files, or more than 512 MiB of them, is not copied: Dial
 says so once in that turn and shell changes stay outside `/undo`. The copy is a copy-on-write clone
 where the filesystem supports it (APFS, Btrfs, XFS with reflinks) and a full copy elsewhere, which
-takes time and disk space in proportion to the source tree.
+takes time and disk space in proportion to the source tree. On Windows, Dial also compares copied
+file contents after commands: matching file size and modification time alone can miss edits.
 
 The turn report still counts the commands under "Outside /undo", since ignored files and effects
 outside the project are not captured. Enabling the setting also makes shell-changed files part of

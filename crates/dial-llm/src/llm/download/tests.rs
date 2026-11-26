@@ -30,11 +30,13 @@ fn complete_models_never_download() {
 #[test]
 fn missing_mlx_repository_takes_a_snapshot_and_validates() {
     let downloaded = Cell::new(false);
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = root.path().join("snapshot").to_string_lossy().into_owned();
     let path = prepare(
         "org/model",
         true,
         |value| {
-            if value == "/snapshot" {
+            if value == snapshot {
                 Ok(value.into())
             } else {
                 bail!("missing or partial")
@@ -51,12 +53,12 @@ fn missing_mlx_repository_takes_a_snapshot_and_validates() {
             assert_eq!(repo, "org/model");
             assert_eq!(fetch, &Fetch::Snapshot);
             downloaded.set(true);
-            Ok(vec!["/snapshot".into()])
+            Ok(vec![snapshot.clone()])
         },
     )
     .unwrap();
     assert!(downloaded.get());
-    assert_eq!(path, "/snapshot");
+    assert_eq!(path, snapshot);
 }
 
 #[test]
@@ -86,6 +88,7 @@ fn invalid_paths_do_not_list_or_download() {
 
 #[test]
 fn download_failure_and_incomplete_snapshots_are_errors() {
+    let root = tempfile::tempdir().unwrap();
     assert!(
         prepare(
             "org/model",
@@ -104,7 +107,9 @@ fn download_failure_and_incomplete_snapshots_are_errors() {
             true,
             |_| bail!("missing"),
             |_| Ok(files(&["model.safetensors"])),
-            |_, _| Ok(vec!["/partial".into()])
+            |_, _| Ok(vec![
+                root.path().join("partial").to_string_lossy().into_owned()
+            ])
         )
         .unwrap_err()
         .to_string()
@@ -220,6 +225,12 @@ fn mixed_mlx_repository_ignores_gguf_by_snapshot() {
 fn picked_file_skips_the_cache_lookup_and_fetches_only_that_file() {
     // Another quantization may already be cached, so the cache must not answer for a picked file.
     let looked_up = Cell::new(0);
+    let root = tempfile::tempdir().unwrap();
+    let quant = root
+        .path()
+        .join("m-Q8_0.gguf")
+        .to_string_lossy()
+        .into_owned();
     let resolved = prepare(
         "org/gguf",
         false,
@@ -231,11 +242,11 @@ fn picked_file_skips_the_cache_lookup_and_fetches_only_that_file() {
         |repo, fetch| {
             assert_eq!(repo, "org/gguf");
             assert_eq!(fetch, &Fetch::Files(files(&["m-Q8_0.gguf"])));
-            Ok(vec!["/snap/m-Q8_0.gguf".into()])
+            Ok(vec![quant.clone()])
         },
     )
     .unwrap();
-    assert_eq!(resolved, "/snap/m-Q8_0.gguf");
+    assert_eq!(resolved, quant);
     // Only the final resolve of the downloaded path ran; the repository lookup did not.
     assert_eq!(looked_up.get(), 1);
 }
@@ -512,47 +523,29 @@ fn subprocess_plans_gguf_files_and_validates_them_before_caching() {
     let model = snapshot.join("m-Q4_K_M.gguf");
     fs::write(&model, b"GGUFweights").unwrap();
     let marker = temp.path().join("fetched");
-    let python = temp.path().join("python");
+    let absent_mlx = temp.path().join("missing-mlx");
+    let python = crate::config::paths::tools_dir(temp.path())
+        .join(HUB_HELPER)
+        .join(HUB_INTERPRETER);
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
     let json = serde_json::to_string(&model.to_string_lossy()).unwrap();
     // The fake interpreter answers the listing script and records any file fetch.
     fs::write(
         &python,
         format!(
-            "#!/bin/sh\n[ \"$1\" = '-c' ] || exit 2\ncase \"$2\" in\n*list_repo_files*) printf '%s\\n' '[\"m-Q4_K_M.gguf\",\"README.md\"]' ;;\n*hf_hub_download*) touch '{marker}'; printf '[%s]\\n' '{json}' ;;\n*) exit 4 ;;\nesac\n",
+            "#!/bin/sh\n[ \"$1\" = '-I' ] && [ \"$2\" = '-c' ] || exit 2\ncase \"$HF_HUB_CACHE\" in /*) ;; *) exit 3 ;; esac\ncase \"$3\" in\n*list_repo_files*) printf '%s\\n' '[\"m-Q4_K_M.gguf\",\"README.md\"]' ;;\n*hf_hub_download*) [ \"$4\" = 'org/gguf' ] && [ \"$5\" = 'm-Q4_K_M.gguf' ] && [ $# -eq 5 ] || exit 5; touch '{marker}'; printf '[%s]\\n' '{json}' ;;\n*) exit 4 ;;\nesac\n",
             marker = marker.display(),
         ),
     )
     .unwrap();
     fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
     let cancel = AtomicBool::new(false);
-    let fetch = |repo: &str, fetch: &Fetch| -> Result<Vec<String>> {
-        let output = match fetch {
-            Fetch::Snapshot => bail!("unexpected snapshot"),
-            Fetch::Files(files) => {
-                let mut args = vec![repo.to_owned()];
-                args.extend(files.iter().cloned());
-                run_python(&python, FILES, &args, 10, &cancel, &|_| {})?
-            }
-        };
-        Ok(serde_json::from_str(output.trim())?)
-    };
-    let resolved = prepare(
+    let resolved = ensure_local_model_with(
+        &hub_python(temp.path(), &absent_mlx),
         "org/gguf",
-        true,
-        |value| {
-            if Path::new(value).is_absolute() && value.ends_with(".gguf") {
-                crate::llm::local_format::gguf_file(Path::new(value))
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .context("not a GGUF")
-            } else {
-                bail!("missing")
-            }
-        },
-        |repo| {
-            let output = run_python(&python, LIST, &[repo.to_owned()], 10, &cancel, &|_| {})?;
-            Ok(serde_json::from_str(output.trim())?)
-        },
-        fetch,
+        &Choice::Files(files(&["m-Q4_K_M.gguf"])),
+        &cancel,
+        &|_| {},
     )
     .unwrap();
     assert_eq!(

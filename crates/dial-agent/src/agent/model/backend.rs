@@ -56,6 +56,12 @@ pub(crate) fn profile_capped_output(backend: &Backend, requested: u32) -> u32 {
         .map_or(output, |limit| output.min(limit))
 }
 
+/// A missing or ambiguous on-disk checkpoint can be repaired in the model picker. Other
+/// initialization errors (authorization, settings, session state) must not be suppressed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub struct LocalWeightsUnavailable(anyhow::Error);
+
 pub fn make_backend(config: &Config) -> Result<Backend> {
     config.require_model()?;
     let provider = config.provider.as_deref().unwrap_or_default();
@@ -176,7 +182,8 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
         }
         (Some(provider), _) if provider == crate::llm::apple::PROVIDER => ProviderKind::Apple,
         (_, None) => ProviderKind::Local {
-            model_dir: crate::llm::download::ensure_local_model(&config.python, &config.model)?,
+            model_dir: crate::llm::catalog::resolve_local_model(&config.model)
+                .map_err(LocalWeightsUnavailable)?,
         },
         (_, Some(endpoint)) => ProviderKind::Endpoint {
             base_url: endpoint.base_url.clone(),

@@ -13,7 +13,8 @@
 //! (`keep_alive`, five minutes by default), so only the server is managed here.
 
 use crate::platform::{fs as platform_fs, process, procinfo::ProcId};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,8 +37,35 @@ const PROBE: Duration = Duration::from_secs(1);
 /// the bound on how far an [`ensure_until`] call can overrun its deadline, besides the lock poll.
 pub const MIN_PROBE: Duration = Duration::from_millis(100);
 
-/// State directories this process holds a lease in, released by [`shutdown`].
-static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// A Windows job handle is itself a lease: the kernel drops it on process death. Keep one
+/// per client and address, not just in the process which happened to launch Ollama.
+#[derive(Default)]
+pub(crate) struct Lease {
+    #[cfg(windows)]
+    _job: Option<std::os::windows::io::OwnedHandle>,
+}
+
+impl Lease {
+    fn for_server(_server: ProcId) -> Result<Self> {
+        Ok(Self {
+            #[cfg(windows)]
+            _job: Some(
+                process::hold_shared_group(_server).context("joining the managed Ollama job")?,
+            ),
+        })
+    }
+
+    /// Called under the state lock. Register shutdown cleanup even if writing the lease fails.
+    fn remember(self, dir: &Path, client: ProcId) -> Result<()> {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_owned(), self);
+        fs::write(lease_path(dir, client), serde_json::to_vec(&client)?)
+            .context("recording the Ollama server lease")
+    }
+}
+
+static HELD: Mutex<BTreeMap<PathBuf, Lease>> = Mutex::new(BTreeMap::new());
 
 /// How [`ensure`] found the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +120,7 @@ pub(crate) trait Host {
     /// Whether the server answers within `timeout`.
     fn reachable(&self, timeout: Duration) -> bool;
     /// Launches the server and returns its identity.
-    fn spawn(&self, dir: &Path) -> Result<ProcId>;
+    fn spawn(&self, dir: &Path) -> Result<(ProcId, Lease)>;
 }
 
 struct RealHost {
@@ -114,7 +142,7 @@ impl Host for RealHost {
             .is_ok_and(|response| response.status().is_success())
     }
 
-    fn spawn(&self, dir: &Path) -> Result<ProcId> {
+    fn spawn(&self, dir: &Path) -> Result<(ProcId, Lease)> {
         let program = match &self.program {
             Some(program) => program.clone(),
             None => crate::llm::local_format::find_server_on_path("ollama").context(
@@ -133,10 +161,27 @@ impl Host for RealHost {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
-        let child = process::spawn_group(&mut command)
-            .with_context(|| format!("starting {} serve", program.display()))?;
-        // The child is not waited on: it outlives this call and is stopped by `release`.
-        ProcId::of(child.id() as i32).context("`ollama serve` exited immediately")
+        #[cfg(unix)]
+        let spawned = process::spawn_group(&mut command).map(|child| (child, Lease::default()));
+        #[cfg(windows)]
+        let spawned = process::spawn_shared_group(&mut command)
+            .map(|(child, job)| (child, Lease { _job: Some(job) }));
+        let (mut child, lease) =
+            spawned.with_context(|| format!("starting {} serve", program.display()))?;
+        let Some(id) = ProcId::of(child.id() as i32) else {
+            #[cfg(unix)]
+            let _ = process::kill_group(child.id());
+            #[cfg(windows)]
+            drop(lease);
+            let _ = child.wait();
+            anyhow::bail!("`ollama serve` exited immediately");
+        };
+        // Unix children need a waiter, but their lifetime is governed by cross-process leases.
+        #[cfg(unix)]
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok((id, lease))
     }
 }
 
@@ -156,9 +201,9 @@ pub fn ensure(
 /// (waiting for the state lock, probing, spawning, polling for readiness) honours both. A deadline
 /// that has passed before the state lock is taken returns [`Ready::Starting`] without taking the
 /// lock, recording a lease or spawning; a deadline passing later, while the server is still coming
-/// up, also returns `Starting`. A set `cancel` returns [`Cancelled`] at the next check, and a
-/// cancelled or failed call drops its own lease, so it does not keep the server up. The call can
-/// finish up to one readiness probe ([`MIN_PROBE`] at least) after `deadline`.
+/// up, also returns `Starting`. Cancellation interrupts the wait but does not abandon a server
+/// already claimed by this process: that lease remains accounted for until shutdown, just like
+/// a pending `Starting` result. One bounded probe can finish past the deadline.
 pub fn ensure_until(
     user_dir: &Path,
     base_url: &str,
@@ -175,18 +220,18 @@ pub fn ensure_until(
         port,
         program: program.map(Path::to_path_buf),
     };
-    let ready = ensure_with(&dir, me, &host, deadline, cancel)?;
-    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-    if !held.contains(&dir) {
-        held.push(dir);
-    }
-    Ok(ready)
+    ensure_with(&dir, me, &host, deadline, cancel)
 }
 
 /// Releases this process's leases, stopping each server Dial started that no live Dial process
 /// still uses. Run once when Dial exits; errors are ignored because exit must not fail on them.
 pub fn shutdown() {
-    let dirs = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+    let dirs: Vec<_> = HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
     let Some(me) = ProcId::current() else {
         return;
     };
@@ -292,44 +337,35 @@ pub(crate) fn ensure_with(
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<Ready> {
-    let result = claim_and_wait(dir, me, host, deadline, cancel);
-    if result.is_err() {
-        // A caller that fails or is cancelled does not keep the server alive for itself.
-        let _ = fs::remove_file(lease_path(dir, me));
-    }
-    result
-}
-
-fn claim_and_wait(
-    dir: &Path,
-    me: ProcId,
-    host: &dyn Host,
-    deadline: Instant,
-    cancel: Option<&AtomicBool>,
-) -> Result<Ready> {
     let Some(lock) = lock_until(dir, deadline, cancel)? else {
         // Another process holds the state and may be starting the server, or the deadline passed
         // first: either way this call does not wait past its deadline.
         return Ok(Ready::Starting);
     };
-    fs::write(lease_path(dir, me), serde_json::to_vec(&me)?)
-        .context("recording the Ollama server lease")?;
+    let recorded = read_server(dir).filter(ProcId::alive);
+    let lease = recorded.map(Lease::for_server).transpose()?;
     if host.reachable(probe_timeout(deadline)) {
+        lease.unwrap_or_default().remember(dir, me)?;
         return Ok(Ready::Running);
     }
     check_cancel(cancel)?;
-    let server = match read_server(dir).filter(ProcId::alive) {
+    let (server, lease) = match recorded.zip(lease) {
         // Another Dial process started it and it is still coming up: wait for it, never spawn twice.
-        Some(server) => server,
+        Some(owned) => owned,
         // A spawn is not started once the deadline has passed; the lease stays for a later call.
         None if Instant::now() >= deadline => return Ok(Ready::Starting),
         None => {
-            let server = host.spawn(dir)?;
-            fs::write(dir.join(SERVER_FILE), serde_json::to_vec(&server)?)
-                .context("recording the Ollama server")?;
-            server
+            let (server, lease) = host.spawn(dir)?;
+            if let Err(error) = fs::write(dir.join(SERVER_FILE), serde_json::to_vec(&server)?) {
+                #[cfg(unix)]
+                let _ = server.signal_group(crate::platform::procinfo::SIGKILL);
+                // On Windows dropping the unpublished job kills the child and its descendants.
+                return Err(error).context("recording the Ollama server");
+            }
+            (server, lease)
         }
     };
+    lease.remember(dir, me)?;
     drop(lock);
     loop {
         if host.reachable(probe_timeout(deadline)) {
@@ -353,6 +389,9 @@ fn claim_and_wait(
 /// Returns whether a server was stopped.
 pub(crate) fn release(dir: &Path, client: ProcId) -> Result<bool> {
     let _lock = lock(dir)?;
+    // Keep our kernel lease until we have inspected the record under the state lock. Dropping
+    // the last handle kills the job even if the spawning Dial process has already exited.
+    let _lease = HELD.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
     let _ = fs::remove_file(lease_path(dir, client));
     if !live_leases(dir)?.is_empty() {
         return Ok(false);
@@ -360,15 +399,14 @@ pub(crate) fn release(dir: &Path, client: ProcId) -> Result<bool> {
     let Some(server) = read_server(dir) else {
         return Ok(false);
     };
-    let _ = fs::remove_file(dir.join(SERVER_FILE));
-    if !server.same_process() {
-        return Ok(false);
+    let matches = server.same_process();
+    #[cfg(unix)]
+    if matches {
+        process::terminate_group(u32::try_from(server.pid)?)
+            .context("stopping the Ollama server Dial started")?;
     }
-    let Ok(pid) = u32::try_from(server.pid) else {
-        bail!("invalid Ollama server pid {}", server.pid);
-    };
-    process::terminate_group(pid).context("stopping the Ollama server Dial started")?;
-    Ok(true)
+    fs::remove_file(dir.join(SERVER_FILE))?;
+    Ok(matches)
 }
 
 #[cfg(test)]

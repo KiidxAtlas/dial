@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn desktop_screenshot_budget_fits_stdio_reply() {
+    // The Desktop bridge sends one JSON line with base64 data. Exercise the actual
+    // reader and request correlation, not just an estimate of base64 overhead.
+    let data = "A".repeat((11 * 1024 * 1024usize).div_ceil(3) * 4);
+    let mut line = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":{"content":[
+        {"type":"text","text":"Screenshot"}, {"type":"image","mimeType":"image/png","data":data}
+    ]}}))
+    .unwrap();
+    line.push(b'\n');
+    let shared = Shared::new(Vec::new(), None);
+    shared.stderr_done.store(true, Ordering::Release);
+    let (tx, rx) = mpsc::channel();
+    lock(&shared.state).pending.insert(
+        1,
+        Waiter {
+            reply: tx,
+            progress: None,
+        },
+    );
+    read_loop(line.as_slice(), &shared, &mpsc::sync_channel(1).0);
+    assert!(
+        matches!(rx.try_recv(), Ok(Event::Reply(Ok(result))) if result["content"][1]["data"].as_str() == Some(&data))
+    );
+}
+
+#[test]
 fn unsupported_callbacks_are_correlated_and_explain_client_limits() {
     let shared = Shared::new(Vec::new(), None);
     for method in [

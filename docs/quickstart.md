@@ -58,7 +58,8 @@ inspect checkpointed changes yourself. Opening file review does not revert anyth
 
 Keep the changes by leaving them in place; commit when ready. To restore files from the latest
 checkpoint **without changing the conversation**, use `/undo files`. To restore captured edits
-**and rewind the conversation**, use `/undo` (`/undo 3` for three turns). These are restore
+**and rewind the conversation**, use `/undo 1` (`/undo 3` for three turns); bare `/undo` opens a
+chooser that starts on the last turn. These are restore
 commands, not previews. Neither reverses external effects such as a push or a running process.
 
 ## Next

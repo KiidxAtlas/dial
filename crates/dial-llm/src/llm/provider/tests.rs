@@ -2697,6 +2697,24 @@ fn context_window_from_local_metadata_not_endpoint_name_guesses() {
 }
 
 #[test]
+fn gguf_prefix_warming_accepts_installed_files_not_empty_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let available = |path: &Path| {
+        backend(ProviderKind::Local {
+            model_dir: path.to_string_lossy().into_owned(),
+        })
+        .local_prefix_available()
+    };
+    assert!(!available(dir.path()));
+    let first = dir.path().join("m-00001-of-00002.gguf");
+    std::fs::write(&first, b"GGUF").unwrap();
+    assert!(!available(&first));
+    std::fs::write(dir.path().join("m-00002-of-00002.gguf"), b"GGUF").unwrap();
+    assert!(available(&first));
+    assert!(available(dir.path()));
+}
+
+#[test]
 fn release_without_a_server_is_a_no_op() {
     let mut local = backend(ProviderKind::Local {
         model_dir: "/models/x".into(),

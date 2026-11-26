@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 /// console code page and garble non-ASCII text).
 const WINDOWS_COPY: &str = "[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())";
 
-/// Clipboard writers to try in order: PowerShell on Windows, `pbcopy`/`wl-copy`/`xclip` elsewhere.
+/// Clipboard writers to try in order: PowerShell on Windows, `pbcopy`/`wl-copy`/`xclip`/`xsel`
+/// elsewhere (X11 desktops often ship only one of the last two).
 fn copy_programs(windows: bool) -> &'static [(&'static str, &'static [&'static str])] {
     if windows {
         &[(
@@ -27,6 +28,7 @@ fn copy_programs(windows: bool) -> &'static [(&'static str, &'static [&'static s
             ("pbcopy", &[]),
             ("wl-copy", &[]),
             ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
         ]
     }
 }

@@ -174,7 +174,7 @@ failures (including checkpoint failures) are not reset by this recovery.
   shown or reverted here. Files too large to checkpoint are listed as not reviewable.
   A revert includes all changes shown for that file, including your own edits: review carefully.
   Changes after preview are refused, other files are untouched, and the revert has its own
-  `/undo files` checkpoint. `/undo` and `/undo files` name the files they restored and removed. Bare `/undo` also rewinds conversation and refuses unrelated newer file
+  `/undo files` checkpoint. `/undo n` and `/undo files` name the files they restored and removed. `/undo n` also rewinds conversation and refuses unrelated newer file
   checkpoints, including a review revert. Private, binary or oversized interactive diffs require manual review.
   The checkpoint lock only keeps other checkpoint recording out; edit tools and external programs
   are not excluded, so a change can still land between a file's compare and its write. This is not

@@ -231,7 +231,7 @@ fn permission_agent(app: &App) -> Agent<'_> {
 
 #[test]
 fn undo_keeps_conversation_on_partial_restore_and_both_commands_show_warnings() {
-    for command in ["/undo", "/rollback"] {
+    for command in ["/undo 1", "/rollback"] {
         let (_home, _project, app, mut shell) = shell();
         let mut agent = permission_agent(&app);
         let cp = agent.checkpoints().unwrap().clone();
@@ -248,7 +248,7 @@ fn undo_keeps_conversation_on_partial_restore_and_both_commands_show_warnings() 
         assert_eq!(agent.session().messages(), before, "{command}");
         let text = transcript_text(&shell);
         assert!(text.contains("rollback stopped"), "{command}: {text}");
-        if command == "/undo" {
+        if command == "/undo 1" {
             assert!(text.contains("conversation kept"), "{text}");
         }
     }
@@ -258,7 +258,7 @@ fn undo_keeps_conversation_on_partial_restore_and_both_commands_show_warnings() 
 /// of stopping at it forever.
 #[test]
 fn oversized_files_are_named_without_blocking_undo_or_rollback() {
-    for command in ["/undo", "/rollback"] {
+    for command in ["/undo 1", "/rollback"] {
         let (_home, _project, app, mut shell) = shell();
         let mut agent = permission_agent(&app);
         let cp = agent.checkpoints().unwrap().clone();
@@ -282,7 +282,7 @@ fn oversized_files_are_named_without_blocking_undo_or_rollback() {
             "{command}: {text}"
         );
         assert!(!text.contains("rollback stopped"), "{command}: {text}");
-        if command == "/undo" {
+        if command == "/undo 1" {
             assert_ne!(
                 agent.session().messages(),
                 before,
@@ -332,7 +332,7 @@ fn undo_branch_veto_runs_before_restoration() {
     agent.session_mut().append(serde_json::json!({"role":"user","content":"edit", "dial_checkpoint":{"session":session,"turn":turn}})).unwrap();
     let before = agent.session().messages();
     let checkpoints = cp.list();
-    shell.command(&app, &mut agent, "/undo").unwrap();
+    shell.command(&app, &mut agent, "/undo 1").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
     assert_eq!(cp.list(), checkpoints);
     assert_eq!(agent.session().messages(), before);
@@ -608,7 +608,7 @@ fn well_formed_closed_grammar_commands_still_run() {
 /// printing counts in one command and a debug list in the other.
 #[test]
 fn file_restore_reads_the_same_for_undo_and_undo_files() {
-    for command in ["/undo", "/undo files"] {
+    for command in ["/undo 1", "/undo files"] {
         let (_home, _project, app, mut shell) = shell();
         let mut agent = permission_agent(&app);
         let cp = agent.checkpoints().unwrap().clone();
@@ -643,7 +643,7 @@ fn file_restore_reads_the_same_for_undo_and_undo_files() {
 fn undo_on_an_empty_conversation_says_there_is_nothing_to_undo() {
     let (_home, _project, app, mut shell) = shell();
     let mut agent = permission_agent(&app);
-    shell.command(&app, &mut agent, "/undo").unwrap();
+    shell.command(&app, &mut agent, "/undo 1").unwrap();
     let text = transcript_text(&shell);
     assert!(text.contains("Nothing to undo"), "{text}");
     assert!(!text.contains("dropped 0"), "{text}");

@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn root_help_groups_every_visible_command_once_and_help_spelling_still_works() {
+    let help = help_command().render_help().to_string();
+    let everyday = help.find("Everyday commands:").expect("grouped");
+    assert!(
+        everyday < help.find("Inspect and research:").unwrap(),
+        "{help}"
+    );
+    assert!(!help.contains("\nCommands:"), "{help}");
+    let root = command();
+    for sub in root.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+        let row = format!("\n  {} ", sub.get_name());
+        assert_eq!(
+            help.matches(&row).count(),
+            1,
+            "{} in {help}",
+            sub.get_name()
+        );
+    }
+    // Parsing is unchanged: commands still run and `dial help <cmd>` asks for that command's help.
+    let parsed = help_command().try_get_matches_from(["dial", "stats", "--json"]);
+    assert!(parsed.is_ok());
+    let asked = help_spelling(["dial", "help", "sessions"].map(Into::into).to_vec());
+    assert_eq!(asked, ["dial", "sessions", "--help"]);
+    let err = help_command().try_get_matches_from(asked).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    assert!(err.to_string().contains("sessions"), "{err}");
+}
+
+#[test]
 fn slash_cli_hints_resolve_through_the_real_clap_tree() {
     use clap::CommandFactory;
     let root = Cli::command();

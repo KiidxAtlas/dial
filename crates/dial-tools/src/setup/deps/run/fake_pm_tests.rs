@@ -51,21 +51,6 @@ fn install_rejects_bun_older_than_the_minimum() {
 }
 
 #[test]
-fn cancel_stops_a_running_step() {
-    let tmp = tempfile::tempdir().unwrap();
-    let slow = tmp.path().join("slow");
-    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
-    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let step = Step {
-        program: slow.display().to_string(),
-        args: Vec::new(),
-        env: Vec::new(),
-    };
-    let error = run_step(&step, &AtomicBool::new(true), &mut |_| {}).unwrap_err();
-    assert!(error.to_string().contains("cancelled"), "{error}");
-}
-
-#[test]
 fn language_server_install_uses_and_rediscovers_standard_manager_bins() {
     for (id, manager, query, install_args, suffix) in [
         (

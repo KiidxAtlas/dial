@@ -63,6 +63,13 @@ impl StatsOverlay {
         self
     }
 
+    /// Lead with another report, e.g. the live session's cost ahead of the stored history.
+    pub fn with_first_tab(mut self, name: &'static str, text: String) -> Self {
+        self.tabs.insert(0, (name, text));
+        self.help = "Home/End jump to the top or bottom of the report.\nThis session is the live runtime count (/cost); the other tabs are the cross-session database. /usage shows provider quotas.";
+        self
+    }
+
     pub fn title(&self) -> &'static str {
         self.title
     }

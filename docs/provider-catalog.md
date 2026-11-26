@@ -119,6 +119,9 @@ For a custom endpoint with no setup URL, use **Edit configuration / endpoint** t
 Open `/providers`, select **Anthropic**, choose **Sign in with Claude subscription**, and complete
 authorization in your browser. Select **Use sign-in or subscription** to pin that route, or
 **Use API key** to keep the subscription signed in while using API billing.
+For Claude or ChatGPT, if no browser opens, close the providers panel and use the sign-in
+URL in the terminal notice. The browser must be able to reach Dial's localhost callback.
+RPC clients receive the same URL in `auth_url` while the login is pending.
 Dial stores access and refresh tokens in its private user directory, refreshes access before
 requests, fingerprints harness requests with Claude Code's billing-header and body attestation,
 and sends subscription requests only to Anthropic's official API endpoint and protocol.
@@ -279,6 +282,7 @@ The window controls retained history and compaction; it does not send that many 
 request or reserve that much model memory. Actual usage appears before the slash in the context meter.
 Configure the same values in TOML, for example `context_window = "auto"`,
 `cloud_context_window = 64000`, and `local_context_window = 16384`.
+RPC clients can read the resulting token limit from `state.current_model.context_window`.
 
 Anthropic discovery reads `max_input_tokens`; older catalogs with missing windows use
 documented limits and bundled model metadata, including 1M tokens for Claude Opus 5.5 and

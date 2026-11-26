@@ -72,7 +72,9 @@ An index is one JSON document:
 - `version` must be `1`. Unknown fields are rejected.
 - `url` uses the source syntax above. `dial skills install <registry-name>` resolves an entry by name.
 - Schemes: `file://`, `https://`, `http://` only. Size cap 1 MiB. 30-second timeout. Redirects are
-  not followed.
+  not followed. For a local index use an absolute file URL, such as
+  `file:///C:/Team%20Skills/index.json` on Windows or `file:///opt/team%20skills/index.json`
+  on Unix. Remote hosts in file URLs are not supported.
 
 ## Marketplaces and /extensions
 

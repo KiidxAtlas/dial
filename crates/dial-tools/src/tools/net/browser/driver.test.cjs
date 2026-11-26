@@ -18,6 +18,11 @@ function harness({realTimers = false} = {}) {
   context.fakeRequest = {postDataBuffer(){return null;},url(){return 'https://example.com/flood';},method(){return 'GET';},headers(){return {};} };
   return {run(code){return vm.runInContext(code,context);},dispatch(request){onLine(JSON.stringify(request));return vm.runInContext('queue',context);},timers,frames,stdout};
 }
+test('a Chromium spawn failure identifies its binary but does not expose Playwright launch logs',async () => {
+  const h=harness();
+  h.run(`process.env.DIAL_CHROMIUM = '/fake/chromium'; chromium.launch = async () => { throw Error('not a valid Win32 application\\nCall log: private-arguments'); }`);
+  await assert.rejects(h.run('initialize({})'),error => error.message.includes('/fake/chromium') && error.message.includes('incompatible executable') && !error.message.includes('private-arguments'));
+});
 test('post-action settlement is bounded even with unlimited action time', async () => {
   const h = harness({realTimers:true});
   h.run('activeHttp = 1');

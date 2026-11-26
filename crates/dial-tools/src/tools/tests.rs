@@ -5,6 +5,19 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 #[test]
+fn tilde_expands_to_the_user_home_not_the_project() {
+    let (_dir, ws) = workspace();
+    if let Some(home) = crate::config::paths::home_dir() {
+        assert_eq!(Path::new(ws.expand_path_prefixes("~").as_ref()), home);
+        assert_eq!(
+            Path::new(ws.expand_path_prefixes("~/notes").as_ref()),
+            home.join("notes")
+        );
+    }
+    assert_eq!(ws.expand_path_prefixes("~other/notes"), "~other/notes");
+}
+
+#[test]
 fn unknown_tool_and_bad_args_are_errors_not_panics() {
     let (_dir, ws) = workspace();
     assert!(run(&ws, "nope", json!({})).is_error);

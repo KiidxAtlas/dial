@@ -131,7 +131,7 @@ fn find_npm(env: &Env) -> Option<PathBuf> {
     env.find("npm").or_else(|| {
         let node = locate(recipe("node")?, env)?;
         let npm = node.parent()?.join("npm");
-        crate::platform::fs::is_executable(&npm).then_some(npm)
+        crate::platform::fs::executable_candidate(&npm)
     })
 }
 
@@ -177,6 +177,37 @@ fn npm_plan(recipe: &Recipe, env: &Env, destination: &Path, packages: &[&str], n
 }
 
 fn uv_plan(recipe: &Recipe, destination: &Path, package: &str, uv: &Path) -> Plan {
+    let mut args = vec!["tool".into(), "install".into()];
+    let mut env = vec![
+        ("UV_TOOL_DIR".into(), program_text(&destination.join("uv"))),
+        (
+            "UV_TOOL_BIN_DIR".into(),
+            program_text(&destination.join("bin")),
+        ),
+    ];
+    if recipe.id == crate::llm::download::HUB_HELPER {
+        args.extend(
+            [
+                "--no-config",
+                "--managed-python",
+                "--python",
+                "3.12",
+                "--no-build",
+                "--default-index",
+                "https://pypi.org/simple",
+            ]
+            .map(String::from),
+        );
+        env.push((
+            "UV_PYTHON_INSTALL_DIR".into(),
+            program_text(&destination.join("python")),
+        ));
+        env.push((
+            "UV_PYTHON_BIN_DIR".into(),
+            program_text(&destination.join("python-bin")),
+        ));
+    }
+    args.push(package.into());
     Plan {
         id: recipe.id,
         method: format!("uv tool into {}", destination.display()),
@@ -184,14 +215,8 @@ fn uv_plan(recipe: &Recipe, destination: &Path, package: &str, uv: &Path) -> Pla
         fetch: None,
         steps: vec![Step {
             program: program_text(uv),
-            args: vec!["tool".into(), "install".into(), package.into()],
-            env: vec![
-                ("UV_TOOL_DIR".into(), program_text(&destination.join("uv"))),
-                (
-                    "UV_TOOL_BIN_DIR".into(),
-                    program_text(&destination.join("bin")),
-                ),
-            ],
+            args,
+            env,
         }],
         expected: destination.join(recipe.artifact),
     }

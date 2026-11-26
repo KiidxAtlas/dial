@@ -186,26 +186,40 @@ fn window_raise_reports_compositor_constraint() {
 
 #[test]
 #[cfg(not(feature = "wayland-pipewire"))]
-fn capabilities_report_no_capture_without_pipewire_feature() {
-    let mut backend = WaylandBackend {
-        display: DisplaySelector::All,
-        ax: None,
-        ax_error: None,
-        input: None,
-        displays: Vec::new(),
-    };
+fn screenshot_portal_never_widens_narrow_capture_requests() {
+    let mut backend = backend_without_services();
     let caps = backend.capabilities();
-    // Shipped builds compile without wayland-pipewire, so the capture path is
-    // absent; capabilities() must not advertise capture the binary cannot do.
-    assert!(
-        !caps.capture,
-        "capture must be false when the pipewire feature is off"
-    );
-    assert_eq!(caps.capture_permission, "unavailable");
+    assert!(caps.capture);
+    assert_eq!(caps.capture_permission, "prompt-or-granted");
+    for target in ["display:active", "display:other-monitor", "window-id"] {
+        let err = backend
+            .capture(
+                &Target::parse(target),
+                &CaptureCaps::default(),
+                Some(&DisplaySelector::All),
+            )
+            .unwrap_err();
+        assert_eq!(err.code.as_str(), "CaptureFailed");
+        assert!(err.message.contains("whole desktop"));
+    }
+    backend.display = DisplaySelector::Active;
     let err = backend
         .capture(&Target::Desktop, &CaptureCaps::default(), None)
-        .expect_err("capture must fail without the pipewire feature");
-    assert_eq!(err.code.as_str(), "CaptureFailed");
+        .unwrap_err();
+    assert!(err.message.contains("whole desktop"));
+    // Requesting all displays reaches the portal capture path, but a revoked operation
+    // must stop before it contacts the live desktop.
+    let source = control::CancellationSource::default();
+    let token = source.token();
+    source.cancel();
+    let error = control::with_token_for_test(&token, || {
+        backend.capture(&Target::parse("display:all"), &CaptureCaps::default(), None)
+    })
+    .unwrap_err();
+    assert_eq!(error.code, token.check().unwrap_err().code);
+    let frame = FrameGeometry::unmapped_desktop(2400, 1200);
+    assert!(frame.map_point(0.0, 0.0, None).is_err());
+    assert!(backend.validate_frame_layout(&frame).is_err());
 }
 
 fn portal_window(x: i32, y: i32, width: u32, height: u32, position_known: bool) -> AtSpiWindow {

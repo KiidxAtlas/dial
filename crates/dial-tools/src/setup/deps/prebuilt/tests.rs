@@ -10,11 +10,66 @@ fn every_pinned_asset_has_a_full_digest_and_a_known_platform() {
             assert!(asset.url.starts_with("https://"));
             assert!(matches!(
                 asset.platform,
-                "darwin-arm64" | "darwin-x64" | "linux-x64" | "linux-arm64"
+                "darwin-arm64"
+                    | "darwin-x64"
+                    | "linux-x64"
+                    | "linux-arm64"
+                    | "linux-x64-musl"
+                    | "linux-arm64-musl"
+                    | "win32-x64"
+                    | "win32-arm64"
             ));
         }
         assert!(prebuilt.asset("darwin-arm64").is_some());
         assert!(prebuilt.asset("plan9-mips").is_none());
+    }
+}
+
+#[test]
+fn release_platforms_distinguish_linux_libcs_and_reject_unknown_targets() {
+    for (os, arch, abi, expected) in [
+        ("linux", "x86_64", "gnu", Some("linux-x64")),
+        ("linux", "aarch64", "gnu", Some("linux-arm64")),
+        ("linux", "x86_64", "musl", Some("linux-x64-musl")),
+        ("linux", "aarch64", "musl", Some("linux-arm64-musl")),
+        ("linux", "x86_64", "uclibc", None),
+        ("linux", "riscv64", "musl", None),
+        ("macos", "aarch64", "", Some("darwin-arm64")),
+        ("macos", "x86_64", "", Some("darwin-x64")),
+        ("windows", "aarch64", "msvc", Some("win32-arm64")),
+        ("windows", "x86_64", "msvc", Some("win32-x64")),
+        ("freebsd", "x86_64", "", None),
+    ] {
+        assert_eq!(platform_key(os, arch, abi), expected, "{os} {arch} {abi}");
+    }
+}
+
+#[test]
+fn musl_runtimes_use_native_archives_and_do_not_offer_glibc_model_servers() {
+    for platform in ["linux-x64-musl", "linux-arm64-musl"] {
+        for (runtime, format) in [
+            (NODE, Format::TarGz),
+            (BUN, Format::Zip),
+            (UV, Format::TarGz),
+        ] {
+            let asset = runtime.asset(platform).unwrap();
+            assert!(asset.url.contains("-musl"), "{}", asset.url);
+            assert_eq!(asset.format, format);
+        }
+        for runtime in [LLAMA_CPP, SD_CPP] {
+            assert!(runtime.asset(platform).is_none());
+        }
+    }
+}
+
+#[test]
+fn windows_setup_runtimes_have_pinned_native_archives_for_each_architecture() {
+    for arch in ["win32-x64", "win32-arm64"] {
+        let asset = BUN.asset(arch).expect("missing Windows Bun archive");
+        assert_eq!(asset.format, Format::Zip);
+        assert!(asset.url.contains("/bun-windows-"));
+        assert_eq!(NODE.asset(arch).unwrap().format, Format::Zip);
+        assert_eq!(UV.asset(arch).unwrap().format, Format::FlatZip);
     }
 }
 

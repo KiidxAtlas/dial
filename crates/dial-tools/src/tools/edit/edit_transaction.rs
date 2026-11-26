@@ -1,4 +1,7 @@
-use std::fs;
+#[cfg(windows)]
+use self::windows::Permissions;
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::path::{Path, PathBuf};
 
 use crate::tools::Workspace;
@@ -22,7 +25,7 @@ pub(crate) use imp::open_read;
 pub(crate) struct Original {
     pub text: String,
     identity: imp::Identity,
-    permissions: fs::Permissions,
+    permissions: Permissions,
 }
 
 /// One file in a transaction: `before` is what was read, `after` the new text (`None` deletes it).
@@ -35,7 +38,7 @@ pub(crate) struct Change {
     pub seen_after: Option<Vec<bool>>,
     pub authored_whole: bool,
     pub projection: Option<crate::tools::edit::edit_source::Projection>,
-    permissions: Option<fs::Permissions>,
+    permissions: Option<Permissions>,
 }
 
 pub(crate) fn inherit_permissions(change: &mut Change, original: &Original) {
@@ -352,6 +355,17 @@ pub(crate) fn commit_as(
         let notes = lsp::writethrough(ws, &paths, origin);
         if !notes.trim().is_empty() {
             warnings.push(notes.trim_end().to_owned());
+        }
+        if origin == lsp::WriteOrigin::Edit {
+            let edited: Vec<String> = paths
+                .iter()
+                .filter(|(_, kind)| *kind != 3)
+                .map(|(path, _)| ws.rel(path))
+                .collect();
+            let hint = crate::tools::vcs::cochange::note(ws.root(), &edited);
+            if !hint.is_empty() {
+                warnings.push(hint.trim_end().to_owned());
+            }
         }
     }
     Ok(warnings)

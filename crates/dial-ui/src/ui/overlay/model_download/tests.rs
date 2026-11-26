@@ -568,6 +568,30 @@ fn quantization_picker_lists_each_choice_with_its_size() {
 }
 
 #[test]
+fn missing_gguf_client_opens_setup_review_instead_of_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+    let uv = crate::setup::deps::install_dir(&layout.user_dir, "uv")
+        .join(crate::setup::deps::prebuilt::UV.binary);
+    std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
+    std::fs::write(uv, []).unwrap();
+    let mut group = ModelDownloads::fixed(dashboard(Vec::new()));
+    group.source = Some(Source {
+        layout,
+        settings: Settings::from_config(&Default::default()),
+        python: home.path().join("missing"),
+    });
+    group.finish_inspect("org/gguf".into(), Family::Gguf, &[("q4.gguf".into(), 2048)]);
+    assert_eq!(
+        group.key(&key(KeyCode::Enter), &Keymap::defaults()),
+        Step::ReviewSetup(download::HUB_HELPER)
+    );
+    assert!(group.task.is_none());
+    assert!(group.has_picker());
+}
+
+#[test]
 fn window_and_size_helpers_keep_the_cursor_visible_and_read_plainly() {
     assert_eq!(window_start(0, 3), 0);
     assert_eq!(window_start(2, 3), 0);

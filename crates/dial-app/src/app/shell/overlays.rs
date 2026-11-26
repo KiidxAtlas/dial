@@ -386,9 +386,13 @@ impl Shell {
                 panel.browser.select_tab(tab);
                 ActiveOverlay::Extensions(Box::new(panel))
             }
-            Which::Stats(range) => ActiveOverlay::Stats(Box::new(
-                crate::app::commands::session::stats_overlay(app, &range)?,
-            )),
+            Which::Stats(range) => {
+                let mut stats = crate::app::commands::session::stats_overlay(app, &range)?;
+                if let Some(session) = self.stats_session.take() {
+                    stats = stats.with_first_tab("This session", session);
+                }
+                ActiveOverlay::Stats(Box::new(stats))
+            }
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
             Which::Peers(panel) => {
                 let panel = *panel;

@@ -44,3 +44,20 @@ fn coding_keeps_recording_only_while_teaching() {
     );
     assert!(!coding.laya.enabled && !coding.memory.autolearn);
 }
+
+/// Hugging Face snapshots link `name.gguf` to an extensionless blob. Loading the configuration
+/// must keep the link's own path so format detection, projectors and shard siblings still apply.
+#[cfg(unix)]
+#[test]
+fn a_linked_gguf_selection_keeps_its_snapshot_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob-e82f48cc");
+    std::fs::write(&blob, b"GGUF").unwrap();
+    let link = dir.path().join("model-Q4_K_M.gguf");
+    std::os::unix::fs::symlink(&blob, &link).unwrap();
+    let config = resolve(&format!("provider='mlx'\nmodel='{}'\n", link.display()));
+    assert_eq!(
+        Path::new(&config.model),
+        std::path::absolute(&link).unwrap()
+    );
+}

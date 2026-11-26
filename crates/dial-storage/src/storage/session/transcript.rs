@@ -26,9 +26,8 @@ impl Session {
     /// Credentials are redacted and HTML embeds verified images (`storage::export`).
     pub fn export(&self, layout: &Layout, path: &Path, html: bool) -> Result<()> {
         let body = self.export_text(layout, html)?;
-        let mut file =
-            platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), path)
-                .with_context(|| format!("creating export {}", path.display()))?;
+        let mut file = platform_fs::create_new_owner_only(path)
+            .with_context(|| format!("creating export {}", path.display()))?;
         file.write_all(body.as_bytes())
             .context("writing session export")
     }

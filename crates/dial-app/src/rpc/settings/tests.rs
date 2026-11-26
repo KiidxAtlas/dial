@@ -150,3 +150,42 @@ fn get_reports_the_most_specific_layer_that_sets_each_key() {
     let unset = unset.expect("defaults list keys neither layer sets");
     assert!(unset.get("scope").is_none(), "{unset}");
 }
+
+#[test]
+fn default_thinking_is_model_checked_persistent_and_scoped() {
+    let (_project, _home, layout) = layout();
+    set(&layout, &json!({"key":"model", "value":"claude-opus-5-5"})).unwrap();
+    set(&layout, &json!({"key":"provider", "value":"anthropic"})).unwrap();
+    let edit = |level, scope| {
+        default_thinking(
+            &layout,
+            &json!({"provider":"anthropic", "model_id":"claude-opus-5-5", "level":level, "scope":scope}),
+            true,
+        )
+    };
+    assert_eq!(edit("high", "global").unwrap()["level"], "high");
+    assert_eq!(edit("medium", "project").unwrap()["level"], "medium");
+    assert!(edit("unknown", "global").is_err());
+    assert_eq!(
+        default_thinking(&layout, &json!({}), false).unwrap()["level"],
+        "high"
+    );
+    assert_eq!(edit("default", "project").unwrap()["level"], "high");
+    assert!(edit("default", "global").unwrap()["level"].is_null());
+    set(
+        &layout,
+        &json!({"key":"model", "value":"other", "scope":"project"}),
+    )
+    .unwrap();
+    assert!(edit("high", "project").is_err());
+    let other = default_thinking(&layout, &json!({"scope":"project"}), false).unwrap();
+    assert!(other["levels"].as_array().unwrap().is_empty());
+    assert!(
+        default_thinking(
+            &layout,
+            &json!({"scope":"project", "provider":"anthropic", "model_id":"other", "level":"high"}),
+            true
+        )
+        .is_err()
+    );
+}

@@ -59,26 +59,28 @@ pub(in crate::platform) fn open_nofollow(
     Ok(file)
 }
 pub(in crate::platform) fn open_dir_nofollow(path: &Path) -> io::Result<File> {
-    let file = open_nofollow(OpenOptions::new().read(true), path, false)?;
-    if !file.metadata()?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected directory",
-        ));
-    }
-    Ok(file)
+    open_directory(path, FILE_GENERIC_READ)
 }
-/// Writable directory handle: create, rename and delete children, flush, and set its DACL.
-/// Without `DELETE` on the directory itself: every process whose current directory this is
-/// (a shell started there, Explorer) holds it open without delete sharing, so requesting
-/// `DELETE` fails with a sharing violation. Children are removed through their own handles.
-const DIRECTORY_WRITE_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | 0x40;
+/// No DELETE on the directory itself (shells hold cwd handles without delete sharing),
+/// or WRITE_DAC / FILE_DELETE_CHILD. Children are removed through their own handles;
+/// private callers that need to set a directory DACL reopen that same object separately.
+const DIRECTORY_WRITE_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 pub(in crate::platform) fn open_dir_nofollow_write(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .access_mode(DIRECTORY_WRITE_ACCESS)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    reject_reparse(&file)?;
+    open_directory(path, DIRECTORY_WRITE_ACCESS)
+}
+
+const TRAVERSE_DIR: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+fn project_dir_access(stage: bool) -> u32 {
+    TRAVERSE_DIR | if stage { FILE_ADD_FILE } else { 0 }
+}
+pub fn open_project_dir(path: &Path, stage: bool) -> io::Result<File> {
+    open_directory(path, project_dir_access(stage))
+}
+pub fn open_project_dir_beneath(root: &File, name: &Path, stage: bool) -> io::Result<File> {
+    relative_name(root, name, project_dir_access(stage), 1, 1)
+}
+fn open_directory(path: &Path, access: u32) -> io::Result<File> {
+    let file = open_nofollow(OpenOptions::new().access_mode(access), path, false)?;
     if !file.metadata()?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -92,84 +94,16 @@ pub(in crate::platform) fn open_beneath(
     relative: &Path,
     directory: bool,
 ) -> io::Result<File> {
-    let mut current = open_dir_nofollow(root)?;
-    let parts: Vec<_> = relative.components().collect();
-    if parts.is_empty() {
-        return if directory {
-            Ok(current)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty file path",
-            ))
-        };
+    if relative.components().next().is_none() && directory {
+        return open_dir_nofollow(root);
     }
-    for (index, part) in parts.iter().enumerate() {
-        let Component::Normal(name) = part else {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "path must contain only plain names",
-            ));
-        };
-        use std::os::windows::ffi::OsStrExt;
-        let mut wide: Vec<u16> = name.encode_wide().collect();
-        if wide.is_empty()
-            || wide.contains(&0)
-            || wide.contains(&(b':' as u16))
-            || wide.len() > (u16::MAX as usize / 2)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid path component",
-            ));
-        }
-        let text = UNICODE_STRING {
-            Length: (wide.len() * 2) as u16,
-            MaximumLength: (wide.len() * 2) as u16,
-            Buffer: wide.as_mut_ptr(),
-        };
-        let attrs = OBJECT_ATTRIBUTES {
-            Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: current.as_raw_handle() as HANDLE,
-            ObjectName: &text,
-            Attributes: 0x40,
-            SecurityDescriptor: ptr::null_mut(),
-            SecurityQualityOfService: ptr::null_mut(),
-        };
-        let mut handle = ptr::null_mut();
-        let mut status = IO_STATUS_BLOCK::default();
-        let is_dir = index + 1 != parts.len() || directory;
-        // FILE_OPEN (1), FILE_SYNCHRONOUS_IO_NONALERT (0x20), FILE_OPEN_REPARSE_POINT (0x200000).
-        // SAFETY: current keeps RootDirectory live; attrs/text/wide remain live and the
-        // counted UTF-16 length fits u16. handle/status are distinct writable outputs;
-        // synchronous IO uses no asynchronous callback or borrowed buffer after return.
-        let result = unsafe {
-            NtCreateFile(
-                &mut handle,
-                FILE_GENERIC_READ,
-                &attrs,
-                &mut status,
-                ptr::null(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                1,
-                0x20 | 0x200000 | if is_dir { 1 } else { 0x40 },
-                ptr::null(),
-                0,
-            )
-        };
-        if result < 0 {
-            // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS returned above.
-            return Err(io::Error::from_raw_os_error(unsafe {
-                windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
-            } as i32));
-        }
-        // SAFETY: successful NtCreateFile transferred one fresh owned handle to this scope.
-        let next = unsafe { File::from_raw_handle(handle.cast()) };
-        reject_reparse(&next)?;
-        current = next;
-    }
-    Ok(current)
+    relative_name(
+        &open_project_dir(root, false)?,
+        relative,
+        FILE_GENERIC_READ,
+        1,
+        if directory { 1 } else { 0x40 },
+    )
 }
 fn relative_name(
     root: &File,
@@ -228,7 +162,7 @@ fn relative_name(
         let result = unsafe {
             NtCreateFile(
                 &mut handle,
-                if last { access } else { FILE_GENERIC_READ },
+                if last { access } else { TRAVERSE_DIR },
                 &attrs,
                 &mut status,
                 ptr::null(),
@@ -339,10 +273,14 @@ pub(in crate::platform) fn create_new_beneath(
     Ok(file)
 }
 pub(in crate::platform) fn open_beneath_handle(root: &File, relative: &Path) -> io::Result<File> {
+    relative_name(root, relative, FILE_GENERIC_READ, 1, 0x40)
+}
+// Rename and hard-link operations need mutation rights; ordinary workspace readers must not.
+fn mutation_source(root: &File, relative: &Path) -> io::Result<File> {
     relative_name(
         root,
         relative,
-        FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         1,
         0x40,
     )
@@ -393,6 +331,15 @@ pub(in crate::platform) fn open_file_beneath(
         ));
     }
     Ok(file)
+}
+/// Project directories use the parent DACL, unlike private storage directories. Return the
+/// created directory itself so rollback records the identity actually created.
+pub(in crate::platform) fn create_project_dir_beneath(
+    root: &File,
+    relative: &Path,
+    stage: bool,
+) -> io::Result<File> {
+    relative_name(root, relative, project_dir_access(stage), 2, 1)
 }
 pub(in crate::platform) fn create_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
     let dir = relative_name(root, relative, FILE_GENERIC_READ | WRITE_DAC, 2, 1)?;
@@ -549,19 +496,19 @@ pub(in crate::platform) fn link_beneath(
     new: &Path,
 ) -> io::Result<()> {
     retry_sharing(|| {
-        let file = open_beneath_handle(root, existing)?;
+        let file = mutation_source(root, existing)?;
         set_name(&file, root, new, 11, false, false)
     })
 }
 pub(in crate::platform) fn rename_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
     retry_sharing(|| {
-        let file = open_beneath_handle(root, from)?;
+        let file = mutation_source(root, from)?;
         set_name(&file, root, to, 10, false, false)
     })
 }
 pub(in crate::platform) fn replace_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
     retry_sharing(|| {
-        let file = open_beneath_handle(root, from)?;
+        let file = mutation_source(root, from)?;
         set_name(&file, root, to, 10, false, true)
     })
 }
@@ -572,7 +519,7 @@ pub(in crate::platform) fn replace_beneath_file(
     to: &Path,
 ) -> io::Result<()> {
     retry_sharing(|| {
-        let source = open_beneath_handle(root, from)?;
+        let source = mutation_source(root, from)?;
         if identity(&source)? != identity(expected)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -824,6 +771,82 @@ fn security(file: &File) -> io::Result<(Allocation, PSID, *mut ACL)> {
     }
     Ok((Allocation(descriptor), owner, acl))
 }
+
+/// Keep the native ACEs (including deny, inherited and object-specific entries) and
+/// protection flag. ACL buffers passed to Win32 must be DWORD-aligned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDacl {
+    acl: Option<std::sync::Arc<[u32]>>,
+    protected: bool,
+}
+
+impl FileDacl {
+    pub fn read(file: &File) -> io::Result<Self> {
+        let (descriptor, _, acl) = security(file)?;
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor owns the descriptor returned by GetSecurityInfo; both outputs are live.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let acl = if acl.is_null() {
+            None
+        } else {
+            // SAFETY: GetSecurityInfo returned this DWORD-aligned ACL in the live descriptor;
+            // its header's AclSize includes the ACEs and is a multiple of four.
+            let len = unsafe { (*acl).AclSize } as usize;
+            if len < mem::size_of::<ACL>() || !len.is_multiple_of(4) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid DACL size",
+                ));
+            }
+            // SAFETY: the validated AclSize covers `len / 4` DWORD-aligned words inside the
+            // descriptor, which stays live until the slice is copied into the Arc below.
+            let words = unsafe { std::slice::from_raw_parts(acl.cast::<u32>(), len / 4) };
+            Some(std::sync::Arc::from(words))
+        };
+        Ok(Self {
+            acl,
+            protected: control & SE_DACL_PROTECTED != 0,
+        })
+    }
+
+    fn install(&self, file: &File) -> io::Result<()> {
+        let acl = self
+            .acl
+            .as_ref()
+            .map_or(ptr::null_mut(), |words| words.as_ptr().cast_mut().cast());
+        // SAFETY: the copied native ACL remains live for SetSecurityInfo, or null represents
+        // the original null DACL. The input ACL is not modified by the API.
+        unsafe { install_acl(file, acl, self.protected) }?;
+        // An unprotected ACL can acquire ACEs from a different destination directory. Never
+        // write content if this filesystem cannot reproduce the original access exactly.
+        if &Self::read(file)? != self {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "destination cannot preserve the original DACL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::platform) fn create_project_file_beneath(
+    root: &File,
+    name: &Path,
+    acl: Option<&FileDacl>,
+) -> io::Result<File> {
+    // Replacements start private; never write the original's text under a wider inherited DACL.
+    let file = create_new_beneath(root, name, acl.is_some())?;
+    if let Some(acl) = acl
+        && let Err(error) = acl.install(&file)
+    {
+        let _ = remove_beneath(root, name);
+        return Err(error);
+    }
+    Ok(file)
+}
 pub(in crate::platform) fn owned_by_current_user(file: &File) -> io::Result<bool> {
     let (_sd, owner, _) = security(file)?;
     Ok(!owner.is_null() && owned_by_token(owner)?)
@@ -899,10 +922,10 @@ fn private_security_descriptor() -> io::Result<Allocation> {
     // SAFETY: the preceding scan bounded length to the returned live UTF-16 string;
     // _text_owner still owns its aligned allocation and conversion copies these units.
     let sid_text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
-    let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text})")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    parse_security_descriptor(&format!("D:P(A;OICI;FA;;;{sid_text})"))
+}
+fn parse_security_descriptor(sddl: &str) -> io::Result<Allocation> {
+    let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = ptr::null_mut();
     // SAFETY: sddl is a live NUL-terminated UTF-16 buffer, revision 1 is supported, and
     // descriptor is writable output for a LocalAlloc-owned security descriptor on success.
@@ -920,24 +943,37 @@ fn private_security_descriptor() -> io::Result<Allocation> {
     Ok(Allocation(descriptor))
 }
 fn install_private_acl(file: &File) -> io::Result<()> {
-    let _owner = private_security_descriptor()?;
+    install_protected_descriptor(file, &private_security_descriptor()?)
+}
+fn install_protected_descriptor(file: &File, descriptor: &Allocation) -> io::Result<()> {
     let mut present = 0;
     let mut defaulted = 0;
     let mut acl = ptr::null_mut();
-    // SAFETY: _owner retains the valid converted security descriptor and all three output
-    // pointers refer to writable slots. Its returned ACL remains backed by _owner.
-    if unsafe { GetSecurityDescriptorDacl(_owner.0, &mut present, &mut acl, &mut defaulted) } == 0
+    // SAFETY: descriptor retains the valid converted security descriptor and all three
+    // outputs are live. The returned ACL remains backed by descriptor.
+    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) }
+        == 0
         || present == 0
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: file keeps the target handle live and _owner retains the ACL returned above;
-    // unused SID/SACL inputs are null and SetSecurityInfo copies the DACL synchronously.
+    // SAFETY: descriptor retains the native ACL until installation finishes.
+    unsafe { install_acl(file, acl, true) }
+}
+
+/// `acl` is null or points to a valid native ACL for the lifetime of the call.
+unsafe fn install_acl(file: &File, acl: *mut ACL, protected: bool) -> io::Result<()> {
+    let protection = if protected {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: caller retains the valid ACL, file owns the handle, and unused SID/SACLs are null.
     let result = unsafe {
         SetSecurityInfo(
             file.as_raw_handle() as HANDLE,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | protection,
             ptr::null_mut(),
             ptr::null_mut(),
             acl,

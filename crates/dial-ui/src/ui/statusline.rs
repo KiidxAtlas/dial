@@ -1039,31 +1039,47 @@ fn short_account(label: &str) -> String {
     format!("{head}{MARK}{id}]{tail}")
 }
 
-/// Show `path` relative to `home` as `~/…`; a trailing `/` on `home` is ignored.
+/// Show `path` relative to `home` as `~/…`; a trailing separator on `home` is ignored. The
+/// Windows verbatim prefix that `canonicalize` adds (`\\?\C:\…`) is never shown.
 pub fn tilde(path: &str, home: Option<&str>) -> String {
+    let path = without_verbatim(path);
+    let home = home.map(without_verbatim);
     let Some(home) = home
+        .as_deref()
         .map(|h| h.trim_end_matches(std::path::is_separator))
         .filter(|h| !h.is_empty())
     else {
-        return path.to_owned();
+        return path.into_owned();
     };
     match path.strip_prefix(home) {
         Some("") => "~".to_owned(),
         Some(rest) if rest.starts_with(std::path::is_separator) => format!("~{rest}"),
-        _ => path.to_owned(),
+        _ => path.into_owned(),
     }
 }
 
+/// `\\?\C:\x` as `C:\x` and `\\?\UNC\server\share` as `\\server\share`.
+fn without_verbatim(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}").into();
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).into()
+}
+
+/// The last `keep` components, split on this platform's separators (`/`, and `\` on Windows).
 fn last_components(path: &str, keep: usize) -> String {
-    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let components: Vec<&str> = path
+        .split(std::path::is_separator)
+        .filter(|c| !c.is_empty())
+        .collect();
     if components.len() <= keep {
         return if path.len() > 1 {
-            path.trim_end_matches('/').to_owned()
+            path.trim_end_matches(std::path::is_separator).to_owned()
         } else {
             path.to_owned()
         };
     }
-    components[components.len() - keep..].join("/")
+    components[components.len() - keep..].join(std::path::MAIN_SEPARATOR_STR)
 }
 
 // ---------------------------------------------------------------------------------------------

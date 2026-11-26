@@ -107,6 +107,18 @@ impl FrameGeometry {
         }
     }
 
+    /// A portal screenshot has image dimensions but no mapping to monitor coordinates.
+    #[cfg(all(dial_desktop_linux, not(feature = "wayland-pipewire")))]
+    pub(crate) fn unmapped_desktop(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            regions: Vec::new(),
+            layout: Vec::new(),
+            kind: FrameKind::Desktop,
+        }
+    }
+
     #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn for_window(window: &DesktopWindow, px_width: u32, px_height: u32) -> Self {
         Self {

@@ -187,12 +187,13 @@ pub fn update(
     super::run::run_plan(&plan, cancel, progress)?;
     // Re-query instead of claiming a package manager's successful exit means everything is current.
     let path = locate(recipe, env).context("updated tool could not be located")?;
-    super::run::health(
+    super::run::health_with_cancel(
         id,
         &path,
         (id == "whisper-cpp")
             .then(|| super::whisper_model_path(&env.user_dir))
             .as_deref(),
+        cancel,
     )
     .context("update ran but tool health verification failed")?;
     let verified = inspect(recipe, &path, env, &mut |step| query(step, cancel))?;

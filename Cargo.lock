@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "dial"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2255,12 +2255,13 @@ dependencies = [
  "tempfile",
  "toml",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "dial-agent"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ast-grep-language",
@@ -2300,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "dial-app"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2341,14 +2342,14 @@ dependencies = [
 
 [[package]]
 name = "dial-build-info"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "dial-client"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "dial-protocol",
  "serde_json",
@@ -2358,7 +2359,7 @@ dependencies = [
 
 [[package]]
 name = "dial-computer"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2402,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "dial-core"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2422,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "dial-llm"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2458,14 +2459,14 @@ dependencies = [
 
 [[package]]
 name = "dial-protocol"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "dial-storage"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2492,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "dial-tools"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2567,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "dial-ui"
-version = "0.3.19"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
