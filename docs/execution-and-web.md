@@ -354,6 +354,8 @@ element helper on the array fails with that instruction and sends nothing. A win
 property, while elements have `await el.bounds()`; calling `win.bounds()` explains the difference.
 Pointer coordinates must come from a fresh full screenshot of the same window.
 
+On stock Linux Wayland builds, request `(await desktop.display('all')).screenshot()` to open the desktop's Screenshot portal. Review its sharing prompt; the compositor may save the captured image. This fallback requires a running XDG desktop portal with a Screenshot backend. It cannot isolate a named window or monitor, and its image has no monitor geometry for coordinate input or zoom. Dial refuses narrower requests rather than capturing more than requested. Use accessibility actions, an Xorg session, or build with `--features wayland-pipewire` for the geometry-aware ScreenCast backend.
+
 An uncalled function in `code` still fails rather than being silently invoked. Correct the call
 instead of repeating it unchanged, and inspect the target before repeating input: statements
 before the error may already have acted. Approval, read-only enforcement and retry guards are unchanged.
@@ -361,6 +363,12 @@ before the error may already have acted. Approval, read-only enforcement and ret
 ## Browser
 
 Browser sessions support headless launch (the default), optional CDP attachment to an existing browser, and isolated persistent storage state per profile. Browser actions include snapshots, ARIA snapshots, accessibility audits, tracing, and action recording. Linux launches use Bubblewrap containment. Loopback WebSocket connections are permitted for local development servers (including HMR) without disabling the outbound network guard. Orphaned tabs from prior processes are reaped rather than accumulating.
+
+Linux confinement does not expose X11 or Wayland display sockets. Use the default `browser.headless = true` for a managed browser, or explicitly attach to a visible operator browser via the relay or a loopback CDP endpoint. During initial setup, Dial lets the package manager and Chromium downloader attempt their own connections instead of requiring direct access to a public host. The Chromium downloader honors conventional HTTP(S)/ALL/NO proxy variables and `NODE_EXTRA_CA_CERTS`; those settings are not passed to the running browser driver.
+
+On Windows, when Dial uses its npm-installed Bun to provision the standalone Chromium runtime, it
+launches the package's native `bun.exe`, not npm's extensionless shell shim.
+If no package manager is available, Dial can download a checksum-verified Bun archive for Windows x64 or ARM64.
 
 ### Request log, routes, and HAR
 

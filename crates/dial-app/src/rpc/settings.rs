@@ -164,5 +164,56 @@ pub(super) fn reset(layout: &Layout, params: &Value) -> Result<Value> {
     )
 }
 
+/// Read the model new sessions start with, not the current conversation's override.
+fn default_config(layout: &Layout, scope: Scope) -> Result<crate::config::types::Config> {
+    let empty = toml::Table::new();
+    if scope == Scope::Project {
+        settings_store::load_config(layout, &empty)
+    } else {
+        crate::config::types::Config::from_layers(
+            layout,
+            &settings_store::load_layer(layout, scope)?,
+            &empty,
+            &empty,
+        )
+    }
+}
+
+pub(super) fn default_thinking(layout: &Layout, params: &Value, save: bool) -> Result<Value> {
+    use crate::config::thinking::{level_name, main_level, reasoning_profile};
+    let scope = scope(params)?;
+    let mut config = default_config(layout, scope)?;
+    let model = config.selection();
+    let profile = reasoning_profile(&config)?;
+    let levels: Vec<_> = profile
+        .iter()
+        .flat_map(|p| &p.capabilities.reasoning_efforts)
+        .map(|effort| level_name(*effort))
+        .collect();
+    if save {
+        if params["provider"].as_str() != Some(&model.provider)
+            || params["model_id"].as_str() != Some(&model.model)
+        {
+            return Err(coded(
+                ErrorCode::Conflict,
+                "The default model changed; choose a level again",
+            ));
+        }
+        let level = params["level"].as_str().unwrap_or("");
+        if level != "default" && !levels.contains(&level) {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                "This model does not offer that thinking level",
+            ));
+        }
+        let changes = crate::app::main_thinking_changes(&config, level)?;
+        settings_store::save_config(layout, scope, &changes)?;
+        config = default_config(layout, scope)?;
+    }
+    Ok(
+        json!({"provider":model.provider, "model_id":model.model, "levels":levels, "level":main_level(&config)}),
+    )
+}
+
 #[cfg(test)]
 mod tests;

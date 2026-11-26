@@ -483,7 +483,10 @@ not deliver a diagnosis. An explicit blocker can stop immediately. For ambiguous
 reminder stays advisory, so a self-contained explanation need not manufacture a tool call.
 Hosted and full-tier local routes skip this reminder. Peer and monitor callbacks carry an existing
 task rather than creating a new obligation. Investigation, missing work and post-edit evidence share
-one reminder per instruction. An observed attempt is not proof that the resulting finding is correct.
+one model reminder per instruction. Spending it on unfinished work does not skip the final check:
+after the task closes, Dial runs applicable checks that have never run and refreshes stale passes.
+Finishing again does not automatically retry a failure or refusal. An observed attempt is not proof
+that the resulting finding is correct.
 
 #### Completion and loop gates
 

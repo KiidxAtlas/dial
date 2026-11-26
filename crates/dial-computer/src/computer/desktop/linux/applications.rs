@@ -652,10 +652,7 @@ pub(super) fn open(app: Application, activate: bool) -> CoreResult<Application> 
         command.args(&argv[1..]);
         command
     };
-    command.env_clear().envs(
-        std::env::vars()
-            .filter(|(name, value)| crate::tools::exec::sandbox::child_env_allowed(name, value)),
-    );
+    crate::tools::exec::sandbox::inherit_allowed_env(&mut command);
     // Desktop applications outlive Dial and must not inherit its cancellation group.
     use std::os::unix::process::CommandExt;
     command.process_group(0);
@@ -701,11 +698,8 @@ fn terminal_command(entry: &Entry, argv: &[String]) -> CoreResult<Command> {
         .ok_or_else(|| invalid("terminal application executable is unavailable"))?;
     if let Some(helper) = resolve_executable("xdg-terminal-exec", None) {
         let mut query = Command::new(&helper);
+        crate::tools::exec::sandbox::inherit_allowed_env(&mut query);
         query
-            .env_clear()
-            .envs(std::env::vars().filter(|(name, value)| {
-                crate::tools::exec::sandbox::child_env_allowed(name, value)
-            }))
             .arg("--print-id")
             .env_remove("XDG_ACTIVATION_TOKEN")
             .env_remove("DESKTOP_STARTUP_ID")
@@ -773,9 +767,7 @@ fn x11_error(error: impl std::fmt::Display) -> DesktopError {
 
 impl Activation {
     fn connect() -> CoreResult<Self> {
-        if env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
-            || env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
-        {
+        if crate::computer::linux_display::DisplayServer::in_wayland_session() {
             return Err(DesktopError::unsupported(
                 "activate=true is unavailable on Wayland without a compositor-issued user-gesture \
 				 activation token; application was not launched",

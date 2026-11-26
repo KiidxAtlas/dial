@@ -100,18 +100,17 @@ fn shared_control_dir_must_be_private() {
 
 #[test]
 fn probe_payload_ignores_banner_noise() {
-    let stdout =
-        "Welcome to prod\nLast login: yesterday\nDIAL_HOST_PROBE=linux-gnu|/bin/bash|5.2.15\n";
+    let stdout = "Welcome to prod\nLast login: yesterday\nDIAL_HOST_PROBE=linux-gnu~/bin/bash~5.2.15~%OS%~:OS\n";
     let payload = extract_probe_payload(stdout, "", HOST_PROBE_MARKER).unwrap();
     assert_eq!(classify_probe(&payload), (Os::Linux, Shell::Bash, true));
     assert_eq!(
         extract_probe_payload(
             "",
-            "  DIAL_HOST_PROBE=darwin23|/bin/zsh|",
+            "  DIAL_HOST_PROBE=darwin23~/bin/zsh~",
             HOST_PROBE_MARKER
         )
         .as_deref(),
-        Some("darwin23|/bin/zsh|")
+        Some("darwin23~/bin/zsh~")
     );
     assert_eq!(
         extract_probe_payload("nothing", "", HOST_PROBE_MARKER),
@@ -125,17 +124,27 @@ fn probe_payload_ignores_banner_noise() {
 
 #[test]
 fn classifies_windows_and_exotic_shells() {
+    for (line, classification) in [
+        (
+            "DIAL_HOST_PROBE=$OSTYPE~$SHELL~$BASH_VERSION~Windows_NT~$env:OS",
+            (Os::Windows, Shell::Cmd, false),
+        ),
+        (
+            "DIAL_HOST_PROBE=~~~%OS%~Windows_NT",
+            (Os::Windows, Shell::Powershell, false),
+        ),
+        (
+            "DIAL_HOST_PROBE=~~~%OS%~:OS",
+            (Os::Unknown, Shell::Unknown, false),
+        ),
+    ] {
+        let stdout = format!("login banner\r\n{line}\r\n");
+        let payload = extract_probe_payload(&stdout, "", HOST_PROBE_MARKER).unwrap();
+        assert_eq!(classify_probe(&payload), classification);
+    }
+    assert_eq!(classify_probe("msys~/usr/bin/bash~5.1").0, Os::Windows);
     assert_eq!(
-        classify_probe("$OSTYPE|$SHELL|$BASH_VERSION").0,
-        Os::Windows
-    );
-    assert_eq!(
-        classify_probe("%OS%|C:\\Windows\\system32\\cmd.exe|"),
-        (Os::Windows, Shell::Cmd, false)
-    );
-    assert_eq!(classify_probe("msys|/usr/bin/bash|5.1").0, Os::Windows);
-    assert_eq!(
-        classify_probe("darwin22|/usr/local/bin/fish|"),
+        classify_probe("darwin22~/usr/local/bin/fish~"),
         (Os::Macos, Shell::Unknown, false)
     );
     assert_eq!(parse_shell("/bin/dash"), Shell::Sh);
@@ -144,6 +153,40 @@ fn classifies_windows_and_exotic_shells() {
     assert_eq!(os_from_uname("Linux"), Some(Os::Linux));
     assert_eq!(os_from_uname("MINGW64_NT-10.0"), Some(Os::Windows));
     assert_eq!(os_from_uname("FreeBSD"), None);
+}
+
+#[test]
+fn native_login_shells_run_the_host_probe() {
+    #[cfg(windows)]
+    let shells = [
+        ("cmd.exe", &["/d", "/c"][..], Os::Windows, Shell::Cmd),
+        (
+            "powershell.exe",
+            &["-NoProfile", "-NonInteractive", "-Command"][..],
+            Os::Windows,
+            Shell::Powershell,
+        ),
+    ];
+    #[cfg(unix)]
+    let shells = [("sh", &["-c"][..], Os::Linux, Shell::Sh)];
+    for (exe, args, os, shell) in shells {
+        let mut command = Command::new(exe);
+        command
+            .args(args)
+            .env("OS", "Windows_NT")
+            .env("OSTYPE", "linux")
+            .env("SHELL", "/bin/sh");
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::raw_arg(&mut command, host_probe_command());
+        #[cfg(unix)]
+        command.arg(host_probe_command());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{exe}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let payload = extract_probe_payload(&stdout, "", HOST_PROBE_MARKER).unwrap();
+        let (actual_os, actual_shell, _) = classify_probe(&payload);
+        assert_eq!((actual_os, actual_shell), (os, shell));
+    }
 }
 
 #[test]

@@ -2216,6 +2216,9 @@ impl ModelOverlay {
                         scope: self.scope,
                     };
                 }
+                Step::ReviewSetup(id) => {
+                    return OverlayEvent::Action(format!("command:/setup choose {id}"));
+                }
                 Step::SetupEmbedding(model) => {
                     return OverlayEvent::SetupDep {
                         id: embeddings::setup_id(&model),
@@ -2974,6 +2977,17 @@ impl ModelOverlay {
                 .all(|(entry, _)| Some(state_of(entry)) == first_state)
         {
             columns.state_w = 0;
+        }
+        // Likewise a capability column of nothing but `?` says only "not reported"; the selected
+        // model's facts still say so in words.
+        if !rows.is_empty()
+            && rows.iter().all(|(entry, _)| {
+                entry.supports_chat()
+                    && !entry.supports_images()
+                    && capabilities(entry).iter().all(|(_, _, s)| s.is_none())
+            })
+        {
+            columns.caps_w = 0;
         }
 
         // Right pane lines before the list.
@@ -3909,25 +3923,32 @@ impl ModelOverlay {
             format!(" Selected: {}", display_name(entry)),
             theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
         )];
-        first.push(Span::styled(
-            format!("  {}", capability_detail(theme, entry)),
-            theme.fg(Tok::Muted),
-        ));
-        // Missing catalog facts are not evidence that a capability is unsupported.
-        let context = Some(
-            entry
-                .selection
-                .context_window
-                .map(|c| format!("context {}", fmt_context(c)))
-                .unwrap_or_else(|| "context unknown".into()),
-        );
-        let max_output = Some(
-            entry
-                .metadata
-                .max_output_tokens
-                .map(|tokens| format!("max output {}", fmt_context(tokens)))
-                .unwrap_or_else(|| "max output unknown".into()),
-        );
+        // Missing catalog facts are not evidence that a capability is unsupported, so they stay
+        // visible, gathered into one "not reported" fact instead of a row of "unknown"s.
+        let mut unreported: Vec<&str> = Vec::new();
+        let capability = capability_detail(theme, entry);
+        if capability == "capabilities not reported" {
+            unreported.push("capabilities");
+        } else {
+            first.push(Span::styled(
+                format!("  {capability}"),
+                theme.fg(Tok::Muted),
+            ));
+        }
+        let context = entry
+            .selection
+            .context_window
+            .map(|c| format!("context {}", fmt_context(c)));
+        if context.is_none() {
+            unreported.push("context");
+        }
+        let max_output = entry
+            .metadata
+            .max_output_tokens
+            .map(|tokens| format!("max output {}", fmt_context(tokens)));
+        if max_output.is_none() {
+            unreported.push("max output");
+        }
         let facts = context
             .into_iter()
             .chain(max_output)
@@ -3941,6 +3962,10 @@ impl ModelOverlay {
                 state_of(entry).to_owned(),
                 if is_local(entry) { "local" } else { "cloud" }.to_owned(),
             ])
+            .chain(
+                (!unreported.is_empty())
+                    .then(|| format!("not reported: {}", unreported.join(", "))),
+            )
             .collect::<Vec<_>>()
             .join(&theme.dot_sep());
         first.push(Span::styled(
@@ -3957,7 +3982,7 @@ impl ModelOverlay {
         }
         let used = self.roles_using(entry);
         let used_text = if used.is_empty() {
-            "no explicit role assignment".to_owned()
+            "no role".to_owned()
         } else {
             format!(
                 "assigned to: {}",
@@ -3994,7 +4019,7 @@ impl ModelOverlay {
         }
         second.extend([Span::styled(
             format!(
-                "  {} {} · catalog only; /doctor for text/tool tests",
+                "  {} {} · /doctor tests it",
                 theme.sym(Sym::Dot),
                 text::one_line(&entry.source)
             ),
@@ -4083,12 +4108,12 @@ impl ModelOverlay {
         .unwrap_or("main");
         let scope = match self.scope {
             Scope::Global => {
-                "user default; clears this project's overrides for this role after review"
+                "this session and your default; project overrides cleared after review"
             }
-            Scope::Project => "project override",
+            Scope::Project => "this session and this project",
         };
         format!(
-            "Assign {} ({role}): this session + {scope}; other sessions unchanged · Ctrl+B scope",
+            "Enter: {} for {scope} · other sessions unchanged · Ctrl+B scope",
             role_label(role)
         )
     }

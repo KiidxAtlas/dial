@@ -455,6 +455,26 @@ pub fn params_hint(repo: &str) -> Option<String> {
         })
 }
 
+pub const HUB_HELPER: &str = "model-downloads";
+/// `uv tool install` normalizes the distribution name and uses the platform's venv layout.
+pub const HUB_INTERPRETER: &str = if cfg!(windows) {
+    "uv/huggingface-hub/Scripts/python.exe"
+} else {
+    "uv/huggingface-hub/bin/python"
+};
+
+/// Prefer the dedicated Hub client; existing MLX/custom environments remain usable.
+pub fn hub_python(user_dir: &Path, configured: &Path) -> std::path::PathBuf {
+    let private = crate::config::paths::tools_dir(user_dir)
+        .join(HUB_HELPER)
+        .join(HUB_INTERPRETER);
+    if private.is_file() {
+        private
+    } else {
+        configured.to_owned()
+    }
+}
+
 /// Reuse complete local weights, otherwise download a Hugging Face repository.
 /// Local paths are never interpreted as repository ids.
 pub fn ensure_local_model(python: &Path, model: &str) -> Result<String> {
@@ -472,6 +492,8 @@ pub fn ensure_local_model(python: &Path, model: &str) -> Result<String> {
 pub enum Choice {
     /// Plan from the repository listing; refuses GGUF repositories with several quantizations.
     Auto,
+    /// Like Auto, but do not fetch MLX weights for CLI setup on an unsupported host.
+    Setup,
     /// Exactly these repository files, as picked from [`quant_options`]. The cache and listing are
     /// bypassed for the choice, so the picked quantization is what gets fetched.
     Files(Vec<String>),
@@ -491,7 +513,7 @@ pub fn ensure_local_model_with(
 ) -> Result<String> {
     ensure!(!cancel.load(Ordering::SeqCst), "download cancelled");
     let listing: Listing<'_> = match choice {
-        Choice::Auto => Box::new(|repo: &str| -> Result<Vec<String>> {
+        Choice::Auto | Choice::Setup => Box::new(|repo: &str| -> Result<Vec<String>> {
             progress(&format!("listing the files of {repo}"));
             let output = run_python(python, LIST, &[repo.to_owned()], 600, cancel, progress).with_context(
                 || {
@@ -507,6 +529,13 @@ pub fn ensure_local_model_with(
         }
     };
     let fetch = |repo: &str, plan: &Fetch| -> Result<Vec<String>> {
+        if matches!((choice, plan), (Choice::Setup, Fetch::Snapshot))
+            && default_family() != Family::Mlx
+        {
+            bail!(
+                "MLX setup requires Apple Silicon macOS; select a GGUF in /models → Get models instead"
+            );
+        }
         progress(&format!("downloading {repo}"));
         let (script, args) = match plan {
             Fetch::Snapshot => (SNAPSHOT, vec![repo.to_owned()]),
@@ -528,7 +557,7 @@ pub fn ensure_local_model_with(
     };
     prepare(
         model,
-        matches!(choice, Choice::Auto),
+        !matches!(choice, Choice::Files(_)),
         crate::llm::catalog::resolve_local_model,
         &*listing,
         fetch,
@@ -559,11 +588,17 @@ fn run_python(
     cancel: &AtomicBool,
     progress: &dyn Fn(&str),
 ) -> Result<String> {
-    let mut argv = vec!["-c".to_owned(), script.to_owned()];
+    ensure!(
+        python.is_absolute() && python.is_file(),
+        "no Hugging Face client was configured; review `/setup model-downloads` (CLI: `dial doctor --fix model-downloads`) or use an existing local model"
+    );
+    let cache = crate::config::paths::hf_cache()
+        .context("no absolute Hugging Face cache; set HF_HUB_CACHE to an absolute directory")?;
+    let mut argv = vec!["-I".to_owned(), "-c".to_owned(), script.to_owned()];
     argv.extend(args.iter().cloned());
     {
         let mut command = std::process::Command::new(python);
-        command.args(&argv);
+        command.args(&argv).env("HF_HUB_CACHE", cache);
         let timeout = Duration::from_secs(timeout);
         let output = crate::runtime::process::run(
             command,
@@ -622,7 +657,7 @@ fn prepare(
     resolve(snapshot).context("downloaded model has no complete usable weights")
 }
 
-fn is_repo_id(model: &str) -> bool {
+pub fn is_repo_id(model: &str) -> bool {
     let parts: Vec<_> = model.split('/').collect();
     parts.len() == 2
         && parts.iter().all(|part| {

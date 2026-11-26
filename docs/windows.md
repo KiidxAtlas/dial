@@ -17,6 +17,8 @@ Open PowerShell (no admin needed) and run:
 
 Then open a new terminal (or keep using the same one; its PATH is updated too) and run `dial`.
 
+To leave both your user and session PATH unchanged, set `$env:DIAL_NO_MODIFY_PATH = '1'` before running the installer. Run the installed `dial.exe` by its full path if its folder is not already on PATH. Older published Windows installers do not recognize this setting.
+
 Pin a version by running the script as a block:
 
     & ([scriptblock]::Create((irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1))) -Version v0.1.4
@@ -24,6 +26,8 @@ Pin a version by running the script as a block:
 With GitHub CLI signed in, the installer downloads through `gh` instead; this is optional.
 
 Dial finds its state directory from a nonempty `DIAL_HOME`, otherwise `HOME\.dial`, falling back to `USERPROFILE\.dial` on Windows when `HOME` is missing or empty. A typical default is `C:\Users\YourName\.dial`. To choose another location in PowerShell, set `$env:DIAL_HOME = 'D:\Dial'` before running `dial`. To keep it for future terminals too, run `[Environment]::SetEnvironmentVariable('DIAL_HOME', 'D:\Dial', 'User')` (this does not update terminals already open). `DIAL_INSTALL_DIR` controls the executable location, not this state directory.
+
+In file-tool paths, `~` and `~/…` use the same `HOME` → `USERPROFILE` fallback, not `DIAL_HOME`. Normal workspace access rules still apply.
 
 ### Publisher signatures and download warnings
 

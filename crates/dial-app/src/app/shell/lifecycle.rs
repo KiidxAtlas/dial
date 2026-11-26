@@ -156,6 +156,7 @@ impl Shell {
             skills_listing: String::new(),
             pending_config: None,
             busy_overlay: None,
+            stats_session: None,
             palette_recent: Vec::new(),
             pending_verification: None,
             pending_resume: None,

@@ -103,6 +103,8 @@ pub const METHODS: &[Method] = &[
     write("delete_local_model", "model"),
     read("settings_schema", "settings"),
     read("get_settings", "settings"),
+    read("get_default_thinking", "settings"),
+    write("set_default_thinking", "settings"),
     write("set_setting", "settings"),
     write("reset_setting", "settings"),
     read("list_checkpoints", "checkpoints"),

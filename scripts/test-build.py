@@ -36,7 +36,8 @@ class BuildTests(unittest.TestCase):
             "    sys.exit(42)\n"
             "profile = sys.argv[sys.argv.index('--profile') + 1]\n"
             "directory = 'debug' if profile == 'dev' else profile\n"
-            "out = pathlib.Path(os.environ['CARGO_TARGET_DIR']) / directory / 'dial'\n"
+            "name = 'dial.exe' if os.environ.get('OS') == 'Windows_NT' else 'dial'\n"
+            "out = pathlib.Path(os.environ['CARGO_TARGET_DIR']) / directory / name\n"
             "out.parent.mkdir(parents=True, exist_ok=True)\n"
             f"out.write_bytes({BINARY!r})\n"
             "out.chmod(0o755)\n"
@@ -44,7 +45,7 @@ class BuildTests(unittest.TestCase):
         self.cargo.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.install}{os.pathsep}{os.environ['PATH']}")
         # Do not inherit the caller's feature selection or build cache.
-        for name in ("MAKEFLAGS", "MFLAGS", "CARGO_TARGET_DIR", "SLIM", "FEATURES", "PROFILE", "TIMINGS"):
+        for name in ("OS", "MAKEFLAGS", "MFLAGS", "CARGO_TARGET_DIR", "SLIM", "FEATURES", "PROFILE", "TIMINGS"):
             self.env.pop(name, None)
 
     def make(self, *args, success=True):
@@ -78,6 +79,16 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), b"old executable")
         self.assertEqual((self.cache / "local/dial").read_bytes(), BINARY)
+
+    def test_windows_build_installs_and_verifies_exe_at_every_destination(self):
+        self.env['OS'] = 'Windows_NT'
+        cargo_bin = self.home / '.cargo/bin/dial.exe'
+        cargo_bin.parent.mkdir(parents=True)
+        cargo_bin.write_bytes(b'old exe')
+        self.make('update')
+        for target in (self.root / 'bin/dial.exe', self.install / 'dial.exe', cargo_bin):
+            self.assertEqual(target.read_bytes(), BINARY)
+            self.assertFalse(target.with_suffix('').exists())
 
     def test_slim_features_and_dev_install_path(self):
         self.make("update", "SLIM=1", "FEATURES=aws,desktop", "PROFILE=dev", "TIMINGS=1")

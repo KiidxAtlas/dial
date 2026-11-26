@@ -83,3 +83,19 @@ fn cancelled_runtime_install_does_not_create_files() {
     );
     assert!(!layout.user_dir.exists());
 }
+
+#[test]
+fn local_gguf_setup_verifies_without_installing_mlx_or_a_downloader() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+    let model = project.path().join("local.gguf");
+    std::fs::write(&model, b"GGUFweights").unwrap();
+    run(&layout, Some(model.to_str().unwrap()), |config| {
+        assert_eq!(std::path::Path::new(&config.model), model);
+        Ok(serde_json::json!({"inference": true, "lora": false}))
+    })
+    .unwrap();
+    assert!(!layout.user_dir.join("python").exists());
+    assert!(!deps::install_dir(&layout.user_dir, crate::llm::download::HUB_HELPER).exists());
+}

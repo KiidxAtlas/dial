@@ -1,13 +1,29 @@
 use super::*;
 use crate::setup::deps::{prebuilt, recipe};
 
+fn manager_name(tool: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool}.cmd")
+    } else {
+        tool.to_owned()
+    }
+}
+
 /// Fake package managers: executable stubs on a fake `PATH` directory.
 pub(crate) fn fake_tools(root: &Path, tools: &[&str]) -> Env {
     let bin = root.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     for tool in tools {
-        let path = bin.join(tool);
-        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let path = bin.join(manager_name(tool));
+        std::fs::write(
+            &path,
+            if cfg!(windows) {
+                "@exit /b 0\r\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            },
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -26,7 +42,13 @@ fn bun_prefers_npm_into_dial_dir_and_never_uses_sudo() {
     let env = fake_tools(tmp.path(), &["npm", "brew"]);
     let plan = plan(recipe("bun").unwrap(), &env).unwrap();
     assert_eq!(plan.steps.len(), 1);
-    assert!(plan.steps[0].program.ends_with("/fakebin/npm"));
+    assert_eq!(
+        std::fs::canonicalize(&plan.steps[0].program).unwrap(),
+        env.path[0]
+            .join(manager_name("npm"))
+            .canonicalize()
+            .unwrap()
+    );
     assert!(plan.steps[0].args.contains(&"bun".to_owned()));
     assert!(plan.destination.starts_with(env.user_dir.join("tools")));
     assert!(plan.fetch.is_none());
@@ -42,7 +64,14 @@ fn falls_back_to_brew_when_npm_is_absent() {
     let tmp = tempfile::tempdir().unwrap();
     let env = fake_tools(tmp.path(), &["brew"]);
     let plan = plan(recipe("bun").unwrap(), &env).unwrap();
-    assert!(plan.steps[0].display().ends_with("brew install bun"));
+    assert_eq!(
+        std::fs::canonicalize(&plan.steps[0].program).unwrap(),
+        env.path[0]
+            .join(manager_name("brew"))
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(plan.steps[0].args, ["install", "bun"]);
 }
 
 #[test]
@@ -69,6 +98,33 @@ fn no_package_manager_is_reported_plainly() {
     assert_eq!(blocked, Err(Blocked::NoPackageManager(vec!["brew", "go"])));
     if prebuilt::current_platform().is_some() {
         assert!(plan(recipe("bun").unwrap(), &env).is_ok());
+    }
+}
+
+#[test]
+fn private_bun_download_and_piper_launcher_are_discoverable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = fake_tools(tmp.path(), &[]);
+    let exe = std::env::consts::EXE_SUFFIX;
+    for (id, rel) in [
+        ("piper", format!("bin/piper{exe}")),
+        ("bun", format!("bun{exe}")),
+    ] {
+        let recipe = recipe(id).unwrap();
+        let expected = install_dir(&env.user_dir, id).join(rel);
+        if id == "bun" {
+            let Some(asset) = prebuilt::current_platform().and_then(|p| prebuilt::BUN.asset(p))
+            else {
+                continue;
+            };
+            let plan = plan(recipe, &env).unwrap();
+            assert_eq!(plan.fetch.unwrap().asset, *asset);
+            assert_eq!(plan.expected, expected);
+        }
+        assert!(locate(recipe, &env).is_none());
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, b"fixture").unwrap();
+        assert_eq!(locate(recipe, &env), Some(expected));
     }
 }
 
@@ -100,14 +156,22 @@ fn manual_recipes_return_their_hint() {
 fn node_downloads_into_dial_dir_when_no_package_manager_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let env = fake_tools(tmp.path(), &[]);
-    if prebuilt::current_platform().is_none() {
+    let Some(asset) = prebuilt::current_platform().and_then(|p| prebuilt::NODE.asset(p)) else {
+        assert!(plan(recipe("node").unwrap(), &env).is_err());
         return;
-    }
+    };
     let plan = plan(recipe("node").unwrap(), &env).unwrap();
     let fetch = plan.fetch.expect("a verified download");
     assert_eq!(fetch.dest, env.user_dir.join("tools").join("node"));
-    assert!(fetch.asset.url.starts_with("https://nodejs.org/dist/"));
-    assert_eq!(plan.expected, fetch.dest.join("bin/node"));
+    assert!(
+        fetch.asset.url.starts_with("https://nodejs.org/dist/")
+            || fetch
+                .asset
+                .url
+                .starts_with("https://unofficial-builds.nodejs.org/download/release/")
+    );
+    assert_eq!(fetch.asset, *asset);
+    assert_eq!(plan.expected, fetch.dest.join(prebuilt::NODE.binary));
     assert!(plan.steps.is_empty());
     assert!(plan.method.contains("sha256 checked"));
 }
@@ -116,17 +180,22 @@ fn node_downloads_into_dial_dir_when_no_package_manager_exists() {
 fn npm_recipes_use_the_npm_of_a_dial_installed_node() {
     let tmp = tempfile::tempdir().unwrap();
     let env = fake_tools(tmp.path(), &[]);
-    let bin = env.user_dir.join("tools/node/bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("node"), "#!/bin/sh\necho v22.23.3\n").unwrap();
-    std::fs::write(bin.join("npm"), "#!/bin/sh\nexit 0\n").unwrap();
+    let node = env.user_dir.join("tools/node").join(prebuilt::NODE.binary);
+    let bin = node.parent().unwrap();
+    let npm = bin.join(manager_name("npm"));
+    std::fs::create_dir_all(bin).unwrap();
+    std::fs::write(&node, b"node fixture").unwrap();
+    std::fs::write(&npm, b"npm fixture").unwrap();
     #[cfg(unix)]
-    for path in [bin.join("node"), bin.join("npm")] {
+    for path in [&node, &npm] {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let bun = plan(recipe("bun").unwrap(), &env).unwrap();
-    assert_eq!(bun.steps[0].program, bin.join("npm").display().to_string());
+    assert_eq!(
+        std::fs::canonicalize(&bun.steps[0].program).unwrap(),
+        npm.canonicalize().unwrap()
+    );
     let path = bun.steps[0]
         .env
         .iter()

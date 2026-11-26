@@ -1147,9 +1147,7 @@ fn detail_lines_name_context_state_and_roles_using_the_model() {
     send(&mut o, &rig, key(KeyCode::Down));
     let shown = draw(&mut o, &rig, 130, 30);
     assert!(
-        shown.contains("context 32k")
-            && shown.contains("no explicit role assignment")
-            && !shown.contains("Source"),
+        shown.contains("context 32k") && shown.contains("no role") && !shown.contains("Source"),
         "{shown}"
     );
 }
@@ -2209,9 +2207,7 @@ fn detail_lines_label_unknown_values_and_groups_skip_zero_counts() {
     // Responsive facts need not share a physical row with the selected model name.
     for fact in [
         "Selected: ollama/llama3",
-        "capabilities not reported",
-        "context unknown",
-        "max output unknown",
+        "not reported: capabilities, context, max output",
     ] {
         assert!(shown.contains(fact), "missing {fact}: {shown}");
     }
@@ -2383,7 +2379,7 @@ fn compact_roles_prioritize_assignments_and_keep_the_full_effect_in_details() {
     );
     assert!(shown.contains("details") && !shown.contains("Enter picks the model"));
     send(&mut o, &rig, shifted_function(12));
-    assert!(draw(&mut o, &rig, 60, 20).contains("clears this project's overrides"));
+    assert!(draw(&mut o, &rig, 60, 20).contains("project overrides cleared"));
 }
 
 #[test]
@@ -2410,10 +2406,13 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
     );
     assert!(
         o.assignment_effect()
-            .contains("user default; clears this project's overrides")
+            .contains("your default; project overrides cleared")
     );
     o.scope = Scope::Project;
-    assert!(o.assignment_effect().contains("project override"));
+    assert!(
+        o.assignment_effect()
+            .contains("this session and this project")
+    );
     o.show_roles();
     o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
     assert!(matches!(
@@ -2793,7 +2792,7 @@ fn responsive_model_details_keep_consequences_capabilities_and_prices_reachable(
         for expected in [
             "after review",
             "other sessions unchanged",
-            "max output unknown",
+            "max output",
             "no tool calls",
             "$15",
             "no recorded requests",
@@ -2897,7 +2896,7 @@ fn detail_focus_has_a_terminal_safe_key_and_never_navigates_or_assigns_models() 
             send(&mut o, &rig, key(code));
             assert_eq!(o.cursor, 0);
         }
-        assert!(draw(&mut o, &rig, w, h).contains("Assign Conversation"));
+        assert!(draw(&mut o, &rig, w, h).contains("Enter: Conversation"));
         assert!(matches!(
             send(&mut o, &rig, key(KeyCode::Esc)),
             OverlayEvent::None

@@ -31,15 +31,15 @@ pub use credentials::{
 use credentials::{bundled_endpoints, validated_url};
 use local_models::{annotate_embedding_checkpoints, lora_support, mlx_architectures, snapshot};
 pub(crate) use local_models::{
-    chat_template, hf_cache, local_model_entries, read_json, uses_mlx_vlm,
+    chat_template, hf_cache, local_model_entries, local_weights_present, read_json, uses_mlx_vlm,
 };
 pub use local_models::{
     downloaded_local_models, is_embedding_checkpoint, local_lora_support, local_model_metadata,
     resolve_local_model,
 };
 pub use local_removal::{
-    LocalRemoval, ModelInUse, ensure_not_in_use, models_in_use, plan_local_model_removal,
-    remove_local_model,
+    LocalRemoval, ModelInUse, ensure_not_in_use, models_in_use, models_in_use_with_current,
+    plan_local_model_removal, remove_local_model,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use local_servers::forget_llama_props;

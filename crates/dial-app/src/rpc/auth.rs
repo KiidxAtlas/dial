@@ -237,11 +237,11 @@ pub(super) fn start_login(
         let dir = crate::config::paths::subscription_auth_dir(&user_dir)?;
         let provider = provider.to_owned();
         return spawn_flow(state, out, id, provider.clone(), move |ui, cancel| {
-            ui.progress("Complete sign-in in your browser.");
+            let login = oauth::Login { ui, cancel };
             let message = if provider == "anthropic" {
-                anthropic_oauth::login(&dir, cancel)?
+                anthropic_oauth::login(&dir, &login)?
             } else {
-                chatgpt::login(&dir, None, cancel)?
+                chatgpt::login(&dir, None, &login)?
             };
             Ok(json!({"provider":provider,"message":message}))
         });

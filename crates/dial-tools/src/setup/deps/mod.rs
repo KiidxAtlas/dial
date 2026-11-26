@@ -132,12 +132,26 @@ const SD_SERVER: &str = if cfg!(windows) {
 
 pub const RECIPES: &[Recipe] = &[
     Recipe {
+        id: crate::llm::download::HUB_HELPER,
+        title: "Hugging Face model downloads (no MLX)",
+        requires: &["uv"],
+        program: "",
+        base: Base::Install,
+        artifact: crate::llm::download::HUB_INTERPRETER,
+        methods: &[Method::Uv("huggingface_hub==2.4.0")],
+    },
+    Recipe {
         id: "bun",
         title: "Bun",
         requires: &[],
         program: "bun",
         base: Base::Install,
-        artifact: "node_modules/.bin/bun",
+        // npm's extensionless .bin/bun on Windows is a POSIX shell shim, not a Win32 image.
+        artifact: if cfg!(windows) {
+            "node_modules/bun/bin/bun.exe"
+        } else {
+            "node_modules/.bin/bun"
+        },
         methods: &[
             Method::Npm(&["bun"]),
             Method::Brew("bun"),
@@ -181,7 +195,11 @@ pub const RECIPES: &[Recipe] = &[
         requires: &["uv"],
         program: "piper",
         base: Base::Install,
-        artifact: "bin/piper",
+        artifact: if cfg!(windows) {
+            "bin/piper.exe"
+        } else {
+            "bin/piper"
+        },
         methods: &[
             Method::Uv("piper-tts"),
             Method::Manual("pip install piper-tts"),
@@ -404,12 +422,12 @@ pub const RECIPES: &[Recipe] = &[
         program: LLAMA_SERVER,
         base: Base::Install,
         artifact: LLAMA_SERVER,
-        // Homebrew where it exists; otherwise the pinned release archive (Windows and Linux x64).
+        // Homebrew where it exists; otherwise the pinned archive (Windows and glibc Linux x64).
         methods: &[
             Method::Brew("llama.cpp"),
             Method::Download(prebuilt::LLAMA_CPP),
             Method::Manual(
-                "install llama.cpp from https://github.com/ggml-org/llama.cpp/releases and set DIAL_LLAMA_SERVER to its llama-server",
+                "install or build llama.cpp for your platform (https://github.com/ggml-org/llama.cpp) and set DIAL_LLAMA_SERVER to the resulting llama-server executable",
             ),
         ],
     },
@@ -421,11 +439,11 @@ pub const RECIPES: &[Recipe] = &[
         base: Base::Install,
         artifact: SD_SERVER,
         // No package manager ships sd-server; the pinned release archive covers macOS arm64,
-        // Linux x64 and Windows x64.
+        // glibc Linux x64 and Windows x64.
         methods: &[
             Method::Download(prebuilt::SD_CPP),
             Method::Manual(
-                "install stable-diffusion.cpp from https://github.com/leejet/stable-diffusion.cpp/releases and set DIAL_SD_SERVER to its sd-server",
+                "install or build stable-diffusion.cpp for your platform (https://github.com/leejet/stable-diffusion.cpp) and set DIAL_SD_SERVER to the resulting sd-server executable",
             ),
         ],
     },

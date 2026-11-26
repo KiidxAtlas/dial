@@ -115,6 +115,26 @@ fn a_selected_model_is_refused_and_kept() {
 }
 
 #[test]
+fn gguf_folder_removal_protects_a_sibling_selected_by_label() {
+    let s = stores();
+    let entries = [entry("pub/gguf-model · q4.gguf", &s.gguf)];
+    let plan = plan_in(&entries[0].label, &entries, &s.stores).unwrap();
+    for selected in ["pub/gguf-model · q8.gguf", "pub/gguf-model"] {
+        assert!(super::ensure_not_in_use(&plan, &[selected.into()]).is_err());
+    }
+    assert!(super::ensure_not_in_use(&plan, &["pub/gguf-model-other · q8.gguf".into()]).is_ok());
+    let config = crate::config::types::Config::default();
+    let mut selection = ModelSelection::new("mlx", "pub/gguf-model");
+    assert!(
+        super::models_in_use_with_current(&config, Some(&selection)).contains(&selection.model)
+    );
+    selection.base_url = Some("http://127.0.0.1:1234/v1".into());
+    assert!(
+        !super::models_in_use_with_current(&config, Some(&selection)).contains(&selection.model)
+    );
+}
+
+#[test]
 fn unknown_models_and_paths_outside_the_stores_are_refused() {
     let s = stores();
     let outside = s.root.join("elsewhere/model");

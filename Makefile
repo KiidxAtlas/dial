@@ -5,6 +5,8 @@ PROFILE ?= local
 CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
 BUILD_DIR = $(CARGO_TARGET_DIR)/$(if $(filter dev,$(PROFILE)),debug,$(PROFILE))
+# Native Cargo emits dial.exe on Windows, including when Make runs under Git Bash/MSYS.
+DIAL_NAME = $(if $(filter Windows_NT,$(OS)),dial.exe,dial)
 # Slim omits optional integrations; FEATURES can add individual capabilities back.
 SLIM ?= 0
 FEATURES ?=
@@ -12,7 +14,7 @@ CARGO_FEATURE_FLAGS = $(if $(filter 1,$(SLIM)),--no-default-features) $(if $(str
 # TIMINGS=1 writes Cargo's HTML timing report (cargo-timings/) for `make build` and `make update`.
 TIMINGS ?= 0
 TIMINGS_FLAG = $(if $(filter 1,$(TIMINGS)),--timings)
-INSTALL_DIR ?= $(shell path="$$(command -v dial 2>/dev/null)"; if [ -n "$$path" ]; then dirname "$$path"; else printf '%s' "$(HOME)/.local/bin"; fi)
+INSTALL_DIR ?= $(shell path="$$(command -v $(DIAL_NAME) 2>/dev/null)"; if [ -n "$$path" ]; then dirname "$$path"; else printf '%s' "$(HOME)/.local/bin"; fi)
 # Timestamped `dial.bak-*` copies kept per installed location by `make update` (newest first).
 KEEP_BACKUPS ?= 3
 # Checks never install dependencies or download models. Python tests report optional skips.
@@ -25,7 +27,7 @@ NEXTEST_PROFILE ?= default
 # job that keeps NEXTEST_DOCTESTS=1, so a split never runs them twice or skips them.
 NEXTEST_PARTITION ?=
 NEXTEST_DOCTESTS ?= 1
-DIAL ?= $(BUILD_DIR)/dial
+DIAL ?= $(BUILD_DIR)/$(DIAL_NAME)
 
 # Tests that run the embedded shell need a freshly built `dial` host (the test binary cannot act as
 # one). HOST_RUN builds it with the same profile and features as the test command, smoke-checks it,
@@ -79,14 +81,14 @@ update:
 	$(PYTHON) scripts/install-dev.py check --keep "$(KEEP_BACKUPS)"
 	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked $(TIMINGS_FLAG) $(CARGO_FEATURE_FLAGS)
 	mkdir -p bin "$(INSTALL_DIR)"
-	$(PYTHON) scripts/install-dev.py install --keep "$(KEEP_BACKUPS)" --build "$(BUILD_DIR)/dial" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
-	@active="$$(command -v dial 2>/dev/null)"; \
-	if [ -z "$$active" ] || ! cmp -s "$$active" "$(BUILD_DIR)/dial"; then \
+	$(PYTHON) scripts/install-dev.py install --keep "$(KEEP_BACKUPS)" --build "$(BUILD_DIR)/$(DIAL_NAME)" --bin-target "bin/$(DIAL_NAME)" --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/$(DIAL_NAME)"
+	@active="$$(command -v $(DIAL_NAME) 2>/dev/null)"; \
+	if [ -z "$$active" ] || ! cmp -s "$$active" "$(BUILD_DIR)/$(DIAL_NAME)"; then \
 		printf 'ERROR: PATH selects %s, which differs from the installed worktree build.\n' "$$active" >&2; \
 		exit 1; \
 	fi
-	@$(PYTHON) scripts/install-dev.py prune --keep "$(KEEP_BACKUPS)" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
-	@printf 'Updated %s and %s\n' '$(CURDIR)/bin/dial' '$(INSTALL_DIR)/dial'
+	@$(PYTHON) scripts/install-dev.py prune --keep "$(KEEP_BACKUPS)" --bin-target "bin/$(DIAL_NAME)" --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/$(DIAL_NAME)"
+	@printf 'Updated %s and %s\n' '$(CURDIR)/bin/$(DIAL_NAME)' '$(INSTALL_DIR)/$(DIAL_NAME)'
 	@printf '%s\n' 'If your shell cached another dial path, run: hash -r (bash) or rehash (zsh).'
 
 

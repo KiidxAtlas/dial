@@ -242,6 +242,41 @@ fn writable_directory_opens_while_another_handle_denies_delete_sharing() {
 }
 
 #[test]
+fn reading_a_file_needs_no_write_or_delete_sharing() {
+    use std::io::Read;
+    let base = scratch_dir("read-only");
+    std::fs::write(base.join("input"), b"visible").unwrap();
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(base.join("input"))
+        .unwrap();
+    let root = open_dir_nofollow(&base).unwrap();
+    let mut text = String::new();
+    open_beneath_handle(&root, Path::new("input"))
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "visible");
+    drop((held, root));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn workspace_stage_starts_with_the_original_custom_dacl() {
+    let base = tempfile::tempdir().unwrap();
+    let root = open_dir_nofollow_write(base.path()).unwrap();
+    let source = create_new_beneath(&root, Path::new("original"), true).unwrap();
+    // Not our owner-only template: deny Anonymous all access and let SYSTEM read.
+    let custom = parse_security_descriptor("D:P(D;;FA;;;AN)(A;;FA;;;OW)(A;;FR;;;SY)").unwrap();
+    install_protected_descriptor(&source, &custom).unwrap();
+    let original = FileDacl::read(&source).unwrap();
+    let staged = create_project_file_beneath(&root, Path::new("stage"), Some(&original)).unwrap();
+    assert_eq!(staged.metadata().unwrap().len(), 0);
+    assert_eq!(FileDacl::read(&staged).unwrap(), original);
+}
+
+#[test]
 fn short_names_support_link_rename_and_replace() {
     let base = scratch_dir("short-names");
     let root = open_dir_nofollow_write(&base).unwrap();

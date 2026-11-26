@@ -22,11 +22,37 @@ fn is_uri_literal(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-._~/:@!$&'()*+,;=".contains(&byte)
 }
 
+// `canonicalize` returns extended-length paths on Windows. The `?` belongs to the
+// Win32 namespace, not to a URI path component. Keep UNC paths in the local-path
+// form understood by our URI reader, rather than enabling remote file authorities.
+#[cfg(any(windows, test))]
+fn windows_uri_path(path: &str) -> String {
+    if let Some(tail) = path.strip_prefix(r"\\?\UNC\") {
+        return format!("//{}", tail.replace('\\', "/"));
+    }
+    let drive = path.strip_prefix(r"\\?\").filter(|tail| {
+        let bytes = tail.as_bytes();
+        bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1..3) == Some(b":\\")
+    });
+    drive.unwrap_or(path).replace('\\', "/")
+}
+
+/// Lexical identity for the diagnostics cache only. A published URI names a normal drive/UNC
+/// path, even when the workspace selected that document via `canonicalize`'s verbatim form.
+/// Never resolve a path supplied by a language server against the filesystem here.
+pub(super) fn diagnostic_key(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str().filter(|text| text.starts_with(r"\\?\")) {
+        return std::borrow::Cow::Owned(windows_uri_path(text).into());
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 pub fn uri_from_path(path: &Path) -> String {
     #[cfg(unix)]
     let bytes = path.as_os_str().as_bytes().to_vec();
     #[cfg(windows)]
-    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+    let bytes = windows_uri_path(&path.to_string_lossy()).into_bytes();
     let mut uri = String::from("file://");
     #[cfg(windows)]
     if !bytes.starts_with(b"/") {

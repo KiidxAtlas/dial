@@ -199,7 +199,7 @@ fn cached_history_refresh_is_incremental_and_preserves_old_busy_snapshot() {
         .unwrap();
     assert_eq!(projection.messages.as_array().unwrap().len(), 1);
     refresh_messages(&session, &mut projection);
-    assert_eq!(projection.messages, json!(session.messages()));
+    assert_eq!(projection.messages, json!(session.archived_messages()));
     assert_eq!(
         old_body,
         projection.messages[0]["content"].as_str().unwrap().as_ptr()
@@ -213,10 +213,22 @@ fn cached_history_refresh_is_incremental_and_preserves_old_busy_snapshot() {
         .append(json!({"role":"user","content":"replacement"}))
         .unwrap();
     refresh_messages(&session, &mut projection);
-    assert_eq!(projection.messages, json!(session.messages()));
+    assert_eq!(projection.messages, json!(session.archived_messages()));
     session.compact("summary".into(), 1).unwrap();
     refresh_messages(&session, &mut projection);
-    assert_eq!(projection.messages, json!(session.messages()));
+    // Clients see what was said, not the model's compacted view.
+    assert_eq!(projection.messages, json!(session.archived_messages()));
+    assert!(
+        projection
+            .messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["dial_compaction_summary"] != true),
+        "{}",
+        projection.messages
+    );
+    assert_eq!(projection.messages[0]["content"], "first");
     refresh_messages(&Session::ephemeral(), &mut projection);
     assert_eq!(projection.messages, json!([]));
 }

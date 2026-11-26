@@ -31,7 +31,7 @@ fn response(value: serde_json::Value) -> Query {
 
 fn private_bun(env: &Env, version: &str) -> PathBuf {
     let dir = install_dir(&env.user_dir, "bun");
-    let path = dir.join("node_modules/.bin/bun");
+    let path = dir.join(recipe("bun").unwrap().artifact);
     executable(&path, "#!/bin/sh\nexit 99\n");
     let manifest = dir.join("node_modules/bun/package.json");
     fs::create_dir_all(manifest.parent().unwrap()).unwrap();

@@ -29,7 +29,7 @@ pub enum Format {
 /// One release archive for one platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Asset {
-    /// `darwin-arm64`, `darwin-x64`, `linux-x64` or `linux-arm64` (see [`current_platform`]).
+    /// Platform key from [`current_platform`].
     pub platform: &'static str,
     pub url: &'static str,
     /// Lowercase hex SHA-256 of the archive, copied from the project's `SHASUMS256.txt`.
@@ -56,20 +56,39 @@ impl Prebuilt {
 
 /// Platform key of the running machine, or `None` when no prebuilt archive exists for it.
 pub fn current_platform() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("darwin-arm64"),
-        ("macos", "x86_64") => Some("darwin-x64"),
-        ("linux", "x86_64") => Some("linux-x64"),
-        ("linux", "aarch64") => Some("linux-arm64"),
-        ("windows", "x86_64") => Some("win32-x64"),
+    let target_env = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        ""
+    };
+    platform_key(std::env::consts::OS, std::env::consts::ARCH, target_env)
+}
+
+fn platform_key(os: &str, arch: &str, target_env: &str) -> Option<&'static str> {
+    match (os, arch, target_env) {
+        ("macos", "aarch64", _) => Some("darwin-arm64"),
+        ("macos", "x86_64", _) => Some("darwin-x64"),
+        ("linux", "x86_64", "gnu") => Some("linux-x64"),
+        ("linux", "aarch64", "gnu") => Some("linux-arm64"),
+        ("linux", "x86_64", "musl") => Some("linux-x64-musl"),
+        ("linux", "aarch64", "musl") => Some("linux-arm64-musl"),
+        ("windows", "x86_64", _) => Some("win32-x64"),
+        ("windows", "aarch64", _) => Some("win32-arm64"),
         _ => None,
     }
 }
 
-/// Node.js 22 LTS, from nodejs.org. Its `bin/npm` is a relative symlink, so links are kept.
+/// Node.js 22 LTS (arm64 musl from Node unofficial-builds); both sources publish SHASUMS256.txt.
+/// Its `bin/npm` is a relative symlink, so links are kept.
 pub const NODE: Prebuilt = Prebuilt {
     version: "22.23.3",
-    binary: "bin/node",
+    binary: if cfg!(windows) {
+        "node.exe"
+    } else {
+        "bin/node"
+    },
     assets: &[
         Asset {
             platform: "darwin-arm64",
@@ -95,13 +114,37 @@ pub const NODE: Prebuilt = Prebuilt {
             sha256: "5ced2d48d1d7198739b7f86804de0171aefb6823b684b12341d3321afc3cb0b2",
             format: Format::TarGz,
         },
+        Asset {
+            platform: "linux-x64-musl",
+            url: "https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64-musl.tar.gz",
+            sha256: "633f49a4f388c5f9564d56d9c0f5ffa394346d92ca0076fe21cf776ece1988bc",
+            format: Format::TarGz,
+        },
+        Asset {
+            platform: "linux-arm64-musl",
+            url: "https://unofficial-builds.nodejs.org/download/release/v22.23.3/node-v22.23.3-linux-arm64-musl.tar.gz",
+            sha256: "8cec03a498d883739d1dc9b924fda2f86944705b54ac707bf48a637483774c70",
+            format: Format::TarGz,
+        },
+        Asset {
+            platform: "win32-x64",
+            url: "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip",
+            sha256: "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71",
+            format: Format::Zip,
+        },
+        Asset {
+            platform: "win32-arm64",
+            url: "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-arm64.zip",
+            sha256: "33dad22e4cef5ee8f9fbb1b0d037fdacd0e56d12a4580f0d63f68b894deab535",
+            format: Format::Zip,
+        },
     ],
 };
 
 /// Bun 1.4.3, from its GitHub release. The zip holds one `bun` executable.
 pub const BUN: Prebuilt = Prebuilt {
     version: "1.4.3",
-    binary: "bun",
+    binary: if cfg!(windows) { "bun.exe" } else { "bun" },
     assets: &[
         Asset {
             platform: "darwin-arm64",
@@ -127,13 +170,37 @@ pub const BUN: Prebuilt = Prebuilt {
             sha256: "efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21",
             format: Format::Zip,
         },
+        Asset {
+            platform: "linux-x64-musl",
+            url: "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-x64-musl-baseline.zip",
+            sha256: "4b5b0b5503f6ebf15161e8c56eb5a263134c05cd98a86dc11ee43ac5bda9862e",
+            format: Format::Zip,
+        },
+        Asset {
+            platform: "linux-arm64-musl",
+            url: "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-aarch64-musl.zip",
+            sha256: "8de8a0003cc2707bb555887e3d450e24e1edf3f605f491393e89ed61a8853420",
+            format: Format::Zip,
+        },
+        Asset {
+            platform: "win32-x64",
+            url: "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-windows-x64-baseline.zip",
+            sha256: "d7a7d3eb216614544aab0cde2d8d9f2e4e87839bf5a30a1cd11d077f02d84e0c",
+            format: Format::Zip,
+        },
+        Asset {
+            platform: "win32-arm64",
+            url: "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-windows-aarch64.zip",
+            sha256: "5e8f142ef722cbc9f67dc068a166e46ee72be8307b38cac7186589d2face668f",
+            format: Format::Zip,
+        },
     ],
 };
 
 /// uv 0.13.1, from its GitHub release. The tarball holds `uv` and `uvx`.
 pub const UV: Prebuilt = Prebuilt {
     version: "0.13.1",
-    binary: "uv",
+    binary: if cfg!(windows) { "uv.exe" } else { "uv" },
     assets: &[
         Asset {
             platform: "darwin-arm64",
@@ -158,6 +225,30 @@ pub const UV: Prebuilt = Prebuilt {
             url: "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-aarch64-unknown-linux-gnu.tar.gz",
             sha256: "9041c73c99fdc5892cf128140beb354eca9231d502068cc36e6cb53a8e59ad14",
             format: Format::TarGz,
+        },
+        Asset {
+            platform: "linux-x64-musl",
+            url: "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-x86_64-unknown-linux-musl.tar.gz",
+            sha256: "6c86040a8f045ab9adc9e3ec4cdafa03fd00e9a988ed2bf28971c7fc2d0debd0",
+            format: Format::TarGz,
+        },
+        Asset {
+            platform: "linux-arm64-musl",
+            url: "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-aarch64-unknown-linux-musl.tar.gz",
+            sha256: "345a8308e4d1835cdfaadf692836fd3137a6d45864773f05ad7bf59442b1ba16",
+            format: Format::TarGz,
+        },
+        Asset {
+            platform: "win32-x64",
+            url: "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-x86_64-pc-windows-msvc.zip",
+            sha256: "3b2661a463a5baea7f5076ea2b25ab71d77f36a6c0d809e5350651792f80a672",
+            format: Format::FlatZip,
+        },
+        Asset {
+            platform: "win32-arm64",
+            url: "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-aarch64-pc-windows-msvc.zip",
+            sha256: "ec7846a5939b4654afee24f2d82bf6fde71bd7a6952d7748f1135ab301dd0a49",
+            format: Format::FlatZip,
         },
     ],
 };

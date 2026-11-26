@@ -38,6 +38,54 @@ fn finish(mut child: std::process::Child) -> Output {
 }
 
 #[test]
+fn missing_local_weights_leave_rpc_connected_for_model_repair() {
+    let env = Env::new();
+    let missing = env.project.path().join("moved.gguf");
+    let server = Server::new(vec![text("fixture reply after repair")]);
+    let config = env.home.path().join("config.toml");
+    let previous = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{previous}\n[model_roles.tester]\nprovider = 'openai-compatible'\nmodel = 'scripted'\nbase_url = '{}'\n", server.url)).unwrap();
+    let launch = dial_client::Launch::new(env!("CARGO_BIN_EXE_dial"))
+        .args(["--model", missing.to_str().unwrap()])
+        .env("DIAL_HOME", env.home.path())
+        .current_dir(env.project.path());
+    let mut client = dial_client::Client::connect(&launch, SETTLE).unwrap();
+    let session = client.ready().session_id.clone();
+    let notice = client.poll(SETTLE).expect("missing-weight diagnostic");
+    assert!(
+        matches!(notice, dial_client::Message::Event(event) if event.kind == "notice" && event.body["message"].as_str().unwrap().contains("moved.gguf"))
+    );
+    let retry = client
+        .call(
+            "set_model",
+            json!({"provider":"mlx", "model_id":missing, "prepare_local_model":true}),
+            SETTLE,
+        )
+        .unwrap_err();
+    assert!(
+        retry.to_string().contains("no complete downloaded weights"),
+        "{retry}"
+    );
+    let selected = client
+        .call(
+            "set_model",
+            json!({"provider":"openai-compatible", "model_id":"scripted"}),
+            SETTLE,
+        )
+        .unwrap();
+    assert_eq!(selected["model"], "scripted");
+    let reply = client
+        .call("send", json!({"text":"test the repaired session"}), SETTLE)
+        .unwrap();
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(server.requests.lock()[0]["model"], "scripted");
+    assert_eq!(
+        client.call("state", json!({}), SETTLE).unwrap()["session_id"],
+        session
+    );
+}
+
+#[test]
 fn finite_piped_state_and_shutdown_receive_responses_before_eof_cleanup() {
     let env = Env::new();
     let server = Server::new(vec![]);
@@ -404,6 +452,36 @@ fn native_session_model_and_settings_methods_answer_during_a_turn() {
 }
 
 #[test]
+fn local_context_edits_reach_the_window_reported_to_chat() {
+    let env = Env::new();
+    let server = Server::new(vec![]);
+    let mut rpc = RpcChild::start(&env, &server);
+    for (i, (key, value, expected)) in [
+        ("local_context_window", json!(8192), 8192),
+        ("context_window", json!(4096), 4096),
+        ("context_window", json!("auto"), 8192),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 4 * i as u64 + 1;
+        rpc.send(
+            id,
+            "set_setting",
+            json!({"scope":"project","key":key,"value":value}),
+        );
+        assert_eq!(rpc.result(id)["saved"], true);
+        rpc.send(id + 1, "apply_settings", json!({}));
+        rpc.result(id + 1);
+        rpc.send(id + 2, "state", json!({}));
+        assert_eq!(
+            rpc.result(id + 2)["current_model"]["context_window"],
+            expected
+        );
+    }
+}
+
+#[test]
 fn apply_settings_rebuilds_around_the_same_session_and_gui_reads_answer_during_a_turn() {
     let env = Env::new();
     // The scripted server answers one connection at a time, and the interrupt-waiting reply holds
@@ -624,6 +702,39 @@ fn providers_that_needed_a_terminal_sign_in_through_masked_prompts() {
             .contains("cancel"),
         "{ended}"
     );
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
+}
+
+#[test]
+#[ignore = "requires the provider-registered localhost ports 1455 and 54545 to be available"]
+fn headless_subscription_login_offers_a_manual_url_and_remains_cancellable() {
+    let env = Env::new();
+    let server = Server::new(vec![]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "hello", json!({"protocol_version":2}));
+    rpc.result(1);
+    for (provider, authorize) in [
+        ("openai", "https://auth.openai.com/oauth/authorize?"),
+        ("anthropic", "https://claude.ai/oauth/authorize?"),
+    ] {
+        rpc.send(2, "login", json!({"provider":provider}));
+        let notice = loop {
+            let event = rpc.next();
+            assert_ne!(event["id"], 2, "sign-in ended before sending the URL");
+            if event["event"] == "auth_url" {
+                break event;
+            }
+        };
+        assert_eq!(notice["provider"], provider);
+        let url = notice["url"].as_str().unwrap();
+        assert!(url.starts_with(authorize) && url.contains("code_challenge="));
+        assert!(!url.contains("code_verifier"));
+        rpc.send(3, "auth_cancel", json!({"provider":provider}));
+        rpc.result(3);
+        let ended = error_response(&rpc, 2);
+        assert_eq!(ended["error"]["message"], "interrupted");
+    }
     rpc.send(1000, "shutdown", json!({}));
     rpc.result(1000);
 }

@@ -227,10 +227,23 @@ impl Actor {
                 let mut reply: Option<(Value, Value)> = None;
                 loop {
                     let (store, serving) = serving_setup(&config)?;
-                    let backend = if !acp && serving.model.trim().is_empty() {
-                        crate::agent::unconfigured_backend(&serving, "")
-                    } else {
-                        make_backend(&serving)?
+                    let (backend, unavailable) = match make_backend(&serving) {
+                        Ok(backend) => (backend, None),
+                        Err(_) if !acp && serving.model.trim().is_empty() => {
+                            (crate::agent::unconfigured_backend(&serving, ""), None)
+                        }
+                        Err(error)
+                            if !acp
+                                && handoff.is_none()
+                                && error.is::<crate::agent::LocalWeightsUnavailable>() =>
+                        {
+                            let reason = format!("{error:#}");
+                            (
+                                crate::agent::unconfigured_backend(&serving, &reason),
+                                Some(reason),
+                            )
+                        }
+                        Err(error) => return Err(error),
                     };
                     let image_input = backend.accepts_image_input();
                     let session = if acp || handoff.is_some() {
@@ -340,6 +353,9 @@ impl Actor {
                             acp,
                         ));
                         worker_out.attribute(agent.session().id(), Value::Null);
+                        if let Some(reason) = unavailable {
+                            worker_out.emit(json!({"event":"notice", "message":reason}));
+                        }
                     }
                     {
                         let mut published_config =

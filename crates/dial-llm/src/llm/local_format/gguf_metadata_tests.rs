@@ -87,6 +87,22 @@ fn split_models_count_every_shard() {
 }
 
 #[test]
+fn gguf_split_weight_bytes_only_count_the_selected_set() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("m-00001-of-00002.gguf");
+    fs::write(&first, b"GGUF1234").unwrap();
+    let second = root.path().join("m-00002-of-00002.gguf");
+    fs::write(root.path().join("blob"), b"GGUF567").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("blob", &second).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(root.path().join("blob"), &second).unwrap();
+    fs::write(root.path().join("m-q8-00001-of-00002.gguf"), b"GGUFother").unwrap();
+    fs::write(root.path().join("m-00001-of-00003.gguf"), b"GGUFold").unwrap();
+    assert_eq!(gguf_weight_bytes(&second), Some(15));
+}
+
+#[test]
 fn sampling_defaults_are_read_from_float_and_integer_keys() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("m.gguf");

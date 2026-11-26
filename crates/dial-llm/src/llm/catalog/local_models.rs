@@ -355,42 +355,76 @@ pub(super) fn local_models_where(
             });
             candidates.extend(revisions.into_iter().map(|e| e.path()));
         }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut mlx = false;
+        let mut quants = std::collections::BTreeMap::new();
         for path in candidates {
-            let (window, gguf) = match snapshot(&path) {
-                Some(window) => (window, false),
-                None if crate::llm::local_format::gguf_file(&path).is_some() => (None, true),
-                None => continue,
-            };
-            let metadata = local_model_metadata(&path);
-            let (source, available) = if gguf {
-                gguf_listing("Hugging Face cache", metadata.gguf_engines)
-            } else {
-                ("Hugging Face cache (MLX)".into(), true)
-            };
-            models.push(ModelEntry {
-                selection: ModelSelection {
-                    model: path.to_string_lossy().into_owned(),
-                    context_window: window,
-                    ..ModelSelection::default()
-                },
-                label: label.clone(),
-                source,
-                available,
-                metadata: ModelMetadata {
-                    lora: lora_support(trainable, &path),
-                    format: Some(if gguf {
-                        LocalFormat::Gguf
-                    } else {
-                        LocalFormat::Mlx
-                    }),
-                    ..metadata
-                },
-            });
-            break;
+            if !seen.insert(path.clone()) || !path.is_dir() {
+                continue;
+            }
+            if !mlx && let Some(window) = snapshot(&path) {
+                models.push(ModelEntry {
+                    selection: ModelSelection {
+                        model: path.to_string_lossy().into_owned(),
+                        context_window: window,
+                        ..Default::default()
+                    },
+                    label: label.clone(),
+                    source: "Hugging Face cache (MLX)".into(),
+                    available: true,
+                    metadata: ModelMetadata {
+                        lora: lora_support(trainable, &path),
+                        format: Some(LocalFormat::Mlx),
+                        ..local_model_metadata(&path)
+                    },
+                });
+                mlx = true;
+            }
+            for file in crate::llm::local_format::snapshot_ggufs(&path) {
+                let relative = file
+                    .strip_prefix(&path)
+                    .expect("inside snapshot")
+                    .to_owned();
+                quants.entry(relative).or_insert(file);
+            }
+            if models.len() + quants.len() >= MAX_MODELS {
+                break;
+            }
+        }
+        let qualified = mlx || quants.len() > 1;
+        for (relative, file) in quants
+            .into_iter()
+            .take(MAX_MODELS.saturating_sub(models.len()))
+        {
+            models.push(gguf_entry(
+                "Hugging Face cache",
+                &label,
+                qualified.then_some(relative.as_path()),
+                &file,
+            ));
         }
     }
     models
 }
+/// A single installed quant keeps its short repository label; variants name the exact file.
+fn gguf_entry(origin: &str, repo: &str, relative: Option<&Path>, file: &Path) -> ModelEntry {
+    let metadata = local_model_metadata(file);
+    let (source, available) = gguf_listing(origin, metadata.gguf_engines);
+    ModelEntry {
+        selection: ModelSelection {
+            model: file.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        label: relative.map_or_else(|| repo.to_owned(), |r| format!("{repo} · {}", r.display())),
+        source,
+        available,
+        metadata: ModelMetadata {
+            format: Some(LocalFormat::Gguf),
+            ..metadata
+        },
+    }
+}
+
 /// Availability is platform compatibility, not proof that the executable is installed.
 fn gguf_listing(origin: &str, loaders: GgufEngines) -> (String, bool) {
     let label = format!("{origin} (GGUF)");
@@ -413,6 +447,12 @@ fn gguf_listing(origin: &str, loaders: GgufEngines) -> (String, bool) {
         )
     }
 }
+/// Filesystem-only availability check for a resolved route; never interpret the path as a repo id.
+pub(crate) fn local_weights_present(path: &Path) -> bool {
+    (path.is_dir() && snapshot(path).is_some())
+        || crate::llm::local_format::gguf_file(path).is_some()
+}
+
 /// Resolve local inference without asking Hugging Face to look up a revision.
 pub fn resolve_local_model(model: &str) -> Result<String> {
     resolve_local_model_in(model, hf_cache().as_deref(), lmstudio_folder().as_deref())
@@ -423,7 +463,14 @@ pub(super) fn resolve_local_model_in(
     studio: Option<&Path>,
 ) -> Result<String> {
     let path = Path::new(model);
-    if snapshot(path).is_some() || crate::llm::local_format::gguf_file(path).is_some() {
+    if path.is_file()
+        && let Some(file) = crate::llm::local_format::gguf_file(path)
+    {
+        // HF snapshot files can be symlinks to extensionless blobs. Keep the filename and its
+        // siblings (projector/shards) while anchoring a relative selection outside the cwd.
+        return Ok(std::path::absolute(file)?.to_string_lossy().into_owned());
+    }
+    if path.is_dir() && local_weights_present(path) {
         return Ok(fs::canonicalize(path)?.to_string_lossy().into_owned());
     }
     if crate::llm::local_format::detect(path) == Some(crate::llm::local_format::LocalFormat::Splash)
@@ -433,7 +480,12 @@ pub(super) fn resolve_local_model_in(
         );
     }
     // Only the requested label is inspected: listing every download stats each shard of every model.
-    let wanted = |label: &str| label == model;
+    let wanted = |repo: &str| {
+        repo == model
+            || model
+                .strip_prefix(repo)
+                .is_some_and(|s| s.starts_with(" · "))
+    };
     let mut entries = cache
         .map(|cache| local_models_where(cache, None, &wanted))
         .unwrap_or_default();
@@ -441,43 +493,30 @@ pub(super) fn resolve_local_model_in(
         entries.extend(lmstudio_mlx_models_where(studio, None, &wanted));
         entries.extend(lmstudio_gguf_models_where(studio, &wanted));
     }
-    if let Some(entry) = entries.into_iter().find(|entry| entry.label == model) {
-        return Ok(fs::canonicalize(entry.selection.model)?
-            .to_string_lossy()
-            .into_owned());
+    if let Some(entry) = entries.iter().find(|entry| entry.label == model) {
+        let local = Path::new(&entry.selection.model);
+        let resolved = if local.is_file() {
+            std::path::absolute(local)?
+        } else {
+            fs::canonicalize(local)?
+        };
+        return Ok(resolved.to_string_lossy().into_owned());
+    }
+    if entries.iter().any(|entry| {
+        entry
+            .label
+            .strip_prefix(model)
+            .is_some_and(|s| s.starts_with(" · "))
+    }) {
+        anyhow::bail!(
+            "local model {model:?} has multiple installed variants; choose a file in /models or specify its exact path"
+        );
     }
     anyhow::bail!(
         "local model {model:?} has no complete downloaded weights (MLX safetensors or a GGUF file); inference is offline. Download this model first or select a downloaded local model in /models (for architecture maintenance, change the Architecture model in Settings → Model → Project understanding)"
     )
 }
-pub(crate) fn hf_cache() -> Option<PathBuf> {
-    std::env::var_os("HF_HUB_CACHE")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HF_HOME")
-                .filter(|s| !s.is_empty())
-                .map(|s| PathBuf::from(s).join("hub"))
-        })
-        .or_else(|| {
-            std::env::var_os("XDG_CACHE_HOME")
-                .filter(|s| !s.is_empty())
-                .map(|cache| PathBuf::from(cache).join("huggingface/hub"))
-        })
-        // Match huggingface_hub's expanduser on Windows, even in a Git shell with another HOME.
-        .or_else(|| {
-            if cfg!(windows) {
-                std::env::var_os("USERPROFILE")
-                    .filter(|s| !s.is_empty())
-                    .map(|s| PathBuf::from(s).join(".cache/huggingface/hub"))
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            crate::config::paths::home_dir().map(|home| home.join(".cache/huggingface/hub"))
-        })
-}
+pub(crate) use crate::config::paths::hf_cache;
 /// The `mlx_lm/models` directory of dial's Python environment (`dial setup` creates it under the user dir).
 pub(super) fn mlx_architectures(user_dir: &Path) -> Option<PathBuf> {
     let lib = crate::config::paths::python_dir(user_dir).join(".venv/lib");
@@ -574,8 +613,7 @@ pub(super) fn lmstudio_mlx_models_where(
     }
     models
 }
-/// GGUF models LM Studio downloaded (`<folder>/<publisher>/<model>/*.gguf`), listed by the file
-/// `llama-server` would load. Labelled `publisher/model`.
+/// Independently selectable GGUF targets in LM Studio's `<folder>/<publisher>/<model>` store.
 pub(super) fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
     lmstudio_gguf_models_where(folder, &|_| true)
 }
@@ -605,24 +643,18 @@ pub(super) fn lmstudio_gguf_models_where(
             if !keep(&label) {
                 continue;
             }
-            let Some(file) = crate::llm::local_format::gguf_file(&repo.path()) else {
-                continue;
-            };
-            let metadata = local_model_metadata(&file);
-            let (source, available) = gguf_listing("LM Studio download", metadata.gguf_engines);
-            models.push(ModelEntry {
-                selection: ModelSelection {
-                    model: file.to_string_lossy().into_owned(),
-                    ..ModelSelection::default()
-                },
-                label,
-                source,
-                available,
-                metadata: ModelMetadata {
-                    format: Some(LocalFormat::Gguf),
-                    ..metadata
-                },
-            });
+            let root = repo.path();
+            let files = crate::llm::local_format::snapshot_ggufs(&root);
+            let qualified = files.len() > 1 || (!files.is_empty() && snapshot(&root).is_some());
+            for file in files.into_iter().take(MAX_MODELS - models.len()) {
+                let relative = file.strip_prefix(&root).expect("inside model folder");
+                models.push(gguf_entry(
+                    "LM Studio download",
+                    &label,
+                    qualified.then_some(relative),
+                    &file,
+                ));
+            }
         }
     }
     models

@@ -15,6 +15,8 @@ test-bin dial dial cmd::update::tests::
 test-lib dial-core platform::
 # Background job process identity and Windows job-object group ownership.
 test-lib dial-core platform::procinfo
+test-lib dial-llm llm::ollama::serve::tests::a_client_reopens_the_managed_job_and_owns_it_after_the_creator_leaves
+test-lib dial-tools setup::deps::run::tests::cancelling_after_a_step_starts_terminates_its_descendant
 # Embedded shell and bundled utilities must work without Git Bash or host coreutils.
 # Includes in-process stop: Windows terminates external commands carrying the run token.
 test-lib dial-tools embedded_shell::
@@ -24,16 +26,26 @@ test-lib dial-tools tools::fs::system::
 test-lib dial-app cli::run::tests::windows_
 # SFTP protocol safety and optional coverage path handling / shell environment rendering.
 test-lib dial-tools tools::integrations::ssh::sftp::
+test-lib dial-tools tools::integrations::ssh::connection::tests::native_login_shells_run_the_host_probe
 test-lib dial-tools tools::exec::shell::backend_tests::
 test-lib dial-agent agent::verify::coverage::
-# Document transactions commit proposals to real files in temporary workspaces. The
-# `tools::edit::edit_transaction` module has no tests of its own (unix, windows and mod alike).
+# Exercise both document transactions and the underlying filesystem replacement.
+test-lib dial-tools tools::edit::edit_transaction::tests::
 test-lib dial-tools tools::edit::document_transaction
 
 # Startup state resolution and first-run model/provider navigation must work without Unix HOME.
 test-lib dial-llm config::paths::tests::
+test-lib dial-tools tools::tests::tilde_expands_to_the_user_home_not_the_project
+test-lib dial-tools setup::deps::plan::tests::
+test-lib dial-tools setup::deps::prebuilt::tests::windows_setup_runtimes
+test-lib dial-tools tools::code::lsp::text::tests::windows_verbatim_paths
+test-lib dial-tools tools::code::lsp::client::tests::push_diagnostics_match_the_open_document_path
+test-lib dial-tools tools::code::lsp::servers::windows_tests::windows_venv_server
+test-lib dial-agent agent::modes::cleanse::checkers::tests::discovers_local_eslint
+test-lib dial-tools tools::integrations::mcp::client::tests::desktop_screenshot_budget_fits_stdio_reply
 test-lib dial-llm llm::local_format::tests::
 test-lib dial-llm llm::catalog::tests::gguf_downloads_keep_the_local_route_but_are_named_by_their_format
+test-lib dial-llm llm::catalog::tests::cached_gguf_quants_list_selectable_files_without_guessing
 test-lib dial-agent learn::worker::tests::inkling_capabilities_follow_the_exact_engine_pin
 test-lib dial-app rpc::models::tests::local_engine_pin_is_exact_and_only_offers_compatible_engines
 test-lib dial-app app::tests::onboarding_
@@ -42,6 +54,17 @@ test-lib dial-ui ui::overlay::providers::tests::a_local_server_that_is_not_runni
 # Native console input must never enable Kitty CSI-u reports, including after suspend.
 test-lib dial-ui ui::term::tests::
 test-lib dial-storage storage::checkpoint::tests::rollback_refuses_non_directory_checkpoint_entries
+test-lib dial-storage storage::checkpoint::shell_snapshot::tests::timestamp_preserving_rewrite
+test-lib dial-storage storage::checkpoint::shell_snapshot::tests::shell_changes_become_entries
+test-lib dial-storage storage::skills::packages::registry::tests::loads_an_index_from_a_file_url
+test-lib dial-storage storage::skills::packages::tests::install_update_and_remove_a_local_repository_end_to_end
+# User-selected export destinations may be ordinary directories; archive contents stay private.
+test-lib dial-storage storage::dump::tests::all_archive_contains_verbatim_session
+test-lib dial-storage storage::session::tests::rename_persists_without_changing_messages_and_export_escapes_tools
+test-lib dial-storage storage::session::pack::tests::unpack_refuses_to_overwrite_and_pack_never_replaces_an_archive
+test-lib dial-storage storage::skills::packages::tests::plans_native_local_paths_with_spaces_and_refs
+# Runs the clipboard PowerShell transport against an in-memory fixture, not a user's clipboard.
+test-lib dial-computer computer::rpc::computer_rpc_tests::windows_clipboard_text_transport_is_exact
 test-lib dial-llm llm::cancel::tcp::tests::
 # New sessions and header rewrites take the journal writer lock on owner-only files; an append-only
 # handle cannot be locked on Windows (os error 5 on the first `dial` after picking a model).

@@ -16,7 +16,7 @@ pub struct BrowserConfig {
     pub chromium_executable: Option<String>,
     /// Overall operation cap in seconds; 0 explicitly opts into unlimited waits.
     pub timeout_secs: u64,
-    /// Launch Chromium headless (default). Headed mode keeps the same sandbox and egress bridge.
+    /// Launch Chromium headless (default). Linux visible browsing requires explicit attachment.
     pub headless: bool,
     /// Operator-started Chromium DevTools endpoint to attach to (loopback only). Requires allow_attach.
     pub cdp_url: Option<String>,

@@ -15,6 +15,14 @@ fn default_browser_operations_have_a_deadline() {
     assert_eq!(deadline(&json!({}), 0).unwrap(), Duration::ZERO);
 }
 #[test]
+fn linux_launches_headless_or_attaches_but_never_opens_a_host_display_socket() {
+    assert!(linux_launch_mode(true, false).is_ok());
+    assert!(linux_launch_mode(false, true).is_ok());
+    let error = linux_launch_mode(false, false).unwrap_err();
+    assert!(error.contains("browser.headless = true") && error.contains("attach"));
+}
+
+#[test]
 fn sandbox_dependency_paths_are_not_profile_injection() {
     assert!(profile_path(Path::new("/tmp/a\"(allow network*)")).is_err());
     assert!(profile_path(Path::new("relative")).is_err());

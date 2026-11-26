@@ -1,5 +1,6 @@
 //! Version control and GitHub CLI tools.
 
+pub(crate) mod cochange;
 pub(in crate::tools) mod forge_policy;
 pub mod gh;
 pub(in crate::tools) mod gh_cache;

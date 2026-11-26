@@ -133,6 +133,9 @@ pub(super) struct Shell {
     /// Latest-request background `/search` state; see `search.rs`.
     search: search::Search,
     pub(super) busy_overlay: Option<BusyOverlay>,
+    /// The live session's cost report, captured with the agent just before `/stats` opens, so the
+    /// agent-free stats panel can lead with it.
+    pub(super) stats_session: Option<String>,
     /// Palette actions run this session, most recent first; they lead the next palette.
     pub(super) palette_recent: Vec<String>,
     pub(super) worker_editors: crate::ui::overlay::subagent_viewer::WorkerEditors,

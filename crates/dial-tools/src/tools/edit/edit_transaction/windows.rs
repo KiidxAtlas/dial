@@ -10,12 +10,19 @@ use std::{
 use super::{Change, MAX_FILE, Original, matches};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Debug)]
+pub(super) struct Permissions {
+    attributes: fs::Permissions,
+    dacl: crate::platform::fs::FileDacl,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Identity {
     file: crate::platform::FileIdentity,
     len: u64,
     modified: std::time::SystemTime,
     mode: u32,
+    dacl: crate::platform::fs::FileDacl,
 }
 impl Identity {
     fn of(file: &File, meta: &fs::Metadata) -> Result<Self, String> {
@@ -24,6 +31,7 @@ impl Identity {
             len: meta.len(),
             modified: meta.modified().map_err(|e| e.to_string())?,
             mode: crate::platform::fs::mode(meta),
+            dacl: crate::platform::fs::FileDacl::read(file).map_err(|e| e.to_string())?,
         })
     }
 
@@ -59,7 +67,8 @@ impl Drop for ParentCleanup {
             return;
         }
         for entry in self.entries.iter().rev() {
-            if let Ok(file) = crate::platform::fs::open_beneath_handle(&entry.parent, &entry.name)
+            if let Ok(file) =
+                crate::platform::fs::open_project_dir_beneath(&entry.parent, &entry.name, false)
                 && crate::platform::fs::identity(&file).ok() == Some(entry.identity)
             {
                 let _ = crate::platform::fs::remove_dir_beneath(&entry.parent, &entry.name);
@@ -95,14 +104,12 @@ impl Directory {
             .strip_prefix(base)
             .map_err(|_| "edit target escapes workspace")?;
         let parent = relative.parent().unwrap_or(Path::new(""));
-        let mut held = if write {
-            crate::platform::fs::open_dir_nofollow_write(base)
-        } else {
-            crate::platform::fs::open_dir_nofollow(base)
-        }
-        .map_err(|e| err("opening workspace", base, e))?;
+        let mut components = parent.components().peekable();
+        let mut held =
+            crate::platform::fs::open_project_dir(base, write && components.peek().is_none())
+                .map_err(|e| err("opening workspace", base, e))?;
         let mut path = base.to_owned();
-        for component in parent.components() {
+        while let Some(component) = components.next() {
             let Component::Normal(part) = component else {
                 return Err("edit path has a non-normal component".into());
             };
@@ -111,19 +118,20 @@ impl Directory {
             }
             let part = PathBuf::from(part);
             path.push(&part);
-            let (next, created) = match crate::platform::fs::open_dir_beneath_handle(&held, &part) {
+            // Ancestors only need traversal. Ask for installation rights on the final parent.
+            let stage = write && components.peek().is_none();
+            let open = || crate::platform::fs::open_project_dir_beneath(&held, &part, stage);
+            let (next, created) = match open() {
                 Ok(file) => (file, false),
                 Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
-                    let created = match crate::platform::fs::create_dir_beneath(&held, &part) {
-                        Ok(()) => true,
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    match crate::platform::fs::create_project_dir_beneath(&held, &part, stage) {
+                        Ok(file) => (file, true),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
+                            open().map_err(|e| err("opening edit directory", &path, e))?,
+                            false,
+                        ),
                         Err(e) => return Err(err("creating edit directory", &path, e)),
-                    };
-                    (
-                        crate::platform::fs::open_dir_beneath_handle(&held, &part)
-                            .map_err(|e| err("opening no-follow edit directory", &path, e))?,
-                        created,
-                    )
+                    }
                 }
                 Err(e) => return Err(err("opening no-follow edit directory", &path, e)),
             };
@@ -135,12 +143,7 @@ impl Directory {
                     identity,
                 });
             }
-            held = if write {
-                crate::platform::fs::open_dir_beneath_handle_write(&held, &part)
-            } else {
-                Ok(next)
-            }
-            .map_err(|e| err("opening edit directory handle", &path, e))?;
+            held = next;
         }
         Ok(Self { file: held, path })
     }
@@ -180,7 +183,10 @@ impl Directory {
         }
         Ok(Some(Original {
             text: String::from_utf8(bytes).map_err(|_| "edit target is not UTF-8")?,
-            permissions: meta.permissions(),
+            permissions: Permissions {
+                attributes: meta.permissions(),
+                dacl: identity.dacl.clone(),
+            },
             identity,
         }))
     }
@@ -210,7 +216,7 @@ impl Directory {
     fn temp(
         &self,
         content: &str,
-        permissions: Option<&fs::Permissions>,
+        permissions: Option<&Permissions>,
         kind: &str,
     ) -> Result<PathBuf, String> {
         let (name, mut file) = self.temp_file(permissions, kind)?;
@@ -226,7 +232,7 @@ impl Directory {
 
     fn temp_file(
         &self,
-        permissions: Option<&fs::Permissions>,
+        permissions: Option<&Permissions>,
         kind: &str,
     ) -> Result<(PathBuf, File), String> {
         for _ in 0..16 {
@@ -235,13 +241,17 @@ impl Directory {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let file = match crate::platform::fs::create_new_beneath(&self.file, &name, true) {
+            let file = match crate::platform::fs::create_project_file_beneath(
+                &self.file,
+                &name,
+                permissions.map(|p| &p.dacl),
+            ) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(err("staging edit", &self.path, e)),
             };
             if let Some(perms) = permissions
-                && let Err(error) = file.set_permissions(perms.clone())
+                && let Err(error) = file.set_permissions(perms.attributes.clone())
             {
                 let _ = self.unlink(&name);
                 return Err(format!("staging edit: {error}"));

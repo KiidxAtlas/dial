@@ -791,7 +791,25 @@ impl Conversation {
         match message["role"].as_str() {
             Some("user") => {
                 let (text, images) = content_text(&message["content"]);
-                self.entries.push(Entry::User(UserEntry { text, images }));
+                match harness_kind(message, &text) {
+                    None => self.entries.push(Entry::User(UserEntry { text, images })),
+                    Some(Harness::Hidden) => {}
+                    Some(Harness::Compaction) => self.entries.push(Entry::Notice(NoticeEntry {
+                        message: "Earlier conversation was compacted".into(),
+                        kind: Some("compaction".into()),
+                        lane: Some("divider".into()),
+                    })),
+                    Some(Harness::Notice(kind)) => {
+                        let text = strip_notice_tags(&text);
+                        if !text.is_empty() {
+                            self.entries.push(Entry::Notice(NoticeEntry {
+                                message: text,
+                                kind: Some(kind.into()),
+                                lane: Some("context".into()),
+                            }));
+                        }
+                    }
+                }
             }
             Some("assistant") => {
                 let (text, _) = content_text(&message["content"]);
@@ -874,6 +892,94 @@ fn content_text(content: &Value) -> (String, usize) {
         }
         _ => (String::new(), 0),
     }
+}
+
+/// How a user-role record the harness wrote (summaries, carried context, reminders, worker
+/// results) is shown. Such records are never the user's words.
+enum Harness {
+    Hidden,
+    Compaction,
+    Notice(&'static str),
+}
+
+/// Marker keys of harness-written user-role records, with how each is shown. Mirrors the
+/// terminal transcript's replay classification.
+const HARNESS_MARKERS: &[(&str, Option<&str>)] = &[
+    ("dial_compaction_summary", Some("compaction")),
+    ("dial_compaction_notes", Some("compaction")),
+    ("dial_compaction_files", Some("compaction")),
+    ("dial_compaction_critical", Some("compaction")),
+    ("dial_snapcompact", Some("compaction")),
+    ("dial_branch_summary", Some("compaction")),
+    ("dial_context_rollover", Some("compaction")),
+    ("dial_continuation", Some("continue")),
+    ("dial_generated_user", Some("continue")),
+    ("dial_exploration_reminder", Some("investigation")),
+    ("dial_worker_result", Some("subagent")),
+    ("dial_side_result", Some("subagent")),
+    ("dial_reminder", Some("recovery")),
+    ("dial_transient", None),
+    ("dial_portable_rules", None),
+    ("dial_context_notes", None),
+];
+
+/// Harness corrections sent as unmarked user messages; their opening words are controller-owned.
+const HARNESS_PREFIXES: &[&str] = &[
+    "<dial-notice",
+    "Your tool call was unreadable:",
+    "That looked like a tool call written as plain text",
+];
+
+/// The legacy unmarked compaction frame (`Session::compaction_message`).
+const COMPACTION_FRAME: &str =
+    "<summary>\nSummary of the earlier conversation (older messages were compacted away):\n";
+
+fn harness_kind(message: &Value, text: &str) -> Option<Harness> {
+    let marked = HARNESS_MARKERS.iter().find(|(key, _)| {
+        message
+            .get(*key)
+            .is_some_and(|value| !value.is_null() && *value != false)
+    });
+    if let Some((_, kind)) = marked {
+        return Some(match kind {
+            None => Harness::Hidden,
+            Some("compaction") => Harness::Compaction,
+            Some(kind) => Harness::Notice(kind),
+        });
+    }
+    if text.starts_with(COMPACTION_FRAME) {
+        return Some(Harness::Compaction);
+    }
+    let trimmed = text.trim_start();
+    HARNESS_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+        .then_some(Harness::Notice("recovery"))
+}
+
+/// Whether a persisted user-role record was written by the harness rather than typed by the
+/// user. [`Conversation`] never shows such a record as an [`Entry::User`] row.
+pub fn is_harness_message(message: &Value) -> bool {
+    message["role"] == "user"
+        && harness_kind(message, &content_text(&message["content"]).0).is_some()
+}
+
+/// `text` without the `<dial-notice …>` envelope tags.
+fn strip_notice_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let next_tag = |s: &str| {
+        [s.find("<dial-notice"), s.find("</dial-notice")]
+            .into_iter()
+            .flatten()
+            .min()
+    };
+    while let Some(at) = next_tag(rest) {
+        out.push_str(&rest[..at]);
+        rest = rest[at..].split_once('>').map_or("", |(_, after)| after);
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
 }
 
 fn strings(value: &Value) -> Vec<String> {

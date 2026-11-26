@@ -2,6 +2,8 @@
 mod capture;
 mod libei;
 mod portal;
+#[cfg(not(feature = "wayland-pipewire"))]
+mod screenshot;
 mod xkb;
 
 use image::RgbaImage;
@@ -135,10 +137,6 @@ impl PortalGeometry {
 }
 
 pub struct WaylandBackend {
-    #[cfg_attr(
-        not(feature = "wayland-pipewire"),
-        expect(dead_code, reason = "only read by the pipewire capture path")
-    )]
     display: DisplaySelector,
     ax: Option<AtSpiAx>,
     ax_error: Option<DesktopError>,
@@ -216,10 +214,9 @@ impl Backend for WaylandBackend {
         DesktopCapabilities {
             backend: "wayland".to_string(),
             display_server: Some("wayland".to_string()),
-            // The PipeWire screencast path is compiled in only under the
-            // wayland-pipewire feature; without it capture() hard-errors, so the
-            // capability report must not advertise a capture the binary cannot do.
-            capture: cfg!(feature = "wayland-pipewire"),
+            // ScreenCast supports mapped frames; stock builds can still capture an
+            // explicitly requested whole desktop through the Screenshot portal.
+            capture: true,
             input: true,
             ax: self.ax.is_some(),
             background_window_input: false,
@@ -229,11 +226,7 @@ impl Backend for WaylandBackend {
             held_input: true,
             spaces: false,
             global_escape: false,
-            capture_permission: if cfg!(feature = "wayland-pipewire") {
-                "prompt-or-granted".to_string()
-            } else {
-                "unavailable".to_string()
-            },
+            capture_permission: "prompt-or-granted".to_string(),
             input_permission: input_permission.to_string(),
             ax_permission: if self.ax.is_some() {
                 "granted".to_string()
@@ -254,7 +247,7 @@ impl Backend for WaylandBackend {
         {
             let _ = frame;
             Err(DesktopError::invalid_coordinate_frame(
-                "validating Wayland display geometry requires the wayland-pipewire feature",
+                "Wayland Screenshot does not report monitor geometry; use accessibility actions, a wayland-pipewire build, or an Xorg session for coordinate input and zoom",
             ))
         }
         #[cfg(feature = "wayland-pipewire")]
@@ -305,10 +298,21 @@ impl Backend for WaylandBackend {
     ) -> CoreResult<(RgbaImage, FrameGeometry)> {
         #[cfg(not(feature = "wayland-pipewire"))]
         {
-            let _ = (target, selector);
-            Err(DesktopError::capture_failed(
-                "Wayland capture requires the wayland-pipewire feature",
-            ))
+            let explicit = target.display_selector();
+            if matches!(target, Target::Window(_))
+                || !matches!(
+                    explicit.as_ref().unwrap_or(&self.display),
+                    DisplaySelector::All
+                )
+                || selector.is_some_and(|s| !matches!(s, DisplaySelector::All))
+            {
+                return Err(DesktopError::capture_failed(
+                    "Wayland Screenshot can only share the whole desktop. For that scope request (await desktop.display('all')).screenshot(); for a narrower target use a wayland-pipewire build or an Xorg session",
+                ));
+            }
+            let image = screenshot::capture()?;
+            let frame = FrameGeometry::unmapped_desktop(image.width(), image.height());
+            Ok((image, frame))
         }
         #[cfg(feature = "wayland-pipewire")]
         {

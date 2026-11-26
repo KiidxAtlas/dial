@@ -61,6 +61,7 @@ mod replay;
 mod resources;
 mod restore;
 mod selection;
+pub(crate) use selection::main_thinking_changes;
 mod shell;
 pub(crate) use shell::turn_report::outcome as recorded_turn_outcome;
 mod side;

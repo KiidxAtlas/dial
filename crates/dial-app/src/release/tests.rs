@@ -24,6 +24,50 @@ fn installation_detection_preserves_package_manager_ownership() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pacman_ownership_not_the_system_bin_directory_selects_manual_updates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let system = Path::new("/usr/bin/dial");
+    let temp = tempfile::tempdir().unwrap();
+    let pacman = temp.path().join("pacman");
+    assert_eq!(
+        Installation::detect(system, Some(&pacman)),
+        Installation::Script
+    );
+    for (reply, manual) in [
+        ("echo dial-bin", true),
+        (
+            "echo 'error: No package owns /usr/bin/dial' >&2; exit 1",
+            false,
+        ),
+        ("echo 'error: database unavailable' >&2; exit 1", true),
+    ] {
+        std::fs::write(&pacman, format!("#!/bin/sh\n{reply}\n")).unwrap();
+        std::fs::set_permissions(&pacman, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let installation = Installation::detect(system, Some(&pacman));
+        let plan = plan(installation, true, Some(Path::new("/src/dial")));
+        let status = status(installation, &plan, "0.3.0", Ok("v0.4.0".into()));
+        if manual {
+            assert_eq!((status.installation, status.method), ("pacman", "manual"));
+            assert!(!status.can_update);
+            assert!(status.update_command.contains("AUR"));
+            assert!(installation.package_manager_argv(None).is_none());
+        } else {
+            assert_eq!(
+                (status.installation, status.method),
+                ("installer", "release")
+            );
+            assert!(status.can_update);
+        }
+    }
+    assert_eq!(
+        Installation::detect(Path::new("/usr/local/bin/dial"), Some(&pacman)),
+        Installation::Script
+    );
+}
+
 #[test]
 fn cargo_installations_update_from_the_repository_not_crates_io() {
     let command = Installation::Cargo.update_command();
@@ -47,15 +91,21 @@ fn cargo_installations_update_from_the_repository_not_crates_io() {
 #[test]
 fn every_installation_has_a_plan_and_source_builds_rebuild_their_checkout() {
     let checkout = Path::new("/src/dial");
-    let rebuild = UpdatePlan::Checkout(checkout.to_owned());
     // Installer copies verify signed releases; a key always wins over a leftover checkout.
     assert_eq!(
         plan(Installation::Script, true, Some(checkout)),
         UpdatePlan::Release
     );
-    assert_eq!(plan(Installation::Script, false, Some(checkout)), rebuild);
-    // `make update` refreshes ~/.cargo/bin/dial too, so that copy is rebuilt, not reinstalled.
-    assert_eq!(plan(Installation::Cargo, false, Some(checkout)), rebuild);
+    // `make update` refreshes ~/.cargo/bin/dial too. Windows cannot overwrite a running
+    // source binary: both CLI and Desktop must report a manual plan before mutating Git.
+    for owner in [Installation::Script, Installation::Cargo] {
+        let rebuild = plan(owner, false, Some(checkout));
+        if cfg!(windows) {
+            assert!(matches!(rebuild, UpdatePlan::Manual(_)));
+        } else {
+            assert_eq!(rebuild, UpdatePlan::Checkout(checkout.to_owned()));
+        }
+    }
     assert_eq!(
         plan(Installation::Cargo, false, None),
         UpdatePlan::PackageManager(Installation::Cargo)

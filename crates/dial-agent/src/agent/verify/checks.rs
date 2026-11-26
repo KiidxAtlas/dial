@@ -2195,14 +2195,31 @@ impl<'a> Agent<'a> {
     /// the answer blocked even when another applicable check passed.
     pub(in crate::agent) fn gate_unverified_edits(
         &mut self,
-        run: bool,
+        first_attempt: bool,
         ui: &mut dyn Ui,
     ) -> GateOutcome {
         let gate = self.current_gate_outcome();
-        if !run || gate.unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
+        if gate.unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
             return gate;
         }
-        let checks = self.current_focused_checks();
+        let mut checks = self.current_focused_checks();
+        if !first_attempt {
+            // The model may have spent its reminder on an open task, before we could run any
+            // checks. Run missing checks and refresh stale passes, but do not retry failures,
+            // refusals or cancellations just because the model tried to finish again.
+            let evidence = &self.step_checks.evidence;
+            let revision = self.step_checks.revision();
+            checks.retain(|check| match evidence.latest_status(&check.command) {
+                None => true,
+                Some(verify::verification::CheckStatus::Passed) => {
+                    evidence.current_status(&check.command, revision) == "stale"
+                }
+                _ => false,
+            });
+            if checks.is_empty() {
+                return gate;
+            }
+        }
         let failures = self.run_checks(&checks, ui).failures;
         let mut gate = self.current_gate_outcome();
         if gate.blocking {

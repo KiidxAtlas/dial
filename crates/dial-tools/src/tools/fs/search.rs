@@ -301,16 +301,7 @@ fn resolve_scope_input(
         let original = if Path::new(input).is_absolute() {
             PathBuf::from(input)
         } else if input == "~" || input.starts_with("~/") {
-            std::env::var_os("HOME")
-                .map(|home| {
-                    let rest = input.strip_prefix("~/").unwrap_or("");
-                    if rest.is_empty() {
-                        PathBuf::from(home)
-                    } else {
-                        PathBuf::from(home).join(rest)
-                    }
-                })
-                .unwrap_or_else(|| ws.root.join(input))
+            ws.root.join(ws.expand_path_prefixes(input).as_ref())
         } else if input == "$TMPDIR"
             || input.starts_with("$TMPDIR/")
             || input == "${TMPDIR}"

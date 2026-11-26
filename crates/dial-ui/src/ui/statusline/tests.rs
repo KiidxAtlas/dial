@@ -871,6 +871,9 @@ fn paths_and_model_ids_are_shortened_to_what_the_user_recognizes() {
     assert_eq!(last_components("~", 2), "~");
     assert_eq!(last_components("/tmp/x", 2), "/tmp/x");
     assert_eq!(last_components("/", 2), "/");
+    // Windows `canonicalize` roots (`\\?\C:\…`) are shown in their ordinary form.
+    assert_eq!(tilde(r"\\?\C:\Users\me\dev", None), r"C:\Users\me\dev");
+    assert_eq!(tilde(r"\\?\UNC\server\share\p", None), r"\\server\share\p");
     assert_eq!(
         short_model("/cache/hub/models--mlx-community--Qwen3-9B/snapshots/abc"),
         "mlx-community/Qwen3-9B"
@@ -1340,4 +1343,17 @@ fn compact_default_hides_account_identity_but_expansion_and_custom_preserve_it()
         ..UiConfig::default()
     };
     assert!(plain(&render(&custom, &status, 240)).contains("[account "));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_project_paths_use_home_and_native_separators() {
+    let home = Some(r"C:\Users\me");
+    assert_eq!(tilde(r"\\?\C:\Users\me\dev\dial", home), r"~\dev\dial");
+    assert_eq!(
+        tilde(r"C:\Users\me\dev\dial", Some(r"\\?\C:\Users\me\")),
+        r"~\dev\dial"
+    );
+    assert_eq!(last_components(r"~\dev\projects\dial", 2), r"projects\dial");
+    assert_eq!(last_components(r"C:\work\", 2), r"C:\work");
 }

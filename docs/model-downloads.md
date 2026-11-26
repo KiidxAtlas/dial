@@ -1,15 +1,19 @@
 # Model downloads
 
 Discovery never fetches weights. Searching Hugging Face, listing a repository's files and reading the
-curated list only read the Hugging Face JSON API. `dial setup`, selecting a local repository for a
-role, Get models downloads in `/models`, and creating the local inference backend can prepare missing
-weights. Use a complete local path for offline use.
+curated list only read the Hugging Face JSON API. Starting a chat backend or retrying a model load
+uses installed weights only. If the configured checkpoint has moved or is incomplete, native RPC
+stays connected and reports the problem so you can pick a model in the same session. Download missing
+weights explicitly with `dial setup`, role preparation in `/models`, or Get models.
 
 ## Explicit downloads
 
 - `dial setup -m <repo-id>` (or `--model`): validates the requested candidate, prepares and verifies
   that exact model, then saves it. A failed download or unsupported model leaves model settings unchanged.
   A successful global choice clears only this project's overrides for the selected role, just like `/models`.
+  Local GGUF files don't require Python. For an uncached repository, setup uses an existing Hub client
+  or installs a private pinned `huggingface_hub` client with uv. Only MLX weights need the MLX runtime;
+  GGUF readiness checks the selected loader (`llama-server` by default), not an inference request.
 - Selecting a Hugging Face repository for a role in `/models` prepares it on a background worker.
   Progress appears in the panel; closing it with Esc cancels preparation without saving the choice.
   Settings are saved only after preparation succeeds. Runtime installation also keeps the TUI responsive
@@ -132,9 +136,22 @@ This differs from **preparing a role assignment**: cancelling that pending prepa
 previous selection and does not save the new role. Browsing, downloading weights, preparing an
 assignment, saving it, and explicitly cancelling work are separate actions.
 
-Selecting a GGUF quantization sends exactly its files to the download (`hf_hub_download`), so the
-other quantizations in the repository are neither listed for choice nor fetched. Check the file sizes
-in the picker before downloading.
+Selecting a GGUF quantization downloads only its files via the official Hugging Face client.
+On a clean machine Enter first opens the normal setup review for **uv** (if missing), then
+**model-downloads**. Return to Get models and confirm the quantization after setup finishes.
+Each installation is separately approved; browsing never installs a helper. To set up the helper
+from the CLI, use `dial doctor --fix model-downloads --yes`. It is independent of MLX and works
+on Windows, Linux and Intel Macs. Existing MLX/custom Python environments containing the client
+can also download. Hugging Face handles authentication, cache writes, retries and integrity.
+
+Dial lists individual GGUF variants from both the Hugging Face cache and LM Studio, including
+nested files and complete split sets. With one installed GGUF and no MLX checkpoint, the short
+repository name still works. With several quants, select a file in Models, use the displayed
+`publisher/model · filename` label, or supply the exact path. Dial does not pick a quant for you.
+Memory-fit estimates count the selected set’s shard contents, not neighboring quants or the
+lengths of cache symlinks.
+The engine’s remove-model action removes the whole repository folder. It refuses if a local
+session/configuration selection passed to the check names that repository or a sibling variant.
 
 Chat models from the Ollama library are not pulled from this view. The Embedding shelf first lists
 every embedding model discovery found (Ollama, LM Studio, other servers, local checkpoints), then the

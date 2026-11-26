@@ -1376,6 +1376,7 @@
         },
         {
           "type": "object",
+          "description": "Session state. current_model.context_window is the effective context window in tokens, including configured and loaded-server limits; older engines omit it.",
           "properties": {
             "id": {
               "$ref": "#/$defs/id"
@@ -2427,6 +2428,26 @@
           },
           "required": ["method"],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Thinking level and available fixed levels for the saved default model, independent of session overrides. Result: {provider, model_id, levels, level}; null level means model default.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "get_default_thinking"},
+            "params": {"type": "object", "properties": {"scope": {"enum": ["global", "project"]}}, "additionalProperties": false}
+          },
+          "required": ["method"], "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Persist a supported thinking level for the named default model, or default to clear the level in this scope. Returns the same projection as get_default_thinking. Does not switch the current session.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_default_thinking"},
+            "params": {"type": "object", "properties": {"scope": {"enum": ["global", "project"]}, "provider": {"type": "string"}, "model_id": {"type": "string"}, "level": {"type": "string"}}, "required": ["provider", "model_id", "level"], "additionalProperties": false}
+          },
+          "required": ["method", "params"], "additionalProperties": false
         },
         {
           "type": "object",

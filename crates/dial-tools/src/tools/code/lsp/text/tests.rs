@@ -112,6 +112,21 @@ fn split_lines_strips_carriage_returns() {
 }
 
 #[test]
+fn windows_verbatim_paths_use_the_filesystem_path_in_uris() {
+    assert_eq!(windows_uri_path(r"\\?\C:\work\a b.rs"), "C:/work/a b.rs");
+    assert_eq!(
+        windows_uri_path(r"\\?\UNC\server\share\x"),
+        "//server/share/x"
+    );
+    #[cfg(windows)]
+    {
+        let uri = uri_from_path(Path::new(r"\\?\C:\work\a b.rs"));
+        assert_eq!(uri, "file:///C:/work/a%20b.rs");
+        assert_eq!(path_from_uri(&uri), Some(PathBuf::from(r"C:\work\a b.rs")));
+    }
+}
+
+#[test]
 fn uri_round_trips_awkward_paths() {
     for path in [
         "/tmp/a b/c#d.rs",

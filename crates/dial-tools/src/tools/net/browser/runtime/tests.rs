@@ -40,52 +40,25 @@ fn provision_cached_dependencies_offline_without_private_chromium() {
     }
     assert!(!runtime.browsers.exists());
     // Configured Chromium and CDP startup both provision these same dependencies only.
-    let provisioned = provision_at(
-        dir.path(),
-        &AtomicBool::new(false),
-        || panic!("cached dependencies must not probe the network"),
-        || panic!("cached dependencies must not need Bun"),
-    )
+    let provisioned = provision_at(dir.path(), &AtomicBool::new(false), || {
+        panic!("cached dependencies must not need Bun")
+    })
     .unwrap();
     assert_eq!(provisioned.entry, runtime.entry);
     assert!(!runtime.browsers.exists());
-    std::fs::remove_file(&runtime.readability).unwrap();
-    let error = provision_at(
-        dir.path(),
-        &AtomicBool::new(false),
-        || false,
-        || panic!("an offline runtime must not install Bun"),
-    )
-    .unwrap_err();
-    assert!(
-        error.contains("JavaScript dependencies are not cached"),
-        "{error}"
-    );
-    assert!(error.contains("registry.npmjs.org"), "{error}");
 }
 
 #[test]
-fn cached_runtime_skips_the_network_probe() {
-    let probed = std::cell::Cell::new(false);
-    let result = ensure_fetchable(true, || {
-        probed.set(true);
-        false
+fn chromium_download_forwards_proxy_and_ca_but_not_ambient_secrets_or_node_options() {
+    let env = download_env(|key| match key {
+        "https_proxy" | "NO_PROXY" | "NODE_EXTRA_CA_CERTS" | "NODE_OPTIONS" | "OPENAI_API_KEY" => {
+            Some(key.into())
+        }
+        _ => None,
     });
-    assert!(result.is_ok());
-    assert!(!probed.get(), "a cached runtime must not probe the network");
-}
-
-#[test]
-fn uncached_runtime_fetches_when_hosts_are_reachable() {
-    assert!(ensure_fetchable(false, || true).is_ok());
-}
-
-#[test]
-fn uncached_runtime_fails_clearly_when_offline() {
-    let error = ensure_fetchable(false, || false).unwrap_err();
-    assert!(error.contains("not cached"), "{error}");
-    assert!(error.contains("registry.npmjs.org"), "{error}");
-    assert!(error.contains("connect to the network"), "{error}");
+    let mut keys: Vec<_> = env.into_iter().map(|(key, _)| key).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["NODE_EXTRA_CA_CERTS", "NO_PROXY", "https_proxy"]);
 }
 
 #[test]
@@ -108,14 +81,27 @@ fn cache_only_prerequisites_never_create_missing_dependencies() {
 }
 
 #[test]
+fn provisioning_spawn_error_names_only_the_failing_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(dir.path().join("missing-bun"));
+    command.arg("private-arg").env("PRIVATE", "private-env");
+    let error = run_bounded(
+        command,
+        INSTALL_CAP,
+        &AtomicBool::new(false),
+        "dependency setup",
+    )
+    .unwrap_err();
+    assert!(error.contains("missing-bun"));
+    assert!(!error.contains("private-arg") && !error.contains("private-env"));
+}
+
+#[test]
 fn missing_bun_stops_provisioning_with_the_setup_command() {
     let dir = tempfile::tempdir().unwrap();
-    let error = provision_at(
-        dir.path(),
-        &AtomicBool::new(false),
-        || true,
-        || Err(bun_unavailable("declined")),
-    )
+    let error = provision_at(dir.path(), &AtomicBool::new(false), || {
+        Err(bun_unavailable("declined"))
+    })
     .unwrap_err();
     assert!(error.contains("/setup bun yes"), "{error}");
     assert!(error.contains("declined"), "{error}");

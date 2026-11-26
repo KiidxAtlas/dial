@@ -31,7 +31,8 @@ def positive_keep(value):
 
 def managed_destinations(bin_target, install_dir, cargo_bin):
     """Checkout copy, installed copy, and the Cargo copy when it exists outside install_dir."""
-    destinations = [Path(bin_target), Path(install_dir) / "dial"]
+    bin_target = Path(bin_target)
+    destinations = [bin_target, Path(install_dir) / bin_target.name]
     cargo = Path(cargo_bin)
     if cargo.is_file() and cargo.parent != Path(install_dir):
         destinations.append(cargo)

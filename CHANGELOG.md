@@ -17,6 +17,28 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
+- After a reminder to finish an open task, Dial runs outstanding checks before reporting the result instead of stopping merely because it already gave the reminder. [Agent loop](docs/agent-loop.md#completion-and-loop-gates).
+- Reopened or compacted sessions in Dial Desktop and other RPC clients show the conversation as it happened. RPC `messages` and `messages_page` now return the active branch's full conversation instead of the model's compacted view, and `dial-client` shows harness-written records (compaction summaries, carried state and files, reminders, worker results) as notices or hides them instead of as user messages. [RPC](docs/rpc-and-acp.md).
+- RPC `state` reports the current model’s effective context window so clients can show configured limits rather than catalog capacity.
+- Local models: nested and multi-quant LM Studio GGUF downloads appear individually in Models. Qualified GGUF labels resolve offline, and split-weight memory estimates count only the selected shards. [Model downloads](docs/model-downloads.md).
+- Local models: GGUF files selected from the Hugging Face cache load again. The selected path kept the snapshot filename instead of resolving to its extensionless blob, which previously failed with "no complete downloaded weights".
+- Local models: with the engine left on Auto, an Atomic-only GGUF architecture now loads with Atomic Engine, the only loader for it on Apple Silicon, instead of asking for a manual engine choice. Hosts without a supported loader still get the existing error.
+- Local models: starting a model server first stops GGUF servers left running by a Dial process that died without cleanup (SIGKILL or a crash). A server stops only if its recorded owner has exited and its recorded process identity still matches; servers owned by running Dial processes and detached `ps restart` servers keep running.
+- Git reads, including `dial commit --dry-run`, and native computer helpers no longer panic when a Unix process inherits a non-UTF-8 environment variable. Child processes still receive only the allowed runtime variables.
+- Browser setup no longer requires a direct connection before trying a download behind a proxy. Linux explains how to use a visible browser without exposing host display sockets; stock Wayland builds support consented whole-desktop screenshots through the Screenshot portal.
+- Windows: standalone browser setup uses the npm-installed native `bun.exe` rather than trying to launch the POSIX shim and failing with “not a valid Win32 application.”
+- Windows: on x64 and ARM64, browser setup can download verified Bun without npm. Voice setup recognizes the private `piper.exe`, and file tools expand `~/` using `USERPROFILE` when `HOME` is missing or empty.
+- Windows: the confined Chromium driver can use release-bundled Node without exposing private state. Explicit Node and uv setup have checksum-verified Windows downloads. LSP handles canonical drive roots, and LSP and Cleanse discover native virtualenv tools and project checkers.
+- Windows: the Backup models panel ignores key releases, so Tab and arrows move one row, choices toggle once and review `y` saves once instead of acting on both the press and the release.
+- Windows: the status line and welcome screen show the project as `C:\…` or `~\…` instead of the `\\?\C:\…` verbatim form, and the abbreviated status path keeps its last two folders on `\` paths.
+- Linux: copying an answer in the terminal UI falls back to `xsel` when `wl-copy` and `xclip` are missing, as computer-use clipboard writes already did, instead of relying on terminal OSC 52 support.
+- After an edit, the language-server note reports how many earlier errors the edit resolved and, for up to three new errors, the server's quick-fix titles (preferred fixes first).
+- Edit results name files that usually change together with the edited file in recent git history (`[history hint]`, once per file per session).
+- Shell output of recognised noisy commands folds runs of five or more identical lines to one copy and a count. Lines that differ in any character, and output of other commands, are never folded. [Shell tool](docs/shell.md).
+- `dir:outline` lists the files the rest of the directory references most first (PageRank over top-level names), so the output budget keeps the central files. [Tools](docs/tools.md).
+
 ## [0.3.19] - 2026-11-25
 
 - Document how to check the Windows computer-use backend and verify approved input in a disposable window.
@@ -3272,7 +3294,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.19...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.0...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3328,3 +3350,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.16]: https://github.com/KiidxAtlas/dial/tree/v0.3.16
 [0.3.18]: https://github.com/KiidxAtlas/dial/tree/v0.3.18
 [0.3.19]: https://github.com/KiidxAtlas/dial/tree/v0.3.19
+[0.4.0]: https://github.com/KiidxAtlas/dial/tree/v0.4.0

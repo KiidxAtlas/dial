@@ -222,12 +222,15 @@ impl Agent<'_> {
             let key = crate::llm::local_runtime::LocalEngine::model_key(&selection.model);
             pins.get(&key).copied().unwrap_or_default() != self.effective_config().local_engine()
         });
-        if prepare_local_model && same_model && !pin_changed {
-            return self
+        if prepare_local_model
+            && same_model
+            && !pin_changed
+            && let Some(backend) = self
                 .backend
                 .as_mut()
-                .context("session backend is busy")?
-                .prepare_local_model(self.interrupt.clone());
+                .filter(|backend| backend.is_managed_local())
+        {
+            return backend.prepare_local_model(self.interrupt.clone());
         }
         let mut base = self.effective_config().clone();
         if let Some(pins) = saved_engines {

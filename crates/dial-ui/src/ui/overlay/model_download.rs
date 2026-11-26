@@ -54,6 +54,8 @@ pub enum Step {
     UseImage(ModelSelection),
     /// Set up this curated embedding model, as `/setup embeddings:<model> yes` does.
     SetupEmbedding(String),
+    /// Open the standard default-Cancel setup review; never install from a download keystroke.
+    ReviewSetup(&'static str),
     /// Assign this discovered, served embedding model to the embedding role.
     UseEmbedding(ModelSelection),
     /// Ask to delete the installed model at this path from disk (Ctrl+D).
@@ -697,6 +699,18 @@ impl ModelDownloads {
             return self.escape();
         }
         if self.picker.is_some() {
+            if keys.matches(Action::SelectConfirm, key)
+                && let Some(source) = &self.source
+                && !download::hub_python(&source.layout.user_dir, &source.python).is_file()
+            {
+                let env = crate::setup::deps::Env::current(&source.layout.user_dir);
+                let uv = crate::setup::deps::recipe("uv").expect("registered uv");
+                return Step::ReviewSetup(if crate::setup::deps::locate(uv, &env).is_none() {
+                    "uv"
+                } else {
+                    download::HUB_HELPER
+                });
+            }
             self.picker_key(key, keys);
             return Step::Handled;
         }
@@ -759,7 +773,11 @@ impl ModelDownloads {
                     "{} choose",
                     pair_label(keys, Action::SelectUp, Action::SelectDown)
                 ),
-                hint(keys, Action::SelectConfirm, "download"),
+                hint(
+                    keys,
+                    Action::SelectConfirm,
+                    "download / review helper setup",
+                ),
                 hint(keys, Action::SelectCancel, "back"),
             ];
         }
@@ -1072,17 +1090,18 @@ impl ModelDownloads {
         needle.is_empty() || haystack.to_lowercase().contains(&needle)
     }
 
-    /// Already-installed repositories are not offered again as suggested downloads.
+    /// GGUF repositories remain browsable: the user may want another quantization.
     fn available_hits(&self) -> Vec<usize> {
         self.hits
             .iter()
             .enumerate()
             .filter(|(_, hit)| {
-                !self
-                    .dashboard
-                    .models
-                    .iter()
-                    .any(|row| row.format == Some(hit.family.label()) && row.label == hit.repo)
+                hit.family == Family::Gguf
+                    || !self
+                        .dashboard
+                        .models
+                        .iter()
+                        .any(|row| row.format == Some(hit.family.label()) && row.label == hit.repo)
             })
             .map(|(index, _)| index)
             .collect()
@@ -1460,7 +1479,7 @@ impl ModelDownloads {
             self.message = "Downloads are unavailable in this view.".into();
             return;
         };
-        let python = source.python.clone();
+        let python = download::hub_python(&source.layout.user_dir, &source.python);
         let (line_tx, lines) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));

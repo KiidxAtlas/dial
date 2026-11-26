@@ -78,7 +78,7 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
             ("initialize", Some(id)) => reply(
                 &mut out,
                 &id,
-                json!({"capabilities": {"documentFormattingProvider": true,
+                json!({"capabilities": {"documentFormattingProvider": true, "codeActionProvider": true,
                     "completionProvider": {}, "signatureHelpProvider": {}, "callHierarchyProvider": true,
                     "workspace": {"fileOperations": {"willRename": {"filters": [{"pattern": {"glob": "**/*"}}]}}}}}),
             ),
@@ -108,6 +108,21 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
                 | "textDocument/typeDefinition",
                 Some(id),
             ) => reply(&mut out, &id, here),
+            ("textDocument/codeAction", Some(id)) => {
+                // Quick fixes for the diagnostic sent in the context; a refactor and a disabled fix
+                // are offered too and must not be named.
+                let fixes = if params["context"]["diagnostics"][0]["message"] == "found ERROR" {
+                    json!([
+                        {"title": "Extract function", "kind": "refactor.extract"},
+                        {"title": "Delete line", "kind": "quickfix"},
+                        {"title": "Unavailable fix", "kind": "quickfix", "disabled": {"reason": "no"}},
+                        {"title": "Remove ERROR", "kind": "quickfix", "isPreferred": true},
+                    ])
+                } else {
+                    json!([])
+                };
+                reply(&mut out, &id, fixes)
+            }
             ("textDocument/references", Some(id)) => {
                 reply(&mut out, &id, json!([here.clone(), here]))
             }
@@ -1385,7 +1400,7 @@ fn edit_results_list_only_errors_the_edit_introduced() {
     let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
     assert!(
         notes.contains(
-            "[LSP advisory, not verification] 1 new error(s) after this edit:\na.fk:3:1: found ERROR\n"
+            "[LSP advisory, not verification] 1 new error(s) after this edit:\na.fk:3:1: found ERROR (quick fix: Remove ERROR; Delete line)\n"
         ),
         "{notes}"
     );
@@ -1393,28 +1408,54 @@ fn edit_results_list_only_errors_the_edit_introduced() {
         !notes.contains("a.fk:1:1"),
         "a pre-existing error was reported: {notes}"
     );
+    let requests: Vec<Value> = logs.lock()[0]
+        .lock()
+        .iter()
+        .filter(|message| message["method"] == "textDocument/codeAction")
+        .cloned()
+        .collect();
+    assert_eq!(requests.len(), 1, "one lookup per new error");
+    assert_eq!(
+        requests[0]["params"]["context"]["only"],
+        json!(["quickfix"])
+    );
 
-    // Fewer errors than before: nothing new, nothing appended.
+    // Fewer errors than before: nothing new, and the fix is counted.
     std::fs::write(&file, "fine\nERROR one\n").unwrap();
     let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
     assert!(!notes.contains("new error"), "{notes}");
+    assert!(
+        notes.contains("[LSP advisory, not verification] 1 error(s) resolved by this edit\n"),
+        "{notes}"
+    );
+    assert_eq!(super::new_errors_in(&notes), None, "{notes}");
 
-    // Many new errors are capped.
+    // Unchanged errors are neither new nor resolved.
+    std::fs::write(&file, "ERROR one\nfine\n").unwrap();
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    assert!(!notes.contains("LSP advisory"), "{notes}");
+
+    // Many new errors are capped, and only the first few get quick-fix lookups.
     let many: String = (0..11).map(|n| format!("ERROR {n}\n")).collect();
     std::fs::write(&file, many).unwrap();
     let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
     assert!(notes.contains("10 new error(s)"), "{notes}");
     assert_eq!(notes.matches(": found ERROR").count(), 8, "{notes}");
+    assert_eq!(notes.matches("(quick fix: ").count(), 3, "{notes}");
     assert!(notes.contains("... 2 more"), "{notes}");
     // The card and `dial watch` read the same block back.
     let (count, listed) = super::new_errors_in(&notes).unwrap();
     assert_eq!((count, listed.len()), (10, 8), "{notes}");
-    assert!(listed.iter().all(|line| line.ends_with(": found ERROR")));
+    assert!(listed.iter().all(|line| line.contains(": found ERROR")));
 }
 
 #[test]
 fn new_errors_in_reads_back_the_advisory_block() {
-    let note = super::new_errors_note(&["a.rs:1:2: bad".to_owned()], true);
+    let note = super::new_errors_note(&["a.rs:1:2: bad".to_owned()], 2, true);
+    assert!(
+        note.contains("1 new error(s) after this edit (file had no earlier diagnostics; some may predate the edit); 2 resolved:\n"),
+        "{note}"
+    );
     let text = format!("Edited a.rs\n{note}\nmore output");
     assert_eq!(
         super::new_errors_in(&text),

@@ -54,6 +54,33 @@ fn home_resolution_preserves_home_and_uses_profile_only_on_windows() {
 }
 
 #[test]
+fn hf_cache_uses_only_absolute_locations_in_priority_order() {
+    let root = tempfile::tempdir().unwrap();
+    let mut env: std::collections::HashMap<&str, PathBuf> = Default::default();
+    let resolve = |env: &std::collections::HashMap<_, PathBuf>| {
+        hf_cache_from(|name| env.get(name).map(|p| p.as_os_str().to_owned()))
+    };
+    for (name, suffix) in [
+        ("HOME", ".cache/huggingface/hub"),
+        ("XDG_CACHE_HOME", "huggingface/hub"),
+        ("HF_HOME", "hub"),
+        ("HUGGINGFACE_HUB_CACHE", ""),
+        ("HF_HUB_CACHE", ""),
+    ] {
+        let previous = resolve(&env);
+        env.insert(name, "relative".into());
+        assert_eq!(resolve(&env), previous, "relative {name}");
+        let absolute = root.path().join(name);
+        env.insert(name, absolute.clone());
+        assert_eq!(
+            resolve(&env),
+            Some(absolute.join(suffix)),
+            "absolute {name}"
+        );
+    }
+}
+
+#[test]
 fn dial_home_precedence_and_missing_home_are_explicit() {
     assert_eq!(
         user_dir_from(Some("custom".into()), || panic!("DIAL_HOME wins")).unwrap(),

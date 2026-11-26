@@ -1578,6 +1578,91 @@ fn gguf_downloads_keep_the_local_route_but_are_named_by_their_format() {
     assert!(entries[1].source.starts_with("LM Studio download (GGUF)"));
     assert!(entries[2].source.starts_with("Hugging Face cache (GGUF)"));
 }
+
+#[test]
+fn cached_gguf_quants_list_selectable_files_without_guessing() {
+    let cache = tempfile::tempdir().unwrap();
+    let snapshot = cache.path().join("models--org--model/snapshots/rev");
+    fs::create_dir_all(snapshot.join("small")).unwrap();
+    let small = snapshot.join("small/m-00001-of-00002.gguf");
+    fs::write(&small, b"GGUFfirst").unwrap();
+    fs::write(snapshot.join("small/m-00002-of-00002.gguf"), b"GGUFsecond").unwrap();
+    fs::write(snapshot.join("mmproj.gguf"), b"GGUFprojector").unwrap();
+    fs::write(snapshot.join("q8-00001-of-00003.gguf"), b"GGUFincomplete").unwrap();
+    assert_eq!(
+        Path::new(&resolve_local_model_in("org/model", Some(cache.path()), None).unwrap()),
+        small
+    );
+    let large = snapshot.join("large.gguf");
+    fs::write(&large, b"GGUFbig").unwrap();
+    let entries = local_models(cache.path(), None);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| std::path::PathBuf::from(&e.selection.model))
+            .collect::<Vec<_>>(),
+        [large, small]
+    );
+    assert_ne!(entries[0].label, entries[1].label);
+    for entry in entries {
+        assert_eq!(
+            resolve_local_model_in(&entry.label, Some(cache.path()), None).unwrap(),
+            entry.selection.model
+        );
+    }
+    assert!(resolve_local_model_in("org/model", Some(cache.path()), None).is_err());
+}
+
+#[test]
+fn gguf_variants_in_lm_studio_are_selectable_without_guessing() {
+    let studio = tempfile::tempdir().unwrap();
+    let repo = studio.path().join("pub/chat");
+    fs::create_dir_all(repo.join("quants")).unwrap();
+    let q4 = repo.join("quants/q4.gguf");
+    fs::write(&q4, b"GGUFsmall").unwrap();
+    fs::write(repo.join("mmproj.gguf"), b"GGUFprojector").unwrap();
+    fs::write(repo.join("incomplete-00001-of-00002.gguf"), b"GGUFpart").unwrap();
+    let resolve = |label| resolve_local_model_in(label, None, Some(studio.path()));
+    assert_eq!(Path::new(&resolve("pub/chat").unwrap()), q4);
+    fs::write(repo.join("q8.gguf"), b"GGUFlarge").unwrap();
+    let entries = lmstudio_gguf_models(studio.path());
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(
+            resolve_local_model_in(&entry.label, None, Some(studio.path())).unwrap(),
+            entry.selection.model
+        );
+    }
+    assert!(
+        resolve("pub/chat")
+            .unwrap_err()
+            .to_string()
+            .contains("choose a file")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gguf_snapshot_symlink_keeps_its_name_and_projector() {
+    let cache = tempfile::tempdir().unwrap();
+    let repo = cache.path().join("models--org--model");
+    let snapshot = repo.join("snapshots/rev");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::create_dir(repo.join("blobs")).unwrap();
+    fs::write(repo.join("blobs/hash"), b"GGUFweights").unwrap();
+    let model = snapshot.join("m.gguf");
+    std::os::unix::fs::symlink("../../blobs/hash", &model).unwrap();
+    let projector = snapshot.join("mmproj.gguf");
+    fs::write(&projector, b"GGUFprojector").unwrap();
+    for name in [model.to_str().unwrap(), "org/model"] {
+        let resolved = resolve_local_model_in(name, Some(cache.path()), None).unwrap();
+        assert_eq!(Path::new(&resolved), model);
+        assert_eq!(
+            crate::llm::local_format::gguf_projector(Path::new(&resolved)),
+            Some(projector.clone())
+        );
+    }
+}
 #[test]
 fn disabled_endpoint_is_never_contacted() {
     let dir = tempfile::tempdir().unwrap();

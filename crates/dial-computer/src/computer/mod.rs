@@ -2,6 +2,8 @@
 
 pub mod call;
 pub mod desktop;
+#[cfg(any(target_os = "linux", test))]
+mod linux_display;
 pub mod protocol;
 pub mod rpc;
 pub mod supervisor;

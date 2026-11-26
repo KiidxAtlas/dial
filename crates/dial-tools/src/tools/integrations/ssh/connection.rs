@@ -36,8 +36,13 @@ const MUX_TEMP_SUFFIX_BYTES: usize = 1 + 16;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 /// A verified master is trusted this long before `ssh -O check` runs again.
 const VERIFY_TTL: Duration = Duration::from_secs(30);
-const HOST_INFO_VERSION: u32 = 1;
+const HOST_INFO_VERSION: u32 = 2;
 const HOST_PROBE_MARKER: &str = "DIAL_HOST_PROBE=";
+// One echo argument and no shell operators, even if Win32-OpenSSH reconstructs the command
+// line. Only cmd expands %OS%, and only PowerShell expands $env:OS here.
+fn host_probe_command() -> String {
+    format!("echo {HOST_PROBE_MARKER}$OSTYPE~$SHELL~$BASH_VERSION~%OS%~$env:OS")
+}
 const TRANSFER_PROBE_MARKER: &str = "DIAL_TRANSFER_OK|";
 
 /// A host to connect to. `name` keys the caches; `host` is what OpenSSH receives.
@@ -708,46 +713,33 @@ pub fn find_probe_marker(stdout: &str, stderr: &str, marker: &str) -> Option<Str
     })
 }
 
-/// OS, login shell and whether bash is present, from `$OSTYPE|$SHELL|$BASH_VERSION`.
+/// OS, login shell and bash evidence from a successful login-shell echo.
 pub fn classify_probe(payload: &str) -> (Os, Shell, bool) {
-    let mut parts = payload.split('|');
+    let mut parts = payload.split('~');
     let os_raw = parts.next().unwrap_or("").trim().to_ascii_lowercase();
     let shell_raw = parts.next().unwrap_or("").trim().to_ascii_lowercase();
     let bash_version = parts.next().unwrap_or("").trim();
-    let payload_lower = payload.to_ascii_lowercase();
-    let unexpanded = ["$OSTYPE", "$SHELL", "$BASH_VERSION"]
-        .iter()
-        .any(|v| payload.contains(v));
-    let windows = ["windows", "msys", "cygwin", "mingw"]
-        .iter()
-        .any(|w| os_raw.contains(w))
-        || payload_lower.contains("windows_nt")
-        || payload_lower.contains("comspec")
-        || shell_raw.contains("cmd")
-        || shell_raw.contains("powershell")
-        || unexpanded
-        || payload.contains("%OS%");
-    let os = if windows {
-        Os::Windows
-    } else if os_raw.contains("darwin") {
-        Os::Macos
-    } else if os_raw.contains("linux") || os_raw.contains("gnu") {
-        Os::Linux
-    } else {
-        Os::Unknown
-    };
-    let mut shell = parse_shell(&shell_raw);
-    if shell == Shell::Unknown && os == Os::Windows && shell_raw.is_empty() {
-        shell = Shell::Cmd;
+    if parts
+        .next()
+        .is_some_and(|v| v.eq_ignore_ascii_case("Windows_NT"))
+    {
+        return (Os::Windows, Shell::Cmd, false);
     }
-    let has_bash = !unexpanded && (!bash_version.is_empty() || shell == Shell::Bash);
+    if parts
+        .next()
+        .is_some_and(|v| v.eq_ignore_ascii_case("Windows_NT"))
+    {
+        return (Os::Windows, Shell::Powershell, false);
+    }
+    let os = os_from_uname(&os_raw).unwrap_or(Os::Unknown);
+    let shell = parse_shell(&shell_raw);
+    let has_bash =
+        (!bash_version.is_empty() && bash_version != "$BASH_VERSION") || shell == Shell::Bash;
     (os, shell, has_bash)
 }
 
 fn probe(target: &Target, settings: &Settings, cancel: &AtomicBool) -> Result<HostInfo, String> {
-    let command = format!(
-        "echo \"{HOST_PROBE_MARKER}$OSTYPE|$SHELL|$BASH_VERSION\" 2>/dev/null || echo \"{HOST_PROBE_MARKER}%OS%|%COMSPEC%|\""
-    );
+    let command = host_probe_command();
     let result = capture(
         target,
         settings,
@@ -759,28 +751,15 @@ fn probe(target: &Target, settings: &Settings, cancel: &AtomicBool) -> Result<Ho
     if result.cancelled {
         return Err("ssh: cancelled".to_owned());
     }
+    if result.timed_out || result.code() == Some(255) {
+        return Err(result.failure(&format!("probing {}", target.name), HELPER_TIMEOUT));
+    }
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
-    let Some(payload) = extract_probe_payload(&stdout, &stderr, HOST_PROBE_MARKER) else {
-        if !result.success() && result.code() == Some(255) {
-            return Err(result.failure(&format!("probing {}", target.name), HELPER_TIMEOUT));
-        }
-        let (transfer, uname) = probe_transfer_shell(target, settings, cancel)?;
-        return Ok(apply_compat(
-            target,
-            HostInfo {
-                version: HOST_INFO_VERSION,
-                os: transfer
-                    .and_then(|_| os_from_uname(&uname))
-                    .unwrap_or(Os::Unknown),
-                shell: Shell::Unknown,
-                transfer_shell: transfer,
-                compat_shell: None,
-                compat_enabled: false,
-            },
-        ));
-    };
-    let (mut os, shell, has_bash) = classify_probe(&payload);
+    let (mut os, shell, has_bash) = extract_probe_payload(&stdout, &stderr, HOST_PROBE_MARKER)
+        .filter(|_| result.success())
+        .map(|payload| classify_probe(&payload))
+        .unwrap_or((Os::Unknown, Shell::Unknown, false));
     let mut transfer_shell = None;
     if os != Os::Windows {
         let (shell, uname) = probe_transfer_shell(target, settings, cancel)?;

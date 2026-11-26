@@ -25,10 +25,7 @@ pub(super) struct EscapeMonitor {
 
 impl EscapeMonitor {
     pub(super) fn start(emergency: EmergencyStop) -> CoreResult<Option<Self>> {
-        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE")
-                .is_ok_and(|value| value.eq_ignore_ascii_case("wayland"));
-        if wayland {
+        if crate::computer::linux_display::DisplayServer::in_wayland_session() {
             return Ok(None);
         }
         let (stop, stopped) = UnixStream::pair().map_err(failed)?;

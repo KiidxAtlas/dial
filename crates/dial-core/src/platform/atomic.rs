@@ -10,9 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ordinary creation permissions (including the umask), not private-state permissions.
 pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mode = fs::metadata(&target).ok().map(|meta| meta.permissions());
     let temp = temp_path(&target);
     // Do not remove a pre-existing staging path if exclusive creation fails.
+    #[cfg(windows)]
+    let (mut file, mode) = workspace_stage(&target, &temp)?;
+    #[cfg(unix)]
+    let mode = fs::metadata(&target).ok().map(|meta| meta.permissions());
+    #[cfg(unix)]
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -29,6 +33,39 @@ pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(windows)]
+fn workspace_stage(target: &Path, temp: &Path) -> io::Result<(File, Option<fs::Permissions>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, READ_CONTROL};
+    // Only a missing target is a new file. Fail closed if its DACL cannot be inspected.
+    let original = match OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+        .open(target)
+    {
+        Ok(file) => Some((
+            file.metadata()?.permissions(),
+            platform_fs::FileDacl::read(&file)?,
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let dir = temp
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = platform_fs::open_project_dir(dir, true)?;
+    let (mode, dacl) = original.unzip();
+    let file = platform_fs::create_project_file_beneath(
+        &parent,
+        Path::new(
+            temp.file_name()
+                .ok_or_else(|| io::Error::other("workspace stage has no name"))?,
+        ),
+        dacl.as_ref(),
+    )?;
+    Ok((file, mode))
 }
 
 /// Checkpoint restores use the recorded mode and create missing parents. The caller owns path

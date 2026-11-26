@@ -265,6 +265,49 @@ public static class DialInstallerEd25519V1
         return ,$raw
     }
 
+    # Both executables are on the install volume. Non-overwriting renames never remove a
+    # destination left by another process. Only this attempt's backup is eligible for rollback.
+    function Install-DialStagedExecutable {
+        param([string] $Staged, [string] $Installed)
+        $lockPath = Join-Path (Split-Path -Parent $Installed) '.dial-update.lock'
+        try {
+            $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+        } catch {
+            throw "Could not lock $lockPath for installation. If another install or update is running, retry after it finishes. $($_.Exception.Message)"
+        }
+        try {
+            $backup = "$Installed.bak"
+            $previous = $null
+            if ([IO.File]::Exists($Installed)) {
+                # Leave any earlier .bak alone until the new install is active.
+                $previous = "$backup.$([Guid]::NewGuid().ToString('N'))"
+                [IO.File]::Move($Installed, $previous)
+            }
+            try {
+                [IO.File]::Move($Staged, $Installed)
+            } catch {
+                $activationError = $_
+                if ($previous) {
+                    try { [IO.File]::Move($previous, $Installed) } catch {
+                        throw "Activation failed: $($activationError.Exception.Message) Rollback also failed: $($_.Exception.Message) Previous executable: $previous"
+                    }
+                }
+                throw $activationError
+            }
+            if ($previous) {
+                try {
+                    [IO.File]::Delete($backup)
+                    [IO.File]::Move($previous, $backup)
+                } catch {
+                    Write-Warning "Dial was installed; the previous executable remains at $previous because $backup could not be refreshed: $($_.Exception.Message)"
+                }
+            }
+        } finally {
+            # The lock file has a stable identity across runs. Release the handle, not the name.
+            $lock.Dispose()
+        }
+    }
+
     if ($env:OS -ne 'Windows_NT') { throw 'This installer runs on Windows only.' }
 
     $arch = $env:PROCESSOR_ARCHITEW6432
@@ -398,31 +441,25 @@ public static class DialInstallerEd25519V1
         $staged = Join-Path $destination ('.dial.new.' + [Guid]::NewGuid().ToString('N') + '.exe')
         Copy-Item -LiteralPath $binary -Destination $staged
         $installed = Join-Path $destination 'dial.exe'
-        $backup = Join-Path $destination 'dial.exe.bak'
-        $hadPrevious = Test-Path -LiteralPath $installed -PathType Leaf
-        try {
-            if ($hadPrevious) { Move-Item -LiteralPath $installed -Destination $backup -Force }
-            Move-Item -LiteralPath $staged -Destination $installed
-        } catch {
-            if (Test-Path -LiteralPath $installed) { Remove-Item -LiteralPath $installed -Force -ErrorAction SilentlyContinue }
-            if ($hadPrevious -and (Test-Path -LiteralPath $backup)) { Move-Item -LiteralPath $backup -Destination $installed -Force }
-            throw
-        }
-
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $userEntries = @($userPath -split ';' | Where-Object { $_ })
-        $inUserPath = @($userEntries | Where-Object { $_.TrimEnd('\') -ieq $destination.TrimEnd('\') }).Count -gt 0
-        if (-not $inUserPath) {
-            [Environment]::SetEnvironmentVariable('Path', (@($userEntries + $destination) -join ';'), 'User')
-        }
-        $sessionEntries = @($env:Path -split ';' | Where-Object { $_ })
-        $inSessionPath = @($sessionEntries | Where-Object { $_.TrimEnd('\') -ieq $destination.TrimEnd('\') }).Count -gt 0
-        if (-not $inSessionPath) {
-            $env:Path = (@($sessionEntries + $destination) -join ';')
-        }
+        Install-DialStagedExecutable $staged $installed
 
         Write-Host "Installed Dial $versionNumber to $installed"
-        Write-Host "$destination is on your user PATH and in this session's PATH."
+        if ($env:DIAL_NO_MODIFY_PATH -eq '1') {
+            Write-Host 'DIAL_NO_MODIFY_PATH=1: user and session PATH were left unchanged. Use the executable path above if needed.'
+        } else {
+            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $userEntries = @($userPath -split ';' | Where-Object { $_ })
+            $inUserPath = @($userEntries | Where-Object { $_.TrimEnd('\') -ieq $destination.TrimEnd('\') }).Count -gt 0
+            if (-not $inUserPath) {
+                [Environment]::SetEnvironmentVariable('Path', (@($userEntries + $destination) -join ';'), 'User')
+            }
+            $sessionEntries = @($env:Path -split ';' | Where-Object { $_ })
+            $inSessionPath = @($sessionEntries | Where-Object { $_.TrimEnd('\') -ieq $destination.TrimEnd('\') }).Count -gt 0
+            if (-not $inSessionPath) {
+                $env:Path = (@($sessionEntries + $destination) -join ';')
+            }
+            Write-Host "$destination is on your user PATH and in this session's PATH."
+        }
         Write-Host ''
         Write-Host 'Next steps:'
         Write-Host '  1. Run dial from inside a project directory, from a normal (non-Administrator) shell.'

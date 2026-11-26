@@ -126,6 +126,10 @@ const STARTERS: &[&str] = crate::ui::command_surface::STARTERS;
 /// Recently run actions shown above the goals.
 const RECENT_MAX: usize = 3;
 
+/// Actions shown under each goal on the first screen, so it is usable without drilling in. The
+/// goal row itself still opens the complete list.
+const GOAL_PREVIEW: usize = 3;
+
 impl Goal {
     fn holds(&self, command: &CommandEntry) -> bool {
         self.commands.contains(&command.name.as_str())
@@ -547,6 +551,20 @@ impl PaletteOverlay {
         self.busy = busy;
     }
 
+    /// One goal's commands, in the goal's display order.
+    fn goal_entries(&self, goal: usize) -> Vec<usize> {
+        let goal = &GOALS[goal];
+        let mut rows: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| goal.holds(&entry.command))
+            .map(|(index, _)| index)
+            .collect();
+        rows.sort_by_key(|&index| goal.position(&self.entries[index].command));
+        rows
+    }
+
     fn rows(&self) -> Vec<Row> {
         let unified = self.unified_query();
         let query = unified.unwrap_or_else(|| self.search.text.trim().trim_start_matches('/'));
@@ -554,26 +572,28 @@ impl PaletteOverlay {
         if !picker && unified.is_none() && query.is_empty() {
             match self.view {
                 View::Goals => {
-                    return self
-                        .recent
-                        .iter()
-                        .map(|&index| Row::Entry(index))
-                        .chain((0..GOALS.len()).map(Row::Goal))
-                        .chain(std::iter::once(Row::AllActions))
-                        .chain(self.unified.is_some().then_some(Row::LocalSearch))
-                        .collect();
+                    let mut rows: Vec<Row> =
+                        self.recent.iter().map(|&index| Row::Entry(index)).collect();
+                    for goal in 0..GOALS.len() {
+                        rows.push(Row::Goal(goal));
+                        rows.extend(
+                            self.goal_entries(goal)
+                                .into_iter()
+                                .filter(|index| !self.recent.contains(index))
+                                .take(GOAL_PREVIEW)
+                                .map(Row::Entry),
+                        );
+                    }
+                    rows.push(Row::AllActions);
+                    rows.extend(self.unified.is_some().then_some(Row::LocalSearch));
+                    return rows;
                 }
                 View::Goal(goal) => {
-                    let goal = &GOALS[goal];
-                    let mut rows: Vec<_> = self
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, entry)| goal.holds(&entry.command))
-                        .map(|(index, _)| index)
+                    return self
+                        .goal_entries(goal)
+                        .into_iter()
+                        .map(Row::Entry)
                         .collect();
-                    rows.sort_by_key(|&index| goal.position(&self.entries[index].command));
-                    return rows.into_iter().map(Row::Entry).collect();
                 }
                 View::Tabs => {}
             }
@@ -693,14 +713,19 @@ impl PaletteOverlay {
         if self.choice.is_some() {
             return false;
         }
-        let cursor = match self.view {
-            View::Goal(goal) => self.recent.len() + goal,
-            View::Tabs => self.recent.len() + GOALS.len(),
+        let back_to = match self.view {
+            View::Goal(goal) => Row::Goal(goal),
+            View::Tabs => Row::AllActions,
             View::Goals => return false,
         };
         self.view = View::Goals;
         self.list_bounds = None;
-        self.cursor = cursor;
+        // Goals lead their own actions, so find the row rather than counting goals.
+        self.cursor = self
+            .rows()
+            .iter()
+            .position(|row| *row == back_to)
+            .unwrap_or(0);
         self.scroll = 0;
         true
     }

@@ -33,7 +33,10 @@ fn discovers_local_eslint_and_prefers_it_over_path() {
         .iter()
         .find(|plan| plan.id == "eslint:.")
         .expect("eslint plan discovered");
-    assert!(Path::new(&plan.argv[0]).ends_with(Path::new("node_modules/.bin").join(name)));
+    assert_eq!(
+        Path::new(&plan.argv[0]).canonicalize().unwrap(),
+        local.canonicalize().unwrap()
+    );
     assert_eq!(plan.display, "eslint . --format=json");
     assert_eq!(plan.parser, Kind::Eslint);
 }

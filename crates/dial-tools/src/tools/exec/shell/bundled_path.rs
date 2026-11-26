@@ -42,7 +42,7 @@ pub(super) fn resolves(ws: &Workspace, path: Option<&OsStr>, program: &str) -> b
 pub(super) fn offered(ws: &Workspace, path: Option<&OsStr>) -> bool {
     bundled_python::available()
         && !resolves(ws, path, "python3")
-        && super::super::kernel::bundled_python_parent(ws).is_ok()
+        && super::super::kernel::bundled_runtime_parent(ws).is_ok()
 }
 
 /// The bundled runtime and the PATH to give the shell, when `path` resolves no `python3`.
@@ -56,7 +56,7 @@ pub(super) fn fallback(
     }
     let shared = SHARED
         .get_or_init(|| {
-            let provisioned = super::super::kernel::bundled_python_parent(ws)
+            let provisioned = super::super::kernel::bundled_runtime_parent(ws)
                 .and_then(|parent| {
                     bundled_python::provision_in(&parent).map_err(|e| format!("{e:#}"))
                 })

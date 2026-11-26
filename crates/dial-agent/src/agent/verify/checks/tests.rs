@@ -2091,6 +2091,40 @@ fn focused_python_checks_avoid_an_interpreter_hidden_by_the_shell_sandbox() {
 }
 
 #[test]
+fn closing_a_reminded_task_still_runs_its_unobserved_check() {
+    use crate::agent::verify::completion::{Decision, ReplyChannel};
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.enabled = true;
+    config.verification.automatic_checks = false;
+    let check = "test -f result.txt";
+    config.verification.commands = vec![command("result exists", check)];
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Auto;
+    let decide = |agent: &mut Agent<'_>| {
+        agent.completion_decision(TurnOutcome::Completed, ReplyChannel::Explicit, &mut NullUi)
+    };
+    assert!(
+        !agent
+            .todo
+            .call(&json!({"op":"set","tasks":[{"content":"Write result"}]}))
+            .is_error
+    );
+    assert!(matches!(decide(&mut agent), Decision::Continue(_)));
+    std::fs::write(root.path().join("result.txt"), "ready").unwrap();
+    agent.step_checks.mutations += 1;
+    assert!(!agent.todo.call(&json!({"op":"done","index":1})).is_error);
+    let decision = decide(&mut agent);
+    assert_eq!(
+        agent.step_checks.evidence.latest_status(check),
+        Some(CheckStatus::Passed)
+    );
+    assert!(matches!(decision, Decision::Accept(TurnOutcome::Completed)));
+}
+
+#[test]
 fn one_current_pass_does_not_discharge_other_stale_or_unobserved_checks() {
     use crate::agent::verify::verification::CheckStatus;
     let root = tempfile::tempdir().unwrap();

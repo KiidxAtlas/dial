@@ -31,9 +31,25 @@ pub fn spawn_group(command: &mut Command) -> io::Result<Child> {
     super::imp::process::spawn_group(command)
 }
 
+/// Spawn a console-independent Windows job shared by cooperating Dial processes. The final
+/// handle close (including a crash) stops the server and all its descendants.
+#[cfg(windows)]
+pub fn spawn_shared_group(
+    command: &mut Command,
+) -> io::Result<(Child, std::os::windows::io::OwnedHandle)> {
+    super::imp::process::spawn_shared_group(command)
+}
+
+/// Acquire a non-inheritable lease on the named job containing this exact server process.
+#[cfg(windows)]
+pub fn hold_shared_group(
+    server: super::procinfo::ProcId,
+) -> io::Result<std::os::windows::io::OwnedHandle> {
+    super::imp::process::hold_shared_group(server)
+}
+
 /// Kill the group led by `leader` immediately (Unix: `killpg(SIGKILL)`; Windows:
-/// `TerminateJobObject`, or a creation-time-checked process-tree kill for a group spawned by
-/// another Dial process that has since exited).
+/// `TerminateJobObject` for a group owned by this runtime).
 pub fn kill_group(leader: u32) -> io::Result<()> {
     super::imp::process::kill_group(leader)
 }

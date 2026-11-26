@@ -56,7 +56,7 @@ fn source_details_explain_inheritance_fallback_and_runtime_precedence() {
         .unwrap();
     assert!(
         o.source_detail(def)
-            .contains("Inherited; edit adds a project override")
+            .contains("from global; editing saves a project override")
     );
     crate::config::schema::set(&mut o.project, def.path, Value::Boolean(true));
     assert!(o.source_detail(def).contains("Delete: global (off)"));

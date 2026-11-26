@@ -86,6 +86,9 @@ pub fn open_dir_nofollow_write(path: &Path) -> io::Result<File> {
     super::imp::fs::open_dir_nofollow_write(path)
 }
 
+#[cfg(windows)]
+pub use super::imp::fs::{open_project_dir, open_project_dir_beneath};
+
 /// Open `relative` beneath the directory `root` one component at a time, never following a
 /// symlink anywhere along the way (Unix: an `openat` walk with `O_NOFOLLOW`; Windows:
 /// handle-relative `NtCreateFile` with `FILE_OPEN_REPARSE_POINT`). `relative` must consist of
@@ -99,6 +102,26 @@ pub fn open_beneath(root: &Path, relative: &Path, directory: bool) -> io::Result
 /// `owner_only` is set or `0o666` otherwise (both subject to the process umask).
 pub fn create_new_beneath(root: &File, relative: &Path, owner_only: bool) -> io::Result<File> {
     super::imp::fs::create_new_beneath(root, relative, owner_only)
+}
+
+#[cfg(windows)]
+pub use super::imp::fs::FileDacl;
+
+/// Create a workspace stage with the existing file's DACL, or inherit the containing
+/// directory's DACL for a new file. Private state must use `create_new_beneath` instead.
+#[cfg(windows)]
+pub fn create_project_file_beneath(
+    root: &File,
+    name: &Path,
+    acl: Option<&FileDacl>,
+) -> io::Result<File> {
+    super::imp::fs::create_project_file_beneath(root, name, acl)
+}
+
+/// Create a new ordinary workspace directory (normal Windows DACL inheritance).
+#[cfg(windows)]
+pub fn create_project_dir_beneath(root: &File, name: &Path, stage: bool) -> io::Result<File> {
+    super::imp::fs::create_project_dir_beneath(root, name, stage)
 }
 
 /// Create a hard link under a pinned directory, failing if the new name already exists.
@@ -316,6 +339,29 @@ pub fn launch_path(program: &Path, search: Option<&std::ffi::OsStr>) -> std::pat
         return found;
     }
     program.to_path_buf()
+}
+
+/// Create an owner-only output file in a caller-selected directory, never opening or replacing
+/// an existing entry. Protection is applied at creation even if the parent is shared.
+pub fn create_new_owner_only(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        open_owner_only(OpenOptions::new().write(true).create_new(true), path)
+    }
+    #[cfg(windows)]
+    {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output path requires a file name",
+            )
+        })?;
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        create_new_beneath(&open_dir_nofollow(parent)?, Path::new(name), true)
+    }
 }
 
 /// Open `path`, creating it owner-only if it does not exist (Unix: `mode(0o600)`; Windows: the

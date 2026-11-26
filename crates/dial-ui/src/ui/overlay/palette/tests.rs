@@ -64,7 +64,8 @@ fn consistent_ux_advanced_commands_stay_searchable_outside_the_everyday_menu() {
     });
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries, false);
-    assert!(palette.entry_rows().is_empty());
+    // Advanced commands never appear on the first screen, only through search.
+    assert!(!names(&palette).contains(&"ratchet"));
     palette.handle(&Event::Paste("ratchet".into()), &keys);
     assert_eq!(names(&palette).first(), Some(&"ratchet"));
 }
@@ -106,6 +107,15 @@ fn names(palette: &PaletteOverlay) -> Vec<&str> {
         .collect()
 }
 
+/// Where `row` sits in the visible rows.
+fn at(palette: &PaletteOverlay, row: Row) -> usize {
+    palette
+        .rows()
+        .iter()
+        .position(|r| *r == row)
+        .expect("row shown")
+}
+
 fn text_lines(palette: &mut PaletteOverlay) -> Vec<String> {
     let rig = Rig::new();
     let ctx = DrawCtx {
@@ -125,8 +135,14 @@ fn text_lines(palette: &mut PaletteOverlay) -> Vec<String> {
 fn goals_are_the_first_screen_and_open_their_commands() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);
+    // Each goal leads its first few actions, so the first screen is usable directly.
+    let goals: Vec<Row> = palette
+        .rows()
+        .into_iter()
+        .filter(|row| !matches!(row, Row::Entry(_)))
+        .collect();
     assert_eq!(
-        palette.rows(),
+        goals,
         [
             Row::Goal(0),
             Row::Goal(1),
@@ -135,6 +151,7 @@ fn goals_are_the_first_screen_and_open_their_commands() {
             Row::AllActions
         ]
     );
+    assert_eq!(names(&palette)[..3], ["sessions", "model", "rename"]);
     assert!(matches!(
         palette.handle(&plain(KeyCode::Enter), &keys),
         OverlayEvent::None
@@ -172,7 +189,7 @@ fn the_selected_rows_detail_follows_the_list_instead_of_the_panel_bottom() {
 fn back_from_a_goal_returns_to_goals_without_running_anything() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);
-    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.cursor = at(&palette, Row::Goal(1));
     palette.handle(&plain(KeyCode::Enter), &keys);
     assert_eq!(palette.view, View::Goal(1));
     assert_eq!(names(&palette), ["undo"]);
@@ -190,7 +207,7 @@ fn back_from_a_goal_returns_to_goals_without_running_anything() {
         OverlayEvent::None
     ));
     assert_eq!(palette.view, View::Goals);
-    assert_eq!(palette.cursor, 1);
+    assert_eq!(palette.rows()[palette.cursor], Row::Goal(1));
     // Only Esc on the goal list closes the panel.
     assert!(matches!(
         palette.handle(&plain(KeyCode::Esc), &keys),
@@ -268,9 +285,7 @@ fn busy_turn_still_lets_goals_open_and_leaves_command_policy_to_the_app() {
 fn all_actions_opens_the_category_tabs_and_tab_cycles_them() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);
-    for _ in 0..4 {
-        palette.handle(&plain(KeyCode::Down), &keys);
-    }
+    palette.cursor = at(&palette, Row::AllActions);
     palette.handle(&plain(KeyCode::Enter), &keys);
     assert_eq!(palette.view, View::Tabs);
     assert_eq!(palette.group, 0);
@@ -292,7 +307,7 @@ fn all_actions_opens_the_category_tabs_and_tab_cycles_them() {
     palette.handle(&plain(KeyCode::Esc), &keys);
     palette.handle(&plain(KeyCode::Esc), &keys);
     assert_eq!(palette.view, View::Goals);
-    assert_eq!(palette.cursor, GOALS.len());
+    assert_eq!(palette.rows()[palette.cursor], Row::AllActions);
 }
 
 #[test]
@@ -475,8 +490,7 @@ fn manage_goal_lists_todo_and_watch_alongside_work_commands() {
         });
     }
     let mut palette = PaletteOverlay::new(source, false);
-    palette.handle(&plain(KeyCode::Down), &keys);
-    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.cursor = at(&palette, Row::Goal(2));
     palette.handle(&plain(KeyCode::Enter), &keys);
     assert_eq!(palette.view, View::Goal(2));
     assert_eq!(names(&palette), ["watch", "todo", "compute"]);
@@ -537,14 +551,15 @@ fn short_panels_keep_cancel_visible_and_clicks_match_drawn_rows() {
         } else {
             assert!(first_row.contains("Start or continue work"), "{first_row}");
             // Clicking an unselected goal only selects it; the next click opens it.
+            let goal = at(&palette, Row::Goal(1)) as u16;
             assert!(matches!(
-                palette.click(1, list_top as u16 + 1),
+                palette.click(1, list_top as u16 + goal),
                 OverlayEvent::None
             ));
             assert_eq!(palette.view, View::Goals);
-            assert_eq!(palette.cursor, 1);
+            assert_eq!(palette.cursor, usize::from(goal));
             assert!(matches!(
-                palette.click(1, list_top as u16 + 1),
+                palette.click(1, list_top as u16 + goal),
                 OverlayEvent::None
             ));
             assert_eq!(palette.view, View::Goal(1));
@@ -760,14 +775,15 @@ fn clicking_a_goal_invalidates_its_old_hitbox_but_selection_alone_does_not() {
     let area = Rect::new(7, 5, 50, 20);
     draw_in(&mut palette, area);
     let bounds = palette.list_bounds.unwrap();
+    let goal = at(&palette, Row::Goal(1));
     assert!(matches!(
-        palette.click(bounds.x, bounds.y + 1),
+        palette.click(bounds.x, bounds.y + goal as u16),
         OverlayEvent::None
     ));
-    assert_eq!(palette.cursor, 1);
+    assert_eq!(palette.cursor, goal);
     assert_eq!(palette.list_bounds, Some(bounds));
     assert!(matches!(
-        palette.click(bounds.x, bounds.y + 1),
+        palette.click(bounds.x, bounds.y + goal as u16),
         OverlayEvent::None
     ));
     assert_eq!(palette.view, View::Goal(1));
@@ -864,10 +880,10 @@ fn action_panel_keeps_controls_near_the_goals_on_tall_screens() {
                     .contains("Esc")
             })
             .expect("visible controls");
-        assert!(footer < area.y + 18, "controls at {footer} in {area:?}");
+        assert!(footer < area.y + 24, "controls at {footer} in {area:?}");
         let bounds = palette.list_bounds.unwrap();
         assert_eq!(bounds.y, area.y + 3);
-        assert_eq!(bounds.height, 5);
+        assert_eq!(usize::from(bounds.height), palette.rows().len());
         assert!(matches!(
             palette.click(bounds.x, bounds.y),
             OverlayEvent::None

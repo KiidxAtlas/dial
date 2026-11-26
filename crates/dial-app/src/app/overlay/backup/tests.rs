@@ -36,6 +36,45 @@ fn draft_requires_explicit_review_and_cancel_never_emits_a_save() {
     assert!(config.retry.fallback_chains.is_empty());
 }
 
+/// Windows consoles (and terminals with keyboard enhancement) also report key releases; a
+/// release must not move, toggle or save a second time.
+#[test]
+fn key_releases_never_repeat_the_press() {
+    use crossterm::event::KeyEventKind;
+    let release = |code| {
+        Event::Key(KeyEvent::new_with_kind(
+            code,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ))
+    };
+    let keys = Keymap::defaults();
+    let config = Config::default();
+    let mut panel = BackupOverlay::new(&config, Scope::Project);
+    press(&mut panel, KeyCode::Tab);
+    assert_eq!(panel.row, 1);
+    assert!(matches!(
+        panel.handle(&release(KeyCode::Tab), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(panel.row, 1);
+    panel.row = 5;
+    press(&mut panel, KeyCode::Enter);
+    let scope = panel.scope;
+    panel.handle(&release(KeyCode::Enter), &keys);
+    assert_eq!(panel.scope, scope);
+    panel.reviewing = true;
+    assert!(matches!(
+        panel.handle(&release(KeyCode::Char('y')), &keys),
+        OverlayEvent::None
+    ));
+    assert!(matches!(
+        panel.handle(&release(KeyCode::Esc), &keys),
+        OverlayEvent::None
+    ));
+    assert!(panel.reviewing);
+}
+
 #[test]
 fn policy_scope_choices_and_review_preserve_order() {
     let config = Config::default();

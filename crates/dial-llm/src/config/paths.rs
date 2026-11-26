@@ -29,6 +29,30 @@ fn home_dir_from(
         .map(PathBuf::from)
 }
 
+/// Choose an absolute Hugging Face hub cache. Ignore relative values: Desktop's helper, the
+/// engine and the user's shell can all run in different working directories.
+pub fn hf_cache() -> Option<PathBuf> {
+    hf_cache_from(|name| std::env::var_os(name))
+}
+
+fn hf_cache_from(mut var: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let mut get = |name: &str| var(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let (home, fallback) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    get("HF_HUB_CACHE")
+        .or_else(|| get("HUGGINGFACE_HUB_CACHE"))
+        .or_else(|| get("HF_HOME").map(|p| p.join("hub")))
+        .or_else(|| get("XDG_CACHE_HOME").map(|p| p.join("huggingface/hub")))
+        .or_else(|| {
+            get(home)
+                .or_else(|| get(fallback))
+                .map(|p| p.join(".cache/huggingface/hub"))
+        })
+}
+
 /// Dial's private user directory, with an explicit DIAL_HOME taking precedence over the home.
 pub fn user_dir() -> Result<PathBuf> {
     user_dir_from(std::env::var_os("DIAL_HOME"), home_dir)

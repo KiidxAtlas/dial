@@ -16,3 +16,11 @@ fn windows_copies_through_powershell_as_utf8() {
             .all(|(program, _)| !program.contains("powershell"))
     );
 }
+
+#[test]
+fn x11_desktops_with_only_xsel_still_copy() {
+    let names: Vec<&str> = copy_programs(false).iter().map(|(p, _)| *p).collect();
+    assert_eq!(names, ["pbcopy", "wl-copy", "xclip", "xsel"]);
+    let (_, args) = copy_programs(false)[3];
+    assert_eq!(args, ["--clipboard", "--input"]);
+}

@@ -47,12 +47,7 @@ pub(super) fn provision(
     if !allow_install {
         return cached();
     }
-    provision_at(
-        &root,
-        interrupt,
-        || hosts_reachable(&["registry.npmjs.org:443"]),
-        bun,
-    )
+    provision_at(&root, interrupt, bun)
 }
 
 /// Where Bun for dependency installation comes from.
@@ -97,15 +92,12 @@ fn cached_at(root: &Path) -> Result<Runtime, String> {
     Ok(runtime)
 }
 
-// Keep cache selection and network probing injectable without changing process-wide environment.
 fn provision_at(
     root: &Path,
     interrupt: &AtomicBool,
-    reachable: impl FnOnce() -> bool,
     bun: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Runtime, String> {
     let runtime = layout(root);
-    ensure_fetchable(dependencies_cached(&runtime), reachable)?;
     std::fs::create_dir_all(root).map_err(|e| format!("creating private browser runtime: {e}"))?;
     crate::platform::fs::set_owner_only(root)
         .map_err(|e| format!("restricting private browser runtime permissions: {e}"))?;
@@ -142,9 +134,6 @@ pub(super) fn install_chromium(
     runtime: &Runtime,
     interrupt: &AtomicBool,
 ) -> Result<(), String> {
-    if !hosts_reachable(&["cdn.playwright.dev:443"]) {
-        return Err("Chromium is not cached and its download host (cdn.playwright.dev) is unreachable; connect to the network once, configure browser.chromium_executable, or attach via CDP".into());
-    }
     let mut command = Command::new(node);
     command
         .arg(&runtime.cli)
@@ -158,6 +147,9 @@ pub(super) fn install_chromium(
         .env("TEMP", std::env::temp_dir())
         .env("TMP", std::env::temp_dir())
         .envs(crate::tools::exec::sandbox::windows_system_env())
+        // Proxy credentials and CA configuration belong only to the trusted downloader,
+        // never the persistent driver, Chromium, or error output.
+        .envs(download_env(|key| std::env::var_os(key)))
         .env("PLAYWRIGHT_BROWSERS_PATH", &runtime.browsers)
         .current_dir(&runtime.root);
     std::fs::create_dir_all(&runtime.browsers)
@@ -208,21 +200,33 @@ pub(super) fn is_cached() -> bool {
     dependencies_cached(&runtime) && has_chromium
 }
 
-/// Refuse to fetch uncached JavaScript dependencies offline. Chromium availability is checked
-/// separately, only when startup actually needs to download a private browser.
-fn ensure_fetchable(cached: bool, reachable: impl FnOnce() -> bool) -> Result<(), String> {
-    if cached || reachable() {
-        return Ok(());
-    }
-    Err("browser JavaScript dependencies are not cached and their download host (registry.npmjs.org) is unreachable; connect to the network once to provision them".into())
+fn download_env(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "NODE_EXTRA_CA_CERTS",
+    ]
+    .into_iter()
+    .filter_map(|key| lookup(key).map(|value| (key, value)))
+    .collect()
 }
 
-/// Whether the hosts that provisioning downloads from accept a TCP connection promptly.
+/// Test-only availability hint for the optional network-backed end-to-end test. Never gate
+/// provisioning on a direct socket probe: installers can use proxies and local caches.
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(super) fn network_reachable() -> bool {
     hosts_reachable(&["registry.npmjs.org:443", "cdn.playwright.dev:443"])
 }
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn hosts_reachable(hosts: &[&str]) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
     hosts.iter().all(|host| {
@@ -256,7 +260,7 @@ fn run_bounded(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = crate::platform::process::spawn_group(&mut command)
-        .map_err(|e| format!("starting {what}: {e}"))?;
+        .map_err(|e| format!("starting {what} with {:?}: {e}", command.get_program()))?;
     let deadline = Instant::now() + cap;
     loop {
         if interrupt.load(Ordering::SeqCst) {
@@ -276,7 +280,7 @@ fn run_bounded(
                 Ok(())
             } else {
                 Err(format!(
-                    "{what} failed (exit {status}); check network access and retry"
+                    "{what} failed (exit {status}); check network, proxy and CA settings and retry"
                 ))
             };
         }

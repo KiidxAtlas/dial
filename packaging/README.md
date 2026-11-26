@@ -18,6 +18,9 @@ git add PKGBUILD .SRCINFO && git commit -m "dial-bin 0.3.1" && git push
 ```
 
 After editing `PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`.
+For installed copies, `pacman -Qo /usr/bin/dial` identifies the owning package. Update
+`dial-bin` through your AUR helper or rebuild the updated PKGBUILD with `makepkg -si`;
+`dial update` leaves the package-owned binary alone.
 
 ## homebrew-core: `homebrew-core/dial.rb`
 

@@ -567,14 +567,9 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
             }
         })?;
     let mut command = Command::new(&node);
+    crate::tools::exec::sandbox::inherit_allowed_env(&mut command);
     command
         .arg(&*script)
-        .env_clear()
-        .envs(
-            std::env::vars().filter(|(name, value)| {
-                crate::tools::exec::sandbox::child_env_allowed(name, value)
-            }),
-        )
         // The same Windows system variables the browser launch keeps; empty elsewhere.
         .envs(crate::tools::exec::sandbox::windows_system_env())
         .current_dir(cwd)

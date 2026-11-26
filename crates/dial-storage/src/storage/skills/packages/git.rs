@@ -41,6 +41,14 @@ pub(super) fn fetch(
 ) -> Result<Checkout> {
     source.validate()?;
     let url = resolve_local(&source.url, base);
+    // canonicalize produces `\\?\C:\...` on Windows. The colon no longer follows a drive
+    // letter at the start of the argument, so Git can treat it as an SSH location. Give Git
+    // an unambiguous file URL for local drives, without changing UNC/remote or lock identities.
+    #[cfg(windows)]
+    let url = match url::Url::from_file_path(&url) {
+        Ok(file_url) if !url.contains("://") && file_url.host().is_none() => String::from(file_url),
+        _ => url,
+    };
     progress(&format!("Fetching {}", source.spec()));
     let dir = tempfile::Builder::new()
         .prefix("dial-skills-")

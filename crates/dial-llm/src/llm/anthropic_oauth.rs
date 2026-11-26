@@ -1,9 +1,9 @@
 //! Anthropic subscription OAuth for the official Messages API.
 use super::{
     auth::SecretToken,
-    oauth::util::{decode, run_opener},
+    oauth::{Login, util::decode},
 };
-use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
+use crate::config::settings_store::{locked_cancellable, locked_for, write_private};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
@@ -14,7 +14,6 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -186,29 +185,6 @@ fn callback_code(
         .filter(|s| !s.is_empty())
         .context("Anthropic OAuth callback did not contain a code")
 }
-fn browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = Command::new("rundll32.exe");
-        c.args(["url.dll,FileProtocolHandler", url]);
-        c
-    };
-    let opened = run_opener(&mut command);
-    ensure!(opened, "could not open the browser for Anthropic sign-in");
-    Ok(())
-}
 fn read_callback(listener: &TcpListener, state: &str, cancel: &AtomicBool) -> Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     super::oauth::util::wait_callback(
@@ -305,21 +281,23 @@ fn tokens(value: &Value, previous: Option<&Tokens>) -> Result<Tokens> {
         expires_at: now().saturating_add(expires),
     })
 }
-pub fn login(dir: &Path, cancel: Arc<AtomicBool>) -> Result<String> {
+pub fn login(dir: &Path, login: &Login<'_>) -> Result<String> {
+    let cancel = &login.cancel;
     let listener = super::oauth::util::bind_callback("localhost", CALLBACK_PORT)
         .context("Anthropic sign-in callback port 54545 is unavailable")?;
     let redirect = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
     let state = random();
     let verifier = random();
-    cancelled(&cancel)?;
-    browser(&authorization_url(&redirect, &state, &verifier))?;
-    let code = read_callback(&listener, &state, &cancel)?;
+    cancelled(cancel)?;
+    login.open(&authorization_url(&redirect, &state, &verifier), None);
+    let code = read_callback(&listener, &state, cancel)?;
     let value = request_token(
         json!({"grant_type":"authorization_code","client_id":CLIENT_ID,"code":code,"redirect_uri":redirect,"code_verifier":verifier,"state":state}),
-        cancel,
+        cancel.clone(),
     )?;
     let tokens = tokens(&value, None)?;
-    let _lock = locked(&credential_path(dir))?;
+    let _lock = locked_cancellable(&credential_path(dir), cancel)?;
+    cancelled(cancel)?;
     save(
         dir,
         &State {

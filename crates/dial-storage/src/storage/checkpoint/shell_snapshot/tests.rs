@@ -23,9 +23,10 @@ fn shell_changes_become_entries_that_rollback_restores() {
     fx.write("made/new.txt", "created");
     let mut recorded = cp.record_shell_changes().unwrap();
     recorded.sort();
-    let expected = ["gone.db-wal", "made/new.txt", "src/edit.txt"];
-    assert_eq!(recorded, expected);
-    assert_eq!(cp.changed_files(turn), expected);
+    let expected = ["gone.db-wal", "made/new.txt", "src/edit.txt"].map(Path::new);
+    for paths in [recorded, cp.changed_files(turn)] {
+        assert_eq!(paths.iter().map(Path::new).collect::<Vec<_>>(), expected);
+    }
     assert!(
         cp.record_shell_changes().unwrap().is_empty(),
         "a recorded path is not recorded twice"
@@ -57,6 +58,30 @@ fn same_length_rewrite_is_detected_and_identical_rewrite_is_not() {
     fs::remove_file(fx.path("b.txt")).unwrap();
     fx.write("b.txt", "bbbb");
     assert_eq!(cp.record_shell_changes().unwrap(), ["a.txt"]);
+}
+
+#[test]
+fn timestamp_preserving_rewrite_is_detected_and_identical_rewrite_is_not() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "aaaa");
+    fx.write("b.txt", "bbbb");
+    let cp = fx.open();
+    cp.begin_turn("shell").unwrap();
+    covered(&cp);
+    for (name, bytes) in [("a.txt", "AAAA"), ("b.txt", "bbbb")] {
+        let path = fx.path(name);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fx.write(name, bytes);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+    assert_eq!(cp.record_shell_changes().unwrap(), ["a.txt"]);
+    assert!(cp.rollback(1).unwrap().warnings.is_empty());
+    assert_eq!(fx.read("a.txt").as_deref(), Some("aaaa"));
 }
 
 #[test]

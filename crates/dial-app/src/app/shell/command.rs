@@ -240,6 +240,9 @@ impl Shell {
             return self.open(app, agent, Which::Choice(Box::new(spec)));
         }
         if let Some(panel) = command_panel(name, args) {
+            if matches!(panel, Which::Stats(_)) {
+                self.stats_session = Some(session_cost_text(agent));
+            }
             return self.open(app, agent, panel);
         }
         let changes_session = matches!(name, "new" | "clear" | "fork" | "move" | "undo")
@@ -873,13 +876,18 @@ impl Shell {
     }
 
     fn cost_command(&mut self, agent: &Agent<'_>) -> Result<Step> {
+        let text = session_cost_text(agent);
+        self.note("Cost and usage", text);
+        Ok(Step::Done)
+    }
+}
+
+/// The current session's cost and usage report, shared by `/cost` and the first tab of `/stats`.
+pub(in crate::app) fn session_cost_text(agent: &Agent<'_>) -> String {
+    {
         let (total, turn) = agent.usage();
         if total.all.requests == 0 {
-            self.note(
-                "Cost and usage",
-                "No model requests yet in this session.\nCost and token counts appear here after the first reply.",
-            );
-            return Ok(Step::Done);
+            return "No model requests yet in this session.\nCost and token counts appear here after the first reply.".to_owned();
         }
         // Summary first, then one short block per role that made requests. Accounting detail
         // (pricing mix, discarded or unreported attempts) appears only when it says something.
@@ -985,10 +993,11 @@ impl Shell {
             }
         }
         text.push_str("\n\nMissing usage or prices are unknown, not free; subscription and local use is not invoice-priced. Caps act on observed cost; in-flight workers and discarded attempts can add charges. Earlier (resumed) sessions are not counted.");
-        self.note("Cost and usage", text);
-        Ok(Step::Done)
+        text
     }
+}
 
+impl Shell {
     fn compact_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
         self.compact_command_review(app, agent, args, |shell, preview| {
             shell.ask(

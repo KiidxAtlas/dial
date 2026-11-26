@@ -1,4 +1,5 @@
 //! Suspended creation prevents descendants escaping the job before containment.
+use crate::platform::procinfo::ProcId;
 use std::{
     collections::HashMap,
     io,
@@ -14,6 +15,7 @@ use windows_sys::Win32::{
     System::{
         Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent},
         JobObjects::*,
+        SystemServices::JOB_OBJECT_QUERY,
         Threading::*,
     },
 };
@@ -36,13 +38,40 @@ pub(in crate::platform) fn quiet_error_dialogs() {
     }
 }
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
-    // SAFETY: null security attributes and name request an unnamed job with default security.
-    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    let (child, job) = spawn_in_job(command, false)?;
+    jobs().insert(child.id(), job);
+    Ok(child)
+}
+
+fn job_name(server: ProcId) -> Vec<u16> {
+    format!("Global\\Dial-SharedJob-{}-{}\0", server.pid, server.start)
+        .encode_utf16()
+        .collect()
+}
+
+// Never adopt a pre-existing named job: an unexpected name collision must not change its limits.
+fn create_job(name: Option<&[u16]>) -> io::Result<OwnedHandle> {
+    // SAFETY: a supplied name is NUL-terminated UTF-16 and lives through the call.
+    let raw = unsafe {
+        CreateJobObjectW(
+            std::ptr::null(),
+            name.map_or(std::ptr::null(), |n| n.as_ptr()),
+        )
+    };
     if raw.is_null() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: CreateJobObjectW returned a fresh non-null handle owned only by this scope.
     let job = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    if name.is_some()
+        && io::Error::last_os_error().raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS as i32)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "shared job already exists",
+        ));
+    }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     // SAFETY: raw stays owned by job; limits is a live initialized structure whose exact
@@ -58,32 +87,88 @@ pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Chil
     {
         return Err(io::Error::last_os_error());
     }
-    let mut child = command
-        .creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP)
-        .spawn()?;
-    let handle = child.as_raw_handle() as HANDLE;
-    // SAFETY: job and child own both live handles; the child is still suspended, so
-    // containment is established before it can start descendants.
-    if unsafe { AssignProcessToJobObject(raw, handle) } == 0 {
-        let error = io::Error::last_os_error();
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+    Ok(job)
+}
+
+fn spawn_in_job(command: &mut Command, shared: bool) -> io::Result<(Child, OwnedHandle)> {
+    let flags = if shared {
+        CREATE_NO_WINDOW
+    } else {
+        CREATE_NEW_PROCESS_GROUP
+    };
+    let mut child = command.creation_flags(CREATE_SUSPENDED | flags).spawn()?;
+    let result = (|| {
+        let name = if shared {
+            Some(job_name(ProcId::of(child.id() as i32).ok_or_else(
+                || io::Error::other("cannot identify shared process"),
+            )?))
+        } else {
+            None
+        };
+        let job = create_job(name.as_deref())?;
+        let raw = job.as_raw_handle() as HANDLE;
+        let handle = child.as_raw_handle() as HANDLE;
+        // SAFETY: job and child own both live handles; the child is still suspended, so
+        // containment is established before it can start descendants.
+        if unsafe { AssignProcessToJobObject(raw, handle) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: handle is our suspended child's live process handle; NtResumeProcess
+        // changes its suspend count without borrowing any Rust memory.
+        let status = unsafe { NtResumeProcess(handle) };
+        if status < 0 {
+            // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS returned above.
+            let error = io::Error::from_raw_os_error(unsafe {
+                windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+            } as i32);
+            return Err(error);
+        }
+        Ok(job)
+    })();
+    match result {
+        Ok(job) => Ok((child, job)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
     }
-    // SAFETY: handle is our suspended child's live process handle; NtResumeProcess
-    // changes its suspend count without borrowing any Rust memory.
-    let status = unsafe { NtResumeProcess(handle) };
-    if status < 0 {
-        // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS returned above.
-        let error = io::Error::from_raw_os_error(unsafe {
-            windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
-        } as i32);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+}
+
+pub(in crate::platform) fn spawn_shared_group(
+    command: &mut Command,
+) -> io::Result<(Child, OwnedHandle)> {
+    spawn_in_job(command, true)
+}
+
+pub(in crate::platform) fn hold_shared_group(server: ProcId) -> io::Result<OwnedHandle> {
+    let leader = open_pid(server.pid as u32, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    if crate::platform::procinfo::win::times(&leader) != Some((server.start, false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "shared group leader changed",
+        ));
     }
-    jobs().insert(child.id(), job);
-    Ok(child)
+    let name = job_name(server);
+    // SAFETY: name is a live NUL-terminated string. This non-inheritable lease only needs query access.
+    let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: OpenJobObjectW provided a fresh owned handle.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    let mut member = 0;
+    // SAFETY: job and leader pin the exact identity under test, member is writable.
+    if unsafe { IsProcessInJob(leader.as_raw_handle() as HANDLE, raw, &mut member) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if member == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared job does not contain its declared leader",
+        ));
+    }
+    Ok(job)
 }
 pub(in crate::platform) fn register_group(
     pid: u32,

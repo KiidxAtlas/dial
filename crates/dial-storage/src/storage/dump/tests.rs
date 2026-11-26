@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{fs::File, io::Read};
 
 use super::*;
 
@@ -37,6 +37,7 @@ fn all_archive_contains_verbatim_session() {
     let (root, layout, session) = setup();
     let out = root.path().join("out");
     let report = dump_session(&layout, &session, DumpKind::All, &out).unwrap();
+    assert!(crate::platform::fs::is_owner_only(&File::open(&report.archive).unwrap()).unwrap());
     assert_eq!(
         report.entries,
         vec!["session.jsonl".to_string(), "llm-request.json".to_string()]

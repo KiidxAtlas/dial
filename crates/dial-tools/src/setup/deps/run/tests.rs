@@ -8,6 +8,43 @@ fn parses_bun_versions() {
     assert!(parse_version("1.2.9").unwrap() < BUN_MIN);
 }
 
+#[test]
+fn cancelling_after_a_step_starts_terminates_its_descendant() {
+    #[cfg(unix)]
+    let (program, args) = ("sh", vec!["-c", "sleep 15 & echo $!; wait"]);
+    #[cfg(windows)]
+    let (program, args) = (
+        "powershell.exe",
+        vec![
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p = Start-Process powershell.exe -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 15' -PassThru; $p.Id; $p.WaitForExit()",
+        ],
+    );
+    let step = Step {
+        program: program.into(),
+        args: args.into_iter().map(String::from).collect(),
+        env: Vec::new(),
+    };
+    let cancel = AtomicBool::new(false);
+    let mut descendant = None;
+    let error = run_step(&step, &cancel, &mut |line| {
+        if let Ok(pid) = line.parse::<i32>() {
+            descendant = crate::platform::procinfo::ProcId::of(pid);
+            cancel.store(true, Ordering::Release);
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    let child = descendant.expect("observed running descendant");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while child.alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!child.alive(), "step's descendant survived cancellation");
+}
+
 #[cfg(unix)]
 #[test]
 fn python_voice_health_uses_supported_help_and_propagates_failure() {
@@ -73,6 +110,6 @@ fn installs_the_pinned_mlx_serve_and_it_answers() {
         "{}",
         location.display()
     );
-    let version = probe(&location, &["--version"]).unwrap();
+    let version = probe(&location, &["--version"], &AtomicBool::new(false)).unwrap();
     assert!(version.contains("mlx-serve 26.11.3"), "{version}");
 }

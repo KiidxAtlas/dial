@@ -9,6 +9,11 @@ fn a_notebook_mutation_reports_its_committed_path() {
         json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[]}).to_string(),
     )
     .unwrap();
+    #[cfg(windows)]
+    let dacl =
+        || crate::platform::fs::FileDacl::read(&std::fs::File::open(&path).unwrap()).unwrap();
+    #[cfg(windows)]
+    let original_acl = dacl();
     let config = Config::default();
     let authorize = crate::tools::testkit::authorize_in_workspace(&ws, "notebook");
     let context = ToolContext {
@@ -32,6 +37,8 @@ fn a_notebook_mutation_reports_its_committed_path() {
     let output = crate::tools::exec::execution::run(&cancel, || notebook.call(&context, &insert));
     assert!(!output.is_error, "{}", output.text);
     assert!(std::fs::read_to_string(&path).unwrap().contains("# Title"));
+    #[cfg(windows)]
+    assert_eq!(dacl(), original_acl);
     // The publish protocol leaves neither the staged file nor the captured original behind.
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()

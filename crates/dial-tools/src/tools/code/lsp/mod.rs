@@ -194,6 +194,7 @@ fn writethrough_with(
         return output;
     }
     let mut errors = Vec::new();
+    let mut resolved = 0;
     let mut unknown_baseline = false;
     // One budget for the whole edit, however many files and servers it touches.
     let deadline = std::time::Instant::now() + WRITE_DIAGNOSTICS_BUDGET;
@@ -229,12 +230,22 @@ fn writethrough_with(
             let Some(items) = client.diagnostics_bounded(path, mark, changed, left) else {
                 continue;
             };
-            let new = new_errors(before.as_deref().unwrap_or_default(), &items);
+            let (new, fixed) = error_changes(before.as_deref().unwrap_or_default(), &items);
+            resolved += fixed;
             unknown_baseline |= before.is_none() && !new.is_empty();
-            errors.extend(new.into_iter().map(|item| diagnostic_line(ws, path, item)));
+            for item in new {
+                let mut line = diagnostic_line(ws, path, item);
+                if errors.len() < QUICK_FIX_LOOKUPS {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if let Some(fix) = quick_fixes(client, path, item, left) {
+                        let _ = write!(line, " (quick fix: {fix})");
+                    }
+                }
+                errors.push(line);
+            }
         }
     }
-    output.push_str(&new_errors_note(&errors, unknown_baseline));
+    output.push_str(&new_errors_note(&errors, resolved, unknown_baseline));
     output
 }
 
@@ -242,10 +253,15 @@ fn writethrough_with(
 const WRITE_DIAGNOSTICS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Most new-error lines appended to one edit result.
 const WRITE_DIAGNOSTICS_LINES: usize = 8;
+/// New errors that get quick-fix titles looked up, within the same diagnostics budget.
+const QUICK_FIX_LOOKUPS: usize = 3;
+/// Most quick-fix titles named for one error.
+const QUICK_FIX_TITLES: usize = 2;
 
-/// Error-severity items of `after` with no counterpart in `before`. Positions are ignored, since an
-/// edit shifts lines; each earlier error with the same message, code and source absorbs one item.
-fn new_errors<'a>(before: &[Value], after: &'a [Value]) -> Vec<&'a Value> {
+/// Error-severity items of `after` with no counterpart in `before`, and how many errors of `before`
+/// have no counterpart in `after` (resolved). Positions are ignored, since an edit shifts lines;
+/// each error with the same message, code and source matches one on the other side.
+fn error_changes<'a>(before: &[Value], after: &'a [Value]) -> (Vec<&'a Value>, usize) {
     let is_error = |item: &&Value| item.get("severity").and_then(Value::as_u64) == Some(1);
     let key = |item: &Value| {
         (
@@ -262,7 +278,7 @@ fn new_errors<'a>(before: &[Value], after: &'a [Value]) -> Vec<&'a Value> {
     for item in before.iter().filter(is_error) {
         *known.entry(key(item)).or_default() += 1;
     }
-    after
+    let new = after
         .iter()
         .filter(is_error)
         .filter(|item| match known.get_mut(&key(item)) {
@@ -272,7 +288,52 @@ fn new_errors<'a>(before: &[Value], after: &'a [Value]) -> Vec<&'a Value> {
             }
             _ => true,
         })
-        .collect()
+        .collect();
+    (new, known.values().sum())
+}
+
+/// Titles of the server's quick fixes for one diagnostic, preferred first, or `None` when the
+/// server offers none, cannot answer within `left`, or has no code actions at all. Only titles are
+/// read; nothing is applied (`lsp code_actions` lists them as applicable actions).
+fn quick_fixes(
+    client: &Client,
+    path: &Path,
+    item: &Value,
+    left: std::time::Duration,
+) -> Option<String> {
+    if left.is_zero() || !client.supports("/codeActionProvider", "textDocument/codeAction") {
+        return None;
+    }
+    let range = item.get("range")?.clone();
+    let params = json!({
+        "textDocument": {"uri": uri_from_path(path)},
+        "range": range,
+        "context": {"diagnostics": [item], "only": ["quickfix"], "triggerKind": 1},
+    });
+    let result = client
+        .request_bounded("textDocument/codeAction", params, left)
+        .ok()?;
+    let mut actions: Vec<&Value> = result
+        .as_array()?
+        .iter()
+        .filter(|action| action.get("disabled").is_none())
+        .filter(|action| {
+            action
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind == "quickfix" || kind.starts_with("quickfix."))
+        })
+        .collect();
+    // Stable: the server's order is kept within preferred and other fixes.
+    actions.sort_by_key(|action| action.get("isPreferred") != Some(&Value::Bool(true)));
+    let titles: Vec<String> = actions
+        .iter()
+        .filter_map(|action| action.get("title").and_then(Value::as_str))
+        .map(|title| title.lines().next().unwrap_or_default().trim().to_owned())
+        .filter(|title| !title.is_empty())
+        .take(QUICK_FIX_TITLES)
+        .collect();
+    (!titles.is_empty()).then(|| titles.join("; "))
 }
 
 /// `path:line:col: message` for one diagnostic (1-based positions, first message line).
@@ -298,18 +359,28 @@ fn diagnostic_line(ws: &Workspace, path: &Path, item: &Value) -> String {
 /// First words of the advisory block [`new_errors_note`] appends to an edit result.
 const NEW_ERRORS_PREFIX: &str = "[LSP advisory, not verification] ";
 
-/// The advisory block appended to an edit result; empty when the edit added no errors.
-fn new_errors_note(errors: &[String], unknown_baseline: bool) -> String {
+/// The advisory block appended to an edit result: errors the edit introduced, and how many earlier
+/// errors it resolved. Empty when it did neither.
+fn new_errors_note(errors: &[String], resolved: usize, unknown_baseline: bool) -> String {
     if errors.is_empty() {
-        return String::new();
+        return if resolved > 0 {
+            format!("{NEW_ERRORS_PREFIX}{resolved} error(s) resolved by this edit\n")
+        } else {
+            String::new()
+        };
     }
     let mut note = format!(
-        "{NEW_ERRORS_PREFIX}{} new error(s) after this edit{}:\n",
+        "{NEW_ERRORS_PREFIX}{} new error(s) after this edit{}{}:\n",
         errors.len(),
         if unknown_baseline {
             " (file had no earlier diagnostics; some may predate the edit)"
         } else {
             ""
+        },
+        if resolved > 0 {
+            format!("; {resolved} resolved")
+        } else {
+            String::new()
         }
     );
     for line in errors.iter().take(WRITE_DIAGNOSTICS_LINES) {

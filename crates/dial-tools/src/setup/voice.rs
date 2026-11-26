@@ -217,7 +217,12 @@ pub fn prepare(
                 Some(model) if nonempty(model) => model.to_path_buf(),
                 _ => run::ensure_whisper_model(&layout.user_dir, cancel, progress)?,
             };
-            progress(&run::health(id, &location, Some(&model))?);
+            progress(&run::health_with_cancel(
+                id,
+                &location,
+                Some(&model),
+                cancel,
+            )?);
             env.voice.stt.whisper_cpp_model = Some(model.clone());
             changes.push(Change::Set {
                 path: "voice.stt.whisper_cpp_model".into(),
@@ -225,7 +230,7 @@ pub fn prepare(
             });
         }
         "espeak-ng" => {
-            progress(&run::health(id, &location, None)?);
+            progress(&run::health_with_cancel(id, &location, None, cancel)?);
             env.voice.tts.espeak_program = location.clone();
         }
         "mlx-whisper" => {

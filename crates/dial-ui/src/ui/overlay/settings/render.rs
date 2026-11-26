@@ -748,15 +748,11 @@ impl SettingsOverlay {
                 };
                 let mut tags: Vec<(String, Tok)> = Vec::new();
                 if editing.is_none() {
-                    // A common source column makes inheritance explicit, including defaults.
-                    tags.push((
-                        format!("{} {source}", theme.sym(Sym::Bullet)),
-                        if source == "default" {
-                            Tok::Dim
-                        } else {
-                            Tok::Accent
-                        },
-                    ));
+                    // Only values that differ from the default carry a source tag, so changed
+                    // settings stand out; the detail line still names the source of every row.
+                    if source != "default" {
+                        tags.push((format!("{} {source}", theme.sym(Sym::Bullet)), Tok::Accent));
+                    }
                     if self.application_changes.contains_key(def.path) {
                         tags.push((self.application_timing(def).to_owned(), Tok::Warning));
                     }

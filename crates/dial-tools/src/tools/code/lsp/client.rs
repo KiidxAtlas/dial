@@ -9,7 +9,7 @@
 //! write. Open documents are bounded; the least recently used one is closed past the limit.
 
 use super::framing::{read_message, write_message};
-use super::text::{path_from_uri, read_source, uri_from_path};
+use super::text::{diagnostic_key, path_from_uri, read_source, uri_from_path};
 use crate::runtime::process::ProcessGroup;
 use anyhow::{Result, anyhow, bail};
 use globset::GlobBuilder;
@@ -341,14 +341,15 @@ impl Shared {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.store(path, params.get("version").and_then(Value::as_i64), items);
+        self.store(&path, params.get("version").and_then(Value::as_i64), items);
     }
 
-    fn store(&self, path: PathBuf, version: Option<i64>, items: Vec<Value>) {
+    fn store(&self, path: &Path, version: Option<i64>, items: Vec<Value>) {
+        let key = diagnostic_key(path).into_owned();
         let mut diagnostics = lock(&self.diagnostics);
         diagnostics.counter += 1;
         let counter = diagnostics.counter;
-        diagnostics.by_file.insert(path, (counter, version, items));
+        diagnostics.by_file.insert(key, (counter, version, items));
         self.published.notify_all();
     }
 
@@ -862,6 +863,11 @@ impl Client {
         }
     }
 
+    /// One request answered within `limit`, without retries: for callers with a fixed time budget.
+    pub fn request_bounded(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
+        self.request_within(method, params, limit)
+    }
+
     fn request_within(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
         self.request_cancellable(method, params, limit, None)
     }
@@ -1204,7 +1210,7 @@ impl Client {
             }
         }
         drop(diagnostics);
-        self.shared.store(path.to_owned(), version, items.clone());
+        self.shared.store(path, version, items.clone());
         Ok(items)
     }
 
@@ -1212,7 +1218,7 @@ impl Client {
     pub fn diagnostics_mark(&self, path: &Path) -> u64 {
         lock(&self.shared.diagnostics)
             .by_file
-            .get(path)
+            .get(diagnostic_key(path).as_ref())
             .map_or(0, |(seq, _, _)| *seq)
     }
 
@@ -1220,7 +1226,7 @@ impl Client {
     pub fn last_diagnostics(&self, path: &Path) -> Option<Vec<Value>> {
         lock(&self.shared.diagnostics)
             .by_file
-            .get(path)
+            .get(diagnostic_key(path).as_ref())
             .map(|(_, _, items)| items.clone())
     }
 
@@ -1271,9 +1277,10 @@ impl Client {
             }
         }
         let expected = self.version(path).map(i64::from);
+        let key = diagnostic_key(path);
         let seq_of = |d: &Diagnostics| {
             d.by_file
-                .get(path)
+                .get(key.as_ref())
                 .filter(|(_, version, _)| version.is_none() || *version == expected)
                 .map_or(0, |(seq, _, _)| *seq)
         };
@@ -1293,7 +1300,7 @@ impl Client {
                 break;
             }
         }
-        let (_, _, items) = guard.by_file.get(path)?;
+        let (_, _, items) = guard.by_file.get(key.as_ref())?;
         let seq = seq_of(&guard);
         (seq > 0 && (!fresh || seq > mark)).then(|| items.clone())
     }

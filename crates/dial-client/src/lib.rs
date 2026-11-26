@@ -35,7 +35,7 @@ mod conversation;
 mod transport_queue;
 pub use conversation::{
     AssistantEntry, Conversation, Entry, NoticeEntry, PendingApproval, ToolCard, ToolEntry,
-    ToolOutcome, UserEntry,
+    ToolOutcome, UserEntry, is_harness_message,
 };
 
 #[cfg(test)]

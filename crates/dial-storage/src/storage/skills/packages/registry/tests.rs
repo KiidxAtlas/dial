@@ -44,12 +44,12 @@ fn search_matches_names_and_descriptions_case_insensitively() {
 
 #[test]
 fn loads_an_index_from_a_file_url_and_rejects_other_schemes() {
-    let dir = std::env::temp_dir().join(format!("dial-registry-test-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("index.json");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index #1%.json");
     fs::write(&path, GOOD).unwrap();
-    let entries = fetch_index(&format!("file://{}", path.display())).unwrap();
+    let url = url::Url::from_file_path(&path).unwrap();
+    let entries = fetch_index(url.as_str()).unwrap();
     assert_eq!(entries.len(), 2);
     assert!(fetch_index("ftp://example.com/index.json").is_err());
-    let _ = fs::remove_dir_all(&dir);
+    assert!(local_index_path("file://other-host/share/index.json").is_err());
 }

@@ -2,6 +2,26 @@ use super::*;
 use crate::ui::overlay::settings::testkit::{Rig, key, render, screen, status_preview};
 
 #[test]
+fn the_live_session_tab_leads_and_tab_reaches_the_stored_history() {
+    let rig = Rig::new();
+    let mut panel = StatsOverlay::new(vec![("Usage / cost", "STORED".into())])
+        .with_first_tab("This session", "LIVE $0.12".into());
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let first = screen(&render(80, 20, |f| panel.draw(f, &ctx)));
+    assert!(
+        first.contains("This session") && first.contains("LIVE $0.12"),
+        "{first}"
+    );
+    panel.handle(&key(KeyCode::Tab), &rig.keys);
+    assert!(screen(&render(80, 20, |f| panel.draw(f, &ctx))).contains("STORED"));
+}
+
+#[test]
 fn tabs_search_help_and_escape_preserve_report_navigation() {
     let rig = Rig::new();
     let mut panel = StatsOverlay::new(vec![

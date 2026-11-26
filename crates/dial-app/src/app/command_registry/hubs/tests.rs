@@ -3,6 +3,20 @@ use crate::app::command_registry::{command_entries, command_panel, command_spec,
 use crate::app::overlay::Which;
 
 #[test]
+fn bare_undo_opens_one_chooser_whose_first_row_is_the_old_bare_undo() {
+    let Some(Which::Choice(spec)) = command_panel("undo", "") else {
+        panic!("bare /undo opens a chooser")
+    };
+    let values: Vec<&str> = spec.items.iter().map(|item| item.value.as_str()).collect();
+    assert_eq!(values, ["1", "2", "files"]);
+    // Any argument still runs directly.
+    for args in ["1", "3", "files", "files 2"] {
+        assert!(command_panel("undo", args).is_none(), "/undo {args}");
+    }
+    assert_eq!(expand("undo", "files 2"), ("rollback", "2"));
+}
+
+#[test]
 fn hubs_route_to_original_handlers_and_keep_their_turn_boundaries() {
     for (hub, args, target, rest) in [
         ("mode", "plan on", "plan", "on"),

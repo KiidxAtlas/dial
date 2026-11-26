@@ -96,6 +96,8 @@ Project-peer notices are emitted when the recipient collects mail at a model req
 not when a sender queues it. An idle RPC client can inspect unread mail with `list_peers`
 without consuming it or starting inference.
 
+`messages` and `messages_page` return the active branch's conversation as it happened: compaction does not remove earlier messages from them or add its summary, carried state or file contents. The model's compacted context is separate and is not exposed here. `dial-client`'s `Conversation` shows harness-written user-role records (summaries, reminders, worker results) as notices, or hides them, and never as user rows; `is_harness_message` reports which records those are.
+
 `messages_page` accepts an unsigned `offset` or a decimal-string `cursor` (offset takes precedence),
 and an unsigned `limit` defaulting to 50 and clamped to 1–500. Invalid types, malformed cursors and
 offsets past the snapshot end are errors, not a silent restart at page zero. An offset at the end
@@ -165,6 +167,8 @@ Session administration, models and settings (native `dial rpc` only for the `ses
 - `apply_settings` (`settings` group, actor method): reloads the saved settings with the process's command-line flags and applies them to the running session, as the terminal does after `/settings` or `/reload`. An approval change applies in place; when nothing else changed the reply is `{applied: "live", rebuilt: false, approval}`. Any other change rebuilds the agent around the same session, keeping the conversation, todo list, plan mode, approval, permission rules, cost, a model chosen with `set_model`, the resident local model and background processes; MCP servers whose configuration is unchanged stay connected. The reply is `{applied: "rebuild", rebuilt: true, host_tools_reset, tools, model, image_input}`. `{reconnect: true}` rebuilds even when nothing changed and reconnects every MCP server instead of keeping its connection, as `/mcp reconnect` does; the reply adds `reconnected: true`. Host tools and URI schemes are dropped on a rebuild (`host_tools_reset`) and must be declared again; parked sessions must be `resume`d again. Invalid saved settings or an unreachable model fail with `invalid_params` and leave the agent unchanged; running workers fail it with `busy`. Engines without `apply_settings` can restart into the same session instead: `dial-client`'s `Client::restart_and_resume` does that.
 
 `state` also carries `current_model` (`provider`, `model_id`, and `thinking` with the explicitly chosen `level` (null when none), `default_level` (the catalog's default when no level is chosen), the declared `levels`, and `settable`, which is true when `set_thinking` can choose a level for this model).
+
+For new sessions, `get_default_thinking` reads the saved default model and its available levels. Pass `scope: "global"` for the everywhere default or `"project"` for the effective project default. `set_default_thinking` takes that scope, the returned `provider` and `model_id`, and a supported `level` (or `default` to remove the explicit level from that layer). Neither method switches the current conversation.
 
 Checkpoints and undo (native `dial rpc` only, `checkpoints` group). These call the same owners as `/review`, `/changes` and `/undo`, through the session's checkpoint journal:
 

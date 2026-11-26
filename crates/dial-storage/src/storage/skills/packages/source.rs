@@ -104,6 +104,7 @@ fn is_local_path(head: &str) -> bool {
     head.starts_with('/')
         || head.starts_with("./")
         || head.starts_with("../")
+        || (cfg!(windows) && head.contains('\\') && !head.contains(':'))
         || head.starts_with('~')
         || head.starts_with('\\')
         || head.as_bytes().get(1..3) == Some(b":\\")
@@ -142,7 +143,11 @@ pub fn default_name(source: &Source) -> Option<String> {
     let raw = match &source.path {
         Some(path) => path.trim_end_matches('/').rsplit('/').next()?,
         None => {
-            let last = source.url.trim_end_matches('/').rsplit(['/', ':']).next()?;
+            let last = source
+                .url
+                .trim_end_matches(std::path::is_separator)
+                .rsplit(|c| c == ':' || std::path::is_separator(c))
+                .next()?;
             last.strip_suffix(".git").unwrap_or(last)
         }
     };

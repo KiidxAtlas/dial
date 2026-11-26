@@ -321,6 +321,42 @@ fn local_commit_installs_every_target_and_leaves_no_staging_entries() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
+#[cfg(windows)]
+#[test]
+fn edit_inherits_new_entry_acls_without_writing_existing_ancestors() {
+    use crate::platform::fs::{FileDacl, open_dir_nofollow, set_owner_only};
+    use std::{fs, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ};
+    let (dir, ws, _) = project(None);
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    // A deterministic inheritable ACL: children inherit ACEs but not the protection flag.
+    set_owner_only(&work).unwrap();
+    let reference = work.join("reference");
+    fs::create_dir(&reference).unwrap();
+    fs::write(reference.join("file"), b"old").unwrap();
+    let acl = |path: &Path| FileDacl::read(&fs::File::open(path).unwrap()).unwrap();
+    let dir_acl = |path: &Path| FileDacl::read(&open_dir_nofollow(path).unwrap()).unwrap();
+    let original = ws.resolve("work/reference/file").unwrap();
+    let before = acl(&original);
+    let created = ws.resolve("work/sub/new.txt").unwrap();
+    let _held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir.path())
+        .unwrap();
+    let changes = [
+        Change::load(&ws, original.clone(), Some("edited".into())).unwrap(),
+        Change::load(&ws, created.clone(), Some("created".into())).unwrap(),
+    ];
+    commit(&ws, &changes).unwrap();
+    assert_eq!(fs::read(&original).unwrap(), b"edited");
+    assert_eq!(acl(&original), before);
+    assert_eq!(acl(&created), before);
+    assert_eq!(dir_acl(created.parent().unwrap()), dir_acl(&reference));
+}
+
 /// The shared preflight refuses each invalid batch before any target is touched: duplicate targets,
 /// an oversized replacement, a `before` that went stale, and a batch over the target cap. The
 /// target and the staging directory are unchanged afterwards.

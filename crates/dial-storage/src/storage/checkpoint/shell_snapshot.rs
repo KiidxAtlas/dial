@@ -38,6 +38,7 @@ struct Stamp {
     modified: Option<std::time::SystemTime>,
     mode: u32,
     /// Unix inode and status-change time, which also move when a file is replaced in place.
+    #[cfg(unix)]
     identity: (u64, i64, i64),
 }
 
@@ -48,12 +49,11 @@ impl Stamp {
             use std::os::unix::fs::MetadataExt;
             (meta.ino(), meta.ctime(), meta.ctime_nsec())
         };
-        #[cfg(not(unix))]
-        let identity = (0, 0, 0);
         Self {
             len: meta.len(),
             modified: meta.modified().ok(),
             mode: platform_fs::mode(meta) & 0o7777,
+            #[cfg(unix)]
             identity,
         }
     }
@@ -137,10 +137,11 @@ impl Checkpoints {
             let current = fs::symlink_metadata(&path)
                 .ok()
                 .filter(fs::Metadata::is_file);
-            if current
-                .as_ref()
-                .is_some_and(|meta| Stamp::of(meta) == saved.stamp)
-            {
+            // Off Unix we have no inode/change-time stamp. A same-size rewrite can
+            // preserve mtime, so compare the saved bytes whenever we have them.
+            if current.as_ref().is_some_and(|meta| {
+                (cfg!(unix) || saved.blob.is_none()) && Stamp::of(meta) == saved.stamp
+            }) {
                 continue;
             }
             let Some(blob) = saved.blob else {
