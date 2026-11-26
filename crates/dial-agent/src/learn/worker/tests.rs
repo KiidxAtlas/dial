@@ -25,7 +25,10 @@ fn inkling_capabilities_follow_the_exact_engine_pin() {
     };
     let key = LocalEngine::model_key(&config.model);
     let caps = capabilities(&config).unwrap();
-    assert_eq!(caps["inference"], false);
+    // Auto picks Atomic Engine, the only loader for this architecture, where it is installed.
+    let atomic_available = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && crate::llm::local_format::atomic_server().is_some();
+    assert_eq!(caps["inference"], atomic_available);
     assert!(
         caps["reason"].as_str().unwrap().contains("Atomic"),
         "{caps}"
@@ -45,11 +48,7 @@ fn inkling_capabilities_follow_the_exact_engine_pin() {
 
     config.local_model_engines.insert(key, LocalEngine::Atomic);
     let caps = capabilities_controlled(&config, &false.into()).unwrap();
-    assert_eq!(
-        caps["inference"],
-        cfg!(all(target_os = "macos", target_arch = "aarch64"))
-            && crate::llm::local_format::atomic_server().is_some()
-    );
+    assert_eq!(caps["inference"], atomic_available);
     assert!(caps["reason"].as_str().unwrap().contains("Atomic"));
     assert_eq!(caps["lora"], false);
 }
