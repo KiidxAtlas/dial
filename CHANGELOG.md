@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-11-25
+
+- Document how to check the Windows computer-use backend and verify approved input in a disposable window.
+
 ## [0.3.18] - 2026-11-24
 
 - RPC clients can list lifecycle hooks with their effective failure mode, every addressable SSH host, the repository's worktrees, and Claude Code or Codex transcripts for the project, and import a listed transcript as a new session (`list_hooks`, `ssh_hosts`, `list_worktrees`, `import_candidates`, `import_session`). `/hooks` and `/ssh` are no longer terminal-only. [RPC operations](docs/rpc-and-acp.md#native-workflow-operations).
@@ -3268,7 +3272,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.18...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.19...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3323,3 +3327,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.17]: https://github.com/KiidxAtlas/dial/tree/v0.3.17
 [0.3.16]: https://github.com/KiidxAtlas/dial/tree/v0.3.16
 [0.3.18]: https://github.com/KiidxAtlas/dial/tree/v0.3.18
+[0.3.19]: https://github.com/KiidxAtlas/dial/tree/v0.3.19
