@@ -1047,6 +1047,42 @@ fn an_unattended_snapshot_of_one_result_prompts_an_independent_check() {
 }
 
 #[test]
+fn a_single_line_membership_check_prompts_an_independent_check() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("bash", json!({"command":"echo amber > out.txt"}))),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"grep -qx amber out.txt","check":true}),
+            )),
+        ),
+        response("Wrote the result.", None),
+        response("I could not verify completeness.", None),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        agent
+            .turn(
+                "Write each matching label, for example amber; print them all.",
+                &mut NullUi,
+            )
+            .unwrap();
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("compare the full set")
+    );
+}
+
+#[test]
 fn a_repeated_unverified_unattended_completion_ends_incomplete() {
     let server = llm::fake::serve(vec![
         response("", Some(("bash", json!({"command":WRITE_RESULT})))),

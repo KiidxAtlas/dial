@@ -2696,14 +2696,35 @@ fn snapshot_word(command: &str) -> Option<&str> {
     (1..=3).find_map(|index| captures.get(index).map(|value| value.as_str()))
 }
 
-/// The expected values of a passing check when every one of them was printed earlier in this
-/// turn and none comes from the request: the check then confirms the program reproduces its own
-/// earlier output, not that the output is right.
+/// A literal whole-line match establishes membership, not completeness.
+fn single_line_membership(command: &str, instruction: &str) -> Option<String> {
+    static MEMBERSHIP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^grep[ \t]+-(?:qx|xq|Fqx|qFx|qxF)[ \t]+(?:"([A-Za-z0-9_][A-Za-z0-9_-]{0,63})"|'([A-Za-z0-9_][A-Za-z0-9_-]{0,63})'|([A-Za-z0-9_][A-Za-z0-9_-]{0,63}))[ \t]+[/A-Za-z0-9_.-]+$"#,
+        )
+        .expect("valid membership pattern")
+    });
+    static EXHAUSTIVE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:all\s+(?:qualifying|matching|valid|winning)|every\s+(?:qualifying|matching|valid|winning)|(?:print|list|write|return|include)\s+them\s+all)\b")
+            .expect("valid exhaustive request pattern")
+    });
+    if !EXHAUSTIVE.is_match(instruction) {
+        return None;
+    }
+    let captures = MEMBERSHIP.captures(command.trim())?;
+    (1..=3).find_map(|index| captures.get(index).map(|value| value.as_str().to_owned()))
+}
+
+/// Expected values from a membership-only check on an exhaustive request, or a snapshot of
+/// values the run printed earlier and the user did not supply.
 pub(in crate::agent) fn self_confirming_values(
     command: &str,
     printed: &std::collections::BTreeSet<String>,
     instruction: &str,
 ) -> Option<Vec<String>> {
+    if let Some(word) = single_line_membership(command, instruction) {
+        return Some(vec![word]);
+    }
     if let Some(word) = snapshot_word(command)
         && printed.contains(word)
         && !instruction
@@ -2727,7 +2748,7 @@ pub(in crate::agent) fn self_confirming_values(
 /// Told once, in an unattended run, when the only passing check is self-confirming.
 pub(in crate::agent) fn self_confirming_reason(values: &[String]) -> String {
     format!(
-        "The passing check only expects values this run printed earlier ({}), so it shows the output matches those values, not that it is right. Before finishing, compare the deliverable with independent evidence: the input itself, the task's own examples or tests, a worked case, or a second method. If the request asks for all qualifying results, independently enumerate candidates and compare the full set to the saved output. If correctness is already established, finish again.",
+        "The passing check only tests for specific values ({}); it does not independently establish correctness. Before finishing, compare the deliverable with independent evidence: the input itself, the task's own examples or tests, a worked case, or a second method. If the request asks for all qualifying results, independently enumerate candidates and compare the full set to the saved output. If correctness is already established, finish again.",
         values.join(", ")
     )
 }

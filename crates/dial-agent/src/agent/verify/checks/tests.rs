@@ -241,6 +241,28 @@ fn self_confirming_values_are_expected_numbers_only_this_run_printed() {
 }
 
 #[test]
+fn membership_only_checks_are_flagged_for_exhaustive_requests() {
+    let printed = std::collections::BTreeSet::new();
+    let exhaustive = "If several labels match, print them all.";
+    assert_eq!(
+        self_confirming_values("grep -qx 'amber' out.txt", &printed, exhaustive),
+        Some(vec!["amber".into()]),
+    );
+    assert_eq!(
+        self_confirming_values(
+            "grep -qx amber out.txt",
+            &printed,
+            "Check that amber exists."
+        ),
+        None,
+    );
+    assert_eq!(
+        self_confirming_values("diff -u expected.txt out.txt", &printed, exhaustive),
+        None,
+    );
+}
+
+#[test]
 fn masked_check_note_names_the_accepted_pipefail_shape() {
     let misplaced = "cd /app && set -o pipefail; python3 run.py | grep -c ok";
     assert!(exit_status_masked(misplaced));

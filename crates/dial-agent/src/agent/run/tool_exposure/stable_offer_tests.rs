@@ -611,22 +611,15 @@ fn stable_offer_surfaces_loadable_tools_without_churning_the_prefix_on_load() {
         assert!(agent.stable_tool_offer());
         let before = agent.system_messages();
         let prompt = serde_json::to_string(&before).unwrap();
-        assert!(
-            prompt.contains("Loadable tools, not in the schema yet"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("Loadable tools, not in the schema yet"));
         for specialist in ["git", "lsp", "ast_edit"] {
-            assert!(
-                prompt.contains(specialist),
-                "missing {specialist} in {prompt}"
-            );
+            assert!(prompt.contains(specialist), "missing loadable {specialist}");
         }
         let loaded = load_tools(agent, json!({"names":["lsp"]}));
-        assert!(!loaded.is_error, "{}", loaded.text);
+        assert!(!loaded.is_error, "loading lsp failed");
         assert!(agent.offered().iter().any(|name| name == "lsp"));
-        assert_eq!(
-            agent.system_messages(),
-            before,
+        assert!(
+            agent.system_messages() == before,
             "loading a specialist must not churn the cached system prefix"
         );
     });
