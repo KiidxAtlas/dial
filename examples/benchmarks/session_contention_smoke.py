@@ -2,10 +2,10 @@
 """Real-CLI session writer-contention smoke.
 
 An owner Dial holds a streamed assistant request after a unique prefix while it keeps its
-session writer lease. A second `dial --continue` on the same private project/HOME must fork a
-sibling journal instead of failing, hijacking the owner, or replaying the owner's in-flight
-inference. Evidence is protocol/state: fixture request records and persisted journal files.
-Terminal captures are text only.
+session writer lease. A second `dial --fork ID` on the same private project/HOME must fork a
+sibling journal without hijacking the owner or replaying its in-flight inference. Interactive
+`--continue` now attaches to the live owner instead. Evidence comes from fixture request
+records and persisted journal files. Terminal captures are text only.
 
 Storage keeps live observations (the interrupted prefix) separate from canonical committed
 chat, so the sibling is expected to surface the prefix as recovery runtime state in its UI while
@@ -227,7 +227,7 @@ def main():
                 owner_bytes = owner_path.read_bytes()
                 owner.capture("owner-held")
 
-                sibling = Terminal(binary, project, home, args.captures, arguments=("--continue",))
+                sibling = Terminal(binary, project, home, args.captures, arguments=("--fork", owner_id))
                 sibling.wait("mock-main")
                 # Positive runtime evidence: the sibling UI surfaces the observed (interrupted)
                 # prefix as recovery state, not as a completed assistant message.
@@ -321,7 +321,6 @@ def main():
         "limitations": [
             "terminal captures are text evidence only",
             "stream sidecar is not asserted directly; the sibling UI prefix is the observable proxy",
-            "not run; assumes the sibling TUI renders the recovered observed prefix",
         ],
     }))
 
