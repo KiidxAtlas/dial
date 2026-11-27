@@ -91,7 +91,7 @@ bzip2-rs = "0.1"
 ruzstd = "0.9"
 sevenz-rust2 = { version = "0.25.0", default-features = false }
 cab = "0.6"
-rars = { version = "0.12", default-features = false }
+rars = { version = "0.13", default-features = false }
 # Rich `read` projections: certificates, executables, columnar data, legacy office, plists and mail.
 x509-parser = { version = "0.18", features = ["verify"] }
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
