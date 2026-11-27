@@ -203,3 +203,79 @@ fn search_walk_honors_repository_exclude_below_gitignore_rules() {
         assert!(search.is_complete());
     }
 }
+
+fn sorted(mut found: Vec<String>) -> Vec<String> {
+    found.sort();
+    found
+}
+
+/// `dist` sorts before `src`, so without `source_first` its files spend the entry budget first.
+/// The limit is set below the full tree, so ordering alone decides what is visited.
+#[test]
+fn source_first_spends_entry_budget_on_source_before_build_output() {
+    let (_dir, root, ws) = workspace();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::create_dir(root.join("dist")).unwrap();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join("src").join(name), "").unwrap();
+    }
+    for i in 0..10 {
+        fs::write(root.join(format!("dist/{i}.js")), "").unwrap();
+    }
+    // Source pass: root, src, a, b, c, then dist reserves one entry. The limit of 6 leaves
+    // no room for dist's own files.
+    let mut sorted_walk = Walk::new(&ws);
+    sorted_walk.entry_limit = 6;
+    let legacy = files(&mut sorted_walk, &root);
+    assert!(legacy.iter().all(|p| p.starts_with("dist/")), "{legacy:?}");
+    assert!(sorted_walk.truncated);
+
+    let mut walk = Walk::new(&ws).source_first();
+    walk.entry_limit = 6;
+    let actual = files(&mut walk, &root);
+    assert_eq!(actual, ["src/a.rs", "src/b.rs", "src/c.rs"]);
+    assert!(walk.truncated, "build output past the budget is reported");
+
+    // An explicit scope inside the build output is not reordered or re-budgeted.
+    let scope = root.join("dist");
+    let mut explicit = Walk::new(&ws);
+    explicit.entry_limit = 6;
+    let mut explicit_source_first = Walk::new(&ws).source_first();
+    explicit_source_first.entry_limit = 6;
+    assert_eq!(
+        files(&mut explicit_source_first, &scope),
+        files(&mut explicit, &scope)
+    );
+}
+
+/// Deferral changes only visit order. Ignore rules, symlinks and enumeration of nested build
+/// output stay identical, for the workspace root and for explicit scopes.
+#[test]
+fn source_first_keeps_visited_set_ignore_rules_symlinks_and_nested_output() {
+    let (_dir, root, ws) = workspace();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.rs"), "").unwrap();
+    fs::create_dir_all(root.join("src/build")).unwrap();
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::create_dir_all(root.join("ignored")).unwrap();
+    fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "").unwrap();
+    fs::write(root.join("src/build/gen.rs"), "").unwrap();
+    fs::write(root.join("dist/bundle.js"), "").unwrap();
+    fs::write(root.join("ignored/x.rs"), "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), root.join("build")).unwrap();
+
+    for start in [root.clone(), root.join("src"), root.join("dist")] {
+        let legacy = sorted(files(&mut Walk::new(&ws), &start));
+        let mut walk = Walk::new(&ws).source_first();
+        let actual = files(&mut walk, &start);
+        assert_eq!(sorted(actual.clone()), legacy, "scope {start:?}");
+        assert!(!walk.truncated, "scope {start:?}");
+        assert!(!actual.iter().any(|p| p.starts_with("ignored/")));
+    }
+    let all = files(&mut Walk::new(&ws).source_first(), &root);
+    assert!(all.contains(&"src/build/gen.rs".into()));
+    assert!(all.contains(&"dist/bundle.js".into()));
+    assert!(!all.iter().any(|p| p.contains("secret")));
+}

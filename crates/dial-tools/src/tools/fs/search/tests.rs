@@ -1021,8 +1021,9 @@ fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
 
 fn search_state(mode: OutputMode, max_matches: usize) -> GrepState {
     GrepState {
-        matcher: build_matcher("needle", false, false).unwrap(),
+        matcher: build_matcher("needle", false, false, false).unwrap(),
         multiline: false,
+        invert: false,
         context: 0,
         max_matches,
         out: String::new(),
@@ -1060,6 +1061,7 @@ fn run_batch(state: &mut GrepState, ws: &Workspace, paths: &mut Vec<PathBuf>, wo
         workers,
         state.matcher.clone(),
         state.multiline,
+        state.invert,
         state.mode,
         |prepare| {
             state.search_batch(ws, paths, &mut Vec::new(), prepare);
@@ -1171,7 +1173,7 @@ fn prefetched_rows_use_observed_bytes_but_stale_witnesses_are_refused() {
     let path = dir.path().join("source.txt");
     fs::write(&path, "needle original\n").unwrap();
     let mut state = search_state(OutputMode::Lines, 10);
-    let probed = probe(&ws, &path, &state.matcher, false, OutputMode::Lines);
+    let probed = probe(&ws, &path, &state.matcher, false, false, OutputMode::Lines);
     fs::write(&path, "replacement\n").unwrap();
     state.search_file(&ws, &path, &mut Vec::new(), Some(probed));
     assert_eq!(state.read_bytes, 0, "rendering must not reopen a probe");
@@ -1722,4 +1724,93 @@ fn grep_and_glob_change_nothing_and_skip_protected_paths() {
     );
     assert_eq!(fs::read_to_string(&open).unwrap(), "needle_open\n");
     assert_eq!(fs::metadata(&open).unwrap().modified().unwrap(), modified);
+}
+
+#[test]
+fn grep_supports_exclusion_globs_word_and_invert() {
+    let (dir, ws) = workspace();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::create_dir_all(dir.path().join("tests")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "let foo = 1;\nlet foobar = 2;\nlet bar = 3;\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tests/it.rs"), "let foo = 99;\n").unwrap();
+
+    // Exclude tests via `!` in glob
+    let excl = run(
+        &ws,
+        "grep",
+        json!({"pattern":"foo","glob":"*.rs;!tests/**"}),
+    );
+    assert!(!excl.is_error, "{}", excl.text);
+    assert!(excl.text.contains("src/lib.rs"), "{}", excl.text);
+    assert!(!excl.text.contains("tests/it.rs"), "{}", excl.text);
+
+    // Standalone exclusion glob (`!tests/**`)
+    let excl_only = run(&ws, "grep", json!({"pattern":"foo","glob":"!tests/**"}));
+    assert!(!excl_only.is_error, "{}", excl_only.text);
+    assert!(excl_only.text.contains("src/lib.rs") && !excl_only.text.contains("tests/it.rs"));
+
+    // Whole-word matching skips `foobar`
+    let word = run(
+        &ws,
+        "grep",
+        json!({"pattern":"foo","path":"src/lib.rs","word":true}),
+    );
+    assert!(!word.is_error, "{}", word.text);
+    assert!(word.text.contains("let foo = 1;"), "{}", word.text);
+    assert!(!word.text.contains("foobar"), "{}", word.text);
+
+    // Invert matching returns only non-matching lines
+    let inv = run(
+        &ws,
+        "grep",
+        json!({"pattern":"foo","path":"src/lib.rs","invert":true}),
+    );
+    assert!(!inv.is_error, "{}", inv.text);
+    assert!(inv.text.contains("let bar = 3;"), "{}", inv.text);
+    assert!(!inv.text.contains("foo"), "{}", inv.text);
+
+    // Invert + multiline is rejected
+    assert!(
+        run(
+            &ws,
+            "grep",
+            json!({"pattern":"foo","invert":true,"multiline":true})
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn glob_supports_type_filter_and_mtime_sort() {
+    let (dir, ws) = workspace();
+    fs::create_dir_all(dir.path().join("alpha/sub")).unwrap();
+    fs::create_dir_all(dir.path().join("beta")).unwrap();
+    let older = dir.path().join("a_old.txt");
+    let newer = dir.path().join("z_new.txt");
+    fs::write(&older, "old\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    fs::write(&newer, "new\n").unwrap();
+
+    let dirs = run(&ws, "glob", json!({"pattern":"**","type":"dir"}));
+    assert!(!dirs.is_error, "{}", dirs.text);
+    assert!(
+        dirs.text.contains("alpha/") && dirs.text.contains("beta/"),
+        "{}",
+        dirs.text
+    );
+    assert!(!dirs.text.contains("a_old.txt"), "{}", dirs.text);
+
+    let by_mtime = run(&ws, "glob", json!({"pattern":"*.txt","sort":"mtime"}));
+    assert!(!by_mtime.is_error, "{}", by_mtime.text);
+    let new_pos = by_mtime.text.find("z_new.txt").expect("z_new.txt");
+    let old_pos = by_mtime.text.find("a_old.txt").expect("a_old.txt");
+    assert!(
+        new_pos < old_pos,
+        "expected newest first:\n{}",
+        by_mtime.text
+    );
 }

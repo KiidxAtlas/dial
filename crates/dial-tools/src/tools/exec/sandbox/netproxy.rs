@@ -18,8 +18,7 @@
 //! the proxy's resolver; UDP (including QUIC and direct DNS) has no route.
 
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
-
+use std::net::IpAddr;
 /// Private re-exec entry point that bridges a loopback port to the proxy socket inside the Linux
 /// network namespace, then runs the command. It is not a user-facing command.
 pub const BRIDGE_ARG: &str = "--dial-net-bridge";
@@ -138,53 +137,10 @@ fn matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// True for globally routable unicast addresses. Everything a sandboxed command could use to
-/// reach this machine, the local network or a cloud metadata service is not public.
+/// True for globally routable unicast addresses. Delegates to the shared network egress guard so
+/// `web_fetch` and the sandbox proxy enforce identical SSRF rules with a single source of truth.
 pub fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_v4(v4);
-            }
-            let segments = v6.segments();
-            // NAT64 (64:ff9b::/96) embeds an IPv4 target.
-            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = segments[6].to_be_bytes();
-                let [c, d] = segments[7].to_be_bytes();
-                return is_public_v4(Ipv4Addr::new(a, b, c, d));
-            }
-            // 6to4 (2002::/16) embeds the IPv4 address of its relay endpoint.
-            if segments[0] == 0x2002 {
-                let [a, b] = segments[1].to_be_bytes();
-                let [c, d] = segments[2].to_be_bytes();
-                return is_public_v4(Ipv4Addr::new(a, b, c, d));
-            }
-            !(v6.is_unspecified()
-                || v6.is_loopback()
-                || v6.is_multicast()
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-                || segments[..6] == [0, 0, 0, 0, 0, 0])
-        }
-    }
-}
-
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_multicast()
-        || a == 0
-        || a >= 240
-        || (a == 100 && (64..128).contains(&b))
-        || (a == 192 && b == 0 && c == 0)
-        || (a == 198 && (18..20).contains(&b)))
+    crate::tools::net::web::guard::blocked_reason(ip).is_none()
 }
 
 /// Environment variables that point standard clients (curl, git, cargo, pip, npm and most HTTP

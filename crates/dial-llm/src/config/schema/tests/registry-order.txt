@@ -216,6 +216,11 @@ sandbox.extra_write
 sandbox.network_allow
 sandbox.network_deny
 sandbox.serial_ports
+sandbox.max_memory_mb
+sandbox.max_cpu_secs
+sandbox.max_processes
+sandbox.max_open_files
+sandbox.max_file_size_mb
 shell.backend
 worktree.clean_source
 plan.autosave

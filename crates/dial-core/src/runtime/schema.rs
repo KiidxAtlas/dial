@@ -25,7 +25,7 @@
 //!
 //! Unlike `calls::validate`, which checks flat tool arguments against dial's own schemas, this one
 //! recurses, because a delegated result may be any shape the parent asked for.
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -56,6 +56,15 @@ const MAX_REF_STEPS: usize = 5_000_000;
 const MAX_REF_STEPS: usize = 50_000;
 /// Longest branch failure quoted inside a `oneOf`/`anyOf` message.
 const MAX_REASON: usize = 120;
+/// Bounds compiled NFA/DFA memory for external JSON Schema regex patterns.
+const MAX_REGEX_BYTES: usize = 256 * 1024;
+
+fn compile_pattern(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_BYTES)
+        .dfa_size_limit(MAX_REGEX_BYTES)
+        .build()
+}
 
 /// Reject a schema that is not an object or boolean, names an unknown `type`, relies on a keyword
 /// this validator does not evaluate, or holds a reference that cannot be resolved locally.
@@ -131,7 +140,7 @@ fn check_at(
             .as_object()
             .ok_or_else(|| format!("{path}: `patternProperties` must be an object"))?;
         for (pattern, sub) in patterns {
-            if Regex::new(pattern).is_err() {
+            if compile_pattern(pattern).is_err() {
                 return Err(format!("{path}: invalid pattern {pattern:?}"));
             }
             check_at(root, sub, &format!("{path}.{pattern}"), refs)?;
@@ -228,7 +237,7 @@ fn check_at(
         let pattern = pattern
             .as_str()
             .ok_or_else(|| format!("{path}: `pattern` must be a string"))?;
-        if Regex::new(pattern).is_err() {
+        if compile_pattern(pattern).is_err() {
             return Err(format!("{path}: invalid pattern {pattern:?}"));
         }
     }
@@ -488,8 +497,8 @@ fn check_string(
 fn pattern_matches(cx: &Cx, pattern: &str, text: &str) -> Result<bool, String> {
     let mut cache = cx.patterns.borrow_mut();
     if !cache.contains_key(pattern) {
-        let regex =
-            Regex::new(pattern).map_err(|why| format!("invalid pattern {pattern:?}: {why}"))?;
+        let regex = compile_pattern(pattern)
+            .map_err(|why| format!("invalid pattern {pattern:?}: {why}"))?;
         cache.insert(pattern.to_owned(), regex);
     }
     Ok(cache.get(pattern).is_some_and(|regex| regex.is_match(text)))

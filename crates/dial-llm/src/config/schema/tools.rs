@@ -72,6 +72,76 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         true
     ),
     field!(
+        "sandbox.max_memory_mb",
+        sandbox.max_memory_mb,
+        TO,
+        "Sandbox",
+        "Max memory (MiB)",
+        "Maximum address-space / job memory in MiB for sandboxed shell and background commands. Zero inherits the parent OS limit.",
+        Kind::Int {
+            min: 0,
+            max: 1_048_576,
+            step: 256
+        },
+        true
+    ),
+    field!(
+        "sandbox.max_cpu_secs",
+        sandbox.max_cpu_secs,
+        TO,
+        "Sandbox",
+        "Max CPU seconds",
+        "Maximum CPU time in seconds for sandboxed shell and background commands. Zero inherits the parent OS limit.",
+        Kind::Int {
+            min: 0,
+            max: 86_400,
+            step: 30
+        },
+        true
+    ),
+    field!(
+        "sandbox.max_processes",
+        sandbox.max_processes,
+        TO,
+        "Sandbox",
+        "Max child processes",
+        "Maximum active processes/threads for sandboxed shell and background commands (RLIMIT_NPROC on Unix, ActiveProcessLimit on Windows). Zero inherits the parent OS limit.",
+        Kind::Int {
+            min: 0,
+            max: 65_535,
+            step: 16
+        },
+        true
+    ),
+    field!(
+        "sandbox.max_open_files",
+        sandbox.max_open_files,
+        TO,
+        "Sandbox",
+        "Max open files",
+        "Maximum open file descriptors (RLIMIT_NOFILE on Unix) for sandboxed shell and background commands. Zero inherits the parent OS limit.",
+        Kind::Int {
+            min: 0,
+            max: 1_048_576,
+            step: 256
+        },
+        true
+    ),
+    field!(
+        "sandbox.max_file_size_mb",
+        sandbox.max_file_size_mb,
+        TO,
+        "Sandbox",
+        "Max file size (MiB)",
+        "Maximum single file size in MiB (RLIMIT_FSIZE on Unix) for sandboxed shell and background commands. Zero inherits the parent OS limit.",
+        Kind::Int {
+            min: 0,
+            max: 1_048_576,
+            step: 64
+        },
+        true
+    ),
+    field!(
         "shell.backend",
         shell.backend,
         TO,

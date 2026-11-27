@@ -561,6 +561,7 @@ impl<'a> Agent<'a> {
             matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
             self.step_checks.fix_revision(),
         );
+        self.record_repair_link(command, &call.id, verdict, ui);
         let evidence_ref = self.retain_check_log(output);
         self.step_checks
             .evidence
@@ -672,6 +673,41 @@ impl<'a> Agent<'a> {
                     "repair evidence was not recorded: {error:#}; {record_error:#}"
                 ));
             }
+        }
+    }
+
+    /// Off-prompt structured evidence linking an observed code failure to the same check's later
+    /// verdict. The failure event is written when observed, so an unresolved failure stays unknown.
+    /// Reused checks never reach this path, so reuse cannot resolve a failure. Commands are redacted
+    /// and bounded before they leave the controller.
+    fn record_repair_link(
+        &mut self,
+        command: &str,
+        call_id: &str,
+        verdict: verify::verification::CheckStatus,
+        ui: &mut dyn Ui,
+    ) {
+        let revision = self.step_checks.revision();
+        let step = self.cur_step;
+        let shown = truncate(&crate::storage::redact::redact_text(command), 200);
+        if let Some(mut linked) = self
+            .step_checks
+            .evidence
+            .link_verdict(command, call_id, verdict, revision)
+        {
+            linked.command = shown.clone();
+            if let Err(error) = self.record(step, "check_repair_verdict", json!(linked)) {
+                ui.notice(&format!("check repair verdict was not recorded: {error:#}"));
+            }
+        }
+        if verdict == verify::verification::CheckStatus::CodeFailed
+            && let Err(error) = self.record(
+                step,
+                "check_failure_observed",
+                json!({"command":shown,"call_id":call_id,"revision":revision}),
+            )
+        {
+            ui.notice(&format!("check failure was not recorded: {error:#}"));
         }
     }
 
@@ -2640,14 +2676,63 @@ fn expected_literals(command: &str) -> Vec<String> {
     values
 }
 
-/// The expected values of a passing check when every one of them was printed earlier in this
-/// turn and none comes from the request: the check then confirms the program reproduces its own
-/// earlier output, not that the output is right.
+/// Short, standalone output values used by literal file snapshot checks.
+pub(in crate::agent) fn snapshot_words(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| {
+        (2..=64).contains(&line.len())
+            && line.as_bytes()[0].is_ascii_alphabetic()
+            && line
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+/// Recognize a literal string comparison against a file read, not a general shell assertion.
+fn snapshot_word(command: &str) -> Option<&str> {
+    static SNAPSHOT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^test\s+"\$\(cat\s+[/A-Za-z0-9_.-]+\)"\s+==?\s+(?:"([A-Za-z][A-Za-z0-9_-]{1,63})"|'([A-Za-z][A-Za-z0-9_-]{1,63})'|([A-Za-z][A-Za-z0-9_-]{1,63}))$"#).expect("valid snapshot pattern")
+    });
+    let captures = SNAPSHOT.captures(command.trim())?;
+    (1..=3).find_map(|index| captures.get(index).map(|value| value.as_str()))
+}
+
+/// A literal whole-line match establishes membership, not completeness.
+fn single_line_membership(command: &str, instruction: &str) -> Option<String> {
+    static MEMBERSHIP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^grep[ \t]+-(?:qx|xq|Fqx|qFx|qxF)[ \t]+(?:"([A-Za-z0-9_][A-Za-z0-9_-]{0,63})"|'([A-Za-z0-9_][A-Za-z0-9_-]{0,63})'|([A-Za-z0-9_][A-Za-z0-9_-]{0,63}))[ \t]+[/A-Za-z0-9_.-]+$"#,
+        )
+        .expect("valid membership pattern")
+    });
+    static EXHAUSTIVE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:all\s+(?:qualifying|matching|valid|winning)|every\s+(?:qualifying|matching|valid|winning)|(?:print|list|write|return|include)\s+them\s+all)\b")
+            .expect("valid exhaustive request pattern")
+    });
+    if !EXHAUSTIVE.is_match(instruction) {
+        return None;
+    }
+    let captures = MEMBERSHIP.captures(command.trim())?;
+    (1..=3).find_map(|index| captures.get(index).map(|value| value.as_str().to_owned()))
+}
+
+/// Expected values from a membership-only check on an exhaustive request, or a snapshot of
+/// values the run printed earlier and the user did not supply.
 pub(in crate::agent) fn self_confirming_values(
     command: &str,
     printed: &std::collections::BTreeSet<String>,
     instruction: &str,
 ) -> Option<Vec<String>> {
+    if let Some(word) = single_line_membership(command, instruction) {
+        return Some(vec![word]);
+    }
+    if let Some(word) = snapshot_word(command)
+        && printed.contains(word)
+        && !instruction
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .any(|token| token == word)
+    {
+        return Some(vec![word.to_owned()]);
+    }
     let expected = expected_literals(command);
     let requested: Vec<String> = distinctive_numbers(instruction)
         .into_iter()
@@ -2663,7 +2748,7 @@ pub(in crate::agent) fn self_confirming_values(
 /// Told once, in an unattended run, when the only passing check is self-confirming.
 pub(in crate::agent) fn self_confirming_reason(values: &[String]) -> String {
     format!(
-        "The passing check only expects values this run's own program printed earlier ({}), so it shows the output is reproducible, not that it is right. Before finishing, compare those values with independent evidence: the input itself, the task's own examples or tests, a worked case, or a second method. If they are already established, finish again.",
+        "The passing check only tests for specific values ({}); it does not independently establish correctness. Before finishing, compare the deliverable with independent evidence: the input itself, the task's own examples or tests, a worked case, or a second method. If the request asks for all qualifying results, independently enumerate candidates and compare the full set to the saved output. If correctness is already established, finish again.",
         values.join(", ")
     )
 }
@@ -2959,46 +3044,31 @@ pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
     }
 
     let mut covered_pipelines = Vec::new();
-    for item in checked_items {
-        match item.kind().as_ref() {
-            "command" | "test_command" => {}
+    let mut stack = checked_items.to_vec();
+    while let Some(node) = stack.pop() {
+        let node = node
+            .field("body")
+            .filter(|_| node.kind() == "redirected_statement")
+            .unwrap_or(node);
+        match node.kind().as_ref() {
+            "command" | "test_command" | "comment" => {}
             "pipeline" => {
-                // tree-sitter-bash can associate a preceding `&&`-list inside a redirected
-                // pipeline stage (`a && b 2>&1 | c`); accept an `&&`-only chain of simple
-                // commands/tests there too, still failing closed on `||`, `!` or subshells.
-                let mut simple = true;
-                let mut stage_stack: Vec<_> = item.named_children().collect();
-                while let Some(stage) = stage_stack.pop() {
-                    let stage = stage
-                        .field("body")
-                        .filter(|_| stage.kind() == "redirected_statement")
-                        .unwrap_or(stage);
-                    match stage.kind().as_ref() {
-                        "command" | "test_command" | "comment" => {}
-                        "list" => {
-                            let items: Vec<_> =
-                                stage.children().filter(|n| n.kind() != "comment").collect();
-                            let [left, operator, right] = items.as_slice() else {
-                                simple = false;
-                                break;
-                            };
-                            if operator.kind() != "&&" {
-                                simple = false;
-                                break;
-                            }
-                            stage_stack.push(right.clone());
-                            stage_stack.push(left.clone());
-                        }
-                        _ => {
-                            simple = false;
-                            break;
-                        }
-                    }
-                }
-                if !simple {
+                // Bash gives pipes precedence over &&, but tree-sitter-bash can put a list
+                // containing another pipeline inside a stage (`a | b | c && d`). Both
+                // operators preserve failures here, so validate nested nodes the same way.
+                covered_pipelines.push(node.node_id());
+                stack.extend(node.named_children());
+            }
+            "list" => {
+                let items: Vec<_> = node.children().filter(|n| n.kind() != "comment").collect();
+                let [left, operator, right] = items.as_slice() else {
+                    return true;
+                };
+                if operator.kind() != "&&" {
                     return true;
                 }
-                covered_pipelines.push(item.node_id());
+                stack.push(right.clone());
+                stack.push(left.clone());
             }
             _ => return true,
         }

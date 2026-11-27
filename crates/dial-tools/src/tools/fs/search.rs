@@ -85,25 +85,25 @@ fn count_multiline(matcher: &Regex, bytes: &[u8]) -> usize {
 }
 
 /// Matching lines of a file (or non-overlapping multiline matches), as a summary page counts them.
-fn match_count(matcher: &Regex, multiline: bool, bytes: &[u8]) -> usize {
+fn match_count(matcher: &Regex, multiline: bool, invert: bool, bytes: &[u8]) -> usize {
     if multiline {
         count_multiline(matcher, bytes)
     } else {
         bytes
             .split_inclusive(|&b| b == b'\n')
-            .filter(|raw| matcher.is_match(trim_eol(raw)))
+            .filter(|raw| matcher.is_match(trim_eol(raw)) != invert)
             .count()
     }
 }
 
 /// Whether a `lines` page could show anything from the file: the same test the row search applies.
-fn any_match(matcher: &Regex, multiline: bool, bytes: &[u8]) -> bool {
+fn any_match(matcher: &Regex, multiline: bool, invert: bool, bytes: &[u8]) -> bool {
     if multiline {
         matcher.is_match(bytes)
     } else {
         bytes
             .split_inclusive(|&b| b == b'\n')
-            .any(|raw| matcher.is_match(trim_eol(raw)))
+            .any(|raw| matcher.is_match(trim_eol(raw)) != invert)
     }
 }
 
@@ -178,6 +178,7 @@ fn probe(
     path: &Path,
     matcher: &Regex,
     multiline: bool,
+    invert: bool,
     mode: OutputMode,
 ) -> Probed {
     let stat = stat_file(ws, path);
@@ -193,9 +194,9 @@ fn probe(
     let read = read_file(path, &mut data);
     let found = matches!(read, Read::Text(_)).then(|| {
         if mode == OutputMode::Lines {
-            usize::from(any_match(matcher, multiline, &data))
+            usize::from(any_match(matcher, multiline, invert, &data))
         } else {
-            match_count(matcher, multiline, &data)
+            match_count(matcher, multiline, invert, &data)
         }
     });
     Probed {
@@ -218,6 +219,7 @@ fn with_prober<R>(
     workers: usize,
     matcher: Regex,
     multiline: bool,
+    invert: bool,
     mode: OutputMode,
     run: impl FnOnce(Option<&mut ProbeMap<'_>>) -> R,
 ) -> R {
@@ -226,7 +228,7 @@ fn with_prober<R>(
     }
     super::workers::with_workers(
         workers.min(PREFETCH_FILES),
-        move |path: PathBuf| probe(ws, &path, &matcher, multiline, mode),
+        move |path: PathBuf| probe(ws, &path, &matcher, multiline, invert, mode),
         |prepare| run(Some(prepare)),
     )
 }
@@ -629,9 +631,10 @@ fn match_segments(pattern: &[Vec<char>], path: &[Vec<char>]) -> bool {
     reach[path.len()]
 }
 
-/// Compiled glob: brace alternatives, each a list of segments.
+/// Compiled glob: positive brace alternatives and optional `!` exclusion patterns.
 struct Glob {
     alternatives: Vec<Vec<Vec<char>>>,
+    excludes: Vec<Vec<Vec<char>>>,
     /// Absolute patterns remain bound to this readable root across all explicit search scopes.
     anchor: Option<PathBuf>,
     /// Common literal directory prefix; an empty prefix leaves the walk unpruned.
@@ -640,6 +643,54 @@ struct Glob {
 
 impl Glob {
     fn new(ws: &Workspace, pattern: &str) -> Result<Glob, String> {
+        if pattern.starts_with('!') || pattern.contains(";!") {
+            return Self::new_filtered(ws, pattern);
+        }
+        Self::new_single(ws, pattern)
+    }
+
+    fn new_filtered(ws: &Workspace, pattern: &str) -> Result<Glob, String> {
+        let mut positives = Vec::new();
+        let mut negatives = Vec::new();
+        for part in pattern.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(neg) = part.strip_prefix('!') {
+                if neg.is_empty() {
+                    return Err("glob exclusion after `!` must not be empty".into());
+                }
+                negatives.push(neg);
+            } else {
+                positives.push(part);
+            }
+        }
+        if positives.is_empty() && negatives.is_empty() {
+            return Err(format!("glob pattern must be 1..={MAX_PATTERN} bytes"));
+        }
+        let mut combined = if positives.is_empty() {
+            Self::new_single(ws, "**")?
+        } else {
+            let mut first = Self::new_single(ws, positives[0])?;
+            for extra in &positives[1..] {
+                let next = Self::new_single(ws, extra)?;
+                if first.anchor != next.anchor {
+                    return Err("glob alternatives must share a workspace root".into());
+                }
+                first.alternatives.extend(next.alternatives);
+                first.prefix = PathBuf::new();
+            }
+            first
+        };
+        for neg in negatives {
+            let ex = Self::new_single(ws, neg)?;
+            combined.excludes.extend(ex.alternatives);
+        }
+        Ok(combined)
+    }
+
+    fn new_single(ws: &Workspace, pattern: &str) -> Result<Glob, String> {
         let path = Path::new(pattern);
         let trailing_separator = pattern.ends_with(std::path::is_separator);
         #[cfg(windows)]
@@ -726,6 +777,7 @@ impl Glob {
             .collect();
         Ok(Glob {
             alternatives,
+            excludes: Vec::new(),
             anchor,
             prefix,
         })
@@ -754,6 +806,7 @@ impl Glob {
         self.alternatives
             .iter()
             .any(|alt| match_segments(alt, &path))
+            && !self.excludes.iter().any(|ex| match_segments(ex, &path))
     }
 }
 
@@ -801,6 +854,23 @@ fn native_pattern(input: &str) -> std::borrow::Cow<'_, str> {
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
     let glob = Glob::new(ws, pattern)?;
+    let entry_type = match opt_str(args, "type")? {
+        None | Some("file") => "file",
+        Some("dir") => "dir",
+        Some("all") => "all",
+        Some(other) => {
+            return Err(format!(
+                "type must be \"file\", \"dir\" or \"all\", not {other:?}"
+            ));
+        }
+    };
+    let sort = match opt_str(args, "sort")? {
+        None | Some("name") => "name",
+        Some("mtime") => "mtime",
+        Some(other) => {
+            return Err(format!("sort must be \"name\" or \"mtime\", not {other:?}"));
+        }
+    };
     let Scopes { roots, missing } = resolve_scopes(ws, args, Some(&glob))?;
     let unsearched = Scopes {
         roots: Vec::new(),
@@ -810,6 +880,12 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
     let (resume, mut skip) = continuation(args, ws)?;
     if resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
         return Err("a glob cursor never has consumed matches; copy next_cursor unchanged".into());
+    }
+    if sort == "mtime" && resume.is_some() {
+        return Err(
+            "glob with sort=\"mtime\" pages with a numeric cursor (\"N\"), not a path cursor"
+                .into(),
+        );
     }
     let limit = opt_u64(args, "limit")?.unwrap_or(MAX_LIST as u64);
     if limit == 0 || limit > MAX_LIST as u64 {
@@ -825,37 +901,141 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
     let mut count = 0;
     let mut next = None;
     let mut unrepresentable = 0;
-    for root in roots {
-        let pattern_root = glob.pattern_root(ws, &root);
-        walk.run_with_prefix(&root, &pattern_root.join(&glob.prefix), &mut |path| {
-            if path.to_str().is_none() {
-                unrepresentable += 1;
-                return true;
+    let mut mtime_cursor: Option<String> = None;
+    if sort == "mtime" {
+        let mut matched: Vec<(std::time::SystemTime, PathBuf, bool)> = Vec::new();
+        for root in roots {
+            let pattern_root = glob.pattern_root(ws, &root);
+            if entry_type == "file" {
+                walk.run_with_prefix(&root, &pattern_root.join(&glob.prefix), &mut |path| {
+                    if path.to_str().is_none() {
+                        unrepresentable += 1;
+                        return true;
+                    }
+                    if glob.matches_path(path, pattern_root) {
+                        let mtime = fs::metadata(path)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        matched.push((mtime, path.to_path_buf(), false));
+                    }
+                    true
+                });
+            } else {
+                walk.run_entries(&root, pattern_root, &mut |path, directory| {
+                    if (entry_type == "dir" && !directory) || (entry_type == "file" && directory) {
+                        return true;
+                    }
+                    if path.to_str().is_none() {
+                        unrepresentable += 1;
+                        return true;
+                    }
+                    if glob.matches_path(path, pattern_root) {
+                        let mtime = fs::metadata(path)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        matched.push((mtime, path.to_path_buf(), directory));
+                    }
+                    true
+                });
             }
-            if !glob.matches_path(path, pattern_root) {
-                return true;
+            if walk.next.is_some() {
+                break;
             }
-            if skip > 0 {
-                skip -= 1;
-                return true;
+        }
+        matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let skip_n = usize::try_from(skip).unwrap_or(usize::MAX);
+        let total = matched.len();
+        for (idx, (_, path, directory)) in matched.into_iter().enumerate().skip(skip_n) {
+            let mut rel = ws.rel(&path);
+            if directory {
+                rel.push('/');
             }
-            let row = format!("{}\n", ws.rel(path));
+            let row = format!("{rel}\n");
             if count == limit || text.len() + row.len() > MAX_GREP_OUTPUT {
-                next = Some((path.to_path_buf(), 0));
-                return false;
+                mtime_cursor = Some(idx.to_string());
+                break;
             }
             text.push_str(&row);
-            if preview && preview_paths.len() < 16 {
-                preview_paths.push(ws.rel(path));
+            if preview && !directory && preview_paths.len() < 16 {
+                preview_paths.push(ws.rel(&path));
             }
             count += 1;
-            true
-        });
-        if next.is_some() || walk.next.is_some() {
-            break;
         }
+        if mtime_cursor.is_none() && skip_n + (count as usize) < total {
+            mtime_cursor = Some((skip_n + count as usize).to_string());
+        }
+    } else if entry_type == "file" {
+        for root in roots {
+            let pattern_root = glob.pattern_root(ws, &root);
+            walk.run_with_prefix(&root, &pattern_root.join(&glob.prefix), &mut |path| {
+                if path.to_str().is_none() {
+                    unrepresentable += 1;
+                    return true;
+                }
+                if !glob.matches_path(path, pattern_root) {
+                    return true;
+                }
+                if skip > 0 {
+                    skip -= 1;
+                    return true;
+                }
+                let row = format!("{}\n", ws.rel(path));
+                if count == limit || text.len() + row.len() > MAX_GREP_OUTPUT {
+                    next = Some((path.to_path_buf(), 0));
+                    return false;
+                }
+                text.push_str(&row);
+                if preview && preview_paths.len() < 16 {
+                    preview_paths.push(ws.rel(path));
+                }
+                count += 1;
+                true
+            });
+            if next.is_some() || walk.next.is_some() {
+                break;
+            }
+        }
+        next = next.or_else(|| walk.next.clone().map(|p| (p, 0)));
+    } else {
+        for root in roots {
+            let pattern_root = glob.pattern_root(ws, &root);
+            walk.run_entries(&root, pattern_root, &mut |path, directory| {
+                if entry_type == "dir" && !directory {
+                    return true;
+                }
+                if path.to_str().is_none() {
+                    unrepresentable += 1;
+                    return true;
+                }
+                if !glob.matches_path(path, pattern_root) {
+                    return true;
+                }
+                if skip > 0 {
+                    skip -= 1;
+                    return true;
+                }
+                let mut rel = ws.rel(path);
+                if directory {
+                    rel.push('/');
+                }
+                let row = format!("{rel}\n");
+                if count == limit || text.len() + row.len() > MAX_GREP_OUTPUT {
+                    next = Some((path.to_path_buf(), 0));
+                    return false;
+                }
+                text.push_str(&row);
+                if preview && !directory && preview_paths.len() < 16 {
+                    preview_paths.push(ws.rel(path));
+                }
+                count += 1;
+                true
+            });
+            if next.is_some() || walk.next.is_some() {
+                break;
+            }
+        }
+        next = next.or_else(|| walk.next.clone().map(|p| (p, 0)));
     }
-    next = next.or_else(|| walk.next.clone().map(|p| (p, 0)));
     let mut coverage = if unrepresentable == 0 {
         format!("results={count}; {}", walk.coverage())
     } else {
@@ -876,6 +1056,11 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         );
     }
     let mut page = finish_page(text, ws, next, skip, &coverage)?;
+    if let Some(cursor) = mtime_cursor {
+        page.push_str(&format!(
+            "[page: {{\"next_cursor\":{cursor:?},\"order\":\"mtime descending\"}}]\n"
+        ));
+    }
     if preview {
         // Reserve the first bounded excerpt for a conventionally named test when one is
         // already on this page. Keep the sorted path listing and the 16-candidate cap intact.
@@ -936,11 +1121,21 @@ const REGEX_SYNTAX_ERROR: &str = "invalid or unsupported Rust regex";
 /// Compile once for bounded byte matching, on lines or whole files.
 /// `literal` escapes all metacharacters. Anchors work at line boundaries;
 /// regex compile memory and per-call input work are bounded separately.
-fn build_matcher(pattern: &str, fixed_string: bool, ignore_case: bool) -> Result<Regex, String> {
-    let source = if fixed_string {
+fn build_matcher(
+    pattern: &str,
+    fixed_string: bool,
+    ignore_case: bool,
+    word: bool,
+) -> Result<Regex, String> {
+    let base = if fixed_string {
         regex::escape(pattern)
     } else {
         pattern.to_owned()
+    };
+    let source = if word {
+        format!(r"\b(?:{base})\b")
+    } else {
+        base
     };
     RegexBuilder::new(&source)
         .case_insensitive(ignore_case)
@@ -1019,6 +1214,7 @@ enum Emitted {
 struct GrepState {
     matcher: Regex,
     multiline: bool,
+    invert: bool,
     context: usize,
     max_matches: usize,
     out: String,
@@ -1283,7 +1479,8 @@ impl GrepState {
         }
         self.scanned += 1;
         if self.mode != OutputMode::Lines {
-            let count = found.unwrap_or_else(|| match_count(&self.matcher, self.multiline, bytes));
+            let count = found
+                .unwrap_or_else(|| match_count(&self.matcher, self.multiline, self.invert, bytes));
             self.summarize(ws, path, count);
             return;
         }
@@ -1476,7 +1673,7 @@ impl GrepState {
         let mut preceding_rows = Vec::with_capacity(self.context);
         for (index, raw) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
             let (number, line) = (index + 1, trim_eol(raw));
-            if self.matcher.is_match(line) {
+            if self.matcher.is_match(line) != self.invert {
                 seen += 1;
                 if seen <= consumed {
                     if self.context > 0 {
@@ -1891,6 +2088,8 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     }
     let preview = opt_bool(args, "preview")?;
     let fixed = opt_bool(args, "literal")?;
+    let word = opt_bool(args, "word")?;
+    let invert = opt_bool(args, "invert")?;
     let escaped_newline = !fixed
         && pattern.as_bytes().windows(2).enumerate().any(|(i, pair)| {
             pair == b"\\n"
@@ -1903,7 +2102,10 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
                     == 0
         });
     let multiline = opt_bool(args, "multiline")? || pattern.contains('\n') || escaped_newline;
-    let matcher = build_matcher(pattern, fixed, opt_bool(args, "ignore_case")?)?;
+    if invert && multiline {
+        return Err("invert cannot be combined with multiline".into());
+    }
+    let matcher = build_matcher(pattern, fixed, opt_bool(args, "ignore_case")?, word)?;
     // One remote or retained text (an ssh:// file or an artifact:// body) is matched line by line.
     let single = match args.get("path").and_then(Value::as_str) {
         Some(path) if crate::tools::integrations::ssh::url::is_ssh_url(path) => {
@@ -1945,7 +2147,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         let context = opt_u64(args, "context")?
             .unwrap_or(0)
             .min(MAX_GREP_CONTEXT as u64) as usize;
-        let mut out = grep_text(&text, path, &matcher, skip, max, context);
+        let mut out = grep_text(&text, path, &matcher, invert, skip, max, context);
         if preview {
             out.push_str(preview::UNAVAILABLE);
         }
@@ -1990,6 +2192,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let mut state = GrepState {
         matcher: matcher.clone(),
         multiline,
+        invert,
         context,
         max_matches: max_matches as usize,
         out: String::new(),
@@ -2034,30 +2237,38 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
                 .map_or_else(|| base.to_owned(), |g| base.join(&g.prefix)),
         )
     };
-    with_prober(ws, workers, matcher, multiline, mode, |mut prepare| {
-        for root in roots {
-            let (pattern_root, prefix) = walk_pattern(root);
-            walk.run_with_prefix(root, &prefix, &mut |path| {
-                if glob
-                    .as_ref()
-                    .is_none_or(|g| g.matches_path(path, pattern_root))
-                    && !state.before_resume(path)
-                {
-                    batch.push(path.to_path_buf());
-                    if batch.len() >= batch_size {
-                        state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
+    with_prober(
+        ws,
+        workers,
+        matcher,
+        multiline,
+        invert,
+        mode,
+        |mut prepare| {
+            for root in roots {
+                let (pattern_root, prefix) = walk_pattern(root);
+                walk.run_with_prefix(root, &prefix, &mut |path| {
+                    if glob
+                        .as_ref()
+                        .is_none_or(|g| g.matches_path(path, pattern_root))
+                        && !state.before_resume(path)
+                    {
+                        batch.push(path.to_path_buf());
+                        if batch.len() >= batch_size {
+                            state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
+                        }
                     }
+                    state.next.is_none()
+                });
+                if state.next.is_none() {
+                    state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
                 }
-                state.next.is_none()
-            });
-            if state.next.is_none() {
-                state.search_batch(ws, &mut batch, &mut bytes, prepare.as_deref_mut());
+                if state.next.is_some() || walk.next.is_some() {
+                    break;
+                }
             }
-            if state.next.is_some() || walk.next.is_some() {
-                break;
-            }
-        }
-    });
+        },
+    );
     if let Some((stop, _)) = state.next.as_ref().filter(|_| batched) {
         walk = SearchWalk::new(
             ws,
@@ -2119,6 +2330,7 @@ fn grep_text(
     text: &str,
     path: &str,
     matcher: &Regex,
+    invert: bool,
     skip: usize,
     max: usize,
     context: usize,
@@ -2127,7 +2339,7 @@ fn grep_text(
     let mut hits = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| matcher.is_match(line.as_bytes()))
+        .filter(|(_, line)| matcher.is_match(line.as_bytes()) != invert)
         .map(|(index, _)| index)
         .skip(skip);
     let page: Vec<usize> = hits.by_ref().take(max).collect();

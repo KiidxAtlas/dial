@@ -1,4 +1,5 @@
 //! Presentation only: never changes validated worker payloads or treats claims as verification.
+use crate::agent::workers::read_receipts::ReadReceipts;
 use crate::tools::Workspace;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -109,13 +110,15 @@ pub(super) fn intent_trail(control: &Value, budget: usize) -> Option<Value> {
 
 /// Separate, conservative result envelope. Only explicit JSON statuses count as worker claims;
 /// execution completion and arbitrary prose never imply acceptance coverage. With the parent's
-/// `workspace`, cited evidence is checked (`evidence_audit`) and a `met` claim whose only cited
-/// evidence does not exist is downgraded; the audit never upgrades a claim.
+/// `workspace`, cited evidence is checked (`evidence_audit`); a `met` claim whose only cited
+/// evidence does not exist or changed since the worker read it is downgraded, and the audit never
+/// upgrades a claim. `controller` carries controller-owned `acceptance` and `read_receipts` only.
 pub(super) fn project(
     report: &str,
     payload: Option<&Value>,
     acceptance: &[String],
     workspace: Option<&Workspace>,
+    controller: Option<&Value>,
 ) -> Value {
     let parsed = serde_json::from_str::<Value>(report).ok();
     let source = payload.or(parsed.as_ref());
@@ -193,8 +196,12 @@ pub(super) fn project(
             envelope["warning_excerpts_overflow"] = json!(true);
         }
     }
+    envelope["controller_acceptance"] = controller_acceptance(controller);
     if let (Some(workspace), Some(source)) = (workspace, source) {
-        audit_evidence(&mut envelope, source, workspace);
+        let receipts = controller
+            .and_then(|controller| controller.get("read_receipts"))
+            .map(ReadReceipts::from_value);
+        audit_evidence(&mut envelope, source, workspace, receipts.as_ref());
     }
     envelope
 }
@@ -250,9 +257,16 @@ fn cited(item: Option<&Value>, report: &Value) -> Vec<String> {
 /// Check cited references against the parent's view of the workspace at projection time.
 /// `valid`: the path (and cited lines) exist; `stale`: the file exists but no longer has the
 /// cited lines; `invalid`: missing, outside the workspace, or an unknown artifact; `unparsed`:
-/// prose or a form this audit does not check. Only `met` claims whose every cited reference
-/// is `invalid` are downgraded to `not_verified`.
-fn audit_evidence(envelope: &mut Value, report: &Value, workspace: &Workspace) {
+/// prose or a form this audit does not check. A parsed line span, even one now past EOF, is judged against the
+/// controller's read receipts (`read`: current, changed, no_receipt or unknown_revision); without
+/// reported receipts it stays unjudged. Only `met` claims whose every cited reference is `invalid`
+/// or changed since the worker read it are downgraded to `not_verified`; the audit never upgrades.
+fn audit_evidence(
+    envelope: &mut Value,
+    report: &Value,
+    workspace: &Workspace,
+    receipts: Option<&ReadReceipts>,
+) {
     let mut refs: Vec<String> = cited(None, report);
     let items = envelope["acceptance"]
         .as_object()
@@ -275,42 +289,118 @@ fn audit_evidence(envelope: &mut Value, report: &Value, workspace: &Workspace) {
     if refs.is_empty() {
         return;
     }
-    let audited: Vec<(String, &'static str)> = refs
+    let audited: Vec<(String, &'static str, Option<&'static str>)> = refs
         .into_iter()
         .map(|reference| {
             let status = evidence_status(&reference, workspace);
-            (reference, status)
+            let read = receipts
+                .filter(|_| matches!(status, "valid" | "stale"))
+                .and_then(|receipts| read_status(&reference, workspace, receipts));
+            (reference, status, read)
         })
         .collect();
     let status_of = |reference: &str| {
         audited
             .iter()
-            .find(|(seen, _)| seen == reference)
-            .map_or("unparsed", |(_, status)| *status)
+            .find(|(seen, _, _)| seen == reference)
+            .map_or("unparsed", |(_, status, _)| *status)
+    };
+    let read_of = |reference: &str| {
+        audited
+            .iter()
+            .find(|(seen, _, _)| seen == reference)
+            .and_then(|(_, _, read)| *read)
     };
     let mut downgraded = Vec::new();
     for (id, cited) in &item_refs {
-        if envelope["acceptance"][id]["status"] == "met"
-            && !cited.is_empty()
-            && cited
-                .iter()
-                .all(|reference| status_of(reference) == "invalid")
-        {
-            envelope["acceptance"][id] =
-                json!({"status":"not_verified","basis":"cited_evidence_invalid","claimed":"met"});
-            downgraded.push(id.clone());
+        if envelope["acceptance"][id]["status"] != "met" || cited.is_empty() {
+            continue;
         }
+        let all_invalid = cited
+            .iter()
+            .all(|reference| status_of(reference) == "invalid");
+        let all_changed = cited.iter().all(|reference| {
+            status_of(reference) == "invalid" || read_of(reference) == Some("changed")
+        });
+        let basis = if all_invalid {
+            "cited_evidence_invalid"
+        } else if all_changed {
+            "cited_evidence_changed_since_read"
+        } else {
+            continue;
+        };
+        envelope["acceptance"][id] = json!({"status":"not_verified","basis":basis,"claimed":"met"});
+        downgraded.push(id.clone());
     }
-    let count = |wanted: &str| audited.iter().filter(|(_, s)| *s == wanted).count();
+    let count = |wanted: &str| audited.iter().filter(|(_, s, _)| *s == wanted).count();
+    let read_count = |wanted: &str| {
+        audited
+            .iter()
+            .filter(|(_, _, r)| *r == Some(wanted))
+            .count()
+    };
     envelope["evidence_audit"] = json!({
-        "refs": audited.iter().map(|(reference, status)| json!({"ref":reference,"status":status})).collect::<Vec<_>>(),
+        "refs": audited.iter().map(|(reference, status, read)| json!({"ref":reference,"status":status,"read":read})).collect::<Vec<_>>(),
         "valid": count("valid"),
         "stale": count("stale"),
         "invalid": count("invalid"),
         "unparsed": count("unparsed"),
+        "read": {
+            "current": read_count("current"),
+            "changed": read_count("changed"),
+            "no_receipt": read_count("no_receipt"),
+            "unknown_revision": read_count("unknown_revision"),
+        },
+        "read_provenance": if receipts.is_some() { "controller_receipts" } else { "not_reported" },
         "downgraded": downgraded,
-        "basis": "parent_workspace_check_at_projection_existence_only_not_content_verification",
+        "basis": "parent_workspace_check_at_projection_existence_and_controller_read_receipts_not_content_verification",
     });
+}
+
+/// The worker-cited span's standing against the controller's read receipts, or `None` for a
+/// reference without a line span (bare paths, artifacts, prose).
+fn read_status(
+    reference: &str,
+    workspace: &Workspace,
+    receipts: &ReadReceipts,
+) -> Option<&'static str> {
+    let reference = reference.trim().trim_matches('`');
+    let (path, Some(span)) = split_location(reference) else {
+        return None;
+    };
+    let resolved = workspace.resolve_read(path).ok()?;
+    let relative = workspace.rel(&resolved);
+    Some(receipts.span_status(workspace, &relative, span).label())
+}
+
+/// The controller's acceptance receipt (configured checks and their verdicts), copied from the
+/// result's controller fields. Worker claims never appear here; absent data stays `not_reported`.
+fn controller_acceptance(controller: Option<&Value>) -> Value {
+    let Some(acceptance) = controller
+        .map(|controller| &controller["acceptance"])
+        .filter(|acceptance| acceptance.is_object())
+    else {
+        return json!({"state":"not_reported","basis":"controller_receipt"});
+    };
+    let rows = acceptance["checks"].as_array();
+    let checks: Vec<Value> = rows
+        .into_iter()
+        .flatten()
+        .take(16)
+        .map(|check| json!({"check":check["check"],"verdict":check["verdict"]}))
+        .collect();
+    let mut view = json!({
+        "state": acceptance["state"].as_str().unwrap_or("not_reported"),
+        "checks": checks,
+        "basis": "controller_receipt",
+    });
+    if let Some(reason) = acceptance["reason"].as_str() {
+        view["reason"] = json!(super::clip(reason, 192));
+    }
+    if rows.is_some_and(|rows| rows.len() > 16) {
+        view["checks_overflow"] = json!(true);
+    }
+    view
 }
 
 /// `path:line[-end]`, `path:line:column` or a bare path; the range is 1-based and inclusive.

@@ -337,11 +337,7 @@ fn frame_bytes(width: u32, height: u32) -> CoreResult<usize> {
 
 pub(super) fn capture(requests: Vec<CaptureRequest>) -> CoreResult<Vec<Captured>> {
     control::check()?;
-    if !super::capture_permission() {
-        return Err(DesktopError::permission_denied(
-            "macOS Screen Recording permission is not granted for this process",
-        ));
-    }
+    super::require_capture_permission()?;
     if !*MODERN_CAPTURE {
         return requests
             .into_iter()

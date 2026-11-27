@@ -10,6 +10,7 @@ struct State<T> {
     bytes: usize,
     senders: usize,
     receiver: bool,
+    woken: bool,
 }
 
 #[derive(Debug)]
@@ -25,6 +26,13 @@ struct Shared<T> {
 pub(super) struct Sender<T>(Arc<Shared<T>>);
 #[derive(Debug)]
 pub(super) struct Receiver<T>(Arc<Shared<T>>);
+#[derive(Debug)]
+pub(super) struct Waker<T>(Arc<Shared<T>>);
+impl<T> Clone for Waker<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 pub(super) fn channel<T>(
     count: usize,
@@ -37,6 +45,7 @@ pub(super) fn channel<T>(
             bytes: 0,
             senders: 1,
             receiver: true,
+            woken: false,
         }),
         changed: Condvar::new(),
         count,
@@ -46,29 +55,36 @@ pub(super) fn channel<T>(
     (Sender(shared.clone()), Receiver(shared))
 }
 
+impl<T> Shared<T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State<T>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.0.state.lock().unwrap().senders += 1;
+        self.0.lock().senders += 1;
         Self(self.0.clone())
     }
 }
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().senders -= 1;
+        self.0.lock().senders -= 1;
         self.0.changed.notify_all();
     }
 }
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.lock();
         state.receiver = false;
         state.queue.clear();
+        state.bytes = 0;
         self.0.changed.notify_all();
     }
 }
 impl<T> Sender<T> {
     pub(super) fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.lock();
         if !state.receiver {
             return Err(TrySendError::Disconnected(value));
         }
@@ -83,12 +99,16 @@ impl<T> Sender<T> {
     }
 
     pub(super) fn send(&self, value: T) -> Result<(), SendError<T>> {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.lock();
         let bytes = (self.0.weight)(&value).min(self.0.bytes);
         while state.receiver
             && (state.queue.len() >= self.0.count || state.bytes + bytes > self.0.bytes)
         {
-            state = self.0.changed.wait(state).unwrap();
+            state = self
+                .0
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
         if !state.receiver {
             return Err(SendError(value));
@@ -99,9 +119,20 @@ impl<T> Sender<T> {
         Ok(())
     }
 }
+impl<T> Waker<T> {
+    /// Interrupt a thread currently waiting in [`Receiver::recv_timeout`].
+    pub(super) fn wake(&self) {
+        let mut state = self.0.lock();
+        state.woken = true;
+        self.0.changed.notify_all();
+    }
+}
 impl<T> Receiver<T> {
+    pub(super) fn waker(&self) -> Waker<T> {
+        Waker(self.0.clone())
+    }
     pub(super) fn recv(&self) -> Result<T, RecvTimeoutError> {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.lock();
         loop {
             if let Some((value, bytes)) = state.queue.pop_front() {
                 state.bytes -= bytes;
@@ -111,12 +142,16 @@ impl<T> Receiver<T> {
             if state.senders == 0 {
                 return Err(RecvTimeoutError::Disconnected);
             }
-            state = self.0.changed.wait(state).unwrap();
+            state = self
+                .0
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
     pub(super) fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.0.state.lock().unwrap();
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self.0.lock();
         loop {
             if let Some((value, bytes)) = state.queue.pop_front() {
                 state.bytes -= bytes;
@@ -126,11 +161,28 @@ impl<T> Receiver<T> {
             if state.senders == 0 {
                 return Err(RecvTimeoutError::Disconnected);
             }
+            if state.woken {
+                state.woken = false;
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let Some(deadline) = deadline else {
+                state = self
+                    .0
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(RecvTimeoutError::Timeout);
             }
-            state = self.0.changed.wait_timeout(state, left).unwrap().0;
+            state = self
+                .0
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }

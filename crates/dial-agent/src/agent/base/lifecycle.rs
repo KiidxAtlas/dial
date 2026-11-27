@@ -724,6 +724,17 @@ impl<'a> Agent<'a> {
                     | crate::agent::model::local_profile::Tier::Lean
             )
         );
+        let interceptor_loadable: Vec<String> = if offered
+            .iter()
+            .any(|name| matches!(name.as_str(), "tool_search" | "tool_load"))
+        {
+            self.discoverable_tools(&offered)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.workspace = self
             .workspace
             .clone()
@@ -731,6 +742,7 @@ impl<'a> Agent<'a> {
                 self.config.bash_interceptor.clone(),
                 self.interceptor_tools(&offered),
             )
+            .with_bash_interceptor_loadable(interceptor_loadable)
             .with_syntax_block(syntax_block);
         let stable = self.stable_tool_offer() && self.parts.system_template.is_none();
         let mut policy_tools = if stable {
@@ -745,8 +757,18 @@ impl<'a> Agent<'a> {
             .map(str::to_owned)
             .collect();
         policy_tools.extend(members);
+        // In stable mode, derive the loadable-tools list from the fixed core (`policy_tools`)
+        // rather than dynamically mutated `offered` so the model knows every specialist exists
+        // without churning the cached system-prompt prefix when a tool is loaded mid-session.
+        let can_load = policy_tools
+            .iter()
+            .any(|name| matches!(name.as_str(), "tool_search" | "tool_load"));
         let discoverable = if stable {
-            Vec::new()
+            if can_load {
+                self.discoverable_tools(&policy_tools)
+            } else {
+                Vec::new()
+            }
         } else {
             self.discoverable_tools(&offered)
         };

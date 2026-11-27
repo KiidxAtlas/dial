@@ -300,3 +300,172 @@ fn baseline_causality_compares_diagnostics_not_status_and_preserves_requested_sc
     ledger.diagnose("suite", &"x".repeat(65_537));
     assert!(!ledger.unchanged_unrelated_failure("suite"));
 }
+
+type Step = (&'static str, &'static str, CheckStatus, Revision);
+/// (failed call, rerun call, change, verdict, checkpointed edits, uncertain effects)
+type Link = (
+    &'static str,
+    &'static str,
+    ChangeLink,
+    CheckStatus,
+    u64,
+    u64,
+);
+
+#[test]
+fn each_verdict_links_only_to_the_failure_it_reruns_with_its_change_kind() {
+    use ChangeLink::{
+        CheckedAfterCheckpointedEdits as Edited, CheckedAfterUncertainEffectsOnly as Effects,
+        NoLongerReproduced as Gone,
+    };
+    use CheckStatus::{CodeFailed, EnvironmentUnavailable, Passed, Unverified};
+    type Case = (&'static str, Vec<Step>, Vec<Option<Link>>);
+    let cases: Vec<Case> = vec![
+        (
+            "a pass after a checkpointed edit resolves the failure",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "r1", Passed, [2, 0, 0]),
+            ],
+            vec![None, Some(("f1", "r1", Edited, Passed, 1, 0))],
+        ),
+        (
+            "negative: a same-revision pass is non-reproduction, and a later edit does not inherit it",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "p0", Passed, [1, 0, 0]),
+                ("t", "r1", Passed, [2, 0, 0]),
+            ],
+            vec![None, Some(("f1", "p0", Gone, Passed, 0, 0)), None],
+        ),
+        (
+            "a same-revision failure replaces the pending identity",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "f2", CodeFailed, [1, 0, 0]),
+                ("t", "r1", Passed, [2, 0, 0]),
+            ],
+            vec![None, None, Some(("f2", "r1", Edited, Passed, 1, 0))],
+        ),
+        (
+            "a same-revision inconclusive run keeps the failure pending",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "u0", Unverified, [1, 0, 0]),
+                ("t", "r1", Passed, [2, 0, 0]),
+            ],
+            vec![None, None, Some(("f1", "r1", Edited, Passed, 1, 0))],
+        ),
+        (
+            "shell effects alone are not an edit",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "r1", Passed, [1, 1, 0]),
+            ],
+            vec![None, Some(("f1", "r1", Effects, Passed, 0, 1))],
+        ),
+        (
+            "extension effects alone are not an edit",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "r1", Passed, [1, 0, 1]),
+            ],
+            vec![None, Some(("f1", "r1", Effects, Passed, 0, 1))],
+        ),
+        (
+            "effects followed by an edit count the edit and the effects separately",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "r1", Passed, [2, 1, 0]),
+            ],
+            vec![None, Some(("f1", "r1", Edited, Passed, 1, 1))],
+        ),
+        (
+            "a still-failing run after an edit is its own verdict and becomes pending",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "f2", CodeFailed, [2, 0, 0]),
+                ("t", "r1", Passed, [3, 0, 0]),
+            ],
+            vec![
+                None,
+                Some(("f1", "f2", Edited, CodeFailed, 1, 0)),
+                Some(("f2", "r1", Edited, Passed, 1, 0)),
+            ],
+        ),
+        (
+            "an inconclusive run after an edit is reported and clears the failure",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "u1", Unverified, [2, 0, 0]),
+                ("t", "r1", Passed, [3, 0, 0]),
+            ],
+            vec![None, Some(("f1", "u1", Edited, Unverified, 1, 0)), None],
+        ),
+        (
+            "an environment problem after an edit is reported, not treated as a repair",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("t", "e1", EnvironmentUnavailable, [2, 0, 0]),
+            ],
+            vec![
+                None,
+                Some(("f1", "e1", Edited, EnvironmentUnavailable, 1, 0)),
+            ],
+        ),
+        (
+            "another check's run never resolves this failure",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("u", "o1", Passed, [2, 0, 0]),
+                ("t", "r1", Passed, [2, 0, 0]),
+                ("u", "o2", Passed, [3, 0, 0]),
+            ],
+            vec![None, None, Some(("f1", "r1", Edited, Passed, 1, 0)), None],
+        ),
+        (
+            "an unresolved failure yields no verdict, and a pass without failure links nothing",
+            vec![
+                ("t", "f1", CodeFailed, [1, 0, 0]),
+                ("u", "o1", Passed, [2, 0, 0]),
+            ],
+            vec![None, None],
+        ),
+    ];
+    for (name, steps, expected) in cases {
+        let mut ledger = Ledger::default();
+        let actual: Vec<_> = steps
+            .iter()
+            .map(|(command, call, status, revision)| {
+                ledger
+                    .link_verdict(command, call, *status, *revision)
+                    .map(|link| {
+                        (
+                            link.failed_call_id,
+                            link.rerun_call_id,
+                            link.change,
+                            link.verdict,
+                            link.checkpointed_edits_since_failure,
+                            link.uncertain_effects_since_failure,
+                        )
+                    })
+            })
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|link| {
+                link.map(|(failed, rerun, change, verdict, edits, effects)| {
+                    (
+                        failed.to_owned(),
+                        rerun.to_owned(),
+                        change,
+                        verdict,
+                        edits,
+                        effects,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(actual, expected, "{name}");
+    }
+}

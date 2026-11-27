@@ -716,6 +716,17 @@ pub(crate) enum Command {
         /// List every optional capability that is not installed, with its setup command.
         #[arg(long, conflicts_with = "fix")]
         all: bool,
+        /// Print the capability and memory report as JSON.
+        #[arg(long, conflicts_with = "fix")]
+        json: bool,
+    },
+    /// Sign in to an OAuth or subscription provider, or list sign-in providers.
+    Login {
+        /// Provider id (for example `anthropic`, `openai`, `github-copilot`); omit to list providers.
+        provider: Option<String>,
+        /// Print the provider list as JSON (only when no provider is given).
+        #[arg(long, conflicts_with = "provider")]
+        json: bool,
     },
     /// Manage the stored sign-ins of an OAuth provider: list accounts, select one, or remove one.
     Auth {
@@ -743,10 +754,18 @@ pub(crate) enum Command {
         /// instead of the active branch.
         #[arg(long)]
         whole_journal: bool,
+        /// Emit machine-readable JSON (`{"url": ..., "notes": [...]}`).
+        #[arg(long)]
+        json: bool,
     },
     /// Search the web from the command line.
     #[command(alias = "q", alias = "web-search")]
     Search(dial::cli::search::SearchArgs),
+    /// View and continue a running session in this project without forking it.
+    Attach {
+        /// Session id prefix to attach to (`dial sessions` lists ids).
+        session: String,
+    },
     /// Follow live edits, diagnostics and screenshots in another pane.
     Watch(dial::cli::watch::WatchArgs),
     /// Run a foreground command and expose bounded output to approved monitors by name.
@@ -941,6 +960,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Sign-in and integrations",
         &[
+            "login",
             "auth",
             "private",
             "provider-batch",

@@ -194,6 +194,13 @@ acceptance. Worker narratives, JSON Schema validity and artifact references cann
 controller receipts. Passing the declared checks does not establish full task correctness or
 live-service behavior.
 
+For line citations, the handoff compares the worker's own controller-recorded `read` spans
+with the parent file at projection time. A receipt means the worker was shown those rows at
+that revision, not that it understood them. A changed revision can downgrade a worker's
+`met` claim; a current receipt cannot upgrade it to controller acceptance. Missing receipts
+are unknown: only supported single-file, numbered reads count, and the retained file and
+span lists are bounded. The full report remains recoverable separately from its projection.
+
 For substantial implementation, built-in delegation guidance asks for a `work_packet` with
 observable outcomes, owned scope and interfaces, configured `acceptance_checks` when available,
 and an explicit account of criteria those checks cannot cover. This is selective guidance, not

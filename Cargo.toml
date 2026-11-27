@@ -13,7 +13,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 
@@ -190,6 +190,7 @@ libc.workspace = true
 rusqlite.workspace = true
 parking_lot.workspace = true
 dial-client.workspace = true
+vt100.workspace = true
 
 [dependencies]
 dial-build-info.workspace = true

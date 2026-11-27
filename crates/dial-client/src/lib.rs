@@ -29,7 +29,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
-use transport_queue::{Receiver, Sender as SyncSender};
+use transport_queue::{Receiver, Sender as SyncSender, Waker as QueueWaker};
 
 mod conversation;
 mod transport_queue;
@@ -662,6 +662,19 @@ pub struct Client {
 /// Opaque wrapper so `Client` can derive `Debug` without exposing the reader's line type.
 struct LineSlot(Line, usize);
 
+/// Thread-safe handle that wakes a thread currently blocked inside [`Client::poll`].
+///
+/// Allows a UI worker loop to wait on `Client::poll` with a long timeout (zero idle CPU)
+/// while waking in microseconds whenever a new outbound command is enqueued from another thread.
+#[derive(Clone, Debug)]
+pub struct PollWaker(QueueWaker<LineSlot>);
+
+impl PollWaker {
+    /// Interrupt an in-flight [`Client::poll`] call so it returns `None` promptly.
+    pub fn wake(&self) {
+        self.0.wake();
+    }
+}
 impl std::fmt::Debug for LineSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LineSlot")
@@ -857,8 +870,13 @@ impl Client {
         }
     }
 
-    /// Next message, waiting at most `timeout`. Returns `None` on timeout, and after
-    /// [`Message::Disconnected`] has been delivered.
+    /// Return a cloneable handle that wakes a thread blocked inside [`Client::poll`].
+    pub fn waker(&self) -> PollWaker {
+        PollWaker(self.lines.waker())
+    }
+
+    /// Next message, waiting at most `timeout`. Returns `None` on timeout (or when interrupted
+    /// via [`PollWaker::wake`]), and after [`Message::Disconnected`] has been delivered.
     pub fn poll(&mut self, timeout: Duration) -> Option<Message> {
         if let Some((message, _)) = self.buffered.pop_front() {
             return Some(message);

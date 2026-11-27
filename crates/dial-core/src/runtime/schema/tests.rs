@@ -321,3 +321,11 @@ fn validate_all_reports_distinct_errors_up_to_max() {
     assert_eq!(validate_all(&schema, &json!({"a":"x"}), 2).len(), 2);
     assert!(validate_all(&schema, &json!({"a":1,"b":1,"c":1}), 5).is_empty());
 }
+
+#[test]
+fn oversized_regex_patterns_are_rejected_bounded() {
+    let huge = "a{100000}";
+    let schema = json!({"type": "string", "pattern": huge});
+    assert!(check_schema(&schema).is_err());
+    assert!(validate(&schema, &json!("a")).is_err());
+}

@@ -26,7 +26,7 @@ use lifecycle::{MAX_IN_FLIGHT, MAX_REQUEST_LIFETIME, Operation, Outgoing, OwnedS
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -359,24 +359,37 @@ impl Client {
     }
 
     /// Starts `program` and its helper threads. No protocol traffic yet; see [`Client::initialize`].
-    pub(super) fn spawn(server: &str, config: &McpServerConfig, shared: Shared) -> Result<Client> {
-        let mut command = Command::new(launch_program(config));
+    pub(super) fn spawn(
+        server: &str,
+        config: &McpServerConfig,
+        shared: Shared,
+        sandbox_spec: Option<&crate::tools::SandboxSpec>,
+    ) -> Result<Client> {
+        let default_spec = if config.sandbox && sandbox_spec.is_none() {
+            Some(crate::tools::sandbox_spec_for_mcp(
+                &crate::config::types::SandboxConfig::default(),
+                None,
+            )?)
+        } else {
+            None
+        };
+        let effective_spec = sandbox_spec.or(default_spec.as_ref());
+        let mut command = build_stdio_command(
+            config,
+            shared.roots.first().map(PathBuf::as_path),
+            effective_spec,
+        )?;
         command
-            .args(&config.args)
-            .env_clear()
-            .envs(server_env(
-                std::env::vars_os().filter_map(|(name, value)| {
-                    Some((name.into_string().ok()?, value.into_string().ok()?))
-                }),
-                &config.env,
-            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(cwd) = &config.cwd {
-            command.current_dir(cwd);
-        }
-        let mut child = crate::platform::process::spawn_group(&mut command).with_context(|| {
+        let spawn_result = if config.sandbox {
+            let limits = effective_spec.map(|spec| spec.limits).unwrap_or_default();
+            crate::platform::process::spawn_group_limited(&mut command, limits)
+        } else {
+            crate::platform::process::spawn_group(&mut command)
+        };
+        let mut child = spawn_result.with_context(|| {
             let program = config.program.display();
             if config.program.is_absolute() && !config.program.exists() {
                 format!(
@@ -1029,6 +1042,71 @@ fn launch_program(config: &McpServerConfig) -> PathBuf {
         .map(|(_, value)| std::ffi::OsString::from(value))
         .or_else(|| std::env::var_os("PATH"));
     crate::platform::fs::launch_path(&config.program, search.as_deref())
+}
+
+/// Build the stdio child `Command` for `config`, optionally wrapping it inside Dial's OS sandbox
+/// when `config.sandbox` is enabled. Uses the unified [`crate::tools::SandboxSpec`] so sandboxed
+/// MCP servers inherit the same secret denials, extra write paths, and resource limits as shell
+/// commands. Owns the child environment for both modes so sandboxed commands keep `TMPDIR` and
+/// redirected toolchain caches alongside explicit `config.env` values.
+pub(super) fn build_stdio_command(
+    config: &McpServerConfig,
+    workspace_root: Option<&Path>,
+    sandbox_spec: Option<&crate::tools::SandboxSpec>,
+) -> Result<Command> {
+    let program = launch_program(config);
+    if !config.sandbox {
+        let mut command = Command::new(program);
+        command.args(&config.args).env_clear().envs(server_env(
+            std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }),
+            &config.env,
+        ));
+        if let Some(cwd) = &config.cwd {
+            command.current_dir(cwd);
+        }
+        return Ok(command);
+    }
+    let root = match &config.cwd {
+        Some(cwd) => cwd.clone(),
+        None => match workspace_root {
+            Some(ws) => ws.to_path_buf(),
+            None => std::env::current_dir()
+                .context("resolving working directory for sandboxed MCP server")?,
+        },
+    };
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolving sandbox root {}", root.display()))?;
+    let program_str = program.to_str().ok_or_else(|| {
+        anyhow!(
+            "sandboxed MCP server path is not UTF-8: {}",
+            program.display()
+        )
+    })?;
+    let arg_refs: Vec<&str> = config.args.iter().map(String::as_str).collect();
+    let owned_spec;
+    let policy = match sandbox_spec {
+        Some(spec) => &spec.policy,
+        None => {
+            owned_spec = crate::tools::sandbox_spec_for_mcp(
+                &crate::config::types::SandboxConfig::default(),
+                None,
+            )?;
+            &owned_spec.policy
+        }
+    };
+    let mut command = crate::tools::exec::sandbox::Sandbox::detect()
+        .command_with_policy(&root, policy, program_str, &arg_refs)
+        .map_err(|error| anyhow!("sandboxing stdio MCP server: {error}"))?;
+    // Dev sandbox owns the allowlisted base env, TMPDIR, and redirected toolchain caches;
+    // layer explicit server env overrides on top without clearing sandbox variables.
+    command.envs(&config.env);
+    if let Some(cwd) = &config.cwd {
+        command.current_dir(cwd);
+    }
+    Ok(command)
 }
 
 /// The server's environment: allowlisted runtime variables ([`child_env_allowed`]), plus the

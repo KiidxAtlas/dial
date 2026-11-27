@@ -31,12 +31,32 @@ const MIN_WINDOW_EDGE: u32 = 16;
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
 }
 
 pub(super) fn capture_permission() -> bool {
     // SAFETY: This non-prompting TCC preflight has no arguments and is available
     // on supported macOS versions.
     unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Succeeds when Screen Recording is granted. Otherwise asks macOS, once per
+/// process, to show its Screen Recording prompt for the responsible app (Dial,
+/// or the terminal running `dial`) and reports the denial. A grant applies after
+/// the app restarts.
+pub(super) fn require_capture_permission() -> CoreResult<()> {
+    static REQUESTED: std::sync::Once = std::sync::Once::new();
+    if capture_permission() {
+        return Ok(());
+    }
+    REQUESTED.call_once(|| {
+        // SAFETY: Argument-free TCC request; macOS shows its prompt at most once
+        // per app and otherwise only returns the current state.
+        unsafe { CGRequestScreenCaptureAccess() };
+    });
+    Err(DesktopError::permission_denied(
+        "macOS Screen Recording permission is not granted for this process. Dial asked macOS for access; allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then restart Dial",
+    ))
 }
 
 pub(super) fn capture_available() -> bool {
@@ -58,11 +78,7 @@ impl MacCapture {
         reason = "keeps discovery on the backend capture object"
     )]
     pub(super) fn displays(&self) -> CoreResult<Vec<DesktopDisplay>> {
-        if !capture_permission() {
-            return Err(DesktopError::permission_denied(
-                "macOS Screen Recording permission is not granted for this process",
-            ));
-        }
+        require_capture_permission()?;
         let monitors = Monitor::all().map_err(|error| {
             DesktopError::capture_failed(format!("Quartz monitor enumeration failed: {error}"))
         })?;
@@ -292,11 +308,7 @@ type WindowDictionary = CFDictionary<CFString, CFType>;
 /// Reads each window from one immutable Quartz snapshot; individual xcap
 /// property getters would re-enumerate the whole desktop for every field.
 fn window_snapshot(target: Option<u32>) -> CoreResult<DesktopWindowSnapshot> {
-    if !capture_permission() {
-        return Err(DesktopError::permission_denied(
-            "macOS Screen Recording permission is not granted for this process",
-        ));
-    }
+    require_capture_permission()?;
     let options = if target.is_some() {
         CGWindowListOption::OptionIncludingWindow
     } else {

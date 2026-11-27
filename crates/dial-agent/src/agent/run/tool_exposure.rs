@@ -23,14 +23,14 @@ pub(in crate::agent) fn controller_name(name: &str) -> &str {
 impl<'a> Agent<'a> {
     /// Initial built-in schemas stay below this bound on lean and local model routes.
     const CORE_SCHEMA_BYTES: usize = 12 * 1024;
-    /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
-    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`, then
-    /// briefly to 27 KiB; shorter `eval`, `finish`, `message` and `task` descriptions restored 25 KiB.
-    /// Raised to 27 KiB again for the per-tool batching notes ([`Self::batching_note`]).
-    const HOSTED_CORE_SCHEMA_BYTES: usize = 27 * 1024;
+    /// Hosted routes ([`Self::hosted_route`]) have room for delegation, job control and repository
+    /// `git` up front. Raised from 27 KiB to 30 KiB so auto-offered repository `git` fits alongside
+    /// `task`+`message` without crowding them out.
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 30 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
     /// Basic workspace operations precede questions, which precede optional execution helpers.
+    /// `git` joins automatically when the workspace is (or directly parents) a Git/jj repository.
     /// `task` (and `message`, which follows it) is offered only on hosted routes. `eval` joins only
     /// when containment is available and a cell runtime resolves ([`Self::automatic_eval_ready`]).
     const CORE_TOOLS: &[&str] = &[
@@ -48,6 +48,7 @@ impl<'a> Agent<'a> {
         "verify",
         "eval",
         "bg",
+        "git",
         "task",
     ];
 
@@ -838,14 +839,7 @@ impl<'a> Agent<'a> {
         let unattended = |name: &str| self.unattended_deferred(name);
         // Repository work should not spend a model request loading its native VCS tool.
         // Respect pinned/hermetic selections and small-context budgets.
-        let repository_git = !pinned
-            && !self.hermetic
-            && !minimal
-            && self
-                .workspace
-                .root()
-                .ancestors()
-                .any(|dir| dir.join(".git").exists());
+        let repository_git = !pinned && !self.hermetic && !minimal && self.workspace_has_git();
         if repository_git && catalog.iter().any(|name| name == "git") {
             names.push("git".into());
         }
@@ -1017,6 +1011,9 @@ impl<'a> Agent<'a> {
             if name == "eval" && !eval_ready() {
                 continue;
             }
+            if name == "git" && !self.workspace_has_git() {
+                continue;
+            }
             // With questions disabled (`ask.enabled`, e.g. print mode), `ask` carries only the
             // folded directory action; it stays loadable through `tool_search` instead of
             // advertising a question action up front that would only be refused.
@@ -1070,6 +1067,33 @@ impl<'a> Agent<'a> {
         core
     }
 
+    /// Whether the workspace sits inside a Git/jj repository or directly parents child
+    /// repositories (multi-repo workspace). Bounded to one directory level and 64 entries.
+    fn workspace_has_git(&self) -> bool {
+        let root = self.workspace.root();
+        if root
+            .ancestors()
+            .any(|dir| dir.join(".git").exists() || dir.join(".jj").is_dir())
+        {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        entries
+            .take(64)
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+            .any(|entry| {
+                let path = entry.path();
+                path.is_dir() && (path.join(".git").exists() || path.join(".jj").is_dir())
+            })
+    }
     /// An unattended launch defers [`Self::UNATTENDED_DEFERRED`] from the first offer unless the
     /// operator prefers delegation (which keeps `task`).
     fn unattended_deferred(&self, name: &str) -> bool {

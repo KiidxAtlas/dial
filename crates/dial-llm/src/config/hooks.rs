@@ -27,6 +27,16 @@ pub const EVENTS: &[&str] = &[
 pub fn canonical(event: &str) -> &str {
     crate::config::hooks::canonical_event(event)
 }
+/// Bounds compiled NFA/DFA memory for user-configured hook matchers.
+const MAX_MATCHER_REGEX_BYTES: usize = 256 * 1024;
+
+/// Compile a full-match hook tool-name regex with bounded NFA/DFA memory.
+pub fn compile_matcher(matcher: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(&format!("^(?:{matcher})$"))
+        .size_limit(MAX_MATCHER_REGEX_BYTES)
+        .dfa_size_limit(MAX_MATCHER_REGEX_BYTES)
+        .build()
+}
 
 pub fn validate(hook: &HookConfig) -> Result<(), String> {
     if !EVENTS.contains(&canonical(&hook.event)) {
@@ -47,8 +57,7 @@ pub fn validate(hook: &HookConfig) -> Result<(), String> {
         return Err("hook timeout_secs must be 0..=600".into());
     }
     if let Some(matcher) = &hook.matcher {
-        regex::Regex::new(&format!("^(?:{matcher})$"))
-            .map_err(|e| format!("invalid hook matcher: {e}"))?;
+        compile_matcher(matcher).map_err(|e| format!("invalid hook matcher: {e}"))?;
     }
     Ok(())
 }

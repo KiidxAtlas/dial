@@ -16,6 +16,122 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Layout, Workspace) {
 }
 
 #[test]
+fn behavior_locator_survives_reopen_and_partial_inventory_without_replaying_claim() {
+    let (_home, project, layout, ws) = fixture();
+    let topic = "incoming request route selection";
+    fs::write(
+        project.path().join("src/tests.rs"),
+        "#[test]\nfn check_routing() {}\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    assert!(
+        !cache
+            .task_context(topic, 2048)
+            .unwrap()
+            .contains("Behavior locator")
+    );
+    cache
+        .remember(
+            topic,
+            "Do not replay this claim.\nOwner: `route_request`\nCheck: `check_routing`",
+            &["src/router.rs".into(), "src/tests.rs".into()],
+            "first-session",
+            0,
+        )
+        .unwrap();
+    drop(cache);
+    fs::write(
+        project.path().join("unread.rs"),
+        "x".repeat(MAX_FILE as usize + 1),
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    let brief = cache.task_brief(topic, 2048, true).unwrap();
+    assert!(
+        brief.starts_with("Behavior locator") && !brief.contains("Do not replay"),
+        "{brief}"
+    );
+    let (_, json) = brief.split_once(": ").unwrap();
+    let row: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        row["owner"],
+        json!({"line":3,"path":"src/router.rs","symbol":"route_request"})
+    );
+    assert_eq!(
+        row["check"],
+        json!({"line":2,"path":"src/tests.rs","symbol":"check_routing"})
+    );
+    assert!(
+        cache
+            .navigation_packet(topic, 2048)
+            .unwrap()
+            .contains(&brief)
+    );
+    assert!(
+        !cache
+            .task_context(topic, brief.len() - 1)
+            .unwrap()
+            .contains("Behavior locator")
+    );
+    assert!(
+        cache
+            .behavior_locator("completely unrelated", 2048)
+            .unwrap()
+            .is_none()
+    );
+    fs::write(
+        project.path().join("src/tests.rs"),
+        "// changed\nfn check_routing() {}\n",
+    )
+    .unwrap();
+    assert!(cache.behavior_locator(topic, 2048).unwrap().is_none());
+}
+
+#[test]
+fn behavior_locator_requires_unique_current_declarations_and_no_contradiction() {
+    let (_home, project, layout, _) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    let topic = "router selection";
+    let sources = ["src/router.rs".to_owned()];
+    for (revision, (extra, found)) in [
+        ("// fn check_routing() {}", false),
+        (
+            "fn check_routing() {}\nmod t { fn check_routing() {} }",
+            false,
+        ),
+        ("fn check_routing() {}", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(
+            project.path().join(&sources[0]),
+            format!("fn route_request() {{}}\n{extra}\n"),
+        )
+        .unwrap();
+        cache
+            .remember_current(
+                topic,
+                "Owner: `route_request`\nCheck: `check_routing`",
+                &sources,
+                "s",
+                revision as i64,
+            )
+            .unwrap();
+        assert_eq!(
+            cache.behavior_locator(topic, 2048).unwrap().is_some(),
+            found
+        );
+    }
+    cache
+        .invalidate_finding(topic, "wrong association")
+        .unwrap();
+    assert!(cache.behavior_locator(topic, 2048).unwrap().is_none());
+}
+
+#[test]
 fn context_rechecks_external_edits_on_each_invocation() {
     let (_home, project, layout, ws) = fixture();
     let cache = Codebase::open(&layout).unwrap();

@@ -193,10 +193,94 @@ jobs:
           path: ${{ env.PACKAGE }}.zip
           if-no-files-found: error
 
+  macos-sign:
+    name: Developer ID sign and notarize macOS candidates
+    needs: [gate, signing-ready, build]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.signing-ready.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: macos-15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      signed: ${{ steps.secrets.outputs.enabled }}
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      PACKAGE: dial-${{ github.ref_name }}-${{ matrix.target }}
+    steps:
+      - name: Check macOS signing secrets
+        id: secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=macOS signing skipped::Configure APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY to Developer ID sign and notarize macOS release binaries."
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.secrets.outputs.enabled == 'true'
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.gate.outputs.candidates || github.run_id }}
+          name: release-assets-${{ matrix.target }}
+          path: candidate
+      - name: Import certificate, sign, notarize and repack
+        if: steps.secrets.outputs.enabled == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain="$RUNNER_TEMP/dial-signing.keychain-db"
+          keychain_pw="$(openssl rand -hex 24)"
+          cert="$RUNNER_TEMP/apple-cert.p12"
+          cleanup() {
+            security delete-keychain "$keychain" 2>/dev/null || true
+            rm -f "$cert" "$RUNNER_TEMP/notarize.zip"
+          }
+          trap cleanup EXIT
+          mkdir -p unpacked
+          tar -xzf "candidate/$PACKAGE.tar.gz" -C unpacked
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$cert"
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          security import "$cert" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_pw" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "unpacked/$PACKAGE/dial"
+          codesign --verify --strict --verbose=2 "unpacked/$PACKAGE/dial"
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            ditto -c -k --keepParent "unpacked/$PACKAGE/dial" "$RUNNER_TEMP/notarize.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+          fi
+          tar -czf "$PACKAGE.tar.gz" -C unpacked "$PACKAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.secrets.outputs.enabled == 'true'
+        with:
+          name: macos-signed-${{ matrix.target }}
+          path: ${{ env.PACKAGE }}.tar.gz
+          if-no-files-found: error
+
   sign:
     name: Sign release manifest
-    needs: [gate, windows-sign]
-    if: ${{ !cancelled() && needs.windows-sign.result == 'success' }}
+    needs: [gate, windows-sign, macos-sign]
+    if: ${{ !cancelled() && needs.windows-sign.result == 'success' && needs.macos-sign.result == 'success' }}
     runs-on: ubuntu-22.04
     # Configure required reviewers and tag deployment rules in repository settings.
     environment: release-signing
@@ -243,7 +327,26 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           for arch in x86_64 aarch64; do test -s "dist/dial-$RELEASE_TAG-$arch-pc-windows-msvc.zip" || exit 1; done
+      - name: Download Developer ID signed macOS archives
+        if: needs.macos-sign.outputs.signed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: macos-signed-*
+          merge-multiple: true
+          path: macos-signed
+      - name: Replace unsigned macOS archives with signed ones
+        if: needs.macos-sign.outputs.signed == 'true'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for arch in aarch64 x86_64; do
+            archive="dial-$RELEASE_TAG-$arch-apple-darwin.tar.gz"
+            test -s "macos-signed/$archive"
+            mv -f "macos-signed/$archive" "dist/$archive"
+          done
       - name: Prepare installers and manifest (no private key)
         env:
           DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}

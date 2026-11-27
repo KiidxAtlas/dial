@@ -31,6 +31,7 @@ pub(in crate::tools) fn entries(args: &Value) -> Result<Vec<&Value>, String> {
             "if_absent",
             "expected_sha256",
             "idempotent",
+            "executable",
             "receipt",
             "verify",
             "allow_syntax_errors",
@@ -69,10 +70,11 @@ pub(in crate::tools) fn entries(args: &Value) -> Result<Vec<&Value>, String> {
                             | "if_absent"
                             | "expected_sha256"
                             | "idempotent"
+                            | "executable"
                     )
             })
         {
-            return Err("batch entries accept path, content/source, if_absent, expected_sha256 and idempotent only; binary and remote batches are unsupported".into());
+            return Err("batch entries accept path, content/source, if_absent, expected_sha256, idempotent and executable only; binary and remote batches are unsupported".into());
         }
         let path = req_str(entry, "path")?;
         if batch && path.starts_with("ssh://") {
@@ -101,6 +103,7 @@ pub(in crate::tools) fn entries(args: &Value) -> Result<Vec<&Value>, String> {
         }
         opt_bool(entry, "if_absent")?;
         opt_bool(entry, "idempotent")?;
+        opt_bool(entry, "executable")?;
         if present(entry, "expected_sha256") {
             validate_hash(req_str(entry, "expected_sha256")?)?;
             if entry["if_absent"] == true {
@@ -258,7 +261,8 @@ pub(in crate::tools) fn schema(description: &str) -> Value {
             "sha256":{"type":"string","minLength":64,"maxLength":64}},"required":["artifact","sha256"],"additionalProperties":false},
         "if_absent":{"type":"boolean","description":"Require missing destination, even on retries."},
         "expected_sha256":{"type":"string","minLength":64,"maxLength":64,"description":"Require this existing revision; still read first."},
-        "idempotent":{"type":"boolean","description":"Witnessed equal bytes succeed unchanged; no progress credit."}
+        "idempotent":{"type":"boolean","description":"Witnessed equal bytes succeed unchanged; no progress credit."},
+        "executable":{"type":"boolean","description":"Mark file executable (chmod +x on Unix)."}
     });
     let mut entry_properties = properties.clone();
     for property in entry_properties.as_object_mut().unwrap().values_mut() {

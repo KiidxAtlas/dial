@@ -87,6 +87,9 @@ impl Codebase {
         }
         let mut out = PACKET_RULE.to_owned();
         out.push_str(coverage);
+        if let Some(row) = self.behavior_locator(query, max_bytes - out.len() - checks.len())? {
+            out.push_str(&row);
+        }
         if owners.is_empty() {
             let note = if partial {
                 "No indexed owner matched this task in the files read so far; coverage is partial, so an owner may be unread. Use codebase_memory recall or read the workspace directly.\n"

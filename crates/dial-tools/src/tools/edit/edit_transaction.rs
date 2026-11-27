@@ -71,6 +71,19 @@ impl Change {
         Self::new(path, Some(before), after)
     }
 
+    /// Mark the written file executable (adds execute bits on Unix; no-op on Windows).
+    pub fn set_executable(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = self
+                .permissions
+                .as_ref()
+                .map_or(0o755, |p| p.mode() | 0o111);
+            self.permissions = Some(Permissions::from_mode(mode));
+        }
+    }
+
     fn new(path: PathBuf, before: Option<Original>, after: Option<String>) -> Self {
         let permissions = before.as_ref().map(|original| original.permissions.clone());
         Self {

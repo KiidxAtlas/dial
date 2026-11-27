@@ -32,6 +32,29 @@ fn events(layout: &Layout, session: &str) -> Vec<Event> {
 }
 
 #[test]
+fn attachment_targets_one_owner_and_never_replays_after_reopen() {
+    use attachment::{Endpoint, Owner};
+    let root = tempfile::tempdir().unwrap();
+    let layout = layout(root.path());
+    let first = Owner::open(&layout, "first").unwrap();
+    let other = Owner::open(&layout, "second").unwrap();
+    let view = Endpoint::lookup(&layout, "first").unwrap();
+    assert!(view.send(&layout, "second", "wrong target").is_err());
+    assert!(view.send(&layout, "first", "  ").is_err());
+    view.send(&layout, "first", "continue").unwrap();
+    assert!(view.send(&layout, "first", "overwrite").is_err());
+    assert!(other.take().unwrap().is_none());
+    assert_eq!(first.take().unwrap().as_deref(), Some("continue"));
+    assert!(first.take().unwrap().is_none());
+    view.send(&layout, "first", "unread").unwrap();
+    drop(first);
+    assert!(Endpoint::lookup(&layout, "first").is_err());
+    let reopened = Owner::open(&layout, "first").unwrap();
+    assert!(view.send(&layout, "first", "stale viewer").is_err());
+    assert!(reopened.take().unwrap().is_none());
+}
+
+#[test]
 fn feed_is_opt_in_and_follows_current_session() {
     let root = tempfile::tempdir().unwrap();
     let layout = layout(root.path());

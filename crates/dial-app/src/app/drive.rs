@@ -51,8 +51,20 @@ pub(super) fn drive(
     // Draw the home before the first agent is built: that waits for MCP servers to connect.
     let _ = shell.paint(None);
     Shell::warm_session_index(&app.layout);
-    // Typing stays live while configured MCP servers finish connecting for the first agent.
-    shell.edit_while(crate::tools::integrations::mcp::prefetch_pending);
+    // The first shell-enabled agent needs the process-wide toolchain inventory. A slow
+    // `--version` probe must not consume the whole welcome animation between its first two paints.
+    let inventory = (!resumed && shell.home.is_some() && app.launch.allows_tool("bash"))
+        .then(|| {
+            std::thread::Builder::new()
+                .name("startup-inventory".into())
+                .spawn(crate::tools::fs::system::session_inventory)
+                .ok()
+        })
+        .flatten();
+    shell.edit_while(|| {
+        inventory.as_ref().is_some_and(|job| !job.is_finished())
+            || crate::tools::integrations::mcp::prefetch_pending()
+    });
     // The backend and its open error last reported, so the paused notice repeats only on change.
     let mut memory_reported: Option<(String, Option<String>)> = None;
     // `session_end` is handed from one agent to the next across same-session rebuilds.

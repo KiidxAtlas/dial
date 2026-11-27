@@ -2,6 +2,7 @@
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
 pub mod enrichment;
+mod locator;
 mod packet;
 use crate::config::paths::Layout;
 use crate::runtime::tool_output::ToolOutput;
@@ -1112,7 +1113,32 @@ impl Codebase {
 
     /// Ambient retrieval is task-scoped; explicit recall keeps the complete index view.
     pub fn task_context(&self, query: &str, max_bytes: usize) -> Result<String> {
-        self.context_inner(query, max_bytes, true)
+        self.task_brief(query, max_bytes, false)
+    }
+
+    /// Prefer one source-bound behavior locator over adding several less-specific records.
+    /// On a miss, preserve the caller's existing architecture/outline fallback.
+    pub fn task_brief(&self, query: &str, max_bytes: usize, architecture: bool) -> Result<String> {
+        let budget = if max_bytes == 0 {
+            usize::MAX
+        } else {
+            max_bytes
+        };
+        if let Some(row) = self.behavior_locator(query, budget)? {
+            return Ok(row);
+        }
+        let mut out = if architecture && budget >= 2 {
+            self.task_architecture_context(query, budget / 2)?
+        } else {
+            String::new()
+        };
+        if let Some(left) = budget.checked_sub(out.len()).filter(|n| *n > 0) {
+            let context = self.context_inner(query, left, true)?;
+            if context.len() <= left {
+                out.push_str(&context);
+            }
+        }
+        Ok(out)
     }
 
     fn context_inner(&self, query: &str, max_bytes: usize, scoped: bool) -> Result<String> {
@@ -1747,7 +1773,7 @@ impl Tool for CodebaseTool {
                 "reason":{"type":"string","maxLength":1000},
                 "query":{"type":"string","maxLength":4096},
                 "topic":{"type":"string","maxLength":160},
-                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding; up to {MAX_SUMMARY_BYTES} UTF-8 bytes. Keep a compact ```diagram fence of the relationships when one explains them better than prose.")},
+                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding; up to {MAX_SUMMARY_BYTES} UTF-8 bytes. For behavior navigation, use a descriptive topic and separate lines Owner: `identifier` and Check: `test_identifier`, citing their source files. These are locators, not check verdicts.")},
                 "sources":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},
                 "expected_revision":{"type":"integer","minimum":0},
                 "max_bytes":{"type":"integer","minimum":1024,"maximum":24000}

@@ -94,7 +94,11 @@ fn non_public_addresses_are_recognized() {
         "::ffff:127.0.0.1",
         "::ffff:10.0.0.1",
         "64:ff9b::a00:1",
+        "64:ff9b:1::1",
         "2001:db8::1",
+        "2001::1",
+        "fec0::1",
+        "::ffff:0:127.0.0.1",
         "2002:7f00:1::",
         "2002:a00:1::1",
     ] {
@@ -173,6 +177,11 @@ mod live {
             b"CONNECT example.com HTTP/1.1\r\n\r\n",
             b"CONNECT example.com:0 HTTP/1.1\r\n\r\n",
             b"CONNECT example.com:443 HTTP/2\r\n\r\n",
+            b"GET http://[::1]garbage/ HTTP/1.1\r\n\r\n",
+            b"GET http://example.com/\nHost:evil.internal HTTP/1.1\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nX-Foo: bar\nHost: evil.internal\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nX-Bad: a\0b\r\n\r\n",
+            b"G/ET http://example.com/ HTTP/1.1\r\n\r\n",
             b"garbage\r\n\r\n",
         ] {
             assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
@@ -333,5 +342,45 @@ mod live {
         client.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"ping");
         echo.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_cache_evicts_lru_and_cleans_up_socket_dir() {
+        let mut cache = super::super::server::EndpointCache::new(2);
+        let r1 = rules(&["a.example"], &[]);
+        let r2 = rules(&["b.example"], &[]);
+        let r3 = rules(&["c.example"], &[]);
+
+        let (ep1, evicted) = cache.get_or_start(&r1).unwrap();
+        assert!(evicted.is_none());
+        let dir1 = ep1.socket().parent().unwrap().to_path_buf();
+        assert!(dir1.exists());
+        drop(ep1);
+
+        let (ep2, evicted) = cache.get_or_start(&r2).unwrap();
+        assert!(evicted.is_none());
+        let dir2 = ep2.socket().parent().unwrap().to_path_buf();
+        drop(ep2);
+
+        // Touch r1 so r2 becomes the least-recently-used idle entry.
+        let (ep1_again, evicted) = cache.get_or_start(&r1).unwrap();
+        assert!(evicted.is_none());
+        drop(ep1_again);
+
+        let (ep3, evicted) = cache.get_or_start(&r3).unwrap();
+        let evicted = evicted.expect("third distinct ruleset should evict r2");
+        assert_eq!(evicted.socket().parent().unwrap(), dir2);
+        drop(evicted);
+        assert!(
+            !dir2.exists(),
+            "evicted endpoint socket directory should be removed on Drop"
+        );
+        assert!(dir1.exists());
+        let dir3 = ep3.socket().parent().unwrap().to_path_buf();
+        assert!(dir3.exists());
+        drop(ep3);
+        drop(cache);
+        assert!(!dir1.exists());
+        assert!(!dir3.exists());
     }
 }

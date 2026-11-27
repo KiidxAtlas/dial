@@ -565,6 +565,16 @@ fn compact_guidance_names_only_offered_helpers_and_rules() {
     }
 }
 
+#[test]
+fn exhaustive_requests_require_coverage_in_every_profile() {
+    let tools = names(&["read", "bash"]);
+    for (lean, one_call) in [(false, false), (true, false), (true, true)] {
+        let guidance = guidance_for(&tools, lean, one_call);
+        assert!(guidance.contains("enumerate the candidates systematically"));
+        assert!(guidance.contains("check for omissions"));
+    }
+}
+
 /// Every profile states which guidance wins a conflict and that none of it widens permissions.
 #[test]
 fn instruction_priority_is_stated_in_every_profile() {

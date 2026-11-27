@@ -8,6 +8,7 @@ pub(in crate::agent) mod development_copy;
 pub(crate) mod isolation;
 pub(in crate::agent) mod live_tasks;
 pub(crate) mod mailbox;
+pub(in crate::agent) mod read_receipts;
 pub(in crate::agent) mod side_questions;
 pub mod subagents;
 pub(in crate::agent) mod task_packet;

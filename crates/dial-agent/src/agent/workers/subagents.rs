@@ -267,8 +267,9 @@ pub(in crate::agent) fn result_projection(
     payload: Option<&Value>,
     acceptance: &[String],
     workspace: Option<&Workspace>,
+    controller: Option<&Value>,
 ) -> Value {
-    handoff::project(report, payload, acceptance, workspace)
+    handoff::project(report, payload, acceptance, workspace, controller)
 }
 
 /// A complete report must never be advertised through a silently elided artifact.
@@ -974,8 +975,10 @@ fn render(
         result["inspections"] = json!(outcome.inspections);
         result["scheduling"] = json!(outcome.scheduling);
         result["acceptance"] = json!(outcome.acceptance);
+        result["read_receipts"] = json!(outcome.read_receipts);
         result["candidate"] = candidate_status(status, outcome.acceptance.state, &job.acceptance_checks);
-        result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace);
+        let projection = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace, Some(&result));
+        result["projection"] = projection;
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
         if let Some(route) = &outcome.model_route {

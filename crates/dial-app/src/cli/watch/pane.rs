@@ -120,6 +120,7 @@ pub(super) enum KeyOutcome {
 }
 
 pub(super) struct Pane {
+    attachment: bool,
     tab: Tab,
     selected: [usize; 6],
     /// Detail lines scrolled past, per tab.
@@ -146,6 +147,7 @@ pub(super) struct Pane {
 impl Pane {
     pub(super) fn new() -> Self {
         Self {
+            attachment: false,
             tab: Tab::Feed,
             selected: [0; 6],
             scroll: [0; 6],
@@ -231,6 +233,14 @@ impl Pane {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return KeyOutcome::Quit;
+        }
+        if self.attachment {
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                return KeyOutcome::Continue;
+            }
+            if key.code == KeyCode::Esc && self.draft.is_empty() {
+                return KeyOutcome::Quit;
+            }
         }
         if let Mode::Confirm { request, prompt } = std::mem::replace(&mut self.mode, Mode::Browse) {
             return match key.code {
@@ -550,6 +560,12 @@ impl Pane {
     }
 
     fn header(&self, theme: &Theme, now_ms: u64) -> (Line<'static>, Span<'static>) {
+        if self.attachment {
+            return (
+                Line::styled(" Attached session", theme.fg(Tok::Accent)),
+                Span::styled("Ctrl+C detaches ", theme.fg(Tok::Muted)),
+            );
+        }
         let mut spans = Vec::new();
         for (n, tab) in TABS.iter().enumerate() {
             let label = format!(" {} {}{} ", n + 1, tab.title(), self.badge(*tab));
@@ -650,6 +666,20 @@ impl Pane {
             ),
             Mode::Browse => {
                 if self.tab == Tab::Peers && self.chat.is_some() {
+                    if self.attachment {
+                        return footer_line(
+                            theme,
+                            self.status
+                                .as_ref()
+                                .map(|s| Span::styled(s.clone(), theme.fg(Tok::Accent))),
+                            &[
+                                ("Enter", "queue prompt"),
+                                ("↑↓", "scroll"),
+                                ("Ctrl+C", "detach"),
+                            ],
+                            width,
+                        );
+                    }
                     let note = match &self.status {
                         Some(status) => Span::styled(status.clone(), theme.fg(Tok::Accent)),
                         None => Span::styled("Type a message", theme.fg(Tok::Muted)),
@@ -1448,6 +1478,10 @@ pub(super) fn run(
     session: &str,
     dir: &Path,
     reader: &mut impl BufRead,
+    attachment: Option<(
+        &crate::storage::session::SessionInfo,
+        super::attachment::Endpoint,
+    )>,
 ) -> Result<i32> {
     use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as Input};
     use crossterm::{cursor, execute, terminal};
@@ -1477,6 +1511,13 @@ pub(super) fn run(
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     let theme = Theme::dark();
     let mut pane = Pane::new();
+    let mut journal_len = None;
+    if attachment.is_some() {
+        pane.attachment = true;
+        pane.tab = Tab::Peers;
+        pane.chat = Some(Target::Session);
+        pane.status = Some("Approvals stay in the original window.".into());
+    }
     let mut pending = Vec::new();
     let mut read_at: Option<Instant> = None;
     loop {
@@ -1485,7 +1526,39 @@ pub(super) fn run(
         }
         if read_at.is_none_or(|at| at.elapsed() >= STATE_EVERY) {
             read_at = Some(Instant::now());
-            pane.set_state(state::read(layout, session));
+            if let Some((info, endpoint)) = &attachment {
+                anyhow::ensure!(
+                    super::attachment::Endpoint::lookup(layout, session)? == *endpoint,
+                    "The owner changed; reopen the session"
+                );
+                let len = std::fs::metadata(&info.path)?.len();
+                if journal_len != Some(len) {
+                    let turns = crate::storage::session::Session::conversation_turns(&info.path)?;
+                    let conversation = turns
+                        .into_iter()
+                        .filter_map(|(role, text)| {
+                            let role = match role.as_str() {
+                                "assistant" => ChatRole::Model,
+                                "user" => ChatRole::User,
+                                _ => return None,
+                            };
+                            Some(state::ChatLine {
+                                role,
+                                text: crate::ui::text::sanitize(&text),
+                                at_ms: 0,
+                            })
+                        })
+                        .collect();
+                    pane.set_state(Ok(Some(Snapshot {
+                        model: info.model.clone(),
+                        conversation,
+                        ..Default::default()
+                    })));
+                    journal_len = Some(len);
+                }
+            } else {
+                pane.set_state(state::read(layout, session));
+            }
         }
         screen.draw(|frame| pane.render(frame, &theme, crate::ui::subagent_model::epoch_ms()))?;
         if !crossterm::event::poll(Duration::from_millis(150))? {
@@ -1495,6 +1568,21 @@ pub(super) fn run(
             Input::Key(key) if key.kind != KeyEventKind::Release => match pane.key(key) {
                 KeyOutcome::Quit => return Ok(0),
                 KeyOutcome::Send(request) => {
+                    if let Some((_, endpoint)) = &attachment {
+                        if let Request::Prompt { text } = request {
+                            pane.outbox.pop();
+                            match endpoint.send(layout, session, &text) {
+                                Ok(()) => {
+                                    pane.status = Some("Queued for the session owner.".into())
+                                }
+                                Err(error) => {
+                                    pane.draft = text;
+                                    pane.status = Some(format!("Not sent: {error:#}"));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Err(error) = state::send(layout, session, &request) {
                         pane.status = Some(format!("Could not send the request: {error:#}"));
                     }

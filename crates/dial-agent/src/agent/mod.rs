@@ -215,9 +215,9 @@ struct StepChecks {
     /// for it. Its process group was stopped when the call returned; an unattended completion is
     /// deferred once so a service the task needs can be restarted under `bg`.
     stopped_shell_job: Option<String>,
-    /// Distinctive numbers (two or more digits, or decimals) printed by this turn's `bash` and
-    /// `eval` results, to recognize a check that only expects values the agent's own run printed.
-    printed_numbers: std::collections::BTreeSet<String>,
+    /// Distinctive numbers and short standalone values printed by `bash` and `eval`, to
+    /// recognize a check that only expects values this turn's own run printed.
+    printed_values: std::collections::BTreeSet<String>,
     /// Failing test names seen in this turn's `bash`, `eval` and `verify` output, so a later check
     /// that excludes one of them is not counted as passing.
     failed_tests: std::collections::BTreeSet<String>,

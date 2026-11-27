@@ -297,3 +297,74 @@ fn pending_targets_survive_arbitration_and_owner_reads_use_path_identity() {
         "a glob display suffix must not keep stale advice"
     );
 }
+
+#[test]
+fn complete_structured_find_absence_is_an_empty_search_only_when_complete() {
+    let args = json!({"query":"Foo","path":"src/net"});
+    let complete = |shown: serde_json::Value, capped: bool, complete: bool| {
+        Some(json!({"find": {
+            "mode": "lexical",
+            "scope": "src/net",
+            "complete": complete,
+            "capped": capped,
+            "shown": shown,
+        }}))
+    };
+    let table = [
+        (
+            "complete, no rows",
+            complete(json!([]), false, true),
+            false,
+            true,
+        ),
+        ("capped", complete(json!([]), true, true), false, false),
+        (
+            "incomplete walk",
+            complete(json!([]), false, false),
+            false,
+            false,
+        ),
+        (
+            "rows shown",
+            complete(json!([{"path":"src/net/a.rs"}]), false, true),
+            false,
+            false,
+        ),
+        ("failed call", complete(json!([]), false, true), true, false),
+        ("unstructured prose", None, false, false),
+    ];
+    for (case, data, is_error, recorded) in table {
+        let mut memory = EmptySearches::default();
+        memory.observe_find(&args, data.as_ref(), is_error, [0, 0, 0]);
+        let note = memory.observe_find(
+            &json!({"query":"Bar","path":"src"}),
+            complete(json!([]), false, true).as_ref(),
+            false,
+            [0, 0, 0],
+        );
+        assert_eq!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("find `Foo` in src/net")),
+            recorded,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn distinct_complete_find_absences_trigger_the_same_declaration_recovery() {
+    let mut memory = EmptySearches::default();
+    let data = json!({"find": {
+        "mode": "lexical",
+        "scope": "src/registry.rs",
+        "complete": true,
+        "capped": false,
+        "shown": [],
+    }});
+    for query in ["name:", "Spec::new"] {
+        let args = json!({"query": query, "path": "src/registry.rs"});
+        memory.observe_find(&args, Some(&data), false, [0, 0, 0]);
+    }
+    let note = memory.advice(false).expect("distinct complete find probes");
+    assert!(note.contains("src/registry.rs"), "{note}");
+}

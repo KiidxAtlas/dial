@@ -284,6 +284,16 @@ impl Codebase {
         path: &str,
         remaining_bytes: &mut usize,
     ) -> Option<String> {
+        self.observed_source(ws, path, remaining_bytes)
+            .map(|(_, digest)| digest)
+    }
+
+    pub(super) fn observed_source(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        remaining_bytes: &mut usize,
+    ) -> Option<(String, String)> {
         if *remaining_bytes == 0 {
             return None;
         }
@@ -301,7 +311,7 @@ impl Codebase {
         if walk.truncated || !admitted {
             return None;
         }
-        source_with_budget(&self.root, path, remaining_bytes).map(|(_, digest)| digest)
+        source_with_budget(&self.root, path, remaining_bytes)
     }
 
     /// Fresh, bounded source provenance. Never reuse this across checks: external edits count too.

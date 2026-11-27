@@ -843,8 +843,8 @@ fn stats_tabs(report: &stats::Report) -> Vec<(&'static str, String)> {
     let mut tools = String::from("Tools timed at runtime\n");
     for tool in &report.by_tool {
         tools.push_str(&format!(
-            "{}: {} calls · {} errors · {} ms total\n",
-            tool.tool, tool.calls, tool.errors, tool.duration_ms
+            "{}: {} calls · {} · {} ms total\n",
+            tool.tool, tool.calls, tool.error_breakdown, tool.duration_ms
         ));
     }
     if report.by_tool.is_empty() {

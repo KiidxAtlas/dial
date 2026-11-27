@@ -32,6 +32,9 @@ pub fn validate_server(name: &str, server: &McpServerConfig) -> Result<()> {
     if server.url.is_some() && server.transport == Some(crate::config::types::McpTransport::Stdio) {
         bail!("remote MCP server cannot use stdio transport");
     }
+    if server.url.is_some() && server.sandbox {
+        bail!("remote MCP server cannot enable local stdio sandbox");
+    }
     if server.url.is_none()
         && matches!(
             server.transport,

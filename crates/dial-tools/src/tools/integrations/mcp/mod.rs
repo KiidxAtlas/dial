@@ -126,6 +126,7 @@ pub struct Session {
     server: McpServerConfig,
     root: PathBuf,
     user_dir: PathBuf,
+    sandbox_spec: Option<crate::tools::SandboxSpec>,
     connect_timeout: Duration,
     client: Mutex<Arc<Client>>,
     /// Held while a connect runs, so calls made meanwhile wait for it instead of racing it.
@@ -295,6 +296,7 @@ impl Session {
             &self.server,
             &self.root,
             &self.user_dir,
+            self.sandbox_spec.as_ref(),
             deadline,
             cancel,
         );
@@ -912,11 +914,20 @@ fn connect(
     server: &McpServerConfig,
     root: &std::path::Path,
     user_dir: &Path,
+    sandbox_spec: Option<crate::tools::SandboxSpec>,
     connect_timeout: Duration,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Connected> {
     let deadline = crate::tools::exec::kernel::execution_deadline(connect_timeout);
-    let (client, signals) = open(name, server, root, user_dir, deadline, cancel)?;
+    let (client, signals) = open(
+        name,
+        server,
+        root,
+        user_dir,
+        sandbox_spec.as_ref(),
+        deadline,
+        cancel,
+    )?;
     let (resources, prompts) = (
         client.has_capability("resources"),
         client.has_capability("prompts"),
@@ -927,6 +938,7 @@ fn connect(
         server: server.clone(),
         root: root.to_path_buf(),
         user_dir: user_dir.to_path_buf(),
+        sandbox_spec,
         connect_timeout,
         client: Mutex::new(Arc::new(client)),
         turn: Mutex::new(()),
@@ -1014,6 +1026,7 @@ fn open(
     server: &McpServerConfig,
     root: &Path,
     user_dir: &Path,
+    sandbox_spec: Option<&crate::tools::SandboxSpec>,
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(Client, signals::Receiver)> {
@@ -1034,7 +1047,7 @@ fn open(
         }
         Client::remote(name, remote, shared)
     } else {
-        Client::spawn(name, &in_project(server, root), shared)?
+        Client::spawn(name, &in_project(server, root), shared, sandbox_spec)?
     };
     match client.initialize(remaining(deadline), cancel) {
         Ok(()) => Ok((client, rx)),

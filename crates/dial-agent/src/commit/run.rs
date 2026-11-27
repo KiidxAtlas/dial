@@ -89,6 +89,41 @@ impl CommitRunOutcome {
             }
         }
     }
+
+    /// Structured JSON representation for `dial commit --json`.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::NothingToCommit { pushed } => serde_json::json!({
+                "kind": "nothing_to_commit",
+                "pushed": pushed,
+            }),
+            Self::WouldPush => serde_json::json!({
+                "kind": "would_push",
+            }),
+            Self::DryRun {
+                message,
+                validation_error,
+            } => serde_json::json!({
+                "kind": "dry_run",
+                "message": message,
+                "warning": validation_error,
+            }),
+            Self::NotCommitted { message } => serde_json::json!({
+                "kind": "not_committed",
+                "message": message,
+            }),
+            Self::Committed {
+                message,
+                pushed,
+                used_fallback,
+            } => serde_json::json!({
+                "kind": "committed",
+                "message": message,
+                "pushed": pushed,
+                "used_fallback": used_fallback,
+            }),
+        }
+    }
 }
 
 /// Run the commit command. `confirm` receives the generated message and returns whether to commit.

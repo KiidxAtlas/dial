@@ -48,3 +48,43 @@ fn blocking_producer_is_released_by_drain_or_receiver_drop() {
         }
     }
 }
+
+#[test]
+fn waker_interrupts_recv_timeout_without_losing_messages() {
+    let (tx, rx) = channel(4, 64, String::len);
+    let waker = rx.waker();
+    let start = Instant::now();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(15));
+        waker.wake();
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    handle.join().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "waker should interrupt recv_timeout promptly, took {:?}",
+        start.elapsed()
+    );
+    // Queued messages are still delivered ahead of any wake flag.
+    tx.try_send("hello".to_owned()).unwrap();
+    rx.waker().wake();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "hello");
+}
+
+#[test]
+fn waker_interrupts_max_timeout_without_panicking() {
+    let (_tx, rx) = channel(4, 64, String::len);
+    let waker = rx.waker();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(15));
+        waker.wake();
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::MAX),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    handle.join().unwrap();
+}

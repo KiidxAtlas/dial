@@ -43,7 +43,8 @@
 //! 2. `(deny network*)` unless allowed;
 //! 3. `(deny network-outbound (remote unix-socket …))` for the launchd
 //!    ssh-agent listener and `docker.sock`;
-//! 4. `(deny mach-lookup …)` for the pasteboard and keychain daemons;
+//! 4. `(deny mach-lookup …)` for the pasteboard, keychain, AppleEvents, and LaunchServices daemons,
+//!    and `(deny sysctl-read …)` for `kern.procargs` / `kern.procargs2`;
 //! 5. `(deny file-read* file-write* (subpath …))` per `deny_read` path, last so
 //!    it also beats the workspace and `extra_write`. Paths are resolved
 //!    (symlinks, `..`) before use because the kernel matches resolved paths;
@@ -58,14 +59,11 @@
 //! read-only. Strict commands are unaffected.
 //!
 //! Dev residual limits:
-//! * Other same-user processes' environment and arguments remain readable
-//!   (`sysctl kern.procargs2`); no SBPL rule found on this macOS version
-//!   blocks it, so never keep secrets in the harness process environment.
 //! * Descriptors opened before the sandbox starts stay usable; the unsandboxed
 //!   parent's inherited fds are the caller's responsibility.
-//! * Most Mach services stay reachable: AppleEvents/LaunchServices (`osascript`,
-//!   `open`) can drive other apps that run unsandboxed. Denying them hangs
-//!   `osascript` and risks breaking CoreFoundation tools, so they are not denied.
+//! * Non-denied Mach services remain reachable for CoreFoundation/system tools.
+//!   On Windows, Dev mode uses a Low-Integrity token rather than AppContainer,
+//!   so domain filtering and `.git` rename restrictions are macOS/Linux only.
 //! * Anything else the workspace holds is trusted later by unsandboxed tools:
 //!   package scripts, build scripts, nested repositories' `.git`.
 //! * `mktemp` without a template and `mktemp -t` use the per-user
@@ -880,12 +878,13 @@ const DEV_WRITABLE_DEVICES: &[&str] = &[
     "/dev/ptmx",
 ];
 
-/// Mach services denied under the Dev policy: clipboard and keychain access
+/// Mach services denied under the Dev policy: clipboard, keychain, and AppleEvents/OSA automation
 /// (the rest of mach-lookup stays open; dyld, DNS and toolchains need it).
 const DEV_DENIED_MACH: &[&str] = &[
     "com.apple.pasteboard.1",
     "com.apple.SecurityServer",
     "com.apple.securityd",
+    "com.apple.coreservices.appleevents",
 ];
 
 /// Resolve `path` to the real path the kernel will match against: symlinks and
@@ -1002,6 +1001,10 @@ pub fn dev_profile(
         out.push_str(&format!(" (global-name \"{service}\")"));
     }
     out.push_str(")\n");
+    // Block reading other processes' argv/environment via sysctl(kern.procargs*).
+    out.push_str(
+        "(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))\n",
+    );
     // Last, so they override the workspace and extra_write allowances.
     append_denials(&mut out, &denied)?;
     Ok(out)

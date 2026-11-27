@@ -131,6 +131,55 @@ pub(in crate::agent) fn observation_key(call: &ToolCall, text: &str) -> u64 {
     hash.finish()
 }
 
+/// Progress identities of one successful observation. A lexical `find` is evidence by the rows it
+/// shows (path, range and source revision) and by each complete scope it walked, so the same rows
+/// under different wording are not new. A lexical result with neither is not progress at all.
+pub(in crate::agent) fn progress_keys(
+    call: &ToolCall,
+    text: &str,
+    data: Option<&serde_json::Value>,
+) -> Vec<u64> {
+    let whole_call = || vec![observation_key(call, text)];
+    let Some(find) = data
+        .filter(|_| call.name == "find")
+        .and_then(|data| data.get("find"))
+    else {
+        return whole_call();
+    };
+    let mut identities: Vec<String> = find["shown"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            format!(
+                "span:{}:{}-{}@{}",
+                row["path"].as_str().unwrap_or_default(),
+                row["start"],
+                row["end"],
+                row["source_sha256"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if find["complete"] == true {
+        identities.push(format!(
+            "scope:{}",
+            find["scope"].as_str().unwrap_or_default()
+        ));
+    }
+    // Capped or partial results that exposed no rows and no complete scope are not evidence.
+    if identities.is_empty() {
+        return Vec::new();
+    }
+    identities
+        .iter()
+        .map(|identity| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            identity.hash(&mut hash);
+            hash.finish()
+        })
+        .collect()
+}
+
 /// `path#TAG` of a read result's `[path#TAG]` header line. The tag names the file content, so a
 /// changed file has a different header.
 fn source_header(line: &str) -> Option<&str> {

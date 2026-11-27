@@ -23,7 +23,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -95,21 +95,189 @@ fn is_turn_start(message: &Value) -> bool {
         && Session::compaction_summary_text(message).is_none()
 }
 
+/// Upper bound on edit proposals remembered per file; only the newest are located.
+const MAX_EDIT_FRAGMENTS: usize = 8;
+
+/// A file this turn attempted to modify. `fragments` are literal new text from its successful
+/// edit calls, oldest first; `receipt_sha` is the raw SHA256 that the newest successful edit result
+/// reported for it. Neither is a trusted position: the carry only locates them in current content,
+/// and calls a location receipt-confirmed when the current bytes hash to `receipt_sha`.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::agent) struct EditedFile {
+    pub(in crate::agent) path: String,
+    pub(in crate::agent) fragments: Vec<String>,
+    pub(in crate::agent) receipt_sha: Option<String>,
+    pub(in crate::agent) receipt_rows: Vec<(usize, String)>,
+}
+
 /// Files the current turn attempted to modify, newest first: write/edit targets in tool calls
 /// since the latest human turn start (or since the history's start when an earlier compaction
-/// already folded that turn start). Attempted targets, never confirmed outcomes.
-pub(in crate::agent) fn edited_this_turn(messages: &[Value]) -> Vec<String> {
+/// already folded that turn start). Attempted targets, never confirmed outcomes; only the literal
+/// text of successful edit results is kept as a locator.
+pub(in crate::agent) fn edited_this_turn(messages: &[Value]) -> Vec<EditedFile> {
     let start = messages.iter().rposition(is_turn_start).unwrap_or(0);
+    let window = &messages[start..];
     let mut ops = FileOps::default();
-    for message in &messages[start..] {
+    for message in window {
         ops.observe(message);
     }
+    let results = successful_edits(window);
     ops.recent
         .iter()
         .rev()
         .filter(|path| ops.modified.contains(*path))
-        .cloned()
+        .map(|path| {
+            let mut file = EditedFile {
+                path: path.clone(),
+                fragments: Vec::new(),
+                receipt_sha: None,
+                receipt_rows: Vec::new(),
+            };
+            for result in results.iter().filter(|result| result.path == *path) {
+                // The newest successful result decides the receipt; text accumulates, newest last.
+                file.receipt_sha.clone_from(&result.receipt_sha);
+                file.receipt_rows.clone_from(&result.receipt_rows);
+                if let Some(text) = &result.text {
+                    file.fragments.retain(|old| old != text);
+                    file.fragments.push(text.clone());
+                    if file.fragments.len() > MAX_EDIT_FRAGMENTS {
+                        file.fragments.remove(0);
+                    }
+                }
+            }
+            file
+        })
         .collect()
+}
+
+/// One path a successful edit result touched: its proposed text (when literal) and the raw SHA256
+/// the result reported for it (when it reported one).
+struct EditResult {
+    path: String,
+    text: Option<String>,
+    receipt_sha: Option<String>,
+    receipt_rows: Vec<(usize, String)>,
+}
+
+/// Successful `edit` results of this window, in order. A failed call, a preview, or a result that
+/// does not say it succeeded contributes nothing, so a rejected proposal never becomes a locator.
+fn successful_edits(window: &[Value]) -> Vec<EditResult> {
+    let mut calls: BTreeMap<String, Value> = BTreeMap::new();
+    for message in window
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+    {
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            if call["function"]["name"] != "edit" {
+                continue;
+            }
+            let arguments = match &call["function"]["arguments"] {
+                Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            if let Some(id) = call["id"].as_str() {
+                calls.insert(id.to_owned(), arguments);
+            }
+        }
+    }
+    let mut results = Vec::new();
+    for message in window.iter().filter(|message| message["role"] == "tool") {
+        let Some(arguments) = message["tool_call_id"]
+            .as_str()
+            .and_then(|id| calls.get(id))
+        else {
+            continue;
+        };
+        let failed = message["dial_evidence"]["is_error"] == true || message["is_error"] == true;
+        let succeeded =
+            message["dial_evidence"]["is_error"] == false || message["is_error"] == false;
+        let content = message["content"].as_str().unwrap_or_default();
+        if failed
+            || !succeeded
+            || message["dial_effects"] == "none"
+            || !message["dial_result_origin"].is_null()
+            || content.starts_with("Preview only;")
+            || arguments["dry_run"] == true
+        {
+            continue;
+        }
+        let receipts = edit_receipts(content);
+        let mut texts = FileOps::proposed_text(arguments);
+        // A reported receipt names its file even when the proposal carried no literal text.
+        for path in receipts.keys() {
+            if !texts.iter().any(|(proposed, _)| proposed.trim() == path) {
+                texts.push((path.clone(), String::new()));
+            }
+        }
+        for (path, text) in texts {
+            let Some(path) = FileOps::clean_path(&path).map(str::to_owned) else {
+                continue;
+            };
+            results.push(EditResult {
+                receipt_sha: receipts.get(&path).map(|r| r.sha.clone()),
+                receipt_rows: receipts
+                    .get(&path)
+                    .map(|r| r.rows.clone())
+                    .unwrap_or_default(),
+                text: (!text.is_empty()).then_some(text),
+                path,
+            });
+        }
+    }
+    results
+}
+
+#[derive(Default)]
+struct EditReceipt {
+    sha: String,
+    rows: Vec<(usize, String)>,
+}
+
+/// Only raw-source hashline sections have usable physical positions. Later, verify both the
+/// whole-file digest and the individual post-edit rows against the authorized target's bytes.
+fn edit_receipts(content: &str) -> BTreeMap<String, EditReceipt> {
+    let mut result = BTreeMap::new();
+    let mut lines = content.lines().peekable();
+    let mut current: Option<&mut EditReceipt> = None;
+    while let Some(line) = lines.next() {
+        if let Some((path, tag)) = line
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.rsplit_once('#'))
+        {
+            current = None;
+            if tag.len() == 4
+                && tag.bytes().all(|b| b.is_ascii_hexdigit())
+                && let Some(sha) = lines
+                    .next_if(|s| s.starts_with("[Source raw SHA256:"))
+                    .and_then(|s| s.strip_suffix(']'))
+                    .and_then(|s| s.strip_prefix("[Source raw SHA256:"))
+                && sha.len() == 64
+                && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                && !lines
+                    .peek()
+                    .is_some_and(|s| *s == "[Notebook cell-source projection]")
+            {
+                let receipt = result
+                    .entry(path.to_owned())
+                    .or_insert_with(EditReceipt::default);
+                *receipt = EditReceipt {
+                    sha: sha.into(),
+                    rows: Vec::new(),
+                };
+                current = Some(receipt);
+            }
+        } else if let Some(r) = &mut current
+            && r.rows.len() < 64
+            && let Some((n, body)) = line.split_once(':')
+            && body.len() <= 4096
+            && let Ok(n) = n.parse::<usize>()
+            && n > 0
+        {
+            r.rows.push((n, body.to_owned()));
+        }
+    }
+    result
 }
 
 /// Index into `source` where the turn containing the cut starts, when the cut lands mid-turn.
@@ -413,12 +581,7 @@ impl FileOps {
     }
 
     fn add(&mut self, modified: bool, path: Option<&str>) {
-        let Some(path) = path.map(str::trim).filter(|path| {
-            !path.is_empty()
-                && !path.contains("://")
-                && !path.contains('\n')
-                && !path.starts_with('[')
-        }) else {
+        let Some(path) = path.and_then(Self::clean_path) else {
             return;
         };
         if modified {
@@ -428,6 +591,27 @@ impl FileOps {
         }
         self.recent.retain(|old| old != path);
         self.recent.push(path.to_owned());
+    }
+
+    fn clean_path(path: &str) -> Option<&str> {
+        Some(path.trim()).filter(|path| {
+            !path.is_empty()
+                && !path.contains("://")
+                && !path.contains('\n')
+                && !path.starts_with('[')
+        })
+    }
+
+    /// New text an edit call proposes per target: literal hashline PUT bodies, or a replace's
+    /// `new_string`. Other grammars propose no literal text and stay path-only.
+    fn proposed_text(arguments: &Value) -> Vec<(String, String)> {
+        if let Some(input) = arguments["input"].as_str() {
+            return crate::tools::edit::hashline::proposed_sources(input).unwrap_or_default();
+        }
+        match (arguments["path"].as_str(), arguments["new_string"].as_str()) {
+            (Some(path), Some(text)) => vec![(path.to_owned(), text.to_owned())],
+            _ => Vec::new(),
+        }
     }
 
     fn merge(&mut self, other: FileOps) {

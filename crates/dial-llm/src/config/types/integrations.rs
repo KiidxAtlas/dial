@@ -54,6 +54,9 @@ pub struct McpServerConfig {
     pub trust_read_only_hint: bool,
     /// Set false to keep the entry without starting it.
     pub enabled: bool,
+    /// Run this stdio MCP server inside Dial's OS sandbox (Dev policy scoped to `cwd`).
+    /// Off by default so trusted local MCP servers keep unrestricted host access.
+    pub sandbox: bool,
     /// OAuth 2.1 settings for `url` servers that require authorization.
     pub oauth: McpOAuthConfig,
     /// Lifecycle events to forward to this server as `notifications/dial/event`.
@@ -75,6 +78,7 @@ impl Default for McpServerConfig {
             connect_timeout_secs: 30,
             trust_read_only_hint: false,
             enabled: true,
+            sandbox: false,
             oauth: McpOAuthConfig::default(),
             lifecycle_hooks: Vec::new(),
         }

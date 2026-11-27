@@ -73,6 +73,9 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "set -o pipefail; false | true; true",
         "set -o pipefail; false | true || true",
         "set -o pipefail; (false | true) && true",
+        "set -o pipefail; false | true | true || true",
+        "set -o pipefail; false | true | true && echo ok; true",
+        "set -o pipefail | true | true && echo ok",
     ] {
         assert!(exit_status_masked(command), "{command}");
     }
@@ -92,6 +95,7 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "set -o pipefail; chmod -R a+rX /tmp/t; su git -c 'git push' && [ \"$(curl -sk https://localhost:8443/index.html)\" = \"ok\" ] && ssh-keyscan -p 22 localhost 2>&1 | grep -q ssh-",
         "set -o pipefail && cd /app && make test | tail -5 > summary",
         "set -o pipefail; cmd1 | grep -q a && cmd2 | grep -q b",
+        "set -o pipefail; printf 'Results: 12 30 8\\n' | tail -n 1 | grep -Eq '^Results: [0-9]+ [0-9]+ [0-9]+$' && echo ok",
     ] {
         assert!(!exit_status_masked(command), "{command}");
     }
@@ -237,6 +241,28 @@ fn self_confirming_values_are_expected_numbers_only_this_run_printed() {
 }
 
 #[test]
+fn membership_only_checks_are_flagged_for_exhaustive_requests() {
+    let printed = std::collections::BTreeSet::new();
+    let exhaustive = "If several labels match, print them all.";
+    assert_eq!(
+        self_confirming_values("grep -qx 'amber' out.txt", &printed, exhaustive),
+        Some(vec!["amber".into()]),
+    );
+    assert_eq!(
+        self_confirming_values(
+            "grep -qx amber out.txt",
+            &printed,
+            "Check that amber exists."
+        ),
+        None,
+    );
+    assert_eq!(
+        self_confirming_values("diff -u expected.txt out.txt", &printed, exhaustive),
+        None,
+    );
+}
+
+#[test]
 fn masked_check_note_names_the_accepted_pipefail_shape() {
     let misplaced = "cd /app && set -o pipefail; python3 run.py | grep -c ok";
     assert!(exit_status_masked(misplaced));
@@ -263,6 +289,16 @@ fn pipefail_check_credit_uses_the_observed_exit_without_promoting_masked_zeroes(
         ),
         (
             "set -o pipefail; false | true",
+            1,
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "set -o pipefail; printf 'Results: 12 30 8\\n' | tail -n 1 | grep -Eq '^Results: [0-9]+ [0-9]+ [0-9]+$' && echo ok",
+            0,
+            CheckStatus::Passed,
+        ),
+        (
+            "set -o pipefail; false | cat | cat && echo ok",
             1,
             CheckStatus::FailedUnknownCause,
         ),

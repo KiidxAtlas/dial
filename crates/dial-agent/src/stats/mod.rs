@@ -177,6 +177,25 @@ pub struct ToolGroup {
     /// Errored calls per error class, most frequent first. Rows recorded before classes existed
     /// are not listed, so the counts can sum to less than the `error` outcome.
     pub error_classes: Vec<NamedCount>,
+    /// Breakdown of `error` outcomes only; control outcomes retain their own statuses.
+    pub error_breakdown: ToolErrorBreakdown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ToolErrorBreakdown {
+    pub command_or_check: u64,
+    pub execution_failure: u64,
+    pub unclassified: u64,
+}
+
+impl std::fmt::Display for ToolErrorBreakdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "command/check findings: {} · execution failures: {} · unclassified errors: {}",
+            self.command_or_check, self.execution_failure, self.unclassified
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -727,51 +746,59 @@ impl Db {
                     avg_ms: (calls > 0).then(|| duration_ms as f64 / calls as f64),
                     error_rate: (calls > 0).then(|| errors as f64 * 100.0 / calls as f64),
                     outcomes: Vec::new(),
+                    error_breakdown: ToolErrorBreakdown::default(),
                     error_classes: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut stmt = self.conn.prepare(
-            "SELECT c.tool, COALESCE(o.status, CASE WHEN c.error THEN 'error' ELSE 'ok' END) AS status, COUNT(*)
-             FROM tool_calls c LEFT JOIN tool_outcomes o ON o.call_id=c.id
-             WHERE c.ts >= ?1 GROUP BY c.tool, status ORDER BY c.tool, status",
+            "SELECT c.tool, COALESCE(o.status, CASE WHEN c.error THEN 'error' ELSE 'ok' END) AS outcome,
+                    o.error_class, COUNT(*) FROM tool_calls c LEFT JOIN tool_outcomes o ON o.call_id=c.id
+             WHERE c.ts >= ?1 GROUP BY c.tool, outcome, o.error_class
+             ORDER BY c.tool, outcome, COUNT(*) DESC, o.error_class",
         )?;
         let rows = stmt.query_map([hour.saturating_mul(HOUR_MS)], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?.max(0) as u64,
             ))
         })?;
         for row in rows {
-            let (tool, status, count) = row?;
+            let (tool, status, class, count) = row?;
             if let Some(group) = tools.iter_mut().find(|g| g.tool == tool) {
-                group.outcomes.push(NamedCount {
-                    name: status,
-                    count: count.max(0) as u64,
-                });
-            }
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT c.tool, o.error_class, COUNT(*) FROM tool_calls c JOIN tool_outcomes o ON o.call_id=c.id
-             WHERE c.ts >= ?1 AND o.error_class IS NOT NULL
-             GROUP BY c.tool, o.error_class ORDER BY c.tool, COUNT(*) DESC, o.error_class",
-        )?;
-        let rows = stmt.query_map([hour.saturating_mul(HOUR_MS)], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (tool, class, count) = row?;
-            if let Some(group) = tools.iter_mut().find(|g| g.tool == tool) {
-                group.error_classes.push(NamedCount {
-                    name: class,
-                    count: count.max(0) as u64,
-                });
+                if status == "error" {
+                    let breakdown = &mut group.error_breakdown;
+                    let bucket = match class.as_deref() {
+                        Some("nonzero_exit" | "check_failed") => &mut breakdown.command_or_check,
+                        Some(
+                            "edit_source_changed"
+                            | "edit_target_not_found"
+                            | "edit_refused"
+                            | "verify_refused"
+                            | "command_not_found"
+                            | "not_executable"
+                            | "signalled"
+                            | "not_started"
+                            | "integration",
+                        ) => &mut breakdown.execution_failure,
+                        _ => &mut breakdown.unclassified,
+                    };
+                    *bucket += count;
+                    if let Some(name) = class {
+                        group.error_classes.push(NamedCount { name, count });
+                    }
+                }
+                if let Some(last) = group.outcomes.last_mut().filter(|row| row.name == status) {
+                    last.count += count;
+                } else {
+                    group.outcomes.push(NamedCount {
+                        name: status,
+                        count,
+                    });
+                }
             }
         }
         Ok(tools)
@@ -1509,11 +1536,10 @@ pub fn render_text(report: &Report) -> String {
         out.push_str("\nTools (timed at runtime)\n");
         for tool in &report.by_tool {
             out.push_str(&format!(
-                "  {:<28} {:>7} calls  {:>6} errors ({})  avg {}{}\n",
+                "  {:<28} {:>7} calls  {}  avg {}{}\n",
                 tool.tool,
                 tool.calls,
-                tool.errors,
-                percent(tool.error_rate),
+                tool.error_breakdown,
                 tool.avg_ms.map_or("-".into(), |ms| format!("{ms:.0}ms")),
                 if tool.error_classes.is_empty() {
                     String::new()

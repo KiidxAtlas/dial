@@ -330,6 +330,44 @@ fn pty_capture_survives_gaps_between_output() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pty_background_jobs_apply_workspace_resource_limits() {
+    let (_dir, ws) = open_workspace();
+    let ws = ws.with_resource_limits(crate::platform::process::ResourceLimits {
+        max_open_files: Some(64),
+        ..Default::default()
+    });
+    let tool = tool();
+    let started = bg(
+        &tool,
+        &ws,
+        json!({"action": "start", "name": "limited-pty", "pty": true, "command": "ulimit -n"}),
+    );
+    assert!(!started.is_error, "{}", started.text);
+    let finished = bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "limited-pty", "timeout": 5}),
+    );
+    assert!(!finished.is_error, "{}", finished.text);
+    let output = bg(
+        &tool,
+        &ws,
+        json!({"action": "output", "name": "limited-pty"}),
+    );
+    let reported = output
+        .text
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<u64>().ok())
+        .find(|&n| n <= 64);
+    assert!(
+        reported.is_some(),
+        "expected PTY job ulimit -n <= 64, got: {}",
+        output.text
+    );
+}
+
 fn start(tool: &Background, ws: &Workspace, name: &str, command: &str) -> ToolOutput {
     bg(
         tool,

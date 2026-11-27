@@ -10,22 +10,27 @@ pub(crate) fn run(
     fix: &Option<String>,
     yes: bool,
     all: bool,
+    json: bool,
 ) -> Result<()> {
     let env = dial::setup::deps::Env::current(&layout.user_dir);
     match fix {
         None => {
-            let capabilities = if all {
-                dial::setup::deps::run::list_text(&env, "dial doctor --fix")
-            } else {
-                dial::setup::deps::run::summary_text(&env, "dial doctor --all")
+            let memory = match Config::load(layout, Some(overlay(cli)?)) {
+                Ok(config) => dial::setup::memory::doctor_text(&config),
+                Err(error) => format!("Memory: settings could not be read ({error:#})."),
             };
-            println!("{capabilities}");
-            println!();
-            match Config::load(layout, Some(overlay(cli)?)) {
-                Ok(config) => println!("{}", dial::setup::memory::doctor_text(&config)),
-                Err(error) => {
-                    println!("Memory: settings could not be read ({error:#}).")
-                }
+            if json {
+                let value = doctor_json(&env, all, &memory);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let capabilities = if all {
+                    dial::setup::deps::run::list_text(&env, "dial doctor --fix")
+                } else {
+                    dial::setup::deps::run::summary_text(&env, "dial doctor --all")
+                };
+                println!("{capabilities}");
+                println!();
+                println!("{memory}");
             }
         }
         Some(id) if id.starts_with("embeddings") => {
@@ -66,3 +71,49 @@ pub(crate) fn run(
     }
     Ok(())
 }
+
+pub(crate) fn doctor_json(
+    env: &dial::setup::deps::Env,
+    all: bool,
+    memory_note: &str,
+) -> serde_json::Value {
+    use dial::setup::deps::Status;
+    let rows = dial::setup::deps::report(env);
+    let mut capabilities = Vec::new();
+    let mut missing = 0usize;
+    for row in rows {
+        let installed = matches!(row.status, Status::Ready);
+        if !installed {
+            missing += 1;
+            if !all {
+                continue;
+            }
+        }
+        capabilities.push(serde_json::json!({
+            "id": row.id,
+            "name": row.title,
+            "installed": installed,
+            "path": installed.then_some(row.detail),
+        }));
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if !all && missing > 0 {
+        notes.push(format!(
+            "Not installed: {missing} optional capabilit{}; `dial doctor --all` lists them with their setup commands.",
+            if missing == 1 { "y" } else { "ies" }
+        ));
+    }
+    notes.extend(
+        memory_note
+            .lines()
+            .map(|line| line.trim_end().to_owned())
+            .filter(|line| !line.is_empty()),
+    );
+    serde_json::json!({
+        "capabilities": capabilities,
+        "notes": notes,
+    })
+}
+
+#[cfg(test)]
+mod tests;

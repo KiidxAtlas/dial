@@ -11,6 +11,8 @@ pub struct CommitCommandArgs {
     pub no_changelog: bool,
     /// Use the deterministic legacy pipeline instead of the agentic flow.
     pub legacy: bool,
+    /// Emit machine-readable JSON instead of human-readable text.
+    pub json: bool,
     /// Additional user context for the model.
     pub context: Option<String>,
     /// Model override (role or `provider/model` pattern).

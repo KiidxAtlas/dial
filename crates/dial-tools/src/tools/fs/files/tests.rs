@@ -1080,3 +1080,31 @@ fn concurrent_reads_of_one_file_return_identical_text() {
         }
     });
 }
+
+#[test]
+fn directory_reads_support_offset_and_limit_pagination() {
+    let (dir, ws) = workspace();
+    let big = dir.path().join("many");
+    fs::create_dir(&big).unwrap();
+    for i in 0..65 {
+        fs::write(big.join(format!("item_{i:02}.txt")), "x\n").unwrap();
+    }
+    let page1 = run(&ws, "read", json!({"path":"many","offset":1,"limit":10}));
+    assert!(!page1.is_error, "{}", page1.text);
+    assert!(page1.text.contains("entries 1-10 of 65"), "{}", page1.text);
+    assert!(
+        page1.text.contains("item_00.txt") && page1.text.contains("continue with offset=11"),
+        "{}",
+        page1.text
+    );
+
+    let page2 = run(&ws, "read", json!({"path":"many","offset":60,"limit":10}));
+    assert!(!page2.is_error, "{}", page2.text);
+    assert!(page2.text.contains("entries 60-65 of 65"), "{}", page2.text);
+    assert!(page2.text.contains("item_64.txt"), "{}", page2.text);
+    assert!(
+        !page2.text.contains("continue with offset="),
+        "{}",
+        page2.text
+    );
+}

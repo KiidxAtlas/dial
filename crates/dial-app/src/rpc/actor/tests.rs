@@ -512,7 +512,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
                 peers: runtime.peers.clone(),
                 sides: runtime.sides.clone(),
             };
-            actor.run().unwrap();
+            actor.spawn().unwrap().join().unwrap().unwrap();
             let target = destination.path().canonicalize().unwrap();
             assert_eq!(admin.layout().project_root, target);
             let config = published_config.read().unwrap();
@@ -1252,6 +1252,12 @@ fn idle_recovery_handler_returns_history_and_authoritative_live_root_contract() 
             runtime.acp = false;
             let message = json!({"role":"user","content":"saved prompt"});
             runtime.agent.session_mut().append(message.clone()).unwrap();
+            runtime
+                .agent
+                .session_mut()
+                .compact("summary".into(), 0)
+                .unwrap();
+            assert_ne!(runtime.agent.session().messages(), vec![message.clone()]);
             let session_id = runtime.agent.session().id().to_owned();
             {
                 let mut output = runtime.worker_out.mapping().unwrap();

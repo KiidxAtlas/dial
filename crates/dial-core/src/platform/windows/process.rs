@@ -38,7 +38,13 @@ pub(in crate::platform) fn quiet_error_dialogs() {
     }
 }
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
-    let (child, job) = spawn_in_job(command, false)?;
+    spawn_group_limited(command, crate::platform::process::ResourceLimits::default())
+}
+pub(in crate::platform) fn spawn_group_limited(
+    command: &mut Command,
+    limits: crate::platform::process::ResourceLimits,
+) -> io::Result<Child> {
+    let (child, job) = spawn_in_job(command, false, limits)?;
     jobs().insert(child.id(), job);
     Ok(child)
 }
@@ -50,7 +56,10 @@ fn job_name(server: ProcId) -> Vec<u16> {
 }
 
 // Never adopt a pre-existing named job: an unexpected name collision must not change its limits.
-fn create_job(name: Option<&[u16]>) -> io::Result<OwnedHandle> {
+fn create_job(
+    name: Option<&[u16]>,
+    resource_limits: crate::platform::process::ResourceLimits,
+) -> io::Result<OwnedHandle> {
     // SAFETY: a supplied name is NUL-terminated UTF-16 and lives through the call.
     let raw = unsafe {
         CreateJobObjectW(
@@ -74,6 +83,19 @@ fn create_job(name: Option<&[u16]>) -> io::Result<OwnedHandle> {
     }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if let Some(procs) = resource_limits.max_processes {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = procs.max(1);
+    }
+    if let Some(bytes) = resource_limits.max_memory_bytes {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+    }
+    if let Some(secs) = resource_limits.max_cpu_secs {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_TIME;
+        limits.BasicLimitInformation.PerJobUserTimeLimit =
+            secs.saturating_mul(10_000_000).min(i64::MAX as u64) as i64;
+    }
     // SAFETY: raw stays owned by job; limits is a live initialized structure whose exact
     // size matches the JobObjectExtendedLimitInformation class supplied here.
     if unsafe {
@@ -90,7 +112,11 @@ fn create_job(name: Option<&[u16]>) -> io::Result<OwnedHandle> {
     Ok(job)
 }
 
-fn spawn_in_job(command: &mut Command, shared: bool) -> io::Result<(Child, OwnedHandle)> {
+fn spawn_in_job(
+    command: &mut Command,
+    shared: bool,
+    resource_limits: crate::platform::process::ResourceLimits,
+) -> io::Result<(Child, OwnedHandle)> {
     let flags = if shared {
         CREATE_NO_WINDOW
     } else {
@@ -105,7 +131,7 @@ fn spawn_in_job(command: &mut Command, shared: bool) -> io::Result<(Child, Owned
         } else {
             None
         };
-        let job = create_job(name.as_deref())?;
+        let job = create_job(name.as_deref(), resource_limits)?;
         let raw = job.as_raw_handle() as HANDLE;
         let handle = child.as_raw_handle() as HANDLE;
         // SAFETY: job and child own both live handles; the child is still suspended, so
@@ -138,7 +164,11 @@ fn spawn_in_job(command: &mut Command, shared: bool) -> io::Result<(Child, Owned
 pub(in crate::platform) fn spawn_shared_group(
     command: &mut Command,
 ) -> io::Result<(Child, OwnedHandle)> {
-    spawn_in_job(command, true)
+    spawn_in_job(
+        command,
+        true,
+        crate::platform::process::ResourceLimits::default(),
+    )
 }
 
 pub(in crate::platform) fn hold_shared_group(server: ProcId) -> io::Result<OwnedHandle> {

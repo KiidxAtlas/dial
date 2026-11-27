@@ -82,6 +82,32 @@ const SIGNATURE_KINDS: &[&str] = &[
     "interface_declaration",
 ];
 
+/// Exact declaration-name locations for a small set of navigation hints. A name in a
+/// comment, call expression or signature's argument is not the declared symbol.
+pub(crate) fn declaration_sites(
+    path: &Path,
+    content: &str,
+    names: &[&str],
+) -> Vec<(String, usize)> {
+    let Some(tree) = language(path).and_then(|lang| AstGrep::try_new(content, lang).ok()) else {
+        return Vec::new();
+    };
+    tree.root()
+        .dfs()
+        .filter_map(|node| {
+            if !SIGNATURE_KINDS.contains(&node.kind().as_ref()) {
+                return None;
+            }
+            let name = node.field("name")?;
+            let text = name.text();
+            names
+                .contains(&text.as_ref())
+                .then(|| (text.into_owned(), name.start_pos().line() + 1))
+        })
+        .take(3)
+        .collect()
+}
+
 /// Named declarations in `content` with their whitespace-normalized header text (the source
 /// before the body), used to detect signature changes between two versions of a file. `None`
 /// when no parser applies or the source exceeds the parser budget.

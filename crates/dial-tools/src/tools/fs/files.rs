@@ -196,6 +196,16 @@ fn trim_partial_utf8(buf: &mut Vec<u8>) {
 /// dependencies, scratch, nested linked worktrees) and gitignored directories are named but not
 /// expanded, so a listing shows project structure instead of generated content.
 pub(in crate::tools) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, String> {
+    list_dir_paged(ws, dir, None, None)
+}
+
+/// Directory listing with optional flat pagination when `offset` or `limit` is explicitly set.
+pub(in crate::tools) fn list_dir_paged(
+    ws: &Workspace,
+    dir: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
     use super::walk::{SKIPPED_DIRS, bounded_ignore, is_linked_worktree};
     use ignore::gitignore::Gitignore;
 
@@ -203,6 +213,67 @@ pub(in crate::tools) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, S
     const SHOWN_PER_DEPTH: [usize; 3] = [50, 12, 8];
     /// Once the listing reaches this size, further directories are named but not expanded.
     const EXPAND_BUDGET: usize = 12 * 1024;
+    const MAX_PAGED_DIR: usize = 500;
+
+    if offset.is_some() || limit.is_some() {
+        let entries =
+            fs::read_dir(dir).map_err(|e| io_message("listing", &dir.to_string_lossy(), &e))?;
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        for item in entries {
+            match item {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if ws.is_protected(&path) {
+                        continue;
+                    }
+                    let kind = entry
+                        .file_type()
+                        .map_err(|e| format!("unreadable entry {}: {e}", path.display()))?;
+                    rows.push((
+                        !kind.is_dir(),
+                        entry.file_name().to_string_lossy().into_owned(),
+                        kind.is_dir(),
+                        kind.is_symlink(),
+                    ));
+                }
+                Err(error) => errors.push(format!("[unreadable directory entry: {error}]\n")),
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let total = rows.len();
+        let start_1 = offset.unwrap_or(1).max(1);
+        let take = limit.unwrap_or(200).clamp(1, MAX_PAGED_DIR);
+        let start_0 = start_1.saturating_sub(1).min(total);
+        let end_0 = start_0.saturating_add(take).min(total);
+        let mut text = format!(
+            "{} is a directory (entries {}-{} of {}; '/' dir, '@' symlink):\n",
+            ws.rel(dir),
+            if start_0 < end_0 { start_0 + 1 } else { 0 },
+            end_0,
+            total
+        );
+        for err in errors {
+            text.push_str(&err);
+        }
+        for (_, name, is_dir, is_link) in &rows[start_0..end_0] {
+            text.push_str(name);
+            if *is_dir {
+                text.push('/');
+            } else if *is_link {
+                text.push('@');
+            }
+            text.push('\n');
+        }
+        if end_0 < total {
+            text.push_str(&format!(
+                "[{} more entries; continue with offset={}]\n",
+                total - end_0,
+                end_0 + 1
+            ));
+        }
+        return Ok(text);
+    }
 
     struct Lister<'a> {
         ws: &'a Workspace,
@@ -507,6 +578,18 @@ fn read_target(
             "use either offset or a line selector on the path (`path:50-100`), not both"
                 .to_string(),
         );
+    }
+    if !sel.selects_lines()
+        && let Ok(resolved) = ws.resolve_read(path_text)
+        && fs::metadata(&resolved).is_ok_and(|meta| meta.is_dir())
+    {
+        let explicit_offset = offset.map(|o| o.min(usize::MAX as u64) as usize);
+        let explicit_limit = if present(args, "limit") {
+            Some(limit)
+        } else {
+            None
+        };
+        return list_dir_paged(ws, &resolved, explicit_offset, explicit_limit);
     }
     if crate::tools::edit::edit_source::notebook_path(Path::new(path_text)) {
         let offset = offset.map_or(1, |value| value.min(usize::MAX as u64) as usize);
@@ -1068,6 +1151,9 @@ pub(crate) fn write_plan(
         path,
         Some(cleaned.as_deref().unwrap_or(content).to_owned()),
     )?;
+    if crate::tools::opt_bool(args, "executable")? {
+        change.set_executable();
+    }
     super::write::preconditions(args, &change)?;
     if let Some(before) = &change.before {
         let count = hashline::split_lines(&hashline::normalize(&before.text)).len();

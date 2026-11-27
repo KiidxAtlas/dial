@@ -248,6 +248,14 @@ impl Engine {
         }
     }
 
+    /// Records every identity of one observation and reports whether any was new. Insertion is
+    /// not short-circuited, so each row or scope of a find is remembered for later results.
+    fn insert_progress_keys(&mut self, keys: Vec<u64>) -> bool {
+        keys.into_iter().fold(false, |fresh, key| {
+            self.progress_observations.insert(key) | fresh
+        })
+    }
+
     /// Settle a worker batch before any subsequent inference or final publication. A second drain
     /// is neutral, so parent settlement and the driver cannot charge the same batch twice.
     pub fn finish_tool_round(&mut self) -> anyhow::Result<()> {
@@ -662,9 +670,11 @@ impl Engine {
             && repeat.is_none()
             && observation
             && output.execution.captures.is_empty()
-            && self
-                .progress_observations
-                .insert(investigation::observation_key(call, &output.text));
+            && self.insert_progress_keys(investigation::progress_keys(
+                call,
+                &output.text,
+                output.data.as_ref(),
+            ));
         // Native receipts identify the pixels and target, not changing labels, timestamps or
         // model arguments. A successful input action may also return a genuine new observation.
         let mut captured = false;

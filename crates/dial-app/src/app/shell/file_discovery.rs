@@ -1,7 +1,7 @@
 //! One cancellable, bounded completion walk per shell; never walk on the input thread.
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, PoisonError,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -90,14 +90,23 @@ impl Files {
         std::thread::spawn(move || {
             loop {
                 let request = {
-                    let mut slot = worker.request.lock().unwrap();
+                    let mut slot = worker
+                        .request
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     while slot.is_none() && !worker.stop.load(Ordering::Acquire) {
-                        slot = worker.wake.wait(slot).unwrap();
+                        slot = worker
+                            .wake
+                            .wait(slot)
+                            .unwrap_or_else(PoisonError::into_inner);
                     }
                     if worker.stop.load(Ordering::Acquire) {
                         return;
                     }
-                    slot.take().unwrap()
+                    let Some(request) = slot.take() else {
+                        continue;
+                    };
+                    request
                 };
                 let (generation, root) = request;
                 if let Some(listing) = walk(&root, || {
@@ -105,7 +114,8 @@ impl Files {
                         || worker.generation.load(Ordering::Acquire) != generation
                 }) {
                     // One replaceable result slot bounds memory and never blocks the worker.
-                    *output.lock().unwrap() = Some((generation, listing));
+                    *output.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some((generation, listing));
                 }
             }
         });
@@ -120,7 +130,11 @@ impl Files {
         }
     }
     pub fn stop(&self) {
-        let mut pending = self.shared.request.lock().unwrap();
+        let mut pending = self
+            .shared
+            .request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.shared.stop.store(true, Ordering::Release);
         self.shared.generation.fetch_add(1, Ordering::AcqRel);
         pending.take();
@@ -142,12 +156,23 @@ impl Files {
         self.requested = Instant::now();
         self.running = true;
         // Discard cached results from the previous generation.
-        self.result.lock().unwrap().take();
-        *self.shared.request.lock().unwrap() = Some((generation, root.to_owned()));
+        self.result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        *self
+            .shared
+            .request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((generation, root.to_owned()));
         self.shared.wake.notify_one();
     }
     pub fn poll(&mut self) -> Option<Listing> {
-        let result = self.result.lock().unwrap().take();
+        let result = self
+            .result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some((generation, mut listing)) = result
             && generation == self.shared.generation.load(Ordering::Acquire)
         {

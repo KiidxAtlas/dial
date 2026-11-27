@@ -304,6 +304,16 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("dist/SHA256SUMS", manifest)
 
 
+    def test_macos_signing_runs_before_manifest_hashing(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
+        signing = workflow.split("\n  macos-sign:\n", 1)[1].split("\n  sign:\n", 1)[0]
+        manifest = workflow.split("\n  sign:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        self.assertIn("codesign --force --options runtime --timestamp", signing)
+        self.assertIn("xcrun notarytool submit", signing)
+        self.assertIn("name: macos-signed-${{ matrix.target }}", signing)
+        self.assertIn("needs.macos-sign.result == 'success'", manifest)
+        self.assertLess(manifest.index("pattern: macos-signed-*"), manifest.index("sha256sum --"))
+
 class PullRequestCandidateRunTests(unittest.TestCase):
     """Runs scripts/release-candidate-run.sh against a real Git history and a fake `gh`."""
 

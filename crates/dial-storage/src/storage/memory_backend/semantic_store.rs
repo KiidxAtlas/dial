@@ -15,9 +15,9 @@ use std::{
 
 pub const MAX_CONTENT_BYTES: usize = 8192;
 pub const MAX_SOURCE_BYTES: usize = 1024;
-/// Upper bound on vectors scanned per search, so a very large store cannot stall a turn.
+/// Threshold up to which `nearest` runs a full exact scan; above this count, a 64-bit SimHash
+/// prefilter shortlists candidates across all live facts before exact cosine reranking.
 pub const MAX_VECTOR_ROWS: usize = 20_000;
-/// Reciprocal-rank fusion constant; the conventional value that keeps top ranks from dominating.
 pub const RRF_K: f64 = 60.0;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -102,6 +102,36 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / denominator
     }
+}
+
+/// Deterministic 64-bit random-hyperplane SimHash for cosine-distance candidate prefiltering.
+/// Equal vectors have Hamming distance 0, orthogonal vectors ~32, opposite vectors 64.
+pub fn simhash(vector: &[f32]) -> i64 {
+    let mut acc = [0.0f64; 64];
+    for (dim, &value) in vector.iter().enumerate() {
+        let v = f64::from(value);
+        if !v.is_finite() || v == 0.0 {
+            continue;
+        }
+        let mut h = (dim as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let bits = h ^ (h >> 31);
+        for (bit, slot) in acc.iter_mut().enumerate() {
+            if (bits >> bit) & 1 != 0 {
+                *slot += v;
+            } else {
+                *slot -= v;
+            }
+        }
+    }
+    let mut sig = 0u64;
+    for (bit, &sum) in acc.iter().enumerate() {
+        if sum >= 0.0 {
+            sig |= 1u64 << bit;
+        }
+    }
+    sig as i64
 }
 
 /// Heap ordering puts the worst retained match first: lower cosine, then older id.
@@ -208,10 +238,18 @@ fn fact_by_id(conn: &Connection, id: i64) -> Result<Option<Fact>> {
     .context("read memory fact")
 }
 
-/// Drops a vector once no live fact still carries that exact content.
+/// Drops a vector, its SimHash signature, and its LSH band entries once no live fact carries that content.
 fn purge_vectors(conn: &Connection, hash: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM embeddings WHERE content_hash=?1 AND NOT EXISTS(SELECT 1 FROM facts WHERE content_hash=?1 AND forgotten=0)",
+        [hash],
+    )?;
+    conn.execute(
+        "DELETE FROM embedding_sigs WHERE content_hash=?1 AND NOT EXISTS(SELECT 1 FROM facts WHERE content_hash=?1 AND forgotten=0)",
+        [hash],
+    )?;
+    conn.execute(
+        "DELETE FROM embedding_lsh WHERE content_hash=?1 AND NOT EXISTS(SELECT 1 FROM facts WHERE content_hash=?1 AND forgotten=0)",
         [hash],
     )?;
     Ok(())
@@ -244,12 +282,30 @@ fn tombstone(conn: &Connection, id: i64, revision: i64, at: i64) -> Result<()> {
     Ok(())
 }
 
-/// Erase historical WAL frames after redaction. A busy reader is reported, not mistaken for erasure.
+/// Erase historical WAL frames after redaction. Uses bounded exponential backoff for transient
+/// concurrent readers; a persistent busy reader is still reported rather than mistaken for erasure.
 fn checkpoint_redaction(conn: &Connection) -> Result<()> {
-    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    let mut delay_ms: u64 = 5;
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    let (busy, log_frames, checkpointed) = loop {
+        let (busy, log_frames, checkpointed): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy == 0 && (log_frames <= 0 || checkpointed == log_frames) {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break (busy, log_frames, checkpointed);
+        }
+        let wait = Duration::from_millis(delay_ms).min(deadline - now);
+        std::thread::sleep(wait);
+        delay_ms = (delay_ms * 2).min(100);
+    };
     ensure!(
-        busy == 0,
-        "memory was forgotten but a busy reader prevented WAL erasure; erasure is incomplete until readers close and a TRUNCATE checkpoint succeeds"
+        busy == 0 && (log_frames <= 0 || checkpointed == log_frames),
+        "memory was forgotten but a busy reader prevented WAL erasure (busy={busy}, checkpointed={checkpointed}/{log_frames}); erasure is incomplete until readers close and a TRUNCATE checkpoint succeeds"
     );
     Ok(())
 }
@@ -281,6 +337,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, tokenize='unicode61');",
         ])?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS embedding_sigs(
+                content_hash TEXT NOT NULL, model TEXT NOT NULL, sig INTEGER NOT NULL,
+                PRIMARY KEY(content_hash, model));
+             CREATE INDEX IF NOT EXISTS embedding_sigs_model_sig ON embedding_sigs(model, sig);
+             CREATE TABLE IF NOT EXISTS embedding_lsh(
+                model TEXT NOT NULL, band INTEGER NOT NULL, bucket INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                PRIMARY KEY(model, band, bucket, content_hash)) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS embedding_lsh_hash ON embedding_lsh(content_hash);",
+        )?;
         conn.execute(
             "INSERT INTO facts_fts(facts_fts, rank) VALUES('secure-delete', 1)",
             [],
@@ -523,20 +590,69 @@ impl Store {
         Ok((version, self.conn.total_changes()))
     }
 
-    /// Exact top-k over the newest `MAX_VECTOR_ROWS` live facts for `model`.
-    /// Rows are decoded one at a time; only `limit` scores and ids survive the scan.
-    /// Memory is O(one vector's dimensions + limit), not O(rows * dimensions).
+    /// Top-k nearest live facts for `model`.
+    /// Up to `MAX_VECTOR_ROWS` facts, runs a streaming exact scan (O(limit) retained scores).
+    /// Beyond `MAX_VECTOR_ROWS`, scans compact 64-bit SimHash signatures across ALL live facts
+    /// (never silently dropping older facts) and exact-cosine reranks the top candidates.
     pub fn nearest(&self, model: &str, query: &[f32], limit: usize) -> Result<Vec<i64>> {
+        self.nearest_with_threshold(model, query, limit, MAX_VECTOR_ROWS)
+    }
+
+    fn nearest_with_threshold(
+        &self,
+        model: &str,
+        query: &[f32],
+        limit: usize,
+        exact_threshold: usize,
+    ) -> Result<Vec<i64>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let exceeds_exact = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM facts f
+                 JOIN embeddings e ON e.content_hash=f.content_hash AND e.model=?1
+                 WHERE f.forgotten=0 LIMIT 1 OFFSET ?2",
+                params![model, exact_threshold as i64],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exceeds_exact {
+            return self.nearest_exact(model, query, limit, exact_threshold);
+        }
+        // Check whether SimHash signatures exist for this model; if none exist (legacy raw rows),
+        // fall back cleanly to the bounded newest-row exact scan.
+        let has_sigs = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM embedding_sigs WHERE model=?1 LIMIT 1",
+                [model],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_sigs {
+            return self.nearest_exact(model, query, limit, exact_threshold);
+        }
+        self.nearest_simhash(model, query, limit, exact_threshold)
+    }
+
+    fn nearest_exact(
+        &self,
+        model: &str,
+        query: &[f32],
+        limit: usize,
+        row_cap: usize,
+    ) -> Result<Vec<i64>> {
         let mut statement = self.conn.prepare(
             "SELECT f.id, e.vector, e.dimensions FROM facts f
              JOIN embeddings e ON e.content_hash=f.content_hash AND e.model=?1
              WHERE f.forgotten=0 ORDER BY f.id DESC LIMIT ?2",
         )?;
-        let mut rows = statement.query(params![model, MAX_VECTOR_ROWS as i64])?;
-        let mut heap = BinaryHeap::with_capacity(limit.min(MAX_VECTOR_ROWS));
+        let mut rows = statement.query(params![model, row_cap as i64])?;
+        let mut heap = BinaryHeap::with_capacity(limit.min(row_cap));
         while let Some(row) = rows.next()? {
             let id = row.get(0)?;
             let bytes = row.get_ref(1)?;
@@ -551,6 +667,155 @@ impl Store {
                     },
                     limit,
                 );
+            }
+        }
+        Ok(heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|item| item.id)
+            .collect())
+    }
+
+    /// Partition a 64-bit SimHash signature into four disjoint 16-bit LSH bands.
+    /// By the pigeonhole principle, any signature within Hamming distance <= 3 shares
+    /// at least one exact 16-bit band, enabling O(log N) B-tree candidate retrieval.
+    fn simhash_bands(sig: i64) -> [i64; 4] {
+        let bits = sig as u64;
+        [
+            (bits & 0xFFFF) as i64,
+            ((bits >> 16) & 0xFFFF) as i64,
+            ((bits >> 32) & 0xFFFF) as i64,
+            ((bits >> 48) & 0xFFFF) as i64,
+        ]
+    }
+
+    /// Indexed LSH probe across the 4 16-bit SimHash bands. Returns deduplicated `(fact_id, sig)`
+    /// pairs whose signatures share at least one band with `query_sig`.
+    fn probe_lsh_candidates(
+        &self,
+        model: &str,
+        query_sig: i64,
+        probe_cap: usize,
+    ) -> Result<Vec<(i64, i64)>> {
+        let [b0, b1, b2, b3] = Self::simhash_bands(query_sig);
+        let mut stmt = self.conn.prepare(
+            "WITH hits(content_hash) AS (
+                 SELECT content_hash FROM embedding_lsh WHERE model=?1 AND band=0 AND bucket=?2
+                 UNION
+                 SELECT content_hash FROM embedding_lsh WHERE model=?1 AND band=1 AND bucket=?3
+                 UNION
+                 SELECT content_hash FROM embedding_lsh WHERE model=?1 AND band=2 AND bucket=?4
+                 UNION
+                 SELECT content_hash FROM embedding_lsh WHERE model=?1 AND band=3 AND bucket=?5
+             )
+             SELECT f.id, s.sig
+             FROM hits h
+             JOIN facts f ON f.content_hash=h.content_hash AND f.forgotten=0
+             JOIN embedding_sigs s ON s.content_hash=h.content_hash AND s.model=?1
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(params![model, b0, b1, b2, b3, probe_cap as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Retrieves SimHash candidates for `model` using O(log N) 4-band LSH index probes first,
+    /// falling back to a full `embedding_sigs` scan only when the indexed bands yield too few
+    /// candidates (e.g. legacy databases without LSH rows or queries with no close neighbors).
+    fn nearest_simhash(
+        &self,
+        model: &str,
+        query: &[f32],
+        limit: usize,
+        exact_threshold: usize,
+    ) -> Result<Vec<i64>> {
+        use std::cmp::Reverse;
+        let query_sig = simhash(query);
+        let candidate_cap = limit
+            .saturating_mul(32)
+            .max(2048.min(exact_threshold))
+            .min(exact_threshold)
+            .max(limit);
+        // Only trust the 4×16-bit LSH fast path when it was not truncated by the unordered SQL
+        // `LIMIT` and yielded enough genuinely close signatures (Hamming <= 12, cos ≳ 0.83).
+        // Distant hot-bucket collisions fall back to scanning compact 64-bit `embedding_sigs`.
+        const LSH_MAX_TRUSTED_HAMMING: u32 = 12;
+        // Max-heap by worst candidate: larger Hamming distance first, then older id (Reverse(id)).
+        let mut shortlist: BinaryHeap<(u32, Reverse<i64>)> =
+            BinaryHeap::with_capacity(candidate_cap);
+        let lsh_probe_cap = candidate_cap.saturating_mul(4).max(256);
+        let lsh_hits = self.probe_lsh_candidates(model, query_sig, lsh_probe_cap)?;
+        let min_lsh_hits = limit.max(16).min(candidate_cap);
+        let lsh_truncated = lsh_hits.len() >= lsh_probe_cap;
+        let close_lsh_hits = if lsh_truncated {
+            0
+        } else {
+            lsh_hits
+                .iter()
+                .filter(|&&(_, sig)| (query_sig ^ sig).count_ones() <= LSH_MAX_TRUSTED_HAMMING)
+                .count()
+        };
+        if !lsh_truncated && close_lsh_hits >= min_lsh_hits {
+            for (id, sig) in lsh_hits {
+                let dist = (query_sig ^ sig).count_ones();
+                let candidate = (dist, Reverse(id));
+                if shortlist.len() < candidate_cap {
+                    shortlist.push(candidate);
+                } else if let Some(mut worst) = shortlist.peek_mut()
+                    && candidate < *worst
+                {
+                    *worst = candidate;
+                }
+            }
+        } else {
+            let mut scan = self.conn.prepare(
+                "SELECT f.id, s.sig FROM facts f
+                 JOIN embeddings e ON e.content_hash=f.content_hash AND e.model=?1
+                 LEFT JOIN embedding_sigs s ON s.content_hash=f.content_hash AND s.model=?1
+                 WHERE f.forgotten=0",
+            )?;
+            let mut rows = scan.query([model])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let sig: Option<i64> = row.get(1)?;
+                let dist = sig.map_or(32, |s| (query_sig ^ s).count_ones());
+                let candidate = (dist, Reverse(id));
+                if shortlist.len() < candidate_cap {
+                    shortlist.push(candidate);
+                } else if let Some(mut worst) = shortlist.peek_mut()
+                    && candidate < *worst
+                {
+                    *worst = candidate;
+                }
+            }
+        }
+
+        let ids: Vec<i64> = shortlist.into_iter().map(|(_, Reverse(id))| id).collect();
+        let mut heap = BinaryHeap::with_capacity(limit.min(ids.len()));
+        let mut fetch = self.conn.prepare(
+            "SELECT e.vector, e.dimensions FROM facts f
+             JOIN embeddings e ON e.content_hash=f.content_hash AND e.model=?1
+             WHERE f.id=?2 AND f.forgotten=0",
+        )?;
+        for id in ids {
+            if let Some((bytes, dimensions)) = fetch
+                .query_row(params![model, id], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()?
+            {
+                let vector = decode(&bytes, dimensions as usize)?;
+                if vector.len() == query.len() {
+                    keep_nearest(
+                        &mut heap,
+                        VectorMatch {
+                            id,
+                            score: cosine(query, &vector),
+                        },
+                        limit,
+                    );
+                }
             }
         }
         Ok(heap
@@ -580,15 +845,26 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (content, vector) in items {
             ensure!(!vector.is_empty(), "embedding vector is empty");
+            let hash = content_hash(content);
+            let sig = simhash(vector);
             tx.execute(
                 "INSERT OR REPLACE INTO embeddings(content_hash,model,dimensions,vector) VALUES(?1,?2,?3,?4)",
-                params![
-                    content_hash(content),
-                    model,
-                    vector.len() as i64,
-                    encode(vector)
-                ],
+                params![&hash, model, vector.len() as i64, encode(vector)],
             )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO embedding_sigs(content_hash,model,sig) VALUES(?1,?2,?3)",
+                params![&hash, model, sig],
+            )?;
+            tx.execute(
+                "DELETE FROM embedding_lsh WHERE model=?1 AND content_hash=?2",
+                params![model, &hash],
+            )?;
+            for (band, bucket) in Self::simhash_bands(sig).into_iter().enumerate() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO embedding_lsh(model,band,bucket,content_hash) VALUES(?1,?2,?3,?4)",
+                    params![model, band as i64, bucket, &hash],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())

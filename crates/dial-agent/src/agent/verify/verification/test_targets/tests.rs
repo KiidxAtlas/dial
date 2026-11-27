@@ -161,3 +161,125 @@ fn javascript_entries_use_literal_jest_paths_and_nested_go_entries_use_their_mod
         "cd 'service' && go test -count=1 '.' -run '^TestDiv$'"
     );
 }
+
+#[test]
+fn project_checks_resolve_cargo_node_go_and_python_targets() {
+    let root = tempfile::tempdir().unwrap();
+    // Cargo subproject
+    let rust = root.path().join("engine");
+    std::fs::create_dir(&rust).unwrap();
+    std::fs::write(
+        rust.join("Cargo.toml"),
+        "[package]\nname = \"e\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let clippy = entry(root.path(), "engine:clippy").unwrap();
+    assert_eq!(
+        clippy.command,
+        "cd 'engine' && cargo clippy --offline --all-targets -- -D warnings"
+    );
+    assert!(!behavioral_target(&clippy.name));
+    let fmt = entry(root.path(), "engine:fmt").unwrap();
+    assert_eq!(fmt.command, "cd 'engine' && cargo fmt --all -- --check");
+    assert!(!behavioral_target(&fmt.name));
+    let test = entry(root.path(), "engine:test").unwrap();
+    assert_eq!(test.command, "cd 'engine' && cargo test --offline");
+    assert!(behavioral_target(&test.name));
+    let filtered = entry(root.path(), "engine:test::smoke").unwrap();
+    assert_eq!(
+        filtered.command,
+        "cd 'engine' && cargo test --offline 'smoke'"
+    );
+    assert!(behavioral_target(&filtered.name));
+    assert!(entry(root.path(), "engine:clippy::smoke").is_err());
+    // Node subproject with scripts + pnpm lockfile
+    let web = root.path().join("web");
+    std::fs::create_dir(&web).unwrap();
+    std::fs::write(
+        web.join("package.json"),
+        r#"{"scripts":{"lint":"eslint .","typecheck":"nuxt typecheck","build":"nuxt build","test":"node --test"}}"#,
+    )
+    .unwrap();
+    std::fs::write(web.join("pnpm-lock.yaml"), "").unwrap();
+    assert_eq!(
+        entry(root.path(), "web:lint").unwrap().command,
+        "cd 'web' && pnpm run lint"
+    );
+    assert_eq!(
+        entry(root.path(), "web:typecheck").unwrap().command,
+        "cd 'web' && pnpm run typecheck"
+    );
+    assert_eq!(
+        entry(root.path(), "web:build").unwrap().command,
+        "cd 'web' && pnpm run build"
+    );
+    assert!(behavioral_target(
+        &entry(root.path(), "web:test").unwrap().name
+    ));
+    assert!(!behavioral_target(
+        &entry(root.path(), "web:typecheck").unwrap().name
+    ));
+
+    // Python fmt (ruff) + typecheck (pyright) + test selector
+    let py = root.path().join("py");
+    std::fs::create_dir(&py).unwrap();
+    std::fs::write(
+        py.join("pyproject.toml"),
+        "[tool.pytest.ini_options]\n[tool.ruff]\n[tool.pyright]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        entry(root.path(), "py:fmt").unwrap().command,
+        "cd 'py' && ruff format --check ."
+    );
+    assert_eq!(
+        entry(root.path(), "py:typecheck").unwrap().command,
+        "cd 'py' && pyright"
+    );
+    assert!(
+        entry(root.path(), "py:test::smoke")
+            .unwrap()
+            .command
+            .contains("-m pytest -q -k 'smoke'")
+    );
+
+    // Escape attempt is rejected.
+    assert!(entry(root.path(), "../outside:clippy").is_err());
+}
+
+#[test]
+fn directory_and_nested_ts_targets_resolve_without_falling_back_to_bash() {
+    let root = tempfile::tempdir().unwrap();
+    let tests_dir = root.path().join("web/tests/unit");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    std::fs::write(tests_dir.join("a.test.mjs"), "").unwrap();
+    std::fs::write(tests_dir.join("b.test.mjs"), "").unwrap();
+    // Recursive directory discovery finds tests nested under web/tests/unit.
+    let dir_check = entry(root.path(), "web/tests").unwrap();
+    assert_eq!(
+        dir_check.command,
+        "node --test 'web/tests/unit/a.test.mjs' 'web/tests/unit/b.test.mjs'"
+    );
+    assert!(behavioral_target(&dir_check.name));
+    // Nested package.json jest runner is found even when workspace root has no package.json.
+    let app = root.path().join("app");
+    std::fs::create_dir_all(app.join("node_modules/.bin")).unwrap();
+    std::fs::write(app.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+    let executable = if cfg!(windows) { "jest.cmd" } else { "jest" };
+    std::fs::write(app.join("node_modules/.bin").join(executable), "").unwrap();
+    std::fs::write(app.join("calc.test.ts"), "").unwrap();
+    let nested = entry(root.path(), "app/calc.test.ts::adds").unwrap();
+    assert!(
+        nested.command.starts_with("cd 'app' && ")
+            && nested
+                .command
+                .contains("--runTestsByPath 'calc.test.ts' -t 'adds'"),
+        "{}",
+        nested.command
+    );
+
+    // Plain .ts test without jest/vitest uses `node --test`.
+    std::fs::write(root.path().join("standalone.test.ts"), "").unwrap();
+    let ts = entry(root.path(), "standalone.test.ts").unwrap();
+    assert_eq!(ts.command, "node --test 'standalone.test.ts'");
+}

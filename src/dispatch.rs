@@ -72,8 +72,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
             endpoint,
             gist,
             whole_journal,
+            json,
         }) => {
-            return cmd::sessions::share(&cli, &layout, id, endpoint, *gist, *whole_journal);
+            return cmd::sessions::share(&cli, &layout, id, endpoint, *gist, *whole_journal, *json);
         }
         Some(Command::Developer(DevCommand::Reliability { action })) => {
             return cmd::inspection::reliability(&cli, &layout, action);
@@ -135,8 +136,16 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                 dial::learn::worker::capabilities,
             );
         }
-        Some(Command::Doctor { fix, yes, all }) => {
-            return cmd::doctor::run(&cli, &layout, fix, *yes, *all);
+        Some(Command::Doctor {
+            fix,
+            yes,
+            all,
+            json,
+        }) => {
+            return cmd::doctor::run(&cli, &layout, fix, *yes, *all, *json);
+        }
+        Some(Command::Login { provider, json }) => {
+            return cmd::login::run(&layout, provider.as_deref(), *json);
         }
         Some(Command::Auth { action }) => {
             return cmd::auth::run(&layout, action);
@@ -172,6 +181,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Images(args)) => {
             return exit_with(dial::cli::images::run(&layout, args.clone())?);
+        }
+        Some(Command::Attach { session }) => {
+            return exit_with(dial::cli::watch::attach(&layout, session)?);
         }
         Some(Command::Watch(args)) => {
             return exit_with(dial::cli::watch::run(&layout, args.clone())?);

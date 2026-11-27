@@ -1010,6 +1010,79 @@ fn an_unattended_shell_deliverable_needs_a_passing_check_before_completion() {
 }
 
 #[test]
+fn an_unattended_snapshot_of_one_result_prompts_an_independent_check() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"printf 'amber\\n' > out.txt; cat out.txt"}),
+            )),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"test \"$(cat out.txt)\" = \"amber\"","check":true}),
+            )),
+        ),
+        response("Wrote the result.", None),
+        response(
+            "I found one result but could not verify completeness.",
+            None,
+        ),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        agent
+            .turn("Write all qualifying labels to out.txt.", &mut NullUi)
+            .unwrap();
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4, "expected a completion deferral");
+    let messages = requests[3]["messages"].to_string();
+    assert!(messages.contains("independent evidence"));
+    assert!(messages.contains("compare the full set"));
+}
+
+#[test]
+fn a_single_line_membership_check_prompts_an_independent_check() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("bash", json!({"command":"echo amber > out.txt"}))),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"grep -qx amber out.txt","check":true}),
+            )),
+        ),
+        response("Wrote the result.", None),
+        response("I could not verify completeness.", None),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        agent
+            .turn(
+                "Write each matching label, for example amber; print them all.",
+                &mut NullUi,
+            )
+            .unwrap();
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("compare the full set")
+    );
+}
+
+#[test]
 fn a_repeated_unverified_unattended_completion_ends_incomplete() {
     let server = llm::fake::serve(vec![
         response("", Some(("bash", json!({"command":WRITE_RESULT})))),
@@ -1124,13 +1197,14 @@ fn a_pipe_masked_unattended_check_does_not_satisfy_the_gate() {
         "false 2>&1 | tail -5 # set -o pipefail",
         "set -o pipefail; set +o pipefail; false | tail -5",
         "(set -o pipefail); false | tail -5",
+        "set -o pipefail; false | cat | cat || true",
     ] {
         let server = llm::fake::serve(vec![
             response("", Some(("bash", json!({"command":WRITE_RESULT})))),
             llm::fake::json(200, &json!({"total_slots":1})),
             check(masked),
             response("Wrote result.csv; the check passes.", None),
-            check("set -o pipefail; grep -q value result.csv | tail -5"),
+            check("set -o pipefail; cat result.csv | head -n 1 | grep -qx value && echo ok"),
             response("Wrote result.csv; the pipefail check passes.", None),
         ]);
         with_launch(true, |agent| {

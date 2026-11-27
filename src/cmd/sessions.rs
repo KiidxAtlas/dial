@@ -294,6 +294,7 @@ pub(crate) fn share(
     endpoint: &Option<String>,
     gist: bool,
     whole_journal: bool,
+    json: bool,
 ) -> Result<()> {
     let config = Config::load(layout, Some(overlay(cli)?))?;
     let selected = if let Some(id) = id {
@@ -313,8 +314,13 @@ pub(crate) fn share(
     let transcript = dial::storage::share::transcript(&selected.path, scope)?;
     let fitted =
         dial::storage::share::fit_to_cap(&transcript, dial::storage::share::SHARE_CAP_BYTES)?;
+    let mut notes = Vec::new();
     for trim in &fitted.trims {
-        eprintln!("share trimmed to fit the size cap: {trim}");
+        let note = format!("Trimmed to fit the size cap: {trim}.");
+        if !json {
+            eprintln!("share trimmed to fit the size cap: {trim}");
+        }
+        notes.push(note);
     }
     let encrypted = fitted.share;
     let server = endpoint
@@ -332,7 +338,22 @@ pub(crate) fn share(
         Some(server) if !gist => dial::storage::share::upload(&encrypted, &server)?,
         _ => dial::storage::share::upload_gist(&encrypted)?,
     };
-    println!("{link}");
+    if json {
+        let mut all_notes = vec![
+            "the key is only in the URL fragment; anyone with the full link can read the session."
+                .to_owned(),
+        ];
+        all_notes.extend(notes);
+        println!(
+            "{}",
+            serde_json::json!({
+                "url": link,
+                "notes": all_notes,
+            })
+        );
+    } else {
+        println!("{link}");
+    }
     Ok(())
 }
 

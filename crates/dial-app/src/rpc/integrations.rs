@@ -195,5 +195,184 @@ pub(super) fn computer_status(config: &Config) -> Value {
     })
 }
 
+/// `doctor`: optional capability installation status and memory configuration notes, matching
+/// `dial doctor --json`.
+pub(super) fn doctor(layout: &Layout, config: Option<&Config>, params: &Value) -> Result<Value> {
+    object(params, "doctor")?;
+    let all = match params.get("all") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(invalid("doctor params.all must be a boolean")),
+    };
+    let env = crate::setup::deps::Env::current(&layout.user_dir);
+    let rows = crate::setup::deps::report(&env);
+    let mut capabilities = Vec::new();
+    let mut missing = 0usize;
+    for row in rows {
+        let installed = matches!(row.status, crate::setup::deps::Status::Ready);
+        if !installed {
+            missing += 1;
+            if !all {
+                continue;
+            }
+        }
+        capabilities.push(json!({
+            "id": row.id,
+            "name": row.title,
+            "installed": installed,
+            "path": installed.then_some(row.detail),
+        }));
+    }
+    let mut notes = Vec::new();
+    if !all && missing > 0 {
+        notes.push(format!(
+            "Not installed: {missing} optional capabilit{}; `dial doctor --all` lists them with their setup commands.",
+            if missing == 1 { "y" } else { "ies" }
+        ));
+    }
+    let memory_note = match config {
+        Some(cfg) => crate::setup::memory::doctor_text(cfg),
+        None => "Memory: settings could not be read.".to_owned(),
+    };
+    notes.extend(
+        memory_note
+            .lines()
+            .map(|line| line.trim_end().to_owned())
+            .filter(|line| !line.is_empty()),
+    );
+    Ok(json!({
+        "capabilities": capabilities,
+        "notes": notes,
+    }))
+}
+
+/// `commit_preview`: generate a commit message preview for the staged changes without creating a
+/// commit (`dial commit --dry-run --json`).
+pub(super) fn commit_preview(layout: &Layout, config: &Config, params: &Value) -> Result<Value> {
+    object(params, "commit_preview")?;
+    let model = match params.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if !m.is_empty() => Some(m.clone()),
+        Some(_) => {
+            return Err(invalid(
+                "commit_preview params.model must be a non-empty string",
+            ));
+        }
+    };
+    let mut args = vec!["--dry-run".to_owned(), "--json".to_owned()];
+    if let Some(m) = model {
+        args.push("--model".to_owned());
+        args.push(m);
+    }
+    let parsed = crate::commit::cli::parse_commit_args(&args)
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InternalError,
+                "commit_preview args returned help",
+            )
+        })?;
+    let outcome = crate::commit::run::run_commit_command(
+        &parsed,
+        &layout.project_root,
+        config,
+        &crate::commit::backend::ProviderBackend,
+        &mut |_: &str| true,
+    )
+    .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    Ok(outcome.to_json())
+}
+
+/// `share_session`: encrypt and upload a session share link, matching `dial share --json`.
+pub(super) fn share_session(layout: &Layout, config: &Config, params: &Value) -> Result<Value> {
+    object(params, "share_session")?;
+    let session_id = match params.get("session_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+        Some(_) => {
+            return Err(invalid(
+                "share_session params.session_id must be a non-empty string",
+            ));
+        }
+    };
+    let gist = match params.get("gist") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(invalid("share_session params.gist must be a boolean")),
+    };
+    let whole_journal = match params.get("whole_journal") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(invalid(
+                "share_session params.whole_journal must be a boolean",
+            ));
+        }
+    };
+    let endpoint = match params.get("endpoint") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid("share_session params.endpoint must be a string")),
+    };
+    let selected = if let Some(id) = session_id {
+        let mut matching = crate::storage::session::Session::find_prefix(layout, id)
+            .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?
+            .into_iter();
+        let info = matching.next().ok_or_else(|| {
+            coded(
+                ErrorCode::NotFound,
+                format!("no session in this project starts with {id:?}"),
+            )
+        })?;
+        if let Some(other) = matching.next() {
+            return Err(invalid(format!(
+                "session prefix {id:?} matches {} and {}; use a longer id",
+                info.id, other.id
+            )));
+        }
+        info
+    } else {
+        crate::storage::session::Session::list_newest(layout, 1)
+            .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| coded(ErrorCode::NotFound, "there are no sessions to share"))?
+    };
+    let scope = if whole_journal {
+        crate::storage::share::Scope::WholeJournal
+    } else {
+        crate::storage::share::Scope::ActiveBranch
+    };
+    let transcript = crate::storage::share::transcript(&selected.path, scope)
+        .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    let fitted =
+        crate::storage::share::fit_to_cap(&transcript, crate::storage::share::SHARE_CAP_BYTES)
+            .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    let mut notes = vec![
+        "the key is only in the URL fragment; anyone with the full link can read the session."
+            .to_owned(),
+    ];
+    for trim in &fitted.trims {
+        notes.push(format!("Trimmed to fit the size cap: {trim}."));
+    }
+    let server = endpoint
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!config.share.server_url.is_empty()).then(|| config.share.server_url.clone()))
+        .or_else(|| {
+            std::env::var("DIAL_SHARE_SERVER")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+    let link = match server {
+        Some(server) if !gist => crate::storage::share::upload(&fitted.share, &server),
+        _ => crate::storage::share::upload_gist(&fitted.share),
+    }
+    .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    Ok(json!({
+        "url": link,
+        "notes": notes,
+    }))
+}
+
 #[cfg(test)]
 mod tests;

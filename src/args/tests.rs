@@ -522,3 +522,17 @@ fn user_facing_arguments_all_have_help_text() {
     walk(&command(), "dial", &mut missing);
     assert!(missing.is_empty(), "arguments without help: {missing:#?}");
 }
+
+#[test]
+fn share_accepts_json_flag() {
+    let cli = Cli::try_parse_from(["dial", "share", "abc123", "--gist", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Share {
+            id: Some(ref id),
+            gist: true,
+            json: true,
+            ..
+        }) if id == "abc123"
+    ));
+}

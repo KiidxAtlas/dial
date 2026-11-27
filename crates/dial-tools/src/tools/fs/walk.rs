@@ -9,6 +9,9 @@
 //! * Nested linked git worktrees (a `.git` file pointing into another repository's `worktrees/`)
 //!   are separate checkouts, not project files, and are skipped the same way.
 //! * Symlinks are never followed or reported; entries are visited in sorted order depth-first.
+//! * Unscoped behavior searches set `source_first`: recognized build output (`dist`, `build`,
+//!   `.next`, …) at any depth is walked after the rest of the tree, under the same budgets, so it
+//!   cannot displace source. Output is still searched; explicit scopes keep plain sorted order.
 
 use crate::tools::Workspace;
 use crate::workspace_copy::SCRATCH_DIR;
@@ -19,6 +22,26 @@ pub(in crate::tools) const MAX_WALK_ENTRIES: usize = 50_000;
 pub(in crate::tools) const MAX_WALK_DEPTH: usize = 40;
 pub(in crate::tools) const SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", ".venv", "__pycache__"];
+
+/// Generated or build output, recognized by name at any depth. Only the order of `source_first`
+/// walks depends on it; these directories are never skipped.
+const BUILD_OUTPUT_DIRS: &[&str] = &[
+    "build",
+    "dist",
+    "out",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    "obj",
+];
+
+fn is_build_output(name: &std::ffi::OsStr) -> bool {
+    BUILD_OUTPUT_DIRS.iter().any(|dir| name == *dir)
+}
 
 /// A nested linked worktree: its `.git` is a small file whose `gitdir:` points into some
 /// repository's `worktrees/` directory. Submodules (`gitdir: …/modules/…`) are project content.
@@ -43,8 +66,13 @@ pub(crate) fn is_linked_worktree(directory: &Path) -> bool {
 pub(crate) struct Walk<'a> {
     ws: &'a Workspace,
     entries: usize,
+    entry_limit: usize,
     directory_entries: usize,
     directory_limit: usize,
+    /// Build-output directories deferred by `source_first`, with their depth, in walk order.
+    deferred: Vec<(std::path::PathBuf, usize)>,
+    draining: bool,
+    source_first: bool,
     /// Entry/depth/admission limits or I/O errors left results incomplete.
     pub truncated: bool,
 }
@@ -54,10 +82,22 @@ impl<'a> Walk<'a> {
         Walk {
             ws,
             entries: 0,
+            entry_limit: MAX_WALK_ENTRIES,
             directory_entries: 0,
             directory_limit: MAX_WALK_ENTRIES,
+            deferred: Vec::new(),
+            draining: false,
+            source_first: false,
             truncated: false,
         }
+    }
+
+    /// Walk recognized build output after all other admitted entries. Deferred directories are
+    /// still enumerated under the same entry and directory budgets, so generated output stays
+    /// searchable; only the visit order changes. Callers use this for unscoped searches only.
+    pub fn source_first(mut self) -> Self {
+        self.source_first = true;
+        self
     }
 
     /// Visit every regular file under `start`. `visit` returns false to stop.
@@ -84,7 +124,30 @@ impl<'a> Walk<'a> {
             .ignore(false)
             .build_matchers()
             .remove(0);
-        self.walk_path(start, start, prefix, 0, &mut matcher, visit);
+        let completed = self.walk_path(start, start, prefix, 0, &mut matcher, visit);
+        let deferred = std::mem::take(&mut self.deferred);
+        if completed {
+            self.draining = true;
+            for (path, depth) in deferred {
+                // The deferral already reserved this entry; walking it again counts it once more.
+                self.entries -= 1;
+                if !self.walk_path(start, &path, prefix, depth, &mut matcher, visit) {
+                    break;
+                }
+            }
+            self.draining = false;
+        }
+    }
+
+    /// Reserve an entry for a build-output directory and walk it after the source pass.
+    fn defer(&mut self, path: &Path, depth: usize) -> bool {
+        self.entries += 1;
+        if self.entries > self.entry_limit {
+            self.truncated = true;
+            return false;
+        }
+        self.deferred.push((path.to_path_buf(), depth));
+        true
     }
 
     fn walk_path(
@@ -125,10 +188,13 @@ impl<'a> Walk<'a> {
                 {
                     return true;
                 }
+                if self.source_first && !self.draining && is_build_output(name) {
+                    return self.defer(path, depth);
+                }
             }
         }
         self.entries += 1;
-        if self.entries > MAX_WALK_ENTRIES {
+        if self.entries > self.entry_limit {
             self.truncated = true;
             return false;
         }

@@ -1102,14 +1102,20 @@ fn handoff_state_valid_priority_json_and_explicit_overflow() {
 fn acceptance_projection_missing_ids_and_custom_payload() {
     let payload = json!({"custom":"legacy", "acceptance":{"acceptance_1":{"status":"met"}}});
     let before = payload.clone();
-    let projection = result_projection("done", Some(&payload), &["one".into(), "two".into()], None);
+    let projection = result_projection(
+        "done",
+        Some(&payload),
+        &["one".into(), "two".into()],
+        None,
+        None,
+    );
     assert_eq!(projection["acceptance"]["acceptance_1"]["status"], "met");
     assert_eq!(
         projection["acceptance"]["acceptance_2"]["status"],
         "not_verified"
     );
     assert_eq!(payload, before);
-    let projection = result_projection("All done, success", None, &["one".into()], None);
+    let projection = result_projection("All done, success", None, &["one".into()], None, None);
     assert_eq!(
         projection["acceptance"]["acceptance_1"]["status"],
         "not_verified"
@@ -1138,7 +1144,7 @@ fn evidence_audit_labels_references_and_downgrades_only_invalid_met_claims() {
     });
     let before = payload.clone();
     let acceptance: Vec<String> = (1..=4).map(|n| format!("item {n}")).collect();
-    let projection = result_projection("", Some(&payload), &acceptance, Some(&workspace));
+    let projection = result_projection("", Some(&payload), &acceptance, Some(&workspace), None);
     assert_eq!(payload, before, "the worker payload is never modified");
     let status = |reference: &str| {
         projection["evidence_audit"]["refs"]
@@ -1176,7 +1182,7 @@ fn evidence_audit_labels_references_and_downgrades_only_invalid_met_claims() {
     assert_eq!(projection["evidence_refs"][2], "src/gone.rs");
     // Without a workspace (legacy derived projections) there is no audit.
     assert!(
-        result_projection("", Some(&payload), &acceptance_ids(4), None)
+        result_projection("", Some(&payload), &acceptance_ids(4), None, None)
             .get("evidence_audit")
             .is_none()
     );
@@ -1189,8 +1195,13 @@ fn acceptance_ids(count: usize) -> Vec<String> {
 #[test]
 fn sync_results_receive_separate_model_visible_acceptance_metadata() {
     for exact in [r#"{"value":7}"#, "independent findings"] {
-        let projection =
-            result_projection("blocked: missing service", None, &["boundary".into()], None);
+        let projection = result_projection(
+            "blocked: missing service",
+            None,
+            &["boundary".into()],
+            None,
+            None,
+        );
         let output = ToolOutput {
             text: exact.into(),
             data: Some(
@@ -1566,7 +1577,13 @@ fn worker_report_returns_string_checks_and_gaps_to_the_parent() {
         "checks_run": checks,
         "gaps": ["acceptance_2: integration binary not run"]
     });
-    let projection = result_projection("", Some(&payload), &["one".into(), "two".into()], None);
+    let projection = result_projection(
+        "",
+        Some(&payload),
+        &["one".into(), "two".into()],
+        None,
+        None,
+    );
     let kept = projection["checks_run"].as_array().unwrap();
     // Object rows are dropped and disclosed, the list keeps eight string rows and flags the overflow.
     assert_eq!(kept.len(), 8);
@@ -1578,7 +1595,7 @@ fn worker_report_returns_string_checks_and_gaps_to_the_parent() {
     assert_eq!(projection["gaps"], payload["gaps"]);
     assert_eq!(projection["gaps_reported"], true);
     assert!(projection.get("gaps_dropped").is_none());
-    let bare = result_projection("done", None, &["one".into()], None);
+    let bare = result_projection("done", None, &["one".into()], None, None);
     assert_eq!(bare["checks_run"], Value::Null);
     assert_eq!(bare["checks_run_reported"], false);
 }
@@ -1619,7 +1636,7 @@ fn unreported_empty_and_malformed_handoff_rows_are_never_confused() {
                 Some(raw) => json!({ key: raw }),
                 None => json!({"answer": "done"}),
             };
-            let projection = result_projection("", Some(&payload), &[], None);
+            let projection = result_projection("", Some(&payload), &[], None, None);
             assert_eq!(projection[key], *expected, "{key}: {label}");
             assert_eq!(
                 projection[format!("{key}_reported")],
@@ -1638,7 +1655,7 @@ fn unreported_empty_and_malformed_handoff_rows_are_never_confused() {
 #[test]
 fn custom_output_schema_absent_fields_stay_unknown_in_the_parent_projection() {
     let payload = json!({"answer": "done", "checks_run": "not part of my schema"});
-    let projection = result_projection("done", Some(&payload), &["one".into()], None);
+    let projection = result_projection("done", Some(&payload), &["one".into()], None, None);
     assert_eq!(projection["checks_run"], Value::Null);
     assert_eq!(projection["checks_run_reported"], false);
     assert_eq!(projection["gaps_reported"], false);
@@ -1658,4 +1675,79 @@ fn custom_output_schema_prompt_does_not_request_report_keys() {
     let prompt = request.jobs[0].system(Path::new("/repo"), &[]);
     assert!(prompt.contains("output_schema remains authoritative"));
     assert!(!prompt.contains("checks_run"));
+}
+
+#[test]
+fn controller_receipts_judge_cited_spans_and_downgrade_only_changed_met_claims() {
+    use crate::agent::workers::read_receipts::ReadReceipts;
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src/lib.rs"), "a\nb\nc\nd\n").unwrap();
+    let workspace = crate::tools::Workspace::new(project.path()).unwrap();
+    // The worker's own read displays rows 2-3; the parent's earlier read of rows 1-2 is not one.
+    let arguments = json!({"path": "src/lib.rs:2-3"});
+    let output = crate::tools::execute(&workspace, "read", &arguments, 10);
+    let call = crate::llm::ToolCall {
+        id: "read-1".into(),
+        name: "read".into(),
+        arguments,
+        malformed_arguments: false,
+    };
+    let mut receipts = ReadReceipts::default();
+    receipts.record(&workspace, &call, &output);
+    // Row 3 disappears; a receipt must still detect that the cited old span changed.
+    std::fs::write(project.path().join("src/lib.rs"), "a\nB\n").unwrap();
+    let stored = serde_json::to_value(&receipts).unwrap();
+    let controller = json!({
+        "acceptance": {"state":"accepted","reason":"all checks passed","checks":[{"check":"unit","verdict":"passed"}]},
+        "read_receipts": stored,
+    });
+    let payload = json!({"acceptance": {
+        "acceptance_1": {"status":"met", "evidence":["src/lib.rs:2-3"]},
+        "acceptance_2": {"status":"met", "evidence":["src/lib.rs:1-2"]},
+        "acceptance_3": {"status":"unmet", "evidence":["src/lib.rs:2"]}
+    }});
+    let acceptance: Vec<String> = (1..=3).map(|n| format!("item {n}")).collect();
+    let projection = result_projection(
+        "",
+        Some(&payload),
+        &acceptance,
+        Some(&workspace),
+        Some(&controller),
+    );
+    let coverage = &projection["acceptance"];
+    assert_eq!(coverage["acceptance_1"]["status"], "not_verified");
+    assert_eq!(
+        coverage["acceptance_1"]["basis"],
+        "cited_evidence_changed_since_read"
+    );
+    // No receipt covers rows 1-2, so the worker's claim stays a claim, not a downgrade.
+    assert_eq!(coverage["acceptance_2"]["status"], "met");
+    assert_eq!(coverage["acceptance_3"]["status"], "unmet");
+    assert_eq!(
+        projection["evidence_audit"]["read"],
+        json!({"current":0,"changed":2,"no_receipt":1,"unknown_revision":0})
+    );
+    assert_eq!(
+        projection["evidence_audit"]["read_provenance"],
+        "controller_receipts"
+    );
+    assert_eq!(
+        projection["evidence_audit"]["downgraded"],
+        json!(["acceptance_1"])
+    );
+    assert_eq!(projection["controller_acceptance"]["state"], "accepted");
+    assert_eq!(
+        projection["controller_acceptance"]["checks"][0]["verdict"],
+        "passed"
+    );
+    assert_eq!(
+        projection["controller_acceptance"]["basis"],
+        "controller_receipt"
+    );
+    // Results recorded before controller receipts existed keep the worker claims unjudged.
+    let legacy = result_projection("", Some(&payload), &acceptance, Some(&workspace), None);
+    assert_eq!(legacy["acceptance"]["acceptance_1"]["status"], "met");
+    assert_eq!(legacy["evidence_audit"]["read_provenance"], "not_reported");
+    assert_eq!(legacy["controller_acceptance"]["state"], "not_reported");
 }

@@ -156,10 +156,11 @@ impl Tool for Find {
             Ok(v) => v,
             Err(e) => return ToolOutput::err(e),
         };
-        let mut text = match find(ctx.workspace, args) {
-            Ok(text) => text,
+        let found = match find_result(ctx.workspace, args) {
+            Ok(found) => found,
             Err(e) => return ToolOutput::err(e),
         };
+        let mut text = found.text;
         if let Some(args) = supplemental {
             let metadata = self.lsp.call(ctx, &args);
             text.push_str(
@@ -193,7 +194,7 @@ impl Tool for Find {
         }
         ToolOutput {
             execution: Default::default(),
-            data: None,
+            data: Some(found.data),
             text,
             is_error: false,
         }
@@ -283,6 +284,9 @@ struct Retrieval {
     limit: usize,
     exact: bool,
     coverage: String,
+    /// Whether the walk covered the whole scope with nothing omitted: the only state in which an
+    /// empty result proves absence.
+    complete: bool,
 }
 pub(crate) fn tokens(text: &str) -> BTreeSet<String> {
     // Split snake_case and camelCase before lowercasing; no language-model interpretation.
@@ -430,14 +434,11 @@ fn retain(
     if heap.len() == 1000
         && heap.peek().is_some_and(|worst| {
             // Match the stable full-source sort, including original declaration/window order.
-            worst.evidence.score > score
-                || (worst.evidence.score == score
-                    && (
-                        worst.evidence.path.as_str(),
-                        worst.evidence.start,
-                        worst.evidence.end,
-                        worst.sequence,
-                    ) <= (path, start, end, order))
+            let hit = &worst.evidence;
+            (
+                order_key(hit.score, &hit.path, hit.start, hit.end),
+                worst.sequence,
+            ) <= (order_key(score, path, start, end), order)
         })
     {
         return;
@@ -461,6 +462,38 @@ fn retain(
         sequence: order,
     });
 }
+/// The ordinary overlapping windows cover individual search terms. Do not let an
+/// enormous declaration pool unrelated matches that no single preview can show.
+/// Keep its header searchable; a phrase or literal crossing window boundaries
+/// also gets a fallback excerpt located at the match, rather than at the header.
+fn lexical_declaration_focus(
+    source: &cache::Source,
+    start: usize,
+    end: usize,
+    phrases: &[String],
+    keywords: &[String],
+) -> (usize, usize, bool) {
+    if end - start < SOURCE_LINES {
+        return (start, end, false);
+    }
+    let folded = source.folded(start, end);
+    let body = source.body(start, end);
+    let matched_prefix = phrases
+        .first()
+        .and_then(|phrase| folded.find(phrase).map(|offset| &folded[..offset]))
+        .or_else(|| {
+            keywords
+                .iter()
+                .find_map(|word| body.find(word).map(|offset| &body[..offset]))
+        });
+    if let Some(prefix) = matched_prefix {
+        let line = start + prefix.bytes().filter(|byte| *byte == b'\n').count();
+        let first = line.saturating_sub(2).max(start);
+        return (first, end.min(first + SOURCE_LINES - 1), true);
+    }
+    (start, start, false)
+}
+
 fn intersects(lines: &[usize], start: usize, end: usize) -> bool {
     lines
         .get(lines.partition_point(|line| *line < start))
@@ -532,7 +565,14 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
         return Err("search scope does not exist".into());
     }
     cache::prune(ws.root());
-    let mut walk = Walk::new(ws);
+    // Unscoped behavior searches visit source before recognized build output, so generated output
+    // cannot exhaust the budget first. Explicit scopes and exact mode keep the plain walk order.
+    let unscoped = opt_str(args, "path")?.is_none();
+    let mut walk = if !exact && unscoped {
+        Walk::new(ws).source_first()
+    } else {
+        Walk::new(ws)
+    };
     let (mut bytes, mut skipped, mut scanned) = (0u64, 0usize, 0usize);
     let mut byte_capped = false;
     let mut heap = BinaryHeap::new();
@@ -691,14 +731,19 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                 if start == 0 || start > source.lines() {
                     continue;
                 }
-                let body = source.body(start, end.min(source.lines()));
-                if !phrases.iter().all(|phrase| {
-                    source
-                        .folded(start, end.min(source.lines()))
-                        .contains(phrase)
-                }) {
+                let declaration_end = end.min(source.lines());
+                if !phrases
+                    .iter()
+                    .all(|phrase| source.folded(start, declaration_end).contains(phrase))
+                {
                     continue;
                 }
+                let (start, end, fallback) = if semantic || kind == "lexical-window" {
+                    (start, declaration_end, false)
+                } else {
+                    lexical_declaration_focus(&source, start, declaration_end, &phrases, &keywords)
+                };
+                let body = source.body(start, end);
                 let hits = postings
                     .iter()
                     .filter(|lines| intersects(lines, start, end))
@@ -707,7 +752,7 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                     .iter()
                     .filter(|keyword| body.contains(keyword.as_str()))
                     .count();
-                if hits == 0 && literal_hits == 0 && phrases.is_empty() && !semantic {
+                if hits == 0 && literal_hits == 0 && phrases.is_empty() && !semantic && !fallback {
                     continue;
                 }
                 let title_hits = postings
@@ -720,6 +765,20 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                     + literal_hits * 15
                     + phrases.len() * 20
                     + usize::from(kind != "lexical-window") * 2;
+                // A fallback may establish a phrase match only in the enclosing
+                // scope. Prefer every self-contained method or window over it.
+                let (score, kind) = if fallback {
+                    (1, "declaration-match-window")
+                } else {
+                    (score, kind)
+                };
+                // A match on a large declaration's header is scored on the header
+                // alone, but still supplies the usual bounded source preview.
+                let end = if end == start && declaration_end > end {
+                    declaration_end.min(start + SOURCE_LINES - 1)
+                } else {
+                    end
+                };
                 retain(
                     target,
                     &mut sequence,
@@ -776,6 +835,7 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
     });
     let mut current = BTreeMap::new();
     let mut stale = 0usize;
+    let saturated = heap.len() >= 1000;
     let results = heap
         .into_sorted_vec()
         .into_iter()
@@ -804,16 +864,34 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
         limit: limit as usize,
         exact,
         coverage,
+        // Conservative: any skipped (binary, oversize, unreadable, changing) file is incomplete.
+        complete: !walk.truncated && !byte_capped && skipped == 0 && stale == 0 && !saturated,
     })
 }
+/// Lexical find rows plus structured facts about those same rows. The text stays the model-facing
+/// result; `data` lets the controller count evidence and absence without parsing prose.
+struct Found {
+    text: String,
+    data: Value,
+}
+
+#[cfg(test)]
 fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
+    find_result(ws, args).map(|found| found.text)
+}
+
+fn find_result(ws: &Workspace, args: &Value) -> Result<Found, String> {
     let retrieved = retrieve(ws, args, false)?;
     let mut out = String::from(
         "Retrieval: deterministic lexical + syntax declarations; scores are relevance points (no embeddings).\n",
     );
     let mut chosen: Vec<(&str, usize, usize, &str)> = vec![];
+    let mut shown = vec![];
+    // A hit left out for the row limit or the output cap makes the result partial, never absent.
+    let mut capped = false;
     for hit in &retrieved.results {
         if chosen.len() >= retrieved.limit {
+            capped = true;
             break;
         }
         if !retrieved.exact
@@ -839,10 +917,17 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
             hit.snippet
         );
         if out.len() + row.len() > MAX_OUTPUT {
+            capped = true;
             break;
         }
         out.push_str(&row);
         chosen.push((&hit.path, hit.start, hit.end, &hit.source_sha256));
+        shown.push(json!({
+            "path": hit.path,
+            "start": hit.start,
+            "end": hit.end,
+            "source_sha256": hit.source_sha256,
+        }));
     }
     if chosen.is_empty() {
         out.push_str("No matching evidence.\n");
@@ -861,7 +946,17 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
         MAX_OUTPUT.saturating_sub(out.len() + SOURCE_BYTES),
     )?;
     append_sections(ws, &mut out, &targets, related);
-    Ok(out)
+    let scope = ws.rel(&ws.resolve_read(opt_str(args, "path")?.unwrap_or("."))?);
+    let data = json!({"find": {
+        "mode": if retrieved.exact { "exact" } else { "lexical" },
+        "scope": scope,
+        // Walk truncation, byte caps, skipped or stale files and a saturated candidate pool all
+        // make this partial: only a complete walk can prove that nothing matches.
+        "complete": retrieved.complete && !capped,
+        "capped": capped,
+        "shown": shown,
+    }});
+    Ok(Found { text: out, data })
 }
 
 const SOURCE_SECTION: &str = "\nSource excerpts (fresh reads that count as read: do not read these rows again; only complete numbered rows are edit witnesses):\n";
@@ -1020,13 +1115,22 @@ fn related_for(
         .collect();
     related::render(ws, scope, &targets, budget.min(6 * 1024))
 }
-fn rank(a: &Evidence, b: &Evidence) -> std::cmp::Ordering {
-    b.score
-        .cmp(&a.score)
-        .then(a.path.cmp(&b.path))
-        .then(a.start.cmp(&b.start))
-        .then(a.end.cmp(&b.end))
+/// Within one file prefer a tighter explanation at equal relevance. Use the
+/// same ordering for heap admission and presentation so ties stay deterministic.
+fn order_key(
+    score: usize,
+    path: &str,
+    start: usize,
+    end: usize,
+) -> (std::cmp::Reverse<usize>, &str, usize, usize) {
+    (std::cmp::Reverse(score), path, end - start, start)
 }
 
+fn rank(a: &Evidence, b: &Evidence) -> std::cmp::Ordering {
+    order_key(a.score, &a.path, a.start, a.end).cmp(&order_key(b.score, &b.path, b.start, b.end))
+}
+
+#[cfg(test)]
+mod find_result_tests;
 #[cfg(test)]
 mod tests;

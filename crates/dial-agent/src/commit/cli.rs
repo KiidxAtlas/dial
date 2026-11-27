@@ -22,6 +22,7 @@ pub fn parse_commit_args(args: &[String]) -> Result<Option<CommitCommandArgs>, S
             "--dry-run" => result.dry_run = true,
             "--no-changelog" => result.no_changelog = true,
             "--legacy" => result.legacy = true,
+            "--json" => result.json = true,
             "--context" => {
                 result.context = Some(take_value(args, &mut i, "--context")?);
             }
@@ -55,7 +56,7 @@ fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, Stri
 
 /// Help text for the commit command.
 pub fn commit_help() -> &'static str {
-    "Usage:\n  dial commit [options]\n\nOptions:\n  --push           Push after committing\n  --dry-run        Preview without committing\n  --no-changelog   Skip changelog updates\n  --legacy         Use legacy deterministic pipeline\n  --context, -c    Additional context for the model\n  --model, -m      Override model selection\n  --help, -h       Show this help message\n"
+    "Usage:\n  dial commit [options]\n\nOptions:\n  --push           Push after committing\n  --dry-run        Preview without committing\n  --no-changelog   Skip changelog updates\n  --legacy         Use legacy deterministic pipeline\n  --json           Emit machine-readable JSON\n  --context, -c    Additional context for the model\n  --model, -m      Override model selection\n  --help, -h       Show this help message\n"
 }
 
 #[cfg(test)]

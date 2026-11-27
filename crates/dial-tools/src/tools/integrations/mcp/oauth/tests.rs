@@ -238,6 +238,7 @@ fn fixed_credentials_connect_despite_a_mismatched_oauth_grant() {
             &config,
             user.path(),
             user.path(),
+            None,
             Some(Instant::now() + Duration::from_secs(3)),
             &|| false,
         )
