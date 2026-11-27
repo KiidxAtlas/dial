@@ -1096,7 +1096,7 @@ fn discovery_and_a_valid_call_to_the_absent_tool_run_in_the_same_batch() {
 #[test]
 fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
     let server = serve(vec![
-        Reply::Call("tool_search", json!({"names":["web_search"]})),
+        Reply::Call("tool_search", json!({"names":["web_search","grep"]})),
         Reply::Text("loaded"),
     ]);
     let mut e = env(&server.url, "auto");
@@ -1116,25 +1116,25 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Basic workspace tools remain available within the compact offer. Optional helpers cannot
-    // displace them; specialists such as `git` require explicit loading.
-    assert!(initial.len() <= 21, "{initial:?}");
+    // The compact offer keeps basic workspace operations; eligibility and the schema budget
+    // can defer additional discovery tools. Deferred schemas can still be requested explicitly.
+    assert!(initial.len() <= 13, "{initial:?}");
     for core in [
         "read",
         "edit",
         "write",
-        "grep",
+        "find",
         "bash",
         "finish",
         "tool_search",
     ] {
         assert!(initial.contains(&core), "{core}");
     }
-    for deferred in ["find", "git", "lsp", "peers"] {
+    for deferred in ["git", "lsp", "peers", "web_search"] {
         assert!(!initial.contains(&deferred), "{deferred}");
     }
-    assert!(!initial.contains(&"web_search"));
     assert!(names(1).contains(&"web_search"));
+    assert!(names(1).contains(&"grep"));
     let report = a.efficiency_report();
     assert_eq!(
         report["usage"]["by_model"]["openai-compatible/scripted"]["main"]["requests"],

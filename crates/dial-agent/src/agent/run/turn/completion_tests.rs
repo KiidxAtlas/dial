@@ -1010,6 +1010,43 @@ fn an_unattended_shell_deliverable_needs_a_passing_check_before_completion() {
 }
 
 #[test]
+fn an_unattended_snapshot_of_one_result_prompts_an_independent_check() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"printf 'amber\\n' > out.txt; cat out.txt"}),
+            )),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"test \"$(cat out.txt)\" = \"amber\"","check":true}),
+            )),
+        ),
+        response("Wrote the result.", None),
+        response(
+            "I found one result but could not verify completeness.",
+            None,
+        ),
+    ]);
+    with_launch(true, |agent| {
+        connect(agent, &server.url);
+        agent
+            .turn("Write all qualifying labels to out.txt.", &mut NullUi)
+            .unwrap();
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4, "expected a completion deferral");
+    let messages = requests[3]["messages"].to_string();
+    assert!(messages.contains("independent evidence"));
+    assert!(messages.contains("compare the full set"));
+}
+
+#[test]
 fn a_repeated_unverified_unattended_completion_ends_incomplete() {
     let server = llm::fake::serve(vec![
         response("", Some(("bash", json!({"command":WRITE_RESULT})))),

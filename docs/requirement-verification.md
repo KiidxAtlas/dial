@@ -4,6 +4,8 @@ Dial can map **declared requirements to observed verification**, without interpr
 
 For requests that ask for every qualifying result, Dial's built-in guidance asks the model to enumerate candidates systematically and check for omissions. This guidance does not replace an independent completeness test.
 
+In unattended runs, Dial can defer completion once when the only passing check compares a file's contents against a short value the run itself printed earlier. The follow-up asks for independent evidence, such as comparing the saved output with a separately enumerated result set. This heuristic does not certify completeness.
+
 ## Inspect the mapping before running checks
 
 The agent can call `verify` with `{"plan": true}` to inspect the existing contract without

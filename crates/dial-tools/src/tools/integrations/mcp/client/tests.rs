@@ -753,6 +753,7 @@ fn stdio_mcp_sandbox_config_validates_and_wraps_command() {
     let state_dir = dir.path().join("state");
     let user_dir = dir.path().join("user");
     let extra_write = dir.path().join("extra");
+    std::fs::create_dir(&extra_write).unwrap();
     let sb_cfg = crate::config::types::SandboxConfig {
         allow_network: false,
         extra_write: vec![extra_write.clone()],

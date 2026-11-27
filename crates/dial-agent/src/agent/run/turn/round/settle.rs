@@ -1,8 +1,8 @@
 //! Settle committed effects, evidence and recovery before history publication.
 use super::*;
 
-/// Distinct printed numbers kept per turn for recognizing self-confirming checks.
-const PRINTED_NUMBERS_CAP: usize = 20_000;
+/// Distinct printed values kept per turn for recognizing self-confirming checks.
+const PRINTED_VALUES_CAP: usize = 20_000;
 
 impl Agent<'_> {
     pub(super) fn settle_call<'reply>(
@@ -267,23 +267,27 @@ impl Agent<'_> {
                 let instruction = control["current_instruction"].as_str().unwrap_or_default();
                 crate::agent::verify::checks::self_confirming_values(
                     command,
-                    &self.step_checks.printed_numbers,
+                    &self.step_checks.printed_values,
                     instruction,
                 )
             } else {
                 None
             };
         if matches!(call.name.as_str(), "bash" | "eval")
-            && self.step_checks.printed_numbers.len() < PRINTED_NUMBERS_CAP
+            && self.step_checks.printed_values.len() < PRINTED_VALUES_CAP
         {
-            self.step_checks.printed_numbers.extend(
-                crate::agent::verify::checks::distinctive_numbers(&output.text)
+            use crate::agent::verify::checks::{distinctive_numbers, snapshot_words};
+            let printed = &mut self.step_checks.printed_values;
+            printed.extend(
+                distinctive_numbers(&output.text)
                     .into_iter()
-                    .map(|(_, value)| value),
+                    .map(|(_, value)| value)
+                    .chain(snapshot_words(&output.text).map(str::to_owned))
+                    .take(PRINTED_VALUES_CAP - printed.len()),
             );
         }
         if matches!(call.name.as_str(), "bash" | "eval" | "verify")
-            && self.step_checks.failed_tests.len() < PRINTED_NUMBERS_CAP
+            && self.step_checks.failed_tests.len() < PRINTED_VALUES_CAP
         {
             self.step_checks.failed_tests.extend(
                 crate::agent::run::outcome_gradient::failing_tests(&output.text),
