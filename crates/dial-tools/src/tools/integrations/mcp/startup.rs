@@ -54,11 +54,17 @@ impl Attempts {
                 let thread = thread::Builder::new()
                     .name(format!("mcp-{name}-connect"))
                     .spawn_scoped(scope, move || {
+                        let sandbox_spec = crate::tools::sandbox_spec_for_mcp(
+                            &config.sandbox,
+                            Some((&config.state_dir, &config.user_dir)),
+                        )
+                        .ok();
                         let result = connect(
                             name,
                             &config.mcp[name],
                             &config.project_root,
                             &config.user_dir,
+                            sandbox_spec,
                             timeout,
                             &|| cancel.load(Ordering::SeqCst),
                         );

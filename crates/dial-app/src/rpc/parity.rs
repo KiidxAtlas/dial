@@ -103,7 +103,8 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         // `/computer on|off` is a set_setting `integrations` write followed by apply_settings.
         "computer" => Method("computer_status"),
         "tree" => Method("session_tree"),
-        "doctor" | "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
+        "doctor" => Method("doctor"),
+        "setup" => Terminal("interactive repair and setup flows; use `dial doctor`"),
         "update" => Terminal("installs a new binary; use `dial update`"),
         "providers" => Terminal("provider setup wizard; use set_setting, login and remove_api_key"),
         "commit" | "git" | "wt" | "changes" => Terminal(GIT),
@@ -114,8 +115,10 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "hooks" => Method("list_hooks"),
         "ssh" => Method("ssh_hosts"),
         "relay" => Terminal(COLLAB),
-        "compute" | "review" | "seance" | "profile" | "todo" | "understanding" | "accounts"
-        | "share" | "dump" | "trace" | "security" | "graphify" | "image" | "modelpreset"
+        "accounts" => Method("auth_accounts"),
+        "share" => Method("share_session"),
+        "compute" | "review" | "seance" | "profile" | "todo" | "understanding"
+        | "dump" | "trace" | "security" | "graphify" | "image" | "modelpreset"
         | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule" | "plan-review"
         | "contract" | "cleanse" | "gc" | "anonymize" | "images" | "marketplace" | "inbox" => {
             Terminal(PANEL)

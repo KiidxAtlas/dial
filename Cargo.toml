@@ -190,6 +190,7 @@ libc.workspace = true
 rusqlite.workspace = true
 parking_lot.workspace = true
 dial-client.workspace = true
+vt100.workspace = true
 
 [dependencies]
 dial-build-info.workspace = true

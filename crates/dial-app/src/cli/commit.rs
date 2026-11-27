@@ -34,6 +34,10 @@ pub fn run(
         parsed.model = global_model.map(str::to_owned);
     }
     let outcome = run_commit_command(&parsed, cwd, config, &ProviderBackend, &mut |_: &str| true)?;
-    println!("{}", outcome.summary());
+    if parsed.json {
+        println!("{}", outcome.to_json());
+    } else {
+        println!("{}", outcome.summary());
+    }
     Ok(outcome.exit_code())
 }

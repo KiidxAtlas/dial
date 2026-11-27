@@ -1403,7 +1403,7 @@ fn run_bash(
             .try_clone()
             .map_err(|e| format!("creating output pipe: {e}"))?;
         spawn.stdin(Stdio::null()).stdout(writer).stderr(writer_err);
-        let child = crate::platform::process::spawn_group(&mut spawn)
+        let child = crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits())
             .map_err(|e| format!("starting sandboxed shell: {e}"))?;
         Ok::<_, String>((reader, child))
     })();

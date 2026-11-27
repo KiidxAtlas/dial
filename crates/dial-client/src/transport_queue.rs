@@ -10,6 +10,7 @@ struct State<T> {
     bytes: usize,
     senders: usize,
     receiver: bool,
+    woken: bool,
 }
 
 #[derive(Debug)]
@@ -25,6 +26,13 @@ struct Shared<T> {
 pub(super) struct Sender<T>(Arc<Shared<T>>);
 #[derive(Debug)]
 pub(super) struct Receiver<T>(Arc<Shared<T>>);
+#[derive(Debug)]
+pub(super) struct Waker<T>(Arc<Shared<T>>);
+impl<T> Clone for Waker<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 pub(super) fn channel<T>(
     count: usize,
@@ -37,6 +45,7 @@ pub(super) fn channel<T>(
             bytes: 0,
             senders: 1,
             receiver: true,
+            woken: false,
         }),
         changed: Condvar::new(),
         count,
@@ -99,7 +108,18 @@ impl<T> Sender<T> {
         Ok(())
     }
 }
+impl<T> Waker<T> {
+    /// Interrupt a thread currently waiting in [`Receiver::recv_timeout`].
+    pub(super) fn wake(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.woken = true;
+        self.0.changed.notify_all();
+    }
+}
 impl<T> Receiver<T> {
+    pub(super) fn waker(&self) -> Waker<T> {
+        Waker(self.0.clone())
+    }
     pub(super) fn recv(&self) -> Result<T, RecvTimeoutError> {
         let mut state = self.0.state.lock().unwrap();
         loop {
@@ -125,6 +145,10 @@ impl<T> Receiver<T> {
             }
             if state.senders == 0 {
                 return Err(RecvTimeoutError::Disconnected);
+            }
+            if state.woken {
+                state.woken = false;
+                return Err(RecvTimeoutError::Timeout);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {

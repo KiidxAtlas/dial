@@ -376,12 +376,10 @@ impl Session {
         out
     }
 
-    /// Conversation projection with journal timestamps for presentation, not provider fields.
-    /// Synthetic compaction messages keep no timestamp unless one was explicitly retained.
+    /// Original messages on the active branch, with journal timestamps for display on resume.
     pub fn timestamped_messages(&self) -> Vec<Value> {
-        let mut messages = self.messages();
-        let offset = messages.len() - self.active.messages.len();
-        for (message, &index) in messages[offset..].iter_mut().zip(&self.active.messages) {
+        let mut messages = self.archived_messages();
+        for (message, &index) in messages.iter_mut().zip(&self.active.archived) {
             if let Some(object) = message.as_object_mut() {
                 object.insert("dial_timestamp".into(), json!(self.entries[index].ts));
             }

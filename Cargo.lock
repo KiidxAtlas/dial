@@ -2255,6 +2255,7 @@ dependencies = [
  "tempfile",
  "toml",
  "ureq",
+ "vt100",
  "windows-sys 0.61.2",
  "zip",
 ]

@@ -700,11 +700,13 @@ impl Proc {
                 .stdout(slave.try_clone().map_err(|e| format!("cloning PTY: {e}"))?)
                 .stderr(slave)
                 .env("TERM", "xterm-256color");
-            // SAFETY: after fork this closure only calls setsid, the TIOCSCTTY ioctl with
-            // integer arguments, and last_os_error; it neither allocates nor locks Rust state.
-            // Command installs the owned PTY slave at fd 0 before invoking pre_exec.
+            let limits = ws.resource_limits();
+            // SAFETY: after fork this closure only calls async-signal-safe getrlimit/setrlimit,
+            // setsid, the TIOCSCTTY ioctl with integer arguments, and last_os_error; it neither
+            // allocates nor locks Rust state. Command installs the owned PTY slave at fd 0.
             unsafe {
-                spawn.pre_exec(|| {
+                spawn.pre_exec(move || {
+                    crate::platform::process::apply_resource_limits(limits)?;
                     if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -734,7 +736,7 @@ impl Proc {
                 None
             };
             spawn.stdout(writer).stderr(writer_err);
-            let child = crate::platform::process::spawn_group(&mut spawn).map_err(|e| {
+            let child = crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits()).map_err(|e| {
                 crate::tools::exec::shell::discard_unspawned_script(&spawn);
                 format!("starting sandboxed shell: {e}")
             })?;
@@ -798,7 +800,7 @@ impl Proc {
                 None
             };
             spawn.stdout(writer).stderr(writer_err);
-            let child = crate::platform::process::spawn_group(&mut spawn).map_err(|e| {
+            let child = crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits()).map_err(|e| {
                 crate::tools::exec::shell::discard_unspawned_script(&spawn);
                 format!("starting shell: {e}")
             })?;

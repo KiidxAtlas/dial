@@ -50,6 +50,7 @@ fn args(dry_run: bool) -> CommitCommandArgs {
         dry_run,
         no_changelog: true,
         legacy: false,
+        json: false,
         context: None,
         model: None,
     }

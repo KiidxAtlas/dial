@@ -529,6 +529,24 @@ fn dev_reads_widely_but_not_denied_paths() {
     assert_eq!(code, Some(0), "{out}");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn dev_profile_blocks_appleevents_and_procargs_sysctl() {
+    let fx = Fixture::new();
+    let text = dev_profile(&fx.ws, &[], &[], false).unwrap();
+    assert!(text.contains("\"com.apple.coreservices.appleevents\""));
+    assert!(text.contains("(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))"));
+    if !require_for_test() {
+        return;
+    }
+    let policy = fx.policy(false);
+    let (code, out) = fx.run(
+        &policy,
+        r#"if /usr/bin/osascript -e 'tell application "System Events" to count processes' 2>/dev/null; then exit 40; fi; exit 0"#,
+    );
+    assert_eq!(code, Some(0), "{out}");
+}
+
 /// The serial grant must compile into both profiles and leave every other device closed.
 #[cfg(target_os = "macos")]
 #[test]

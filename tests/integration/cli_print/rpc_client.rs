@@ -673,6 +673,89 @@ fn an_engine_whose_stdout_is_not_read_queues_events_without_loss() {
     assert!(child.wait().unwrap().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn attached_cli_displays_the_owner_reply_and_detaches_without_stopping_it() {
+    use dial::platform::terminal;
+    use std::time::Instant;
+    let env = Env::new();
+    let server = Server::new(vec![text("original-reply"), text("attached-reply")]);
+    let mut owner = Client::connect(&launch(&env, &server), WAIT).unwrap();
+    owner.call("send", json!({"text":"original-prompt"}), WAIT).unwrap();
+    let (mut master, slave) = terminal::open(32, 120).unwrap();
+    let mut input = master.try_clone().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dial"));
+    cmd.args(["attach", &owner.ready().session_id])
+        .current_dir(env.project.path()).env("DIAL_HOME", env.home.path()).env("TERM", "xterm-256color")
+        .stdin(slave.try_clone().unwrap()).stdout(slave.try_clone().unwrap()).stderr(slave);
+    terminal::controlling_child(&mut cmd);
+    let mut viewer = cmd.spawn().unwrap();
+    let mut terminal = vt100::Parser::new(32, 120, 0);
+    let mut wait_for = |needle: &str| {
+        let deadline = Instant::now() + WAIT;
+        let mut buf = [0; 8192];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => terminal.process(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("PTY: {e}"),
+            }
+            if terminal.screen().contents().contains(needle) { return; }
+            if Instant::now() >= deadline { break; }
+        }
+        panic!("missing {needle:?} on screen:\n{}", terminal.screen().contents());
+    };
+    wait_for("original-reply");
+    input.write_all(b"continue-from-cli\r").unwrap();
+    wait_for("attached-reply");
+    input.write_all(b"\x03").unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        // A real terminal keeps consuming output during teardown; tcsetattr can wait for it.
+        let mut tail = [0; 8192];
+        if let Ok(n) = master.read(&mut tail) { terminal.process(&tail[..n]); }
+        if let Some(status) = viewer.try_wait().unwrap() { assert!(status.success()); break; }
+        assert!(Instant::now() < deadline, "detach timed out:\n{}", terminal.screen().contents());
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(owner.call("messages", json!({}), WAIT).unwrap().to_string().contains("continue-from-cli"));
+}
+
+#[test]
+fn attached_prompt_continues_original_session_with_approval_on_owner() {
+    let env = Env::new();
+    ask_before_writes(&env);
+    let server = Server::new(vec![text("first answer"), call("write", json!({"path":"result.txt","content":"approved"})), text("continued")]);
+    let launch = launch(&env, &server);
+    let mut owner = Client::connect(&launch, WAIT).unwrap();
+    let mut viewer = Client::connect(&launch, WAIT).unwrap();
+    let session = owner.ready().session_id.clone();
+    owner.call("send", json!({"text":"first prompt"}), WAIT).unwrap();
+    let before = viewer.call("messages", json!({}), WAIT).unwrap();
+    let prompt = json!({"session_id":session,"text":"write the result"});
+    let foreign_project = tempfile::tempdir().unwrap();
+    let mut outsider = Client::connect(&launch.clone().current_dir(foreign_project.path()), WAIT).unwrap();
+    assert_eq!(code(outsider.call("send_attached_prompt", prompt.clone(), WAIT).unwrap_err()), "refused");
+    assert_eq!(viewer.call("send_attached_prompt", prompt, WAIT).unwrap(), json!({"session_id":session,"queued":true}));
+    let approval = loop {
+        if let Message::Event(e) = next(&mut owner) && let Some(a) = e.approval() { break a; }
+    };
+    assert!(!env.project.path().join("result.txt").exists());
+    assert_eq!(code(viewer.approve(&approval.approval_id, Decision::Allow, WAIT).unwrap_err()), "not_pending");
+    owner.approve(&approval.approval_id, Decision::Allow, WAIT).unwrap();
+    loop {
+        if let Message::Event(e) = next(&mut owner) && e.kind == "collaboration_turn" {
+            assert_eq!(e.body["result"]["text"], "continued", "{}", e.body);
+            break;
+        }
+    }
+    let messages = owner.call("messages", json!({}), WAIT).unwrap();
+    for text in ["first prompt", "first answer", "write the result", "continued"] { assert!(messages.to_string().contains(text)); }
+    assert_eq!(viewer.call("messages", json!({}), WAIT).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(env.project.path().join("result.txt")).unwrap(), "approved");
+}
+
 #[test]
 fn native_peer_board_and_human_mail_are_session_bound_even_during_inference() {
     let env = Env::new();

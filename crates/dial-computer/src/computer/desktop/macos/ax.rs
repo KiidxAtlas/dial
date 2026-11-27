@@ -11,10 +11,13 @@ use std::{
     time::Duration,
 };
 
-use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
+use objc2_application_services::{
+    AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
+    kAXTrustedCheckOptionPrompt,
+};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDate, CFNumber, CFRange, CFRetained, CFString, CFTimeZone, CFType,
-    CGPoint, CGSize, Type,
+    CFArray, CFBoolean, CFDate, CFDictionary, CFNumber, CFRange, CFRetained, CFString, CFTimeZone,
+    CFType, CGPoint, CGSize, Type,
 };
 use parking_lot::Mutex;
 
@@ -810,13 +813,32 @@ fn perform_action(element: &AXUIElement, action: &str) -> CoreResult<()> {
 }
 
 fn ensure_trusted() -> CoreResult<()> {
+    require_trusted("macOS Accessibility permission is not granted for this process")
+}
+
+/// Succeeds when the process is a trusted accessibility client. Otherwise asks
+/// macOS, once per process, to show its Accessibility prompt for the responsible
+/// app and reports `denial` with where to grant it.
+pub(super) fn require_trusted(denial: &str) -> CoreResult<()> {
+    static REQUESTED: std::sync::Once = std::sync::Once::new();
     if is_trusted() {
-        Ok(())
-    } else {
-        Err(DesktopError::permission_denied(
-            "macOS Accessibility permission is not granted for this process",
-        ))
+        return Ok(());
     }
+    REQUESTED.call_once(|| {
+        // SAFETY: The prompt key is a static CFString and the dictionary holds
+        // retained CF values for the duration of this synchronous TCC query.
+        let options = unsafe {
+            CFDictionary::<CFString, CFType>::from_slices(
+                &[kAXTrustedCheckOptionPrompt],
+                &[CFBoolean::new(true).as_ref()],
+            )
+        };
+        // SAFETY: `options` is a CFDictionary<CFString, CFType> as the API expects.
+        unsafe { AXIsProcessTrustedWithOptions(Some(options.as_opaque())) };
+    });
+    Err(DesktopError::permission_denied(format!(
+        "{denial}. Dial asked macOS for access; allow it in System Settings > Privacy & Security > Accessibility (Device Control and Data Access), then restart Dial"
+    )))
 }
 
 fn create_application(pid: libc::pid_t) -> CoreResult<CFRetained<AXUIElement>> {

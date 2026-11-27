@@ -23,12 +23,56 @@ pub fn quiet_error_dialogs() {
     #[cfg(windows)]
     super::imp::process::quiet_error_dialogs();
 }
+/// Optional OS-enforced resource limits applied to a spawned process group.
+/// Any `None` field leaves that resource unchanged from the parent environment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Maximum CPU time in seconds (`RLIMIT_CPU` on Unix; Job Object time limit on Windows).
+    pub max_cpu_secs: Option<u64>,
+    /// Maximum memory in bytes (`RLIMIT_AS` on Unix; Job Object commit memory limit on Windows).
+    pub max_memory_bytes: Option<u64>,
+    /// Maximum size of any single written file in bytes (`RLIMIT_FSIZE` on Unix).
+    pub max_file_size_bytes: Option<u64>,
+    /// Maximum open file descriptors (`RLIMIT_NOFILE` on Unix).
+    pub max_open_files: Option<u64>,
+    /// Maximum simultaneous processes (`RLIMIT_NPROC` on Unix; Job Object active processes on Windows).
+    pub max_processes: Option<u32>,
+}
+
+impl ResourceLimits {
+    pub const fn is_empty(&self) -> bool {
+        self.max_cpu_secs.is_none()
+            && self.max_memory_bytes.is_none()
+            && self.max_file_size_bytes.is_none()
+            && self.max_open_files.is_none()
+            && self.max_processes.is_none()
+    }
+}
+
 
 /// Spawn `command` as the leader of a new process group (Unix: `process_group(0)`; Windows: a
 /// new console process group inside a Job Object assigned before the child runs any code).
 /// On Windows this sets the command's creation flags; do not set them separately.
 pub fn spawn_group(command: &mut Command) -> io::Result<Child> {
     super::imp::process::spawn_group(command)
+}
+
+/// Like [`spawn_group`], also installing any configured OS resource limits before child execution.
+pub fn spawn_group_limited(command: &mut Command, limits: ResourceLimits) -> io::Result<Child> {
+    if limits.is_empty() {
+        return spawn_group(command);
+    }
+    super::imp::process::spawn_group_limited(command, limits)
+}
+
+/// Apply any configured POSIX `setrlimit(2)` bounds inside a Unix `pre_exec` closure.
+/// Async-signal-safe: invokes only `getrlimit`/`setrlimit` on stack values.
+#[cfg(unix)]
+pub fn apply_resource_limits(limits: ResourceLimits) -> io::Result<()> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    super::imp::process::apply_resource_limits(limits)
 }
 
 /// Spawn a console-independent Windows job shared by cooperating Dial processes. The final

@@ -479,7 +479,7 @@ fn cancelling_a_blocked_stdio_write_kills_and_reaps_the_connection() {
         args: vec!["-c".into(), "exec sleep 60".into()],
         ..McpServerConfig::default()
     };
-    let client = Client::spawn("blocked", &config, Shared::new(Vec::new(), None)).unwrap();
+    let client = Client::spawn("blocked", &config, Shared::new(Vec::new(), None), None).unwrap();
     let began = Instant::now();
     let error = client
         .request_with(
@@ -556,7 +556,7 @@ fn closed_stdout_settles_an_inflight_blocked_stdin_write_before_return() {
         args: vec!["-c".into(), "sleep 0.15; exec 1>&-; exec sleep 60".into()],
         ..Default::default()
     };
-    let client = Client::spawn("closed-output", &config, Shared::new(Vec::new(), None)).unwrap();
+    let client = Client::spawn("closed-output", &config, Shared::new(Vec::new(), None), None).unwrap();
     let error = client
         .request_with(
             "tools/call",
@@ -586,7 +586,7 @@ fn progress_callback_panic_settles_blocked_stdio_work() {
         args: vec!["-c".into(), "exec sleep 60".into()],
         ..Default::default()
     };
-    let client = Client::spawn("panic-output", &config, Shared::new(Vec::new(), None)).unwrap();
+    let client = Client::spawn("panic-output", &config, Shared::new(Vec::new(), None), None).unwrap();
     let shared = client.shared.clone();
     let progress = thread::spawn(move || {
         while lock(&shared.state).pending.is_empty() {
@@ -708,5 +708,94 @@ fn terminal_stdio_replies_wait_for_writer_bookkeeping_without_closing_the_server
             }
             assert!(!client.is_closed(), "the connection remains usable");
         });
+    }
+}
+
+#[test]
+fn stdio_mcp_sandbox_config_validates_and_wraps_command() {
+    let remote_sandboxed = McpServerConfig {
+        url: Some("https://mcp.example.com".into()),
+        sandbox: true,
+        ..Default::default()
+    };
+    assert!(
+        crate::config::tools::mcp::validate_server("remote", &remote_sandboxed).is_err(),
+        "remote URL MCP servers must reject local stdio sandbox"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = BTreeMap::new();
+    env.insert("MCP_CUSTOM_TOKEN".into(), "ok".into());
+    let plain = McpServerConfig {
+        program: PathBuf::from("/bin/echo"),
+        args: vec!["hi".into()],
+        cwd: None,
+        env,
+        sandbox: false,
+        ..Default::default()
+    };
+    assert!(crate::config::tools::mcp::validate_server("plain", &plain).is_ok());
+    let cmd = build_stdio_command(&plain, Some(dir.path()), None).unwrap();
+    assert_eq!(cmd.get_program(), "/bin/echo");
+    assert!(
+        cmd.get_envs()
+            .any(|(k, v)| k == "MCP_CUSTOM_TOKEN" && v == Some(std::ffi::OsStr::new("ok"))),
+        "plain stdio command must pass explicit config.env"
+    );
+
+    let state_dir = dir.path().join("state");
+    let user_dir = dir.path().join("user");
+    let extra_write = dir.path().join("extra");
+    let sb_cfg = crate::config::types::SandboxConfig {
+        allow_network: false,
+        extra_write: vec![extra_write.clone()],
+        max_cpu_secs: 45,
+        max_memory_mb: 512,
+        max_file_size_mb: 64,
+        max_open_files: 128,
+        max_processes: 32,
+        ..Default::default()
+    };
+    let spec = crate::tools::sandbox_spec_for_mcp(&sb_cfg, Some((&state_dir, &user_dir))).unwrap();
+    assert_eq!(spec.limits.max_cpu_secs, Some(45));
+    assert_eq!(spec.limits.max_memory_bytes, Some(512 * 1024 * 1024));
+    assert_eq!(spec.limits.max_file_size_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(spec.limits.max_open_files, Some(128));
+    assert_eq!(spec.limits.max_processes, Some(32));
+    match &spec.policy {
+        crate::tools::exec::sandbox::Policy::Dev {
+            deny_read,
+            extra_write: ew,
+            allow_network,
+            ..
+        } => {
+            assert!(!allow_network, "MCP spec must inherit allow_network");
+            assert!(deny_read.contains(&state_dir), "MCP spec must deny project state dir");
+            assert!(deny_read.contains(&user_dir), "MCP spec must deny Dial user dir");
+            assert!(ew.contains(&extra_write), "MCP spec must inherit extra_write");
+        }
+        other => panic!("expected Policy::Dev, got {other:?}"),
+    }
+
+    let sandboxed = McpServerConfig {
+        sandbox: true,
+        ..plain
+    };
+    assert!(crate::config::tools::mcp::validate_server("sandboxed", &sandboxed).is_ok());
+    if matches!(
+        crate::tools::exec::sandbox::Sandbox::detect(),
+        crate::tools::exec::sandbox::Sandbox::Available
+    ) {
+        let cmd = build_stdio_command(&sandboxed, Some(dir.path()), Some(&spec)).unwrap();
+        assert_ne!(cmd.get_program(), "/bin/echo");
+        assert!(
+            cmd.get_envs().any(|(k, v)| k == "TMPDIR" && v.is_some()),
+            "sandboxed MCP command must preserve sandbox TMPDIR instead of wiping it"
+        );
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "MCP_CUSTOM_TOKEN" && v == Some(std::ffi::OsStr::new("ok"))),
+            "sandboxed MCP command must still layer explicit config.env"
+        );
     }
 }

@@ -125,6 +125,11 @@ pub(crate) fn chat(
     let session = if let Some(selection) = selection {
         Some(selection.resolve(&layout.project_root)?)
     } else if let Some(path) = resume_path {
+        if interactive && !cli.restore && Session::open_elsewhere(&path) {
+            let id = Session::read(&path)?.id().to_owned();
+            dial::cli::watch::attach_with_prompt(&layout, &id, &text)?;
+            return Ok(());
+        }
         match Session::open_or_fork(&layout, &path)? {
             dial::storage::session::Resumed::Owned(session) => Some(session),
             dial::storage::session::Resumed::Forked { source_id, session } => {

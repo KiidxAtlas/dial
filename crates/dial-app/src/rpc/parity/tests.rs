@@ -49,7 +49,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "compute",
     "contract",
     "debug",
-    "doctor",
     "dump",
     "experience",
     "fresh",
@@ -77,7 +76,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "security",
     "setup",
     "shake",
-    "share",
     "steering",
     "tan",
     "todo",
@@ -86,7 +84,6 @@ const TERMINAL_BASELINE: &[&str] = &[
     "update",
     "weights",
     "wt",
-    "accounts",
 ];
 
 #[test]

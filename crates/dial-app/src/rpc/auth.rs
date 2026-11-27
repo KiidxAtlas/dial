@@ -498,5 +498,52 @@ pub(super) fn providers(user_dir: &Path, config: Option<&Config>) -> Value {
     json!({ "providers": providers, "key_providers": key_providers, "endpoint_keys": endpoint_keys })
 }
 
+/// `auth_accounts`: list, select, or remove stored OAuth accounts for a provider.
+pub(super) fn accounts(user_dir: &Path, params: &Value) -> Result<Value> {
+    let provider = params["provider"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| coded(ErrorCode::InvalidParams, "auth_accounts requires params.provider"))?;
+    let action = params["action"].as_str().unwrap_or("list");
+    match action {
+        "list" => {}
+        "select" => {
+            let key = params["key"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| coded(ErrorCode::InvalidParams, "select requires params.key"))?;
+            oauth::select_account(user_dir, provider, key)
+                .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+        }
+        "remove" => {
+            let key = params["key"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| coded(ErrorCode::InvalidParams, "remove requires params.key"))?;
+            oauth::sign_out_account(user_dir, provider, key)
+                .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+        }
+        other => {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                format!("unknown auth_accounts action {other:?}; expected list, select, or remove"),
+            ));
+        }
+    }
+    let accounts: Vec<Value> = oauth::list_accounts(user_dir, provider)
+        .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?
+        .into_iter()
+        .map(|account| {
+            json!({
+                "key": account.key,
+                "label": account.label,
+                "active": account.active,
+                "cooling": account.cooling,
+            })
+        })
+        .collect();
+    Ok(json!({ "provider": provider, "accounts": accounts }))
+}
+
 #[cfg(test)]
 mod tests;

@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod attachment;
 mod pane;
 pub(crate) mod state;
 const MAX_EVENT: usize = 128 * 1024;
@@ -254,6 +255,22 @@ pub(crate) fn preview_image(
     }
     Ok((Some(thumbnail), warning))
 }
+/// Attach to a running session by an unambiguous project-local ID prefix.
+pub fn attach(layout: &Layout, prefix: &str) -> Result<i32> {
+    attach_with_prompt(layout, prefix, "")
+}
+
+pub fn attach_with_prompt(layout: &Layout, prefix: &str, initial: &str) -> Result<i32> {
+    use crate::storage::session::Session;
+    ensure!(!prefix.is_empty(), "a session ID is required");
+    let found = Session::find_prefix(layout, prefix)?;
+    let [info] = found.as_slice() else { anyhow::bail!("Expected one session matching {prefix:?}, found {}", found.len()) };
+    ensure!(Session::open_elsewhere(&info.path), "This session is not running; resume it instead");
+    ensure!(std::io::stdout().is_terminal(), "Session attachment requires a terminal");
+    let endpoint = attachment::Endpoint::lookup(layout, &info.id)?;
+    if !initial.trim().is_empty() { endpoint.send(layout, &info.id, initial)?; }
+    pane::run(layout, &info.id, &directory(layout, &info.id)?, &mut std::io::empty(), Some((info, endpoint)))
+}
 
 pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
     let dir = directory(layout, &args.session)?;
@@ -272,7 +289,7 @@ pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
     let protocol = terminal.then(ImageProtocol::detect).flatten();
     let mut reader = BufReader::new(file);
     if !args.once && terminal {
-        return pane::run(layout, &args.session, &dir, &mut reader);
+        return pane::run(layout, &args.session, &dir, &mut reader, None);
     }
     let mut pending = Vec::new();
     let mut out = std::io::stdout().lock();

@@ -38,13 +38,7 @@ impl MacosBackend {
     }
 
     fn require_input_permission() -> CoreResult<()> {
-        if ax::is_trusted() {
-            Ok(())
-        } else {
-            Err(DesktopError::permission_denied(
-                "macOS Accessibility permission is required for native input",
-            ))
-        }
+        ax::require_trusted("macOS Accessibility permission is required for native input")
     }
 }
 

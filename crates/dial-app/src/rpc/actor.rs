@@ -585,15 +585,37 @@ impl<'a> ActorRuntime<'a> {
 
 impl ActorRuntime<'_> {
     fn run(&mut self, in_flight: &mut Option<Value>) -> Result<Exit> {
+        let mut attachment = None;
+        let mut attachment_session = String::new();
         loop {
             if self.worker_out.unavailable() {
                 break;
+            }
+            let session_id = self.agent.session().id();
+            if !self.acp && attachment_session != session_id {
+                attachment = if self.agent.session().path().is_none() { None } else { match crate::cli::watch::attachment::Owner::open(self.layout, session_id) {
+                    Ok(owner) => Some(owner),
+                    Err(error) => { self.ui.notice(&format!("Session attachment unavailable: {error:#}")); None }
+                } };
+                attachment_session = session_id.to_owned();
             }
             let request = match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(request) => request,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.idle_tick()?;
-                    continue;
+                    let Some(owner) = &attachment else { continue };
+                    if !owner.pending() || crate::collab::room::is_guest() || self.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() { continue; }
+                    match owner.take() {
+                        Ok(Some(text)) => {
+                            self.flag.store(false, Ordering::SeqCst);
+                            json!({"method":"send","params":{"text":text},"_collaboration":true})
+                        }
+                        other => {
+                            self.active.store(false, Ordering::SeqCst);
+                            if let Err(error) = other { self.ui.notice(&format!("Attached prompt refused: {error:#}")); }
+                            continue;
+                        }
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
@@ -1054,7 +1076,7 @@ impl ActorRuntime<'_> {
                     .envelope
                     .live
                     .snapshot(Some(self.agent.session().id()), output.envelope.seq);
-                snapshot["messages"] = json!(self.agent.session().messages());
+                snapshot["messages"] = Value::Array(self.agent.session().archived_messages());
                 snapshot["busy"] = json!(false);
                 snapshot["todo"] = json!(self.agent.todo().snapshot());
                 self.recovery_reply = Some(self.worker_out.reserve_reply(&output)?);
@@ -1331,7 +1353,7 @@ impl ActorRuntime<'_> {
             "fork_session" => self.fork_session(params),
             "close_session" if self.acp => self.close_session(params),
             "list_sessions" if self.acp => self.list_sessions(params),
-            "messages" => Ok(json!({"messages":self.agent.session().messages()})),
+            "messages" => Ok(json!({"messages":self.agent.session().archived_messages()})),
             "rename" => {
                 self.agent.session_mut().rename(
                     params["title"]
@@ -1883,7 +1905,7 @@ impl ActorRuntime<'_> {
             }
             self.publish_activation();
             if params["_replay"] == true {
-                for message in self.agent.session().messages() {
+                for message in self.agent.session().archived_messages() {
                     if self.flag.load(Ordering::SeqCst)
                         || self.worker_out.failed.load(Ordering::SeqCst)
                     {

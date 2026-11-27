@@ -209,6 +209,8 @@ pub struct Workspace {
     web_network_block: Option<&'static str>,
     policy: Option<exec::sandbox::Policy>,
     unsandboxed: bool,
+    /// Optional OS resource limits applied to foreground and background shell commands.
+    resource_limits: crate::platform::process::ResourceLimits,
     /// Shell that runs `bash` commands (`shell.backend`).
     shell_backend: crate::config::types::ShellBackend,
     /// Shrink the output of recognised noisy commands (`shell.minimize_output`).
@@ -284,6 +286,7 @@ impl Workspace {
             web_network_block: Some("no session network policy is attached"),
             policy: None,
             unsandboxed: false,
+            resource_limits: crate::platform::process::ResourceLimits::default(),
             shell_backend: crate::config::types::ShellBackend::Auto,
             minimize_output: false,
             git_guard: crate::config::types::GitGuard::Workers,
@@ -422,6 +425,19 @@ impl Workspace {
     pub fn with_policy(mut self, policy: exec::sandbox::Policy) -> Self {
         self.policy = Some(policy);
         self
+    }
+
+    /// Configure OS-enforced resource limits for shell commands spawned in this workspace.
+    pub fn with_resource_limits(
+        mut self,
+        limits: crate::platform::process::ResourceLimits,
+    ) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+
+    pub fn resource_limits(&self) -> crate::platform::process::ResourceLimits {
+        self.resource_limits
     }
 
     /// The sandbox policy in force at exec time. Attached roots get normal write access,
@@ -2130,8 +2146,77 @@ fn io_message(action: &str, path: &str, error: &io::Error) -> String {
     }
 }
 
-/// Apply the configured shell sandbox. `protected` is (dial state dir, dial user dir): in developer
-/// mode bash may read most of the machine but never those or common credential directories.
+/// Unified OS sandbox policy and process resource limits shared across shell commands,
+/// background PTY jobs, and opt-in sandboxed stdio MCP servers.
+#[derive(Clone, Debug)]
+pub struct SandboxSpec {
+    pub policy: exec::sandbox::Policy,
+    pub limits: crate::platform::process::ResourceLimits,
+}
+
+/// Convert `[sandbox]` config fields (`0 = inherit`) into OS process resource limits.
+pub fn sandbox_resource_limits(config: &SandboxConfig) -> crate::platform::process::ResourceLimits {
+    crate::platform::process::ResourceLimits {
+        max_cpu_secs: (config.max_cpu_secs > 0).then_some(config.max_cpu_secs),
+        max_memory_bytes: (config.max_memory_mb > 0)
+            .then(|| config.max_memory_mb.saturating_mul(1024 * 1024)),
+        max_file_size_bytes: (config.max_file_size_mb > 0)
+            .then(|| config.max_file_size_mb.saturating_mul(1024 * 1024)),
+        max_open_files: (config.max_open_files > 0).then_some(config.max_open_files),
+        max_processes: (config.max_processes > 0).then_some(config.max_processes),
+    }
+}
+
+/// Build the canonical Dev sandbox policy (project state, user dir, subscription auth, home
+/// secrets denied; `extra_write` expanded from `~`).
+pub fn sandbox_dev_policy(
+    config: &SandboxConfig,
+    protected: Option<(&Path, &Path)>,
+) -> Result<exec::sandbox::Policy> {
+    let home = crate::config::paths::home_dir();
+    let mut deny_read: Vec<PathBuf> = Vec::new();
+    if let Some((state, user)) = protected {
+        deny_read.push(state.to_owned());
+        deny_read.push(user.to_owned());
+        deny_read.push(crate::config::paths::subscription_auth_dir(user)?);
+    } else if let Ok(user) = crate::config::paths::user_dir() {
+        if let Ok(auth) = crate::config::paths::subscription_auth_dir(&user) {
+            deny_read.push(auth);
+        }
+        deny_read.push(user);
+    }
+    if let Some(home) = &home {
+        deny_read.extend(dev_home_secrets(home));
+    }
+    let extra_write = config
+        .extra_write
+        .iter()
+        .map(|p| match (p.strip_prefix("~"), &home) {
+            (Ok(rest), Some(home)) => home.join(rest),
+            _ => p.clone(),
+        })
+        .collect();
+    Ok(exec::sandbox::Policy::Dev {
+        deny_read,
+        extra_write,
+        allow_network: config.allow_network,
+        serial_ports: config.serial_ports,
+    })
+}
+
+/// Build the unified sandbox policy + resource limits for opt-in sandboxed stdio MCP servers.
+pub fn sandbox_spec_for_mcp(
+    config: &SandboxConfig,
+    protected: Option<(&Path, &Path)>,
+) -> Result<SandboxSpec> {
+    Ok(SandboxSpec {
+        policy: sandbox_dev_policy(config, protected)?,
+        limits: sandbox_resource_limits(config),
+    })
+}
+
+/// Apply `[sandbox]` configuration to a workspace (shell, background jobs, and web guard).
+/// In Dev mode bash may read most of the machine but never Dial state or common credential dirs.
 pub fn apply_sandbox_config(
     ws: Workspace,
     config: &SandboxConfig,
@@ -2152,7 +2237,8 @@ pub fn apply_sandbox_config(
         .with_network_rules(
             exec::sandbox::netproxy::NetworkRules::new(&config.network_allow, &config.network_deny)
                 .map_err(anyhow::Error::msg)?,
-        );
+        )
+        .with_resource_limits(sandbox_resource_limits(config));
     if let Some((_, user)) = protected {
         let auth = crate::config::paths::subscription_auth_dir(user)?;
         ws.credential_paths = vec![
@@ -2169,38 +2255,13 @@ pub fn apply_sandbox_config(
             extra_write: Vec::new(),
             serial_ports: config.serial_ports,
         }),
-        SandboxMode::Dev => {
-            let home = crate::config::paths::home_dir();
-            let mut deny_read: Vec<PathBuf> = Vec::new();
-            if let Some((state, user)) = protected {
-                deny_read.push(state.to_owned());
-                deny_read.push(user.to_owned());
-                deny_read.push(crate::config::paths::subscription_auth_dir(user)?);
-            }
-            if let Some(home) = &home {
-                deny_read.extend(dev_home_secrets(home));
-            }
-            let extra_write = config
-                .extra_write
-                .iter()
-                .map(|p| match (p.strip_prefix("~"), &home) {
-                    (Ok(rest), Some(home)) => home.join(rest),
-                    _ => p.clone(),
-                })
-                .collect();
-            ws.with_policy(Policy::Dev {
-                deny_read,
-                extra_write,
-                allow_network: config.allow_network,
-                serial_ports: config.serial_ports,
-            })
-        }
+        SandboxMode::Dev => ws.with_policy(sandbox_dev_policy(config, protected)?),
     })
 }
 
 /// Home paths the Dev sandbox policy never lets a command read: credential directories, and the
 /// credential files that exist.
-fn dev_home_secrets(home: &Path) -> Vec<PathBuf> {
+pub(crate) fn dev_home_secrets(home: &Path) -> Vec<PathBuf> {
     let mut denied: Vec<PathBuf> = [
         ".ssh",
         ".aws",

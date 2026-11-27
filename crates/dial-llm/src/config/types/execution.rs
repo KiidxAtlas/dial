@@ -172,6 +172,21 @@ pub struct SandboxConfig {
     /// Let sandboxed commands open USB serial adapters (Arduino, ESP32 and similar boards) so
     /// build tools can flash them and read their serial output. Off by default.
     pub serial_ports: bool,
+    /// Per-command CPU time limit in seconds (`RLIMIT_CPU` / Windows Job Object limit). Zero inherits the parent OS limit.
+    #[serde(default)]
+    pub max_cpu_secs: u64,
+    /// Memory limit in MiB (`RLIMIT_AS` / Windows Job Object memory limit). Zero inherits the parent OS limit.
+    #[serde(default)]
+    pub max_memory_mb: u64,
+    /// Maximum single file size in MiB (`RLIMIT_FSIZE` on Unix). Zero inherits the parent OS limit.
+    #[serde(default)]
+    pub max_file_size_mb: u64,
+    /// Maximum open file descriptors (`RLIMIT_NOFILE` on Unix). Zero inherits the parent OS limit.
+    #[serde(default)]
+    pub max_open_files: u64,
+    /// Maximum simultaneous processes (`RLIMIT_NPROC` / Windows Job Object limit). Zero inherits the parent OS limit.
+    #[serde(default)]
+    pub max_processes: u32,
 }
 
 impl Default for SandboxConfig {
@@ -183,6 +198,11 @@ impl Default for SandboxConfig {
             network_allow: vec![],
             network_deny: vec![],
             serial_ports: false,
+            max_cpu_secs: 0,
+            max_memory_mb: 0,
+            max_file_size_mb: 0,
+            max_open_files: 0,
+            max_processes: 0,
         }
     }
 }

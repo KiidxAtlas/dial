@@ -100,6 +100,73 @@ pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Chil
     spawn(command.process_group(0))
 }
 
+/// Apply one POSIX `setrlimit(2)` bound, clamping against the current hard limit so lowering a
+/// resource never fails with `EPERM` when the parent environment already enforces a tighter cap.
+fn apply_rlimit(resource: libc::c_int, limit: u64) -> io::Result<()> {
+    // SAFETY: `rlimit` is a plain C struct; `getrlimit`/`setrlimit` are async-signal-safe syscalls.
+    unsafe {
+        let mut current = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(resource, &mut current) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let requested = libc::rlim_t::try_from(limit).unwrap_or(libc::rlim_t::MAX);
+        let clamped_max = if current.rlim_max == libc::RLIM_INFINITY {
+            requested
+        } else {
+            requested.min(current.rlim_max)
+        };
+        let clamped_cur = if current.rlim_cur == libc::RLIM_INFINITY {
+            clamped_max
+        } else {
+            clamped_max.min(current.rlim_cur)
+        };
+        let next = libc::rlimit {
+            rlim_cur: clamped_cur,
+            rlim_max: clamped_max,
+        };
+        if libc::setrlimit(resource, &next) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Apply all configured POSIX `setrlimit(2)` bounds in the current process.
+/// Async-signal-safe: invokes only `getrlimit`/`setrlimit` on stack values, so it may be
+/// called directly from a `CommandExt::pre_exec` closure (including PTY child setup).
+pub(in crate::platform) fn apply_resource_limits(
+    limits: crate::platform::process::ResourceLimits,
+) -> io::Result<()> {
+    if let Some(secs) = limits.max_cpu_secs {
+        apply_rlimit(libc::RLIMIT_CPU as libc::c_int, secs)?;
+    }
+    if let Some(bytes) = limits.max_memory_bytes {
+        apply_rlimit(libc::RLIMIT_AS as libc::c_int, bytes)?;
+    }
+    if let Some(bytes) = limits.max_file_size_bytes {
+        apply_rlimit(libc::RLIMIT_FSIZE as libc::c_int, bytes)?;
+    }
+    if let Some(files) = limits.max_open_files {
+        apply_rlimit(libc::RLIMIT_NOFILE as libc::c_int, files)?;
+    }
+    if let Some(procs) = limits.max_processes {
+        apply_rlimit(libc::RLIMIT_NPROC as libc::c_int, u64::from(procs))?;
+    }
+    Ok(())
+}
+
+pub(in crate::platform) fn spawn_group_limited(
+    command: &mut Command,
+    limits: crate::platform::process::ResourceLimits,
+) -> io::Result<Child> {
+    // SAFETY: The closure runs between fork and exec and invokes only async-signal-safe
+    // `getrlimit`/`setrlimit` syscalls on plain stack values copied by value.
+    unsafe {
+        command.pre_exec(move || apply_resource_limits(limits));
+    }
+    spawn(command.process_group(0))
+}
+
 pub(in crate::platform) fn kill_group(leader: u32) -> io::Result<()> {
     // SAFETY: killpg only signals; the caller owns the group it names.
     check(unsafe { libc::killpg(pid(leader)?, libc::SIGKILL) })

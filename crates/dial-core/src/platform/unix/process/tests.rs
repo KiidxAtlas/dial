@@ -89,3 +89,26 @@ fn children_outlive_the_short_lived_thread_that_spawned_them() {
         "the caller keeps its command"
     );
 }
+
+#[test]
+fn spawn_group_limited_applies_rlimits_in_child() {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "ulimit -n; ulimit -f"])
+        .stdout(std::process::Stdio::piped());
+    let limits = crate::platform::process::ResourceLimits {
+        max_open_files: Some(64),
+        max_file_size_bytes: Some(1024 * 1024),
+        ..Default::default()
+    };
+    let child = spawn_group_limited(&mut command, limits).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let nofile: u64 = lines.next().unwrap_or("").trim().parse().unwrap();
+    assert!(nofile <= 64, "expected RLIMIT_NOFILE <= 64, got {nofile}");
+    // POSIX `ulimit -f` reports 512-byte blocks (1 MiB == 2048 blocks).
+    let fsize: u64 = lines.next().unwrap_or("").trim().parse().unwrap();
+    assert!(fsize <= 2048, "expected RLIMIT_FSIZE <= 2048 blocks, got {fsize}");
+}

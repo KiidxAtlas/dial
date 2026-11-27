@@ -1130,9 +1130,11 @@ impl Admin {
                 | "get_schema"
                 | "code_history"
                 | "stats"
+                | "doctor"
                 | "list_hooks"
                 | "ssh_hosts"
                 | "list_worktrees"
+                | "commit_preview"
                 | "import_candidates"
                 | "computer_status"
         )
@@ -1259,10 +1261,12 @@ impl Admin {
             "list_skills" => skills::list(&layout, &config.skills.registries, params),
             "code_history" => reports::code_history(&layout, &config, params),
             "stats" => reports::stats(&layout, params),
+            "doctor" => integrations::doctor(&layout, self.saved_config().ok().as_ref(), params),
             // Saved, not running, configuration: an edit made with `set_setting` shows at once.
             "list_hooks" => integrations::hooks(&self.saved_config()?),
             "ssh_hosts" => integrations::ssh_hosts(&self.saved_config()?),
             "list_worktrees" => integrations::worktrees(&layout.project_root),
+            "commit_preview" => integrations::commit_preview(&layout, &self.saved_config()?, params),
             "import_candidates" => integrations::import_candidates(&layout, params),
             "import_session" => integrations::import_session(&layout, params),
             "computer_status" => Ok(integrations::computer_status(&self.saved_config()?)),
@@ -1723,6 +1727,19 @@ fn run_control(
                 "list_peers" if !acp => {
                     out.result(&id, peers.list(&request["params"]));
                 }
+                "send_attached_prompt" if !acp => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct AttachedPrompt { session_id: String, text: String }
+                    let result = serde_json::from_value::<AttachedPrompt>(request["params"].clone())
+                        .map_err(|error| coded(ErrorCode::InvalidParams, error))
+                        .and_then(|args| {
+                            crate::cli::watch::attachment::Endpoint::queue(&admin.layout(), &args.session_id, &args.text)
+                                .map_err(|error| coded(ErrorCode::Refused, error))?;
+                            Ok(json!({"queued":true,"session_id":args.session_id}))
+                        });
+                    out.result(&id, result);
+                }
                 "send_peer_message" if !acp => {
                     out.result(&id, peers.send(&request["params"]));
                 }
@@ -1952,6 +1969,13 @@ fn run_control(
                     })();
                     out.result(&id, result);
                 }
+                "auth_accounts" => {
+                    let result = (|| -> Result<Value> {
+                        auth::ensure_v2(&out)?;
+                        auth::accounts(&auth_dir, &request["params"])
+                    })();
+                    out.result(&id, result);
+                }
                 "usage" if !acp => {
                     // Each signed-in provider is asked over the network; answer off the
                     // controller so other requests keep flowing. The connection's cancel token
@@ -1961,6 +1985,24 @@ fn run_control(
                         move |cancel| {
                             let outcomes = crate::llm::usage_report::fetch_all(&dir, &cancel);
                             Ok(crate::llm::usage_report::outcomes_json(&outcomes))
+                        },
+                        move |result| reply.result(&answer_id, result),
+                    ) {
+                        out.result(&id, Err(error));
+                    }
+                }
+                "share_session" if !acp => {
+                    let (admin, reply, answer_id, params) = (
+                        admin.clone(),
+                        out.clone(),
+                        id.clone(),
+                        request["params"].clone(),
+                    );
+                    if let Err(error) = read_jobs.spawn(
+                        move |_| {
+                            let layout = admin.layout();
+                            let config = admin.saved_config()?;
+                            integrations::share_session(&layout, &config, &params)
                         },
                         move |result| reply.result(&answer_id, result),
                     ) {
@@ -2278,9 +2320,11 @@ fn run_control(
                 | "search_sessions"
                 | "code_history"
                 | "stats"
+                | "doctor"
                 | "list_hooks"
                 | "ssh_hosts"
                 | "list_worktrees"
+                | "commit_preview"
                 | "import_candidates"
                 | "import_session"
                 | "computer_status"

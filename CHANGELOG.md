@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+- Continue a running local conversation from another terminal (`dial attach ID`) or from Desktop's session sidebar, without making a fork. The original engine retains tool approvals.
+- Keep original prompts and replies when reopening a compacted session, including Desktop's ↑ prompt recall. The model still resumes from its compacted context.
+- The CLI keeps the launch dial moving and the composer responsive while it checks installed toolchain versions. [Terminal rendering](docs/tui-rendering.md).
+
 ## [0.4.0] - 2026-11-26
 
 - After a reminder to finish an open task, Dial runs outstanding checks before reporting the result instead of stopping merely because it already gave the reminder. [Agent loop](docs/agent-loop.md#completion-and-loop-gates).

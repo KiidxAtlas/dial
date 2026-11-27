@@ -1252,6 +1252,12 @@ fn idle_recovery_handler_returns_history_and_authoritative_live_root_contract() 
             runtime.acp = false;
             let message = json!({"role":"user","content":"saved prompt"});
             runtime.agent.session_mut().append(message.clone()).unwrap();
+            runtime
+                .agent
+                .session_mut()
+                .compact("summary".into(), 0)
+                .unwrap();
+            assert_ne!(runtime.agent.session().messages(), vec![message.clone()]);
             let session_id = runtime.agent.session().id().to_owned();
             {
                 let mut output = runtime.worker_out.mapping().unwrap();

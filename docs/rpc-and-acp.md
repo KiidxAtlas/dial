@@ -281,10 +281,16 @@ turn rather than silently queueing a session change behind it.
   on or off is a `set_setting` write of `integrations` followed by `apply_settings`.
 
 `recovery_snapshot` returns a combined idle transcript and live-state snapshot with an event
-sequence fence. It refuses active workers and oversized histories rather than certifying a
+sequence fence. Its messages are the original turns on the active branch, even after compaction:
+reopening a session restores the conversation and Desktop's ↑ prompt recall, not the model's
+summary. It refuses active workers and oversized histories rather than certifying a
 racing or truncated recovery. Process preceding messages before applying it. `state.live`
 contains only pending approvals, question and todo with their fence; it cannot certify transcript
 recovery. See [client recovery](client-contracts.md#rust-client).
+
+**Continue from another local surface.** Open the running session in Desktop's sidebar (Attached chat in Terminal), or use `dial attach ID` in another terminal in the same project. Interactive `--resume ID` also attaches when the journal is locked. The view follows recorded prompts and replies; it is not a token stream. Enter queues a plain-text prompt for the original CLI or native RPC engine when idle. Only one prompt can wait at a time; approvals and questions remain in the original window. Ctrl+C in the attached terminal detaches without stopping the owner. Closing the owner discards any not-yet-consumed prompt; reopen the saved session to resume normally. Both engines need attachment support. This is local to the same user and project, not a network share.
+
+Native RPC clients can `send_attached_prompt` with `{session_id,text}`. A `queued:true` reply means the live owner's inbox accepted the prompt, not that a turn finished. Do not automatically retry a lost response.
 
 `steer` accepts input only for an active turn, not merely a busy actor, and any supplied session ID
 must match that turn. Admission closes when the turn settles. Unconsumed queued input is discarded

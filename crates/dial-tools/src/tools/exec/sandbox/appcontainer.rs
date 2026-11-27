@@ -27,10 +27,10 @@
 //! Residual limits:
 //! * Programs the container cannot read (installed under the user profile, such as a per-user
 //!   Node or Python) cannot run unless their folder is listed in `sandbox.extra_write`.
-//! * As with Low integrity, a protected `.git` can be renamed away through the parent's
-//!   delete-child right; in-place changes are refused.
+//! * Writable roots omit `FILE_DELETE_CHILD` (while keeping inherited `DELETE` on ordinary files)
+//!   so `.git` and `deny_read` entries with explicit `DENY DELETE` cannot be renamed away through
+//!   their parent directory.
 //! * Domain filtering (`network_allow`/`network_deny`) is still refused on Windows.
-
 // Compiled on other platforms only for the policy tests below.
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -183,12 +183,15 @@ mod imp {
     /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
     const ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
 
+    /// `FILE_DELETE_CHILD` directory right: omitted from writable roots so explicit `DENY DELETE`
+    /// ACEs on `.git` and `deny_read` children cannot be bypassed by renaming via the parent.
+    const FILE_DELETE_CHILD: u32 = 0x40;
+
     /// Every right that changes a file or directory, its attributes, its security descriptor or
     /// its children: write/append data, write EA and attributes, delete, delete child, WRITE_DAC
     /// and WRITE_OWNER. Read, execute and SYNCHRONIZE stay available.
-    const WRITE_RIGHTS: u32 = 0x2 | 0x4 | 0x10 | 0x100 | 0x1_0000 | 0x40 | 0x4_0000 | 0x8_0000;
-
-    /// The fixed profile of the enforcement self-test, so it does not create one per run.
+    const WRITE_RIGHTS: u32 =
+        0x2 | 0x4 | 0x10 | 0x100 | 0x1_0000 | FILE_DELETE_CHILD | 0x4_0000 | 0x8_0000;
     const SELF_TEST_PROFILE: &str = "dial.sandbox.5e1f7e57";
 
     /// A SID released with `FreeSid` (AppContainer SIDs) or `LocalFree` (string conversions).
@@ -303,7 +306,7 @@ mod imp {
     impl Access {
         fn entry(self) -> (i32, u32) {
             match self {
-                Access::Full => (GRANT_ACCESS, FILE_ALL_ACCESS),
+                Access::Full => (GRANT_ACCESS, FILE_ALL_ACCESS & !FILE_DELETE_CHILD),
                 Access::ReadExecute => (GRANT_ACCESS, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
                 Access::NoWrite => (DENY_ACCESS, WRITE_RIGHTS),
                 Access::None => (DENY_ACCESS, FILE_ALL_ACCESS),
@@ -685,6 +688,7 @@ Set-Content -Path ..\outside\canary.txt -Value x
 Get-Content -Path ..\outside\readable.txt
 Get-Content -Path secret\secret.txt
 Set-Content -Path .git\config -Value changed
+Rename-Item -Path .git -NewName .git-moved
 Write-Output done
 ";
         let encoded: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -735,8 +739,10 @@ Write-Output done
                 "a read outside the workspace or of a protected path was not blocked".into(),
             );
         }
-        if std::fs::read_to_string(git.join("config")).ok().as_deref() != Some("original") {
-            return Err("Git metadata inside the workspace was writable".into());
+        if !git.exists()
+            || std::fs::read_to_string(git.join("config")).ok().as_deref() != Some("original")
+        {
+            return Err("Git metadata inside the workspace was writable or renamable".into());
         }
         Ok(())
     }

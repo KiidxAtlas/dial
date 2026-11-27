@@ -234,17 +234,24 @@ impl Session {
 
     /// Active-branch conversation turns as `(role, text)`, for the picker's preview pane.
     pub fn preview_turns(path: &Path) -> Result<Vec<(String, String)>> {
-        let s = Self::read(path)?;
+        Self::read(path)?.conversation_text(Some(PICKER_PREVIEW_CHARS))
+    }
+
+    /// Full conversation text from the live writer's active branch, without claiming its lock.
+    pub fn conversation_turns(path: &Path) -> Result<Vec<(String, String)>> {
+        Self::read(path)?.conversation_text(None)
+    }
+
+    fn conversation_text(&self, limit: Option<usize>) -> Result<Vec<(String, String)>> {
         let mut turns = Vec::new();
-        for &i in &s.active.branch {
-            let Kind::Message(message) = &s.entries[i].kind else {
+        for &i in &self.active.branch {
+            let Kind::Message(message) = &self.entries[i].kind else {
                 continue;
             };
             if is_conversation_message(message) {
-                turns.push((
-                    role_of(message).to_owned(),
-                    truncate_chars(&content_text(message), PICKER_PREVIEW_CHARS),
-                ));
+                let text = content_text(message);
+                let text = match limit { Some(n) => truncate_chars(&text, n), None => text };
+                turns.push((role_of(message).to_owned(), text));
             }
         }
         Ok(turns)

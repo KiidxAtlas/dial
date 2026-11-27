@@ -170,3 +170,109 @@ fn retained_scores_are_bounded_independently_of_scanned_rows() {
     // (320 bytes on 64-bit targets) plus one 6144-byte vector, independent of rows.
     assert!(heap.capacity() * std::mem::size_of::<VectorMatch>() <= 640);
 }
+
+#[test]
+fn simhash_preserves_angular_ordering_and_recalls_oldest_fact_beyond_exact_threshold() {
+    let a = [1.0f32, 0.0, 0.25, -0.5, 0.75, 0.1, -0.2, 0.9];
+    let near = [0.98f32, 0.02, 0.24, -0.49, 0.74, 0.11, -0.19, 0.89];
+    let opposite: Vec<f32> = a.iter().map(|v| -v).collect();
+    let sig_a = simhash(&a);
+    assert_eq!((sig_a ^ simhash(&a)).count_ones(), 0);
+    assert!((sig_a ^ simhash(&near)).count_ones() <= 4);
+    assert_eq!((sig_a ^ simhash(&opposite)).count_ones(), 64);
+
+    let mut store = store();
+    let target = match store.retain("oldest needle fact", "test", 1).unwrap() {
+        Saved::Created(fact) => fact,
+        _ => unreachable!(),
+    };
+    store
+        .store_vectors("m", &[("oldest needle fact".into(), a.to_vec())])
+        .unwrap();
+    let mut batch = Vec::new();
+    for i in 0..300 {
+        let content = format!("newer haystack fact {i}");
+        store.retain(&content, "test", i + 2).unwrap();
+        // Orthogonal/opposite-ish vectors that should never outrank `a`.
+        let v = vec![
+            -0.5,
+            1.0,
+            (i as f32 % 7.0) * 0.1,
+            0.8,
+            -0.6,
+            0.4,
+            0.9,
+            -0.7,
+        ];
+        batch.push((content, v));
+    }
+    store.store_vectors("m", &batch).unwrap();
+    // With exact_threshold=50 over 301 rows, the old newest-only cap would have dropped `target`.
+    let found = store.nearest_with_threshold("m", &a, 3, 50).unwrap();
+    assert_eq!(found.first().copied(), Some(target.id));
+}
+
+#[test]
+fn lsh_banded_index_recalls_needle_directly_and_purges_on_forget() {
+    let needle_vec = [1.0f32, 0.2, -0.3, 0.8, 0.5, -0.4, 0.7, -0.1];
+    let near_vec = [0.99f32, 0.21, -0.29, 0.79, 0.51, -0.39, 0.69, -0.11];
+    let mut store = store();
+    let target = match store.retain("lsh needle fact", "test", 1).unwrap() {
+        Saved::Created(fact) => fact,
+        _ => unreachable!(),
+    };
+    let target_hash = content_hash(&target.content);
+    store
+        .store_vectors("m", &[("lsh needle fact".into(), needle_vec.to_vec())])
+        .unwrap();
+    let mut batch = Vec::new();
+    for i in 0..80 {
+        let content = format!("lsh neighbor {i}");
+        store.retain(&content, "test", i + 2).unwrap();
+        // First 20 are near neighbors so LSH probe returns >= 16 candidates without full fallback;
+        // remaining 60 are distant haystack vectors.
+        let v = if i < 20 {
+            near_vec.to_vec()
+        } else {
+            vec![-1.0, -0.2, 0.3, -0.8, -0.5, 0.4, -0.7, 0.1]
+        };
+        batch.push((content, v));
+    }
+    store.store_vectors("m", &batch).unwrap();
+
+    let band_rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM embedding_lsh WHERE model='m'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(band_rows, 81 * 4);
+
+    // Direct LSH band probe must retrieve the oldest needle without scanning the full table.
+    let lsh_hits = store
+        .probe_lsh_candidates("m", simhash(&needle_vec), 256)
+        .unwrap();
+    assert!(
+        lsh_hits.iter().any(|(id, _)| *id == target.id),
+        "expected target id in LSH band hits"
+    );
+    assert!(
+        lsh_hits.len() < 81,
+        "LSH probe should skip distant opposite-direction facts"
+    );
+
+    let found = store.nearest_with_threshold("m", &needle_vec, 3, 25).unwrap();
+    assert_eq!(found.first().copied(), Some(target.id));
+
+    // Forgetting the fact must purge all 4 LSH band entries immediately.
+    store.forget(target.id, 1, 500).unwrap();
+    let remaining_for_target: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM embedding_lsh WHERE content_hash=?1",
+            [&target_hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_for_target, 0);
+}

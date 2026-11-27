@@ -46,6 +46,17 @@
         },
         {
           "type": "object",
+          "description": "Queue one text prompt for an exact local running session. Queued is not a turn completion receipt; the original owner executes it when idle and retains approvals.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "send_attached_prompt"},
+            "params": {"type":"object","properties":{"session_id":{"type":"string","minLength":1},"text":{"type":"string","minLength":1,"description":"Nonblank; at most 65536 UTF-8 bytes."}},"required":["session_id","text"],"additionalProperties":false}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Native RPC only. Host the active session archive after explicit consent. Defaults to a read-only room; writable rooms retain configured guest-steering gates. Returns {hosting:true,read_only,session_id}, never a room link or signing key. Setup is cancellable. The connection owns the host: disconnect or replacing its session closes the room.",
           "properties": {
             "id": {
@@ -3413,6 +3424,76 @@
             "id": { "$ref": "#/$defs/id" },
             "method": { "const": "reliability" },
             "params": { "type": "object", "properties": {}, "additionalProperties": false }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "List, select, or remove stored OAuth accounts for a provider (protocol 2), matching `dial auth accounts`. Result: {provider, accounts: [{key, label, active, cooling}]}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "auth_accounts" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": { "type": "string", "minLength": 1 },
+                "action": { "enum": ["list", "select", "remove"] },
+                "key": { "type": "string" }
+              },
+              "required": ["provider"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Inspect optional capability dependencies and memory configuration, matching `dial doctor --json`. Read-only; runs off the agent. Result: {capabilities: [{id, name, installed, path}], notes}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "doctor" },
+            "params": {
+              "type": "object",
+              "properties": { "all": { "type": "boolean" } },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Generate an AI commit message preview for staged changes without committing, matching `dial commit --dry-run --json`. Read-only; runs off the agent. Result: {dry_run, message, warning?, fallback}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "commit_preview" },
+            "params": {
+              "type": "object",
+              "properties": { "model": { "type": "string", "minLength": 1 } },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Encrypt and upload a session share link (share server or secret GitHub gist), matching `dial share --json`. Runs off the agent. Result: {url, notes}.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "method": { "const": "share_session" },
+            "params": {
+              "type": "object",
+              "properties": {
+                "session_id": { "type": "string", "minLength": 1 },
+                "gist": { "type": "boolean" },
+                "endpoint": { "type": "string" },
+                "whole_journal": { "type": "boolean" }
+              },
+              "additionalProperties": false
+            }
           },
           "required": ["method"],
           "additionalProperties": false

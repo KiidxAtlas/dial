@@ -9,20 +9,17 @@
 //! Connect behaviour matches ureq's `TcpConnector`: resolved addresses share the connect budget, and an
 //! address-specific failure (an unrouted IPv6 address, a refusal) moves on to the next address.
 //!
-//! Cancellation reaches both blocking phases a request starts with: the connect runs on a helper thread
-//! the request stops waiting for, and the request body is written in short slices that resume at the
-//! byte offset already sent, so an interrupt never waits out the whole phase budget and a partially sent
-//! request is never replayed.
+//! Cancellation reaches both blocking phases a request starts with: the connect runs non-blocking
+//! on the caller's own thread using `wait_socket_writable` in short slices (so an interrupt closes
+//! the socket immediately without spawning or abandoning a helper thread), and the request body is
+//! written in short slices that resume at the byte offset already sent, so an interrupt never waits
+//! out the whole phase budget and a partially sent request is never replayed.
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{
-    Arc,
-    atomic::AtomicBool,
-    mpsc::{self, RecvTimeoutError},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
-use socket2::{SockRef, TcpKeepalive};
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, TcpKeepalive, Type};
 use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, Transport,
 };
@@ -80,30 +77,110 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
     }
 }
 
-/// [`connect_any`] on a helper thread, abandoned as soon as the request is interrupted. The abandoned
-/// attempt ends on its own within its connect budget and drops whatever socket it opened.
+/// Connects to the first reachable address without blocking past [`CANCEL_POLL`] on an interrupt
+/// and without spawning a helper thread. Dropping the non-blocking socket on cancellation closes
+/// the in-flight handshake immediately.
 fn connect_cancellable(
     addrs: &[SocketAddr],
     timeout: NextTimeout,
     interrupt: &AtomicBool,
 ) -> Result<TcpStream, ureq::Error> {
     super::check(interrupt)?;
-    let addrs = addrs.to_vec();
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("dial-connect".into())
-        .spawn(move || {
-            let _ = tx.send(connect_any(&addrs, timeout));
-        })?;
-    loop {
-        match rx.recv_timeout(CANCEL_POLL) {
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Timeout) => super::check(interrupt)?,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("the connect attempt ended without a result").into());
+    let budget = timeout.not_zero().map(|after| *after);
+    let started = Instant::now();
+    let total_weight = 2.0 * (1.0 - 0.5_f64.powi(addrs.len() as i32));
+    let mut weight = 1.0_f64;
+    let mut last = None;
+    for addr in addrs {
+        super::check(interrupt)?;
+        let per_addr = budget.map(|b| b.mul_f64(weight / total_weight).max(MIN_PER_ADDRESS));
+        match connect_one_cancellable(*addr, per_addr, interrupt) {
+            Ok(stream) => return Ok(stream),
+            Err(ureq::Error::Io(error)) if address_specific(&error) => {
+                last = Some(ureq::Error::Io(error));
             }
+            Err(ureq::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if budget.is_some_and(|budget| started.elapsed() > budget) {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                last = Some(ureq::Error::Timeout(ureq::Timeout::Connect));
+            }
+            Err(error) => return Err(error),
+        }
+        weight /= 2.0;
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused").into()
+    }))
+}
+
+/// Non-blocking TCP connect to one address, polled in [`CANCEL_POLL`] slices so cancellation
+/// stops the handshake immediately and closes the socket.
+fn connect_one_cancellable(
+    addr: SocketAddr,
+    budget: Option<Duration>,
+    interrupt: &AtomicBool,
+) -> Result<TcpStream, ureq::Error> {
+    super::check(interrupt)?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    let sock_addr = SockAddr::from(addr);
+    match socket.connect(&sock_addr) {
+        Ok(()) => {
+            let stream: TcpStream = socket.into();
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        Err(error) if is_in_progress(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let stream: TcpStream = socket.into();
+    let started = Instant::now();
+    loop {
+        super::check(interrupt)?;
+        let mut slice = CANCEL_POLL;
+        if let Some(budget) = budget {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+            }
+            slice = slice.min(remaining);
+        }
+        let ready = crate::platform::io::wait_socket_writable(&stream, slice)?;
+        if let Some(error) = SockRef::from(&stream).take_error()? {
+            return Err(error.into());
+        }
+        if ready {
+            // Verify the peer is actually connected; some kernels signal POLLHUP without SO_ERROR.
+            if let Err(error) = stream.peer_addr() {
+                return Err(error.into());
+            }
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
         }
     }
+}
+
+/// Whether `connect(2)` on a non-blocking socket returned the expected "handshake in progress" code.
+fn is_in_progress(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EINPROGRESS) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(10035 | 10036)) {
+        // WSAEWOULDBLOCK (10035) / WSAEINPROGRESS (10036)
+        return true;
+    }
+    false
 }
 
 pub(in crate::llm) fn keepalive(stream: &TcpStream) -> io::Result<()> {
@@ -115,43 +192,10 @@ pub(in crate::llm) fn keepalive(stream: &TcpStream) -> io::Result<()> {
     )
 }
 
-/// The first address that connects. Budgets follow a halving series that sums to the whole connect budget,
-/// so a host with several addresses still finishes within it.
+/// Convenience wrapper for callers and tests without an external interrupt flag.
+#[cfg(test)]
 fn connect_any(addrs: &[SocketAddr], timeout: NextTimeout) -> Result<TcpStream, ureq::Error> {
-    let budget = timeout.not_zero().map(|after| *after);
-    let started = Instant::now();
-    let total_weight = 2.0 * (1.0 - 0.5_f64.powi(addrs.len() as i32));
-    let mut weight = 1.0_f64;
-    let mut last = None;
-    for addr in addrs {
-        let attempt = match budget {
-            Some(budget) => TcpStream::connect_timeout(
-                addr,
-                budget.mul_f64(weight / total_weight).max(MIN_PER_ADDRESS),
-            ),
-            None => TcpStream::connect(addr),
-        };
-        match attempt {
-            Ok(stream) => return Ok(stream),
-            Err(error) if address_specific(&error) => last = Some(ureq::Error::Io(error)),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if budget.is_some_and(|budget| started.elapsed() > budget) {
-                    return Err(ureq::Error::Timeout(timeout.reason));
-                }
-                last = Some(ureq::Error::Timeout(ureq::Timeout::Connect));
-            }
-            Err(error) => return Err(error.into()),
-        }
-        weight /= 2.0;
-    }
-    Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused").into()
-    }))
+    connect_cancellable(addrs, timeout, &AtomicBool::new(false))
 }
 
 /// This address refused or is unroutable from here; another resolved address may still work.
