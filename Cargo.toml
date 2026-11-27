@@ -132,7 +132,7 @@ x11rb = { version = "=0.14.0", features = ["randr", "xinput", "xtest"] }
 xkeysym = "=0.2.1"
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 xcap = { version = "=0.9.6", default-features = false }
-cpal = "0.16"
+cpal = "0.18"
 block2 = "=0.6.2"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 foreign-types = "=0.5.0"
