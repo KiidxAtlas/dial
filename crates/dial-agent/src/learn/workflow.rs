@@ -35,6 +35,12 @@ pub struct Metrics {
     pub generations: u64,
     pub tool_calls: u64,
     pub investigation_calls: u64,
+    /// Same-check verdicts after a controller-observed code failure and an outside change.
+    #[serde(default)]
+    pub check_repair_verdicts: u64,
+    /// Of those verdicts, the ones that passed.
+    #[serde(default)]
+    pub check_repairs_passed: u64,
     pub protocol_errors: u64,
     /// Visible assistant bytes accompanying tool calls, not hidden reasoning or final answers.
     pub chatter_bytes: u64,
@@ -60,6 +66,16 @@ impl Metrics {
             "repair_round" => self.repair_rounds += 1,
             "change_review" => self.change_reviews += 1,
             "verification" if data["passed"] == false => self.verification_failures += 1,
+            // Only a changed-revision rerun is a repair verdict. Credit a pass only when a
+            // checkpointed edit moved; shell or extension effects alone never count as an edit.
+            "check_repair_verdict" if data["change"] != "no_longer_reproduced" => {
+                self.check_repair_verdicts += 1;
+                if data["verdict"] == "passed"
+                    && data["change"] == "checked_after_checkpointed_edits"
+                {
+                    self.check_repairs_passed += 1;
+                }
+            }
             "generation" => {
                 self.generations += 1;
                 self.completion_tokens = self
@@ -119,6 +135,8 @@ impl Metrics {
             .architecture_tokens
             .saturating_add(other.architecture_tokens);
         self.verification_failures += other.verification_failures;
+        self.check_repair_verdicts += other.check_repair_verdicts;
+        self.check_repairs_passed += other.check_repairs_passed;
         self.repair_rounds += other.repair_rounds;
         self.change_reviews += other.change_reviews;
         self.generations = self.generations.saturating_add(other.generations);

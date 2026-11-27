@@ -922,3 +922,193 @@ fn a_worker_snapshot_never_ingests_build_output_or_dependencies() {
     let files = String::from_utf8(listed.stdout).unwrap();
     assert_eq!(files.trim(), "src/main.rs", "{files}");
 }
+
+#[test]
+fn cwd_targets_subrepositories_and_confines_paths() {
+    let parent = tempfile::tempdir().unwrap();
+    for name in ["repo-a", "repo-b"] {
+        let dir = parent.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let sh = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "{name}: {args:?}"
+            )
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.name", "t"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "commit.gpgsign", "false"]);
+        crate::tools::testkit::disable_inherited_git_filters(&dir);
+        std::fs::write(dir.join("file.txt"), format!("{name}-v1\n")).unwrap();
+        sh(&["add", "file.txt"]);
+        sh(&["commit", "-q", "-m", &format!("init {name}"), "--no-verify"]);
+    }
+    let ws = Workspace::new(parent.path()).unwrap();
+    std::fs::write(parent.path().join("repo-a/file.txt"), "repo-a-v2\n").unwrap();
+    std::fs::write(parent.path().join("repo-b/file.txt"), "repo-b-v2\n").unwrap();
+
+    // Repo-relative and workspace-relative paths both work under `cwd`.
+    let status_a = call(&ws, json!({"action":"status","cwd":"repo-a"}));
+    assert!(!status_a.is_error, "{}", status_a.text);
+    assert!(status_a.text.contains("file.txt"), "{}", status_a.text);
+
+    let diff_rel = call(
+        &ws,
+        json!({"action":"diff","cwd":"repo-a","path":"file.txt"}),
+    );
+    assert!(!diff_rel.is_error, "{}", diff_rel.text);
+    assert!(diff_rel.text.contains("+repo-a-v2"), "{}", diff_rel.text);
+
+    let diff_ws = call(
+        &ws,
+        json!({"action":"diff","cwd":"repo-b","path":"repo-b/file.txt"}),
+    );
+    assert!(!diff_ws.is_error, "{}", diff_ws.text);
+    assert!(diff_ws.text.contains("+repo-b-v2"), "{}", diff_ws.text);
+
+    let log_a = call(&ws, json!({"action":"log","cwd":"repo-a","limit":5}));
+    assert!(!log_a.is_error, "{}", log_a.text);
+    assert!(log_a.text.contains("init repo-a"), "{}", log_a.text);
+
+    // Staging + commit in subrepo works without touching sibling repo.
+    let add_a = call(
+        &ws,
+        json!({"action":"add","cwd":"repo-a","paths":["file.txt"]}),
+    );
+    assert!(!add_a.is_error, "{}", add_a.text);
+    let commit_a = call(
+        &ws,
+        json!({"action":"commit","cwd":"repo-a","message":"update a"}),
+    );
+    assert!(!commit_a.is_error, "{}", commit_a.text);
+    let status_b = call(&ws, json!({"action":"status","cwd":"repo-b"}));
+    assert!(status_b.text.contains("file.txt"), "{}", status_b.text);
+
+    // Escape attempts and non-directories are refused.
+    assert!(call(&ws, json!({"action":"status","cwd":"../outside"})).is_error);
+    assert!(call(&ws, json!({"action":"status","cwd":"repo-a/file.txt"})).is_error);
+    assert!(
+        call(
+            &ws,
+            json!({"action":"diff","cwd":"repo-a","path":"../repo-b/file.txt"})
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn extended_read_actions_and_diff_log_options_work() {
+    let (dir, ws) = repo();
+    let sh = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{args:?}");
+    };
+    std::fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+    sh(&["add", "a.txt"]);
+    sh(&["commit", "-q", "-m", "feat: alpha", "--no-verify"]);
+    sh(&["tag", "v0.1.0"]);
+    std::fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+    sh(&["add", "a.txt"]);
+    sh(&["commit", "-q", "-m", "fix: beta", "--no-verify"]);
+    sh(&["tag", "v0.2.0"]);
+    sh(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.invalid/repo.git",
+    ]);
+
+    // diff with base..head, stat, and name_only
+    let stat = call(
+        &ws,
+        json!({"action":"diff","base":"v0.1.0","head":"v0.2.0","stat":true}),
+    );
+    assert!(!stat.is_error, "{}", stat.text);
+    assert!(
+        stat.text.contains("a.txt") && stat.text.contains("1 file changed"),
+        "{}",
+        stat.text
+    );
+    let names = call(
+        &ws,
+        json!({"action":"diff","base":"v0.1.0","head":"v0.2.0","name_only":true}),
+    );
+    assert_eq!(names.text.trim(), "a.txt");
+    assert!(call(&ws, json!({"action":"diff","head":"HEAD"})).is_error);
+    assert!(
+        call(
+            &ws,
+            json!({"action":"diff","staged":true,"base":"v0.1.0","head":"v0.2.0"})
+        )
+        .is_error
+    );
+
+    // log with rev range, grep, author, stat
+    let filtered = call(
+        &ws,
+        json!({"action":"log","rev":"v0.1.0..v0.2.0","grep":"beta","stat":true}),
+    );
+    assert!(!filtered.is_error, "{}", filtered.text);
+    assert!(
+        filtered.text.contains("fix: beta") && !filtered.text.contains("feat: alpha"),
+        "{}",
+        filtered.text
+    );
+    assert!(filtered.text.contains("a.txt"), "{}", filtered.text);
+
+    // stash_list and stash_show
+    std::fs::write(dir.path().join("a.txt"), "stashed\n").unwrap();
+    sh(&["stash", "push", "-q", "-m", "wip-check"]);
+    let stashes = call(&ws, json!({"action":"stash_list"}));
+    assert!(!stashes.is_error, "{}", stashes.text);
+    assert!(
+        stashes.text.contains("stash@{0}") && stashes.text.contains("wip-check"),
+        "{}",
+        stashes.text
+    );
+    let stash_show = call(&ws, json!({"action":"stash_show","stat":true}));
+    assert!(!stash_show.is_error, "{}", stash_show.text);
+    assert!(stash_show.text.contains("a.txt"), "{}", stash_show.text);
+
+    // tags, remotes, rev_parse (HEAD, single ref, and merge-base)
+    let tags = call(&ws, json!({"action":"tags","limit":5}));
+    assert!(!tags.is_error, "{}", tags.text);
+    assert!(
+        tags.text.contains("v0.2.0") && tags.text.contains("v0.1.0"),
+        "{}",
+        tags.text
+    );
+    let remotes = call(&ws, json!({"action":"remotes"}));
+    assert!(!remotes.is_error, "{}", remotes.text);
+    assert!(
+        remotes.text.contains("origin") && remotes.text.contains("example.invalid"),
+        "{}",
+        remotes.text
+    );
+    let head = call(&ws, json!({"action":"rev_parse"}));
+    assert!(!head.is_error, "{}", head.text);
+    assert!(head.text.lines().count() >= 2, "{}", head.text);
+    let mb = call(
+        &ws,
+        json!({"action":"rev_parse","base":"v0.1.0","head":"v0.2.0"}),
+    );
+    assert!(!mb.is_error, "{}", mb.text);
+    assert_eq!(mb.text.trim().len(), 40, "{}", mb.text);
+
+    // All new read actions run without approval.
+    let tool = Git::default();
+    for action in ["stash_list", "stash_show", "tags", "remotes", "rev_parse"] {
+        assert!(!tool.needs_approval(&json!({"action": action})), "{action}");
+    }
+}

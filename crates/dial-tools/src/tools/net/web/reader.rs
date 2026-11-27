@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CHAIN: [&str; 3] = ["native", "trafilatura", "lynx"];
 const READER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest extracted text accepted from an external reader subprocess.
+const MAX_READER_OUTPUT: u64 = 4 * 1024 * 1024;
 /// How often a running external reader re-checks the interrupt flag.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
 const JINA_ENDPOINT: &str = "https://r.jina.ai/";
@@ -196,7 +198,7 @@ fn run_external(
     let mut stdin = group
         .take_stdin()
         .ok_or_else(|| format!("{program} has no stdin"))?;
-    let mut stdout = group
+    let stdout = group
         .take_stdout()
         .ok_or_else(|| format!("{program} has no stdout"))?;
     let payload = input.as_bytes().to_vec();
@@ -205,7 +207,7 @@ fn run_external(
     });
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
-        let _ = stdout.read_to_end(&mut output);
+        let _ = stdout.take(MAX_READER_OUTPUT + 1).read_to_end(&mut output);
         output
     });
     loop {
@@ -237,6 +239,12 @@ fn run_external(
     let output = reader
         .join()
         .map_err(|_| format!("{program} output reader panicked"))?;
+    if output.len() as u64 > MAX_READER_OUTPUT {
+        return Err(format!(
+            "{program} output exceeded {} bytes",
+            MAX_READER_OUTPUT
+        ));
+    }
     if !status.success() {
         return Err(format!("{program} exited with {status}"));
     }

@@ -736,10 +736,12 @@ impl Proc {
                 None
             };
             spawn.stdout(writer).stderr(writer_err);
-            let child = crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits()).map_err(|e| {
-                crate::tools::exec::shell::discard_unspawned_script(&spawn);
-                format!("starting sandboxed shell: {e}")
-            })?;
+            let child =
+                crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits())
+                    .map_err(|e| {
+                        crate::tools::exec::shell::discard_unspawned_script(&spawn);
+                        format!("starting sandboxed shell: {e}")
+                    })?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
             let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())
@@ -800,10 +802,12 @@ impl Proc {
                 None
             };
             spawn.stdout(writer).stderr(writer_err);
-            let child = crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits()).map_err(|e| {
-                crate::tools::exec::shell::discard_unspawned_script(&spawn);
-                format!("starting shell: {e}")
-            })?;
+            let child =
+                crate::platform::process::spawn_group_limited(&mut spawn, ws.resource_limits())
+                    .map_err(|e| {
+                        crate::tools::exec::shell::discard_unspawned_script(&spawn);
+                        format!("starting shell: {e}")
+                    })?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
             let reader = spawn_pipe_reader(reader, false, ring.clone(), spool, stop.clone())

@@ -10,8 +10,8 @@ use crate::runtime::{
 /// A label for a call whose status is [`ToolStatus::Error`], or `None` for every other status:
 /// blocked, skipped, timed-out and aborted calls are already told apart by the status itself.
 ///
-/// `check_failed` is a check that ran and reported failures, which is the tool working; every
-/// other label is a call that did not do what was asked.
+/// `check_failed` and `nonzero_exit` describe a check or command that ran, not a failure
+/// to execute it. Generic or missing labels do not establish why the call failed.
 pub fn error_class(tool: &str, status: ToolStatus, output: &ToolOutput) -> Option<&'static str> {
     if status != ToolStatus::Error {
         return None;

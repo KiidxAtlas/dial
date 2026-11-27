@@ -1187,13 +1187,21 @@ fn with_bash_interceptor(
         (
             config,
             offered.iter().map(String::as_str).collect::<Vec<_>>(),
+            ws.bash_interceptor_loadable()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         )
     });
     let hint = match &interceptor {
-        Some((config, offered)) => {
-            match bash_interceptor::check_in(config, offered, command, &|path| {
-                ws.resolve(path).is_ok()
-            }) {
+        Some((config, offered, loadable)) => {
+            match bash_interceptor::check_in_with_loadable(
+                config,
+                offered,
+                loadable,
+                command,
+                &|path| ws.resolve(path).is_ok(),
+            ) {
                 Some(Verdict::Block(message)) => {
                     return Ok(ToolOutput::err(message)
                         .with_effects(crate::runtime::execution::Effects::None));
@@ -1215,7 +1223,7 @@ fn with_bash_interceptor(
         output.text.push('\n');
         output.text.push_str(note);
     }
-    if let Some((config, offered)) = interceptor
+    if let Some((config, offered, _)) = interceptor
         && let Some(line) = hint
             .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
             .or_else(|| bash_interceptor::trim_hint(config, command))

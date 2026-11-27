@@ -117,12 +117,10 @@ pub(super) fn parity(name: &str) -> Option<Parity> {
         "relay" => Terminal(COLLAB),
         "accounts" => Method("auth_accounts"),
         "share" => Method("share_session"),
-        "compute" | "review" | "seance" | "profile" | "todo" | "understanding"
-        | "dump" | "trace" | "security" | "graphify" | "image" | "modelpreset"
-        | "changelog" | "loop" | "fresh" | "shake" | "tan" | "debug" | "rule" | "plan-review"
-        | "contract" | "cleanse" | "gc" | "anonymize" | "images" | "marketplace" | "inbox" => {
-            Terminal(PANEL)
-        }
+        "compute" | "review" | "seance" | "profile" | "todo" | "understanding" | "dump"
+        | "trace" | "security" | "graphify" | "image" | "modelpreset" | "changelog" | "loop"
+        | "fresh" | "shake" | "tan" | "debug" | "rule" | "plan-review" | "contract" | "cleanse"
+        | "gc" | "anonymize" | "images" | "marketplace" | "inbox" => Terminal(PANEL),
         _ => return None,
     })
 }

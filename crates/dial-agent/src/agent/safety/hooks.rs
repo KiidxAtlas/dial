@@ -178,7 +178,8 @@ pub fn fail_closed(hook: &HookConfig) -> bool {
         .unwrap_or_else(|| canonical(&hook.event) == "pre_tool_use")
 }
 
-/// Matchers compile once per distinct pattern for the life of the process.
+/// Matchers compile once per distinct pattern; capped to prevent unbounded growth across config edits.
+const MAX_CACHED_MATCHERS: usize = 256;
 static MATCHERS: LazyLock<parking_lot::Mutex<HashMap<String, Option<regex::Regex>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
@@ -188,9 +189,12 @@ fn matches(hook: &HookConfig, tool: Option<&str>) -> bool {
         (Some(_), None) => false,
         (Some(pattern), Some(tool)) => {
             let mut cache = MATCHERS.lock();
+            if !cache.contains_key(pattern) && cache.len() >= MAX_CACHED_MATCHERS {
+                cache.clear();
+            }
             cache
                 .entry(pattern.clone())
-                .or_insert_with(|| regex::Regex::new(&format!("^(?:{pattern})$")).ok())
+                .or_insert_with(|| dial_llm::config::hooks::compile_matcher(pattern).ok())
                 .as_ref()
                 // An invalid matcher never matches; validation rejects it at load.
                 .is_some_and(|re| re.is_match(tool))

@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -21,16 +21,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 /// Pause after a failed `accept` (for example, out of file descriptors) so the loop cannot spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Maximum distinct proxy endpoints kept alive in one process before LRU eviction.
+const MAX_ENDPOINTS: usize = 16;
+/// Short timeout for the local wake connection used to unblock `accept()` during shutdown.
+const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// A running proxy: a loopback TCP port (macOS clients) and a Unix socket in a private directory
-/// (bound into Linux sandboxes). It serves until the process exits.
+/// (bound into Linux sandboxes). Shuts down its listener threads and removes its socket directory
+/// once evicted from the process cache and dropped by every active caller.
 #[derive(Debug)]
 pub struct Endpoint {
     port: u16,
     socket: PathBuf,
+    stop: Arc<AtomicBool>,
+    tcp_thread: Option<std::thread::JoinHandle<()>>,
+    unix_thread: Option<std::thread::JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)),
+            SHUTDOWN_WAKE_TIMEOUT,
+        );
+        let _ = UnixStream::connect(&self.socket);
+        if let Some(handle) = self.tcp_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.unix_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
 impl Endpoint {
     /// The loopback TCP port in this process's network namespace.
     pub fn port(&self) -> u16 {
@@ -53,19 +77,64 @@ impl Endpoint {
     }
 }
 
-/// The process-wide proxy for `rules`, started on first use.
-pub fn endpoint(rules: &NetworkRules) -> Result<Arc<Endpoint>, String> {
-    static RUNNING: LazyLock<Mutex<HashMap<NetworkRules, Arc<Endpoint>>>> =
-        LazyLock::new(Mutex::default);
-    let mut running = RUNNING.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(endpoint) = running.get(rules) {
-        return Ok(endpoint.clone());
+pub(super) struct EndpointCache {
+    max: usize,
+    next_seq: u64,
+    entries: HashMap<NetworkRules, (u64, Arc<Endpoint>)>,
+}
+
+impl EndpointCache {
+    pub(super) fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            next_seq: 0,
+            entries: HashMap::new(),
+        }
     }
-    let endpoint = Arc::new(
-        start(rules.clone())
-            .map_err(|error| format!("starting the sandbox network proxy: {error}"))?,
-    );
-    running.insert(rules.clone(), endpoint.clone());
+
+    pub(super) fn get_or_start(
+        &mut self,
+        rules: &NetworkRules,
+    ) -> Result<(Arc<Endpoint>, Option<Arc<Endpoint>>), String> {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.next_seq;
+        if let Some((last_used, endpoint)) = self.entries.get_mut(rules) {
+            *last_used = seq;
+            return Ok((endpoint.clone(), None));
+        }
+        let endpoint = Arc::new(
+            start(rules.clone())
+                .map_err(|error| format!("starting the sandbox network proxy: {error}"))?,
+        );
+        let evicted = if self.entries.len() >= self.max {
+            // Prefer evicting an endpoint with no active callers outside the cache; otherwise
+            // evict the oldest entry (its listeners remain alive until active callers drop it).
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, (_, ep))| Arc::strong_count(ep) == 1)
+                .min_by_key(|(_, (used, _))| *used)
+                .or_else(|| self.entries.iter().min_by_key(|(_, (used, _))| *used))
+                .map(|(k, _)| k.clone());
+            victim.and_then(|key| self.entries.remove(&key).map(|(_, ep)| ep))
+        } else {
+            None
+        };
+        self.entries.insert(rules.clone(), (seq, endpoint.clone()));
+        Ok((endpoint, evicted))
+    }
+}
+
+/// The process-wide proxy for `rules`, started on first use and bounded by LRU eviction.
+pub fn endpoint(rules: &NetworkRules) -> Result<Arc<Endpoint>, String> {
+    static RUNNING: LazyLock<Mutex<EndpointCache>> =
+        LazyLock::new(|| Mutex::new(EndpointCache::new(MAX_ENDPOINTS)));
+    let (endpoint, evicted) = {
+        let mut running = RUNNING.lock().unwrap_or_else(|error| error.into_inner());
+        running.get_or_start(rules)?
+    };
+    // Drop any evicted endpoint outside the cache lock so its shutdown join never blocks callers.
+    drop(evicted);
     Ok(endpoint)
 }
 
@@ -79,24 +148,51 @@ fn start(rules: NetworkRules) -> io::Result<Endpoint> {
     let socket = dir.path().join("proxy.sock");
     let unix = UnixListener::bind(&socket)?;
     let rules = Arc::new(rules);
+    let stop = Arc::new(AtomicBool::new(false));
     let tcp_rules = rules.clone();
-    std::thread::Builder::new()
+    let tcp_stop = stop.clone();
+    let tcp_thread = std::thread::Builder::new()
         .name("dial-netproxy-tcp".into())
         .spawn(move || {
-            serve(tcp.incoming(), "dial-netproxy-conn", move |client| {
-                let _ = handle(client, &tcp_rules);
-            })
+            serve(
+                tcp.incoming(),
+                "dial-netproxy-conn",
+                Some(tcp_stop),
+                move |client| {
+                    let _ = handle(client, &tcp_rules);
+                },
+            )
         })?;
-    std::thread::Builder::new()
+    let unix_stop = stop.clone();
+    let unix_thread = match std::thread::Builder::new()
         .name("dial-netproxy-unix".into())
         .spawn(move || {
-            serve(unix.incoming(), "dial-netproxy-conn", move |client| {
-                let _ = handle(client, &rules);
-            })
-        })?;
+            serve(
+                unix.incoming(),
+                "dial-netproxy-conn",
+                Some(unix_stop),
+                move |client| {
+                    let _ = handle(client, &rules);
+                },
+            )
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                SHUTDOWN_WAKE_TIMEOUT,
+            );
+            let _ = tcp_thread.join();
+            return Err(error);
+        }
+    };
     Ok(Endpoint {
         port,
         socket,
+        stop,
+        tcp_thread: Some(tcp_thread),
+        unix_thread: Some(unix_thread),
         _dir: dir,
     })
 }
@@ -147,15 +243,26 @@ impl Drop for Slot {
 fn serve<S: Send + 'static>(
     incoming: impl Iterator<Item = io::Result<S>>,
     name: &str,
+    stop: Option<Arc<AtomicBool>>,
     handler: impl Fn(S) + Send + Sync + 'static,
 ) {
     let handler = Arc::new(handler);
     let active = Arc::new(AtomicUsize::new(0));
+    let stopping = || {
+        stop.as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    };
     for client in incoming {
+        if stopping() {
+            break;
+        }
         let client = match client {
             Ok(client) => client,
             Err(_) => {
                 std::thread::sleep(ACCEPT_BACKOFF);
+                if stopping() {
+                    break;
+                }
                 continue;
             }
         };
@@ -284,17 +391,28 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
     let text = std::str::from_utf8(head).map_err(|_| "request head is not UTF-8")?;
     let mut lines = text.split("\r\n");
     let line = lines.next().unwrap_or_default();
+    if has_bare_line_or_ctl(line, false) {
+        return Err("control character in request line");
+    }
     let mut parts = line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err("malformed request line");
     };
+    if !is_http_token(method) {
+        return Err("invalid HTTP method");
+    }
     if !version.starts_with("HTTP/1.") {
         return Err("only HTTP/1.x proxy requests are supported");
     }
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(target, None)?;
+        for header in lines.filter(|line| !line.is_empty()) {
+            if has_bare_line_or_ctl(header, true) {
+                return Err("control character in request header");
+            }
+        }
         return Ok(Request {
             host,
             port,
@@ -317,6 +435,9 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
     // request to an allowed address cannot name another virtual host there.
     let mut forward = format!("{method} {path} {version}\r\nHost: {authority}\r\n");
     for header in lines.filter(|line| !line.is_empty()) {
+        if has_bare_line_or_ctl(header, true) {
+            return Err("control character in request header");
+        }
         let name = header.split(':').next().unwrap_or_default().trim();
         if [
             "host",
@@ -342,6 +463,41 @@ pub(super) fn parse(head: &[u8]) -> Result<Request, &'static str> {
     })
 }
 
+/// Reject bare CR/LF (which enable HTTP request smuggling when only CRLF was split) and other
+/// ASCII control bytes. Horizontal tabs are allowed only in header values (RFC 9110 §5.5).
+fn has_bare_line_or_ctl(line: &str, allow_tab: bool) -> bool {
+    line.bytes().any(|b| match b {
+        b'\t' => !allow_tab,
+        0x00..=0x1f | 0x7f => true,
+        _ => false,
+    })
+}
+
+/// RFC 9110 §5.6.2 HTTP token characters for request methods.
+fn is_http_token(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.get(..prefix.len())
         .filter(|head| head.eq_ignore_ascii_case(prefix))
@@ -351,7 +507,14 @@ fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> 
 fn split_host_port(authority: &str, default: Option<u16>) -> Result<(String, u16), &'static str> {
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest.split_once(']').ok_or("unterminated IPv6 address")?;
-        (host, after.strip_prefix(':'))
+        let port = if after.is_empty() {
+            None
+        } else if let Some(port) = after.strip_prefix(':') {
+            Some(port)
+        } else {
+            return Err("invalid IPv6 authority");
+        };
+        (host, port)
     } else {
         match authority.rsplit_once(':') {
             Some((host, port)) if !host.contains(':') => (host, Some(port)),
@@ -418,11 +581,16 @@ pub(super) fn spawn_bridge(listener: TcpListener, socket: PathBuf) -> io::Result
     std::thread::Builder::new()
         .name("dial-net-bridge".into())
         .spawn(move || {
-            serve(listener.incoming(), "dial-net-bridge-conn", move |client| {
-                if let Ok(proxy) = UnixStream::connect(&socket) {
-                    let _ = relay(client, proxy);
-                }
-            })
+            serve(
+                listener.incoming(),
+                "dial-net-bridge-conn",
+                None,
+                move |client| {
+                    if let Ok(proxy) = UnixStream::connect(&socket) {
+                        let _ = relay(client, proxy);
+                    }
+                },
+            )
         })?;
     Ok(())
 }

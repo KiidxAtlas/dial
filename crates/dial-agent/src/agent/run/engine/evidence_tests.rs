@@ -399,3 +399,50 @@ fn read_only_shell_investigation_with_new_output_is_evidence_until_an_edit() {
         "shell output after an edit must be grounded before it counts"
     );
 }
+
+#[test]
+fn lexical_find_rounds_credit_new_evidence_without_withholding_a_paraphrased_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let path = dir.path().join("service.rs");
+    std::fs::write(&path, "fn reconnect_network() {}\n").unwrap();
+    let config = crate::config::types::Config::default();
+    let find = crate::tools::code::navigation::tools(&config)
+        .pop()
+        .unwrap();
+    let context = crate::tools::integrations::ext::ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let mut engine = Engine::default();
+    let mut search = |id: &str, query: &str| {
+        let call = ToolCall {
+            id: id.into(),
+            name: "find".into(),
+            arguments: json!({"query":query,"related":false}),
+            malformed_arguments: false,
+        };
+        let mut result = find.call(&context, &call.arguments);
+        assert!(
+            !result.is_error && result.text.contains("reconnect_network"),
+            "{}",
+            result.text
+        );
+        let (withheld, _, _) =
+            engine.settle(&workspace, &call, &mut result, Default::default(), |_| true);
+        assert!(withheld.is_none(), "{withheld:?}");
+        engine.take_round_progress()
+    };
+    assert_eq!(
+        search("first", "reconnect network"),
+        RoundProgress::Productive
+    );
+    assert_eq!(search("again", "network reconnect"), RoundProgress::Stalled);
+    std::fs::write(path, "fn reconnect_network() { retry(); }\n").unwrap();
+    assert_eq!(
+        search("changed", "network reconnect"),
+        RoundProgress::Productive
+    );
+}

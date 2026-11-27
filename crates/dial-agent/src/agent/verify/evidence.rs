@@ -85,10 +85,47 @@ impl ReproState {
     }
 }
 
+/// Identity of one controller-observed code failure, awaiting a later run of its check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FailureLink {
+    call_id: String,
+    revision: Revision,
+}
+
+/// What separates a failed run from the same check's later run. Revision inequality alone is not
+/// an edit: shell and extension effects move their own counters without a checkpointed edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::agent) enum ChangeLink {
+    /// Same revision and passing: the failure did not reproduce. No change is claimed.
+    NoLongerReproduced,
+    /// The checkpointed edit counter moved. This says the check ran after edits, not which edit fixed it.
+    CheckedAfterCheckpointedEdits,
+    /// Only uncertain shell or extension effects moved. Not an edit.
+    CheckedAfterUncertainEffectsOnly,
+}
+
+/// A same-check verdict linked to the failure it reruns, with both run identities and revisions.
+/// The first edit revision is not tracked, so no per-edit attribution is claimed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(in crate::agent) struct LinkedVerdict {
+    pub command: String,
+    pub failed_call_id: String,
+    pub failed_revision: Revision,
+    pub rerun_call_id: String,
+    pub rerun_revision: Revision,
+    pub verdict: CheckStatus,
+    pub change: ChangeLink,
+    pub checkpointed_edits_since_failure: u64,
+    pub uncertain_effects_since_failure: u64,
+}
+
 #[derive(Default)]
 pub(in crate::agent) struct Ledger {
     latest: BTreeMap<String, Observation>,
     baseline: BTreeMap<String, Observation>,
+    /// Pending code failures awaiting the next run of the same command; unresolved means unknown.
+    failure_links: BTreeMap<String, FailureLink>,
     /// Turn-scoped: the ledger is rebuilt with `StepChecks` at every user turn.
     repros: Vec<FocusedCheck>,
     reproductions: BTreeMap<String, Reproduction>,
@@ -104,6 +141,53 @@ impl Ledger {
         behavioral: bool,
     ) {
         self.observe_with_fix_revision(command, call_id, status, revision, behavioral, revision);
+    }
+
+    /// Link an actual run's verdict to the pending failure of the same command. Reuse never
+    /// reaches here. A passing run at the failed revision records non-reproduction. A run after
+    /// any revision change records what changed. A non-passing run at the failed revision keeps
+    /// the failure pending. Any new code failure becomes the pending identity.
+    pub fn link_verdict(
+        &mut self,
+        command: &str,
+        call_id: &str,
+        status: CheckStatus,
+        revision: Revision,
+    ) -> Option<LinkedVerdict> {
+        let linked = self.failure_links.get(command).and_then(|prior| {
+            let change = if prior.revision == revision {
+                (status == CheckStatus::Passed).then_some(ChangeLink::NoLongerReproduced)?
+            } else if prior.revision[0] != revision[0] {
+                ChangeLink::CheckedAfterCheckpointedEdits
+            } else {
+                ChangeLink::CheckedAfterUncertainEffectsOnly
+            };
+            let uncertain = |r: Revision| r[1].saturating_add(r[2]);
+            Some(LinkedVerdict {
+                command: command.to_owned(),
+                failed_call_id: prior.call_id.clone(),
+                failed_revision: prior.revision,
+                rerun_call_id: call_id.to_owned(),
+                rerun_revision: revision,
+                verdict: status,
+                change,
+                checkpointed_edits_since_failure: revision[0].saturating_sub(prior.revision[0]),
+                uncertain_effects_since_failure: uncertain(revision)
+                    .saturating_sub(uncertain(prior.revision)),
+            })
+        });
+        if status == CheckStatus::CodeFailed {
+            self.failure_links.insert(
+                command.to_owned(),
+                FailureLink {
+                    call_id: call_id.to_owned(),
+                    revision,
+                },
+            );
+        } else if linked.is_some() {
+            self.failure_links.remove(command);
+        }
+        linked
     }
 
     /// Reproduction attempts invalidate older evidence, but are not fixes in their own right.

@@ -73,3 +73,18 @@ fn waker_interrupts_recv_timeout_without_losing_messages() {
     rx.waker().wake();
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "hello");
 }
+
+#[test]
+fn waker_interrupts_max_timeout_without_panicking() {
+    let (_tx, rx) = channel(4, 64, String::len);
+    let waker = rx.waker();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(15));
+        waker.wake();
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::MAX),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    handle.join().unwrap();
+}

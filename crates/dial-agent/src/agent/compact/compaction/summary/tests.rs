@@ -369,6 +369,55 @@ fn file_ops_record_rename_file_moves_but_not_previews_or_server_edits() {
 }
 
 #[test]
+fn edited_this_turn_locates_only_successful_edit_text_and_keeps_the_newest_receipt() {
+    let messages = [
+        user("edit both"),
+        assistant_call(
+            "1",
+            "edit",
+            json!({"path":"src/a.rs","old_string":"let x = 1;","new_string":"let y = 2;"}),
+        ),
+        json!({"role":"tool","tool_call_id":"1","content":"updated src/a.rs","dial_evidence":{"is_error":false}}),
+        assistant_call(
+            "2",
+            "edit",
+            json!({"input":"[src/b.rs#0000]\nPUT 900.=900:\n+let rejected = 0;\n"}),
+        ),
+        json!({"role":"tool","tool_call_id":"2","content":"PUT 900 did not apply","dial_evidence":{"is_error":true}}),
+        assistant_call(
+            "3",
+            "edit",
+            json!({"path":"src/b.rs","old_string":"let x = 1;","new_string":"let q = 4;"}),
+        ),
+        json!({"role":"tool","tool_call_id":"3","content":format!("[src/b.rs#0000]\n[Source raw SHA256:{}]\nupdated (+1 -1 lines)", "a".repeat(64)),"dial_evidence":{"is_error":false}}),
+        assistant_call("4", "read", json!({"path":"src/c.rs"})),
+    ];
+    let edited = edited_this_turn(&messages);
+    let summarized: Vec<(&str, Vec<&str>, Option<&str>)> = edited
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                file.fragments.iter().map(String::as_str).collect(),
+                file.receipt_sha.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summarized,
+        [
+            (
+                "src/b.rs",
+                vec!["let q = 4;"],
+                Some("a".repeat(64).as_str())
+            ),
+            ("src/a.rs", vec!["let y = 2;"], None),
+        ],
+        "the failed proposal is not a locator; the read-only target is not carried"
+    );
+}
+
+#[test]
 fn split_turn_is_detected_only_when_the_cut_lands_inside_a_turn() {
     let messages = vec![
         user("first"),

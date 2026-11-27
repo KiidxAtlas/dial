@@ -987,3 +987,82 @@ fn batched_paths_reconciles_racing_edit_on_narrowed_target() {
             .is_none()
     );
 }
+
+#[test]
+fn find_progress_follows_shown_evidence_and_complete_scopes_not_wording() {
+    let find = |query: &str, scope: &str, complete: bool, shown: serde_json::Value| {
+        let data = json!({"find": {
+            "mode": "lexical",
+            "scope": scope,
+            "complete": complete,
+            "capped": !complete,
+            "shown": shown,
+        }});
+        let call = call("find", json!({"query": query, "path": scope}));
+        progress_keys(&call, "rendered rows", Some(&data))
+    };
+    let row = |sha: &str| json!([{"path": "src/a.rs", "start": 1, "end": 3, "source_sha256": sha}]);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut fresh = |keys: Vec<u64>| {
+        keys.into_iter()
+            .fold(false, |new, key| seen.insert(key) | new)
+    };
+    let table = [
+        (
+            "first complete search shows a span",
+            find("reconnect", "src", true, row("aa")),
+            true,
+        ),
+        (
+            "same span under other wording",
+            find("reconnect_network", "src", true, row("aa")),
+            false,
+        ),
+        (
+            "same scope with no rows",
+            find("retry", "src", true, json!([])),
+            false,
+        ),
+        (
+            "new complete scope",
+            find("retry", "tests", true, json!([])),
+            true,
+        ),
+        (
+            "changed source revision of the same span",
+            find("reconnect", "src", true, row("bb")),
+            true,
+        ),
+        (
+            "capped rows already seen",
+            find("reconnect", "src", false, row("bb")),
+            false,
+        ),
+        (
+            "capped new scope with no rows",
+            find("retry", "newscope", false, json!([])),
+            false,
+        ),
+    ];
+    for (case, keys, expected) in table {
+        assert_eq!(fresh(keys), expected, "{case}");
+    }
+    // Capped empty results expose neither a row nor a complete scope: they are not progress,
+    // whatever their wording, and a capped result never claims its scope.
+    for query in ["missing", "other wording"] {
+        assert!(
+            find(query, "newscope", false, json!([])).is_empty(),
+            "{query}"
+        );
+    }
+    // Other tools keep their whole-call identity even when they carry the same data.
+    let grep = call("grep", json!({"pattern": "reconnect", "path": "src"}));
+    assert_eq!(
+        progress_keys(
+            &grep,
+            "rendered rows",
+            Some(&json!({"find": {"complete": true, "shown": [], "scope": "src"}}))
+        ),
+        vec![observation_key(&grep, "rendered rows")]
+    );
+}

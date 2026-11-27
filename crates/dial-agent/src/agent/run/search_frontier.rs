@@ -1,4 +1,4 @@
-//! Per-turn memory of empty native searches. When a `grep` or `glob` finds nothing, the result
+//! Per-turn memory of empty native searches. When a `grep`, `glob` or complete lexical `find` finds nothing, the result
 //! names up to three earlier empty searches from this turn whose scope overlaps, so the model can
 //! widen or change its approach instead of re-probing the same ground. Patterns are compared
 //! literally; nothing is inferred about what an alternative search would return. The memory
@@ -43,6 +43,30 @@ impl EmptySearches {
         is_error: bool,
         revision: Revision,
     ) -> Option<String> {
+        let search = Self::empty_search(tool, args, output, is_error);
+        self.record(tool, args, is_error, search, revision)
+    }
+
+    /// A lexical `find` is judged from its structured `data.find`, never from its prose rows.
+    pub(in crate::agent) fn observe_find(
+        &mut self,
+        args: &Value,
+        data: Option<&Value>,
+        is_error: bool,
+        revision: Revision,
+    ) -> Option<String> {
+        let search = find_search(args, data, is_error);
+        self.record("find", args, is_error, search, revision)
+    }
+
+    fn record(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        is_error: bool,
+        search: Option<Search>,
+        revision: Revision,
+    ) -> Option<String> {
         if revision != self.revision {
             *self = Self {
                 revision,
@@ -67,7 +91,7 @@ impl EmptySearches {
             self.advised.retain(|scope| !paths.contains(scope));
             self.pending.retain(|scope| !paths.contains(scope));
         }
-        let search = Self::empty_search(tool, args, output, is_error)?;
+        let search = search?;
         if search.scopes.len() == 1
             && let Some(scope) = search.scopes.first()
             && scope.extension().is_some()
@@ -239,6 +263,24 @@ fn empty_shell_search(args: &Value, output: &str) -> Option<Search> {
         pattern: words[index].clone(),
         scopes: vec![normalize(&scope.to_string_lossy())],
         scope: scope.to_string_lossy().into_owned(),
+    })
+}
+
+/// A complete lexical `find` whose structured result shows no rows: the walk covered the whole
+/// scope and nothing matched. Capped, truncated, failed or unstructured results are never absence.
+fn find_search(args: &Value, data: Option<&Value>, is_error: bool) -> Option<Search> {
+    let find = data?.get("find")?;
+    let no_rows = find["shown"].as_array().is_some_and(Vec::is_empty);
+    if is_error || find["complete"] != true || find["capped"] != false || !no_rows {
+        return None;
+    }
+    let pattern = args["query"].as_str()?.to_owned();
+    let scope = find["scope"].as_str()?;
+    Some(Search {
+        tool: "find".into(),
+        pattern,
+        scopes: vec![normalize(scope)],
+        scope: scope.to_owned(),
     })
 }
 

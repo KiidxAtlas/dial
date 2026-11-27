@@ -273,3 +273,24 @@ fn controller_batch_authorizes_all_paths_and_reports_only_actual_mutations() {
     );
     assert_eq!(result.data.unwrap()["files"][0]["outcome"], "unchanged");
 }
+
+#[test]
+fn write_executable_sets_execute_permission() {
+    use crate::tools::edit::editing::Execution;
+    let (dir, ws) = workspace();
+    let res = output(
+        &ws,
+        &json!({"path":"run.sh","content":"#!/bin/sh\necho hi\n","executable":true}),
+        &Execution::default(),
+    );
+    assert!(res.is_ok(), "{res:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.path().join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "expected executable mode, got {mode:o}");
+    }
+}

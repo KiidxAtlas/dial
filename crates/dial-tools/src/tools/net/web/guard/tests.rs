@@ -31,8 +31,14 @@ fn refuses_local_and_private_ranges() {
         "::ffff:10.0.0.1",
         "::ffff:169.254.169.254",
         "64:ff9b::a00:1",
+        "64:ff9b:1::1",
         "2002:7f00:1::1",
         "::127.0.0.1",
+        "::ffff:0:127.0.0.1",
+        "fec0::1",
+        "2001::1",
+        "2001:2::1",
+        "100::1",
     ] {
         assert!(blocked(ip), "{ip} should be refused");
     }

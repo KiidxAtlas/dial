@@ -503,7 +503,12 @@ pub(super) fn accounts(user_dir: &Path, params: &Value) -> Result<Value> {
     let provider = params["provider"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| coded(ErrorCode::InvalidParams, "auth_accounts requires params.provider"))?;
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidParams,
+                "auth_accounts requires params.provider",
+            )
+        })?;
     let action = params["action"].as_str().unwrap_or("list");
     match action {
         "list" => {}

@@ -21,6 +21,48 @@ fn capture_work<T>(run: impl FnOnce() -> T) -> (T, RetrievalWork) {
 }
 
 #[test]
+fn lexical_preview_shows_the_matching_method_not_its_large_impl() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let mut source = String::from("struct Service;\nimpl Service {\n");
+    source.push_str(&"    // unrelated setup\n".repeat(100));
+    source.push_str("    fn recover(&self) {\n        reconnect_after_failure();\n    }\n}\n");
+    fs::write(dir.path().join("service.rs"), source).unwrap();
+    let out = find(
+        &ws,
+        &json!({"query":"service reconnect failure", "limit":1}),
+    )
+    .unwrap();
+    let (_, excerpt) = out
+        .split_once(SOURCE_SECTION)
+        .expect("fresh source excerpt");
+    assert!(
+        excerpt.contains("104:        reconnect_after_failure();"),
+        "{out}"
+    );
+    assert!(out.contains("owner service.rs:2-106"), "{out}");
+}
+
+#[test]
+fn lexical_preview_locates_phrase_only_supported_by_enclosing_scope() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let source = format!(
+        "fn long() {{\n{}    // FIRST needle\n{}    // second needle\n}}\n",
+        "    // setup\n".repeat(50),
+        "    // middle\n".repeat(50)
+    );
+    fs::write(dir.path().join("long.rs"), source).unwrap();
+    let out = find(
+        &ws,
+        &json!({"query":"\"first needle\" \"second needle\"", "limit":1, "related":false}),
+    )
+    .unwrap();
+    let (hits, shown) = out.split_once(SOURCE_SECTION).unwrap();
+    assert!(hits.contains("declaration-match-window"), "{hits}");
+    assert!(shown.contains("52:    // FIRST needle"), "{shown}");
+    assert!(!shown.contains("1:fn long()"));
+}
+
+#[test]
 fn lexical_retrieval_parses_only_matching_sources_and_rechecks_nonmatches() {
     let (dir, ws) = crate::tools::testkit::workspace();
     for index in 0..16 {
@@ -331,6 +373,39 @@ fn path_mode_refuses_content_routes_before_service_dispatch() {
             out.text
         );
     }
+}
+
+#[test]
+fn unscoped_behavior_find_reaches_source_before_generated_files_exhaust_the_byte_budget() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let build = dir.path().join("package/build");
+    fs::create_dir_all(&build).unwrap();
+    // Sparse binary fixtures consume the real scan budget without constructing large indexes.
+    for i in 0..MAX_TOTAL / MAX_FILE {
+        fs::File::create(build.join(format!("{i:02}.bin")))
+            .unwrap()
+            .set_len(MAX_FILE)
+            .unwrap();
+    }
+    fs::write(build.join("z.rs"), "fn generated_symbol() {}\n").unwrap();
+    fs::write(dir.path().join("source.rs"), "fn source_symbol() {}\n").unwrap();
+    let search = |args| find(&ws, &args).unwrap();
+    let unscoped = search(json!({"query":"source_symbol", "related":false}));
+    assert!(
+        unscoped.contains("source.rs:1-1 score=") && unscoped.contains("corpus byte cap=true"),
+        "{unscoped}"
+    );
+    let scoped = search(json!({"query":"source_symbol", "path":".", "related":false}));
+    assert!(
+        scoped.contains("No matching evidence.") && scoped.contains("corpus byte cap=true"),
+        "{scoped}"
+    );
+    let generated =
+        search(json!({"query":"generated_symbol", "path":"package/build/z.rs", "related":false}));
+    assert!(
+        generated.contains("package/build/z.rs:1-1 score="),
+        "{generated}"
+    );
 }
 
 #[test]

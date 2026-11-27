@@ -54,20 +54,34 @@ impl Attempts {
                 let thread = thread::Builder::new()
                     .name(format!("mcp-{name}-connect"))
                     .spawn_scoped(scope, move || {
-                        let sandbox_spec = crate::tools::sandbox_spec_for_mcp(
-                            &config.sandbox,
-                            Some((&config.state_dir, &config.user_dir)),
-                        )
-                        .ok();
-                        let result = connect(
-                            name,
-                            &config.mcp[name],
-                            &config.project_root,
-                            &config.user_dir,
-                            sandbox_spec,
-                            timeout,
-                            &|| cancel.load(Ordering::SeqCst),
-                        );
+                        let server_cfg = &config.mcp[name];
+                        let result = if server_cfg.sandbox {
+                            match crate::tools::sandbox_spec_for_mcp(
+                                &config.sandbox,
+                                Some((&config.state_dir, &config.user_dir)),
+                            ) {
+                                Ok(spec) => connect(
+                                    name,
+                                    server_cfg,
+                                    &config.project_root,
+                                    &config.user_dir,
+                                    Some(spec),
+                                    timeout,
+                                    &|| cancel.load(Ordering::SeqCst),
+                                ),
+                                Err(error) => Err(error.context("building MCP sandbox policy")),
+                            }
+                        } else {
+                            connect(
+                                name,
+                                server_cfg,
+                                &config.project_root,
+                                &config.user_dir,
+                                None,
+                                timeout,
+                                &|| cancel.load(Ordering::SeqCst),
+                            )
+                        };
                         let _ = attempt.result.set(result);
                     });
                 match thread {

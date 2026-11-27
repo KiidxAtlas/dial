@@ -141,5 +141,53 @@ pub fn default_rules() -> Vec<Rule> {
             "bg",
             "Use `bg` with `action: start` and `name` for watch mode so its output, input, and lifecycle stay managed.",
         ),
+        // Read-only Git/GitHub commands (never `git grep`, mutating commands, or arbitrary flags).
+        rule(
+            r"^\s*(?:git(?:\s+-C\s+\S+|\s+--no-pager)*\s+(?:status|diff|log|show|blame|branch|reflog|stash\s+(?:list|show)|tag(?:\s+(?:-l|--list)\b|$)|remote(?:\s+(?:-v|--verbose)\b|$)|rev-parse|merge-base)|gh\s+(?:pr\s+(?:view|checks)|issue\s+view))(?:\s|$)",
+            "git",
+            "Use the `git` tool instead of shell git/gh read commands (pass `cwd` for sub-repositories). It runs unapproved with structured output.",
+        ),
+        // Live host state inspection belongs in `read` via `sys://` URIs.
+        rule(
+            r"^\s*(?:ps|lsof|ss|netstat)(?:\s|$)",
+            "read",
+            "Use the `read` tool with `sys://procs`, `sys://ports`, or `sys://host` for live host state instead of ps/lsof/ss/netstat.",
+        ),
+        // Simple web-page GETs; downloads, custom methods/headers/bodies, redirects and loopback APIs keep bash.
+        rule(
+            r"^\s*(?:curl|wget)(?!.*(?:\s-(?:[XdoOFHuT]|-[a-z]*data|-[a-z]*output|-[a-z]*request|-[a-z]*header|-[a-z]*form|-[a-z]*user|-[a-z]*head)\b|\s-I(?:\s|$)|>|localhost|127\.0\.0\.1|\[::1\]))\s+.*https?://",
+            "read",
+            "Use the `read` tool with an `http(s)://` URL (`fetch: true`) instead of curl/wget for reading web pages.",
+        ),
+        // Archive directory listings belong in `read` (which decodes archives and `:member` views).
+        rule(
+            r"^\s*(?:tar\s+-[a-zA-Z]*t[a-zA-Z]*f?\s+|unzip\s+-l\s+)",
+            "read",
+            "Use the `read` tool to inspect archive listings and members (`:member`) instead of tar -t / unzip -l.",
+        ),
+        // Directory trees belong in `read` (directory view with pagination) or `glob`.
+        rule(
+            r"^\s*tree(?:\s|$)",
+            "glob",
+            "Use `read` on a directory (with optional `offset`/`limit`) or `glob` (`type: \"dir\"|\"all\"`) instead of `tree`.",
+        ),
+        // Standalone file line counts belong in `read` or `grep` (`output: "count"`).
+        rule(
+            r"^\s*wc\s+-[a-zA-Z]*l(?:\s|$)",
+            "read",
+            "Use `read` (which shows line totals) or `grep` (`output: \"count\"`) instead of `wc -l`.",
+        ),
+        // Binary/file-type sniffing belongs in `read` (which decodes executables, archives, and `:bytes=`).
+        rule(
+            r"^\s*(?:file|strings)\s+",
+            "read",
+            "Use the `read` tool instead of `file`/`strings`; it sniffs binary/executable formats and supports `:bytes=O+N`.",
+        ),
+        // Direct test/lint/fmt/typecheck invocations that `verify` covers natively (placed after watch-mode `bg` rule).
+        rule(
+            r"^\s*(?:(?:python3?\s+-m\s+)?(?:pytest|unittest|mypy)|pyright|ruff\s+(?:check|format\s+--check)|(?:npx\s+|pnpm\s+|yarn\s+|bunx\s+)?(?:jest|vitest)|node\s+--test|go\s+(?:test|vet|build)|cargo\s+(?:test|check|build|clippy|fmt(?:\s+--all)?\s+--\s+--check|fmt\s+--check))(?:\s|$)",
+            "verify",
+            "Use the `verify` tool for tests and project checks (`targets: [\"path/to/test\"]` or `[\"dir:clippy|fmt|lint|typecheck|build|test\"]`) so passing results count toward final verification.",
+        ),
     ]
 }

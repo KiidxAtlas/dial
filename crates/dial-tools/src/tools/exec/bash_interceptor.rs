@@ -60,13 +60,29 @@ pub fn check(
 
 /// Workspace-scoped file tools: they refuse paths outside the workspace roots.
 const WORKSPACE_FILE_TOOLS: &[&str] = &["read", "grep", "glob"];
-
+/// Read-only tools eligible for compound `lookup_batch` hints.
+const BATCH_LOOKUP_TOOLS: &[&str] = &["read", "grep", "glob", "git"];
 /// [`check`] where `in_workspace` reports whether an absolute path lies in the workspace. A hint
 /// toward `read`/`grep`/`glob` is withheld when the command names an absolute path outside it:
 /// following the hint would only be refused and cost a further round trip.
 pub fn check_in(
     config: &BashInterceptorConfig,
     available_tools: &[&str],
+    command: &str,
+    in_workspace: &dyn Fn(&str) -> bool,
+) -> Option<Verdict> {
+    check_in_with_loadable(config, available_tools, &[], command, in_workspace)
+}
+
+/// [`check_in`] that also knows which tools are loadable via `tool_search`.
+///
+/// In `Hint` mode, when a command matches a rule whose tool is not yet offered but is loadable,
+/// returns a hint pointing at `tool_search` to load it for the next round. `Block` mode never
+/// blocks for an unloaded tool.
+pub fn check_in_with_loadable(
+    config: &BashInterceptorConfig,
+    available_tools: &[&str],
+    loadable_tools: &[&str],
     command: &str,
     in_workspace: &dyn Fn(&str) -> bool,
 ) -> Option<Verdict> {
@@ -81,12 +97,16 @@ pub fn check_in(
             &custom
         }
     };
-    if config.mode == InterceptMode::Hint && lookup_batch(rules, available_tools, command) {
+    if config.mode == InterceptMode::Hint
+        && let Some(batch) = lookup_batch(rules, available_tools, loadable_tools, command)
+    {
         // Same refusal as a single duplicate: the workspace tools would refuse the path.
-        if absolute_operands(command).any(|path| !in_workspace(path)) {
+        if batch.uses_workspace_file_tool
+            && absolute_operands(command).any(|path| !in_workspace(path))
+        {
             return None;
         }
-        return Some(Verdict::Hint(LOOKUP_BATCH_HINT.to_owned()));
+        return Some(Verdict::Hint(batch.message()));
     }
     let candidates = match config.mode {
         InterceptMode::Block => interception_candidates(command),
@@ -96,7 +116,11 @@ pub fn check_in(
         return None;
     }
     for compiled in rules {
-        if !available_tools.contains(&compiled.tool.as_str()) {
+        let offered = available_tools.contains(&compiled.tool.as_str());
+        let loadable = !offered
+            && config.mode == InterceptMode::Hint
+            && loadable_tools.contains(&compiled.tool.as_str());
+        if !offered && !loadable {
             continue;
         }
         for candidate in &candidates {
@@ -112,6 +136,10 @@ pub fn check_in(
                         "Blocked: {}\n\nOriginal command: {command}",
                         compiled.message
                     )),
+                    InterceptMode::Hint if loadable => Verdict::Hint(format!(
+                        "[hint] Load `{}` via `tool_search` names:[\"{}\"] for the next round. {}",
+                        compiled.tool, compiled.tool, compiled.message
+                    )),
                     InterceptMode::Hint => Verdict::Hint(format!("[hint] {}", compiled.message)),
                 });
             }
@@ -123,19 +151,75 @@ pub fn check_in(
 /// The hint for a batch of lookups; `read` takes several paths and parallel calls cover the rest.
 const LOOKUP_BATCH_HINT: &str = "[hint] Every command here is a lookup that `read`/`grep`/`glob` cover; send them as parallel tool calls in one response (`read` takes `paths` for several files).";
 
-/// Hint-mode batch: a compound command of two or more lookups, each covered by a workspace file
-/// tool that is offered. A leading `cd DIR` and bare `echo`/`printf` separator lines do not
-/// count. Any piped stage, writing segment or uncovered segment makes the batch mixed: no hint.
-fn lookup_batch(rules: &[Compiled], available_tools: &[&str], command: &str) -> bool {
+struct BatchMatch {
+    uses_workspace_file_tool: bool,
+    uses_git: bool,
+    loadable: Vec<String>,
+}
+
+impl BatchMatch {
+    fn message(&self) -> String {
+        if !self.uses_git && self.loadable.is_empty() {
+            return LOOKUP_BATCH_HINT.to_owned();
+        }
+        let mut msg = "[hint] Every command here is covered by dedicated tools (`read`/`grep`/`glob`/`git`); send them as parallel tool calls in one response.".to_owned();
+        if !self.loadable.is_empty() {
+            let names = self
+                .loadable
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            msg.push_str(&format!(
+                " Load deferred tools via `tool_search` names:[{names}]."
+            ));
+        }
+        msg
+    }
+}
+
+/// Hint-mode batch: a compound command of two or more lookups, each covered by an offered or
+/// loadable lookup tool (`read`/`grep`/`glob`/`git`). A leading `cd DIR` and bare `echo`/`printf`
+/// separator lines do not count. Any piped stage, writing segment or uncovered segment makes the
+/// batch mixed: no hint.
+fn lookup_batch(
+    rules: &[Compiled],
+    available_tools: &[&str],
+    loadable_tools: &[&str],
+    command: &str,
+) -> Option<BatchMatch> {
     let mut segments = extract_flat_shell_command_segments(command);
     if segments.len() > 1 && !segments[1].piped_stdin && is_cd(&segments[0].text) {
         segments.remove(0);
     }
     segments.retain(|segment| !is_printing_line(&segment.text));
-    segments.len() > 1
-        && segments.iter().all(|segment| {
-            !segment.piped_stdin && is_covered_lookup(rules, available_tools, &segment.text)
-        })
+    if segments.len() <= 1 {
+        return None;
+    }
+    let mut uses_workspace_file_tool = false;
+    let mut uses_git = false;
+    let mut loadable = Vec::new();
+    for segment in &segments {
+        if segment.piped_stdin {
+            return None;
+        }
+        let (tool, is_loadable) =
+            covered_lookup(rules, available_tools, loadable_tools, &segment.text)?;
+        if WORKSPACE_FILE_TOOLS.contains(&tool) {
+            uses_workspace_file_tool = true;
+        }
+        if tool == "git" {
+            uses_git = true;
+        }
+        if is_loadable && !loadable.iter().any(|t| t == tool) {
+            loadable.push(tool.to_owned());
+        }
+    }
+    Some(BatchMatch {
+        uses_workspace_file_tool,
+        uses_git,
+        loadable,
+    })
 }
 
 /// `echo`/`printf` of literal text with no redirection or expansion: it runs nothing.
@@ -144,22 +228,33 @@ fn is_printing_line(segment: &str) -> bool {
         && !segment.contains(['>', '<', '$', '`'])
 }
 
-/// Whether the first offered rule matching `segment` names a workspace file tool, and the
-/// segment does not write (`>`, ignoring `2>&1`).
-fn is_covered_lookup(rules: &[Compiled], available_tools: &[&str], segment: &str) -> bool {
+/// First offered or loadable lookup rule matching `segment` (`read`/`grep`/`glob`/`git`), provided
+/// the segment does not write (`>`, ignoring `2>&1`).
+fn covered_lookup<'a>(
+    rules: &'a [Compiled],
+    available_tools: &[&str],
+    loadable_tools: &[&str],
+    segment: &str,
+) -> Option<(&'a str, bool)> {
     if segment.replace(" 2>&1", "").contains('>') {
-        return false;
+        return None;
     }
     let stripped = without_leading_environment_assignments(segment);
-    std::iter::once(segment)
-        .chain(stripped.as_deref())
-        .any(|candidate| {
-            rules
-                .iter()
-                .filter(|rule| available_tools.contains(&rule.tool.as_str()))
-                .find(|rule| rule.matches(candidate))
-                .is_some_and(|rule| WORKSPACE_FILE_TOOLS.contains(&rule.tool.as_str()))
-        })
+    for candidate in std::iter::once(segment).chain(stripped.as_deref()) {
+        if let Some(rule) = rules.iter().find(|rule| {
+            (available_tools.contains(&rule.tool.as_str())
+                || loadable_tools.contains(&rule.tool.as_str()))
+                && rule.matches(candidate)
+        }) {
+            let tool = rule.tool.as_str();
+            if BATCH_LOOKUP_TOOLS.contains(&tool) {
+                let is_loadable = !available_tools.contains(&tool);
+                return Some((tool, is_loadable));
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Words of `command` that are absolute paths, with surrounding quotes removed.

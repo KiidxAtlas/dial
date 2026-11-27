@@ -110,5 +110,8 @@ fn spawn_group_limited_applies_rlimits_in_child() {
     assert!(nofile <= 64, "expected RLIMIT_NOFILE <= 64, got {nofile}");
     // POSIX `ulimit -f` reports 512-byte blocks (1 MiB == 2048 blocks).
     let fsize: u64 = lines.next().unwrap_or("").trim().parse().unwrap();
-    assert!(fsize <= 2048, "expected RLIMIT_FSIZE <= 2048 blocks, got {fsize}");
+    assert!(
+        fsize <= 2048,
+        "expected RLIMIT_FSIZE <= 2048 blocks, got {fsize}"
+    );
 }

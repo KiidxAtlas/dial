@@ -535,7 +535,9 @@ fn dev_profile_blocks_appleevents_and_procargs_sysctl() {
     let fx = Fixture::new();
     let text = dev_profile(&fx.ws, &[], &[], false).unwrap();
     assert!(text.contains("\"com.apple.coreservices.appleevents\""));
-    assert!(text.contains("(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))"));
+    assert!(text.contains(
+        "(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))"
+    ));
     if !require_for_test() {
         return;
     }

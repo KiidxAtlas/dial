@@ -75,14 +75,25 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
     } else if seg[..6] == [0, 0, 0, 0, 0, 0] {
         // IPv4-compatible (::a.b.c.d): deprecated, never a legitimate public destination.
         Some("IPv4-compatible")
-    } else if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        // NAT64 well-known prefix: the embedded IPv4 address is what is actually reached.
+    } else if seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        // IPv4-translated (::ffff:0:a.b.c.d, RFC 2765): embeds an IPv4 address.
         blocked_v4(Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             seg[6] as u8,
             (seg[7] >> 8) as u8,
             seg[7] as u8,
         ))
+    } else if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        // NAT64 well-known prefix (RFC 6052): the embedded IPv4 address is what is actually reached.
+        blocked_v4(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ))
+    } else if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+        // NAT64 local-use prefix (RFC 8215): reserved for private/local IPv4 translation.
+        Some("local-use NAT64")
     } else if seg[0] == 0x2002 {
         // 6to4: the IPv4 address sits in bits 16..48.
         blocked_v4(Ipv4Addr::new(
@@ -91,6 +102,15 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
             (seg[2] >> 8) as u8,
             seg[2] as u8,
         ))
+    } else if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        // Teredo (RFC 4380): tunnels an obfuscated IPv4 address and is not a safe direct target.
+        Some("Teredo")
+    } else if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0 {
+        // IPv6 benchmarking (RFC 5180).
+        Some("benchmarking")
+    } else if seg[..4] == [0x0100, 0, 0, 0] {
+        // Discard-Only (RFC 6666).
+        Some("discard-only")
     } else if seg[0] == 0x2001 && seg[1] == 0x0db8 {
         Some("documentation")
     } else {

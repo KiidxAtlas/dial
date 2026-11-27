@@ -288,3 +288,32 @@ fn profile_provenance_and_measurements_persist_in_model_bound_store() {
     assert_eq!(store.active().unwrap().id, base.id);
     assert!(Store::open(dir.path(), "different-model", "coding", &harness).is_err());
 }
+
+#[test]
+fn only_checkpointed_edit_passes_credit_repairs_and_non_reproduction_is_not_a_verdict() {
+    let mut metrics = Metrics::default();
+    let events = [
+        ("checked_after_checkpointed_edits", "passed"),
+        ("checked_after_checkpointed_edits", "code_failed"),
+        ("checked_after_uncertain_effects_only", "passed"),
+        ("no_longer_reproduced", "passed"),
+    ];
+    for (change, verdict) in events {
+        metrics.observe(
+            "check_repair_verdict",
+            &json!({"change":change,"verdict":verdict}),
+        );
+    }
+    metrics.observe("check_failure_observed", &json!({"revision":[1,0,0]}));
+    metrics.observe("verification", &json!({"passed":false}));
+    let mut combined = Metrics::default();
+    combined.add(&metrics);
+    assert_eq!(
+        (
+            combined.check_repair_verdicts,
+            combined.check_repairs_passed,
+            combined.verification_failures,
+        ),
+        (3, 1, 1)
+    );
+}

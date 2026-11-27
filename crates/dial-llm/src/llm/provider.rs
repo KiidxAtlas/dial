@@ -17,16 +17,16 @@
 pub(super) mod compaction;
 mod recovery;
 mod spec;
-pub use compaction::{NativeCompactionFailure, NativeCompactionReply, NativeCompactionRequest};
-pub use spec::{
-    ProviderKind, UNCONFIGURED_MODEL, UNCONFIGURED_PROVIDER, anthropic_url, context_window_hint,
-    endpoint_url, unconfigured_message, validate,
-};
-use spec::Wire;
 use super::model_config::ApiProtocol;
 use super::server::{self, ModelServer};
 use super::{self as llm, Chat, Reply, SERVER_MODEL};
 use anyhow::{Context, Result, bail, ensure};
+pub use compaction::{NativeCompactionFailure, NativeCompactionReply, NativeCompactionRequest};
+use spec::Wire;
+pub use spec::{
+    ProviderKind, UNCONFIGURED_MODEL, UNCONFIGURED_PROVIDER, anthropic_url, context_window_hint,
+    endpoint_url, unconfigured_message, validate,
+};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{

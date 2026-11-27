@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-27
+
+- Tool statistics distinguish commands and checks that reported a problem from execution failures, leaving ambiguous historical errors unclassified.
+- Unscoped behavior search visits source before recognized build output and previews matching code instead of large enclosing declarations. Compaction favors current edit locations in large files, and lexical search progress tracks returned evidence rather than query wording. The search and file-carry budgets are unchanged.
 - Continue a running local conversation from another terminal (`dial attach ID`) or from Desktop's session sidebar, without making a fork. The original engine retains tool approvals.
 - Keep original prompts and replies when reopening a compacted session, including Desktop's ↑ prompt recall. The model still resumes from its compacted context.
 - The CLI keeps the launch dial moving and the composer responsive while it checks installed toolchain versions. [Terminal rendering](docs/tui-rendering.md).
@@ -3298,7 +3302,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.1...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3355,3 +3359,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.18]: https://github.com/KiidxAtlas/dial/tree/v0.3.18
 [0.3.19]: https://github.com/KiidxAtlas/dial/tree/v0.3.19
 [0.4.0]: https://github.com/KiidxAtlas/dial/tree/v0.4.0
+[0.4.1]: https://github.com/KiidxAtlas/dial/tree/v0.4.1

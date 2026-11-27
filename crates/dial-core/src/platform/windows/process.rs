@@ -164,7 +164,11 @@ fn spawn_in_job(
 pub(in crate::platform) fn spawn_shared_group(
     command: &mut Command,
 ) -> io::Result<(Child, OwnedHandle)> {
-    spawn_in_job(command, true, crate::platform::process::ResourceLimits::default())
+    spawn_in_job(
+        command,
+        true,
+        crate::platform::process::ResourceLimits::default(),
+    )
 }
 
 pub(in crate::platform) fn hold_shared_group(server: ProcId) -> io::Result<OwnedHandle> {

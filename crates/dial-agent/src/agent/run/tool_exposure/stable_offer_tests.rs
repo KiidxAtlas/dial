@@ -604,3 +604,62 @@ fn parameter_summaries_mark_required_parameters_and_bound_enums() {
         "action*: a|b|c|d|e|f|g|h|i|j|k|l|…; path: string"
     );
 }
+
+#[test]
+fn stable_offer_surfaces_loadable_tools_without_churning_the_prefix_on_load() {
+    with_agent(HOSTED, |agent| {
+        assert!(agent.stable_tool_offer());
+        let before = agent.system_messages();
+        let prompt = serde_json::to_string(&before).unwrap();
+        assert!(
+            prompt.contains("Loadable tools, not in the schema yet"),
+            "{prompt}"
+        );
+        for specialist in ["git", "lsp", "ast_edit"] {
+            assert!(
+                prompt.contains(specialist),
+                "missing {specialist} in {prompt}"
+            );
+        }
+        let loaded = load_tools(agent, json!({"names":["lsp"]}));
+        assert!(!loaded.is_error, "{}", loaded.text);
+        assert!(agent.offered().iter().any(|name| name == "lsp"));
+        assert_eq!(
+            agent.system_messages(),
+            before,
+            "loading a specialist must not churn the cached system prefix"
+        );
+    });
+}
+
+#[test]
+fn stable_offer_auto_offers_git_for_single_and_multi_repo_workspaces() {
+    for subrepo in [false, true] {
+        with_agent(HOSTED, |agent| {
+            let git_dir = if subrepo {
+                let child = agent.workspace.root().join("service-a");
+                std::fs::create_dir(&child).unwrap();
+                child.join(".git")
+            } else {
+                agent.workspace.root().join(".git")
+            };
+            std::fs::create_dir(&git_dir).unwrap();
+            agent.rebuild_system();
+            let offered = agent.offered();
+            for expected in ["git", "task", "message", "bg"] {
+                assert!(
+                    offered.iter().any(|name| name == expected),
+                    "subrepo={subrepo} missing {expected}: {offered:?}"
+                );
+            }
+            let bytes = serde_json::to_vec(&agent.schemas(&offered).unwrap())
+                .unwrap()
+                .len();
+            assert!(
+                bytes <= Agent::HOSTED_CORE_SCHEMA_BYTES,
+                "subrepo={subrepo} exceeded budget: {bytes} > {}",
+                Agent::HOSTED_CORE_SCHEMA_BYTES
+            );
+        });
+    }
+}

@@ -371,7 +371,7 @@ fn environment_prompt(
     // One statement of discovery, naming only the discovery tools actually offered.
     if offered("tool_search") {
         let load = ", then load its exact name with `tool_search` names:[name] (or search with load:true) to call it next round";
-        out.push_str(&format!("- Specialist and MCP tools: before declaring a capability unavailable, find one with `tool_search` by task or domain{load}; prefer it over a shell or web substitute. A miss returns a catalog page with a next_query to follow.\n"));
+        out.push_str(&format!("- Specialist and MCP tools: before reaching for `bash` (VCS, LSP, AST rewrites, dependency sources, archives/binaries, web search, debugging) or declaring a capability unavailable, find one with `tool_search` by task or domain{load}; prefer it over a shell or web substitute. A miss returns a catalog page with a next_query to follow.\n"));
     }
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: use `tool_search` names:[exact name] first and call the tool next round; unload:[name] removes explicit activation. Loading grants no permission.\n");

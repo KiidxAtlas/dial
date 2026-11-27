@@ -89,7 +89,12 @@ fn probe(agent: &ureq::Agent, address: &RelayAddress, token: &str) -> Probe {
         Err(_) => return Probe::Unreachable,
     };
     let status = response.status().as_u16();
-    let body = response.body_mut().read_to_string().unwrap_or_default();
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(64 * 1024)
+        .read_to_string()
+        .unwrap_or_default();
     match status {
         200 => match serde_json::from_str::<Value>(&body)
             .ok()

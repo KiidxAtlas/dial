@@ -444,13 +444,22 @@ impl Agent<'_> {
             let revision = self.step_checks.revision();
             let mut effective = call.clone();
             if crate::agent::window::file_handles::expand(&self.workspace, &mut effective).is_ok() {
-                self.step_checks.empty_searches.observe(
-                    &effective.name,
-                    &effective.arguments,
-                    &output.text,
-                    output.is_error,
-                    revision,
-                )
+                if effective.name == "find" {
+                    self.step_checks.empty_searches.observe_find(
+                        &effective.arguments,
+                        output.data.as_ref(),
+                        output.is_error,
+                        revision,
+                    )
+                } else {
+                    self.step_checks.empty_searches.observe(
+                        &effective.name,
+                        &effective.arguments,
+                        &output.text,
+                        output.is_error,
+                        revision,
+                    )
+                }
             } else {
                 None
             }

@@ -1266,7 +1266,9 @@ impl Admin {
             "list_hooks" => integrations::hooks(&self.saved_config()?),
             "ssh_hosts" => integrations::ssh_hosts(&self.saved_config()?),
             "list_worktrees" => integrations::worktrees(&layout.project_root),
-            "commit_preview" => integrations::commit_preview(&layout, &self.saved_config()?, params),
+            "commit_preview" => {
+                integrations::commit_preview(&layout, &self.saved_config()?, params)
+            }
             "import_candidates" => integrations::import_candidates(&layout, params),
             "import_session" => integrations::import_session(&layout, params),
             "computer_status" => Ok(integrations::computer_status(&self.saved_config()?)),
@@ -1730,14 +1732,22 @@ fn run_control(
                 "send_attached_prompt" if !acp => {
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
-                    struct AttachedPrompt { session_id: String, text: String }
-                    let result = serde_json::from_value::<AttachedPrompt>(request["params"].clone())
-                        .map_err(|error| coded(ErrorCode::InvalidParams, error))
-                        .and_then(|args| {
-                            crate::cli::watch::attachment::Endpoint::queue(&admin.layout(), &args.session_id, &args.text)
+                    struct AttachedPrompt {
+                        session_id: String,
+                        text: String,
+                    }
+                    let result =
+                        serde_json::from_value::<AttachedPrompt>(request["params"].clone())
+                            .map_err(|error| coded(ErrorCode::InvalidParams, error))
+                            .and_then(|args| {
+                                crate::cli::watch::attachment::Endpoint::queue(
+                                    &admin.layout(),
+                                    &args.session_id,
+                                    &args.text,
+                                )
                                 .map_err(|error| coded(ErrorCode::Refused, error))?;
-                            Ok(json!({"queued":true,"session_id":args.session_id}))
-                        });
+                                Ok(json!({"queued":true,"session_id":args.session_id}))
+                            });
                     out.result(&id, result);
                 }
                 "send_peer_message" if !acp => {

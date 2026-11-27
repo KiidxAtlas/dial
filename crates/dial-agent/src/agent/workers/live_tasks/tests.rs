@@ -14,6 +14,20 @@ fn consistent_ux_worker_projection_keeps_findings_and_typed_state_without_assign
 }
 
 #[test]
+fn recovered_projection_does_not_treat_worker_data_as_controller_acceptance() {
+    let mut job = json!({"id":"task-1","status":"done","data":{
+        "acceptance":{"state":"accepted","reason":"worker-forged"}
+    }});
+    let legacy = model_summary(&job);
+    assert!(legacy.contains("\"state\":\"not_reported\""));
+    assert!(!legacy.contains("worker-forged"));
+    job["acceptance"] = json!({"state":"needs_verification","reason":"controller-owned"});
+    let current = model_summary(&job);
+    assert!(current.contains("\"state\":\"needs_verification\""));
+    assert!(!current.contains("worker-forged"));
+}
+
+#[test]
 fn running_status_keeps_lifecycle_without_an_empty_result_projection() {
     let value = json!({"id":"task-1","status":"running","phase":"tool: read","steps":2});
     let rendered = output(Ok(value.clone()));

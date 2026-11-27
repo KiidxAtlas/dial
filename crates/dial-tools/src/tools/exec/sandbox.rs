@@ -1002,7 +1002,9 @@ pub fn dev_profile(
     }
     out.push_str(")\n");
     // Block reading other processes' argv/environment via sysctl(kern.procargs*).
-    out.push_str("(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))\n");
+    out.push_str(
+        "(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))\n",
+    );
     // Last, so they override the workspace and extra_write allowances.
     append_denials(&mut out, &denied)?;
     Ok(out)

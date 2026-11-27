@@ -22,6 +22,7 @@ const MAX_PROCS: usize = 200;
 const MAX_FILES: usize = 30;
 const COMMAND_CHARS: usize = 240;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PROBE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Read one `sys://` target.
 pub(super) fn read(input: &str, cancel: &AtomicBool) -> Result<String, String> {
@@ -170,10 +171,10 @@ fn probe(program: &str, args: &[&str], cancel: &AtomicBool) -> Result<String, St
         .stderr(Stdio::null());
     let mut child = dial_core::platform::process::spawn(&mut command)
         .map_err(|error| format!("{program} is unavailable: {error}"))?;
-    let mut pipe = child.stdout.take().ok_or("probe stdout unavailable")?;
+    let pipe = child.stdout.take().ok_or("probe stdout unavailable")?;
     let reader = std::thread::spawn(move || {
         let mut text = Vec::new();
-        let _ = pipe.read_to_end(&mut text);
+        let _ = pipe.take(MAX_PROBE_BYTES).read_to_end(&mut text);
         text
     });
     let started = std::time::Instant::now();

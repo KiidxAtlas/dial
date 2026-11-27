@@ -199,7 +199,11 @@ fn read_line_from<R: BufRead, W: Write>(
     placeholder: Option<&str>,
     allow_empty: bool,
 ) -> Result<String> {
-    write!(writer, "{}", format_prompt(message, placeholder, allow_empty))?;
+    write!(
+        writer,
+        "{}",
+        format_prompt(message, placeholder, allow_empty)
+    )?;
     writer.flush()?;
     let mut line = String::new();
     let bytes = reader.read_line(&mut line)?;
@@ -379,7 +383,9 @@ mod tests {
                 flow.id
             );
         }
-        let err = resolve_target("nonexistent-provider").unwrap_err().to_string();
+        let err = resolve_target("nonexistent-provider")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("anthropic"), "{err}");
         assert!(err.contains("openai"), "{err}");
     }
@@ -388,7 +394,10 @@ mod tests {
     fn list_and_render_providers_cover_subscriptions_and_oauth_flows() {
         let dir = tempfile::tempdir().unwrap();
         let rows = list_providers(dir.path());
-        assert!(rows.iter().any(|r| r.provider == "anthropic" && !r.signed_in));
+        assert!(
+            rows.iter()
+                .any(|r| r.provider == "anthropic" && !r.signed_in)
+        );
         assert!(rows.iter().any(|r| r.provider == "openai" && !r.signed_in));
         assert!(rows.len() >= 2 + oauth::flows().count());
 

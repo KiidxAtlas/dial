@@ -28,7 +28,7 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 const HOOKS_SKIPPED: &str =
     "[repository hooks and commit signing were skipped because git.bypass_hooks = true]";
 
-const DESCRIPTION: &str = "Structured Git/jj and GitHub operations. Read actions need no approval; mutations need approval. commit uses staged changes unless all=true; branch_create also switches branches; push never forces. In .jj repositories status/diff/log/commit use jj unless vcs=git; jj has no staging. GitHub actions require gh. Hooks and signing apply unless git.bypass_hooks is configured. Truncated output links to complete retained text via read; status may show counts/samples. Use reflog to investigate lost work. Other operations use bash under normal approval.";
+const DESCRIPTION: &str = "Structured Git/jj and GitHub operations. Read actions need no approval; mutations need approval. Pass `cwd` to target a sub-repository in a multi-repo workspace. commit uses staged changes unless all=true; branch_create also switches branches; push never forces. In .jj repositories status/diff/log/commit use jj unless vcs=git; jj has no staging. GitHub actions require gh. Hooks and signing apply unless git.bypass_hooks is configured. Truncated output links to complete retained text via read; status may show counts/samples. Use reflog to investigate lost work. Other operations use bash under normal approval.";
 
 #[derive(Default)]
 pub struct Git {
@@ -49,6 +49,11 @@ const READS: &[&str] = &[
     "show",
     "blame",
     "branches",
+    "stash_list",
+    "stash_show",
+    "tags",
+    "remotes",
+    "rev_parse",
     "pr_view",
     "pr_checks",
     "issue_view",
@@ -70,12 +75,35 @@ fn valid_ref(text: &str) -> Result<&str, String> {
     }
 }
 
+/// One ref or a two-ref range (`a..b` / `a...b`), never an option.
+fn valid_rev_range(text: &str) -> Result<&str, String> {
+    if let Some((a, b)) = text.split_once("...") {
+        valid_ref(a)?;
+        valid_ref(b)?;
+        return Ok(text);
+    }
+    if let Some((a, b)) = text.split_once("..") {
+        valid_ref(a)?;
+        valid_ref(b)?;
+        return Ok(text);
+    }
+    valid_ref(text)
+}
+
+/// Short non-empty query string (`grep` / `author`), never containing NUL or control chars.
+fn valid_query<'a>(text: &'a str, field: &str) -> Result<&'a str, String> {
+    if text.is_empty() || text.len() > 200 || text.chars().any(char::is_control) {
+        return Err(format!("invalid {field} filter"));
+    }
+    Ok(text)
+}
+
 fn number(args: &Value) -> Result<String, String> {
     let n = opt_u64(args, "number")?.ok_or("missing required argument \"number\"")?;
     Ok(n.to_string())
 }
 
-fn paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, String> {
+fn paths(ws: &Workspace, root: &Path, args: &Value) -> Result<Vec<String>, String> {
     let list = args
         .get("paths")
         .and_then(Value::as_array)
@@ -84,16 +112,44 @@ fn paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, String> {
         return Err("`paths` needs 1..200 entries".into());
     }
     list.iter()
-        .map(|p| one_path(ws, p.as_str().ok_or("`paths` entries must be strings")?))
+        .map(|p| {
+            one_path(
+                ws,
+                root,
+                p.as_str().ok_or("`paths` entries must be strings")?,
+            )
+        })
         .collect()
 }
 
-/// A workspace-confined path as a repository-relative string, never an option.
-fn one_path(ws: &Workspace, input: &str) -> Result<String, String> {
-    let abs = ws.resolve(input)?;
+/// Workspace-confined repository directory (`cwd`, or workspace root when omitted).
+fn repo_root(ws: &Workspace, args: &Value) -> Result<PathBuf, String> {
+    let Some(cwd) = opt_str(args, "cwd")? else {
+        return Ok(ws.root().to_path_buf());
+    };
+    let abs = ws.resolve(cwd)?;
+    if !abs.is_dir() {
+        return Err(format!("cwd {cwd:?} is not an existing directory"));
+    }
+    Ok(abs)
+}
+
+/// A workspace-confined path as a `root`-relative string, never an option.
+/// When `root` is a sub-repository (`cwd`), accepts either repo-relative or workspace-relative paths.
+fn one_path(ws: &Workspace, root: &Path, input: &str) -> Result<String, String> {
+    let abs = if root == ws.root() || Path::new(input).is_absolute() {
+        ws.resolve(input)?
+    } else if let Ok(from_ws) = ws.resolve(input)
+        && from_ws.starts_with(root)
+    {
+        from_ws
+    } else {
+        let candidate = root.join(input);
+        ws.resolve(&candidate.to_string_lossy())?
+    };
     let rel = abs
-        .strip_prefix(ws.root())
-        .map_err(|_| format!("path {input:?} is outside the workspace"))?;
+        .strip_prefix(root)
+        .map_err(|_| format!("path {input:?} is outside the repository directory"))?;
     let text = rel.to_string_lossy().into_owned();
     Ok(if text.is_empty() { ".".into() } else { text })
 }
@@ -258,7 +314,17 @@ const TEXTCONV_CONFIG: &str = r"^diff\..*\.textconv$";
 /// Read subcommands that only load commits, trees and refs from the object database. Git runs
 /// clean/smudge filters only when converting working-tree files, so configured filter drivers
 /// (for example git-lfs) cannot execute for them.
-const OBJECT_ONLY_READS: &[&str] = &["log", "reflog", "show", "branch", "rev-parse"];
+const OBJECT_ONLY_READS: &[&str] = &[
+    "log",
+    "reflog",
+    "show",
+    "branch",
+    "rev-parse",
+    "merge-base",
+    "stash",
+    "tag",
+    "remote",
+];
 
 fn filter_config_query(root: &Path, pattern: &str) -> Command {
     let mut query = Command::new("git");
@@ -753,7 +819,7 @@ pub(crate) fn is_jj(root: &Path) -> bool {
     root.join(".jj").is_dir()
 }
 
-fn use_jj(ws: &Workspace, args: &Value, action: &str) -> Result<bool, String> {
+fn use_jj(root: &Path, args: &Value, action: &str) -> Result<bool, String> {
     let jj_action = matches!(action, "status" | "diff" | "log" | "commit");
     match opt_str(args, "vcs")? {
         Some("git") => Ok(false),
@@ -762,17 +828,17 @@ fn use_jj(ws: &Workspace, args: &Value, action: &str) -> Result<bool, String> {
             "{action} has no jj form here; use vcs \"git\" or bash"
         )),
         Some(other) => Err(format!("unknown vcs {other:?}; use \"git\" or \"jj\"")),
-        None => Ok(jj_action && is_jj(ws.root())),
+        None => Ok(jj_action && is_jj(root)),
     }
 }
 
 fn jj_dispatch(
     ws: &Workspace,
+    root: &Path,
     args: &Value,
     action: &str,
     cancel: &AtomicBool,
 ) -> Result<(bool, String), String> {
-    let root = ws.root();
     let jj = |a: Vec<String>| {
         run(Invocation {
             program: "jj",
@@ -789,7 +855,7 @@ fn jj_dispatch(
         "status" => {
             let mut a = strings(&["status"]);
             if let Some(path) = opt_str(args, "path")? {
-                a.push(jj_path(ws, path)?);
+                a.push(jj_path(ws, root, path)?);
             }
             jj(a)
         }
@@ -797,20 +863,35 @@ fn jj_dispatch(
             if opt_bool(args, "staged")? {
                 return Err("jj has no staging area; diff shows the working-copy change (omit `staged`, or pass vcs \"git\")".into());
             }
-            let mut a = strings(&["diff", "--git"]);
+            let mut a = if opt_bool(args, "stat")? {
+                strings(&["diff", "--stat"])
+            } else if opt_bool(args, "name_only")? {
+                strings(&["diff", "--name-only"])
+            } else {
+                strings(&["diff", "--git"])
+            };
             if let Some(base) = opt_str(args, "base")? {
                 a.extend(["--from".into(), valid_ref(base)?.to_owned()]);
             }
+            if let Some(head) = opt_str(args, "head")? {
+                a.extend(["--to".into(), valid_ref(head)?.to_owned()]);
+            }
             if let Some(path) = opt_str(args, "path")? {
-                a.push(jj_path(ws, path)?);
+                a.push(jj_path(ws, root, path)?);
             }
             jj(a)
         }
         "log" => {
             let n = opt_u64(args, "limit")?.unwrap_or(20).clamp(1, 50);
             let mut a = vec!["log".into(), "--limit".into(), n.to_string()];
+            if opt_bool(args, "stat")? {
+                a.push("--stat".into());
+            }
+            if let Some(rev) = opt_str(args, "rev")? {
+                a.extend(["-r".into(), valid_rev_range(rev)?.to_owned()]);
+            }
             if let Some(path) = opt_str(args, "path")? {
-                a.push(jj_path(ws, path)?);
+                a.push(jj_path(ws, root, path)?);
             }
             jj(a)
         }
@@ -818,7 +899,7 @@ fn jj_dispatch(
             let message = commit_message(args)?;
             let mut a = strings(&["commit", "-m", message]);
             if args.get("paths").is_some_and(|p| !p.is_null()) {
-                a.extend(paths(ws, args)?.into_iter().map(|p| jj_file(&p)));
+                a.extend(paths(ws, root, args)?.into_iter().map(|p| jj_file(&p)));
             }
             jj(a)
         }
@@ -827,8 +908,8 @@ fn jj_dispatch(
 }
 
 /// A workspace path as a literal jj fileset (`file:"..."`), never a revset or option.
-fn jj_path(ws: &Workspace, input: &str) -> Result<String, String> {
-    Ok(jj_file(&one_path(ws, input)?))
+fn jj_path(ws: &Workspace, root: &Path, input: &str) -> Result<String, String> {
+    Ok(jj_file(&one_path(ws, root, input)?))
 }
 
 /// `file:"<path>"` with the path as a jj string literal. jj's literal grammar accepts raw UTF-8
@@ -950,7 +1031,8 @@ fn dispatch(
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, String> {
     let action = req_str(args, "action")?;
-    let root = ws.root();
+    let root_buf = repo_root(ws, args)?;
+    let root = root_buf.as_path();
     let git = |a: Vec<String>, t: Duration| {
         run(Invocation {
             program: "git",
@@ -994,9 +1076,9 @@ fn dispatch(
         })
     };
     let mut note = None;
-    let jj = use_jj(ws, args, action)?;
+    let jj = use_jj(root, args, action)?;
     let (ok, text) = if jj {
-        jj_dispatch(ws, args, action, cancel)?
+        jj_dispatch(ws, root, args, action, cancel)?
     } else {
         match action {
             "status" => {
@@ -1008,21 +1090,39 @@ fn dispatch(
                 ]);
                 if let Some(path) = opt_str(args, "path")? {
                     a.push("--".into());
-                    a.push(one_path(ws, path)?);
+                    a.push(one_path(ws, root, path)?);
                 }
                 git(a, LOCAL_TIMEOUT)?
             }
             "diff" => {
+                let staged = opt_bool(args, "staged")?;
+                let base = opt_str(args, "base")?;
+                let head = opt_str(args, "head")?;
+                if head.is_some() && (staged || base.is_none()) {
+                    return Err(
+                        "diff `head` requires `base` and cannot combine with `staged`".into(),
+                    );
+                }
                 let mut a = strings(&["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
-                if opt_bool(args, "staged")? {
+                if staged {
                     a.push("--staged".into());
                 }
-                if let Some(base) = opt_str(args, "base")? {
-                    a.push(valid_ref(base)?.to_owned());
+                if opt_bool(args, "stat")? {
+                    a.push("--stat".into());
+                }
+                if opt_bool(args, "name_only")? {
+                    a.push("--name-only".into());
+                }
+                match (base, head) {
+                    (Some(b), Some(h)) => {
+                        a.push(format!("{}..{}", valid_ref(b)?, valid_ref(h)?));
+                    }
+                    (Some(b), None) => a.push(valid_ref(b)?.to_owned()),
+                    (None, _) => {}
                 }
                 if let Some(path) = opt_str(args, "path")? {
                     a.push("--".into());
-                    a.push(one_path(ws, path)?);
+                    a.push(one_path(ws, root, path)?);
                 }
                 git(a, LOCAL_TIMEOUT)?
             }
@@ -1036,9 +1136,22 @@ fn dispatch(
                     format!("-n{n}"),
                     "--format=%h %ad %an  %s%d".into(),
                 ];
+                if opt_bool(args, "stat")? {
+                    a.push("--stat".into());
+                }
+                if let Some(grep) = opt_str(args, "grep")? {
+                    a.push("--fixed-strings".into());
+                    a.push(format!("--grep={}", valid_query(grep, "grep")?));
+                }
+                if let Some(author) = opt_str(args, "author")? {
+                    a.push(format!("--author={}", valid_query(author, "author")?));
+                }
+                if let Some(rev) = opt_str(args, "rev")? {
+                    a.push(valid_rev_range(rev)?.to_owned());
+                }
                 if let Some(path) = opt_str(args, "path")? {
                     a.push("--".into());
-                    a.push(one_path(ws, path)?);
+                    a.push(one_path(ws, root, path)?);
                 }
                 git(a, LOCAL_TIMEOUT)?
             }
@@ -1083,21 +1196,93 @@ fn dispatch(
                     a.push(valid_ref(rev)?.to_owned());
                 }
                 a.push("--".into());
-                a.push(one_path(ws, req_str(args, "path")?)?);
+                a.push(one_path(ws, root, req_str(args, "path")?)?);
                 git(a, LOCAL_TIMEOUT)?
             }
             "branches" => git(
                 strings(&["branch", "--all", "--verbose", "--no-color"]),
                 LOCAL_TIMEOUT,
             )?,
+            "stash_list" => {
+                let n = opt_u64(args, "limit")?.unwrap_or(20).clamp(1, 50);
+                git(
+                    vec![
+                        "stash".into(),
+                        "list".into(),
+                        "--no-color".into(),
+                        format!("-n{n}"),
+                        "--format=%gd %gs".into(),
+                    ],
+                    LOCAL_TIMEOUT,
+                )?
+            }
+            "stash_show" => {
+                let rev = match opt_str(args, "rev")? {
+                    Some(r) => valid_ref(r)?,
+                    None => "stash@{0}",
+                };
+                let mut a = strings(&[
+                    "stash",
+                    "show",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ]);
+                if opt_bool(args, "name_only")? {
+                    a.push("--name-only".into());
+                } else if opt_bool(args, "stat")? {
+                    a.push("--stat".into());
+                } else {
+                    a.extend(strings(&["--stat", "--patch"]));
+                }
+                a.push(rev.into());
+                git(a, LOCAL_TIMEOUT)?
+            }
+            "tags" => {
+                let n = opt_u64(args, "limit")?.unwrap_or(20).clamp(1, 50) as usize;
+                let (ok, raw) = git(
+                    strings(&["tag", "--list", "--sort=-creatordate"]),
+                    LOCAL_TIMEOUT,
+                )?;
+                if ok {
+                    let lines: Vec<&str> = raw.lines().take(n).collect();
+                    (true, lines.join("\n"))
+                } else {
+                    (false, raw)
+                }
+            }
+            "remotes" => git(strings(&["remote", "-v"]), LOCAL_TIMEOUT)?,
+            "rev_parse" => match (opt_str(args, "base")?, opt_str(args, "head")?) {
+                (Some(b), Some(h)) => git(
+                    vec![
+                        "merge-base".into(),
+                        valid_ref(b)?.to_owned(),
+                        valid_ref(h)?.to_owned(),
+                    ],
+                    LOCAL_TIMEOUT,
+                )?,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err("rev_parse merge-base needs both `base` and `head`".into());
+                }
+                (None, None) => {
+                    let mut a = strings(&["rev-parse"]);
+                    if let Some(rev) = opt_str(args, "rev")? {
+                        a.push("--verify".into());
+                        a.push(valid_ref(rev)?.to_owned());
+                    } else {
+                        a.extend(strings(&["--abbrev-ref", "HEAD", "HEAD"]));
+                    }
+                    git(a, LOCAL_TIMEOUT)?
+                }
+            },
             "add" => {
                 let mut a = strings(&["add", "--"]);
-                a.extend(paths(ws, args)?);
+                a.extend(paths(ws, root, args)?);
                 git(a, LOCAL_TIMEOUT)?
             }
             "unstage" => {
                 let mut a = strings(&["restore", "--staged", "--"]);
-                a.extend(paths(ws, args)?);
+                a.extend(paths(ws, root, args)?);
                 git(a, LOCAL_TIMEOUT)?
             }
             "commit" => {
@@ -1204,18 +1389,28 @@ impl Tool for Git {
     ) -> Option<crate::tools::surface::resources::Access> {
         use crate::tools::surface::resources::{Access, workspace_reads};
         let action = args["action"].as_str().filter(|a| READS.contains(a))?;
-        if use_jj(workspace, args, action).ok()? {
+        let root = repo_root(workspace, args).ok()?;
+        if use_jj(&root, args, action).ok()? {
             return Some(workspace_reads(workspace));
         }
         match (action, args["path"].as_str()) {
             (
-                "log" | "reflog" | "show" | "branches" | "pr_view" | "pr_checks" | "issue_view",
+                "log" | "reflog" | "show" | "branches" | "stash_list" | "stash_show" | "tags"
+                | "remotes" | "rev_parse" | "pr_view" | "pr_checks" | "issue_view",
                 _,
             ) => Some(Access::default()),
-            ("status" | "diff" | "blame", Some(path)) => Some(Access {
-                reads: vec![path.into()],
-                writes: Vec::new(),
-            }),
+            ("status" | "diff" | "blame", Some(path)) => {
+                let rel = one_path(workspace, &root, path).ok()?;
+                let abs = root.join(rel);
+                let ws_rel = abs
+                    .strip_prefix(workspace.root())
+                    .unwrap_or(&abs)
+                    .to_path_buf();
+                Some(Access {
+                    reads: vec![ws_rel],
+                    writes: Vec::new(),
+                })
+            }
             ("status" | "diff", None) => Some(workspace_reads(workspace)),
             _ => None,
         }
@@ -1230,18 +1425,23 @@ impl Tool for Git {
             "git",
             DESCRIPTION,
             json!({
-                "action": {"type": "string", "enum": ["status", "diff", "log", "reflog", "show", "blame", "branches", "add", "unstage", "commit", "branch_create", "switch", "push", "pr_create", "pr_view", "pr_checks", "issue_view"]},
-                "vcs": {"type": "string", "enum": ["git", "jj"], "description": "status/diff/log/commit: force git or jj (default: jj when .jj/ exists)"},
-                "start": {"type": "integer", "minimum": 1, "description": "blame: first line"},
+                "action": {"type": "string", "enum": ["status", "diff", "log", "reflog", "show", "blame", "branches", "stash_list", "stash_show", "tags", "remotes", "rev_parse", "add", "unstage", "commit", "branch_create", "switch", "push", "pr_create", "pr_view", "pr_checks", "issue_view"]},
+                "cwd": {"type": "string", "description": "Sub-repo directory relative to workspace root"},
+                "vcs": {"type": "string", "enum": ["git", "jj"], "description": "status/diff/log/commit: force git or jj"},
                 "end": {"type": "integer", "minimum": 1, "description": "blame: last line"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "add/unstage: workspace paths"},
-                "path": {"type": "string", "description": "status/diff/log: limit to this path; blame: file (required)"},
+                "path": {"type": "string", "description": "status/diff/log: path filter; blame: file"},
                 "staged": {"type": "boolean", "description": "diff: staged changes"},
-                "base": {"type": "string", "description": "diff: compare the working tree to this ref; pr_create: base branch"},
-                "rev": {"type": "string", "description": "show: commit, tag or ref; blame: blame as of this revision"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "log/reflog: entries to show (default 20)"},
+                "stat": {"type": "boolean", "description": "diff/log/stash_show: diffstat summary"},
+                "name_only": {"type": "boolean", "description": "diff/stash_show: changed file names only"},
+                "base": {"type": "string", "description": "diff: base ref; rev_parse: merge-base A; pr_create: base branch"},
+                "head": {"type": "string", "description": "diff: compare base..head; rev_parse: merge-base B"},
+                "rev": {"type": "string", "description": "show/blame/stash_show/rev_parse: ref; log: ref or a..b"},
+                "grep": {"type": "string", "description": "log: commit message text filter"},
+                "author": {"type": "string", "description": "log: author filter"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "log/reflog/stash_list/tags: max entries (default 20)"},
                 "message": {"type": "string", "description": "commit: message"},
-                "all": {"type": "boolean", "description": "commit: include every tracked change"},
+                "all": {"type": "boolean", "description": "commit: include tracked changes"},
                 "name": {"type": "string", "description": "branch_create/switch: branch name"},
                 "from": {"type": "string", "description": "branch_create: starting ref (default HEAD)"},
                 "remote": {"type": "string", "description": "push: remote (default origin)"},

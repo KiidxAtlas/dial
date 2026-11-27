@@ -281,6 +281,7 @@ jobs:
     name: Sign release manifest
     needs: [gate, windows-sign, macos-sign]
     if: ${{ !cancelled() && needs.windows-sign.result == 'success' && needs.macos-sign.result == 'success' }}
+    runs-on: ubuntu-22.04
     # Configure required reviewers and tag deployment rules in repository settings.
     environment: release-signing
     permissions:

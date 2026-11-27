@@ -187,16 +187,9 @@ impl<'a> Agent<'a> {
         let result = thread::scope(|scope| -> Result<_> {
             let (tx, rx) = mpsc::sync_channel(1);
             let worker = scope.spawn(move || {
-                let result = cache.refresh(&workspace, &cancel).and_then(|stats| {
-                    let architecture = cache.task_architecture_context(query, max_bytes / 2)?;
-                    let remaining = max_bytes.saturating_sub(architecture.len());
-                    let context = if remaining == 0 {
-                        String::new()
-                    } else {
-                        cache.task_context(query, remaining)?
-                    };
-                    Ok((stats, format!("{architecture}{context}")))
-                });
+                let result = cache
+                    .refresh(&workspace, &cancel)
+                    .and_then(|stats| Ok((stats, cache.task_brief(query, max_bytes, true)?)));
                 let _ = tx.send(result);
             });
             let result = receive_with_heartbeat(&rx, ui);

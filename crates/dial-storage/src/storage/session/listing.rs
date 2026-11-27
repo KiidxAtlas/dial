@@ -250,7 +250,10 @@ impl Session {
             };
             if is_conversation_message(message) {
                 let text = content_text(message);
-                let text = match limit { Some(n) => truncate_chars(&text, n), None => text };
+                let text = match limit {
+                    Some(n) => truncate_chars(&text, n),
+                    None => text,
+                };
                 turns.push((role_of(message).to_owned(), text));
             }
         }

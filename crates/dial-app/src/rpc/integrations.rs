@@ -253,7 +253,11 @@ pub(super) fn commit_preview(layout: &Layout, config: &Config, params: &Value) -
     let model = match params.get("model") {
         None | Some(Value::Null) => None,
         Some(Value::String(m)) if !m.is_empty() => Some(m.clone()),
-        Some(_) => return Err(invalid("commit_preview params.model must be a non-empty string")),
+        Some(_) => {
+            return Err(invalid(
+                "commit_preview params.model must be a non-empty string",
+            ));
+        }
     };
     let mut args = vec!["--dry-run".to_owned(), "--json".to_owned()];
     if let Some(m) = model {
@@ -262,7 +266,12 @@ pub(super) fn commit_preview(layout: &Layout, config: &Config, params: &Value) -
     }
     let parsed = crate::commit::cli::parse_commit_args(&args)
         .map_err(|error| invalid(error.to_string()))?
-        .ok_or_else(|| coded(ErrorCode::InternalError, "commit_preview args returned help"))?;
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InternalError,
+                "commit_preview args returned help",
+            )
+        })?;
     let outcome = crate::commit::run::run_commit_command(
         &parsed,
         &layout.project_root,
@@ -280,7 +289,11 @@ pub(super) fn share_session(layout: &Layout, config: &Config, params: &Value) ->
     let session_id = match params.get("session_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
-        Some(_) => return Err(invalid("share_session params.session_id must be a non-empty string")),
+        Some(_) => {
+            return Err(invalid(
+                "share_session params.session_id must be a non-empty string",
+            ));
+        }
     };
     let gist = match params.get("gist") {
         None | Some(Value::Null) => false,
@@ -290,7 +303,11 @@ pub(super) fn share_session(layout: &Layout, config: &Config, params: &Value) ->
     let whole_journal = match params.get("whole_journal") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(flag)) => *flag,
-        Some(_) => return Err(invalid("share_session params.whole_journal must be a boolean")),
+        Some(_) => {
+            return Err(invalid(
+                "share_session params.whole_journal must be a boolean",
+            ));
+        }
     };
     let endpoint = match params.get("endpoint") {
         None | Some(Value::Null) => None,
@@ -328,11 +345,9 @@ pub(super) fn share_session(layout: &Layout, config: &Config, params: &Value) ->
     };
     let transcript = crate::storage::share::transcript(&selected.path, scope)
         .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
-    let fitted = crate::storage::share::fit_to_cap(
-        &transcript,
-        crate::storage::share::SHARE_CAP_BYTES,
-    )
-    .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    let fitted =
+        crate::storage::share::fit_to_cap(&transcript, crate::storage::share::SHARE_CAP_BYTES)
+            .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
     let mut notes = vec![
         "the key is only in the URL fragment; anyone with the full link can read the session."
             .to_owned(),

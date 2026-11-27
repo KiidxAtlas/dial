@@ -37,6 +37,7 @@ pub(super) struct ChildTurn<'a> {
     )>,
     cached_memory_prompt: Option<(String, String)>,
     inspections: crate::agent::workflow::efficiency::Inspections,
+    read_receipts: crate::agent::workers::read_receipts::ReadReceipts,
     scheduling: crate::agent::workflow::efficiency::Scheduling,
     streamed: Option<crate::agent::run::streaming_dispatch::StreamingDispatch>,
     rule_catalog: crate::agent::safety::rules::Catalog,
@@ -340,6 +341,7 @@ impl<'a> ChildTurn<'a> {
             active_settings,
             cached_memory_prompt,
             inspections,
+            read_receipts: Default::default(),
             scheduling: Default::default(),
             streamed: None,
             rule_catalog,
@@ -1770,6 +1772,7 @@ impl<'a> ChildTurn<'a> {
                             model_route: None,
                             scheduling: Default::default(),
                             inspections: Default::default(),
+                            read_receipts: Default::default(),
                             conversation: None,
                         }),
                     ));
@@ -2495,6 +2498,12 @@ impl<'a> ChildTurn<'a> {
                 let integrity = output.execution.output.get_or_insert_with(Default::default);
                 integrity.mark_presentation_partial();
             }
+            // Receipts follow what the model is shown: only a whole, original, unblocked native read
+            // whose visible body is exactly its output counts. Pointers, reductions and clipped rows
+            // decline here, so rows never sent cannot become receipts.
+            if !blocked && !dropped && original_observation && body == output.text {
+                self.read_receipts.record(env.workspace, call, &output);
+            }
             crate::telemetry::tool_output(
                 env.config,
                 false,
@@ -2854,6 +2863,7 @@ impl<'a> ChildTurn<'a> {
         }
         outcome.scheduling = self.scheduling;
         outcome.inspections = self.inspections;
+        outcome.read_receipts = self.read_receipts;
         // Moved out once: every finish path, including provider and budget exhaustion, keeps its history.
         outcome.conversation = Some(ChildConversation {
             messages: self.messages,

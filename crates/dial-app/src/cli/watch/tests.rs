@@ -33,7 +33,7 @@ fn events(layout: &Layout, session: &str) -> Vec<Event> {
 
 #[test]
 fn attachment_targets_one_owner_and_never_replays_after_reopen() {
-    use attachment::{Owner, Endpoint};
+    use attachment::{Endpoint, Owner};
     let root = tempfile::tempdir().unwrap();
     let layout = layout(root.path());
     let first = Owner::open(&layout, "first").unwrap();

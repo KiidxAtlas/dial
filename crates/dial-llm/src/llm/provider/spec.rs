@@ -3,8 +3,8 @@
 //! Extracted from `provider.rs` so provider identity/validation rules live independently of
 //! transport execution, retry loops, and response streaming.
 
-use super::super::model_config::ApiProtocol;
 use super::super as llm;
+use super::super::model_config::ApiProtocol;
 use anyhow::{Context, Result, bail, ensure};
 use std::fmt;
 use std::io::Read;

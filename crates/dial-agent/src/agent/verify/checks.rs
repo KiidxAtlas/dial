@@ -561,6 +561,7 @@ impl<'a> Agent<'a> {
             matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
             self.step_checks.fix_revision(),
         );
+        self.record_repair_link(command, &call.id, verdict, ui);
         let evidence_ref = self.retain_check_log(output);
         self.step_checks
             .evidence
@@ -672,6 +673,41 @@ impl<'a> Agent<'a> {
                     "repair evidence was not recorded: {error:#}; {record_error:#}"
                 ));
             }
+        }
+    }
+
+    /// Off-prompt structured evidence linking an observed code failure to the same check's later
+    /// verdict. The failure event is written when observed, so an unresolved failure stays unknown.
+    /// Reused checks never reach this path, so reuse cannot resolve a failure. Commands are redacted
+    /// and bounded before they leave the controller.
+    fn record_repair_link(
+        &mut self,
+        command: &str,
+        call_id: &str,
+        verdict: verify::verification::CheckStatus,
+        ui: &mut dyn Ui,
+    ) {
+        let revision = self.step_checks.revision();
+        let step = self.cur_step;
+        let shown = truncate(&crate::storage::redact::redact_text(command), 200);
+        if let Some(mut linked) = self
+            .step_checks
+            .evidence
+            .link_verdict(command, call_id, verdict, revision)
+        {
+            linked.command = shown.clone();
+            if let Err(error) = self.record(step, "check_repair_verdict", json!(linked)) {
+                ui.notice(&format!("check repair verdict was not recorded: {error:#}"));
+            }
+        }
+        if verdict == verify::verification::CheckStatus::CodeFailed
+            && let Err(error) = self.record(
+                step,
+                "check_failure_observed",
+                json!({"command":shown,"call_id":call_id,"revision":revision}),
+            )
+        {
+            ui.notice(&format!("check failure was not recorded: {error:#}"));
         }
     }
 

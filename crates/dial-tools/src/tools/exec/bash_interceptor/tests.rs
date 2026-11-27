@@ -95,7 +95,7 @@ fn segments(command: &str) -> Vec<(String, bool)> {
 #[test]
 fn default_rules_all_compile_and_match_count() {
     let rules = default_rules();
-    assert_eq!(rules.len(), 13);
+    assert_eq!(rules.len(), 21);
     for r in &rules {
         assert!(
             compile_rule(r).is_some(),
@@ -884,4 +884,124 @@ fn leading_assignment_stripping() {
     assert_eq!(without_leading_environment_assignments("FOO=\"a"), None);
     assert_eq!(without_leading_environment_assignments("FOO=1"), None);
     assert_eq!(without_leading_environment_assignments("ls -la"), None);
+}
+
+#[test]
+fn broadened_rules_cover_git_host_web_archives_and_verify() {
+    let full_tools = &[
+        "read", "grep", "glob", "edit", "write", "bash", "bg", "git", "verify",
+    ];
+    for (cmd, expected_tool) in [
+        ("git status", "git"),
+        ("git -C dial-engine diff --stat", "git"),
+        ("git --no-pager log -n 5", "git"),
+        ("git stash list", "git"),
+        ("git tag --list", "git"),
+        ("git remote -v", "git"),
+        ("git rev-parse HEAD", "git"),
+        ("gh pr view 42", "git"),
+        ("ps aux", "read"),
+        ("lsof -i :3000", "read"),
+        ("curl -s https://example.com/docs", "read"),
+        ("tar -tf archive.tar.gz", "read"),
+        ("unzip -l bundle.zip", "read"),
+        ("tree src", "glob"),
+        ("wc -l src/lib.rs", "read"),
+        ("file target/debug/app", "read"),
+        ("strings bin/tool", "read"),
+        ("pytest tests/test_a.py", "verify"),
+        ("cargo clippy --all-targets -- -D warnings", "verify"),
+        ("cargo fmt --all -- --check", "verify"),
+        ("cargo test -p dial-tools", "verify"),
+        ("go test ./...", "verify"),
+        ("ruff check .", "verify"),
+        ("pyright", "verify"),
+        ("node --test src/a.test.mjs", "verify"),
+    ] {
+        let verdict = check(&hint_mode(), full_tools, cmd);
+        let Some(Verdict::Hint(line)) = verdict else {
+            panic!("expected hint for `{cmd}`, got {verdict:?}");
+        };
+        let matched_tool = default_rules()
+            .into_iter()
+            .find(|r| line == format!("[hint] {}", r.message))
+            .map(|r| r.tool);
+        assert_eq!(
+            matched_tool.as_deref(),
+            Some(expected_tool),
+            "{cmd}: {line}"
+        );
+    }
+    // Watch-mode test commands still route to `bg`, not `verify`.
+    let watch = check(&hint_mode(), full_tools, "pytest --watch");
+    assert!(
+        matches!(watch, Some(Verdict::Hint(ref s)) if s.contains("Use `bg`")),
+        "{watch:?}"
+    );
+    // Mutating git, curl POST/downloads/localhost, and `git grep` stay untouched.
+    for untouched in [
+        "git commit -m hi",
+        "git grep -n foo",
+        "curl -X POST https://api.example.com/v1 -d '{}'",
+        "curl -o out.bin https://example.com/file.bin",
+        "curl https://example.com > page.html",
+        "curl http://localhost:3000/health",
+    ] {
+        assert_eq!(
+            check(&hint_mode(), full_tools, untouched),
+            None,
+            "{untouched}"
+        );
+    }
+}
+
+#[test]
+fn loadable_tools_get_discovery_hints_without_blocking() {
+    let offered = &["read", "grep", "glob", "bash"];
+    let loadable = &["git", "verify"];
+    let hint = check_in_with_loadable(&hint_mode(), offered, loadable, "git status", &|_| true);
+    let Some(Verdict::Hint(line)) = hint else {
+        panic!("expected discovery hint, got {hint:?}");
+    };
+    assert!(
+        line.contains("tool_search") && line.contains("names:[\"git\"]"),
+        "{line}"
+    );
+    // Block mode must never block for an unloaded tool.
+    assert_eq!(
+        check_in_with_loadable(&on(), offered, loadable, "git status", &|_| true),
+        None
+    );
+}
+
+#[test]
+fn lookup_batch_covers_compound_git_and_loadable_lookups() {
+    let full_tools = &["read", "grep", "glob", "git", "bash"];
+    let hint = check(
+        &hint_mode(),
+        full_tools,
+        "cd dial-engine && git status && git diff --stat",
+    );
+    let Some(Verdict::Hint(line)) = hint else {
+        panic!("expected git batch hint, got {hint:?}");
+    };
+    assert!(
+        line.contains("parallel tool calls") && line.contains("`git`"),
+        "{line}"
+    );
+
+    let deferred = check_in_with_loadable(
+        &hint_mode(),
+        &["read", "grep", "glob", "bash"],
+        &["git"],
+        "git status && cat Cargo.toml",
+        &|_| true,
+    );
+    let Some(Verdict::Hint(line)) = deferred else {
+        panic!("expected deferred batch hint, got {deferred:?}");
+    };
+    assert!(
+        line.contains("tool_search") && line.contains("\"git\""),
+        "{line}"
+    );
 }

@@ -112,3 +112,51 @@ fn bare_conflict_lists_unmerged_git_paths() {
         out.text
     );
 }
+
+#[test]
+fn bare_and_subrepo_conflict_work_in_multi_repo_workspace() {
+    let (dir, ws) = workspace();
+    let sub = dir.path().join("repo-a");
+    fs::create_dir_all(&sub).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&sub)
+            .output()
+            .unwrap();
+        assert!(status.status.success() || args[0] == "merge", "{status:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    disable_inherited_git_filters(&sub);
+    fs::write(sub.join("f.txt"), "base\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-qb", "other"]);
+    fs::write(sub.join("f.txt"), "other\n").unwrap();
+    git(&["commit", "-qam", "other"]);
+    git(&["checkout", "-q", "main"]);
+    fs::write(sub.join("f.txt"), "main\n").unwrap();
+    git(&["commit", "-qam", "main"]);
+    git(&["merge", "-q", "other"]);
+
+    let all = run(&ws, "read", json!({"path": "conflict://"}));
+    assert_eq!(
+        all.text, "1 unmerged path:\nconflict://repo-a/f.txt: 1 hunk",
+        "{}",
+        all.text
+    );
+    let scoped = run(&ws, "read", json!({"path": "conflict://repo-a"}));
+    assert_eq!(
+        scoped.text, "1 unmerged path:\nconflict://repo-a/f.txt: 1 hunk",
+        "{}",
+        scoped.text
+    );
+}

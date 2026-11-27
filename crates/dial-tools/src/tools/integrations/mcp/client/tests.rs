@@ -556,7 +556,13 @@ fn closed_stdout_settles_an_inflight_blocked_stdin_write_before_return() {
         args: vec!["-c".into(), "sleep 0.15; exec 1>&-; exec sleep 60".into()],
         ..Default::default()
     };
-    let client = Client::spawn("closed-output", &config, Shared::new(Vec::new(), None), None).unwrap();
+    let client = Client::spawn(
+        "closed-output",
+        &config,
+        Shared::new(Vec::new(), None),
+        None,
+    )
+    .unwrap();
     let error = client
         .request_with(
             "tools/call",
@@ -586,7 +592,8 @@ fn progress_callback_panic_settles_blocked_stdio_work() {
         args: vec!["-c".into(), "exec sleep 60".into()],
         ..Default::default()
     };
-    let client = Client::spawn("panic-output", &config, Shared::new(Vec::new(), None), None).unwrap();
+    let client =
+        Client::spawn("panic-output", &config, Shared::new(Vec::new(), None), None).unwrap();
     let shared = client.shared.clone();
     let progress = thread::spawn(move || {
         while lock(&shared.state).pending.is_empty() {
@@ -770,9 +777,18 @@ fn stdio_mcp_sandbox_config_validates_and_wraps_command() {
             ..
         } => {
             assert!(!allow_network, "MCP spec must inherit allow_network");
-            assert!(deny_read.contains(&state_dir), "MCP spec must deny project state dir");
-            assert!(deny_read.contains(&user_dir), "MCP spec must deny Dial user dir");
-            assert!(ew.contains(&extra_write), "MCP spec must inherit extra_write");
+            assert!(
+                deny_read.contains(&state_dir),
+                "MCP spec must deny project state dir"
+            );
+            assert!(
+                deny_read.contains(&user_dir),
+                "MCP spec must deny Dial user dir"
+            );
+            assert!(
+                ew.contains(&extra_write),
+                "MCP spec must inherit extra_write"
+            );
         }
         other => panic!("expected Policy::Dev, got {other:?}"),
     }

@@ -507,6 +507,7 @@ pub(super) fn finish_worker(body: &Option<crate::runtime::Body>, outcome: &Outco
         }
         data["result"] = outcome.data.clone().unwrap_or_else(|| json!(text));
         data["acceptance"] = json!(outcome.acceptance);
+        data["read_receipts"] = json!(outcome.read_receipts);
         if let Some(rules) = &outcome.portable_rules {
             data["portable_rules"] = rules.clone();
         }

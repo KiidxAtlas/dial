@@ -32,6 +32,7 @@ This index explains ownership; existing paths remain stable for suites, CI and i
 - **Cross-agent evaluation** uses `cross_agent.py` and `cross-agent.toml` with installed agent CLIs.
   [Registry discovery](registry-discovery.md) additionally checks ordered trace behavior;
   answer-only `dial benchmark` runs do not establish that behavior.
+- **Codebase-memory A/B pilot:** `codebase_memory_ab.py` runs fresh-session `with`/`without` trials through the real CLI (`dial -p --output-format json`, `dial understanding --json`, `dial stats --json`). The `lexical` target (`--dial-engine <checkout>`) copies only `navigation.rs`, `workflow/investigation.rs` and `run/engine/evidence_tests.rs` into each trial and grades `progress_keys` and its proving test externally; `fixture` is synthetic and for stub tests. `run` makes paid model calls unless `--dial` is a stub; `test_codebase_memory_ab.py` uses a stub that proves plumbing, isolation and grading only, not a measurement.
 - **Specialized probes:** `offline_compare.py` uses scripted loopback responses and synthetic
   token counts; `swe_bench.py` is an optional Docker/SWE-bench workflow with downloads and model
   calls; `retrieval_measurements.py` runs Rust retrieval measurements without a model.

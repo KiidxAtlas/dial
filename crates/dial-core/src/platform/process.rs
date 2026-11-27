@@ -49,7 +49,6 @@ impl ResourceLimits {
     }
 }
 
-
 /// Spawn `command` as the leader of a new process group (Unix: `process_group(0)`; Windows: a
 /// new console process group inside a Job Object assigned before the child runs any code).
 /// On Windows this sets the command's creation flags; do not set them separately.

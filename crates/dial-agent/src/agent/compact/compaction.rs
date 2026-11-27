@@ -34,8 +34,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-pub(in crate::agent) use summary::edited_this_turn;
 pub use summary::{BranchSummary, summarize_branch};
+pub(in crate::agent) use summary::{EditedFile, edited_this_turn};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

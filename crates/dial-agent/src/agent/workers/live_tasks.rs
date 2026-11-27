@@ -1445,6 +1445,7 @@ impl LiveTasks {
                 value["inspections"] = json!(outcome.inspections);
                 value["scheduling"] = json!(outcome.scheduling);
                 value["acceptance"] = json!(outcome.acceptance);
+                value["read_receipts"] = json!(outcome.read_receipts);
                 *control
                     .acceptance
                     .lock()
@@ -1493,6 +1494,7 @@ impl LiveTasks {
                     value.get("data"),
                     &acceptance,
                     Some(&workspace),
+                    Some(&value),
                 );
                 if let Some(store) = workspace.artifacts() {
                     match subagents::retain_report(store, &value) {
@@ -2084,6 +2086,7 @@ fn model_summary_view(value: &Value, delivered: &impl Fn(&Value) -> bool) -> Str
                 job.get("data"),
                 &acceptance,
                 None,
+                Some(job),
             );
             &derived
         };

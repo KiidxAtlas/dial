@@ -155,17 +155,50 @@ fn tools_list_error_classes_and_legacy_outcome_rows_migrate() {
         })
         .unwrap();
     }
+    for (status, class) in [
+        (crate::tools::ToolStatus::Error, "nonzero_exit"),
+        (crate::tools::ToolStatus::Error, "command_not_found"),
+        (crate::tools::ToolStatus::Error, "tool_error"),
+        (crate::tools::ToolStatus::Error, "effects_unknown"),
+        (crate::tools::ToolStatus::Error, "future_class"),
+        (crate::tools::ToolStatus::Timeout, "nonzero_exit"),
+    ] {
+        db.record_tool(&ToolRecord {
+            status: Some(status),
+            ts_ms: 2,
+            tool: "bash".into(),
+            error: true,
+            error_class: Some(class.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
     let tools = db.tools(None).unwrap();
     let verify = tools.iter().find(|group| group.tool == "verify").unwrap();
     // The legacy row was never rolled up, so it shows in the outcome statuses only.
     assert_eq!(verify.errors, 3);
     assert_eq!(names(&verify.outcomes), vec![("error", 4)]);
+    let breakdown = |tool| {
+        let row = tools.iter().find(|group| group.tool == tool).unwrap();
+        serde_json::to_value(row).unwrap()["error_breakdown"].clone()
+    };
+    assert_eq!(
+        breakdown("verify"),
+        serde_json::json!({"command_or_check": 2, "execution_failure": 1, "unclassified": 1})
+    );
+    assert_eq!(
+        breakdown("bash"),
+        serde_json::json!({"command_or_check": 1, "execution_failure": 1, "unclassified": 3})
+    );
     // The pre-class row stays unclassified rather than being guessed.
     assert_eq!(
         names(&verify.error_classes),
         vec![("check_failed", 2), ("verify_refused", 1)]
     );
     let text = render_text(&db.report(None, 10).unwrap());
+    assert!(
+        text.contains("command/check findings: 2 · execution failures: 1 · unclassified errors: 1")
+    );
     assert!(
         text.contains("[2 check_failed, 1 verify_refused]"),
         "class breakdown missing:\n{text}"

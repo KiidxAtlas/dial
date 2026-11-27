@@ -54,6 +54,8 @@ pub(in crate::agent) struct Outcome {
     pub model_route: Option<Value>,
     /// Controller-owned exact inspection identities; never part of the worker's validated answer.
     pub inspections: crate::agent::workflow::efficiency::Inspections,
+    /// Controller-owned read receipts for worker reports; never part of the worker's answer.
+    pub read_receipts: crate::agent::workers::read_receipts::ReadReceipts,
     pub scheduling: crate::agent::workflow::efficiency::Scheduling,
     /// The child's conversation at finish, moved out so a retained slot can continue it.
     pub conversation: Option<ChildConversation>,
@@ -84,6 +86,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            read_receipts: Default::default(),
             scheduling: Default::default(),
             conversation: None,
         }
@@ -99,6 +102,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            read_receipts: Default::default(),
             scheduling: Default::default(),
             conversation: None,
         }
@@ -114,6 +118,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            read_receipts: Default::default(),
             scheduling: Default::default(),
             conversation: None,
         }

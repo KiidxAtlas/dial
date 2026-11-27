@@ -384,9 +384,7 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let spawn_result = if config.sandbox {
-            let limits = effective_spec
-                .map(|spec| spec.limits)
-                .unwrap_or_default();
+            let limits = effective_spec.map(|spec| spec.limits).unwrap_or_default();
             crate::platform::process::spawn_group_limited(&mut command, limits)
         } else {
             crate::platform::process::spawn_group(&mut command)
@@ -1059,15 +1057,12 @@ pub(super) fn build_stdio_command(
     let program = launch_program(config);
     if !config.sandbox {
         let mut command = Command::new(program);
-        command
-            .args(&config.args)
-            .env_clear()
-            .envs(server_env(
-                std::env::vars_os().filter_map(|(name, value)| {
-                    Some((name.into_string().ok()?, value.into_string().ok()?))
-                }),
-                &config.env,
-            ));
+        command.args(&config.args).env_clear().envs(server_env(
+            std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }),
+            &config.env,
+        ));
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
@@ -1084,9 +1079,12 @@ pub(super) fn build_stdio_command(
     let root = root
         .canonicalize()
         .with_context(|| format!("resolving sandbox root {}", root.display()))?;
-    let program_str = program
-        .to_str()
-        .ok_or_else(|| anyhow!("sandboxed MCP server path is not UTF-8: {}", program.display()))?;
+    let program_str = program.to_str().ok_or_else(|| {
+        anyhow!(
+            "sandboxed MCP server path is not UTF-8: {}",
+            program.display()
+        )
+    })?;
     let arg_refs: Vec<&str> = config.args.iter().map(String::as_str).collect();
     let owned_spec;
     let policy = match sandbox_spec {

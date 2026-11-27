@@ -199,18 +199,41 @@ fn file_text(ws: &Workspace, input: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{input} does not exist"))
 }
 
-fn list(ws: &Workspace) -> Result<String, String> {
+fn unmerged_in(repo: &std::path::Path) -> Result<Vec<String>, String> {
     let names = crate::tools::vcs::git::run_checked(
-        ws.root(),
+        repo,
         &["diff", "--name-only", "--diff-filter=U", "--relative", "-z"],
         false,
-    )
-    .map_err(|error| {
-        format!("conflict:// lists unmerged Git paths ({error}); pass conflict://<path> to inspect one file")
-    })?;
-    let paths: Vec<&str> = names.split('\0').filter(|p| !p.is_empty()).collect();
+    )?;
+    Ok(names
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn child_git_repos(root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    const MAX_CHILDREN: usize = 64;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut repos = Vec::new();
+    for entry in entries.flatten().take(MAX_CHILDREN) {
+        let path = entry.path();
+        if path.is_dir()
+            && path.join(".git").exists()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            repos.push((name.to_owned(), path));
+        }
+    }
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    repos
+}
+
+fn format_unmerged(ws: &Workspace, paths: &[String]) -> String {
     if paths.is_empty() {
-        return Ok("No unmerged paths.".into());
+        return "No unmerged paths.".into();
     }
     let mut out = format!(
         "{} unmerged path{}:\n",
@@ -237,7 +260,47 @@ fn list(ws: &Workspace) -> Result<String, String> {
             paths.len() - MAX_LISTED
         ));
     }
-    Ok(out.trim_end().into())
+    out.trim_end().into()
+}
+
+fn list_in_dir(
+    ws: &Workspace,
+    dir: &std::path::Path,
+    prefix: Option<&str>,
+) -> Result<String, String> {
+    let mut paths = unmerged_in(dir).map_err(|error| {
+        format!("conflict:// lists unmerged Git paths ({error}); pass conflict://<path> to inspect one file")
+    })?;
+    if let Some(prefix) = prefix {
+        let prefix = prefix.trim_end_matches('/');
+        for path in &mut paths {
+            *path = format!("{prefix}/{path}");
+        }
+    }
+    Ok(format_unmerged(ws, &paths))
+}
+
+fn list(ws: &Workspace) -> Result<String, String> {
+    match unmerged_in(ws.root()) {
+        Ok(paths) => Ok(format_unmerged(ws, &paths)),
+        Err(root_error) => {
+            let repos = child_git_repos(ws.root());
+            if repos.is_empty() {
+                return Err(format!(
+                    "conflict:// lists unmerged Git paths ({root_error}); pass conflict://<path> to inspect one file"
+                ));
+            }
+            let mut all = Vec::new();
+            for (name, repo) in repos {
+                if let Ok(paths) = unmerged_in(&repo) {
+                    for path in paths {
+                        all.push(format!("{name}/{path}"));
+                    }
+                }
+            }
+            Ok(format_unmerged(ws, &all))
+        }
+    }
 }
 
 /// Read a `conflict://` target. Single-file results end with the anchored read of every hunk.
@@ -252,7 +315,11 @@ pub(super) fn read(
     if rest.is_empty() {
         return list(ws);
     }
-    if ws.resolve(rest)?.is_dir() {
+    let resolved = ws.resolve(rest)?;
+    if resolved.is_dir() {
+        if resolved.join(".git").exists() {
+            return list_in_dir(ws, &resolved, Some(rest));
+        }
         return Err(format!(
             "conflict://{rest} must name a file; use conflict:// to list unmerged paths"
         ));

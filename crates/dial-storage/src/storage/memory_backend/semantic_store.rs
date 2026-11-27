@@ -737,13 +737,26 @@ impl Store {
             .max(2048.min(exact_threshold))
             .min(exact_threshold)
             .max(limit);
+        // Only trust the 4×16-bit LSH fast path when it was not truncated by the unordered SQL
+        // `LIMIT` and yielded enough genuinely close signatures (Hamming <= 12, cos ≳ 0.83).
+        // Distant hot-bucket collisions fall back to scanning compact 64-bit `embedding_sigs`.
+        const LSH_MAX_TRUSTED_HAMMING: u32 = 12;
         // Max-heap by worst candidate: larger Hamming distance first, then older id (Reverse(id)).
         let mut shortlist: BinaryHeap<(u32, Reverse<i64>)> =
             BinaryHeap::with_capacity(candidate_cap);
         let lsh_probe_cap = candidate_cap.saturating_mul(4).max(256);
         let lsh_hits = self.probe_lsh_candidates(model, query_sig, lsh_probe_cap)?;
         let min_lsh_hits = limit.max(16).min(candidate_cap);
-        if lsh_hits.len() >= min_lsh_hits {
+        let lsh_truncated = lsh_hits.len() >= lsh_probe_cap;
+        let close_lsh_hits = if lsh_truncated {
+            0
+        } else {
+            lsh_hits
+                .iter()
+                .filter(|&&(_, sig)| (query_sig ^ sig).count_ones() <= LSH_MAX_TRUSTED_HAMMING)
+                .count()
+        };
+        if !lsh_truncated && close_lsh_hits >= min_lsh_hits {
             for (id, sig) in lsh_hits {
                 let dist = (query_sig ^ sig).count_ones();
                 let candidate = (dist, Reverse(id));

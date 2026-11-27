@@ -24,9 +24,14 @@ impl Shell {
         self.background_control = agent.background_control();
         // Restored workers exist before the first foreground turn binds its controls.
         self.live_tasks = Some(agent.live_task_control());
-        let attachment = agent.session().path().and_then(|_| match crate::cli::watch::attachment::Owner::open(&app.layout, agent.session().id()) {
-            Ok(owner) => Some(owner),
-            Err(error) => { self.note("Session attachment unavailable", format!("{error:#}")); None }
+        let attachment = agent.session().path().and_then(|_| {
+            match crate::cli::watch::attachment::Owner::open(&app.layout, agent.session().id()) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    self.note("Session attachment unavailable", format!("{error:#}"));
+                    None
+                }
+            }
         });
         let mut dirty = true;
         let mut previous_status = None;
@@ -92,7 +97,9 @@ impl Shell {
                 match owner.take() {
                     Ok(Some(text)) => {
                         let step = self.run_turn(app, agent, &text)?;
-                        if !matches!(step, Step::Done) { return Ok(step); }
+                        if !matches!(step, Step::Done) {
+                            return Ok(step);
+                        }
                         dirty = true;
                     }
                     Err(error) => self.note("Attached prompt refused", format!("{error:#}")),

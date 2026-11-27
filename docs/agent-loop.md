@@ -528,6 +528,13 @@ an early-stop safeguard, not proof that a changed input is a useful repair. Infr
 permission, cancellation, timeout and unverified problems never become automatic code repairs;
 their existing failure obligations remain visible. No extra reviewer-model request is added.
 
+The check ledger also records what happened after an observed code failure. An actual rerun
+of the same command can link its verdict to the failed call and both effect revisions. A
+pass without changes means the failure did not reproduce. A rerun after checkpointed edits
+is distinct from one after only uncertain shell or extension effects. Neither identifies a
+causal edit. Reused results and passing a different check do not supply this link or resolve
+the original failure.
+
 When `[verification].automatic_checks` is off and applicable checks are missing for current edits,
 the completion gate runs them through the same approval and freshness owner as `verify`. A
 passing current check adds no review request. An unresolved check receives at most the shared
@@ -1000,8 +1007,8 @@ Four verification aids are always on (not experimental):
   workspace path is not completed until a run naming that path was observed to stay up or exit
   zero with no later effect after its launch; see
   [requirement-verification.md](requirement-verification.md#requested-run-targets).
-- **Empty-search memory and declaration recovery.** A local `grep` or `glob` with no matches
-  names up to three earlier empty searches in an overlapping scope. Two distinct empty patterns
+- **Empty-search memory and declaration recovery.** A local `grep`, `glob`, or complete lexical
+  `find` with no matches names up to three earlier empty searches in an overlapping scope. Two distinct empty patterns
   against the same explicit file queue one advisory declaration-read correction, rather than
   encouraging another representation guess. Intentional absence checks remain valid and are
   never refused. The correction uses the next request's actual call policy: only batch-permitted
@@ -1011,6 +1018,9 @@ Four verification aids are always on (not experimental):
   Paged, remote, incomplete and failed native searches do not count. A literal single-file
   `grep -c` with an attributable zero count and exit 1 also counts; ambiguous compound shell
   scripts and pipelines are deliberately not classified as empty searches.
+  For lexical `find`, progress follows returned source spans, their revisions, and newly completed
+  scopes, not changes to the query wording. A partial scan returning no rows is not evidence of
+  absence. This affects progress accounting, not whether a check passed.
 - **Request call policy.** Each foreground request records `tool_call_policy` in the existing
   workflow event stream and saves `reliability.call_policy` in session control and the existing
   request-policy history. `/reliability` shows `batch` or `one_call` and its causes: declared model
@@ -1861,12 +1871,12 @@ Retaining raw recent groups and exact critical carry does not depend on the mode
 lossy-summary preference. A live-prefix summary is only cheaper where the route caches prompt
 prefixes and the live request was recently sent; no cache-hit rate is claimed.
 
-After a compaction, the current text of files this turn edited (attempted `write`/`edit` targets,
-newest first) is re-read from the workspace and carried in the replacement prefix, so the next
-request does not have to read them again. The carry is bounded: at most eight files, 12 KiB per file
-and 32 KiB in all, and no more than about 5% of the window; larger files are truncated with a note
-to read the rest. Binary, missing and out-of-workspace paths are skipped, and an older carry is
-replaced rather than retained.
+After compaction, Dial re-reads this turn’s attempted edit targets, newest first. Small text files
+are carried whole. For a larger file, Dial carries current lines around an edit it can locate,
+with the path and line range. If it cannot locate the edit reliably, it lists the path instead of
+spending the budget on the first lines of the file. The file-text limits remain eight files,
+12 KiB per file, 32 KiB total, and about 5% of the window. Binary, missing and out-of-workspace
+paths are skipped. A newer carry replaces the older one; it does not confer edit authority.
 
 On models with preserved thinking (catalog fact `preserved-thinking`: Claude Fable 5.1, Mythos 5.1,
 Opus 5.5, Sonnet 5.5 and Haiku 5.5), each signed thinking block is checked against the exact history
