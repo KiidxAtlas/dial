@@ -2,6 +2,8 @@
 
 Dial can map **declared requirements to observed verification**, without interpreting an English completion claim as proof. This is opt-in operator configuration; ordinary answers still need no checklist.
 
+For requests that ask for every qualifying result, Dial's built-in guidance asks the model to enumerate candidates systematically and check for omissions. This guidance does not replace an independent completeness test.
+
 ## Inspect the mapping before running checks
 
 The agent can call `verify` with `{"plan": true}` to inspect the existing contract without

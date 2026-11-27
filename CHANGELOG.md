@@ -19,6 +19,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [0.4.1] - 2026-11-27
 
+- Dial's built-in guidance now calls for checking omissions when a request asks for every qualifying result. [Verification](docs/requirement-verification.md).
 - Tool statistics distinguish commands and checks that reported a problem from execution failures, leaving ambiguous historical errors unclassified.
 - Unscoped behavior search visits source before recognized build output and previews matching code instead of large enclosing declarations. Compaction favors current edit locations in large files, and lexical search progress tracks returned evidence rather than query wording. The search and file-carry budgets are unchanged.
 - Continue a running local conversation from another terminal (`dial attach ID`) or from Desktop's session sidebar, without making a fork. The original engine retains tool approvals.
