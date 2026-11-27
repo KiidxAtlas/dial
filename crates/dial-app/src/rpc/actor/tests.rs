@@ -512,7 +512,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
                 peers: runtime.peers.clone(),
                 sides: runtime.sides.clone(),
             };
-            actor.run().unwrap();
+            actor.spawn().unwrap().join().unwrap().unwrap();
             let target = destination.path().canonicalize().unwrap();
             assert_eq!(admin.layout().project_root, target);
             let config = published_config.read().unwrap();

@@ -166,6 +166,13 @@ fn serving_setup(config: &Config) -> Result<(Option<crate::storage::store::Store
 }
 
 impl Actor {
+    pub(super) fn spawn(self) -> std::io::Result<std::thread::JoinHandle<Result<()>>> {
+        // The move/rebuild path can exceed the default stack in debug builds.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || self.run())
+    }
+
     pub(super) fn run(self) -> Result<()> {
         let Self {
             layout,

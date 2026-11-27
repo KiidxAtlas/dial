@@ -1558,7 +1558,7 @@ fn run_control(
         peers: peers.clone(),
         sides: sides.clone(),
     };
-    let worker = thread::spawn(move || actor.run());
+    let worker = actor.spawn().context("start RPC actor")?;
     let (mut task_control, mut maintenance_control, mut background) = match control_rx.recv() {
         Ok(controls) => controls,
         Err(_) => {
