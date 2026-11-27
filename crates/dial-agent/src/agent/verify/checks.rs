@@ -2995,46 +2995,31 @@ pub(in crate::agent) fn exit_status_masked(command: &str) -> bool {
     }
 
     let mut covered_pipelines = Vec::new();
-    for item in checked_items {
-        match item.kind().as_ref() {
-            "command" | "test_command" => {}
+    let mut stack = checked_items.to_vec();
+    while let Some(node) = stack.pop() {
+        let node = node
+            .field("body")
+            .filter(|_| node.kind() == "redirected_statement")
+            .unwrap_or(node);
+        match node.kind().as_ref() {
+            "command" | "test_command" | "comment" => {}
             "pipeline" => {
-                // tree-sitter-bash can associate a preceding `&&`-list inside a redirected
-                // pipeline stage (`a && b 2>&1 | c`); accept an `&&`-only chain of simple
-                // commands/tests there too, still failing closed on `||`, `!` or subshells.
-                let mut simple = true;
-                let mut stage_stack: Vec<_> = item.named_children().collect();
-                while let Some(stage) = stage_stack.pop() {
-                    let stage = stage
-                        .field("body")
-                        .filter(|_| stage.kind() == "redirected_statement")
-                        .unwrap_or(stage);
-                    match stage.kind().as_ref() {
-                        "command" | "test_command" | "comment" => {}
-                        "list" => {
-                            let items: Vec<_> =
-                                stage.children().filter(|n| n.kind() != "comment").collect();
-                            let [left, operator, right] = items.as_slice() else {
-                                simple = false;
-                                break;
-                            };
-                            if operator.kind() != "&&" {
-                                simple = false;
-                                break;
-                            }
-                            stage_stack.push(right.clone());
-                            stage_stack.push(left.clone());
-                        }
-                        _ => {
-                            simple = false;
-                            break;
-                        }
-                    }
-                }
-                if !simple {
+                // Bash gives pipes precedence over &&, but tree-sitter-bash can put a list
+                // containing another pipeline inside a stage (`a | b | c && d`). Both
+                // operators preserve failures here, so validate nested nodes the same way.
+                covered_pipelines.push(node.node_id());
+                stack.extend(node.named_children());
+            }
+            "list" => {
+                let items: Vec<_> = node.children().filter(|n| n.kind() != "comment").collect();
+                let [left, operator, right] = items.as_slice() else {
+                    return true;
+                };
+                if operator.kind() != "&&" {
                     return true;
                 }
-                covered_pipelines.push(item.node_id());
+                stack.push(right.clone());
+                stack.push(left.clone());
             }
             _ => return true,
         }

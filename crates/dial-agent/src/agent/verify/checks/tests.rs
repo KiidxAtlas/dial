@@ -73,6 +73,9 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "set -o pipefail; false | true; true",
         "set -o pipefail; false | true || true",
         "set -o pipefail; (false | true) && true",
+        "set -o pipefail; false | true | true || true",
+        "set -o pipefail; false | true | true && echo ok; true",
+        "set -o pipefail | true | true && echo ok",
     ] {
         assert!(exit_status_masked(command), "{command}");
     }
@@ -92,6 +95,7 @@ fn pipefail_must_apply_to_the_checked_foreground_pipeline() {
         "set -o pipefail; chmod -R a+rX /tmp/t; su git -c 'git push' && [ \"$(curl -sk https://localhost:8443/index.html)\" = \"ok\" ] && ssh-keyscan -p 22 localhost 2>&1 | grep -q ssh-",
         "set -o pipefail && cd /app && make test | tail -5 > summary",
         "set -o pipefail; cmd1 | grep -q a && cmd2 | grep -q b",
+        "set -o pipefail; printf 'Results: 12 30 8\\n' | tail -n 1 | grep -Eq '^Results: [0-9]+ [0-9]+ [0-9]+$' && echo ok",
     ] {
         assert!(!exit_status_masked(command), "{command}");
     }
@@ -263,6 +267,16 @@ fn pipefail_check_credit_uses_the_observed_exit_without_promoting_masked_zeroes(
         ),
         (
             "set -o pipefail; false | true",
+            1,
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "set -o pipefail; printf 'Results: 12 30 8\\n' | tail -n 1 | grep -Eq '^Results: [0-9]+ [0-9]+ [0-9]+$' && echo ok",
+            0,
+            CheckStatus::Passed,
+        ),
+        (
+            "set -o pipefail; false | cat | cat && echo ok",
             1,
             CheckStatus::FailedUnknownCause,
         ),

@@ -1124,13 +1124,14 @@ fn a_pipe_masked_unattended_check_does_not_satisfy_the_gate() {
         "false 2>&1 | tail -5 # set -o pipefail",
         "set -o pipefail; set +o pipefail; false | tail -5",
         "(set -o pipefail); false | tail -5",
+        "set -o pipefail; false | cat | cat || true",
     ] {
         let server = llm::fake::serve(vec![
             response("", Some(("bash", json!({"command":WRITE_RESULT})))),
             llm::fake::json(200, &json!({"total_slots":1})),
             check(masked),
             response("Wrote result.csv; the check passes.", None),
-            check("set -o pipefail; grep -q value result.csv | tail -5"),
+            check("set -o pipefail; cat result.csv | head -n 1 | grep -qx value && echo ok"),
             response("Wrote result.csv; the pipefail check passes.", None),
         ]);
         with_launch(true, |agent| {
