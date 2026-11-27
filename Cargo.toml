@@ -104,7 +104,7 @@ calamine = "0.38"
 plist = { version = "1.10", default-features = false }
 mail-parser = { version = "1", features = ["full_encoding"] }
 parking_lot = "0.13"
-similar = { version = "2.7", default-features = false, features = ["text"] }
+similar = { version = "3.2", default-features = false, features = ["text"] }
 shlex = "2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 resvg = { version = "0.50.0", default-features = false }
