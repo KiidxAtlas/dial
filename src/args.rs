@@ -762,7 +762,10 @@ pub(crate) enum Command {
     #[command(alias = "q", alias = "web-search")]
     Search(dial::cli::search::SearchArgs),
     /// View and continue a running session in this project without forking it.
-    Attach { session: String },
+    Attach {
+        /// Session id prefix to attach to (`dial sessions` lists ids).
+        session: String,
+    },
     /// Follow live edits, diagnostics and screenshots in another pane.
     Watch(dial::cli::watch::WatchArgs),
     /// Run a foreground command and expose bounded output to approved monitors by name.
