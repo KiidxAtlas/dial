@@ -76,7 +76,7 @@ unicode-segmentation = "1"
 pulldown-cmark = { version = "0.12", default-features = false }
 quick-xml = "0.42"
 regex = "1.13.1"
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 tiktoken-rs = "0.12"
 ast-grep-core = "0.51.0"
 ast-grep-language = "0.51.0"
