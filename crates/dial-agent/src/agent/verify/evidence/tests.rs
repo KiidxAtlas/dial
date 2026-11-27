@@ -319,7 +319,8 @@ fn each_verdict_links_only_to_the_failure_it_reruns_with_its_change_kind() {
         NoLongerReproduced as Gone,
     };
     use CheckStatus::{CodeFailed, EnvironmentUnavailable, Passed, Unverified};
-    let cases: Vec<(&str, Vec<Step>, Vec<Option<Link>>)> = vec![
+    type Case = (&'static str, Vec<Step>, Vec<Option<Link>>);
+    let cases: Vec<Case> = vec![
         (
             "a pass after a checkpointed edit resolves the failure",
             vec![

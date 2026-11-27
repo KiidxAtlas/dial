@@ -100,9 +100,15 @@ pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Chil
     spawn(command.process_group(0))
 }
 
+// glibc exposes the resource as an unsigned enum; macOS and musl take an int.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type RlimitResource = libc::c_uint;
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+type RlimitResource = libc::c_int;
+
 /// Apply one POSIX `setrlimit(2)` bound, clamping against the current hard limit so lowering a
 /// resource never fails with `EPERM` when the parent environment already enforces a tighter cap.
-fn apply_rlimit(resource: libc::c_int, limit: u64) -> io::Result<()> {
+fn apply_rlimit(resource: RlimitResource, limit: u64) -> io::Result<()> {
     // SAFETY: `rlimit` is a plain C struct; `getrlimit`/`setrlimit` are async-signal-safe syscalls.
     unsafe {
         let mut current = std::mem::zeroed::<libc::rlimit>();
@@ -138,19 +144,19 @@ pub(in crate::platform) fn apply_resource_limits(
     limits: crate::platform::process::ResourceLimits,
 ) -> io::Result<()> {
     if let Some(secs) = limits.max_cpu_secs {
-        apply_rlimit(libc::RLIMIT_CPU as libc::c_int, secs)?;
+        apply_rlimit(libc::RLIMIT_CPU, secs)?;
     }
     if let Some(bytes) = limits.max_memory_bytes {
-        apply_rlimit(libc::RLIMIT_AS as libc::c_int, bytes)?;
+        apply_rlimit(libc::RLIMIT_AS, bytes)?;
     }
     if let Some(bytes) = limits.max_file_size_bytes {
-        apply_rlimit(libc::RLIMIT_FSIZE as libc::c_int, bytes)?;
+        apply_rlimit(libc::RLIMIT_FSIZE, bytes)?;
     }
     if let Some(files) = limits.max_open_files {
-        apply_rlimit(libc::RLIMIT_NOFILE as libc::c_int, files)?;
+        apply_rlimit(libc::RLIMIT_NOFILE, files)?;
     }
     if let Some(procs) = limits.max_processes {
-        apply_rlimit(libc::RLIMIT_NPROC as libc::c_int, u64::from(procs))?;
+        apply_rlimit(libc::RLIMIT_NPROC, u64::from(procs))?;
     }
     Ok(())
 }

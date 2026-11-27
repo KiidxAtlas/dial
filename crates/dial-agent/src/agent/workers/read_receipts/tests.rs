@@ -163,7 +163,8 @@ fn multi_target_raw_and_failed_reads_record_nothing() {
 fn crafted_or_mismatched_native_output_is_declined_or_bounded() {
     let (_root, workspace) = workspace(&[("src/lib.rs", "a\nb\nc\n"), ("src/other.rs", "x\n")]);
     let lib = "[src/lib.rs#ABCD]";
-    let cases: Vec<(&str, Value, String, Option<Vec<(usize, usize)>>)> = vec![
+    type Case = (&'static str, Value, String, Option<Vec<(usize, usize)>>);
+    let cases: Vec<Case> = vec![
         (
             "header names another file",
             json!({"path": "src/lib.rs:1-1"}),

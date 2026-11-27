@@ -277,7 +277,7 @@ fn controller_batch_authorizes_all_paths_and_reports_only_actual_mutations() {
 #[test]
 fn write_executable_sets_execute_permission() {
     use crate::tools::edit::editing::Execution;
-    let (dir, ws) = workspace();
+    let (_dir, ws) = workspace();
     let res = output(
         &ws,
         &json!({"path":"run.sh","content":"#!/bin/sh\necho hi\n","executable":true}),
@@ -287,7 +287,7 @@ fn write_executable_sets_execute_permission() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(dir.path().join("run.sh"))
+        let mode = fs::metadata(_dir.path().join("run.sh"))
             .unwrap()
             .permissions()
             .mode();
