@@ -1,6 +1,6 @@
 pkgbase = dial-bin
 	pkgdesc = Coding agent for the terminal with undo, test evidence and an optional OS sandbox; runs local or hosted models
-	pkgver = 0.4.1
+	pkgver = 0.4.2
 	pkgrel = 1
 	url = https://github.com/KiidxAtlas/dial
 	arch = x86_64
@@ -13,9 +13,9 @@ pkgbase = dial-bin
 	optdepends = llama.cpp: serve GGUF models locally
 	provides = dial
 	conflicts = dial
-	source_x86_64 = https://github.com/KiidxAtlas/dial/releases/download/v0.4.1/dial-v0.4.1-x86_64-unknown-linux-gnu.tar.gz
-	sha256sums_x86_64 = cd1f6b15fb9acb77f49a16e7258ed8b172f7368019768713cf909c98afe1374b
-	source_aarch64 = https://github.com/KiidxAtlas/dial/releases/download/v0.4.1/dial-v0.4.1-aarch64-unknown-linux-gnu.tar.gz
-	sha256sums_aarch64 = 69a6fb8bb98352528132d22e9fe370c0951658c082aba7847d8c940457da2079
+	source_x86_64 = https://github.com/KiidxAtlas/dial/releases/download/v0.4.2/dial-v0.4.2-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = 89de3c378c5a7beed1f741764cde6235b031430ce807368fa90cfdc99b20c5f3
+	source_aarch64 = https://github.com/KiidxAtlas/dial/releases/download/v0.4.2/dial-v0.4.2-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = aced152daca90798193956796a577b76d9dc6fd4d6a36dca061c4001da9d93a9
 
 pkgname = dial-bin
