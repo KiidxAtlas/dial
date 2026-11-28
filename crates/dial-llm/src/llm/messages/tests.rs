@@ -64,7 +64,10 @@ fn local_prefix_is_merged_without_moving_guidance_or_tool_history() {
     assert_eq!(messages, original);
     assert_eq!(local(&wire).unwrap(), wire);
     assert_eq!(
-        WireForm::SingleSystemPrefix.apply(&messages).unwrap().as_ref(),
+        WireForm::SingleSystemPrefix
+            .apply(&messages)
+            .unwrap()
+            .as_ref(),
         &wire
     );
 }

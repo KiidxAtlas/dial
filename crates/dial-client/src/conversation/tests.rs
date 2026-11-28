@@ -867,7 +867,9 @@ fn a_stop_announced_as_a_notice_shows_once_as_the_reply() {
     let mut view = Conversation::new();
     view.push_user("try again", 0);
     let stop = "Stopped: the request is too large.";
-    view.apply(&event(json!({"event":"notice","kind":"recovery","message":"compacting and retrying"})));
+    view.apply(&event(
+        json!({"event":"notice","kind":"recovery","message":"compacting and retrying"}),
+    ));
     view.apply(&event(json!({"event":"notice","message":stop})));
     view.apply(&response("send", json!({"text":stop})));
     let copies = view
@@ -881,5 +883,7 @@ fn a_stop_announced_as_a_notice_shows_once_as_the_reply() {
         .count();
     assert_eq!(copies, 1, "{:?}", view.entries());
     assert!(matches!(view.entries().last(), Some(Entry::Assistant(a)) if a.text == stop));
-    assert!(matches!(&view.entries()[1], Entry::Notice(n) if n.message == "compacting and retrying"));
+    assert!(
+        matches!(&view.entries()[1], Entry::Notice(n) if n.message == "compacting and retrying")
+    );
 }

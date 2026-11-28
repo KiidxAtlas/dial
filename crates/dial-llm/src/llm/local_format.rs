@@ -216,8 +216,8 @@ fn is_exl3_config(path: &Path) -> bool {
         .and_then(|q| q.get("quant_method"))
         .and_then(|v| v.as_str())
         .is_some_and(|m| m.eq_ignore_ascii_case("exl3") || m.eq_ignore_ascii_case("exllamav3"));
-    let has_exl3_section = value.get("exl3_config").is_some()
-        || quant.and_then(|q| q.get("exl3_config")).is_some();
+    let has_exl3_section =
+        value.get("exl3_config").is_some() || quant.and_then(|q| q.get("exl3_config")).is_some();
     method_is_exl3 || has_exl3_section
 }
 

@@ -106,7 +106,10 @@ fn metal_prefill_out_of_memory_is_a_context_overflow() {
     )));
     // Loading a model that does not fit is not something compaction can fix.
     assert_ne!(
-        http(400, "Failed to load model \"big-model\". Error: out of memory"),
+        http(
+            400,
+            "Failed to load model \"big-model\". Error: out of memory"
+        ),
         ErrorClass::ContextOverflow
     );
 }

@@ -782,7 +782,11 @@ impl Conversation {
                 matches!(entry, Entry::Notice(notice) if notice.kind.is_none() && notice.message == text)
             });
             match announced {
-                Some(index) if self.entries[index + 1..].iter().all(|entry| matches!(entry, Entry::Notice(_))) => {
+                Some(index)
+                    if self.entries[index + 1..]
+                        .iter()
+                        .all(|entry| matches!(entry, Entry::Notice(_))) =>
+                {
                     self.entries[index] = reply;
                 }
                 _ => self.entries.push(reply),

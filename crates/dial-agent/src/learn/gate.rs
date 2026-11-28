@@ -752,7 +752,9 @@ fn judge_with(
             GuardMode::Strict => statistical,
             GuardMode::Practical => false,
             GuardMode::Auto => {
-                statistical && total > 0 && regression_bound(0, 0, total, guard_alpha) <= rules.max_regression
+                statistical
+                    && total > 0
+                    && regression_bound(0, 0, total, guard_alpha) <= rules.max_regression
             }
         };
         if enforce_guard_bound && !suite.primary && !futile_stop && total > 0 {

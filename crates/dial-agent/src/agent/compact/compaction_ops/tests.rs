@@ -182,6 +182,10 @@ fn compaction_refuses_to_commit_inside_an_open_tool_call_group() {
             error.to_string().contains("tool-call group is incomplete"),
             "{error:#}"
         );
-        assert_eq!(agent.session.messages(), before, "history must be unchanged");
+        assert_eq!(
+            agent.session.messages(),
+            before,
+            "history must be unchanged"
+        );
     });
 }

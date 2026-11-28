@@ -280,18 +280,23 @@ impl Agent<'_> {
                             ));
                         }
                         let message = if compaction_error
-                            .is::<crate::agent::compact::compaction::NothingToCompact>()
-                        {
+                            .is::<crate::agent::compact::compaction::NothingToCompact>(
+                        ) {
                             // Only the newest message group is left, so neither compacting nor
                             // "continue" can shrink the request; say what the provider refused.
                             let detail: String = format!("{error:#}").chars().take(400).collect();
-                            format!("Stopped: the model rejected the request as too large for its context ({detail}). There is no earlier conversation to compact: the request is only the latest message plus Dial's system prompt and tool definitions, so compacting or saying \"continue\" will not help. Select a model with a larger context window (for a local model, load it with a larger context or more memory), or send a shorter message.")
+                            format!(
+                                "Stopped: the model rejected the request as too large for its context ({detail}). There is no earlier conversation to compact: the request is only the latest message plus Dial's system prompt and tool definitions, so compacting or saying \"continue\" will not help. Select a model with a larger context window (for a local model, load it with a larger context or more memory), or send a shorter message."
+                            )
                         } else {
-                            format!("Stopped: the request exceeded the model's context window and compaction could not make room ({compaction_error:#}). The session and completed work are kept; select a larger-window model, compact manually, or say \"continue\" to retry.")
+                            format!(
+                                "Stopped: the request exceeded the model's context window and compaction could not make room ({compaction_error:#}). The session and completed work are kept; select a larger-window model, compact manually, or say \"continue\" to retry."
+                            )
                         };
                         return self
                             .stop_turn(ui, message, sent.step + 1)
-                            .map(crate::agent::run::engine::Tick::Finished).map(ControlFlow::Break);
+                            .map(crate::agent::run::engine::Tick::Finished)
+                            .map(ControlFlow::Break);
                     }
                 };
                 if !outcome.continue_allowed

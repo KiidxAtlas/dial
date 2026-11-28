@@ -49,9 +49,9 @@ fn compatibility(config: &Config) -> (Option<LocalFormat>, Option<&'static str>)
         Some(LocalFormat::Mlx) if resolved.is_none() => {
             Some("This checkpoint is incomplete. Finish downloading its weights first.")
         }
-        Some(LocalFormat::Mlx) if !apple_silicon && config.training.backend == "mlx" => {
-            Some("Dial’s MLX trainer requires an Apple Silicon Mac. Set training.backend to auto or peft for PyTorch/PEFT.")
-        }
+        Some(LocalFormat::Mlx) if !apple_silicon && config.training.backend == "mlx" => Some(
+            "Dial’s MLX trainer requires an Apple Silicon Mac. Set training.backend to auto or peft for PyTorch/PEFT.",
+        ),
         Some(LocalFormat::Mlx)
             if !config.runs_dial_mlx()
                 || !catalog::local_model_metadata(path).kind.supports_chat() =>

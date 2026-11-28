@@ -81,8 +81,14 @@ fn top_of(dir: &Path) -> Result<PathBuf, String> {
 /// The nested repository at `folder`, which must be a repository top inside `project`.
 fn selected_root(project: &Path, folder: &str) -> Result<PathBuf, String> {
     let relative = Path::new(folder);
-    if folder.is_empty() || relative.components().any(|part| !matches!(part, Component::Normal(_))) {
-        return Err(format!("repo must name a folder inside the project, not {folder:?}"));
+    if folder.is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!(
+            "repo must name a folder inside the project, not {folder:?}"
+        ));
     }
     let project = project.canonicalize().map_err(|e| e.to_string())?;
     let dir = project
@@ -94,7 +100,9 @@ fn selected_root(project: &Path, folder: &str) -> Result<PathBuf, String> {
     }
     match top_of(&dir) {
         Ok(top) if top.canonicalize().is_ok_and(|top| top == dir) => Ok(dir),
-        Ok(_) => Err(format!("{folder} is inside another repository, not a repository of its own")),
+        Ok(_) => Err(format!(
+            "{folder} is inside another repository, not a repository of its own"
+        )),
         Err(_) => Err(format!("{folder} is not a Git repository")),
     }
 }
@@ -102,7 +110,12 @@ fn selected_root(project: &Path, folder: &str) -> Result<PathBuf, String> {
 fn choose_message(project: &Path, repos: &[PathBuf]) -> String {
     let names: Vec<String> = repos
         .iter()
-        .map(|repo| repo.strip_prefix(project).unwrap_or(repo).display().to_string())
+        .map(|repo| {
+            repo.strip_prefix(project)
+                .unwrap_or(repo)
+                .display()
+                .to_string()
+        })
         .collect();
     format!(
         "This folder holds several Git repositories: {}. Open one with /git repo <folder>.",

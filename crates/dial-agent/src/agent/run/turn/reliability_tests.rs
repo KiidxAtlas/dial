@@ -147,21 +147,27 @@ fn local_stream_replays_reasoning_and_matching_read_result() {
         json!({"choices":[{"delta":{"reasoning_content":"Need to read the value first."},"finish_reason":null}]}),
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read-value","type":"function","function":{"name":"read","arguments":"{\"path\":\"value.txt\"}"}}]},"finish_reason":"tool_calls"}]}),
     ];
-    let stream = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", first[0], first[1]);
+    let stream = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        first[0], first[1]
+    );
     let server = llm::fake::serve(vec![
         llm::fake::Script::Sse(stream),
         slots(),
         response("The value is violet-731.", None),
     ]);
-    with_agent("[compaction]\nenabled=false\n[harness]\ntools=['read']\n", |agent| {
-        connect(agent, &server.url);
-        std::fs::write(agent.workspace.root().join("value.txt"), "violet-731\n").unwrap();
-        let report = agent
-            .turn("Read value.txt and report its value.", &mut NullUi)
-            .unwrap();
-        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
-        assert_eq!(report.text, "The value is violet-731.");
-    });
+    with_agent(
+        "[compaction]\nenabled=false\n[harness]\ntools=['read']\n",
+        |agent| {
+            connect(agent, &server.url);
+            std::fs::write(agent.workspace.root().join("value.txt"), "violet-731\n").unwrap();
+            let report = agent
+                .turn("Read value.txt and report its value.", &mut NullUi)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert_eq!(report.text, "The value is violet-731.");
+        },
+    );
     let requests = completion_requests(&server);
     assert_eq!(requests.len(), 2);
     assert!(!mentions(&requests[0], "violet-731"));
@@ -171,7 +177,10 @@ fn local_stream_replays_reasoning_and_matching_read_result() {
         .find(|pair| pair[0]["tool_calls"][0]["id"] == "read-value")
         .unwrap();
     assert_eq!(pair[0]["role"], "assistant");
-    assert_eq!(pair[0]["reasoning_content"], "Need to read the value first.");
+    assert_eq!(
+        pair[0]["reasoning_content"],
+        "Need to read the value first."
+    );
     assert_eq!(pair[1]["role"], "tool");
     assert_eq!(pair[1]["tool_call_id"], "read-value");
     assert!(pair[1]["content"].as_str().unwrap().contains("violet-731"));

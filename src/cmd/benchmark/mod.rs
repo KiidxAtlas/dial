@@ -489,7 +489,9 @@ fn assist_configurations(
     // ship on are measured by turning them off.
     let experiments: [(&str, ExperimentSwitch); 8] = [
         ("enable-fault_witness", |e| e.fault_witness = Some(true)),
-        ("disable-repro_first", |e| e.repro_first = Some(ReproFirst::Off)),
+        ("disable-repro_first", |e| {
+            e.repro_first = Some(ReproFirst::Off)
+        }),
         ("enable-repro_first_gate", |e| {
             e.repro_first = Some(ReproFirst::Gate)
         }),

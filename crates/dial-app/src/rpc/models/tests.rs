@@ -112,8 +112,16 @@ fn local_engine_pin_is_exact_and_only_offers_compatible_engines() {
             json!(["auto", "mlx", "mlx-serve", "vllm-mlx", "mistral-rs"])
         );
         assert_eq!(mlx_desc["local_engine"]["default"], "mlx");
-        assert!(mlx_desc["local_engine"]["installed"].get("mlx-serve").is_some());
-        assert!(mlx_desc["local_engine"]["installed"].get("vllm-mlx").is_some());
+        assert!(
+            mlx_desc["local_engine"]["installed"]
+                .get("mlx-serve")
+                .is_some()
+        );
+        assert!(
+            mlx_desc["local_engine"]["installed"]
+                .get("vllm-mlx")
+                .is_some()
+        );
     }
 }
 

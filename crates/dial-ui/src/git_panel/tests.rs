@@ -33,7 +33,10 @@ fn canon(path: &Path) -> PathBuf {
 #[test]
 fn a_project_outside_git_uses_its_only_nested_repository() {
     let dir = project(&["only"]);
-    assert_eq!(resolve(dir.path(), None).unwrap(), canon(&dir.path().join("only")));
+    assert_eq!(
+        resolve(dir.path(), None).unwrap(),
+        canon(&dir.path().join("only"))
+    );
 }
 
 #[test]
@@ -78,7 +81,10 @@ fn an_explicit_choice_must_name_a_repository_of_its_own_inside_the_project() {
     #[cfg(unix)]
     {
         let error = resolve(dir.path(), Some("escape")).unwrap_err();
-        assert!(error.contains("outside the project"), "a link out of the project is refused: {error}");
+        assert!(
+            error.contains("outside the project"),
+            "a link out of the project is refused: {error}"
+        );
     }
 }
 

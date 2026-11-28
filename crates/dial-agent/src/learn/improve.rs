@@ -1195,8 +1195,7 @@ fn lora_candidate(
         } else {
             let ft = metadata["fine_tune_type"].as_str().unwrap_or("");
             ensure!(
-                metadata["model"].as_str() == Some(expected_model)
-                    && matches!(ft, "lora" | "dora"),
+                metadata["model"].as_str() == Some(expected_model) && matches!(ft, "lora" | "dora"),
                 "active adapter metadata does not match model; refusing incremental training"
             );
             cfg.training.fine_tune_type = ft.to_owned();
@@ -1713,7 +1712,11 @@ fn bounded_training_records(
     reader.seek(SeekFrom::Start(cursor))?;
     let mut offset = cursor;
     let mut delta = Vec::new();
-    let delta_limit = if max_delta == 0 { usize::MAX } else { max_delta };
+    let delta_limit = if max_delta == 0 {
+        usize::MAX
+    } else {
+        max_delta
+    };
     while delta.len() < delta_limit {
         let line_start = reader.stream_position()?;
         let mut line = String::new();
@@ -1744,7 +1747,11 @@ fn bounded_training_records(
 
 fn bounded_validation_records(path: &Path, max_valid: usize) -> Result<Vec<String>> {
     let mut reader = BufReader::new(fs::File::open(path)?);
-    let limit = if max_valid == 0 { usize::MAX } else { max_valid };
+    let limit = if max_valid == 0 {
+        usize::MAX
+    } else {
+        max_valid
+    };
     let mut records = Vec::with_capacity(limit.min(256));
     while records.len() < limit {
         let mut line = String::new();

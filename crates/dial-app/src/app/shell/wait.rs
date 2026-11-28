@@ -287,7 +287,11 @@ impl Shell {
     }
 
     /// Offer a one-time install into Dial's own folder when a selected runtime is not installed.
-    fn prepare_runtime_recipe(&mut self, app: &App, engine: crate::llm::local_runtime::LocalEngine) -> Result<bool> {
+    fn prepare_runtime_recipe(
+        &mut self,
+        app: &App,
+        engine: crate::llm::local_runtime::LocalEngine,
+    ) -> Result<bool> {
         if engine.is_installed(&app.layout.user_dir) {
             return Ok(true);
         }

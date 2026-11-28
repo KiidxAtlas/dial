@@ -18,7 +18,9 @@ pub(super) fn repositories(root: &Path) -> Vec<PathBuf> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut visited = 0;
     'walk: while let Some((dir, depth)) = queue.pop_front() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             // `file_type` does not follow links, so a link is never entered.
             if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
@@ -51,7 +53,8 @@ pub(super) fn repositories(root: &Path) -> Vec<PathBuf> {
 
 /// Whether Git says `dir` is the top of its own work tree (a gitfile may point elsewhere).
 fn confirmed_top(dir: &Path) -> bool {
-    let Ok(top) = crate::tools::vcs::git::run_checked(dir, &["rev-parse", "--show-toplevel"], false)
+    let Ok(top) =
+        crate::tools::vcs::git::run_checked(dir, &["rev-parse", "--show-toplevel"], false)
     else {
         return false;
     };

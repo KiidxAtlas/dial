@@ -538,9 +538,7 @@ pub const RECIPES: &[Recipe] = &[
         },
         methods: &[
             Method::Uv("vllm"),
-            Method::Manual(
-                "install vLLM on Linux (https://docs.vllm.ai) and set DIAL_VLLM_SERVER",
-            ),
+            Method::Manual("install vLLM on Linux (https://docs.vllm.ai) and set DIAL_VLLM_SERVER"),
         ],
     },
     Recipe {

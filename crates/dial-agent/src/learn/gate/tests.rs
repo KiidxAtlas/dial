@@ -1285,7 +1285,11 @@ fn practical_guard_mode_passes_clean_small_guard_while_strict_rejects_unproven()
         GuardMode::Practical,
         &|| false,
         |v, case| {
-            if let Some(idx) = case.id.strip_prefix("primary").and_then(|s| s.parse::<usize>().ok()) {
+            if let Some(idx) = case
+                .id
+                .strip_prefix("primary")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 let limit = if v.id == 1 { 10 } else { 15 };
                 return Ok(idx < limit);
             }

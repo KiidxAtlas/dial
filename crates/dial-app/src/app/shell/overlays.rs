@@ -418,7 +418,11 @@ impl Shell {
                 }
                 ActiveOverlay::Jobs(Box::new(panel))
             }
-            Which::Git { root, revision, folder } => {
+            Which::Git {
+                root,
+                revision,
+                folder,
+            } => {
                 use crate::ui::overlay::git::{GitOverlay, GitTab};
                 let tab = GitTab::from_args(&revision);
                 let pinned = revision.as_str();

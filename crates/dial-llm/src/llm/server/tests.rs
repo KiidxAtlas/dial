@@ -800,11 +800,26 @@ fn external_runtime_command_builders_and_model_id_discovery() {
     };
     assert_eq!(
         to_strings(mlx_serve_chat_args("/models/qwen", 8081)),
-        ["--model", "/models/qwen", "--serve", "--host", "127.0.0.1", "--port", "8081"]
+        [
+            "--model",
+            "/models/qwen",
+            "--serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8081"
+        ]
     );
     assert_eq!(
         to_strings(vllm_mlx_args("/models/qwen", 8082)),
-        ["serve", "/models/qwen", "--host", "127.0.0.1", "--port", "8082"]
+        [
+            "serve",
+            "/models/qwen",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8082"
+        ]
     );
     assert_eq!(
         to_strings(mistralrs_args("/models/qwen", None, 8083).unwrap()),
@@ -812,9 +827,22 @@ fn external_runtime_command_builders_and_model_id_discovery() {
     );
     assert_eq!(
         to_strings(
-            mistralrs_args("/models/qwen", Some(Path::new("/models/qwen/q4.gguf")), 8084).unwrap()
+            mistralrs_args(
+                "/models/qwen",
+                Some(Path::new("/models/qwen/q4.gguf")),
+                8084
+            )
+            .unwrap()
         ),
-        ["--port", "8084", "gguf", "-m", "/models/qwen", "-f", "q4.gguf"]
+        [
+            "--port",
+            "8084",
+            "gguf",
+            "-m",
+            "/models/qwen",
+            "-f",
+            "q4.gguf"
+        ]
     );
 
     let dir = tempfile::tempdir().unwrap();

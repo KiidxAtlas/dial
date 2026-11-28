@@ -1008,8 +1008,9 @@ fn launch(
     use llm::local_runtime::{GgufEngines, GgufLoader, LocalEngine};
     if gguf.is_none()
         && runtime.engine != LocalEngine::Auto
-        && !format
-            .is_some_and(|f| LocalEngine::choices(f, GgufEngines::Unknown).contains(&runtime.engine))
+        && !format.is_some_and(|f| {
+            LocalEngine::choices(f, GgufEngines::Unknown).contains(&runtime.engine)
+        })
     {
         return Err(Failure::Fatal(anyhow!(
             "The selected {} engine is not a known loader for this model on this platform. Review the engine choice before loading it.",
@@ -1096,90 +1097,91 @@ fn launch(
         } else {
             let atomic = loader == GgufLoader::Atomic;
             let requested = requested_context(context);
-        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
-            .map_err(Failure::Fatal)?;
-        let dspark = (atomic && runtime.is_default() && adapter.is_none())
-            .then(|| llm::local_format::inkling_dspark(file, context_tokens))
-            .flatten();
-        let projector = llm::local_format::gguf_projector(file);
-        let caps = llama_help_caps(&program);
-        let shared_pool = shared_pool(context_tokens, !atomic && caps.shared_slots, |pool| {
-            llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits)
-        });
-        let launch = LlamaLaunch {
-            model: file,
-            projector: projector.as_deref(),
-            adapter,
-            context_tokens,
-            shared_pool,
-            reasoning_budget: caps
-                .reasoning_budget
-                .then_some(LLAMA_DEFAULT_REASONING_BUDGET),
-            reasoning_budget_message: caps.reasoning_budget_message,
-            cache_reuse: caps.cache_reuse.then_some(LLAMA_DEFAULT_CACHE_REUSE),
-            port,
-        };
-        let mut command = Command::new(program);
-        command.args(launch.args(runtime).map_err(Failure::Fatal)?);
-        if atomic {
-            command.args(["--alias", SERVER_MODEL]);
-            if let Some(draft) = dspark {
-                let depth = if file
-                    .file_name()
-                    .is_some_and(|n| n == "Inkling-2-Mini-AD-IQ2_M.gguf")
-                {
-                    "7"
-                } else {
-                    "3"
-                };
-                let budget = if llm::local_fit::physical_memory_bytes()
-                    .is_some_and(|bytes| bytes >= 24 << 30)
-                {
-                    "14436"
-                } else {
-                    "8292"
-                };
-                command.arg("-md").arg(draft).args([
-                    "--spec-type",
-                    "draft-dspark",
-                    "--spec-draft-n-max",
-                    depth,
-                    "--spec-draft-n-ubatch",
-                    "32",
-                    "--engine-budget-mib",
-                    budget,
-                    "-fit",
-                    "off",
-                    "-b",
-                    "1024",
-                    "-ub",
-                    "1024",
-                    "-fa",
-                    "on",
-                    "-ctk",
-                    "q4_0",
-                    "-ctv",
-                    "q4_0",
-                    "-ctkd",
-                    "q4_0",
-                    "-ctvd",
-                    "q4_0",
-                    "-ngl",
-                    "all",
-                    "-ngld",
-                    "99",
-                    "-t",
-                    "8",
-                    "-tb",
-                    "8",
-                    "--cache-ram",
-                    "0",
-                    "--ctx-checkpoints",
-                    "0",
-                    "--no-warmup",
-                ]);
+            let context_tokens =
+                llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
+                    .map_err(Failure::Fatal)?;
+            let dspark = (atomic && runtime.is_default() && adapter.is_none())
+                .then(|| llm::local_format::inkling_dspark(file, context_tokens))
+                .flatten();
+            let projector = llm::local_format::gguf_projector(file);
+            let caps = llama_help_caps(&program);
+            let shared_pool = shared_pool(context_tokens, !atomic && caps.shared_slots, |pool| {
+                llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits)
+            });
+            let launch = LlamaLaunch {
+                model: file,
+                projector: projector.as_deref(),
+                adapter,
+                context_tokens,
+                shared_pool,
+                reasoning_budget: caps
+                    .reasoning_budget
+                    .then_some(LLAMA_DEFAULT_REASONING_BUDGET),
+                reasoning_budget_message: caps.reasoning_budget_message,
+                cache_reuse: caps.cache_reuse.then_some(LLAMA_DEFAULT_CACHE_REUSE),
+                port,
+            };
+            let mut command = Command::new(program);
+            command.args(launch.args(runtime).map_err(Failure::Fatal)?);
+            if atomic {
+                command.args(["--alias", SERVER_MODEL]);
+                if let Some(draft) = dspark {
+                    let depth = if file
+                        .file_name()
+                        .is_some_and(|n| n == "Inkling-2-Mini-AD-IQ2_M.gguf")
+                    {
+                        "7"
+                    } else {
+                        "3"
+                    };
+                    let budget = if llm::local_fit::physical_memory_bytes()
+                        .is_some_and(|bytes| bytes >= 24 << 30)
+                    {
+                        "14436"
+                    } else {
+                        "8292"
+                    };
+                    command.arg("-md").arg(draft).args([
+                        "--spec-type",
+                        "draft-dspark",
+                        "--spec-draft-n-max",
+                        depth,
+                        "--spec-draft-n-ubatch",
+                        "32",
+                        "--engine-budget-mib",
+                        budget,
+                        "-fit",
+                        "off",
+                        "-b",
+                        "1024",
+                        "-ub",
+                        "1024",
+                        "-fa",
+                        "on",
+                        "-ctk",
+                        "q4_0",
+                        "-ctv",
+                        "q4_0",
+                        "-ctkd",
+                        "q4_0",
+                        "-ctvd",
+                        "q4_0",
+                        "-ngl",
+                        "all",
+                        "-ngld",
+                        "99",
+                        "-t",
+                        "8",
+                        "-tb",
+                        "8",
+                        "--cache-ram",
+                        "0",
+                        "--ctx-checkpoints",
+                        "0",
+                        "--no-warmup",
+                    ]);
+                }
             }
-        }
             command
         }
     } else if resolved_non_gguf != LocalEngine::Mlx {

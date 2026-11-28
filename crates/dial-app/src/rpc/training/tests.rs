@@ -135,7 +135,11 @@ fn training_status_reports_exl3_config_and_export_action_validation() {
     std::fs::create_dir(&existing).unwrap();
     for (act, out, expected_code) in [
         ("export_peft", "relative/out", ErrorCode::InvalidParams),
-        ("export_gguf_lora", existing.to_str().unwrap(), ErrorCode::Conflict),
+        (
+            "export_gguf_lora",
+            existing.to_str().unwrap(),
+            ErrorCode::Conflict,
+        ),
         ("export_gguf", "relative/out.gguf", ErrorCode::InvalidParams),
         ("export_exl3", "relative/exl3", ErrorCode::InvalidParams),
         ("prepare_gguf", "relative/prep", ErrorCode::InvalidParams),

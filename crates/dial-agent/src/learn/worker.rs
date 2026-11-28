@@ -1064,12 +1064,7 @@ pub fn fuse(
 
 /// Export a trained adapter to standard HuggingFace PEFT format (`adapter_config.json` +
 /// `adapter_model.safetensors`), compatible with ExLlamaV3/TabbyAPI, vLLM, and llama.cpp conversion.
-pub fn export_peft(
-    config: &Config,
-    model: &str,
-    adapter: &Path,
-    output: &Path,
-) -> Result<Value> {
+pub fn export_peft(config: &Config, model: &str, adapter: &Path, output: &Path) -> Result<Value> {
     let model = crate::llm::catalog::resolve_local_model(model)?;
     ensure!(adapter.is_absolute(), "adapter path must be absolute");
     fresh_output(output)?;

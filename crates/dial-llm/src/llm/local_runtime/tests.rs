@@ -164,7 +164,10 @@ fn auto_uses_the_only_capable_gguf_loader() {
 
 #[test]
 fn local_engine_ids_labels_recipes_and_gguf_loaders_cover_all_runtimes() {
-    use crate::llm::local_format::{LocalFormat, gguf_fixtures::{header, string}};
+    use crate::llm::local_format::{
+        LocalFormat,
+        gguf_fixtures::{header, string},
+    };
     let all = [
         LocalEngine::Auto,
         LocalEngine::Mlx,
