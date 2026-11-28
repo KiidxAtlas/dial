@@ -466,8 +466,10 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         adapter,
                         request,
                         timeout,
-                        Arc::clone(&interrupt),
-                        wrap_up.clone(),
+                        crate::agent::workflow::reasoning::GuardSignals {
+                            interrupt: Arc::clone(&interrupt),
+                            wrap_up: wrap_up.clone(),
+                        },
                         policy,
                         crate::agent::workflow::reasoning::Sinks {
                             on_text: &mut on_text,

@@ -320,7 +320,7 @@ impl Shell {
         if choice != Some(0) {
             return Ok(false);
         }
-        self.note("Local models", &format!("installing {}…", engine.label()));
+        self.note("Local models", format!("installing {}…", engine.label()));
         let layout = app.layout.clone();
         let recipe_id = recipe_id.to_owned();
         self.wait_local_preparation(app, move |cancel, progress| {

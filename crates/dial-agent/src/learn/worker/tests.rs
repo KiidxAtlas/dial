@@ -109,9 +109,11 @@ fn exl3_capabilities_and_backend_script_routing() {
     let peft_script = root.path().join("dial_peft_worker.py");
     std::fs::write(&mlx_script, "# mlx").unwrap();
     std::fs::write(&peft_script, "# peft").unwrap();
-    let mut cfg = Config::default();
-    cfg.python = root.path().join("python3");
-    cfg.worker = mlx_script.clone();
+    let mut cfg = Config {
+        python: root.path().join("python3"),
+        worker: mlx_script,
+        ..Default::default()
+    };
     cfg.training.backend = "peft".into();
     assert_eq!(
         worker_script(&cfg)

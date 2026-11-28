@@ -232,7 +232,7 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
 #[test]
 fn experiment_variants_change_the_shipped_experimental_settings() {
     let shipped = Config::default();
-    let baseline = serde_json::to_value(&shipped.experimental).unwrap();
+    let baseline = serde_json::to_value(shipped.experimental).unwrap();
     let rows: Vec<_> = assist_configurations(&shipped, "openai", "model")
         .into_iter()
         .filter(|c| c.experimental != ExperimentalOverrides::default())
@@ -242,7 +242,7 @@ fn experiment_variants_change_the_shipped_experimental_settings() {
         let mut config = shipped.clone();
         apply_experimental(&mut config, &variant.experimental);
         assert_ne!(
-            serde_json::to_value(&config.experimental).unwrap(),
+            serde_json::to_value(config.experimental).unwrap(),
             baseline,
             "{} must change a shipped experimental setting",
             variant.name

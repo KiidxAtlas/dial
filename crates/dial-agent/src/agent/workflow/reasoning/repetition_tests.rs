@@ -37,9 +37,7 @@ fn tool_payloads_are_not_treated_as_repetitive_answer_text() {
 
 #[test]
 fn long_reasoning_exact_cycle_catches_on_third_repeat_while_text_requires_four() {
-    let para = format!(
-        "Hmm, so how did getrandom get bumped? Let me check the actual behavior by looking at the output more carefully. Actually, maybe the regex matched the version line of getrandom because the alternation was not parenthesized properly.\n\n"
-    );
+    let para = "Hmm, so how did getrandom get bumped? Let me check the actual behavior by looking at the output more carefully. Actually, maybe the regex matched the version line of getrandom because the alternation was not parenthesized properly.\n\n";
     assert!(para.len() >= 160);
     // 3.5 copies crosses the 128-byte scan cadence right after repeat #3 while staying below 4.
     let three_plus = format!("{}{}", para.repeat(3), &para[..128]);

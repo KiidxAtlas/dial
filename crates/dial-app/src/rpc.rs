@@ -1842,24 +1842,24 @@ fn run_control(
                     out.result(&id, result);
                 }
                 "get_modes" if !acp => {
-                    let result = (|| -> Result<Value> {
+                    let result = {
                         let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         modes_reply(&projection)
-                    })();
+                    };
                     out.result(&id, result);
                 }
                 "goal" if !acp && workflows::is_goal_get(&request["params"]) => {
-                    let result = (|| -> Result<Value> {
+                    let result = {
                         let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         goal_get_reply(&projection)
-                    })();
+                    };
                     out.result(&id, result);
                 }
                 "evidence" if !acp && diagnostics::is_cached_action(&request["params"]) => {
-                    let result = (|| -> Result<Value> {
+                    let result = {
                         let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         diagnostics::cached(&projection.evidence, &request["params"])
-                    })();
+                    };
                     out.result(&id, result);
                 }
                 "abort" => {

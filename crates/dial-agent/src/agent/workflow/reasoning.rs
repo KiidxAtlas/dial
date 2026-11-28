@@ -114,6 +114,7 @@ impl Repetition {
 ///    appeared earlier in the reasoning block (catches paraphrase/opener-drift spirals).
 /// 2. Non-contiguous paragraph replay: >= 2 long paragraphs (>= 160 bytes, >= 24 words) repeat
 ///    earlier paragraphs at >= 75% 5-word Jaccard similarity (catches interleaved replays).
+///
 /// Used only on streamed reasoning, never on answer text or tool payloads.
 #[derive(Default)]
 struct ReasoningLoopDetector {
@@ -534,16 +535,21 @@ pub(in crate::agent) struct Sinks<'a> {
     pub on_event: &'a mut dyn FnMut(&StreamEvent) -> bool,
 }
 
+pub(in crate::agent) struct GuardSignals {
+    pub interrupt: Arc<AtomicBool>,
+    pub wrap_up: Option<Arc<AtomicBool>>,
+}
+
 pub(in crate::agent) fn chat_with_wrap_up(
     backend: &mut Backend,
     adapter: Option<&Path>,
     request: &Chat,
     timeout: u64,
-    interrupt: Arc<AtomicBool>,
-    wrap_up: Option<Arc<AtomicBool>>,
+    signals: GuardSignals,
     config: &ReasoningGuardConfig,
     sinks: Sinks<'_>,
 ) -> Result<Reply> {
+    let GuardSignals { interrupt, wrap_up } = signals;
     let Sinks {
         on_text,
         on_notice,
