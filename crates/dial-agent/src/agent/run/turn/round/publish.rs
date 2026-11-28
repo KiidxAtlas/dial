@@ -50,12 +50,13 @@ impl Agent<'_> {
             },
             None => (None, None),
         };
-        let limit = crate::agent::workflow::efficiency::preview_limit(
+        let limit = crate::agent::workflow::efficiency::local_preview_limit(
             &self.config.efficiency,
             self.context_window(),
             &call.name,
             output.is_error,
             artifact.is_some(),
+            self.local_profile_active() && !self.hermetic,
         );
         let limit = budget.limit(
             call,

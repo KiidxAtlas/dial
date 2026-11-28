@@ -87,14 +87,14 @@ impl<'de> Deserialize<'de> for LeanLocal {
 }
 
 /// `assistance.local.edit_mode`: the edit grammar for local routes when nothing pins one. `inherit`
-/// follows `[edit] mode`; any edit mode name selects that grammar. Unset, local routes use Hashline
+/// follows `[edit] mode`; any edit mode name selects that grammar. Unset, local routes use Replace
 /// unless `[edit] mode` is set explicitly, which then wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalEditMode(pub Option<EditMode>);
 
 impl Default for LocalEditMode {
     fn default() -> Self {
-        Self(Some(EditMode::Hashline))
+        Self(Some(EditMode::Replace))
     }
 }
 
@@ -166,9 +166,13 @@ pub enum LocalSideModels {
 /// Default `assistance.local.small_window`: planned windows at or below it get the small tier.
 pub const LOCAL_SMALL_WINDOW: u32 = 16_384;
 
+/// Default per-request ceiling for `assistance.local.reasoning_share` (about 4,000 tokens hard
+/// guard; 3/4 ≈ 3,000 tokens soft close on Dial's runtime), so large context windows do not unlock
+/// unbounded single-step thinking unless the operator explicitly raises `reasoning_share`.
+pub const LOCAL_REASONING_DEFAULT_MAX_BYTES: usize = 16_384;
+
 /// Longest `assistance.local.keep_loaded_secs`: one day.
 pub const LOCAL_KEEP_LOADED_MAX_SECS: u32 = 86_400;
-
 /// `[assistance.local]`: the local-model profile. Every policy here applies only to locally served
 /// main models (`Config::local_main_model`); hosted routes and hermetic runs are unchanged, and explicit
 /// pins (edit-mode override, model profile, harness, `[edit] model_variants`, a pinned temperature) win.
@@ -185,7 +189,9 @@ pub struct LocalAssistance {
     /// `model` uses the model's shipped sampling; `harness` sends Dial's harness temperature.
     pub sampling: LocalSamplingSource,
     /// Percent of the planned window that streamed reasoning may use per request on lean tiers, when
-    /// `reasoning_guard.max_reasoning_bytes` is unlimited or larger. 0 disables the cap.
+    /// `reasoning_guard.max_reasoning_bytes` is unlimited or larger. At or below the default share,
+    /// capped at `LOCAL_REASONING_DEFAULT_MAX_BYTES` so large context windows do not unlock
+    /// unbounded per-step thinking. 0 disables the cap.
     pub reasoning_share: u32,
     /// Consecutive failing rounds (malformed tool calls or failed edits) before the session escalates
     /// one step: first the minimal tool set and lean prompt, then the replace edit grammar. The
@@ -226,7 +232,7 @@ impl Default for LocalAssistance {
             escalate_after: 2,
             thinking: LocalThinking::Model,
             keep_loaded_secs: 0,
-            prompt_cache: false,
+            prompt_cache: true,
             side_models: LocalSideModels::Warn,
             context_advice: true,
             loop_penalty: false,

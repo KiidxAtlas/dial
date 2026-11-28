@@ -13,6 +13,165 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+/// Effort levels a local server's chat template declares (`reasoning_effort`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EffortCaps {
+    pub none: bool,
+    pub minimal: bool,
+    pub low: bool,
+    pub medium: bool,
+    pub high: bool,
+    pub max: bool,
+}
+
+impl EffortCaps {
+    pub fn is_empty(self) -> bool {
+        !(self.none || self.minimal || self.low || self.medium || self.high || self.max)
+    }
+    /// Ordered list of Dial `ReasoningEffort` variants supported by this local template/server.
+    pub fn to_reasoning_efforts(self) -> Vec<crate::llm::profiles::ReasoningEffort> {
+        use crate::llm::profiles::ReasoningEffort;
+        let mut levels = Vec::new();
+        if self.none {
+            levels.push(ReasoningEffort::None);
+        }
+        if self.minimal {
+            levels.push(ReasoningEffort::Minimal);
+        }
+        if self.low {
+            levels.push(ReasoningEffort::Low);
+        }
+        if self.medium {
+            levels.push(ReasoningEffort::Medium);
+        }
+        if self.high {
+            levels.push(ReasoningEffort::High);
+        }
+        if self.max {
+            levels.push(ReasoningEffort::Max);
+        }
+        levels
+    }
+
+    fn add_level(&mut self, name: &str) {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "none" => self.none = true,
+            "minimal" => self.minimal = true,
+            "low" => self.low = true,
+            "medium" => self.medium = true,
+            "high" => self.high = true,
+            "max" | "xhigh" => self.max = true,
+            _ => {}
+        }
+    }
+
+    /// Standard effort trio when a template accepts `reasoning_effort` without enumerating levels.
+    fn standard() -> Self {
+        Self {
+            low: true,
+            medium: true,
+            high: true,
+            ..Self::default()
+        }
+    }
+
+    /// Infers `reasoning_effort` support from a Jinja chat template when it references
+    /// `reasoning_effort`.
+    pub fn from_template(template: &str) -> Option<Self> {
+        if !template.contains(EFFORT_MARKER) {
+            return None;
+        }
+        let mut caps = Self::default();
+        for level in ["none", "minimal", "low", "medium", "high", "max", "xhigh"] {
+            let double = format!("\"{level}\"");
+            let single = format!("'{level}'");
+            if template.contains(&double) || template.contains(&single) {
+                caps.add_level(level);
+            }
+        }
+        Some(if caps.is_empty() {
+            Self::standard()
+        } else {
+            caps
+        })
+    }
+
+    /// Reads llama.cpp `/props` `chat_template_caps` (`supports_reasoning_effort` and
+    /// `reasoning_effort_levels`), falling back to the raw `chat_template` when caps omit it.
+    pub fn from_llama_props(props: &Value) -> Option<Self> {
+        let caps = &props["chat_template_caps"];
+        match caps
+            .get("supports_reasoning_effort")
+            .and_then(Value::as_bool)
+        {
+            Some(false) => None,
+            Some(true) => {
+                let mut found = Self::default();
+                if let Some(levels) = caps
+                    .get("reasoning_effort_levels")
+                    .and_then(Value::as_array)
+                {
+                    for level in levels.iter().filter_map(Value::as_str) {
+                        found.add_level(level);
+                    }
+                }
+                if !found.is_empty() {
+                    Some(found)
+                } else {
+                    props["chat_template"]
+                        .as_str()
+                        .and_then(Self::from_template)
+                        .or_else(|| Some(Self::standard()))
+                }
+            }
+            None => props["chat_template"]
+                .as_str()
+                .and_then(Self::from_template),
+        }
+    }
+
+    /// Effort for planning, fresh user turns, failed rounds, and plan changes.
+    pub fn pick_planning(self) -> Option<&'static str> {
+        if self.medium {
+            Some("medium")
+        } else if self.low {
+            Some("low")
+        } else if self.high {
+            Some("high")
+        } else {
+            None
+        }
+    }
+
+    /// Effort for routine continuations after a successful tool round.
+    pub fn pick_routine(self) -> Option<&'static str> {
+        if self.low {
+            Some("low")
+        } else if self.minimal {
+            Some("minimal")
+        } else if self.none {
+            Some("none")
+        } else if self.medium {
+            Some("medium")
+        } else {
+            None
+        }
+    }
+
+    /// Effort for recovery retries after a reasoning gate hit and for side requests.
+    pub fn pick_recovery(self) -> Option<&'static str> {
+        if self.minimal {
+            Some("minimal")
+        } else if self.none {
+            Some("none")
+        } else if self.low {
+            Some("low")
+        } else {
+            None
+        }
+    }
+}
+
 /// What one local server reports about itself and the model it serves.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ServerFacts {
@@ -21,6 +180,9 @@ pub struct ServerFacts {
     /// Whether the model's chat template or server exposes a thinking switch. `Some(false)` is a
     /// known absence; `None` is unknown.
     pub thinking_switch: Option<bool>,
+    /// Graded `reasoning_effort` levels the server/template supports (`None` when unsupported or
+    /// unknown).
+    pub effort_caps: Option<EffortCaps>,
     /// Whether the server reports native tool support for the model: llama.cpp's chat-template
     /// capabilities, Ollama's `capabilities` (`tools`), LM Studio's `capabilities` (`tool_use`).
     /// `Some(false)` is a reported absence; `None` is unknown, including servers that report no
@@ -123,6 +285,8 @@ fn sampler(value: f64) -> Option<f64> {
 
 /// Template marker of the switch Qwen-style templates read from `enable_thinking`.
 const THINKING_MARKER: &str = "enable_thinking";
+/// Template marker of graded effort templates (e.g. Inkling, GPT-OSS) reading `reasoning_effort`.
+const EFFORT_MARKER: &str = "reasoning_effort";
 /// Draft models offered for one target at most.
 const MAX_DRAFT_CANDIDATES: usize = 3;
 /// Tokenizer files larger than this are not digested.
@@ -279,15 +443,17 @@ fn dial_runtime_facts(model: &str) -> ServerFacts {
         Some(LocalFormat::Gguf) => {
             local_format::gguf_info(path).and_then(|info| info.chat_template)
         }
-        Some(LocalFormat::Mlx) => catalog::chat_template(path),
+        Some(LocalFormat::Mlx | LocalFormat::Exl3) => catalog::chat_template(path),
         _ => None,
     };
+    let effort_caps = template.as_deref().and_then(EffortCaps::from_template);
     ServerFacts {
         native_tools: None,
         slots: (format == Some(LocalFormat::Gguf))
             .then(super::server::dial_llama_slots)
             .flatten(),
         thinking_switch: template.map(|template| template.contains(THINKING_MARKER)),
+        effort_caps,
         defaults: ServerDefaults::default(),
     }
 }
@@ -313,6 +479,7 @@ fn llama_facts(
         thinking_switch: props["chat_template"]
             .as_str()
             .map(|template| template.contains(THINKING_MARKER)),
+        effort_caps: EffortCaps::from_llama_props(&props),
         defaults: ServerDefaults::from_llama_props(&props),
     })
 }
@@ -337,6 +504,7 @@ fn ollama_facts(
     Some(ServerFacts {
         slots: None,
         thinking_switch: Some(has("thinking")),
+        effort_caps: None,
         native_tools: Some(has("tools")),
         defaults: ServerDefaults::from_ollama_parameters(&shown),
     })
@@ -419,7 +587,7 @@ impl Fingerprint {
 
 fn weight_bytes(path: &Path, format: LocalFormat) -> Option<u64> {
     match format {
-        LocalFormat::Mlx => local_fit::safetensors_bytes(path),
+        LocalFormat::Mlx | LocalFormat::Exl3 => local_fit::safetensors_bytes(path),
         LocalFormat::Gguf => local_format::gguf_weight_bytes(path),
         LocalFormat::Splash => None,
     }
@@ -427,12 +595,11 @@ fn weight_bytes(path: &Path, format: LocalFormat) -> Option<u64> {
 
 fn tokenizer_digest(path: &Path, format: LocalFormat) -> Option<String> {
     match format {
-        LocalFormat::Mlx => mlx_tokenizer_digest(path),
+        LocalFormat::Mlx | LocalFormat::Exl3 => mlx_tokenizer_digest(path),
         LocalFormat::Gguf => local_format::gguf_tokenizer_digest(path),
         LocalFormat::Splash => None,
     }
 }
-
 /// SHA-256 (lowercase hex) of an MLX checkpoint's `tokenizer.json` vocabulary, merges and added
 /// tokens. Two checkpoints with the same digest encode text identically.
 fn mlx_tokenizer_digest(dir: &Path) -> Option<String> {

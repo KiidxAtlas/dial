@@ -303,6 +303,9 @@ def main():
                 f'base_url="http://127.0.0.1:{server.server_port}/v1"\n'
                 'allow_insecure=true\nprotocol="chat-completions"\n'
                 '[improve]\nenabled=false\n[harness]\nmax_steps=20\nmax_tokens=4096\n'
+                # The scripted loopback endpoint is classified as local. Exercise the selected
+                # benchmark tool policies rather than the lean-local offer, which can omit bash.
+                '[assistance]\nlean_local=false\n'
             )
             for name, model, edit in [("baseline", "scripted-base", "replace"), ("without-integrations", "scripted-ablated", "replace"), ("hashline", "scripted-hashline", "hashline")]:
                 config += '[model_profiles.' + name + ']\nprovider="openai"\nmodel="' + model + '"\nmax_tokens=8192\nedit_mode="' + edit + '"\n[model_profiles.' + name + '.capabilities]\ntemperature=true\ntools=true\noutput_limit="max-tokens"\n'

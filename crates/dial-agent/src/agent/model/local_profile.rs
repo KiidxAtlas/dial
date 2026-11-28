@@ -41,7 +41,17 @@ const MAIN_SLOT: u32 = 0;
 /// Loop recovery penalties: mild enough to keep code and tool syntax intact (identifiers repeat).
 const LOOP_PRESENCE_PENALTY: f64 = 0.5;
 const LOOP_REPETITION_PENALTY: f64 = 1.1;
-
+/// llama.cpp DRY + widened repetition lookback for loop recovery: penalizes repeating multi-token
+/// sequences across 1024 tokens without distorting short identifiers or syntax.
+const LOOP_REPEAT_LAST_N: u32 = 256;
+const LOOP_DRY_MULTIPLIER: f64 = 0.8;
+const LOOP_DRY_ALLOWED_LENGTH: u32 = 3;
+const LOOP_DRY_PENALTY_LAST_N: u32 = 1024;
+/// Gentle baseline DRY on local llama.cpp routes (allowed length 4 leaves short code/JSON tokens
+/// untouched while breaking long paragraph/phrase loops inside the sampler).
+const BASELINE_DRY_MULTIPLIER: f64 = 0.5;
+const BASELINE_DRY_ALLOWED_LENGTH: u32 = 4;
+const BASELINE_DRY_PENALTY_LAST_N: u32 = 1024;
 /// Measured speed samples needed before the time budget trusts them.
 const TIME_BUDGET_MIN_SAMPLES: u64 = 3;
 
@@ -147,6 +157,8 @@ pub(in crate::agent) struct LocalSession {
     prefill: Mean,
     /// Phase thinking for the next request.
     think_next: bool,
+    /// Next request recovers from a reasoning gate hit (step down effort / thinking).
+    recovering_next: bool,
     /// A successful `todo` update in the current round: the next request plans again.
     plan_changed: bool,
     /// The next request retries a repetition loop with penalties; the last one did.
@@ -224,7 +236,6 @@ pub(in crate::agent) fn host_default_sampling(
     auth_config: &crate::config::types::Config,
     hermetic: bool,
     profile: &mut Option<ModelProfile>,
-    harness_temperature: f64,
 ) -> Option<&'static str> {
     let adaptive = &config.adaptive;
     if hermetic
@@ -239,17 +250,19 @@ pub(in crate::agent) fn host_default_sampling(
     }
     let selection = auth_config.selection();
     if auth_config.endpoint.is_none() {
-        if !config.local_profile_applies()
-            || harness_temperature != Harness::default().temperature
-            || profile.as_ref().is_some_and(|p| p.thinking == Some(true))
-        {
+        if !auth_config.local_profile_applies() {
             return None;
         }
-        let shipped = crate::llm::model_sampling::recommended_sampling(&config.model)?;
+        let shipped = crate::llm::model_sampling::recommended_sampling(&auth_config.model);
         let p = profile
             .get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
+        let Some(shipped) = shipped else {
+            p.capabilities.temperature = false;
+            return Some("local server defaults");
+        };
         if p.capabilities.temperature {
             p.temperature = shipped.temperature;
+            p.capabilities.temperature = p.temperature.is_some();
         }
         if p.top_p.is_none() && shipped.top_p.is_some() {
             p.capabilities.top_p = true;
@@ -392,7 +405,9 @@ impl Agent<'_> {
     }
 
     /// Streamed-reasoning byte cap for one request on the lean tiers: `reasoning_share` percent of the
-    /// planned window at about four bytes per token.
+    /// planned window at about four bytes per token, capped at `LOCAL_REASONING_DEFAULT_MAX_BYTES`
+    /// when `reasoning_share` is at or below the default so large context windows do not unlock
+    /// unbounded single-step thinking.
     pub(in crate::agent) fn local_reasoning_cap(&self) -> Option<usize> {
         let share = self.config.assistance.local.reasoning_share as usize;
         if share == 0
@@ -401,12 +416,19 @@ impl Agent<'_> {
         {
             return None;
         }
+        let default_share =
+            crate::config::types::LocalAssistance::default().reasoning_share as usize;
+        let ceiling = if share <= default_share {
+            crate::config::types::LOCAL_REASONING_DEFAULT_MAX_BYTES
+        } else {
+            1_048_576
+        };
         Some(
             (self.context_window() as usize)
                 .saturating_mul(4)
                 .saturating_mul(share)
                 .saturating_div(100)
-                .clamp(256, 1_048_576),
+                .clamp(256, ceiling),
         )
     }
 
@@ -416,14 +438,12 @@ impl Agent<'_> {
     pub(in crate::agent) fn apply_local_sampling(
         &self,
         profile: &mut Option<ModelProfile>,
-        harness_temperature: f64,
     ) -> Option<&'static str> {
         host_default_sampling(
             self.effective_config(),
             &self.auth_config,
             self.hermetic,
             profile,
-            harness_temperature,
         )
     }
 
@@ -567,6 +587,7 @@ impl Agent<'_> {
             // Planning and recovery think; a step after a successful round is mechanical.
             self.local_session.think_next =
                 failed || std::mem::take(&mut self.local_session.plan_changed);
+            self.local_session.recovering_next = false;
         }
         let after = self.config.assistance.local.escalate_after;
         if !self.local_profile_active() || after == 0 {
@@ -705,6 +726,7 @@ impl Agent<'_> {
         }
         self.probe_local_server();
         self.local_session.think_next = true;
+        self.local_session.recovering_next = false;
         self.local_session.penalty_next = false;
         self.local_session.plan_changed = false;
         self.note_local_edit_mode(ui);
@@ -822,8 +844,33 @@ impl Agent<'_> {
             .then_some(local.keep_loaded_secs),
             cache_slot: (llama && local.prompt_cache).then_some(MAIN_SLOT),
             prompt_progress: llama,
+            dry_multiplier: llama.then_some(BASELINE_DRY_MULTIPLIER),
+            dry_allowed_length: llama.then_some(BASELINE_DRY_ALLOWED_LENGTH),
+            dry_penalty_last_n: llama.then_some(BASELINE_DRY_PENALTY_LAST_N),
             ..Default::default()
         }
+    }
+
+    /// Phase-appropriate `reasoning_effort` for effort-capable local models when nothing pins
+    /// thinking/effort. Keeps planning bounded (`medium`), routine continuations light (`low`),
+    /// and recovery/side steps minimal (`minimal`/`none`).
+    fn local_phase_effort(
+        &self,
+        profile: Option<&ModelProfile>,
+        recovering: bool,
+    ) -> Option<String> {
+        if Self::thinking_pinned(profile) {
+            return None;
+        }
+        let caps = self.local_session.facts.effort_caps?;
+        let picked = if recovering {
+            caps.pick_recovery()
+        } else if self.local_session.think_next {
+            caps.pick_planning()
+        } else {
+            caps.pick_routine()
+        };
+        picked.map(str::to_owned)
     }
 
     /// Whether this request's profile already decides thinking; then phase thinking stays out.
@@ -853,32 +900,49 @@ impl Agent<'_> {
         self.probe_local_server();
         backend.set_local_hints(self.local_base_hints(profile.as_ref()));
         let local = &self.config.assistance.local;
-        backend.set_loop_penalty(local.loop_penalty.then(|| {
-            LocalHints {
-                presence_penalty: Some(LOOP_PRESENCE_PENALTY),
-                repetition_penalty: Some(LOOP_REPETITION_PENALTY),
-                thinking: (local.thinking == LocalThinking::Phase
-                    && self.local_session.facts.thinking_switch == Some(true)
-                    && !Self::thinking_pinned(profile.as_ref()))
-                .then_some(false),
-                ..Default::default()
-            }
-        }));
-        let mut hints = LocalHints::default();
-        if local.thinking == LocalThinking::Phase
+        let llama = self.local_session.server == Some(LocalServer::LlamaCpp);
+        let recovery_effort = self.local_phase_effort(profile.as_ref(), true);
+        let toggle_recovery = self.local_session.facts.effort_caps.is_none()
             && self.local_session.facts.thinking_switch == Some(true)
-            && !Self::thinking_pinned(profile.as_ref())
-        {
-            hints.thinking = Some(self.local_session.think_next);
+            && !Self::thinking_pinned(profile.as_ref());
+        backend.set_loop_penalty(local.loop_penalty.then(|| LocalHints {
+            presence_penalty: Some(LOOP_PRESENCE_PENALTY),
+            repetition_penalty: Some(LOOP_REPETITION_PENALTY),
+            repeat_last_n: llama.then_some(LOOP_REPEAT_LAST_N),
+            dry_multiplier: llama.then_some(LOOP_DRY_MULTIPLIER),
+            dry_allowed_length: llama.then_some(LOOP_DRY_ALLOWED_LENGTH),
+            dry_penalty_last_n: llama.then_some(LOOP_DRY_PENALTY_LAST_N),
+            thinking: (local.thinking == LocalThinking::Phase && toggle_recovery).then_some(false),
+            reasoning_effort: recovery_effort.clone(),
+            ..Default::default()
+        }));
+        let recovering = std::mem::take(&mut self.local_session.recovering_next);
+        let mut hints = LocalHints::default();
+        if let Some(effort) = self.local_phase_effort(profile.as_ref(), recovering) {
+            hints.reasoning_effort = Some(effort);
+        } else if toggle_recovery {
+            if local.thinking == LocalThinking::Phase {
+                hints.thinking = Some(!recovering && self.local_session.think_next);
+            } else if recovering {
+                hints.thinking = Some(false);
+            }
         }
-        let penalty = std::mem::take(&mut self.local_session.penalty_next) && local.loop_penalty;
+        let penalty_triggered = std::mem::take(&mut self.local_session.penalty_next);
+        let penalty = penalty_triggered && local.loop_penalty;
         if penalty {
             hints.presence_penalty = Some(LOOP_PRESENCE_PENALTY);
             hints.repetition_penalty = Some(LOOP_REPETITION_PENALTY);
         }
+        if penalty_triggered && (penalty || llama) {
+            hints.repeat_last_n = llama.then_some(LOOP_REPEAT_LAST_N);
+            hints.dry_multiplier = llama.then_some(LOOP_DRY_MULTIPLIER);
+            hints.dry_allowed_length = llama.then_some(LOOP_DRY_ALLOWED_LENGTH);
+            hints.dry_penalty_last_n = llama.then_some(LOOP_DRY_PENALTY_LAST_N);
+        }
         self.local_session.penalty_sent = penalty;
         let record = json!({
             "thinking": hints.thinking,
+            "reasoning_effort": hints.reasoning_effort,
             "loop_penalty": penalty,
             "suggested_context": self.local_session.affordable_context,
             // What the server applies to any generation field this request omits.
@@ -889,7 +953,7 @@ impl Agent<'_> {
     }
 
     /// A side request on the main backend: its own llama.cpp slot when the server has one to spare,
-    /// and no thinking where the model has a switch and nothing pins it.
+    /// and minimal/no thinking where the model has a control and nothing pins it.
     pub(in crate::agent) fn prepare_local_side_request(&mut self, backend: &mut Backend) {
         if !self.local_profile_active() {
             return;
@@ -898,14 +962,18 @@ impl Agent<'_> {
         let profile = backend.compaction_profile().cloned();
         backend.set_local_hints(self.local_base_hints(profile.as_ref()));
         let llama = self.local_session.server == Some(LocalServer::LlamaCpp);
+        let reasoning_effort = self.local_phase_effort(profile.as_ref(), true);
+        let thinking = (reasoning_effort.is_none()
+            && self.config.assistance.local.thinking == LocalThinking::Phase
+            && self.local_session.facts.thinking_switch == Some(true)
+            && !Self::thinking_pinned(profile.as_ref()))
+        .then_some(false);
         backend.next_local_hints(LocalHints {
             cache_slot: (llama && self.config.assistance.local.prompt_cache)
                 .then(|| side_slot(self.local_session.facts.slots))
                 .flatten(),
-            thinking: (self.config.assistance.local.thinking == LocalThinking::Phase
-                && self.local_session.facts.thinking_switch == Some(true)
-                && !Self::thinking_pinned(profile.as_ref()))
-            .then_some(false),
+            thinking,
+            reasoning_effort,
             ..Default::default()
         });
     }
@@ -995,6 +1063,7 @@ impl Agent<'_> {
         }
         if let Some(hit) = error.downcast_ref::<crate::agent::workflow::reasoning::GateHit>() {
             session.think_next = false;
+            session.recovering_next = true;
             if hit.is_repetition() {
                 session.pending.repetition_loops += 1;
                 session.penalty_next = true;

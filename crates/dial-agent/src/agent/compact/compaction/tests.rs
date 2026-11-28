@@ -820,6 +820,80 @@ fn cut_with_known_model_counts_tokens_and_never_splits_a_tool_pair() {
 }
 
 #[test]
+fn shake_keeps_archive_reference_without_replaying_old_tool_output() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let reference = "artifact://older-tool-result";
+    let old_output = "raw older tool output ".repeat(1_000);
+    let request = Chat {
+        messages: vec![
+            json!({"role":"system","content":"stable rules"}),
+            json!({"role":"user","content":"inspect the workspace"}),
+            json!({"role":"assistant","tool_calls":[{
+                "id":"read-1","type":"function","function":{"name":"read","arguments":"{}"}
+            }]}),
+            json!({"role":"tool","tool_call_id":"read-1","content":old_output,
+                   "dial_model_content":old_output,"dial_evidence":{"artifact":reference,"is_error":false}}),
+            json!({"role":"user","content":"latest exact request"}),
+        ],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let prepared = compact_history(
+        &mut compaction_backend(),
+        HistoryCompaction {
+            request: &request,
+            policy: &CompactionConfig::default(),
+            context: CompactionContext {
+                identity: CompactionIdentity {
+                    provider: "endpoint",
+                    model: "test",
+                    agent: None,
+                },
+                window: 32_768,
+                summary_window: 32_768,
+                summary_output_limit: None,
+                timeout_secs: 5,
+                user_dir: user_dir.path(),
+                native_request: None,
+                retained_overhead_tokens: 0,
+                supplemental_context: None,
+            },
+            options: &CompactionOptions {
+                method: Some(CompactionMethod::Shake),
+                require_method: true,
+                keep_recent_tokens: Some(64),
+                ..Default::default()
+            },
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, _, _| panic!("shake must not request a model summary"),
+        None,
+    )
+    .unwrap();
+    let history = prepared.history(&request);
+    let tool = history
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    let content = tool["content"].as_str().unwrap();
+    assert!(content.contains(reference), "{content}");
+    assert!(!content.contains("raw older tool output"), "{content}");
+    // Publish stores a model-facing view that the request projection restores over `content`.
+    let model_view = tool["dial_model_content"].as_str().unwrap();
+    assert!(model_view.contains(reference), "{model_view}");
+    assert!(
+        !model_view.contains("raw older tool output"),
+        "{model_view}"
+    );
+    assert_eq!(tool["tool_call_id"], "read-1");
+    assert_eq!(request.messages[3]["content"], old_output);
+    assert_eq!(history.last(), request.messages.last());
+}
+
+#[test]
 fn live_handoff_keeps_the_exact_recent_tail_and_portable_fallback_is_non_destructive() {
     use crate::llm::provider::ProviderKind;
     for rejected in [false, true] {

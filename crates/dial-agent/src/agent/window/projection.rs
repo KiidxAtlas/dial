@@ -27,6 +27,10 @@ impl<'a> Agent<'a> {
         rule_state: Option<&mut crate::agent::safety::rules::State>,
     ) -> Result<usize> {
         crate::agent::compact::snapcompact::views::project(messages);
+        let local_route = self.local_profile_active() && !self.hermetic;
+        if local_route {
+            strip_local_reasoning(messages);
+        }
         let economy = self.config.efficiency.enabled && !self.hermetic;
         let identity = self.auth_config.selection();
         let raw_estimate = crate::llm::wire::counting::request_tokens(
@@ -65,17 +69,24 @@ impl<'a> Agent<'a> {
             agent: None,
         };
         let projection_mode = HistoryProjectionMode::for_identity(compaction_identity);
+        let pressure = self.context_meter.predict(raw_estimate).max(raw_estimate) > pressure_at;
+        // Rewriting older messages mid-turn busts prefix KV caches on both local servers
+        // (llama.cpp / MLX) and prompt-caching cloud providers (Anthropic, OpenAI, Gemini, etc.).
+        // Keep sent history append-only until actual context pressure requires pruning.
+        let prefix_preserve =
+            !pressure && (local_route || cached_cloud_route(self.config, &identity.provider));
         let policy = sent_history_policy(
             crate::agent::workflow::evidence::Policy {
-                warm_tokens: if economy || self.config.compaction.preserve_prefix {
+                warm_tokens: if economy || self.config.compaction.preserve_prefix || prefix_preserve
+                {
                     0
                 } else {
                     CACHE_WARM_SUFFIX_TOKENS
                 },
-                pressure: self.context_meter.predict(raw_estimate).max(raw_estimate) > pressure_at,
+                pressure,
                 protect_tokens: (window as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
-                supersede_reads: self.config.compaction.supersede_reads,
-                drop_useless: self.config.compaction.drop_useless,
+                supersede_reads: !prefix_preserve && self.config.compaction.supersede_reads,
+                drop_useless: !prefix_preserve && self.config.compaction.drop_useless,
             },
             compaction_identity,
         );
@@ -406,5 +417,83 @@ pub(in crate::agent) fn sent_history_policy(
     HistoryProjectionMode::for_identity(identity).apply(policy)
 }
 
+/// Active-turn `reasoning_content` replay cap on local routes. Completed earlier turns always drop
+/// stale `reasoning_content` from the projected request (keeping the transcript intact); within an
+/// active multi-step turn, older assistant steps also drop it once cumulative earlier reasoning
+/// exceeds this cap so long tool chains never replay tens of thousands of tokens of old thoughts.
+const LOCAL_ACTIVE_TURN_REASONING_REPLAY_CAP: usize = 16 * 1024;
+
+/// Strip stale `reasoning_content` from projected history for local routes without mutating the
+/// persisted session transcript. Preserves Anthropic/provider signed blocks (`dial_provider_content`)
+/// and keeps the immediately preceding assistant step's reasoning within the active turn.
+pub(in crate::agent) fn strip_local_reasoning(messages: &mut [Value]) {
+    let active_turn_start = messages
+        .iter()
+        .rposition(|m| {
+            m["role"] == "user"
+                && m["dial_transient"] != true
+                && m["dial_generated_user"] != true
+                && crate::storage::transcript::is_history(m)
+        })
+        .unwrap_or(0);
+    let strip = |m: &mut Value| {
+        if m["role"] == "assistant"
+            && m["dial_provider_content"].is_null()
+            && let Some(obj) = m.as_object_mut()
+        {
+            obj.remove("reasoning_content");
+        }
+    };
+    for message in &mut messages[..active_turn_start] {
+        strip(message);
+    }
+    let last_assistant = messages[active_turn_start..]
+        .iter()
+        .rposition(|m| m["role"] == "assistant")
+        .map(|offset| active_turn_start + offset);
+    let Some(last_assistant) = last_assistant else {
+        return;
+    };
+    let earlier_bytes: usize = messages[active_turn_start..last_assistant]
+        .iter()
+        .filter(|m| m["role"] == "assistant" && m["dial_provider_content"].is_null())
+        .filter_map(|m| m["reasoning_content"].as_str())
+        .map(str::len)
+        .sum();
+    if earlier_bytes > LOCAL_ACTIVE_TURN_REASONING_REPLAY_CAP {
+        for message in &mut messages[active_turn_start..last_assistant] {
+            strip(message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+/// Whether a hosted provider uses prefix prompt caching (so mid-turn history rewrites before
+/// pressure would bust the cached prefix and cost more than keeping earlier reads intact).
+/// An explicit `prompt_cache = false` on the active profile opts out.
+fn cached_cloud_route(config: &crate::config::Config, provider: &str) -> bool {
+    if let Some(profile) = config.active_model_profile() {
+        if profile.prompt_cache == Some(false) {
+            return false;
+        }
+        if profile.prompt_cache == Some(true) || profile.capabilities.prompt_cache {
+            return true;
+        }
+    }
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "anthropic"
+            | "bedrock"
+            | "vertex"
+            | "openai"
+            | "openai-codex"
+            | "chatgpt"
+            | "gemini"
+            | "google"
+            | "deepseek"
+            | "xai"
+            | "openrouter"
+    )
+}

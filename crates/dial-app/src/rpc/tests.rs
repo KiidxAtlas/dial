@@ -49,7 +49,7 @@ fn state_reply_reads_only_the_state_projection() {
     let projection = QueryProjection {
         state: json!({"session_id":"s1","tree":[]}),
         messages: json!([{"role":"user","content":"large history"}]),
-        cursor: Default::default(),
+        ..Default::default()
     };
     let reply = state_reply(&projection, true).unwrap();
     assert_eq!(reply, json!({"session_id":"s1","tree":[],"busy":true}));
@@ -768,5 +768,66 @@ fn a_failed_turn_replies_with_its_diagnostic_and_not_the_guidance_written_for_th
             2
         ),
         json!({"id":8,"error":{"code":ErrorCode::Busy.as_str(),"message":"workers are running"}})
+    );
+}
+
+#[test]
+fn cached_ui_queries_do_not_require_the_actor_busy_slot() {
+    assert!(Admin::reads("get_available_commands"));
+    assert!(Admin::reads("training_status"));
+    assert!(workflows::is_goal_get(&json!({"action": "get"})));
+    for non_get in [
+        json!({"action": "get", "extra": 1}),
+        json!({"action": "set", "objective": "ship"}),
+        json!({"action": "pause"}),
+        json!({"action": "resume"}),
+        json!({}),
+    ] {
+        assert!(!workflows::is_goal_get(&non_get), "{non_get}");
+    }
+    for action in ["turns", "model_request", "checks"] {
+        assert!(diagnostics::is_cached_action(&json!({"action": action})));
+    }
+    for action in ["check", "inspect", "lineage", "bogus", ""] {
+        assert!(!diagnostics::is_cached_action(&json!({"action": action})));
+    }
+    assert!(!diagnostics::is_cached_action(&json!({})));
+
+    let empty = QueryProjection::default();
+    assert!(modes_reply(&empty).is_err());
+    assert!(goal_get_reply(&empty).is_err());
+    assert!(diagnostics::cached(&empty.evidence, &json!({"action": "turns"})).is_err());
+
+    let projection = QueryProjection {
+        state: json!({
+            "session_id": "s1",
+            "working_modes": {
+                "plan": false,
+                "modes": {"vibe": false, "goal": {"goal": null}}
+            }
+        }),
+        evidence: diagnostics::EvidenceProjection {
+            model_request: json!({"session_id": "s1", "last_request": null}),
+            turns: json!({"session_id": "s1", "turns": []}),
+            checks: json!({"checks_current": false, "recorded_checks": []}),
+        },
+        ..Default::default()
+    };
+    assert_eq!(modes_reply(&projection).unwrap()["plan"], false);
+    assert_eq!(
+        goal_get_reply(&projection).unwrap(),
+        json!({"goal": {"goal": null}})
+    );
+    assert_eq!(
+        diagnostics::cached(&projection.evidence, &json!({"action": "turns"})).unwrap(),
+        json!({"session_id": "s1", "turns": []})
+    );
+    assert_eq!(
+        diagnostics::cached(&projection.evidence, &json!({"action": "model_request"})).unwrap(),
+        json!({"session_id": "s1", "last_request": null})
+    );
+    assert_eq!(
+        diagnostics::cached(&projection.evidence, &json!({"action": "checks"})).unwrap(),
+        json!({"checks_current": false, "recorded_checks": []})
     );
 }

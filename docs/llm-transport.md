@@ -21,6 +21,12 @@ Window-reset headers remain quota information, not mandatory waits. A throttle (
 529) remains distinct from account quota exhaustion. Configured failover retains its shorter
 wait policy. Incomplete/truncated streams are discarded and retried within the same attempt
 bounds; partial tool calls are never executed. Claude usage polling shares this retry policy.
+
+For local OpenAI-compatible chat endpoints, Dial sends a completed tool call and its matching
+result in the next inference request, including any `reasoning_content` emitted by the model.
+Whether the runtime uses that reasoning or reuses a cached prefix depends on its chat template
+and cache policy. Dial avoids copying the conversation just to normalize an already compatible
+system-message layout; this does not change the wire prompt or add mid-stream result injection.
 A response carrying `x-should-retry: false` is not resent: the request fails at once. The failure
 keeps its class, so API-key and OAuth account rotation and a configured fallback model still apply.
 

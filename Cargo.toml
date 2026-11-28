@@ -13,7 +13,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
 
@@ -91,7 +91,7 @@ bzip2-rs = "0.1"
 ruzstd = "0.9"
 sevenz-rust2 = { version = "0.25.0", default-features = false }
 cab = "0.6"
-rars = { version = "0.12", default-features = false }
+rars = { version = "0.13", default-features = false }
 # Rich `read` projections: certificates, executables, columnar data, legacy office, plists and mail.
 x509-parser = { version = "0.18", features = ["verify"] }
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
@@ -145,7 +145,7 @@ objc2-foundation = "=0.3.2"
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem"] }
 enigo = { version = "=0.6.1", default-features = false }
-uiautomation = "=0.25.1"
+uiautomation = "=0.25.3"
 winreg = "0.56"
 
 # Lints every member inherits with `[lints] workspace = true`. Only lints the tree is already clean

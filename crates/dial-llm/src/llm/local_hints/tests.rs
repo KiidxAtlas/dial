@@ -4,11 +4,16 @@ use serde_json::json;
 fn all() -> LocalHints {
     LocalHints {
         thinking: Some(false),
+        reasoning_effort: Some("low".into()),
         keep_alive_secs: Some(1800),
         cache_slot: Some(3),
         prompt_progress: true,
         presence_penalty: Some(0.5),
         repetition_penalty: Some(1.2),
+        repeat_last_n: Some(256),
+        dry_multiplier: Some(0.8),
+        dry_allowed_length: Some(3),
+        dry_penalty_last_n: Some(1024),
     }
 }
 
@@ -23,8 +28,13 @@ fn llama_cpp_wire_uses_completion_fields_and_merges_template_kwargs() {
         body["chat_template_kwargs"],
         json!({"other":1,"enable_thinking":false})
     );
+    assert_eq!(body["reasoning_effort"], "low");
     assert_eq!(body["presence_penalty"], 0.5);
     assert_eq!(body["repeat_penalty"], 1.2);
+    assert_eq!(body["repeat_last_n"], 256);
+    assert_eq!(body["dry_multiplier"], 0.8);
+    assert_eq!(body["dry_allowed_length"], 3);
+    assert_eq!(body["dry_penalty_last_n"], 1024);
     assert!(body.get("ttl").is_none() && body.get("think").is_none());
 }
 
@@ -33,9 +43,11 @@ fn mlx_runtime_wire_uses_template_kwargs_and_mlx_penalty_names_only() {
     let mut body = json!({"model":"m"});
     all().apply_openai(LocalServer::MlxRuntime, &mut body);
     assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    assert_eq!(body["reasoning_effort"], "low");
     assert_eq!(body["repetition_penalty"], 1.2);
     assert_eq!(body["presence_penalty"], 0.5);
     assert!(body.get("repeat_penalty").is_none());
+    assert!(body.get("dry_multiplier").is_none() && body.get("repeat_last_n").is_none());
     assert!(body.get("cache_prompt").is_none() && body.get("ttl").is_none());
 }
 
@@ -66,13 +78,16 @@ fn ollama_wire_puts_keep_alive_and_think_on_body_and_penalties_in_options() {
 #[test]
 fn existing_body_fields_win_over_hints_on_every_server() {
     let mut body = json!({"ttl":60,"repeat_penalty":1.0,"presence_penalty":0.1,"cache_prompt":false,
+        "reasoning_effort":"high","dry_multiplier":0.3,"repeat_last_n":128,
         "chat_template_kwargs":{"enable_thinking":true}});
     all().apply_openai(LocalServer::LlamaCpp, &mut body);
     assert_eq!(body["cache_prompt"], false);
     assert_eq!(body["repeat_penalty"], 1.0);
     assert_eq!(body["presence_penalty"], 0.1);
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["dry_multiplier"], 0.3);
+    assert_eq!(body["repeat_last_n"], 128);
     assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
-
     let mut body = json!({"keep_alive":"5m","think":true,"options":{"repeat_penalty":1.05}});
     let mut options = body["options"].take();
     all().apply_ollama(&mut body, &mut options);

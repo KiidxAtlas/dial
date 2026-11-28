@@ -64,7 +64,7 @@ fn explicit_temperature_pin_is_recorded_from_layers_and_never_serialized() {
     }
 }
 
-/// The local route's default grammar is Hashline. An explicit `[edit] mode` on a local route wins over
+/// The local route's default grammar is Replace. An explicit `[edit] mode` on a local route wins over
 /// that default, while an explicitly set `assistance.local.edit_mode` replaces `[edit] mode` and is
 /// reported once. `inherit`, matching modes and unset modes report nothing. Never serialized.
 #[test]
@@ -78,10 +78,10 @@ fn local_edit_mode_default_yields_to_explicit_edit_mode() {
     };
     let harness = Harness::default();
     let cases = [
-        ("", types::EditMode::Hashline, None),
+        ("", types::EditMode::Replace, None),
         (
-            "[assistance.local]\nedit_mode = 'replace'\n",
-            types::EditMode::Replace,
+            "[assistance.local]\nedit_mode = 'hashline'\n",
+            types::EditMode::Hashline,
             None,
         ),
         ("[edit]\nmode = 'patch'\n", types::EditMode::Patch, None),

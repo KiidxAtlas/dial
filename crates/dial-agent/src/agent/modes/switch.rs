@@ -266,6 +266,7 @@ impl Agent<'_> {
         self.record_main_model_route("Session main model switch installed the selected model (may reapply a recorded session switch); not worker assignment routing");
         // The loaded-size cap belonged to the previous server/model; the next probe re-reads it.
         self.context_cap = None;
+        self.memory_ceiling = None;
         self.modes.switch = Some(Saved {
             selection: selection.clone(),
             effort,

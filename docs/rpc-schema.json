@@ -46,6 +46,22 @@
         },
         {
           "type": "object",
+          "description": "Native RPC read-only: the saved conversation of one session of the launched project, read without resuming it or claiming its writer lock. Returns {session_id,messages} in the shape of messages. Unknown ids return not_found.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "session_messages"},
+            "params": {
+              "type": "object",
+              "properties": {"session_id": {"type": "string", "minLength": 1}},
+              "required": ["session_id"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "description": "Queue one text prompt for an exact local running session. Queued is not a turn completion receipt; the original owner executes it when idle and retains approvals.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
@@ -1106,6 +1122,35 @@
             "method"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Inspect a local training base without switching models, importing examples or loading weights. Returns the format, compatibility guidance, settings, verified turn count, stored version and live job state.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" }, "method": { "const": "training_status" },
+            "params": { "type": "object", "properties": { "model": { "type": "string", "minLength": 1 } }, "required": ["model"], "additionalProperties": false }
+          }, "required": ["method", "params"], "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Explicit consent for an operation on one local training base. Approve imports eligible examples from the named active session without starting training. Start queues the existing gated training worker. Stop also pauses scheduling; resume re-enables it. Fuse, export_peft, export_gguf_lora, export_gguf, export_exl3, and prepare_gguf export adapters or prepare a trainable FP16 copy from a GGUF.",
+          "properties": {
+            "id": { "$ref": "#/$defs/id" }, "method": { "const": "training_action" },
+            "params": { "type": "object", "properties": {
+              "model": { "type": "string", "minLength": 1 },
+              "action": { "enum": ["approve", "start", "stop", "resume", "fuse", "export_peft", "export_gguf_lora", "export_gguf", "export_exl3", "prepare_gguf"] },
+              "confirm": { "const": true },
+              "session_id": { "type": "string", "minLength": 1 },
+              "output": { "type": "string", "minLength": 1 },
+              "version": { "type": "integer", "minimum": 1 },
+              "dequantize": { "type": "boolean" },
+              "dtype": { "enum": ["f32", "f16", "bf16"] },
+              "quant": { "type": "string", "minLength": 1 },
+              "bpw": { "type": "number", "minimum": 1.5, "maximum": 8.0 }
+            }, "required": ["model", "action", "confirm"], "additionalProperties": false,
+              "if": { "properties": { "action": { "const": "approve" } } }, "then": { "required": ["session_id"] }, "else": { "not": { "required": ["session_id"] } }
+            }
+          }, "required": ["method", "params"], "additionalProperties": false
         },
         {
           "type": "object",
@@ -2400,7 +2445,7 @@
         },
         {
           "type": "object",
-          "description": "Compatible downloaded chat model rows include local_engine: {choices, selected, setting}. Offer only choices; for GGUF these depend on the architecture in the header and the platform. If selected is not in choices, prompt for a new preference. Save the runtime ID to that per-model setting before loading the model. With refresh: true the reply also carries checked: {providers, capable, candidates, checked_at, provider_status: [{id, label, base_url, state, detail, models}]}, narrowed to provider when given.",
+          "description": "Compatible downloaded chat model rows include local_engine: {choices, selected, setting, default, installed}. Offer only choices; for GGUF these depend on the architecture in the header and the platform. `default` is the runtime Auto resolves to, and `installed` maps each concrete runtime ID in `choices` to whether it is currently installed so clients can offer one-click download/setup on select. If selected is not in choices, prompt for a new preference. Save the runtime ID to that per-model setting before loading the model. With refresh: true the reply also carries checked: {providers, capable, candidates, checked_at, provider_status: [{id, label, base_url, state, detail, models}]}, narrowed to provider when given.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_models"},
@@ -2961,6 +3006,48 @@
             },
             "method": {
               "const": "restart_model"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Pre-warm this session's Dial-managed local model server ahead of Turn 1. No-op ({warmed:false}) for hosted routes. Result: {warmed:boolean, resident:boolean}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "warm_local_model"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Steer an active local or reasoning generation to wrap up thinking immediately, preserving its prefix digest and retrying the step at minimal effort. Safe to call during a turn. Result: {accepted:boolean}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "wrap_up_thinking"
             },
             "params": {
               "type": "object",

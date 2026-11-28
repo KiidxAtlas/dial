@@ -191,9 +191,10 @@ pub(in crate::setup) fn health_with_cancel(
             }
             Ok(format!("Node.js {}.{}.{}", version.0, version.1, version.2))
         }
-        // These Python CLIs expose --help, not --version. A version probe rejects a healthy
-        // installation before the settings picker can prepare its voice/model files.
-        "piper" | "mlx-whisper" => {
+        // These CLIs expose --help (or non-standard --version output). A version probe rejects a
+        // healthy installation before the picker can start serving models or voices.
+        "piper" | "mlx-whisper" | "vllm-mlx" | "vllm" | "sglang" | "exl3" | "mistral-rs"
+        | "ik-llama" | "atomic-engine" => {
             probe(location, &["--help"]).map(|_| format!("{id} CLI available"))
         }
         crate::llm::download::HUB_HELPER => probe(
@@ -618,6 +619,16 @@ pub fn preview_text(id: &str, env: &Env) -> String {
         return format!("{} is already set up.", recipe.title);
     }
     let mut lines = vec![format!("{}:", recipe.title)];
+    if id == "mlx-runtime" && cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        let dir = crate::config::paths::python_dir(&env.user_dir);
+        if super::recipe("uv").is_some_and(|uv| locate(uv, env).is_none()) {
+            lines.push("Also sets up first: uv".to_owned());
+        }
+        lines.push("Method: uv sync --locked (Dial private Python MLX environment)".to_owned());
+        lines.push(format!("Installs into: {}", dir.join(".venv").display()));
+        lines.push("Confirm with: /setup mlx-runtime yes".to_owned());
+        return lines.join("\n");
+    }
     let missing = super::plan::unmet_requirements(recipe, env);
     if !missing.is_empty() {
         lines.push(format!("Also sets up first: {}", missing.join(", ")));
@@ -659,6 +670,28 @@ pub fn install_and_save(
     progress: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>> {
     let env = Env::current(&layout.user_dir);
+    if id == "mlx-runtime" {
+        let mut done = Vec::new();
+        let uv_recipe = recipe("uv").expect("registered uv");
+        if locate(uv_recipe, &env).is_none() {
+            progress(&format!("== {}", uv_recipe.title));
+            let uv_loc = install("uv", &env, cancel, progress)?;
+            done.push(format!("{}: {}", uv_recipe.title, uv_loc.display()));
+        }
+        let emit = std::cell::RefCell::new(progress);
+        crate::setup::ensure_runtime_with(layout, cancel, &|line| {
+            (emit.borrow_mut())(line);
+        })?;
+        let progress = emit.into_inner();
+        let py = crate::config::paths::python_dir(&layout.user_dir)
+            .join(".venv")
+            .join("bin")
+            .join("python");
+        let detail = health_with_cancel("mlx-runtime", &py, None, cancel)?;
+        progress(&format!("ok: {detail}"));
+        done.push(format!("Local MLX runtime: {}", py.display()));
+        return Ok(done);
+    }
     let mut done = Vec::new();
     let mut stack = vec![id];
     let mut order = Vec::new();

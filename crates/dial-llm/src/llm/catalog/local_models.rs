@@ -363,6 +363,13 @@ pub(super) fn local_models_where(
                 continue;
             }
             if !mlx && let Some(window) = snapshot(&path) {
+                let detected = crate::llm::local_format::detect(&path).unwrap_or(LocalFormat::Mlx);
+                let is_exl3 = detected == LocalFormat::Exl3;
+                let (source, available) = if is_exl3 {
+                    exl3_listing("Hugging Face cache")
+                } else {
+                    ("Hugging Face cache (MLX)".into(), true)
+                };
                 models.push(ModelEntry {
                     selection: ModelSelection {
                         model: path.to_string_lossy().into_owned(),
@@ -370,11 +377,15 @@ pub(super) fn local_models_where(
                         ..Default::default()
                     },
                     label: label.clone(),
-                    source: "Hugging Face cache (MLX)".into(),
-                    available: true,
+                    source,
+                    available,
                     metadata: ModelMetadata {
-                        lora: lora_support(trainable, &path),
-                        format: Some(LocalFormat::Mlx),
+                        lora: if is_exl3 {
+                            None
+                        } else {
+                            lora_support(trainable, &path)
+                        },
+                        format: Some(detected),
                         ..local_model_metadata(&path)
                     },
                 });
@@ -443,6 +454,24 @@ fn gguf_listing(origin: &str, loaders: GgufEngines) -> (String, bool) {
     } else {
         (
             format!("{label} · llama.cpp not installed; Dial offers to install it on first use"),
+            true,
+        )
+    }
+}
+
+/// Availability for EXL3 checkpoints: requires a non-macOS host with NVIDIA CUDA + ExLlamaV3/TabbyAPI.
+fn exl3_listing(origin: &str) -> (String, bool) {
+    let label = format!("{origin} (EXL3)");
+    if cfg!(target_os = "macos") {
+        (
+            format!("{label} · requires NVIDIA CUDA (ExLlamaV3/TabbyAPI); not runnable on macOS"),
+            false,
+        )
+    } else if crate::llm::local_format::exl3_server().is_some() {
+        (label, true)
+    } else {
+        (
+            format!("{label} · ExLlamaV3/TabbyAPI server not found (set DIAL_EXL3_SERVER)"),
             true,
         )
     }
@@ -594,6 +623,13 @@ pub(super) fn lmstudio_mlx_models_where(
             let Some(window) = snapshot(&path) else {
                 continue;
             };
+            let detected = crate::llm::local_format::detect(&path).unwrap_or(LocalFormat::Mlx);
+            let is_exl3 = detected == LocalFormat::Exl3;
+            let (source, available) = if is_exl3 {
+                exl3_listing("LM Studio download")
+            } else {
+                ("LM Studio download (MLX)".into(), true)
+            };
             models.push(ModelEntry {
                 selection: ModelSelection {
                     model: path.to_string_lossy().into_owned(),
@@ -601,11 +637,15 @@ pub(super) fn lmstudio_mlx_models_where(
                     ..ModelSelection::default()
                 },
                 label,
-                source: "LM Studio download (MLX)".into(),
-                available: true,
+                source,
+                available,
                 metadata: ModelMetadata {
-                    lora: lora_support(trainable, &path),
-                    format: Some(LocalFormat::Mlx),
+                    lora: if is_exl3 {
+                        None
+                    } else {
+                        lora_support(trainable, &path)
+                    },
+                    format: Some(detected),
                     ..local_model_metadata(&path)
                 },
             });

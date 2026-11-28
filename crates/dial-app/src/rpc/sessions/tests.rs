@@ -33,6 +33,20 @@ fn ids(page: &Value) -> Vec<String> {
 }
 
 #[test]
+fn session_messages_reads_a_saved_conversation_without_resuming_it() {
+    let (_project, _home, layout) = layout();
+    let id = conversation(&layout, "hello there");
+    let read = messages(&layout, &json!({"session_id": id})).unwrap();
+    assert_eq!(read["session_id"], id.as_str());
+    assert_eq!(read["messages"][0]["role"], "user");
+    assert_eq!(read["messages"][0]["content"], "hello there");
+    // Reading is repeatable: no writer lock was claimed.
+    assert!(!Session::open_elsewhere(&find(&layout, &id).unwrap().path));
+    assert!(messages(&layout, &json!({"session_id": "missing"})).is_err());
+    assert!(messages(&layout, &json!({})).is_err());
+}
+
+#[test]
 fn list_pages_pins_first_and_marks_the_current_session() {
     let (_project, _home, layout) = layout();
     let first = conversation(&layout, "first");

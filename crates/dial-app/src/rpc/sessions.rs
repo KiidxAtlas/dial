@@ -1,7 +1,7 @@
-//! Native RPC session administration served by the controller: `list_sessions`, `delete_session`
-//! and `pin_session`. They read or remove journals of the launched project only and never touch
-//! the active session, so they stay available while a turn runs. Opening and resuming sessions
-//! remain actor work (`resume`, `new_session`, `fork_session`).
+//! Native RPC session administration served by the controller: `list_sessions`, `session_messages`,
+//! `delete_session` and `pin_session`. They read or remove journals of the launched project only
+//! and never touch the active session, so they stay available while a turn runs. Opening and
+//! resuming sessions remain actor work (`resume`, `new_session`, `fork_session`).
 use super::coded;
 use crate::config::paths::Layout;
 use crate::storage::{session::Session, session_pins};
@@ -133,6 +133,18 @@ fn find(layout: &Layout, wanted: &str) -> Result<crate::storage::session::Sessio
                 "session id not found in launched project",
             )
         })
+}
+
+/// The saved conversation of one session of this project, read without resuming it or taking its
+/// writer lock, so a client can show it at once (also while another writer holds it).
+pub(super) fn messages(layout: &Layout, params: &Value) -> Result<Value> {
+    let wanted = params["session_id"]
+        .as_str()
+        .ok_or_else(|| invalid("session_messages requires params.session_id"))?;
+    let info = find(layout, wanted)?;
+    let session = Session::read(&info.path)
+        .map_err(|error| coded(ErrorCode::Failed, format!("{error:#}")))?;
+    Ok(json!({"session_id": wanted, "messages": session.archived_messages()}))
 }
 
 /// Deletes another session of this project: its journal, stream supplement, side thread and pin.

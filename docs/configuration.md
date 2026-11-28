@@ -378,6 +378,8 @@ the settings panel labels that mode as pinned instead of claiming an ineffective
 
 ### Live local-model settings
 
+Local requests default to the model's recommended sampling values when Dial loads its weights. Missing values are left to the server; an external local endpoint uses its own defaults. Explicit sampling and phase-thinking settings still apply. Ordinary local edits default to the `replace` edit grammar and lean tool offer (with compact prompt context, a 16 KiB default per-request reasoning cap on lean tiers, and llama.cpp prompt-cache slot pinning enabled by default); specialists remain discoverable. This changes neither the loaded context limit nor permissions.
+
 Before each main local-model request, Dial shows its requested temperature, thinking switch and
 output-token limit in the status bar. These are the **last request's overrides**, not measured engine
 defaults. Unspecified values say `server default` or `model default`; no settings are shown before

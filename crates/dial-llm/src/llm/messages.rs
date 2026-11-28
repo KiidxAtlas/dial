@@ -56,9 +56,41 @@ impl WireForm {
     pub fn apply<'a>(self, messages: &'a [Value]) -> anyhow::Result<std::borrow::Cow<'a, [Value]>> {
         Ok(match self {
             Self::Canonical => std::borrow::Cow::Borrowed(messages),
+            Self::SingleSystemPrefix if already_local(messages) => {
+                std::borrow::Cow::Borrowed(messages)
+            }
             Self::SingleSystemPrefix => std::borrow::Cow::Owned(local(messages)?),
         })
     }
+
+    pub(super) fn chat(
+        self,
+        request: &super::Chat,
+    ) -> anyhow::Result<std::borrow::Cow<'_, super::Chat>> {
+        Ok(match self.apply(&request.messages)? {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(request),
+            std::borrow::Cow::Owned(messages) => std::borrow::Cow::Owned(super::Chat {
+                messages,
+                tools: request.tools.clone(),
+                temperature: request.temperature,
+                max_tokens: request.max_tokens,
+                seed: request.seed,
+            }),
+        })
+    }
+}
+
+fn already_local(messages: &[Value]) -> bool {
+    messages
+        .iter()
+        .enumerate()
+        .all(|(index, message)| match message["role"].as_str() {
+            Some("system") => {
+                index == 0 && message["dial_transient"] != true && message["content"].is_string()
+            }
+            Some("developer") => false,
+            _ => true,
+        })
 }
 
 /// Local chat templates commonly accept exactly one initial system message. Keep the

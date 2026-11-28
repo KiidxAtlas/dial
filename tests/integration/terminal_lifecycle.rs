@@ -101,6 +101,46 @@ fn occurrences(bytes: &[u8], needle: &[u8]) -> usize {
     bytes.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
+/// Answers Dial's llama.cpp capability probe (`GET /props`), which is local-server detection and not
+/// inference, and returns the request line of every other request the backend received.
+fn unexpected_backend_requests(backend: &TcpListener) -> Vec<String> {
+    let mut unexpected = Vec::new();
+    loop {
+        let mut stream = match backend.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                unexpected.push(format!("accept failed: {e}"));
+                break;
+            }
+        };
+        // Accepted sockets may inherit the listener's nonblocking mode; read them blocking.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 8192 {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&buffer[..n]),
+            }
+        }
+        let line = String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if line == "GET /props HTTP/1.1" {
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        } else {
+            unexpected.push(line);
+        }
+    }
+    unexpected
+}
+
 impl Session {
     fn start(backend: &TcpListener) -> Result<Self> {
         let root = tempfile::tempdir()?;
@@ -293,9 +333,11 @@ fn termination_restores_terminal_and_stops_owned_relay() {
                 String::from_utf8_lossy(tail)
             ));
         }
-        match backend.accept() {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            result => failures.push(format!("{name}: unexpected backend connection: {result:?}")),
+        let unexpected = unexpected_backend_requests(&backend);
+        if !unexpected.is_empty() {
+            failures.push(format!(
+                "{name}: unexpected backend request(s): {unexpected:?}"
+            ));
         }
         // Per-case cleanup happens only after all observations were captured above.
         drop(session);

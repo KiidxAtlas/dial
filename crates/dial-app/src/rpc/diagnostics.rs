@@ -15,6 +15,78 @@ use serde_json::{Value, json};
 /// Most citations one `lineage` request names, as `/evidence lineage` accepts.
 const MAX_LINEAGE_REFERENCES: usize = 16;
 
+/// Cached read-only `evidence` payloads published alongside the RPC query projection.
+#[derive(Default)]
+pub(super) struct EvidenceProjection {
+    pub model_request: Value,
+    pub turns: Value,
+    pub checks: Value,
+}
+
+pub(super) fn snapshot(agent: &Agent<'_>) -> EvidenceProjection {
+    EvidenceProjection {
+        model_request: model_request_snapshot(agent),
+        turns: turns_snapshot(agent),
+        checks: checks_snapshot(agent),
+    }
+}
+
+/// Whether `params` asks for a read-only `evidence` action served from `EvidenceProjection`.
+pub(super) fn is_cached_action(params: &Value) -> bool {
+    matches!(
+        params.get("action").and_then(Value::as_str).map(str::trim),
+        Some("model_request" | "turns" | "checks")
+    )
+}
+
+/// Serve a cached read-only `evidence` action without taking the actor's busy slot.
+pub(super) fn cached(projection: &EvidenceProjection, params: &Value) -> Result<Value> {
+    let value = match required_text(params, "action")?.as_str() {
+        "model_request" => &projection.model_request,
+        "turns" => &projection.turns,
+        "checks" => &projection.checks,
+        other => {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                format!("evidence action {other} is not cached"),
+            ));
+        }
+    };
+    anyhow::ensure!(value.is_object(), "RPC state snapshot is unavailable");
+    Ok(value.clone())
+}
+
+fn model_request_snapshot(agent: &Agent<'_>) -> Value {
+    json!({"session_id": agent.session().id(), "last_request": agent.last_main_request()})
+}
+
+fn turns_snapshot(agent: &Agent<'_>) -> Value {
+    let session = agent.session();
+    let turns: Vec<_> = session
+        .recorded_turns(50)
+        .into_iter()
+        .map(|(id, label, summary)| {
+            let report = crate::app::recorded_turn_outcome(summary, &Value::Null);
+            json!({"id":id, "label":redact_text(&label), "outcome":report.status, "details":report.handoff,
+                "main_request_receipt":summary["main_request_receipt"],
+                "step_limit":summary["step_limit"] == true, "turn":summary["checkpoint_turn"],
+                "files":summary["changed_files"].as_array().into_iter().flatten().filter_map(Value::as_str)
+                    .filter(|path| crate::storage::experience::safe_path(path)).take(128).collect::<Vec<_>>()})
+        })
+        .collect();
+    json!({"session_id":session.id(), "turns":turns})
+}
+
+fn checks_snapshot(agent: &Agent<'_>) -> Value {
+    let summary = &agent.session().control_state()["turn_summary"];
+    json!({
+        "checks_current": summary["checks_current"] == true,
+        "recorded_checks": redact_value(Value::Array(
+            summary["recorded_checks"].as_array().cloned().unwrap_or_default(),
+        )),
+    })
+}
+
 /// `evidence`: a read-only workbench action. `checks` lists the checks recorded at turn completion;
 /// `check` inspects the retained log of one of them by exact name; `inspect` and `lineage` read
 /// citations through the workbench owner. None of them writes evidence. `compare` is a separate
@@ -22,30 +94,9 @@ const MAX_LINEAGE_REFERENCES: usize = 16;
 pub(super) fn evidence(agent: &Agent<'_>, params: &Value) -> Result<Value> {
     let action = required_text(params, "action")?;
     match action.as_str() {
-        "model_request" => Ok(
-            json!({"session_id": agent.session().id(), "last_request": agent.last_main_request()}),
-        ),
-        "turns" => {
-            let session = agent.session();
-            let turns: Vec<_> = session.recorded_turns(50).into_iter().map(|(id, label, summary)| {
-                let report = crate::app::recorded_turn_outcome(summary, &Value::Null);
-                json!({"id":id, "label":redact_text(&label), "outcome":report.status, "details":report.handoff,
-                    "main_request_receipt":summary["main_request_receipt"],
-                    "step_limit":summary["step_limit"] == true, "turn":summary["checkpoint_turn"],
-                    "files":summary["changed_files"].as_array().into_iter().flatten().filter_map(Value::as_str)
-                        .filter(|path| crate::storage::experience::safe_path(path)).take(128).collect::<Vec<_>>()})
-            }).collect();
-            Ok(json!({"session_id":session.id(), "turns":turns}))
-        }
-        "checks" => {
-            let summary = &agent.session().control_state()["turn_summary"];
-            Ok(json!({
-                "checks_current": summary["checks_current"] == true,
-                "recorded_checks": redact_value(Value::Array(
-                    summary["recorded_checks"].as_array().cloned().unwrap_or_default(),
-                )),
-            }))
-        }
+        "model_request" => Ok(model_request_snapshot(agent)),
+        "turns" => Ok(turns_snapshot(agent)),
+        "checks" => Ok(checks_snapshot(agent)),
         "check" => {
             let name = required_word(params, "name")?;
             let summary = agent.session().control_state()["turn_summary"].clone();

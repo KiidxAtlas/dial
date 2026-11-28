@@ -421,18 +421,33 @@ def load_base(model, lazy=False):
     return load(model, tokenizer_config={"trust_remote_code": False}, lazy=lazy)
 
 
-LORA_PROBE_VERSION = 2
+LORA_PROBE_VERSION = 3
+ATTENTION_PROJECTIONS = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+    "qkv_proj", "in_proj", "wq", "wk", "wv", "wo",
+})
 
 
-def query_targets(model, count=None, keys=None):
-    """Preserve query adapters; fall back to the architecture's linear projections.
+def _switch_linear_types():
+    try:
+        from mlx_lm.layers.moe import QuantizedSwitchLinear, SwitchLinear
+    except ImportError:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    return SwitchLinear, QuantizedSwitchLinear
 
-    MLX applies a union of relative keys to every selected block. Resolve that union
-    before computing expected tensors, including matches in heterogeneous blocks.
-    Explicit keys select an existing adapter's own layout; each must match a projection.
+
+def query_targets(model, count=None, keys=None, target_mode="all-linear"):
+    """Resolve LoRA/DoRA target linear projections across the selected transformer blocks.
+
+    target_mode:
+      - "all-linear" (default): all MLX LoRA-compatible linear projections in selected blocks
+      - "attention": attention projections (q/k/v/o/out/qkv/in), with block fallback
+      - "q-proj": legacy query-only selection (q_proj -> o_proj/out_proj -> all)
+      - comma-separated names: explicit leaf or relative projection names
+    Explicit `keys` always preserve an existing adapter's exact layout.
     """
     from mlx import nn
-    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    SwitchLinear, QuantizedSwitchLinear = _switch_linear_types()
     supported = (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)
     layers = getattr(model, "layers", None)
     require(layers is not None and len(layers) > 0, "model exposes no trainable transformer layers")
@@ -444,20 +459,34 @@ def query_targets(model, count=None, keys=None):
         present = {name for layer in selected for name, _ in layer.named_modules()}
         require(bool(keys) and keys <= present, "adapter keys do not match the selected blocks")
     else:
+        mode = (target_mode or "all-linear").strip()
+        require(bool(mode), "target_modules must not be empty")
+        custom = None
+        if mode not in ("all-linear", "attention", "q-proj"):
+            custom = {part.strip() for part in mode.split(",") if part.strip()}
+            require(bool(custom), "target_modules must specify at least one projection")
         keys = set()
         for layer in selected:
             eligible = [(name, module) for name, module in layer.named_modules()
                         if name and isinstance(module, supported)]
-            # Keep existing query-only adapters byte-for-byte compatible on ordinary attention.
-            found = [(name, module) for name, module in eligible if name.rsplit(".", 1)[-1] == "q_proj"]
-            if not found:
-                # Prefer a single output projection for fused attention and recurrent blocks.
-                found = [(name, module) for name, module in eligible
-                         if name.rsplit(".", 1)[-1] in ("o_proj", "out_proj")]
-            if not found:
+            require(bool(eligible), "selected block exposes no MLX LoRA-compatible linear projections")
+            if mode == "all-linear":
                 found = eligible
-            require(bool(found), "selected block exposes no MLX LoRA-compatible linear projections")
+            elif mode == "attention":
+                found = [(name, module) for name, module in eligible
+                         if name.rsplit(".", 1)[-1] in ATTENTION_PROJECTIONS] or eligible
+            elif mode == "q-proj":
+                found = [(name, module) for name, module in eligible if name.rsplit(".", 1)[-1] == "q_proj"]
+                if not found:
+                    found = [(name, module) for name, module in eligible
+                             if name.rsplit(".", 1)[-1] in ("o_proj", "out_proj")]
+                if not found:
+                    found = eligible
+            else:
+                found = [(name, module) for name, module in eligible
+                         if name in custom or name.rsplit(".", 1)[-1] in custom]
             keys.update(name for name, _ in found)
+        require(bool(keys), "target_modules matched no MLX LoRA-compatible linear projections")
     modules = [module for layer in selected for name, module in layer.named_modules() if name in keys]
     require(all(isinstance(module, supported) for module in modules), "target path has incompatible types across blocks")
     selected_ids = {id(module) for module in modules}
@@ -466,31 +495,38 @@ def query_targets(model, count=None, keys=None):
     return sorted(keys), selected_ids
 
 
-def expected_weights(model, selected_ids, rank):
+def expected_weights(model, selected_ids, rank, fine_tune_type="lora"):
     from mlx.utils import tree_flatten
-    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    SwitchLinear, QuantizedSwitchLinear = _switch_linear_types()
+    from mlx_lm.tuner.dora import DoRALinear
     from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
+    require(fine_tune_type in ("lora", "dora"), "fine_tune_type must be lora or dora")
     expected = {}
+    wanted = ("lora_a", "lora_b", "m") if fine_tune_type == "dora" else ("lora_a", "lora_b")
     for name, module in model.named_modules():
         if id(module) not in selected_ids:
             continue
-        wrapper = LoRASwitchLinear if isinstance(module, (SwitchLinear, QuantizedSwitchLinear)) else LoRALinear
+        if isinstance(module, (SwitchLinear, QuantizedSwitchLinear)):
+            require(fine_tune_type == "lora", "DoRA is not supported on MoE SwitchLinear layers; use lora")
+            wrapper = LoRASwitchLinear
+        else:
+            wrapper = DoRALinear if fine_tune_type == "dora" else LoRALinear
         adapter = wrapper.from_base(module, r=rank, scale=20.0, dropout=0.0)
         for key, tensor in tree_flatten(adapter.parameters()):
-            if key in ("lora_a", "lora_b"):
+            if key in wanted:
                 expected[name + "." + key] = tuple(tensor.shape)
     require(bool(expected), "no adapter parameters found")
     return expected
 
 
-def validate_adapter(path, model_name, count, parameters, expected):
+def validate_adapter(path, model_name, count, parameters, expected, fine_tune_type="lora"):
     import mlx.core as mx
     directory = Path(path).resolve(strict=True)
     require(directory.is_dir(), "adapter must be a directory")
     with (directory / "adapter_config.json").open() as source:
         config = json.load(source)
     require(isinstance(config, dict), "adapter configuration must be an object")
-    require(config.get("model") == model_name and config.get("fine_tune_type") == "lora"
+    require(config.get("model") == model_name and config.get("fine_tune_type") == fine_tune_type
             and config.get("num_layers") == count and config.get("lora_parameters") == parameters,
             "adapter model, layer count or LoRA parameters are incompatible")
     tensors = mx.load(str(directory / "adapters.safetensors"))
@@ -511,18 +547,21 @@ def adapter_layout(model, model_name, path):
     with (directory / "adapter_config.json").open() as source:
         config = json.load(source)
     require(isinstance(config, dict), "adapter configuration must be an object")
+    fine_tune_type = config.get("fine_tune_type", "lora")
+    require(fine_tune_type in ("lora", "dora"), "adapter fine_tune_type must be lora or dora")
     count = integer(config, "num_layers", 1, 256)
     parameters = config.get("lora_parameters")
     require(isinstance(parameters, dict) and set(parameters) == {"rank", "dropout", "scale", "keys"},
             "missing adapter LoRA parameters")
     rank = integer(parameters, "rank", 1, MAX_ADAPTER_RANK)
-    scale, keys = parameters["scale"], parameters["keys"]
-    require(parameters["dropout"] == 0.0 and type(scale) in (int, float) and math.isfinite(scale) and scale > 0
+    dropout, scale, keys = parameters["dropout"], parameters["scale"], parameters["keys"]
+    require(type(dropout) in (int, float) and math.isfinite(dropout) and 0.0 <= dropout <= 0.5
+            and type(scale) in (int, float) and math.isfinite(scale) and scale > 0
             and isinstance(keys, list) and all(isinstance(key, str) and key for key in keys)
             and keys == sorted(set(keys)), "adapter must use supported LoRA parameters")
     _, ids = query_targets(model, count, keys)
-    expected = expected_weights(model, ids, rank)
-    validate_adapter(directory, model_name, count, parameters, expected)
+    expected = expected_weights(model, ids, rank, fine_tune_type=fine_tune_type)
+    validate_adapter(directory, model_name, count, parameters, expected, fine_tune_type=fine_tune_type)
     return directory, count, parameters, expected
 
 
@@ -533,7 +572,7 @@ def apply_adapter(model, model_name, path):
     return directory
 
 
-def write_adapter(output, model_name, count, parameters, tensors):
+def write_adapter(output, model_name, count, parameters, tensors, fine_tune_type="lora"):
     """Publish a complete adapter directory in one rename; an existing output is never replaced."""
     import tempfile
 
@@ -544,7 +583,7 @@ def write_adapter(output, model_name, count, parameters, tensors):
     scratch = Path(tempfile.mkdtemp(prefix=".adapter-", dir=output.parent))
     try:
         (scratch / "adapter_config.json").write_text(json.dumps(
-            {"model": model_name, "fine_tune_type": "lora", "num_layers": count, "lora_parameters": parameters}))
+            {"model": model_name, "fine_tune_type": fine_tune_type, "num_layers": count, "lora_parameters": parameters}))
         mx.save_safetensors(str(scratch / "adapters.safetensors"), tensors)
         os.rename(scratch, output)
     except BaseException:
@@ -568,6 +607,10 @@ def combine_adapters(model, model_name, inputs, output):
     """
     import mlx.core as mx
     layouts = [(adapter_layout(model, model_name, path), weight) for path, weight in inputs]
+    for layout, _ in layouts:
+        cfg = json.loads((layout[0] / "adapter_config.json").read_text())
+        require(cfg.get("fine_tune_type", "lora") == "lora",
+                "adapter rank concatenation is supported for LoRA adapters only (not DoRA)")
     count = max(layout[1] for layout, _ in layouts)
     keys = sorted({key for layout, _ in layouts for key in layout[2]["keys"]})
     rank = sum(layout[2]["rank"] for layout, _ in layouts)
@@ -662,6 +705,74 @@ def fuse(request):
         raise
     return {"output": str(output), "model_type": config.get("model_type"), "layers": len(fused),
             "dequantized": dequantize}
+
+
+def export_peft_op(request):
+    import dial_lora_export
+    model_name = resolve_model(string(request, "model"))
+    adapter = string(request, "adapter")
+    output = Path(string(request, "output"))
+    require(output.is_absolute() and not output.exists(), "output must be a new absolute path")
+    model, _ = load_base(model_name, lazy=True)
+    adapter_layout(model, model_name, adapter)
+    try:
+        return dial_lora_export.export_peft(model_name, adapter, output)
+    except dial_lora_export.ExportError as error:
+        raise RequestError(str(error)) from None
+
+
+def export_gguf_lora_op(request):
+    import dial_lora_export
+    model_name = resolve_model(string(request, "model"))
+    adapter = string(request, "adapter")
+    output = Path(string(request, "output"))
+    dtype = request.get("dtype", "f32")
+    converter = request.get("converter_script")
+    require(output.is_absolute() and not output.exists(), "output must be a new absolute path")
+    model, _ = load_base(model_name, lazy=True)
+    adapter_layout(model, model_name, adapter)
+    try:
+        return dial_lora_export.export_gguf_lora(
+            model_name, adapter, output, converter_script=converter, dtype=dtype
+        )
+    except dial_lora_export.ExportError as error:
+        raise RequestError(str(error)) from None
+
+
+def export_gguf_op(request):
+    import tempfile
+    import dial_lora_export
+    model_name = resolve_model(string(request, "model"))
+    adapter = string(request, "adapter")
+    output = Path(string(request, "output"))
+    quant = request.get("quant", "f16")
+    converter = request.get("converter_script")
+    quantize_bin = request.get("quantize_bin")
+    uv_bin = request.get("uv_bin")
+    require(output.is_absolute() and not output.exists(), "output must be a new absolute path")
+    require(output.parent.is_dir(), "output parent must exist")
+    with tempfile.TemporaryDirectory(prefix=".fuse-for-gguf-", dir=output.parent) as scratch:
+        fused_dir = Path(scratch) / "fused"
+        fuse({"model": model_name, "adapter": adapter, "output": str(fused_dir), "dequantize": True})
+        try:
+            return dial_lora_export.export_gguf_fused(
+                fused_dir, output, quant=quant, converter_script=converter,
+                quantize_bin=quantize_bin, uv_bin=uv_bin,
+            )
+        except dial_lora_export.ExportError as error:
+            raise RequestError(str(error)) from None
+
+
+def prepare_gguf_op(request):
+    import dial_lora_export
+    source = string(request, "source")
+    output = Path(string(request, "output"))
+    uv_bin = request.get("uv_bin")
+    require(output.is_absolute() and not output.exists(), "output must be a new absolute path")
+    try:
+        return dial_lora_export.prepare_gguf(source, output, uv_bin=uv_bin)
+    except dial_lora_export.ExportError as error:
+        raise RequestError(str(error)) from None
 
 
 def probe_adapter(model, tokens):
@@ -856,11 +967,39 @@ def replay_batches(factory, completed, seed):
     return batches
 
 
+def build_optimizer(args, total_steps):
+    """Build AdamW or Adam with optional cosine decay + linear warmup schedule."""
+    from mlx import optimizers
+    from mlx_lm.tuner.utils import build_schedule
+
+    lr = float(args.get("learning_rate", 1e-4))
+    schedule_kind = str(args.get("lr_schedule", "constant"))
+    warmup_ratio = float(args.get("warmup_ratio", 0.0))
+    if schedule_kind == "cosine" and total_steps > 1:
+        warmup = int(round(total_steps * warmup_ratio))
+        warmup = min(warmup, max(0, total_steps - 1))
+        decay = max(1, total_steps - warmup)
+        lr_schedule = build_schedule({
+            "name": "cosine_decay",
+            "warmup": warmup,
+            "warmup_init": lr * 0.01 if warmup > 0 else 0.0,
+            "arguments": [lr, decay, lr * 0.1],
+        })
+    else:
+        lr_schedule = lr
+    opt_kind = str(args.get("optimizer", "adamw"))
+    if opt_kind == "adamw":
+        return optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=float(args.get("weight_decay", 0.01)),
+        )
+    return optimizers.Adam(learning_rate=lr_schedule)
+
+
 def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args, expected):
     import tempfile
 
     import mlx.core as mx
-    from mlx import optimizers
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.tuner import TrainingArgs
     from mlx_lm.tuner import train as tuner_train
@@ -871,14 +1010,23 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
     output = Path(request["output_dir"])
     pause = Path(string(request, "pause_file"))
     progress = Path(string(request, "progress_file"))
-    identity = {key: request[key] for key in (
-        "model", "resume_adapter", "iters", "batch_size", "num_layers", "rank", "max_seq_length")}
+    fine_tune_type = str(args.get("fine_tune_type", "lora"))
+    checkpoint_every = int(request.get("checkpoint_every", 1))
+    grad_accum = int(args.get("grad_accumulation_steps", 1))
+    grad_checkpoint = bool(args.get("grad_checkpoint", False))
+    identity = {key: request.get(key) for key in (
+        "model", "resume_adapter", "iters", "batch_size", "num_layers", "rank", "max_seq_length",
+        "fine_tune_type", "target_modules", "learning_rate", "lr_schedule", "warmup_ratio",
+        "optimizer", "weight_decay", "dropout", "scale", "grad_checkpoint", "grad_accumulation_steps")}
     identity["datasets"] = [hashlib.sha256(Path(request[key]).read_bytes()).hexdigest()
                             for key in ("train_data", "valid_data")]
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     mx.random.seed(args["seed"])
     model.freeze()
-    linear_to_lora_layers(model, args["num_layers"], args["lora_parameters"])
+    linear_to_lora_layers(
+        model, args["num_layers"], args["lora_parameters"],
+        use_dora=(fine_tune_type == "dora"),
+    )
     checkpoint = None
     if request.get("resume_checkpoint"):
         checkpoint = json.loads((output / "resume.json").read_text())
@@ -904,7 +1052,8 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
             continue
         completed = checkpoint["completed"] if checkpoint and checkpoint["phase"] == phase else 0
         require(type(completed) is int and 0 <= completed <= total, "invalid checkpoint iteration")
-        optimizer = optimizers.Adam(learning_rate=args["learning_rate"])
+        phase_accum = grad_accum if phase == "sft" else 1
+        optimizer = build_optimizer(args, max(1, total // phase_accum))
         if checkpoint and checkpoint["phase"] == phase:
             state = tree_unflatten(list(mx.load(str(directory / "state.npz")).items()))
             optimizer.state = state.get("optimizer", {})
@@ -913,10 +1062,7 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
                 current[:] = saved_key
 
         class Callback(TrainingCallback):
-            def update(self, iteration, info):
-                atomic_json(progress, {"stage": f"training {phase} {iteration}/{total}",
-                                      "phase": phase, "iteration": iteration, "total": total,
-                                      "peak_memory_gb": info.get("peak_memory")})
+            def save_checkpoint(self, iteration):
                 root = output / "checkpoints"
                 root.mkdir(exist_ok=True)
                 saved = Path(tempfile.mkdtemp(prefix="step-", dir=root))
@@ -933,7 +1079,19 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
                     old = (output / prior["directory"]).resolve()
                     if old.parent == root.resolve() and old != saved.resolve():
                         shutil.rmtree(old)
-                if pause.exists():
+
+            def update(self, iteration, info):
+                atomic_json(progress, {"stage": f"training {phase} {iteration}/{total}",
+                                      "phase": phase, "iteration": iteration, "total": total,
+                                      "train_loss": info.get("train_loss"),
+                                      "val_loss": info.get("val_loss"),
+                                      "learning_rate": info.get("learning_rate"),
+                                      "peak_memory_gb": info.get("peak_memory")})
+                on_step_boundary = (iteration % phase_accum == 0) or (iteration >= total)
+                paused = pause.exists()
+                if on_step_boundary and (paused or iteration == 0 or iteration >= total or (iteration % checkpoint_every == 0)):
+                    self.save_checkpoint(iteration)
+                if paused and on_step_boundary:
                     raise TrainingPaused()
 
             def on_train_loss_report(self, info):
@@ -945,13 +1103,19 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
         if completed < total:
             callback = Callback()
             callback.update(completed, {})
-            training_args = TrainingArgs(batch_size=batch_size, iters=total-completed,
+            training_args = TrainingArgs(
+                batch_size=batch_size, iters=total - completed,
                 val_batches=-1 if validation else 0, steps_per_report=1,
-                steps_per_eval=min(100, total), steps_per_save=total+1,
-                adapter_file=output / "adapters.safetensors", max_seq_length=args["max_seq_length"])
+                steps_per_eval=min(100, total), steps_per_save=total + 1,
+                adapter_file=output / "adapters.safetensors",
+                max_seq_length=args["max_seq_length"],
+                grad_checkpoint=grad_checkpoint,
+                grad_accumulation_steps=phase_accum,
+            )
             kwargs = {"model": model, "optimizer": optimizer, "train_dataset": dataset,
                       "val_dataset": validation, "args": training_args,
-                      "iterate_batches": replay_batches(factory, completed, args["seed"] + (1 if phase == "preference" else 0)),
+                      "iterate_batches": replay_batches(factory, completed,
+                                                        args["seed"] + (1 if phase == "preference" else 0)),
                       "training_callback": callback}
             if loss is not None:
                 kwargs["loss"] = loss
@@ -960,29 +1124,48 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
     mx.save_safetensors(str(output / "adapters.safetensors"), dict(tree_flatten(model.trainable_parameters())))
 
 
-def resume_layout(model, model_name, path, scratch):
-    """Continue an adapter in its own rank, keys and layers at the standard training scale.
+def resume_layout(model, model_name, path, scratch, target_scale=20.0):
+    """Continue an adapter in its own rank, keys and layers at the requested training scale.
 
     Combined and baked adapters use scale 1; their B tensors are rescaled so the resumed
     function is identical while optimizer steps keep the usual effect size.
     """
     import mlx.core as mx
     directory, count, own, expected = adapter_layout(model, model_name, path)
-    parameters = dict(own, scale=20.0)
+    parameters = dict(own, scale=target_scale)
     weights = directory / "adapters.safetensors"
-    if own["scale"] != 20.0:
+    if own["scale"] != target_scale:
         tensors = mx.load(str(weights))
-        factor = own["scale"] / 20.0
+        factor = own["scale"] / target_scale
         weights = Path(scratch) / "adapters.safetensors"
         mx.save_safetensors(str(weights), {name: tensor * factor if name.endswith(".lora_b") else tensor
                                            for name, tensor in tensors.items()})
     return count, parameters, expected, str(weights)
 
-
 def train(request):
     import tempfile
     with tempfile.TemporaryDirectory(prefix="dial-resume-") as scratch:
         return train_in(request, scratch)
+
+
+def _opt_float(request, key, default, low, high):
+    value = request.get(key, default)
+    require(type(value) in (int, float) and math.isfinite(value) and low <= float(value) <= high,
+            f"{key} must be finite in [{low}, {high}]")
+    return float(value)
+
+
+def _opt_int(request, key, default, low, high):
+    value = request.get(key, default)
+    require(type(value) is int and low <= value <= high,
+            f"{key} must be an integer in [{low}, {high}]")
+    return value
+
+
+def _opt_bool(request, key, default):
+    value = request.get(key, default)
+    require(type(value) is bool, f"{key} must be a boolean")
+    return value
 
 
 def train_in(request, scratch):
@@ -991,11 +1174,33 @@ def train_in(request, scratch):
               "rank": (1, MAX_ADAPTER_RANK if request.get("resume_adapter") is not None else 128),
               "max_seq_length": (32, 8192)}
     values = {key: integer(request, key, *limits) for key, limits in bounds.items()}
+    fine_tune_type = str(request.get("fine_tune_type", "lora"))
+    require(fine_tune_type in ("lora", "dora"), "fine_tune_type must be lora or dora")
+    target_modules = str(request.get("target_modules", "all-linear")).strip()
+    require(bool(target_modules), "target_modules must not be empty")
+    learning_rate = _opt_float(request, "learning_rate", 1e-4, 1e-6, 1e-2)
+    lr_schedule = str(request.get("lr_schedule", "cosine"))
+    require(lr_schedule in ("cosine", "constant"), "lr_schedule must be cosine or constant")
+    warmup_ratio = _opt_float(request, "warmup_ratio", 0.1, 0.0, 0.5)
+    optimizer_name = str(request.get("optimizer", "adamw"))
+    require(optimizer_name in ("adamw", "adam"), "optimizer must be adamw or adam")
+    weight_decay = _opt_float(request, "weight_decay", 0.01, 0.0, 1.0)
+    dropout = _opt_float(request, "dropout", 0.0, 0.0, 0.5)
+    scale = _opt_float(request, "scale", 20.0, 0.1, 128.0)
+    grad_checkpoint = _opt_bool(request, "grad_checkpoint", True)
+    grad_accum = _opt_int(request, "grad_accumulation_steps", 1, 1, 64)
+    checkpoint_every = _opt_int(request, "checkpoint_every", 8, 1, 1000)
     # A resume rank is only a request hint: resume_layout validates the saved model,
     # keys, shapes and finite tensors before replacing it with the adapter's own rank.
     import numpy as np
-    from mlx_lm.lora import CONFIG_DEFAULTS, train_model
+    from mlx_lm.lora import CONFIG_DEFAULTS
+    from mlx_lm.tuner import TrainingArgs
+    from mlx_lm.tuner import train as tuner_train
     from mlx_lm.tuner.datasets import CacheDataset
+    from mlx_lm.tuner.trainer import iterate_batches
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    from mlx.utils import tree_flatten
+    import mlx.core as mx
     train_records, valid_records = read_datasets(string(request, "train_data"), string(request, "valid_data"))
     require(min(len(train_records), len(valid_records)) >= values["batch_size"],
             "each dataset needs at least batch_size records")
@@ -1010,13 +1215,21 @@ def train_in(request, scratch):
                    for record in train_records]
     resume_file = None
     if request.get("resume_adapter") is not None:
-        count, parameters, expected, resume_file = resume_layout(
-            model, model_name, string(request, "resume_adapter"), scratch)
+        resume_path = string(request, "resume_adapter")
+        count, parameters, expected, resume_file = (
+            resume_layout(model, model_name, resume_path, scratch)
+            if scale == 20.0
+            else resume_layout(model, model_name, resume_path, scratch, scale)
+        )
+        resume_cfg = json.loads((Path(resume_path).resolve() / "adapter_config.json").read_text())
+        fine_tune_type = resume_cfg.get("fine_tune_type", "lora")
         values.update(num_layers=count, rank=parameters["rank"])
     else:
-        keys, ids = query_targets(model, values["num_layers"])
-        parameters = {"rank": values["rank"], "dropout": 0.0, "scale": 20.0, "keys": keys}
-        expected = expected_weights(model, ids, values["rank"])
+        effective_layers = min(values["num_layers"], len(model.layers))
+        values["num_layers"] = effective_layers
+        keys, ids = query_targets(model, effective_layers, target_mode=target_modules)
+        parameters = {"rank": values["rank"], "dropout": dropout, "scale": scale, "keys": keys}
+        expected = expected_weights(model, ids, values["rank"], fine_tune_type=fine_tune_type)
     train_set = Dataset(sft_records, tokenizer)
     valid_set = Dataset(valid_records, tokenizer)
     # Do not silently truncate away the externally verified assistant answer.
@@ -1027,42 +1240,64 @@ def train_in(request, scratch):
                     "training example has no assistant target tokens or exceeds max_seq_length")
     args = copy.deepcopy(CONFIG_DEFAULTS)
     args.update(values)
-    args.update(model=model_name, train=True, fine_tune_type="lora", adapter_path=str(output),
+    args.update(model=model_name, train=True, fine_tune_type=fine_tune_type, adapter_path=str(output),
                 data={"train": str(Path(request["train_data"]).resolve()),
                       "valid": str(Path(request["valid_data"]).resolve())},
                 lora_parameters=parameters, resume_adapter_file=resume_file,
+                learning_rate=learning_rate, lr_schedule=lr_schedule, warmup_ratio=warmup_ratio,
+                optimizer=optimizer_name, weight_decay=weight_decay,
+                grad_checkpoint=grad_checkpoint, grad_accumulation_steps=grad_accum,
                 val_batches=-1, steps_per_report=min(10, values["iters"]),
                 steps_per_eval=min(100, values["iters"]), save_every=values["iters"],
                 mask_prompt=True, trust_remote_code=False)
     np.random.seed(args["seed"])
     if request.get("pause_file"):
+        req = dict(request, checkpoint_every=checkpoint_every)
         try:
             # The MLX batch iterator expects processed (tokens, offset) items.
-            pausable_train(request, model, tokenizer, CacheDataset(train_set), CacheDataset(valid_set),
+            pausable_train(req, model, tokenizer, CacheDataset(train_set), CacheDataset(valid_set),
                            pairs, args, expected)
         except TrainingPaused:
             return {"paused": True}
-        validate_adapter(output, model_name, values["num_layers"], parameters, expected)
+        validate_adapter(output, model_name, values["num_layers"], parameters, expected, fine_tune_type=fine_tune_type)
         return {"adapter": str(output)}
-    train_model(SimpleNamespace(**args), model, train_set, valid_set)
-    # Without eligible pairs, preserve the established SFT behavior exactly.
+    mx.random.seed(args["seed"])
+    model.freeze()
+    linear_to_lora_layers(model, values["num_layers"], parameters, use_dora=(fine_tune_type == "dora"))
+    if resume_file:
+        model.load_weights(resume_file, strict=False)
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_json(output / "adapter_config.json", args)
+    sft_args = TrainingArgs(
+        batch_size=values["batch_size"], iters=values["iters"],
+        val_batches=-1, steps_per_report=min(10, values["iters"]),
+        steps_per_eval=min(100, values["iters"]), steps_per_save=values["iters"] + 1,
+        adapter_file=output / "adapters.safetensors",
+        max_seq_length=values["max_seq_length"],
+        grad_checkpoint=grad_checkpoint,
+        grad_accumulation_steps=grad_accum,
+    )
+    optimizer = build_optimizer(args, values["iters"])
+    tuner_train(model=model, optimizer=optimizer,
+                train_dataset=CacheDataset(train_set), val_dataset=CacheDataset(valid_set),
+                args=sft_args, iterate_batches=iterate_batches)
+    # Without eligible pairs, preserve the established SFT behavior cleanly.
     if pairs:
         tokenized_pairs = tokenize_preference_pairs(pairs, tokenizer, values["max_seq_length"])
         if tokenized_pairs:
-            from mlx import optimizers
-            from mlx_lm.tuner import TrainingArgs
-            from mlx_lm.tuner import train as tuner_train
             iters = preference_iterations(values["iters"], len(tokenized_pairs))
             preference_args = TrainingArgs(
                 batch_size=PREFERENCE_PAIRS_PER_BATCH, iters=iters, val_batches=0, steps_per_report=iters,
                 steps_per_eval=iters, steps_per_save=iters + 1,
                 adapter_file=output / "adapters.safetensors",
-                max_seq_length=values["max_seq_length"])
-            optimizer = optimizers.Adam(learning_rate=args["learning_rate"])
-            tuner_train(model=model, optimizer=optimizer, train_dataset=tokenized_pairs,
+                max_seq_length=values["max_seq_length"],
+                grad_checkpoint=grad_checkpoint)
+            pref_opt = build_optimizer(args, iters)
+            tuner_train(model=model, optimizer=pref_opt, train_dataset=tokenized_pairs,
                         val_dataset=None, args=preference_args, loss=preference_loss,
                         iterate_batches=iterate_preference_batches)
-    validate_adapter(output, model_name, values["num_layers"], parameters, expected)
+    mx.save_safetensors(str(output / "adapters.safetensors"), dict(tree_flatten(model.trainable_parameters())))
+    validate_adapter(output, model_name, values["num_layers"], parameters, expected, fine_tune_type=fine_tune_type)
     return {"adapter": str(output)}
 
 
@@ -1103,9 +1338,9 @@ def sensitivity(request):
     records, _ = read_records(train_data)
     model_name = resolve_model(model_name)
     model, tokenizer = load_base(model_name)
-    keys, _ = query_targets(model)
+    target_modules = str(request.get("target_modules", "all-linear"))
+    keys, _ = query_targets(model, target_mode=target_modules)
     layer_count = len(model.layers)
-    dataset = Dataset(render_records(records, tokenizer), tokenizer)
     usable = []
     for index in range(len(dataset)):
         tokens, offset = dataset.process(dataset[index])
@@ -1168,7 +1403,9 @@ def main():
         operations = {"steering_extract":steering_operation,"steering_evaluate":steering_operation,"steering_import":steering_operation,
                       "steering_bake":steering_operation,"capabilities": capabilities, "generate": generate,
                       "train": train, "sensitivity": sensitivity, "score": score, "adapter_combine": adapter_combine,
-                      "fuse": fuse, "weights_map": weights_operation, "weights_stats": weights_operation,
+                      "fuse": fuse, "export_peft": export_peft_op, "export_gguf_lora": export_gguf_lora_op,
+                      "export_gguf": export_gguf_op, "prepare_gguf": prepare_gguf_op,
+                      "weights_map": weights_operation, "weights_stats": weights_operation,
                       "weights_activations": weights_operation, "weights_trace": weights_operation,
                       "weights_generate": weights_operation, "weights_direction": weights_operation,
                       "weights_edit": weights_operation, "weights_try": weights_operation, "weights_attribute": weights_operation,

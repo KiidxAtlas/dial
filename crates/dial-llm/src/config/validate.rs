@@ -576,6 +576,10 @@ impl Config {
             i.lora_min_examples >= 1,
             "lora_min_examples must be positive"
         );
+        ensure!(
+            matches!(i.gate_mode.as_str(), "auto" | "practical" | "strict"),
+            "improve.gate_mode must be auto, practical or strict"
+        );
         Ok(())
     }
 
@@ -962,14 +966,62 @@ impl Config {
         ensure!(
             t.interval_secs >= 1
                 && (1..=10000).contains(&t.iters)
-                && (1..=16).contains(&t.batch_size),
-            "invalid training interval, iterations or batch size"
+                && (1..=16).contains(&t.batch_size)
+                && (1..=64).contains(&t.grad_accumulation_steps),
+            "invalid training interval, iterations, batch size or gradient accumulation"
         );
         ensure!(
             (1..=256).contains(&t.num_layers)
                 && (1..=128).contains(&t.rank)
                 && (32..=8192).contains(&t.max_seq_length),
             "invalid LoRA layers, rank or sequence length"
+        );
+        ensure!(
+            matches!(t.backend.as_str(), "auto" | "mlx" | "peft"),
+            "training.backend must be auto, mlx or peft"
+        );
+        ensure!(
+            matches!(t.fine_tune_type.as_str(), "lora" | "dora"),
+            "training.fine_tune_type must be lora or dora"
+        );
+        ensure!(
+            !t.target_modules.trim().is_empty(),
+            "training.target_modules must not be empty"
+        );
+        ensure!(
+            t.scale.is_finite() && (0.1..=128.0).contains(&t.scale),
+            "training.scale must be in 0.1..=128.0"
+        );
+        ensure!(
+            t.dropout.is_finite() && (0.0..=0.5).contains(&t.dropout),
+            "training.dropout must be in 0.0..=0.5"
+        );
+        ensure!(
+            t.learning_rate.is_finite() && (1e-6..=1e-2).contains(&t.learning_rate),
+            "training.learning_rate must be in 1e-6..=1e-2"
+        );
+        ensure!(
+            matches!(t.lr_schedule.as_str(), "cosine" | "constant"),
+            "training.lr_schedule must be cosine or constant"
+        );
+        ensure!(
+            t.warmup_ratio.is_finite() && (0.0..=0.5).contains(&t.warmup_ratio),
+            "training.warmup_ratio must be in 0.0..=0.5"
+        );
+        ensure!(
+            matches!(t.optimizer.as_str(), "adamw" | "adam"),
+            "training.optimizer must be adamw or adam"
+        );
+        ensure!(
+            t.weight_decay.is_finite() && (0.0..=1.0).contains(&t.weight_decay),
+            "training.weight_decay must be in 0.0..=1.0"
+        );
+        ensure!(
+            (1..=1000).contains(&t.checkpoint_every)
+                && t.max_train_examples <= 10000
+                && t.max_replay_examples <= 2000
+                && (1..=2000).contains(&t.max_valid_examples),
+            "invalid training checkpoint interval or dataset window limits"
         );
         Ok(())
     }

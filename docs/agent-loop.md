@@ -1454,8 +1454,9 @@ limits, reasoning budgets, approvals or verification requirements:
 - Local model profile (`[assistance.local]`) applies only to locally served main models (the same
   routes as `lean_local`). Hosted routes and hermetic runs are unchanged, and explicit pins win
   over every local-profile policy below. Its keys are `enabled` (default `true`), `small_window`
-  (default 16384; 0 disables the small tier, otherwise 1024..=1048576), `edit_mode`, `sampling`,
-  `reasoning_share` (default 50), `escalate_after` (default 2), and the keys below.
+  (default 16384; 0 disables the small tier, otherwise 1024..=1048576), `edit_mode` (default `replace`),
+  `sampling`, `reasoning_share` (default 10, capped at 16 KiB at or below the default share),
+  `escalate_after` (default 2), and the keys below.
   - After a recognized check reports a classified code failure, the next local request can show
     one repair brief: the current goal, the checked and current revisions, whether a checkpointed
     edit followed the check, and a short quotation of the failure when available. Locations, inputs
@@ -1488,11 +1489,11 @@ limits, reasoning budgets, approvals or verification requirements:
   - Prompt scope: tool-specific sentences of the fixed guidance (`skill`, saved project maps for
     `codebase_memory`, the LSP) appear only when that tool is offered, like the preview and
     delegation sections.
-  - Edit mode: local routes default to Hashline, as do hosted routes. Precedence is the
+  - Edit mode: local routes default to `replace`, while hosted routes keep `hashline`. Precedence is the
     `--edit-mode` override, model profile `edit_mode`, `[harness] edit_mode`, `[edit] model_variants`,
-    an explicit `assistance.local.edit_mode` other than `inherit`, then `[edit] mode`. Hermetic
-    evaluation ignores the local override. The single `edit` tool also accepts the other native
-    edit grammars without loading more tools.
+    an explicit `assistance.local.edit_mode` other than `inherit`, then `[edit] mode` (an explicitly
+    configured `[edit] mode` wins over the built-in local default). Hermetic evaluation ignores the local
+    override. The single `edit` tool also accepts the other native edit grammars without loading more tools.
   - Sampling: `model` (default) leaves externally hosted local models to their serving host's API
     defaults, including LM Studio and Ollama. Dial omits `temperature` instead of substituting a
     learned harness value or guessing the host's numeric default. An explicitly configured
@@ -1508,11 +1509,14 @@ limits, reasoning budgets, approvals or verification requirements:
     Independent workers use the same policy at each request boundary, including after a worker
     model switch; finite role/task/recovery output budgets remain explicit.
   - Reasoning share: on lean tiers, streamed reasoning per request is capped at `reasoning_share`
-    percent of the planned window, at about 4 bytes per token. The cap applies only when
+    percent of the planned window, at about 4 bytes per token. At or below the default share (10),
+    the cap is further bounded by 16 KiB (~4,000 tokens hard guard; ~3,000 tokens soft close on
+    Dial's own runtime) so large context windows do not unlock unbounded single-step thinking;
+    raising `reasoning_share` above the default scales up to 1 MiB. The cap applies only when
     `reasoning_guard.max_reasoning_bytes` is 0 (unlimited) or larger than that cap; a stricter
     explicit limit still applies. When the cap is hit, the existing reasoning guard discards that
     generation and retries once; requests to Dial's own runtime also carry the `dial_reasoning`
-    budget (3/4 of the cap). 0 disables it.
+    budget (3/4 of the cap) to close thinking and continue. 0 disables it.
   - Escalation: `escalate_after` failing rounds (malformed tool calls, or failed `edit`
     or `write` calls) step the session up. Step 1 switches to the minimal tool set and lean prompt;
     step 2 switches to the `replace` edit grammar unless a pin chooses otherwise (it is skipped when
@@ -1552,11 +1556,11 @@ limits, reasoning budgets, approvals or verification requirements:
     value opts into keeping it loaded after requests (Ollama `keep_alive`, LM Studio `ttl` for
     just-in-time loaded models). An explicit model-profile `keep_alive` wins. With that opt-in,
     an Ollama model this session loaded can be unloaded at exit; an already loaded model is left alone.
-  - Prompt cache (`prompt_cache`, default off, llama.cpp only): leaves cache/slot selection to
-    the server unless enabled. When enabled, requests send `cache_prompt` and an `id_slot`.
-    The main session uses slot 0; with multiple slots, side requests use the last slot and workers
-    use the others. Prompt-cache hits reported by the server are still counted and shown in the
-    status line (`N cached`) without an explicit cache override.
+  - Prompt cache (`prompt_cache`, default on, llama.cpp only): sends `cache_prompt` and an
+    `id_slot`. The main session uses slot 0; with multiple slots, side requests use the last slot
+    and workers use the others so they do not evict the main prompt cache. Turn off to leave
+    cache/slot selection to the server. Prompt-cache hits reported by the server are still counted
+    and shown in the status line (`N cached`) even when turned off.
   - Side models (`side_models`, default `warn`): a side role (`small`, `coach`) assigned to a
     different model on the main model's local server makes the server swap models for summaries,
     ranking and edit repair. `warn` keeps the assignment and says so once per session, with the

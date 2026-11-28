@@ -159,6 +159,15 @@ impl Store {
         Ok((added, examples.len() - added))
     }
 
+    /// Count approved source turns without decoding their private payloads.
+    pub fn session_example_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM session_examples", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Approved source snapshots, never counted as target-model performance.
     pub fn session_training_examples(&self) -> Result<Vec<(i64, SessionTrainingExample)>> {
         let mut statement = self

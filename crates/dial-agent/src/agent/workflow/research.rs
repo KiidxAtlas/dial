@@ -12,8 +12,8 @@ use std::collections::VecDeque;
 // work routinely spans many read/search/run rounds before its first edit, so the window is wide.
 // These count model round trips without progress, not batched calls; evidence-linked synthesis
 // renews the window. One set serves the parent loop and workers alike.
-/// Rounds before the early advisory warning on routes with the forced checkpoint.
-const WARN_ROUNDS: u32 = 12;
+/// Rounds before the early advisory warning on routes with the forced checkpoint (lean local routes).
+const WARN_ROUNDS: u32 = 6;
 /// Rounds before the forced, tool-free synthesis checkpoint (lean routes only).
 const SYNTHESIS_ROUNDS: u32 = 24;
 /// Rounds before the advisory warning on routes without the forced checkpoint. Hosted and
@@ -116,7 +116,7 @@ pub(in crate::agent) fn is_observation(call: &ToolCall) -> bool {
         ),
         "codebase_memory" => matches!(
             call.arguments["action"].as_str(),
-            Some("recall" | "architecture" | "impact" | "refresh")
+            Some("recall" | "architecture" | "impact" | "refresh" | "list_guardrails")
         ),
         "peers" => matches!(call.arguments["action"].as_str(), None | Some("list")),
         _ => false,

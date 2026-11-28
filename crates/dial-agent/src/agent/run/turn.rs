@@ -128,6 +128,7 @@ pub(in crate::agent) struct TurnState<'a> {
     auto_continues: u32,
     planning_notice: bool,
     plan_after_gate: bool,
+    wrap_up_next_step: bool,
     // Tool-contract reliability and stall/pace guards.
     measured: Option<Value>,
     reliability: crate::reliability::Stats,
@@ -458,6 +459,7 @@ impl Agent<'_> {
             auto_continues: 0,
             planning_notice: false,
             plan_after_gate: false,
+            wrap_up_next_step: false,
             measured,
             reliability,
             policy_signature: String::new(),

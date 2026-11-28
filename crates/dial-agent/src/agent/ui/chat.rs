@@ -174,8 +174,8 @@ pub(in crate::agent) struct ChatMonitors<'a, 'm> {
     pub(in crate::agent) rules: Option<&'a mut crate::agent::safety::rules::Monitor<'m>>,
     pub(in crate::agent) stream:
         Option<&'a mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
+    pub(in crate::agent) wrap_up: Option<Arc<AtomicBool>>,
 }
-
 pub(in crate::agent) fn chat_with_ui(
     backend: &mut Backend,
     adapter: Option<&Path>,
@@ -215,6 +215,7 @@ pub(in crate::agent) fn chat_with_ui_inner(
         ChatMonitors {
             rules,
             stream: None,
+            wrap_up: None,
         },
     )
 }
@@ -233,6 +234,7 @@ pub(in crate::agent) fn chat_with_ui_streaming(
     let ChatMonitors {
         mut rules,
         mut stream,
+        wrap_up,
     } = monitors;
     let mut automatically_retried = false;
     let mut loop_attempts = 1;
@@ -254,6 +256,7 @@ pub(in crate::agent) fn chat_with_ui_streaming(
                 stream: stream.as_mut().map(|stream| {
                     &mut **stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
                 }),
+                wrap_up: wrap_up.clone(),
             },
         );
         if result
@@ -353,6 +356,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     let ChatMonitors {
         mut rules,
         mut stream,
+        wrap_up,
     } = monitors;
     if let Some(monitor) = rules.as_deref_mut() {
         monitor.restart();
@@ -457,12 +461,15 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     !interrupt.load(Ordering::SeqCst)
                 };
                 let result = if let Some(policy) = policy {
-                    crate::agent::workflow::reasoning::chat(
+                    crate::agent::workflow::reasoning::chat_with_wrap_up(
                         backend,
                         adapter,
                         request,
                         timeout,
-                        Arc::clone(&interrupt),
+                        crate::agent::workflow::reasoning::GuardSignals {
+                            interrupt: Arc::clone(&interrupt),
+                            wrap_up: wrap_up.clone(),
+                        },
                         policy,
                         crate::agent::workflow::reasoning::Sinks {
                             on_text: &mut on_text,

@@ -772,10 +772,25 @@ impl Conversation {
         };
         let text = result["text"].as_str().unwrap_or_default();
         if !streamed && !text.is_empty() {
-            self.entries.push(Entry::Assistant(AssistantEntry {
+            let reply = Entry::Assistant(AssistantEntry {
                 text: text.to_owned(),
                 ..AssistantEntry::default()
-            }));
+            });
+            // A stopped turn is announced as a notice and also returned as the reply. Show it
+            // once, as the reply (as the saved conversation replays it), in the notice's place.
+            let announced = self.entries.iter().rposition(|entry| {
+                matches!(entry, Entry::Notice(notice) if notice.kind.is_none() && notice.message == text)
+            });
+            match announced {
+                Some(index)
+                    if self.entries[index + 1..]
+                        .iter()
+                        .all(|entry| matches!(entry, Entry::Notice(_))) =>
+                {
+                    self.entries[index] = reply;
+                }
+                _ => self.entries.push(reply),
+            }
         }
         if result["interrupted"] == true {
             self.entries.push(Entry::Notice(NoticeEntry {

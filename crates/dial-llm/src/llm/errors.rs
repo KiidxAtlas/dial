@@ -115,6 +115,15 @@ pub fn overflow_prompt_tokens(err: &anyhow::Error) -> Option<u64> {
     })
 }
 
+/// The overflow was the local server running out of memory for the prompt, not a token limit:
+/// the served context window overstates what this machine can actually prefill.
+pub fn is_memory_overflow(err: &anyhow::Error) -> bool {
+    is_context_overflow(err)
+        && err
+            .chain()
+            .any(|cause| MEMORY_OVERFLOW.is_match(&cause.to_string()))
+}
+
 static OVERFLOW_COUNT: LazyLock<[Regex; 5]> = LazyLock::new(|| {
     [
         one(r"(?i)prompt is too long:\s*(\d+)\s*tokens"), // Anthropic
@@ -282,7 +291,8 @@ fn classify_text(
     // a status: stream error events carry none.
     let per_minute = PER_MINUTE_WINDOW.is_match(text) || TPM_RPM_THROTTLE.is_match(text);
     let budget = TOKEN_BUDGET.is_match(text);
-    let token_overflow = !throttled && (OVERFLOW.is_match(text) || (budget && !per_minute));
+    let token_overflow = !throttled
+        && (OVERFLOW.is_match(text) || MEMORY_OVERFLOW.is_match(text) || (budget && !per_minute));
     if token_overflow {
         return ErrorClass::ContextOverflow;
     }
@@ -412,9 +422,20 @@ static OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)this model's maximum context length", // OpenAI / Mistral / DeepSeek
         r"(?i)prompt too long; exceeded (max )?context length", // Mistral
         r"(?i)input validation error.*(inputs|tokens).*must be <=", // TGI
+    ])
+});
+
+/// Local servers that ran out of memory for this prompt: a smaller (compacted) prompt needs less
+/// prefill memory, so these recover as overflows, and the served window is not a usable ceiling.
+static MEMORY_OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
+    set(&[
         // oMLX refuses a prompt whose prefill would exceed its memory ceiling and names context
-        // reduction as the fix; a smaller (compacted) prompt needs less prefill memory.
+        // reduction as the fix.
         r"(?i)prefill memory guard rejected this prompt",
+        // MLX engines (LM Studio) run out of Metal memory evaluating the prompt cache during
+        // prefill: the GPU command-buffer failure, not a model-load error.
+        r"(?i)\[METAL\] Command buffer execution failed: Insufficient Memory",
+        r"(?i)kIOGPUCommandBufferCallbackErrorOutOfMemory",
     ])
 });
 

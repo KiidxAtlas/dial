@@ -202,7 +202,7 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
     let configurations = assist_configurations(&Config::default(), "openai", "model");
     let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names[..2], ["raw", "dial"]);
-    assert_eq!(names.len(), 5 + ASSIST_VARIANTS.len() + 7);
+    assert_eq!(names.len(), 5 + ASSIST_VARIANTS.len() + 8);
     assert_eq!(configurations[1].assistance.lean_local, Some(LeanLocal::On));
     let sections = |c: &MachineConfiguration| json!({"assistance": c.assistance, "policy": c.policy, "experimental": c.experimental, "efficiency": c.efficiency});
     let dial = sections(&configurations[1]);
@@ -222,6 +222,29 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
         assert_eq!(
             changed, 1,
             "{} must change exactly one feature",
+            variant.name
+        );
+    }
+}
+
+/// An experiment row that sets a switch to its shipped default measures nothing: each row must
+/// change the effective experimental settings of a shipped config.
+#[test]
+fn experiment_variants_change_the_shipped_experimental_settings() {
+    let shipped = Config::default();
+    let baseline = serde_json::to_value(shipped.experimental).unwrap();
+    let rows: Vec<_> = assist_configurations(&shipped, "openai", "model")
+        .into_iter()
+        .filter(|c| c.experimental != ExperimentalOverrides::default())
+        .collect();
+    assert_eq!(rows.len(), 8);
+    for variant in rows {
+        let mut config = shipped.clone();
+        apply_experimental(&mut config, &variant.experimental);
+        assert_ne!(
+            serde_json::to_value(config.experimental).unwrap(),
+            baseline,
+            "{} must change a shipped experimental setting",
             variant.name
         );
     }

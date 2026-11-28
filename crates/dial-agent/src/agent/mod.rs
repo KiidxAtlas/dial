@@ -138,6 +138,7 @@ struct PromptParts {
     soul: Option<String>,
     overrides: (Option<String>, Option<String>),
     context: Vec<window::context::ContextFile>,
+    workspace_map: String,
     skills: String,
     memory: String,
     system_template: Option<window::prompt_template::Template>,
@@ -390,6 +391,10 @@ pub struct Agent<'a> {
     role_backends: BTreeMap<String, Backend>,
     /// Context the serving endpoint reports as currently loaded; may be far below the configured window.
     context_cap: Option<u32>,
+    /// Prompt ceiling learned when the local server ran out of memory prefilling a request (Metal
+    /// OOM, oMLX guard): the loaded window overstates what this machine can serve. Cleared with
+    /// `context_cap` whenever the route or model changes.
+    memory_ceiling: Option<u32>,
     /// The configured route's backend-bound state: fallback cooldown and the primary's loaded cap.
     route: model::route::ActiveRoute,
     layout: Option<Layout>,
@@ -418,6 +423,7 @@ pub struct Agent<'a> {
     memory: Option<Arc<ProvenanceMemory>>,
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
     codebase: Option<Arc<Codebase>>,
+    guardrails: memory::knowledge::GuardrailState,
     /// Per-turn code diffs searchable across sessions (`code_history`); `None` when disabled.
     history: Option<Arc<crate::tools::knowledge::history::ChangeHistory>>,
     experience: Option<Arc<crate::storage::experience::Experience>>,
@@ -453,6 +459,8 @@ pub struct Agent<'a> {
     active_side_namespace: Option<String>,
     context_rule_catalog: Option<Arc<safety::rules::Catalog>>,
     interrupt: Arc<AtomicBool>,
+    /// User-triggered mid-thought steering: cancels active reasoning and retries at minimal effort.
+    wrap_up_thinking: Arc<AtomicBool>,
     hermetic: bool,
     /// Overrides the trajectory domain (self-play records as `selfplay:<family>`).
     domain_override: Option<String>,

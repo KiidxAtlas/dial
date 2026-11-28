@@ -46,11 +46,20 @@ if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/n
     use_gh=true
 fi
 required_tools='tar install mktemp'
-if [ "$use_gh" = false ]; then required_tools="$required_tools curl"; fi
 for tool in $required_tools; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Missing required tool: $tool" >&2; exit 1; }
 done
-
+http_tool=
+if [ "$use_gh" = false ]; then
+    if command -v curl >/dev/null 2>&1; then
+        http_tool=curl
+    elif command -v wget >/dev/null 2>&1; then
+        http_tool=wget
+    else
+        echo 'Missing required tool: curl or wget' >&2
+        exit 1
+    fi
+fi
 # SHA256SUMS is signed with the release Ed25519 key. Verifiers, in order of preference:
 #   1. OpenSSH `ssh-keygen -Y verify` (OpenSSH 8.1+) over SHA256SUMS.sshsig. It ships with
 #      macOS and nearly every Linux, so most installs need nothing extra.
@@ -111,9 +120,13 @@ repository=https://github.com/KiidxAtlas/dial
 if [ "$version" = latest ]; then
     if [ "$use_gh" = true ]; then
         version=$(gh release view --repo KiidxAtlas/dial --json tagName --jq .tagName)
-    else
+    elif [ "$http_tool" = curl ]; then
         release_url=$(curl --fail --silent --show-error --location --retry 2 \
             --output /dev/null --write-out '%{url_effective}' "$repository/releases/latest")
+        version=${release_url##*/}
+    else
+        release_url=$(wget -q --https-only --spider --max-redirect=10 -S "$repository/releases/latest" 2>&1 \
+            | awk '/^[[:space:]]*[Ll]ocation:[[:space:]]*/ { loc=$2 } END { gsub(/\r/, "", loc); print loc }')
         version=${release_url##*/}
     fi
 fi
@@ -145,8 +158,10 @@ trap 'exit 143' TERM
 fetch() {
     if [ "$use_gh" = true ]; then
         gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" --pattern "$1" >/dev/null 2>&1
-    else
+    elif [ "$http_tool" = curl ]; then
         curl --fail --silent --show-error --location --retry 2 "$base/$1" --output "$scratch/$1" 2>/dev/null
+    else
+        wget -q --https-only --tries=2 -O "$scratch/$1" "$base/$1" 2>/dev/null
     fi
 }
 for asset in "$archive" SHA256SUMS; do

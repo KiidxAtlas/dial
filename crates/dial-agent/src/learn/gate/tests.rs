@@ -1239,3 +1239,66 @@ fn tiny_suites_cannot_pass_the_statistical_gate() {
         report.reason
     );
 }
+
+#[test]
+fn practical_guard_mode_passes_clean_small_guard_while_strict_rejects_unproven() {
+    assert_eq!(GuardMode::parse("auto"), GuardMode::Auto);
+    assert_eq!(GuardMode::parse("practical"), GuardMode::Practical);
+    assert_eq!(GuardMode::parse("strict"), GuardMode::Strict);
+    assert_eq!(GuardMode::parse("unknown"), GuardMode::Auto);
+
+    let (baseline, candidate) = versions();
+    // Primary: 5 candidate-only wins (significant at alpha 0.1). Guard: identical, 20 cases.
+    let suites = [suite("primary", true, 20), suite("guard", false, 20)];
+    let (strict_report, strict_outcome) = evaluate_outcome_with_guard(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        GuardMode::Strict,
+        &|| false,
+        runner(10, 15, "primary"),
+    )
+    .unwrap();
+    assert!(!strict_report.passed);
+    assert_eq!(strict_outcome, Outcome::Unproven);
+
+    let (practical_report, practical_outcome) = evaluate_outcome_with_guard(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        GuardMode::Practical,
+        &|| false,
+        runner(10, 15, "primary"),
+    )
+    .unwrap();
+    assert!(practical_report.passed, "{}", practical_report.reason);
+    assert_eq!(practical_outcome, Outcome::Accepted);
+
+    // Practical mode still rejects a real point regression exceeding max_regression (1.0 pt).
+    let (regressed_report, regressed_outcome) = evaluate_outcome_with_guard(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        GuardMode::Practical,
+        &|| false,
+        |v, case| {
+            if let Some(idx) = case
+                .id
+                .strip_prefix("primary")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                let limit = if v.id == 1 { 10 } else { 15 };
+                return Ok(idx < limit);
+            }
+            // Guard: candidate drops 1 of 20 cases (5.0 percentage points > 1.0 tolerance).
+            let idx: usize = case.id.strip_prefix("guard").unwrap().parse().unwrap();
+            Ok(v.id == 1 || idx > 0)
+        },
+    )
+    .unwrap();
+    assert!(!regressed_report.passed);
+    assert_eq!(regressed_outcome, Outcome::Regressed);
+}

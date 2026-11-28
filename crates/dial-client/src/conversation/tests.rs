@@ -861,3 +861,29 @@ fn harness_written_user_records_never_show_as_the_users_words() {
     let harness: Vec<bool> = messages.iter().map(is_harness_message).collect();
     assert_eq!(harness, [true, true, true, true, true, true, false]);
 }
+
+#[test]
+fn a_stop_announced_as_a_notice_shows_once_as_the_reply() {
+    let mut view = Conversation::new();
+    view.push_user("try again", 0);
+    let stop = "Stopped: the request is too large.";
+    view.apply(&event(
+        json!({"event":"notice","kind":"recovery","message":"compacting and retrying"}),
+    ));
+    view.apply(&event(json!({"event":"notice","message":stop})));
+    view.apply(&response("send", json!({"text":stop})));
+    let copies = view
+        .entries()
+        .iter()
+        .filter(|entry| match entry {
+            Entry::Notice(n) => n.message == stop,
+            Entry::Assistant(a) => a.text == stop,
+            _ => false,
+        })
+        .count();
+    assert_eq!(copies, 1, "{:?}", view.entries());
+    assert!(matches!(view.entries().last(), Some(Entry::Assistant(a)) if a.text == stop));
+    assert!(
+        matches!(&view.entries()[1], Entry::Notice(n) if n.message == "compacting and retrying")
+    );
+}

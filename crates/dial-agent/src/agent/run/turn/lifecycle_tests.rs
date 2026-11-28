@@ -257,6 +257,8 @@ timeout_secs=5
 [verification.inputs.'delivery']
 paths=['payload.txt']
 environment=[]
+[assistance]
+lean_local=false
 "#,
         |agent| {
             connect(agent, &server.url);

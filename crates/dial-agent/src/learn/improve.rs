@@ -445,11 +445,13 @@ fn evaluate_candidate(
     let total = suites.iter().map(|suite| suite.cases.len()).sum::<usize>() * 2;
     let mut checked = 0;
     let stop = || super::auto::check_stop(config).is_err();
-    let judged = gate::evaluate_outcome(
+    let guard_mode = gate::GuardMode::parse(&config.improve.gate_mode);
+    let judged = gate::evaluate_outcome_with_guard(
         &eval.rules,
         &suites,
         baseline,
         candidate,
+        guard_mode,
         &stop,
         |v, case| {
             progress(&format!(
@@ -1144,9 +1146,11 @@ fn lora_candidate(
         } else {
             &[]
         },
+        t.max_train_examples as usize,
+        t.max_replay_examples as usize,
     )?;
     let prefix_digest = training_prefix_digest(&train_path, watermark)?;
-    let valid_lines = bounded_validation_records(&valid_path)?;
+    let valid_lines = bounded_validation_records(&valid_path, t.max_valid_examples as usize)?;
     let minimum = min_examples(config);
     if train_lines.len() < minimum || valid_lines.len() < t.batch_size as usize {
         return Ok(Err(format!(
@@ -1166,8 +1170,8 @@ fn lora_candidate(
     let mut cfg = config.clone();
     cfg.training.train_data = train_temp.clone();
     cfg.training.valid_data = valid_temp;
-    cfg.training.iters = cfg.training.iters.min(32);
-    cfg.training.rank = (t.rank << level).min(64);
+    cfg.training.iters = t.iters;
+    cfg.training.rank = (t.rank << level).min(128);
     if let Some(adapter) = active.adapter.as_ref() {
         let metadata: Value =
             serde_json::from_slice(&fs::read(adapter.join("adapter_config.json"))?)
@@ -1175,23 +1179,39 @@ fn lora_candidate(
         let expected_model = caps["resolved_model"]
             .as_str()
             .unwrap_or(config.model.as_str());
-        ensure!(
-            metadata["model"].as_str() == Some(expected_model)
-                && metadata["fine_tune_type"] == "lora",
-            "active adapter metadata does not match model; refusing incremental training"
-        );
-        cfg.training.rank = u32::try_from(
-            metadata["lora_parameters"]["rank"]
-                .as_u64()
-                .context("active adapter rank metadata missing")?,
-        )
-        .context("active adapter rank metadata out of range")?;
-        cfg.training.num_layers = u32::try_from(
-            metadata["num_layers"]
-                .as_u64()
-                .context("active adapter layer metadata missing")?,
-        )
-        .context("active adapter layer metadata out of range")?;
+        let is_peft = metadata["peft_type"].as_str() == Some("LORA");
+        if is_peft {
+            cfg.training.rank = u32::try_from(
+                metadata["r"]
+                    .as_u64()
+                    .context("active PEFT adapter rank metadata missing")?,
+            )
+            .context("active PEFT adapter rank metadata out of range")?;
+            if metadata["use_dora"].as_bool() == Some(true) {
+                cfg.training.fine_tune_type = "dora".into();
+            } else {
+                cfg.training.fine_tune_type = "lora".into();
+            }
+        } else {
+            let ft = metadata["fine_tune_type"].as_str().unwrap_or("");
+            ensure!(
+                metadata["model"].as_str() == Some(expected_model) && matches!(ft, "lora" | "dora"),
+                "active adapter metadata does not match model; refusing incremental training"
+            );
+            cfg.training.fine_tune_type = ft.to_owned();
+            cfg.training.rank = u32::try_from(
+                metadata["lora_parameters"]["rank"]
+                    .as_u64()
+                    .context("active adapter rank metadata missing")?,
+            )
+            .context("active adapter rank metadata out of range")?;
+            cfg.training.num_layers = u32::try_from(
+                metadata["num_layers"]
+                    .as_u64()
+                    .context("active adapter layer metadata missing")?,
+            )
+            .context("active adapter layer metadata out of range")?;
+        }
         ensure!(
             cfg.training.rank > 0 && cfg.training.num_layers > 0,
             "active adapter rank/layer metadata invalid"
@@ -1248,10 +1268,11 @@ fn lora_candidate(
         &format!("adapter_digest:{}", candidate.id),
         &adapter_digest(&adapter)?,
     )?;
+    let replay_cap = t.max_replay_examples as usize;
     let replay = train_lines
         .iter()
         .rev()
-        .take(16)
+        .take(replay_cap)
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()
@@ -1670,10 +1691,12 @@ fn bounded_training_records(
     path: &Path,
     cursor: u64,
     replay: &[String],
+    max_delta: usize,
+    max_replay: usize,
 ) -> Result<(Vec<String>, u64)> {
     let length = fs::metadata(path)?.len();
     if cursor > length {
-        return bounded_training_records(path, 0, replay);
+        return bounded_training_records(path, 0, replay, max_delta, max_replay);
     }
     if cursor > 0 {
         let mut file = fs::File::open(path)?;
@@ -1689,7 +1712,12 @@ fn bounded_training_records(
     reader.seek(SeekFrom::Start(cursor))?;
     let mut offset = cursor;
     let mut delta = Vec::new();
-    while delta.len() < 32 {
+    let delta_limit = if max_delta == 0 {
+        usize::MAX
+    } else {
+        max_delta
+    };
+    while delta.len() < delta_limit {
         let line_start = reader.stream_position()?;
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -1709,16 +1737,23 @@ fn bounded_training_records(
             delta.push(line);
         }
     }
-    let mut rows: Vec<String> = replay.iter().take(16).cloned().collect();
+    let mut rows: Vec<String> = replay.iter().take(max_replay).cloned().collect();
     rows.extend(delta);
-    rows.truncate(48);
+    if max_delta > 0 {
+        rows.truncate(max_delta.saturating_add(max_replay));
+    }
     Ok((rows, offset))
 }
 
-fn bounded_validation_records(path: &Path) -> Result<Vec<String>> {
+fn bounded_validation_records(path: &Path, max_valid: usize) -> Result<Vec<String>> {
     let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut records = Vec::with_capacity(32);
-    while records.len() < 32 {
+    let limit = if max_valid == 0 {
+        usize::MAX
+    } else {
+        max_valid
+    };
+    let mut records = Vec::with_capacity(limit.min(256));
+    while records.len() < limit {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
             break;
@@ -2432,8 +2467,8 @@ pub fn apply(
     validate_proposal(config, &active, proposal)?;
     verify_adapter(store, &active)?;
     let eval = build_evaluation(config, store)?;
-    let (candidate, pending) = match proposal.operation.as_str() {
-        "harness" => (
+    let candidates: Vec<(Version, Option<TrainingState>)> = match proposal.operation.as_str() {
+        "harness" => vec![(
             store.candidate(
                 active.id,
                 "harness",
@@ -2441,38 +2476,77 @@ pub fn apply(
                 active.adapter.as_deref(),
             )?,
             None,
-        ),
+        )],
         _ => {
             harvest::harvest(config, store, &eval.held_out)?;
-            match lora_candidate(runtime, config, store, &active, &eval, progress)? {
-                Ok(v) => (v.version, Some(v.commit)),
+            let lora = match lora_candidate(runtime, config, store, &active, &eval, progress)? {
+                Ok(v) => v,
                 Err(why) => bail!("{why}"),
+            };
+            let trained_id = lora.version.id;
+            let mut steps = Vec::new();
+            let screened = screen_weights(
+                runtime,
+                config,
+                store,
+                &active,
+                Some(lora),
+                2,
+                &mut steps,
+                progress,
+            )?;
+            if screened.is_empty() {
+                let reason = steps
+                    .iter()
+                    .rev()
+                    .find_map(|s| s["data"]["reason"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "prescreen rejected all weight candidates".into());
+                return Ok(Admission {
+                    candidate: trained_id,
+                    baseline: active.id,
+                    passed: false,
+                    reason,
+                    scores: vec![],
+                });
             }
+            screened
+                .into_iter()
+                .map(|(_, version, pending)| (version, pending))
+                .collect()
         }
     };
     let mut cache = Cache::new();
-    let admission = match evaluate_candidate(
-        runtime,
-        EvaluationContext {
-            config,
-            store,
-            eval: &eval,
-        },
-        &mut cache,
-        &active,
-        &candidate,
-        progress,
-    ) {
-        Ok(judgment) => judgment.admission,
-        Err(error) => {
-            let rejected = evaluation_failure(config, &active, &candidate, error)?;
-            store.admit(&rejected)?;
-            return Ok(rejected);
+    let mut last_admission = None;
+    for (candidate, pending) in candidates {
+        let admission = match evaluate_candidate(
+            runtime,
+            EvaluationContext {
+                config,
+                store,
+                eval: &eval,
+            },
+            &mut cache,
+            &active,
+            &candidate,
+            progress,
+        ) {
+            Ok(judgment) => judgment.admission,
+            Err(error) => {
+                let rejected = evaluation_failure(config, &active, &candidate, error)?;
+                store.admit(&rejected)?;
+                last_admission = Some(rejected);
+                continue;
+            }
+        };
+        super::auto::check_stop(config)?;
+        store.admit_with_training(&admission, pending.as_ref())?;
+        let passed = admission.passed;
+        last_admission = Some(admission);
+        if passed {
+            break;
         }
-    };
-    super::auto::check_stop(config)?;
-    store.admit_with_training(&admission, pending.as_ref())?;
-    Ok(admission)
+    }
+    last_admission.context("no candidate was evaluated")
 }
 
 /// A stop is not an evaluation verdict: preserve pending candidates on every admission path.
@@ -2555,7 +2629,14 @@ pub fn verify_adapter(store: &Store, version: &Version) -> Result<()> {
 
 pub(crate) fn adapter_digest(path: &Path) -> Result<String> {
     let mut digest = Sha256::new();
-    for name in ["adapter_config.json", "adapters.safetensors"] {
+    let weights_name = if path.join("adapters.safetensors").exists() {
+        "adapters.safetensors"
+    } else if path.join("adapter_model.safetensors").exists() {
+        "adapter_model.safetensors"
+    } else {
+        "adapters.safetensors"
+    };
+    for name in ["adapter_config.json", weights_name] {
         let file = path.join(name);
         ensure!(
             fs::symlink_metadata(&file)?.file_type().is_file(),

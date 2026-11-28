@@ -134,10 +134,84 @@ fn an_overflow_that_compaction_cannot_fix_stops_the_turn_instead_of_failing_it()
     let report = result.expect("a context overflow must end the turn gracefully, not as an error");
     assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert!(
-        report.text.contains("compaction could not make room"),
-        "{}",
+        report.text.contains("no earlier conversation to compact")
+            && report.text.contains("maximum context length is 8192"),
+        "a single message cannot be compacted; the stop names the provider's limit: {}",
         report.text
     );
+}
+
+#[test]
+fn local_stream_replays_reasoning_and_matching_read_result() {
+    let first = [
+        json!({"choices":[{"delta":{"reasoning_content":"Need to read the value first."},"finish_reason":null}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read-value","type":"function","function":{"name":"read","arguments":"{\"path\":\"value.txt\"}"}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    let stream = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        first[0], first[1]
+    );
+    let server = llm::fake::serve(vec![
+        llm::fake::Script::Sse(stream),
+        slots(),
+        response("The value is violet-731.", None),
+    ]);
+    with_agent(
+        "[compaction]\nenabled=false\n[harness]\ntools=['read']\n",
+        |agent| {
+            connect(agent, &server.url);
+            std::fs::write(agent.workspace.root().join("value.txt"), "violet-731\n").unwrap();
+            let report = agent
+                .turn("Read value.txt and report its value.", &mut NullUi)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert_eq!(report.text, "The value is violet-731.");
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    assert!(!mentions(&requests[0], "violet-731"));
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let pair = messages
+        .windows(2)
+        .find(|pair| pair[0]["tool_calls"][0]["id"] == "read-value")
+        .unwrap();
+    assert_eq!(pair[0]["role"], "assistant");
+    assert_eq!(
+        pair[0]["reasoning_content"],
+        "Need to read the value first."
+    );
+    assert_eq!(pair[1]["role"], "tool");
+    assert_eq!(pair[1]["tool_call_id"], "read-value");
+    assert!(pair[1]["content"].as_str().unwrap().contains("violet-731"));
+}
+
+#[test]
+fn a_local_out_of_memory_overflow_lowers_the_planning_window() {
+    let metal = || {
+        llm::fake::json(
+            500,
+            &json!({"error":{"message":"Error in iterating prediction stream: RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"}}),
+        )
+    };
+    let mut scripts: Vec<_> = (0..8).map(|_| metal()).collect();
+    scripts.push(llm::fake::json(200, &json!({"total_slots":1})));
+    let server = llm::fake::serve(scripts);
+    with_agent("[retry]\nmax_attempts=1\n", |agent| {
+        connect(agent, &server.url);
+        let before = agent.context_window();
+        assert!(
+            before > 8_192,
+            "the fixture must start above the minimum window"
+        );
+        let report = agent.turn("Say done", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+        let after = agent.context_window();
+        assert!(
+            after < before && after >= 8_192,
+            "the window must drop below the served size after an out-of-memory prefill"
+        );
+    });
 }
 
 fn calls(calls: &[(&str, Value)]) -> llm::fake::Script {

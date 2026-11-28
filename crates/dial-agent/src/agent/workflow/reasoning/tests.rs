@@ -108,3 +108,42 @@ fn reasoning_recovery_is_bounded_across_causes() {
             .contains("one recovery attempt")
     );
 }
+
+#[test]
+fn reasoning_recovery_resets_after_progress_preserves_digest_and_stays_bounded() {
+    let mut recovery = Recovery::default();
+    let first = recovery
+        .intercept_with_digest(
+            "stream repeated reasoning",
+            Some("The regex alternates unparenthesized branches in Cargo.lock."),
+        )
+        .unwrap();
+    assert!(first.contains("Earlier reasoning before cutoff"));
+    assert!(first.contains("unparenthesized branches"));
+
+    // Without forward progress, a consecutive hit still stops cleanly.
+    assert!(recovery.intercept("second consecutive hit").is_err());
+
+    // Forward progress re-arms recovery for later steps, up to MAX_RECOVERIES_PER_TURN.
+    for step in 2..=MAX_RECOVERIES_PER_TURN {
+        recovery.note_progress();
+        assert!(
+            recovery.intercept(&format!("later hit {step}")).is_ok(),
+            "hit {step} after progress should recover"
+        );
+    }
+    // Once the per-turn total cap is reached, even progress cannot allow infinite loops.
+    recovery.note_progress();
+    assert!(recovery.intercept("past turn cap").is_err());
+}
+
+#[test]
+fn gate_captures_compact_sentence_bounded_prefix_digest() {
+    let mut gate = Gate::new();
+    gate.record_prefix("First, inspect Cargo.lock to find which workspace crates share version 0.4.2. Second, anchor the replacement regex on package header boundaries so third-party crates like getrandom are never matched. ");
+    gate.record_prefix(&"Repeating filler sentence over and over. ".repeat(30));
+    let digest = gate.prefix_digest().expect("digest captured");
+    assert!(digest.len() <= PREFIX_MAX_BYTES);
+    assert!(digest.contains("First, inspect Cargo.lock"));
+    assert!(digest.ends_with('.'));
+}

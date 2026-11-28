@@ -180,6 +180,8 @@ impl Agent<'_> {
         // sync, so a mid-turn fallback or promotion never replays under the old route.
         self.cache_warm = None;
         self.context_cap = context_cap;
+        // A learned memory ceiling belonged to the previous route's server and model.
+        self.memory_ceiling = None;
         self.role_backends.clear();
         self.subagent_backend = None;
         self.route.generation = self.route.generation.wrapping_add(1);

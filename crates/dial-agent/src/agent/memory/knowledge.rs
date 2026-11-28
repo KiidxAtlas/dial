@@ -1,6 +1,189 @@
 //! Laya advice, codebase context recall and architecture synthesis.
 
 use crate::agent::*;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+
+#[derive(Default)]
+pub(in crate::agent) struct GuardrailState {
+    history_generation: u64,
+    shown_invariants: BTreeSet<String>,
+    shown_dead_ends: BTreeSet<String>,
+}
+
+impl GuardrailState {
+    pub(in crate::agent) fn sync_generation(&mut self, generation: u64) {
+        if self.history_generation != generation {
+            self.history_generation = generation;
+            self.shown_invariants.clear();
+            self.shown_dead_ends.clear();
+        }
+    }
+}
+
+fn relative_workspace_path(workspace: &Workspace, raw: &str) -> Option<String> {
+    let mut candidate = raw.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    loop {
+        if let Ok(resolved) = workspace.resolve(candidate)
+            && let Ok(rel) = resolved.strip_prefix(workspace.root())
+        {
+            let rel = rel.to_string_lossy().into_owned();
+            if !rel.is_empty() {
+                return Some(rel);
+            }
+        }
+        candidate = candidate.rsplit_once(':')?.0;
+    }
+}
+
+fn extract_mutation_paths(
+    workspace: &Workspace,
+    call: &ToolCall,
+    output: &ToolOutput,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut push = |candidate: &str| {
+        if let Some(rel) = relative_workspace_path(workspace, candidate)
+            && !paths.contains(&rel)
+        {
+            paths.push(rel);
+        }
+    };
+    if let Some(path) = call.arguments["path"].as_str() {
+        push(path);
+    }
+    if let Some(files) = call.arguments["files"].as_array() {
+        for entry in files {
+            if let Some(path) = entry["path"].as_str() {
+                push(path);
+            }
+        }
+    }
+    if call.name == "edit"
+        && let Some(input) = call.arguments["input"].as_str()
+    {
+        for line in input.lines().filter(|line| line.starts_with('[')) {
+            if let Some((path, _)) = line.trim_start_matches('[').rsplit_once('#') {
+                push(path);
+            }
+        }
+    }
+    for changed in &output.execution.changed_paths {
+        if let Ok(rel) = changed.strip_prefix(workspace.root()) {
+            let rel = rel.to_string_lossy().into_owned();
+            if !rel.is_empty() && !paths.contains(&rel) {
+                paths.push(rel);
+            }
+        }
+    }
+    paths
+}
+
+struct GuardrailEvidence<'a> {
+    check_failed: bool,
+    attached_verify_failed: Option<&'a str>,
+    changed_files: &'a [String],
+    baselines: &'a BTreeMap<String, String>,
+}
+
+fn attach_guardrails_with(
+    cache: &Codebase,
+    workspace: &Workspace,
+    guardrails: &mut GuardrailState,
+    history_generation: u64,
+    call: &ToolCall,
+    output: &mut ToolOutput,
+    evidence: GuardrailEvidence<'_>,
+) -> Vec<String> {
+    let GuardrailEvidence {
+        check_failed,
+        attached_verify_failed,
+        changed_files,
+        baselines,
+    } = evidence;
+    let mut diagnostics = Vec::new();
+    guardrails.sync_generation(history_generation);
+    let mut effective = call.clone();
+    let _ = crate::agent::window::file_handles::expand(workspace, &mut effective);
+
+    // 1) Path-scoped 1-line invariants: lazily attached once per generation on file touch.
+    let invariant_paths = if effective.name == "read" && !output.is_error {
+        crate::agent::verify::caller_obligations::read_targets(workspace, &effective.arguments)
+    } else if matches!(effective.name.as_str(), "edit" | "write" | "ast_edit") {
+        extract_mutation_paths(workspace, &effective, output)
+    } else {
+        Vec::new()
+    };
+    if !invariant_paths.is_empty() {
+        let invariant_baselines = if effective.name == "read" {
+            BTreeMap::new()
+        } else {
+            baselines.clone()
+        };
+        match cache.invariants_for_paths(
+            &invariant_paths,
+            &invariant_baselines,
+            &mut guardrails.shown_invariants,
+            crate::tools::knowledge::codebase::guardrails::DEFAULT_ATTACH_BYTES,
+        ) {
+            Ok(Some(note)) => {
+                output.text.push('\n');
+                output.text.push_str(&note);
+            }
+            Ok(None) => {}
+            Err(error) => diagnostics.push(format!("codebase invariants unavailable: {error:#}")),
+        }
+    }
+
+    // 2) Failure-triggered 1-line dead ends: zero tokens on passing runs.
+    let edit_failed =
+        matches!(effective.name.as_str(), "edit" | "write" | "ast_edit") && output.is_error;
+    let verify_failed = effective.name == "verify" && output.is_error;
+    let bash_failed = effective.name == "bash"
+        && (output.is_error
+            || check_failed
+            || output.process_outcome().is_some_and(|process| {
+                process.started
+                    && (process.exit_code.is_some_and(|code| code != 0)
+                        || process.timed_out
+                        || process.signal.is_some())
+            }));
+    if edit_failed || verify_failed || bash_failed || attached_verify_failed.is_some() {
+        let mut failure_paths = extract_mutation_paths(workspace, &effective, output);
+        for path in changed_files {
+            if !failure_paths.contains(path) {
+                failure_paths.push(path.clone());
+            }
+        }
+        let failure_text = if !output.is_error
+            && let Some(text) = attached_verify_failed
+        {
+            text.to_owned()
+        } else {
+            output.text.clone()
+        };
+        match cache.dead_ends_for_failure(
+            &failure_paths,
+            &failure_text,
+            baselines,
+            &mut guardrails.shown_dead_ends,
+            crate::tools::knowledge::codebase::guardrails::DEFAULT_ATTACH_BYTES,
+        ) {
+            Ok(Some(note)) => {
+                output.text.push('\n');
+                output.text.push_str(&note);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                diagnostics.push(format!("codebase dead-end lookup unavailable: {error:#}"))
+            }
+        }
+    }
+    diagnostics
+}
 
 pub(in crate::agent) fn defer_architecture_attempt_on_failure<T>(
     cache: &Codebase,
@@ -408,7 +591,88 @@ impl<'a> Agent<'a> {
         ));
         Ok(())
     }
+
+    /// Lazily attach path-scoped 1-line invariants on file touch and failure-triggered 1-line
+    /// dead ends when an edit, verify or bash check fails.
+    pub(in crate::agent) fn attach_codebase_guardrails(
+        &mut self,
+        call: &ToolCall,
+        output: &mut ToolOutput,
+        check_failed: bool,
+        attached_verify_failed: Option<&str>,
+        observed_sources: &BTreeMap<String, Option<String>>,
+        ui: &mut dyn Ui,
+    ) {
+        if self.hermetic {
+            return;
+        }
+        let Some(cache) = self.codebase.clone() else {
+            return;
+        };
+        let is_read = call.name == "read" && !output.is_error;
+        let is_mutation = matches!(call.name.as_str(), "edit" | "write" | "ast_edit");
+        let is_failure = (is_mutation && output.is_error)
+            || (call.name == "verify" && output.is_error)
+            || (call.name == "bash"
+                && (output.is_error
+                    || check_failed
+                    || output.process_outcome().is_some_and(|process| {
+                        process.started
+                            && (process.exit_code.is_some_and(|code| code != 0)
+                                || process.timed_out
+                                || process.signal.is_some())
+                    })))
+            || attached_verify_failed.is_some();
+        if !is_read && !is_mutation && !is_failure {
+            return;
+        }
+        let mut changed_files = Vec::new();
+        let mut baselines = BTreeMap::new();
+        if is_mutation || is_failure {
+            for (path, hash) in observed_sources {
+                if let Some(digest) = hash {
+                    baselines.insert(path.clone(), digest.clone());
+                }
+            }
+            if let (Some(turn), Some(checkpoints)) =
+                (self.step_checks.turn, self.checkpoints.as_ref())
+            {
+                changed_files = checkpoints.changed_files(turn);
+                if let Ok(versions) = checkpoints.turn_versions(turn) {
+                    for version in versions {
+                        if version.in_project
+                            && let Some(before) = &version.before
+                        {
+                            baselines
+                                .entry(version.path)
+                                .or_insert_with(|| format!("{:x}", Sha256::digest(before)));
+                        }
+                    }
+                }
+            }
+        }
+        let generation = self.session.context_history_generation();
+        let diagnostics = attach_guardrails_with(
+            &cache,
+            &self.workspace,
+            &mut self.guardrails,
+            generation,
+            call,
+            output,
+            GuardrailEvidence {
+                check_failed,
+                attached_verify_failed,
+                changed_files: &changed_files,
+                baselines: &baselines,
+            },
+        );
+        for diagnostic in diagnostics {
+            ui.diagnostic(&diagnostic);
+        }
+    }
 }
 
 #[cfg(test)]
 mod architecture_retry_tests;
+#[cfg(test)]
+mod guardrail_tests;

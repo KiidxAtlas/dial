@@ -454,12 +454,126 @@ pub const RECIPES: &[Recipe] = &[
         program: "mlx-serve",
         base: Base::Install,
         artifact: "mlx-serve",
-        // Runs MLX image packs on Apple Silicon. Its Homebrew formula needs a third-party tap, so
-        // Dial installs the pinned release archive (macOS arm64 only).
+        // Runs MLX chat models and image packs on Apple Silicon. Its Homebrew formula needs a
+        // third-party tap, so Dial installs the pinned release archive (macOS arm64 only).
         methods: &[
             Method::Download(prebuilt::MLX_SERVE),
             Method::Manual(
                 "install MLX-Serve from https://github.com/ddalcu/mlx-serve/releases (macOS on Apple Silicon) and set DIAL_MLX_SERVE to its mlx-serve",
+            ),
+        ],
+    },
+    Recipe {
+        id: "vllm-mlx",
+        title: "vLLM-MLX (vllm-mlx)",
+        requires: &["uv"],
+        program: "vllm-mlx",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "Scripts/vllm-mlx.exe"
+        } else {
+            "bin/vllm-mlx"
+        },
+        methods: &[
+            Method::Uv("vllm-mlx"),
+            Method::Manual(
+                "install vllm-mlx on Apple Silicon (`uv tool install vllm-mlx`) and set DIAL_VLLM_MLX_SERVER",
+            ),
+        ],
+    },
+    Recipe {
+        id: "mistral-rs",
+        title: "mistral.rs (mistralrs-server)",
+        requires: &[],
+        program: "mistralrs-server",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "mistralrs-server.exe"
+        } else {
+            "mistralrs-server"
+        },
+        methods: &[
+            Method::Brew("mistral.rs"),
+            Method::Manual(
+                "install mistralrs-server via `cargo install mistralrs-server` or https://github.com/EricLBuehler/mistral.rs/releases and set DIAL_MISTRALRS_SERVER",
+            ),
+        ],
+    },
+    Recipe {
+        id: "ik-llama",
+        title: "ik_llama.cpp (ik-llama-server)",
+        requires: &[],
+        program: "ik-llama-server",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "ik-llama-server.exe"
+        } else {
+            "ik-llama-server"
+        },
+        methods: &[Method::Manual(
+            "select ik_llama.cpp in Dial Desktop to download and build it into ~/.dial/tools/ik-llama, or build https://github.com/ikawrakow/ik_llama.cpp and set DIAL_IK_LLAMA_SERVER",
+        )],
+    },
+    Recipe {
+        id: "atomic-engine",
+        title: "Atomic Engine (atomic-llama-server)",
+        requires: &[],
+        program: "atomic-llama-server",
+        base: Base::Install,
+        artifact: "atomic-llama-server",
+        methods: &[Method::Manual(
+            "select Atomic Engine in Dial Desktop's model picker to download and build it on Apple Silicon, or set DIAL_ATOMIC_SERVER",
+        )],
+    },
+    Recipe {
+        id: "vllm",
+        title: "vLLM (vllm)",
+        requires: &["uv"],
+        program: "vllm",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "Scripts/vllm.exe"
+        } else {
+            "bin/vllm"
+        },
+        methods: &[
+            Method::Uv("vllm"),
+            Method::Manual("install vLLM on Linux (https://docs.vllm.ai) and set DIAL_VLLM_SERVER"),
+        ],
+    },
+    Recipe {
+        id: "sglang",
+        title: "SGLang (sglang)",
+        requires: &["uv"],
+        program: "sglang",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "Scripts/sglang.exe"
+        } else {
+            "bin/sglang"
+        },
+        methods: &[
+            Method::Uv("sglang"),
+            Method::Manual(
+                "install SGLang on Linux (https://docs.sglang.ai) and set DIAL_SGLANG_SERVER",
+            ),
+        ],
+    },
+    Recipe {
+        id: "exl3",
+        title: "ExLlamaV3 (exllamav3-server)",
+        requires: &["uv"],
+        program: "exllamav3-server",
+        base: Base::Install,
+        artifact: if cfg!(windows) {
+            "Scripts/exllamav3-server.exe"
+        } else {
+            "bin/exllamav3-server"
+        },
+        methods: &[
+            Method::Uv("exllamav3"),
+            Method::Manual(
+                "install ExLlamaV3 / TabbyAPI on an NVIDIA CUDA host and set DIAL_EXL3_SERVER",
             ),
         ],
     },

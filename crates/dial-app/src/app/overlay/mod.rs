@@ -94,6 +94,8 @@ pub(super) enum Which {
     Git {
         root: std::path::PathBuf,
         revision: String,
+        /// `/git repo <folder>`: a nested repository of the project, chosen by the user.
+        folder: Option<String>,
     },
 }
 

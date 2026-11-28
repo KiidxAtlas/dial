@@ -252,10 +252,37 @@ pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
             model.default_effort,
         ),
         (None, None) => {
-            let Some(declared) = declared else {
+            if let Some(declared) = declared {
+                (declared.mode, declared.efforts(), Default::default(), None)
+            } else if config.local_main_model() {
+                let base_url = config.endpoint.as_ref().map(|e| e.base_url.as_str());
+                let token = config.endpoint.as_ref().and_then(|endpoint| {
+                    crate::llm::catalog::resolve_credential(
+                        &config.user_dir,
+                        &endpoint.base_url,
+                        endpoint.api_key_env.as_deref(),
+                    )
+                    .ok()
+                    .flatten()
+                });
+                let facts = crate::llm::local_server::facts(
+                    &selection.provider,
+                    &selection.model,
+                    base_url,
+                    token.as_deref(),
+                    config.request_headers(),
+                );
+                let efforts = facts
+                    .effort_caps
+                    .map(|caps| caps.to_reasoning_efforts())
+                    .unwrap_or_default();
+                if efforts.is_empty() {
+                    return Ok(None);
+                }
+                (ThinkingMode::Effort, efforts, Default::default(), None)
+            } else {
                 return Ok(None);
-            };
-            (declared.mode, declared.efforts(), Default::default(), None)
+            }
         }
     };
     let reasoning = match mode {

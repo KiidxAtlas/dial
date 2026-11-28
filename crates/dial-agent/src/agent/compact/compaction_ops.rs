@@ -102,6 +102,21 @@ impl<'a> Agent<'a> {
                 .cloned(),
         );
         let mut policy = self.config.compaction.clone();
+        // On local routes, try zero-inference deterministic fast-compaction (`Shake`) first when
+        // the operator has not customized `method_order`, avoiding a multi-minute local summary
+        // stall whenever older archived tool outputs or reasoning can be shed cleanly.
+        if self.local_profile_active()
+            && !self.hermetic
+            && policy.method_order
+                == crate::config::compaction::CompactionConfig::default().method_order
+        {
+            policy.method_order = vec![
+                crate::config::compaction::CompactionMethod::Shake,
+                crate::config::compaction::CompactionMethod::Remote,
+                crate::config::compaction::CompactionMethod::Soft,
+                crate::config::compaction::CompactionMethod::Snapcompact,
+            ];
+        }
         if let Some((authority, advice)) = &self.memory_controller.compaction_advice
             && memory_authority_matches(&self.session, authority, 0)
         {

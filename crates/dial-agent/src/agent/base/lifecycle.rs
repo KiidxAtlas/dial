@@ -360,6 +360,7 @@ impl<'a> Agent<'a> {
                 &config.foreign_sources,
                 &config.context_files.extra,
             ),
+            workspace_map: crate::agent::window::prompt::compact_workspace_map(workspace.root()),
             skills: skills::catalog_block(&skills),
             // Standing memory guidance and auto-learn guidance; children receive the same text in `child.rs`.
             memory: [
@@ -422,12 +423,14 @@ impl<'a> Agent<'a> {
             memory,
             memory_runtime,
             codebase,
+            guardrails: Default::default(),
             history,
             checkpoints: Some(checkpoints),
             store,
             approval: config.approval,
             always,
             interrupt,
+            wrap_up_thinking: Arc::new(AtomicBool::new(false)),
             plan_mode: false,
             session_cost: None,
             tan_jobs: modes::tan::Jobs::default(),
@@ -467,6 +470,7 @@ impl<'a> Agent<'a> {
             subagent_backend,
             role_backends: BTreeMap::new(),
             context_cap: None,
+            memory_ceiling: None,
             route: Default::default(),
             enabled_tools: HashSet::new(),
             tool_routing: Default::default(),
@@ -581,6 +585,7 @@ impl<'a> Agent<'a> {
             todo: TodoList::default(),
             memory: None,
             codebase: None,
+            guardrails: Default::default(),
             history: None,
             memory_runtime: None,
             checkpoints: None,
@@ -602,6 +607,7 @@ impl<'a> Agent<'a> {
             active_side_namespace: None,
             context_rule_catalog: None,
             interrupt: Arc::new(AtomicBool::new(false)),
+            wrap_up_thinking: Arc::new(AtomicBool::new(false)),
             hermetic: true,
             domain_override: domain,
             trajectory: None,
@@ -643,6 +649,7 @@ impl<'a> Agent<'a> {
                 soul: None,
                 overrides: (None, None),
                 context: Vec::new(),
+                workspace_map: String::new(),
                 skills: String::new(),
                 memory: String::new(),
                 system_template: None,
@@ -651,6 +658,7 @@ impl<'a> Agent<'a> {
             subagent_backend: None,
             role_backends: BTreeMap::new(),
             context_cap: None,
+            memory_ceiling: None,
             route: Default::default(),
             enabled_tools: HashSet::new(),
             tool_routing: Default::default(),
@@ -784,14 +792,24 @@ impl<'a> Agent<'a> {
                     if !self.hermetic && self.tool_eligible("bash") {
                         runtimes
                             .push_str(&tools::exec::shell::interpreter_guidance(&self.workspace));
-                        runtimes.push_str(&tools::fs::system::session_inventory().compact());
+                        if !lean {
+                            runtimes.push_str(&tools::fs::system::session_inventory().compact());
+                        }
                     }
+                    if !self.hermetic
+                        && lean
+                        && !self.lean_tools
+                        && !self.parts.workspace_map.is_empty()
+                    {
+                        runtimes.push_str(&self.parts.workspace_map);
+                    }
+                    let eval_in_policy = policy_tools.iter().any(|tool| tool == "eval");
                     if !self.hermetic && self.tool_eligible("eval") {
                         runtimes.push_str(&tools::exec::eval::runtime_guidance(
                             self.workspace.root(),
                             self.config,
                         ));
-                        if self.config.eval.portable_helpers {
+                        if eval_in_policy && self.config.eval.portable_helpers {
                             runtimes.push_str("- Counterexample search in eval: `dial.search(prop, {gen})` and `dial.compare(f, g, {gen})` try edge cases and seeded random inputs from `dial.gen` (int, float, string, array, tuple, record, pick, oneOf, bool) and shrink a failure; compare a tricky implementation (a regex, a parser) against a plain reference.\n");
                         }
                     }

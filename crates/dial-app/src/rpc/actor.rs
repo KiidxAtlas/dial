@@ -96,6 +96,7 @@ pub(super) struct Actor {
     pub control_tx: mpsc::SyncSender<Controls>,
     pub worker_out: Sender,
     pub flag: Arc<AtomicBool>,
+    pub wrap_up: Arc<AtomicBool>,
     pub active: Arc<AtomicBool>,
     pub worker_closing: Arc<AtomicBool>,
     pub worker_prompt_queued: Arc<AtomicBool>,
@@ -203,6 +204,7 @@ impl Actor {
             admin_layout,
             sides,
             peers,
+            wrap_up,
         } = self;
         run_boundary(
             |in_flight| -> Result<()> {
@@ -218,6 +220,7 @@ impl Actor {
                     interrupt: flag.clone(),
                     input_disconnected: worker_disconnected,
                     steering: queue,
+                    active: active.clone(),
                     prompt_queued: worker_prompt_queued.clone(),
                     next: 0,
                     node_cursors: Default::default(),
@@ -273,6 +276,7 @@ impl Actor {
                         flag.clone(),
                     )?;
                     agent.set_launch(launch.clone())?;
+                    agent.set_wrap_up_flag(wrap_up.clone());
                     if acp {
                         // Bridged only for what the client advertises at `initialize` (checked per call).
                         agent
@@ -894,7 +898,8 @@ impl ActorRuntime<'_> {
     fn idle_tick(&mut self) -> Result<()> {
         self.agent.pump_subagents(&mut self.ui);
         if self.current && !crate::collab::room::is_guest() {
-            let queued = self.worker_prompt_queued.load(Ordering::SeqCst);
+            let queued = self.worker_prompt_queued.load(Ordering::SeqCst)
+                || self.active.load(Ordering::SeqCst);
             let foreground =
                 self.config.compute_locks && self.agent.foreground_idle_pending(queued)?;
             let mut ready = !foreground || self.compute.is_some();
@@ -931,6 +936,17 @@ impl ActorRuntime<'_> {
         {
             crate::learn::compute::clear_owner(&self.layout.user_dir);
             std::fs::File::unlock(&lock)?;
+        }
+        if !self.active.load(Ordering::SeqCst)
+            && self.agent.release_idle_local_models(Duration::from_secs(
+                crate::agent::Agent::LOCAL_MODEL_IDLE_UNLOAD_SECS,
+            ))
+        {
+            let _ = self.release_foreground_compute();
+            self.ui.notice(
+                "Unloaded idle local model to free memory; it will reload on your next message.",
+            );
+            self.ui.projection_dirty = true;
         }
         // Idle work (background workers, compaction) can change state without any actor
         // command. Republish the projection only when runtime or history changed.
@@ -1153,6 +1169,10 @@ impl ActorRuntime<'_> {
             "schedule_status" => maintenance::schedule_status(self.layout, params),
             "research_status" => research::inspect(&self.agent),
             "research_action" => self.research_action(params),
+            "training_status" => training::status(self.layout, self.config, params),
+            "training_action" => {
+                training::action(self.layout, self.config, self.agent.session(), params)
+            }
             "collaboration_join" => self.collaboration_join(params),
             "collaboration_start" => {
                 if self
@@ -1267,23 +1287,7 @@ impl ActorRuntime<'_> {
                     "metrics":state["metrics"]
                 }))
             }
-            "get_available_commands" => {
-                // Every discoverable slash command, with where its engine operation lives for an
-                // RPC client (`rpc`: a method, client presentation, or terminal-only and why).
-                let mut commands: Vec<Value> = crate::app::discoverable_commands()
-                    .map(|(name, usage, description)| {
-                        let rpc = super::parity::parity(name).map(super::parity::Parity::json);
-                        json!({"name":name,"usage":usage,"description":description,"kind":"builtin","rpc":rpc})
-                    })
-                    .collect();
-                // Custom and skill commands are prompt templates that `send` expands.
-                commands.extend(crate::app::prompt_commands(self.layout).into_iter().map(
-                    |(name, usage, description, kind)| {
-                        json!({"name":name,"usage":usage,"description":description,"kind":kind,"rpc":{"surface":"method","method":"send"}})
-                    },
-                ));
-                Ok(json!({"commands":commands}))
-            }
+            "get_available_commands" => Ok(super::available_commands(self.layout)),
             "list_permission_rules" => permissions::list(&self.agent, params),
             "add_permission_rule" => permissions::add(&mut self.agent, params),
             "remove_permission_rule" => permissions::remove(&mut self.agent, params),
@@ -1325,7 +1329,16 @@ impl ActorRuntime<'_> {
                 self.agent
                     .restart_managed_model()
                     .map_err(|error| coded(ErrorCode::InvalidParams, format!("{error:#}")))?;
+                self.release_foreground_compute()?;
                 Ok(json!({"restarted":true}))
+            }
+            "warm_local_model" => {
+                let warmed = self
+                    .agent
+                    .warm_local_model()
+                    .map_err(|error| coded(ErrorCode::InvalidParams, format!("{error:#}")))?;
+                self.ui.projection_dirty = true;
+                Ok(json!({"warmed": warmed, "resident": self.agent.local_model_resident()}))
             }
             "export" => self.export(params),
             "set_host_tools" => self.set_host_tools(params),

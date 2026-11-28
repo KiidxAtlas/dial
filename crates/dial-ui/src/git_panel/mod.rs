@@ -5,7 +5,11 @@
 mod ai;
 mod git;
 mod jobs;
+mod nested;
 mod watch;
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -17,13 +21,15 @@ pub(crate) use watch::Watch;
 const CONTEXT: &str = "-U3";
 
 use crate::config::types::Config;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Git handle for one project root. Cheap to clone; background jobs take a clone.
 #[derive(Clone)]
 pub struct Repo {
     root: PathBuf,
     config: Config,
+    /// A nested repository the user chose (`/git repo <folder>`), relative to `root`.
+    selected: Option<String>,
 }
 
 impl Repo {
@@ -31,17 +37,32 @@ impl Repo {
         Self {
             root: root.to_path_buf(),
             config: config.clone(),
+            selected: None,
         }
     }
 
+    /// Work on the nested repository at `folder` (relative to the project), not the project itself.
+    pub fn select(mut self, folder: &str) -> Self {
+        self.selected = Some(folder.to_owned());
+        self
+    }
+
     /// Resolve porcelain path coordinates on a worker, never from the input thread.
+    ///
+    /// A project that is not a repository uses its only nested repository. Several nested
+    /// repositories are never guessed between: the error names them so the user can choose.
     pub(crate) fn at_repository_root(mut self) -> Result<Self, String> {
-        let top = crate::tools::vcs::git::run_checked(
-            &self.root,
-            &["rev-parse", "--show-toplevel"],
-            false,
-        )?;
-        self.root = PathBuf::from(top.trim_end_matches(['\n', '\r']));
+        self.root = match &self.selected {
+            Some(folder) => selected_root(&self.root, folder)?,
+            None => match top_of(&self.root) {
+                Ok(top) => top,
+                Err(error) => match nested::repositories(&self.root).as_slice() {
+                    [] => return Err(error),
+                    [only] => only.clone(),
+                    many => return Err(choose_message(&self.root, many)),
+                },
+            },
+        };
         Ok(self)
     }
 
@@ -49,6 +70,57 @@ impl Repo {
     pub(crate) fn watch(&self) -> Result<Watch, String> {
         Watch::start(&self.root)
     }
+}
+
+/// The repository `dir` is the top of, when Git says so.
+fn top_of(dir: &Path) -> Result<PathBuf, String> {
+    let top = crate::tools::vcs::git::run_checked(dir, &["rev-parse", "--show-toplevel"], false)?;
+    Ok(PathBuf::from(top.trim_end_matches(['\n', '\r'])))
+}
+
+/// The nested repository at `folder`, which must be a repository top inside `project`.
+fn selected_root(project: &Path, folder: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(folder);
+    if folder.is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!(
+            "repo must name a folder inside the project, not {folder:?}"
+        ));
+    }
+    let project = project.canonicalize().map_err(|e| e.to_string())?;
+    let dir = project
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| format!("{folder} is not a folder in the project"))?;
+    if !dir.starts_with(&project) {
+        return Err(format!("{folder} is outside the project"));
+    }
+    match top_of(&dir) {
+        Ok(top) if top.canonicalize().is_ok_and(|top| top == dir) => Ok(dir),
+        Ok(_) => Err(format!(
+            "{folder} is inside another repository, not a repository of its own"
+        )),
+        Err(_) => Err(format!("{folder} is not a Git repository")),
+    }
+}
+
+fn choose_message(project: &Path, repos: &[PathBuf]) -> String {
+    let names: Vec<String> = repos
+        .iter()
+        .map(|repo| {
+            repo.strip_prefix(project)
+                .unwrap_or(repo)
+                .display()
+                .to_string()
+        })
+        .collect();
+    format!(
+        "This folder holds several Git repositories: {}. Open one with /git repo <folder>.",
+        names.join(", ")
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

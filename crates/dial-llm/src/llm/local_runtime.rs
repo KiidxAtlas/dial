@@ -26,8 +26,15 @@ pub enum LocalEngine {
     #[default]
     Auto,
     Mlx,
+    MlxServe,
+    VllmMlx,
     LlamaCpp,
     Atomic,
+    IkLlama,
+    MistralRs,
+    Vllm,
+    Sglang,
+    Exl3,
 }
 
 impl LocalEngine {
@@ -36,21 +43,134 @@ impl LocalEngine {
         format!("{:x}", Sha256::digest(model.as_bytes()))
     }
 
+    /// Stable kebab-case identifier matching serde and RPC wire format.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Mlx => "mlx",
+            Self::MlxServe => "mlx-serve",
+            Self::VllmMlx => "vllm-mlx",
+            Self::LlamaCpp => "llama-cpp",
+            Self::Atomic => "atomic",
+            Self::IkLlama => "ik-llama",
+            Self::MistralRs => "mistral-rs",
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+            Self::Exl3 => "exl3",
+        }
+    }
+
+    /// Human-readable label for UI pickers and diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Mlx => "MLX",
+            Self::MlxServe => "MLX-Serve",
+            Self::VllmMlx => "vLLM-MLX",
+            Self::LlamaCpp => "llama.cpp",
+            Self::Atomic => "Atomic Engine",
+            Self::IkLlama => "ik_llama.cpp",
+            Self::MistralRs => "mistral.rs",
+            Self::Vllm => "vLLM",
+            Self::Sglang => "SGLang",
+            Self::Exl3 => "ExLlamaV3",
+        }
+    }
+
+    /// Dependency recipe id in `dial_tools::setup::deps::RECIPES` (for `/setup <id>` / `doctor --fix`).
+    pub const fn recipe_id(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Mlx => Some("mlx-runtime"),
+            Self::MlxServe => Some("mlx-serve"),
+            Self::VllmMlx => Some("vllm-mlx"),
+            Self::LlamaCpp => Some("llama-cpp"),
+            Self::Atomic => Some("atomic-engine"),
+            Self::IkLlama => Some("ik-llama"),
+            Self::MistralRs => Some("mistral-rs"),
+            Self::Vllm => Some("vllm"),
+            Self::Sglang => Some("sglang"),
+            Self::Exl3 => Some("exl3"),
+        }
+    }
+
+    /// Runtime that `Auto` selects on this platform for `(format, gguf)`.
+    pub fn default_for(
+        format: super::local_format::LocalFormat,
+        gguf: GgufEngines,
+    ) -> Option<Self> {
+        use super::local_format::LocalFormat;
+        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        match (format, gguf) {
+            (LocalFormat::Mlx, _) if apple => Some(Self::Mlx),
+            (LocalFormat::Mlx, _) if cfg!(target_os = "linux") => {
+                if super::local_format::vllm_server().is_some() {
+                    Some(Self::Vllm)
+                } else if super::local_format::sglang_server().is_some() {
+                    Some(Self::Sglang)
+                } else if super::local_format::mistralrs_server().is_some() {
+                    Some(Self::MistralRs)
+                } else {
+                    Some(Self::Vllm)
+                }
+            }
+            (LocalFormat::Mlx, _) => Some(Self::MistralRs),
+            (LocalFormat::Gguf, GgufEngines::AtomicOnly) if apple => Some(Self::Atomic),
+            (LocalFormat::Gguf, GgufEngines::Both) => Some(Self::LlamaCpp),
+            (LocalFormat::Exl3, _) if !cfg!(target_os = "macos") => Some(Self::Exl3),
+            _ => None,
+        }
+    }
+
+    /// Whether this runtime's local executable/environment is currently installed on disk.
+    pub fn is_installed(self, user_dir: &std::path::Path) -> bool {
+        use super::local_format;
+        match self {
+            Self::Auto => true,
+            Self::Mlx => local_format::mlx_python_ready(user_dir),
+            Self::MlxServe => local_format::mlx_serve().is_some(),
+            Self::VllmMlx => local_format::vllm_mlx_server().is_some(),
+            Self::LlamaCpp => local_format::llama_server().is_some(),
+            Self::Atomic => local_format::atomic_server().is_some(),
+            Self::IkLlama => local_format::ik_llama_server().is_some(),
+            Self::MistralRs => local_format::mistralrs_server().is_some(),
+            Self::Vllm => local_format::vllm_server().is_some(),
+            Self::Sglang => local_format::sglang_server().is_some(),
+            Self::Exl3 => local_format::exl3_server().is_some(),
+        }
+    }
+
     pub fn choices(format: super::local_format::LocalFormat, gguf: GgufEngines) -> &'static [Self] {
         use super::local_format::LocalFormat;
         let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         match (format, gguf) {
-            (LocalFormat::Mlx, _) if apple => &[Self::Auto, Self::Mlx],
-            (LocalFormat::Gguf, GgufEngines::AtomicOnly) if apple => &[Self::Atomic],
-            (LocalFormat::Gguf, GgufEngines::Both) if apple => {
-                &[Self::Auto, Self::LlamaCpp, Self::Atomic]
+            (LocalFormat::Mlx, _) if apple => &[
+                Self::Auto,
+                Self::Mlx,
+                Self::MlxServe,
+                Self::VllmMlx,
+                Self::MistralRs,
+            ],
+            (LocalFormat::Mlx, _) if cfg!(target_os = "linux") => {
+                &[Self::Auto, Self::Vllm, Self::Sglang, Self::MistralRs]
             }
-            (LocalFormat::Gguf, GgufEngines::Both) => &[Self::Auto, Self::LlamaCpp],
+            (LocalFormat::Mlx, _) => &[Self::Auto, Self::MistralRs],
+            (LocalFormat::Gguf, GgufEngines::AtomicOnly) if apple => &[Self::Atomic],
+            (LocalFormat::Gguf, GgufEngines::Both) if apple => &[
+                Self::Auto,
+                Self::LlamaCpp,
+                Self::Atomic,
+                Self::IkLlama,
+                Self::MistralRs,
+            ],
+            (LocalFormat::Gguf, GgufEngines::Both) => {
+                &[Self::Auto, Self::LlamaCpp, Self::IkLlama, Self::MistralRs]
+            }
+            (LocalFormat::Exl3, _) if !cfg!(target_os = "macos") => &[Self::Auto, Self::Exl3],
             _ => &[],
         }
     }
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalRuntime {

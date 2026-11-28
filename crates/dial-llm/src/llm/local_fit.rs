@@ -249,9 +249,43 @@ pub fn gguf_serving_context(
 }
 
 /// Physical memory, read once per process.
+pub fn cached_memory_bytes() -> Option<u64> {
+    cached_memory()
+}
+
+/// Physical memory, read once per process.
 fn cached_memory() -> Option<u64> {
     static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MEMORY.get_or_init(physical_memory_bytes)
+}
+
+/// Lightweight memory-fit inspection for a downloaded local MLX directory or GGUF path.
+/// Reads only file sizes and header metadata; never loads a model.
+pub fn inspect_local_path(
+    path: &Path,
+    requested_context: u64,
+    kv_bits: Option<u8>,
+) -> Option<(Estimate, u64, Option<u64>)> {
+    let gguf =
+        crate::llm::local_format::gguf_info(path).filter(|_| !path.join("config.json").is_file());
+    let (arch, weights) = match &gguf {
+        Some(info) => (
+            Architecture::from_gguf(info)?,
+            crate::llm::local_format::gguf_weight_bytes(path)?,
+        ),
+        None => {
+            let text = fs::read_to_string(path.join("config.json")).ok()?;
+            let config: Value = serde_json::from_str(&text).ok()?;
+            (
+                Architecture::from_config(&config)?,
+                safetensors_bytes(path)?,
+            )
+        }
+    };
+    let memory = cached_memory();
+    let est = estimate(weights, &arch, requested_context, kv_bits, memory);
+    let max_ctx = max_context(weights, &arch, kv_bits, memory);
+    Some((est, max_ctx, memory))
 }
 
 /// Whether a KV pool of `tokens` next to the GGUF model's weights stays within the comfortable

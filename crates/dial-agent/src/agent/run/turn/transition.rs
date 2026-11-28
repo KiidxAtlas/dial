@@ -98,6 +98,7 @@ impl TurnState<'_> {
             auto_continues,
             planning_notice,
             plan_after_gate,
+            wrap_up_next_step,
             reliability,
             stall,
             edit_churn,
@@ -130,6 +131,7 @@ impl TurnState<'_> {
             *reasoning_budget = None;
             *planning_notice = false;
             *plan_after_gate = false;
+            *wrap_up_next_step = false;
             *compaction_failed = false;
             *compaction_retry_floor = None;
             *automatic_coach_pending = false;

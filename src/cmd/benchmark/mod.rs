@@ -485,11 +485,12 @@ fn assist_configurations(
     configurations.push(shake_first);
     type ExperimentSwitch = fn(&mut ExperimentalOverrides);
 
-    // One row per experimental workflow switch, each a single change from `dial`.
-    let experiments: [(&str, ExperimentSwitch); 7] = [
+    // One row per experimental workflow switch, each a single change from `dial`. Switches that
+    // ship on are measured by turning them off.
+    let experiments: [(&str, ExperimentSwitch); 8] = [
         ("enable-fault_witness", |e| e.fault_witness = Some(true)),
-        ("enable-repro_first_advise", |e| {
-            e.repro_first = Some(ReproFirst::Advise)
+        ("disable-repro_first", |e| {
+            e.repro_first = Some(ReproFirst::Off)
         }),
         ("enable-repro_first_gate", |e| {
             e.repro_first = Some(ReproFirst::Gate)
@@ -498,11 +499,14 @@ fn assist_configurations(
         ("enable-outcome_gradient", |e| {
             e.outcome_gradient_rounds = Some(3)
         }),
-        ("enable-streaming_dispatch", |e| {
-            e.streaming_dispatch = Some(true)
+        ("disable-streaming_dispatch", |e| {
+            e.streaming_dispatch = Some(false)
         }),
         ("enable-check_predictions", |e| {
             e.check_predictions = Some(true)
+        }),
+        ("enable-adaptive_output_effort", |e| {
+            e.adaptive_output_effort = Some(true)
         }),
     ];
     for (name, enable) in experiments {
@@ -918,6 +922,9 @@ fn apply_experimental(config: &mut Config, overrides: &ExperimentalOverrides) {
     }
     if let Some(value) = overrides.check_predictions {
         experimental.check_predictions = value;
+    }
+    if let Some(value) = overrides.adaptive_output_effort {
+        experimental.adaptive_output_effort = value;
     }
 }
 

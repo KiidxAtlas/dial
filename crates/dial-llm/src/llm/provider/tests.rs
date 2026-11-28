@@ -4807,3 +4807,55 @@ fn strict_tools_keep_the_edit_guidance_tool_unpromoted() {
     assert_eq!(body["tools"][1]["name"], "write_notes");
     assert_eq!(body["tools"][1]["strict"], true);
 }
+
+#[test]
+fn lower_next_request_effort_drops_one_request_without_mutating_profile() {
+    use llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    let mut profile = ModelProfile::minimal("openai", "gpt-5");
+    profile.capabilities = ModelCapabilities {
+        reasoning: ReasoningApi::OpenaiResponses,
+        reasoning_efforts: vec![
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ],
+        ..Default::default()
+    };
+    profile.reasoning_effort = Some(ReasoningEffort::High);
+    let mut remote = backend(anthropic_endpoint("http://127.0.0.1:1/v1"));
+    remote.profile = Some(profile);
+
+    assert!(remote.lower_next_request_effort());
+    assert_eq!(
+        remote
+            .next_profile
+            .as_ref()
+            .and_then(|p| p.reasoning_effort),
+        Some(ReasoningEffort::Minimal)
+    );
+    // Persistent profile remains untouched for subsequent steps.
+    assert_eq!(
+        remote.profile.as_ref().and_then(|p| p.reasoning_effort),
+        Some(ReasoningEffort::High)
+    );
+
+    // Anthropic budget mode clamps thinking_budget to 1024.
+    let mut claude = ModelProfile::minimal("anthropic", "claude-sonnet-4-5");
+    claude.capabilities = ModelCapabilities {
+        reasoning: ReasoningApi::AnthropicBudget,
+        ..Default::default()
+    };
+    claude.thinking_budget = Some(16_000);
+    remote.next_profile = None;
+    remote.profile = Some(claude);
+    assert!(remote.lower_next_request_effort());
+    assert_eq!(
+        remote.next_profile.as_ref().and_then(|p| p.thinking_budget),
+        Some(1_024)
+    );
+    assert_eq!(
+        remote.profile.as_ref().and_then(|p| p.thinking_budget),
+        Some(16_000)
+    );
+}

@@ -698,3 +698,110 @@ fn history_projection_mode_append_only_disables_all_sent_history_rewrites() {
     assert!(rewritable.supersede_reads);
     assert!(rewritable.drop_useless);
 }
+
+#[test]
+fn strip_local_reasoning_drops_prior_turns_and_oversized_active_turn_reasoning() {
+    let mut messages = vec![
+        json!({"role":"user","content":"Turn 1"}),
+        json!({"role":"assistant","content":"Done 1","reasoning_content":"Old turn 1 thought"}),
+        json!({"role":"user","content":"Turn 2"}),
+        json!({"role":"assistant","content":"","reasoning_content":"Step 1 thought","tool_calls":[{"id":"c1","function":{"name":"read","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"c1","content":"file"}),
+        json!({"role":"assistant","content":"","reasoning_content":"Latest step thought","tool_calls":[{"id":"c2","function":{"name":"edit","arguments":"{}"}}]}),
+    ];
+    strip_local_reasoning(&mut messages);
+    assert!(messages[1].get("reasoning_content").is_none());
+    assert_eq!(messages[3]["reasoning_content"], "Step 1 thought");
+    assert_eq!(messages[5]["reasoning_content"], "Latest step thought");
+
+    // When earlier active-turn reasoning exceeds the cap, older active steps drop too while the
+    // immediately preceding assistant step stays intact.
+    let big = "pondering ".repeat(2000);
+    messages[3]["reasoning_content"] = json!(big);
+    strip_local_reasoning(&mut messages);
+    assert!(messages[3].get("reasoning_content").is_none());
+    assert_eq!(messages[5]["reasoning_content"], "Latest step thought");
+
+    // Provider-signed thinking blocks are never touched.
+    let mut signed = vec![
+        json!({"role":"user","content":"Turn 1"}),
+        json!({"role":"assistant","content":"ok","reasoning_content":"keep","dial_provider_content":[{"type":"thinking","thinking":"keep"}]}),
+        json!({"role":"user","content":"Turn 2"}),
+    ];
+    strip_local_reasoning(&mut signed);
+    assert_eq!(signed[1]["reasoning_content"], "keep");
+}
+
+#[test]
+fn local_route_preserves_prefix_before_pressure_and_strips_prior_turn_reasoning() {
+    with_agent(
+        "provider='local'\nmodel='local-test'\n[compaction]\nsupersede_reads=true\n",
+        |agent| {
+            let mut messages = vec![
+                json!({"role":"user","content":"First turn"}),
+                json!({"role":"assistant","content":"Done","reasoning_content":"Stale prior reasoning"}),
+                json!({"role":"user","content":"Second turn"}),
+                json!({"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r1","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r1","is_error":false,"observation":"read:a.rs"}}),
+                json!({"role":"assistant","tool_calls":[{"id":"r2","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r2","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r2","is_error":false,"observation":"read:a.rs"}}),
+            ];
+            project(agent, &mut messages);
+            assert!(
+                messages[1].get("reasoning_content").is_none(),
+                "prior turn reasoning_content must be stripped on local routes"
+            );
+            assert!(
+                !messages[4]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("[Superseded"),
+                "local routes keep earlier reads intact before pressure to preserve KV cache"
+            );
+        },
+    );
+}
+
+#[test]
+fn cached_cloud_route_preserves_prefix_before_pressure_unless_cache_disabled() {
+    with_agent(
+        "provider='anthropic'\nmodel='claude-opus-5'\n[compaction]\npreserve_prefix=false\nsupersede_reads=true\n[efficiency]\nenabled=false\n",
+        |agent| {
+            let mut messages = vec![
+                json!({"role":"user","content":"Inspect a.rs"}),
+                json!({"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r1","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r1","is_error":false,"observation":"read:a.rs"}}),
+                json!({"role":"assistant","tool_calls":[{"id":"r2","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r2","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r2","is_error":false,"observation":"read:a.rs"}}),
+            ];
+            project(agent, &mut messages);
+            assert!(
+                !messages[2]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("[Superseded"),
+                "cached cloud routes should keep earlier reads intact before pressure to preserve prompt cache"
+            );
+        },
+    );
+    with_agent(
+        "provider='anthropic'\nmodel='claude-opus-5'\nmodel_profile='nocache'\n[model_profiles.nocache]\nprovider='anthropic'\nmodel='claude-opus-5'\nprompt_cache=false\n[compaction]\npreserve_prefix=false\nsupersede_reads=true\n[efficiency]\nenabled=false\n",
+        |agent| {
+            let mut messages = vec![
+                json!({"role":"user","content":"Inspect a.rs"}),
+                json!({"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r1","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r1","is_error":false,"observation":"read:a.rs"}}),
+                json!({"role":"assistant","tool_calls":[{"id":"r2","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"r2","content":"fn main() {}\n".repeat(120),"dial_evidence":{"artifact":"artifact://r2","is_error":false,"observation":"read:a.rs"}}),
+            ];
+            project(agent, &mut messages);
+            assert!(
+                messages[2]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("[Superseded"),
+                "explicit prompt_cache=false should still allow mid-turn read supersession"
+            );
+        },
+    );
+}

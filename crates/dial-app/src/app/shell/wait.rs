@@ -286,24 +286,45 @@ impl Shell {
         }
     }
 
-    /// GGUF models run on Dial's supervised `llama-server`. When none is found, offer the same
-    /// one-time install the MLX runtime gets, into Dial's own folder.
-    fn prepare_llama_cpp(&mut self, app: &App) -> Result<bool> {
-        if crate::llm::local_format::llama_server().is_some() {
+    /// Offer a one-time install into Dial's own folder when a selected runtime is not installed.
+    fn prepare_runtime_recipe(
+        &mut self,
+        app: &App,
+        engine: crate::llm::local_runtime::LocalEngine,
+    ) -> Result<bool> {
+        if engine.is_installed(&app.layout.user_dir) {
             return Ok(true);
         }
+        let Some(recipe_id) = engine.recipe_id() else {
+            return Ok(true);
+        };
+        let env = crate::setup::deps::Env::current(&app.layout.user_dir);
+        let preview = crate::setup::deps::run::preview_text(recipe_id, &env);
+        // Skip prompting when no automatic installer is available on this host (e.g. Manual-only).
+        if crate::setup::deps::recipe(recipe_id)
+            .is_some_and(|r| crate::setup::deps::plan::plan(r, &env).is_err())
+            && recipe_id != "mlx-runtime"
+        {
+            return Ok(true);
+        }
+        let title = format!("Set up {}", engine.label());
+        let button = format!("Install {}", engine.label());
         let choice = self.ask(
-            "Set up llama.cpp",
-            "GGUF models run on llama.cpp's llama-server, which is not installed. Dial installs a pinned, checksum-verified build into its own folder (no admin rights needed). Downloads need network access.",
-            &[("Install llama.cpp", 'y'), ("Cancel", 'n')],
+            &title,
+            &format!(
+                "{} is not installed yet.\n\n{preview}\n\nDownloads need network access and install into Dial's folder without admin rights.",
+                engine.label()
+            ),
+            &[(&button, 'y'), ("Cancel", 'n')],
         );
         if choice != Some(0) {
             return Ok(false);
         }
-        self.note("Local models", "installing llama.cpp…");
+        self.note("Local models", format!("installing {}…", engine.label()));
         let layout = app.layout.clone();
+        let recipe_id = recipe_id.to_owned();
         self.wait_local_preparation(app, move |cancel, progress| {
-            crate::setup::deps::run::install_and_save(&layout, "llama-cpp", &cancel, progress)?;
+            crate::setup::deps::run::install_and_save(&layout, &recipe_id, &cancel, progress)?;
             Ok(String::new())
         })
     }
@@ -319,14 +340,28 @@ impl Shell {
             .flatten();
         let model = cached.as_deref().map(Path::new).unwrap_or(model);
         use crate::llm::local_format::{LocalFormat, detect, gguf_file};
-        use crate::llm::local_runtime::GgufLoader;
-        if detect(model) == Some(LocalFormat::Gguf) {
+        use crate::llm::local_runtime::{GgufEngines, GgufLoader, LocalEngine};
+        let format = detect(model);
+        if format == Some(LocalFormat::Gguf) {
             let file = gguf_file(model)
                 .ok_or_else(|| anyhow::anyhow!("GGUF weights no longer available"))?;
             return match GgufLoader::resolve(&file, app.config.local_engine())? {
-                GgufLoader::LlamaCpp => self.prepare_llama_cpp(app),
-                GgufLoader::Atomic => Ok(true), // Atomic setup belongs to Desktop.
+                GgufLoader::LlamaCpp => self.prepare_runtime_recipe(app, LocalEngine::LlamaCpp),
+                GgufLoader::MistralRs => self.prepare_runtime_recipe(app, LocalEngine::MistralRs),
+                GgufLoader::Atomic | GgufLoader::IkLlama => Ok(true), // Source-build setup belongs to Desktop.
             };
+        }
+        if format == Some(LocalFormat::Exl3) {
+            return self.prepare_runtime_recipe(app, LocalEngine::Exl3);
+        }
+        let resolved_engine = match app.config.local_engine() {
+            LocalEngine::Auto => format
+                .and_then(|f| LocalEngine::default_for(f, GgufEngines::Unknown))
+                .unwrap_or(LocalEngine::Mlx),
+            other => other,
+        };
+        if resolved_engine != LocalEngine::Mlx {
+            return self.prepare_runtime_recipe(app, resolved_engine);
         }
         if !app.config.python.is_file() || !app.config.worker.is_file() {
             let choice = self.ask("Set up local models",

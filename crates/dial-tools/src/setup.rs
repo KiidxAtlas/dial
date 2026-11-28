@@ -14,6 +14,8 @@ use std::{
 };
 
 const WORKER: &str = include_str!("../../../python/dial_worker.py");
+const PEFT_WORKER: &str = include_str!("../../../python/dial_peft_worker.py");
+const LORA_EXPORT: &str = include_str!("../../../python/dial_lora_export.py");
 const STEERING: &str = include_str!("../../../python/dial_steering.py");
 const WEIGHTS: &str = include_str!("../../../python/dial_weights.py");
 const PYPROJECT: &str = include_str!("../../../python/pyproject.toml");
@@ -24,18 +26,24 @@ fn write_runtime_manifest(dir: &std::path::Path) -> Result<()> {
     settings_store::write_private(&dir.join("uv.lock"), UV_LOCK)
 }
 
-/// Keep the managed worker aligned with the binary without reinstalling Python packages.
+/// Keep the managed workers aligned with the binary without reinstalling Python packages.
 /// Explicit custom worker paths are never replaced.
 pub fn refresh_worker(config: &Config) -> Result<()> {
-    let managed = crate::config::paths::python_dir(&config.user_dir).join("dial_worker.py");
+    let python_dir = crate::config::paths::python_dir(&config.user_dir);
+    let managed = python_dir.join("dial_worker.py");
     if config.worker == managed
         && std::fs::read(&managed).ok().as_deref() != Some(WORKER.as_bytes())
     {
         settings_store::write_private(&managed, WORKER.as_bytes())?;
     }
     if config.worker == managed {
-        for (name, source) in [("dial_steering.py", STEERING), ("dial_weights.py", WEIGHTS)] {
-            let path = crate::config::paths::python_dir(&config.user_dir).join(name);
+        for (name, source) in [
+            ("dial_peft_worker.py", PEFT_WORKER),
+            ("dial_lora_export.py", LORA_EXPORT),
+            ("dial_steering.py", STEERING),
+            ("dial_weights.py", WEIGHTS),
+        ] {
+            let path = python_dir.join(name);
             if std::fs::read(&path).ok().as_deref() != Some(source.as_bytes()) {
                 settings_store::write_private(&path, source.as_bytes())?;
             }
@@ -66,6 +74,8 @@ pub fn ensure_runtime_with(
     let dir = crate::config::paths::python_dir(&layout.user_dir);
     crate::platform::atomic::private_dir(&dir)?;
     settings_store::write_private(&dir.join("dial_worker.py"), WORKER.as_bytes())?;
+    settings_store::write_private(&dir.join("dial_peft_worker.py"), PEFT_WORKER.as_bytes())?;
+    settings_store::write_private(&dir.join("dial_lora_export.py"), LORA_EXPORT.as_bytes())?;
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
     settings_store::write_private(&dir.join("dial_weights.py"), WEIGHTS.as_bytes())?;
     write_runtime_manifest(&dir)?;

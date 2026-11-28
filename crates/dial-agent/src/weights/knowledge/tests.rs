@@ -144,6 +144,8 @@ fn installed_worker_maps_and_collects_without_inference_or_checkpoint_writes() {
         ..Config::default()
     };
     config.weights.knowledge = true;
+    // Exercise the PEFT worker used by default on Linux, even on Apple Silicon.
+    config.training.backend = "peft".into();
     let cancel = AtomicBool::new(false);
     let mapped = refresh(&config, &cancel).unwrap();
     assert_eq!(mapped["atlas"]["tensors"][0]["role"], "query");

@@ -191,6 +191,24 @@ fn context_settings_reject_invalid_caps_and_accept_legacy_numbers() {
 }
 
 #[test]
+fn inkling_companion_does_not_reduce_the_configured_local_window() {
+    use crate::llm::local_runtime::LocalEngine;
+
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("Inkling-2-Mini-AD-Q4_K.gguf");
+    let draft = root.path().join(crate::llm::local_format::INKLING_DRAFT);
+    for file in [&model, &draft] {
+        std::fs::write(file, b"GGUF").unwrap();
+    }
+    let mut config = resolve("local_context_window=128000").unwrap();
+    let pick = crate::llm::model_config::ModelSelection::new("mlx", model.to_str().unwrap());
+    config
+        .local_model_engines
+        .insert(LocalEngine::model_key(&pick.model), LocalEngine::Atomic);
+    assert_eq!(config.with_selection(&pick).context_window, 128_000);
+}
+
+#[test]
 fn profile_context_size_overrides_shared_caps_and_respects_capacity() {
     let config = resolve("provider='anthropic'\nmodel='claude-opus-5-5'\ncontext_window=32768\ncloud_context_window=64000\nmodel_profile='main'\n[model_profiles.main]\nprovider='anthropic'\nmodel='claude-opus-5-5'\ncontext_window=200000\n").unwrap();
     assert_eq!(config.context_window, 200_000);

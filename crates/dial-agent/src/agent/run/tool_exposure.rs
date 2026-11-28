@@ -137,16 +137,16 @@ impl<'a> Agent<'a> {
     /// Minimal first-request offer: after the full set cannot fit the context window, on the small
     /// local tier, or after a local escalation (`local_profile`).
     const LEAN_TOOLS: [&str; 10] = [
+        "tool_search",
+        "finish",
         "read",
-        "write",
         "edit",
-        "bash",
+        "write",
         "grep",
+        "verify",
+        "bash",
         "glob",
         "todo",
-        "finish",
-        "verify",
-        "tool_search",
     ];
 
     /// Initial tool budget under the lean local profile. A configured 0 (unlimited) becomes this bound.
@@ -1004,7 +1004,17 @@ impl<'a> Agent<'a> {
             schema_size("bash")
                 .saturating_sub(self.budgeted_schema_bytes("bash", false).unwrap_or(budget))
         };
-        for &name in Self::CORE_TOOLS {
+        // Stable across turns: spend the lean offer on finding, changing and checking files.
+        // If discovery isn't permitted, don't hide other directly callable tools.
+        let candidates: &[&str] = if self.lean_local()
+            && self.tool_eligible("tool_search")
+            && catalog.iter().any(|name| name == "tool_search")
+        {
+            &Self::LEAN_TOOLS
+        } else {
+            Self::CORE_TOOLS
+        };
+        for &name in candidates {
             if !catalog.iter().any(|entry| entry == name) || !self.tool_eligible(name) {
                 continue;
             }

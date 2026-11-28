@@ -270,9 +270,49 @@ fi
 if "$install_sh" "$root/scripts/install.sh" 'v0.1.0/../../other' > "$test_root/version.log" 2>&1; then
     echo 'Unsafe version was accepted' >&2; exit 1
 fi
+# Verify wget fallback when curl is absent on minimal Linux hosts.
+mkdir -p "$test_root/wget-only-bin"
+for tool in uname ldd gh libressl ls; do
+    ln -s "$test_root/bin/$tool" "$test_root/wget-only-bin/$tool"
+done
+cat > "$test_root/wget-only-bin/wget" <<'SH'
+#!/bin/bash
+set -eu
+output= url= spider=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -O) output=$2; shift 2 ;;
+        --spider) spider=1; shift ;;
+        --tries=*|--max-redirect=*|-q|-S|--https-only) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+if [ "$spider" = 1 ] && [ "$url" = https://github.com/KiidxAtlas/dial/releases/latest ]; then
+    printf '  Location: https://github.com/KiidxAtlas/dial/releases/tag/v0.1.0\r\n' >&2
+    exit 0
+fi
+case "$url" in
+    https://github.com/KiidxAtlas/dial/releases/download/v0.1.0/*)
+        file=${url##*/}; cp "$FIXTURES/$file" "$output" ;;
+    *) echo "Unexpected wget download: $url" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$test_root/wget-only-bin/wget"
+# GNU tar invokes gzip through PATH; keep it available without adding curl.
+for util in sh dash bash tar gzip install mktemp grep sed awk tr base64 tail sha256sum shasum ssh-keygen openssl python3 chmod mkdir rm mv cp cat head basename dirname; do
+    found=$(command -v "$util" 2>/dev/null || true)
+    if [ -n "$found" ] && [ ! -e "$test_root/wget-only-bin/$util" ]; then
+        ln -s "$found" "$test_root/wget-only-bin/$util"
+    fi
+done
+FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_LIBC=glibc PATH="$test_root/wget-only-bin" \
+    DIAL_INSTALL_DIR="$test_root/wget-linux/bin" \
+    "$install_sh" "$root/scripts/install.sh" latest > "$test_root/wget-linux.log" 2>&1
+[ "$("$test_root/wget-linux/bin/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
+
 export FAKE_OS=Windows_NT FAKE_ARCH=x86_64
 if "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/platform.log" 2>&1; then
     echo 'Unsupported native Windows was accepted' >&2; exit 1
 fi
 [ ! -e "$DIAL_INSTALL_DIR/dial" ]
-echo "Installer tests passed under $install_sh: macOS and Linux (glibc/musl, x86-64/arm64) target selection, latest version, authenticated private downloads and access denial, ssh-keygen/OpenSSL/Python signature verifiers, fail-closed refusal and explicit opt-out, bad-signature and tamper rejection, releases without SHA256SUMS.sshsig, shell profile PATH setup (idempotent, opt-out), no overwrite on failure, unsafe manifest/version/platform rejection."
+echo "Installer tests passed under $install_sh: macOS and Linux (glibc/musl, x86-64/arm64) target selection, latest version, curl and wget fallback, authenticated private downloads and access denial, ssh-keygen/OpenSSL/Python signature verifiers, fail-closed refusal and explicit opt-out, bad-signature and tamper rejection, releases without SHA256SUMS.sshsig, shell profile PATH setup (idempotent, opt-out), no overwrite on failure, unsafe manifest/version/platform rejection."

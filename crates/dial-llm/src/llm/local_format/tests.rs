@@ -5,6 +5,24 @@ fn gguf(path: &Path) {
 }
 
 #[test]
+fn inkling_dspark_requires_a_companion_and_a_known_short_window() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("Inkling-2-Mini-AD-Q4_K.gguf");
+    let draft = root.path().join(INKLING_DRAFT);
+    gguf(&model);
+    assert_eq!(inkling_dspark(&model, Some(4096)), None);
+    gguf(&draft);
+    assert_eq!(inkling_dspark(&model, Some(4096)), Some(draft));
+    for window in [Some(4097), Some(128_000), None] {
+        assert_eq!(inkling_dspark(&model, window), None);
+    }
+    assert_eq!(
+        inkling_dspark(&root.path().join("other.gguf"), Some(4096)),
+        None
+    );
+}
+
+#[test]
 fn package_fallbacks_are_native_to_the_target() {
     assert!(package_bin_dirs("windows").is_empty());
     assert_eq!(package_bin_dirs("linux"), ["/usr/local/bin"]);
@@ -22,6 +40,16 @@ fn detects_each_format_from_layout() {
     fs::write(mlx.join("config.json"), "{}").unwrap();
     fs::write(mlx.join("model.safetensors"), b"x").unwrap();
     assert_eq!(detect(&mlx), Some(LocalFormat::Mlx));
+
+    let exl3 = root.path().join("exl3");
+    fs::create_dir(&exl3).unwrap();
+    fs::write(
+        exl3.join("config.json"),
+        r#"{"model_type":"llama","quantization_config":{"quant_method":"exl3","bits":4.0}}"#,
+    )
+    .unwrap();
+    fs::write(exl3.join("model.safetensors"), b"x").unwrap();
+    assert_eq!(detect(&exl3), Some(LocalFormat::Exl3));
 
     let splash = root.path().join("splash");
     for dir in ["target", "tokenizer"] {

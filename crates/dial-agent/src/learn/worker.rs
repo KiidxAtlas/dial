@@ -420,13 +420,9 @@ fn call_worker(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     honour_stop: bool,
 ) -> Result<Value> {
-    crate::setup::refresh_worker(config)?;
-    ensure!(
-        config.python.is_absolute() && config.worker.is_absolute(),
-        "python and worker paths must be absolute"
-    );
+    let script = worker_script(config)?;
     let input = serde_json::to_string(request).context("serializing worker request")?;
-    let worker = config.worker.to_str().context("worker path is not UTF-8")?;
+    let worker = script.to_str().context("worker path is not UTF-8")?;
     let stop_file = config.state_dir.join("improvement.stop");
     let output = loop {
         let result = run_command_handoff(
@@ -474,14 +470,58 @@ struct Capabilities {
     resolved_model: Option<PathBuf>,
 }
 
-/// Bump when adapter target selection or the verification contract changes.
-pub fn current_lora_probe(caps: &Value) -> bool {
-    caps["lora_probe_version"].as_u64() == Some(2)
+/// Resolve which Python worker script serves `config.training.backend` (`"auto"`, `"mlx"`, or `"peft"`).
+pub fn worker_script(config: &Config) -> Result<PathBuf> {
+    crate::setup::refresh_worker(config)?;
+    ensure!(
+        config.python.is_absolute() && config.worker.is_absolute(),
+        "python and worker paths must be absolute"
+    );
+    let use_peft = match config.training.backend.as_str() {
+        "peft" => true,
+        "mlx" => false,
+        _ => !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")),
+    };
+    if use_peft {
+        let sibling = config
+            .worker
+            .parent()
+            .context("worker path has no parent directory")?
+            .join("dial_peft_worker.py");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    Ok(config.worker.clone())
 }
 
-/// Capabilities of GGUF and Splash models, answered without the MLX-only Python worker: GGUF serves
-/// inference through its selected loader but cannot be LoRA-trained (training needs MLX weights), and a
-/// Splash bundle can only be run by LM Studio. `None` for MLX checkpoints and unresolved models.
+/// Resolve the PEFT/EXL3 worker explicitly (for CUDA EXL3 export).
+fn peft_worker_script(config: &Config) -> Result<PathBuf> {
+    crate::setup::refresh_worker(config)?;
+    ensure!(
+        config.python.is_absolute() && config.worker.is_absolute(),
+        "python and worker paths must be absolute"
+    );
+    let sibling = config
+        .worker
+        .parent()
+        .context("worker path has no parent directory")?
+        .join("dial_peft_worker.py");
+    ensure!(
+        sibling.is_file(),
+        "PEFT/EXL3 worker script not found at {}",
+        sibling.display()
+    );
+    Ok(sibling)
+}
+
+/// Bump when adapter target selection or the verification contract changes.
+pub fn current_lora_probe(caps: &Value) -> bool {
+    caps["lora_probe_version"].as_u64() == Some(3)
+}
+
+/// Capabilities of GGUF, EXL3 and Splash models, answered without the MLX-only Python worker.
+/// `None` for MLX/safetensors checkpoints and unresolved models.
 fn non_mlx_capabilities(model: &str, engine: LocalEngine) -> Option<Value> {
     use crate::llm::local_format::{self, LocalFormat};
     let resolved = crate::llm::catalog::resolve_local_model(model).ok();
@@ -501,10 +541,39 @@ fn non_mlx_capabilities(model: &str, engine: LocalEngine) -> Option<Value> {
                 .and_then(|loader| loader.program().map(|_| loader));
             match result {
                 Ok(loader) => {
-                    let name = match loader { GgufLoader::Atomic => "Atomic Engine", GgufLoader::LlamaCpp => "llama.cpp" };
-                    (true, format!("{name} is available for GGUF inference and evaluation; LoRA training needs MLX weights"))
+                    let (name, lora_note) = match loader {
+                        GgufLoader::Atomic => ("Atomic Engine", " (with --lora adapter serving)"),
+                        GgufLoader::LlamaCpp => ("llama.cpp", " (with --lora adapter serving)"),
+                        GgufLoader::IkLlama => ("ik_llama.cpp", " (with --lora adapter serving)"),
+                        GgufLoader::MistralRs => ("mistral.rs", " (fused GGUF export)"),
+                    };
+                    (
+                        true,
+                        format!(
+                            "{name} is available for GGUF inference{lora_note}; run `dial improve prepare-gguf` to prepare an FP16 checkpoint for LoRA training"
+                        ),
+                    )
                 }
                 Err(error) => (false, error.to_string()),
+            }
+        }
+        LocalFormat::Exl3 => {
+            if cfg!(target_os = "macos") {
+                (
+                    false,
+                    "EXL3 models require an NVIDIA CUDA GPU (Linux/Windows) with ExLlamaV3/TabbyAPI; use MLX or GGUF on macOS".to_owned(),
+                )
+            } else {
+                match local_format::exl3_server() {
+                    Some(_) => (
+                        true,
+                        "ExLlamaV3/TabbyAPI is available for EXL3 inference (with PEFT --lora-dir serving); train on an FP16/BF16 safetensors base checkpoint and export PEFT or EXL3".to_owned(),
+                    ),
+                    None => (
+                        false,
+                        "EXL3 server not found; install ExLlamaV3/TabbyAPI or set DIAL_EXL3_SERVER".to_owned(),
+                    ),
+                }
             }
         }
         LocalFormat::Splash => (
@@ -515,7 +584,7 @@ fn non_mlx_capabilities(model: &str, engine: LocalEngine) -> Option<Value> {
     Some(json!({
         "inference": inference,
         "lora": false,
-        "lora_probe_version": 2,
+        "lora_probe_version": 3,
         "reason": reason,
         "unsupported": unsupported,
         "resolved_model": path,
@@ -540,16 +609,11 @@ pub fn capabilities_controlled(
     if let Some(result) = non_mlx_capabilities(&config.model, config.local_engine()) {
         return validate_capabilities(result);
     }
-    crate::setup::refresh_worker(config)?;
-    ensure!(
-        config.python.is_absolute() && config.worker.is_absolute(),
-        "python and worker paths must be absolute"
-    );
+    let script = worker_script(config)?;
     let input = json!({"op":"capabilities", "model":config.model}).to_string();
     let output = run_command_handoff(
         &config.python,
-        &[config
-            .worker
+        &[script
             .to_str()
             .context("worker path is not UTF-8")?
             .to_owned()],
@@ -648,14 +712,23 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
         "op": "train", "model": config.model, "resume_adapter": active.adapter,
         "train_data": training.train_data, "valid_data": training.valid_data,
         "output_dir": output_dir, "iters": training.iters, "batch_size": training.batch_size,
-        "num_layers": training.num_layers, "rank": training.rank, "max_seq_length": training.max_seq_length,
+        "grad_accumulation_steps": training.grad_accumulation_steps,
+        "num_layers": training.num_layers, "rank": training.rank,
+        "max_seq_length": training.max_seq_length,
+        "fine_tune_type": training.fine_tune_type,
+        "target_modules": training.target_modules,
+        "scale": training.scale,
+        "dropout": training.dropout,
+        "learning_rate": training.learning_rate,
+        "lr_schedule": training.lr_schedule,
+        "warmup_ratio": training.warmup_ratio,
+        "optimizer": training.optimizer,
+        "weight_decay": training.weight_decay,
+        "grad_checkpoint": training.grad_checkpoint,
+        "checkpoint_every": training.checkpoint_every,
     });
     let response = if super::compute::background_active() {
-        crate::setup::refresh_worker(config)?;
-        ensure!(
-            config.python.is_absolute() && config.worker.is_absolute(),
-            "python and worker paths must be absolute"
-        );
+        let script = worker_script(config)?;
         let control = tempfile::tempdir()?;
         let pause = control.path().join("pause");
         let progress = control.path().join("progress.json");
@@ -680,8 +753,7 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
             let mut budget_stop = None;
             let output = run_command_handoff(
                 &config.python,
-                &[config
-                    .worker
+                &[script
                     .to_str()
                     .context("worker path is not UTF-8")?
                     .to_owned()],
@@ -821,14 +893,19 @@ fn produced_adapter(reported: &Path, output_dir: &Path) -> Result<PathBuf> {
         reported == expected,
         "worker returned a different adapter directory"
     );
-    for artifact in ["adapter_config.json", "adapters.safetensors"] {
-        let metadata =
-            std::fs::metadata(expected.join(artifact)).context("missing adapter artifact")?;
-        ensure!(
-            metadata.is_file() && metadata.len() > 0,
-            "empty or invalid adapter artifact"
-        );
-    }
+    let cfg_meta = std::fs::metadata(expected.join("adapter_config.json"))
+        .context("missing adapter_config.json")?;
+    ensure!(
+        cfg_meta.is_file() && cfg_meta.len() > 0,
+        "empty or invalid adapter_config.json"
+    );
+    let has_weights = ["adapters.safetensors", "adapter_model.safetensors"]
+        .iter()
+        .any(|name| {
+            std::fs::metadata(expected.join(name))
+                .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        });
+    ensure!(has_weights, "missing or empty adapter weights safetensors");
     Ok(expected)
 }
 
@@ -983,6 +1060,141 @@ pub fn fuse(
         "worker did not produce the requested checkpoint"
     );
     Ok(fused)
+}
+
+/// Export a trained adapter to standard HuggingFace PEFT format (`adapter_config.json` +
+/// `adapter_model.safetensors`), compatible with ExLlamaV3/TabbyAPI, vLLM, and llama.cpp conversion.
+pub fn export_peft(config: &Config, model: &str, adapter: &Path, output: &Path) -> Result<Value> {
+    let model = crate::llm::catalog::resolve_local_model(model)?;
+    ensure!(adapter.is_absolute(), "adapter path must be absolute");
+    fresh_output(output)?;
+    call(
+        config,
+        &json!({"op": "export_peft", "model": model, "adapter": adapter, "output": output}),
+    )
+}
+
+/// Export a trained LoRA adapter to a standalone `.gguf` LoRA file for `llama-server --lora`.
+/// Uses llama.cpp's `convert_lora_to_gguf.py` when present, or Dial's built-in GGUF v3 writer.
+pub fn export_gguf_lora(
+    config: &Config,
+    model: &str,
+    adapter: &Path,
+    output: &Path,
+    dtype: &str,
+) -> Result<Value> {
+    let model = crate::llm::catalog::resolve_local_model(model)?;
+    ensure!(adapter.is_absolute(), "adapter path must be absolute");
+    ensure!(
+        output.is_absolute() && !output.exists(),
+        "GGUF LoRA output path must be a new absolute file path"
+    );
+    let converter = crate::llm::local_format::convert_lora_to_gguf();
+    call(
+        config,
+        &json!({
+            "op": "export_gguf_lora",
+            "model": model,
+            "adapter": adapter,
+            "output": output,
+            "dtype": dtype,
+            "converter_script": converter,
+        }),
+    )
+}
+
+/// Fuse an adapter into FP16 safetensors and convert (+ optionally quantize via `llama-quantize`)
+/// into a standalone `.gguf` model file.
+pub fn export_gguf(
+    config: &Config,
+    model: &str,
+    adapter: &Path,
+    output: &Path,
+    quant: &str,
+) -> Result<Value> {
+    let model = crate::llm::catalog::resolve_local_model(model)?;
+    ensure!(adapter.is_absolute(), "adapter path must be absolute");
+    ensure!(
+        output.is_absolute() && !output.exists(),
+        "GGUF output path must be a new absolute file path"
+    );
+    let converter = crate::llm::local_format::convert_hf_to_gguf();
+    let quantize_bin = crate::llm::local_format::llama_quantize();
+    let uv_bin = crate::setup::deps::locate(
+        crate::setup::deps::recipe("uv").expect("registered uv"),
+        &crate::setup::deps::Env::current(&config.user_dir),
+    );
+    call(
+        config,
+        &json!({
+            "op": "export_gguf",
+            "model": model,
+            "adapter": adapter,
+            "output": output,
+            "quant": quant,
+            "converter_script": converter,
+            "quantize_bin": quantize_bin,
+            "uv_bin": uv_bin,
+        }),
+    )
+}
+
+/// Fuse an adapter (optional) into base safetensors and quantize to EXL3 (requires NVIDIA CUDA + exllamav3).
+pub fn export_exl3(
+    config: &Config,
+    model: &str,
+    adapter: Option<&Path>,
+    output: &Path,
+    bpw: f64,
+) -> Result<Value> {
+    let model = crate::llm::catalog::resolve_local_model(model)?;
+    ensure!(
+        bpw.is_finite() && (1.5..=8.0).contains(&bpw),
+        "EXL3 bpw must be in [1.5, 8.0]"
+    );
+    if let Some(a) = adapter {
+        ensure!(a.is_absolute(), "adapter path must be absolute");
+    }
+    fresh_output(output)?;
+    let script = peft_worker_script(config)?;
+    let request = json!({
+        "op": "export_exl3",
+        "model": model,
+        "adapter": adapter,
+        "output": output,
+        "bpw": bpw,
+    });
+    let raw = run_command(
+        &config.python,
+        &[script
+            .to_str()
+            .context("PEFT worker path is not UTF-8")?
+            .to_owned()],
+        &request.to_string(),
+        config.worker_timeout_secs,
+    )?;
+    let value: Value = serde_json::from_str(&raw).context("PEFT worker returned invalid JSON")?;
+    ensure!(value.is_object(), "PEFT worker response must be an object");
+    Ok(value)
+}
+
+/// Dequantize a local `.gguf` file into a trainable FP16 safetensors checkpoint directory.
+pub fn prepare_gguf(config: &Config, source: &Path, output: &Path) -> Result<Value> {
+    ensure!(source.is_absolute(), "GGUF source path must be absolute");
+    fresh_output(output)?;
+    let uv_bin = crate::setup::deps::locate(
+        crate::setup::deps::recipe("uv").expect("registered uv"),
+        &crate::setup::deps::Env::current(&config.user_dir),
+    );
+    call(
+        config,
+        &json!({
+            "op": "prepare_gguf",
+            "source": source,
+            "output": output,
+            "uv_bin": uv_bin,
+        }),
+    )
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {

@@ -315,6 +315,7 @@ fn local_hints_fill_gaps_never_override_profile_values_and_stay_off_hosted_route
         prompt_progress: true,
         presence_penalty: Some(0.9),
         repetition_penalty: Some(1.3),
+        ..Default::default()
     };
     // The profile's own presence penalty wins; the hint fills the missing LM Studio names only.
     let mut lm = ModelProfile::minimal("lm-studio", "m");

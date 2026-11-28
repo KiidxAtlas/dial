@@ -28,12 +28,12 @@ fn incremental_window_caps_delta_replay_and_preserves_boundaries() {
     let replay = (0..20)
         .map(|i| format!("{{\"r\":{i}}}"))
         .collect::<Vec<_>>();
-    let (rows, cursor) = bounded_training_records(&path, 0, &replay).unwrap();
+    let (rows, cursor) = bounded_training_records(&path, 0, &replay, 32, 16).unwrap();
     assert_eq!(rows.len(), 48);
     assert_eq!(rows[15], "{\"r\":15}");
     assert_eq!(rows[16], "{\"n\":0}");
     assert_eq!(rows[47], "{\"n\":31}");
-    let (next, _) = bounded_training_records(&path, cursor, &[]).unwrap();
+    let (next, _) = bounded_training_records(&path, cursor, &[], 32, 16).unwrap();
     assert_eq!(next[0], "{\"n\":32}");
 }
 
@@ -42,10 +42,10 @@ fn cursor_reset_and_partial_line_are_safe() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("train.jsonl");
     fs::write(&path, "{\"a\":1}\n{\"b\":2}").unwrap();
-    let (rows, cursor) = bounded_training_records(&path, 99, &[]).unwrap();
+    let (rows, cursor) = bounded_training_records(&path, 99, &[], 32, 16).unwrap();
     assert_eq!(rows, vec!["{\"a\":1}"]);
     assert_eq!(cursor, 8);
-    assert!(bounded_training_records(&path, 1, &[]).is_err());
+    assert!(bounded_training_records(&path, 1, &[], 32, 16).is_err());
 }
 
 #[test]
@@ -59,11 +59,15 @@ fn validation_window_and_default_iterations_are_bounded() {
             .collect::<String>(),
     )
     .unwrap();
-    let sample = bounded_validation_records(&path).unwrap();
+    let sample = bounded_validation_records(&path, 32).unwrap();
     assert_eq!(sample.len(), 32);
     assert_eq!(sample[31], "{\"n\":31}");
     let training = crate::config::types::TrainingConfig::default();
-    assert_eq!(training.iters, 32);
+    assert_eq!(training.iters, 100);
+    assert_eq!(training.target_modules, "all-linear");
+    assert_eq!(training.optimizer, "adamw");
+    assert_eq!(training.lr_schedule, "cosine");
+    assert!(training.grad_checkpoint);
     assert_eq!(training.interval_secs, 6 * 3600);
 }
 #[test]

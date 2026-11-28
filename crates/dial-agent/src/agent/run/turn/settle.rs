@@ -218,6 +218,9 @@ impl Agent<'_> {
         // offer stay as they are.
         self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui);
         let tool_round_failed = eval.tool_round_failed;
+        if !tool_round_failed && form_kinds.is_empty() && !edit_failed {
+            self.reasoning_recovery.note_progress();
+        }
         if !self.hermetic {
             let mut control = self.session.control_state();
             settle_reliability(
