@@ -765,7 +765,7 @@ fn local_route_preserves_prefix_before_pressure_and_strips_prior_turn_reasoning(
 #[test]
 fn cached_cloud_route_preserves_prefix_before_pressure_unless_cache_disabled() {
     with_agent(
-        "provider='anthropic'\nmodel='claude-opus-5'\n[compaction]\nsupersede_reads=true\n",
+        "provider='anthropic'\nmodel='claude-opus-5'\n[compaction]\npreserve_prefix=false\nsupersede_reads=true\n[efficiency]\nenabled=false\n",
         |agent| {
             let mut messages = vec![
                 json!({"role":"user","content":"Inspect a.rs"}),
@@ -785,7 +785,7 @@ fn cached_cloud_route_preserves_prefix_before_pressure_unless_cache_disabled() {
         },
     );
     with_agent(
-        "provider='anthropic'\nmodel='claude-opus-5'\nmodel_profile='nocache'\n[model_profiles.nocache]\nprovider='anthropic'\nmodel='claude-opus-5'\nprompt_cache=false\n[compaction]\nsupersede_reads=true\n",
+        "provider='anthropic'\nmodel='claude-opus-5'\nmodel_profile='nocache'\n[model_profiles.nocache]\nprovider='anthropic'\nmodel='claude-opus-5'\nprompt_cache=false\n[compaction]\npreserve_prefix=false\nsupersede_reads=true\n[efficiency]\nenabled=false\n",
         |agent| {
             let mut messages = vec![
                 json!({"role":"user","content":"Inspect a.rs"}),

@@ -931,6 +931,10 @@ pub(in crate::agent) fn compact_history_with_execution(
                             "[Recoverable older tool evidence archived at {reference}; retrieve with read. Original result and mutation outcome remain in the immutable session archive.]"
                         );
                         message["content"] = json!(summary_line);
+                        if message.get("dial_model_content").is_some() {
+                            // The request projection restores this model-facing view over `content`.
+                            message["dial_model_content"] = json!(summary_line);
+                        }
                         elided += 1;
                     }
                     if elided == 0 && stripped_reasoning == 0 {

@@ -1411,6 +1411,7 @@ def main():
                       "weights_edit": weights_operation, "weights_try": weights_operation, "weights_attribute": weights_operation,
                       "weights_analyze": weights_operation, "weights_combine": weights_operation,
                       "weights_investigate": weights_operation, "weights_explained": weights_operation}
+        operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")
         phase = operation
         with diagnostics_to_stderr():

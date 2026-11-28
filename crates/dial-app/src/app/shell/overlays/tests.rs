@@ -240,7 +240,7 @@ fn model_settings_inheritance_keeps_other_edit_pins_and_the_original_config() {
     use crate::llm::profiles::ModelProfile;
 
     for (route, settings, process, expected) in [
-        ("local", "", None, "hashline"),
+        ("local", "", None, "replace"),
         ("hosted", "", None, "hashline"),
         (
             "local",

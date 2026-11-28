@@ -1101,7 +1101,7 @@ fn coding_model_catalog_ignores_learning_records_and_never_starts_python() {
         store
             .set_meta(
                 "serving_capabilities",
-                &json!({"inference":true, "lora":supported, "lora_probe_version":2}).to_string(),
+                &json!({"inference":true, "lora":supported, "lora_probe_version":3}).to_string(),
             )
             .unwrap();
         paths.push(selection);
@@ -1190,7 +1190,7 @@ fn lora_acceptance_is_not_runtime_use_and_disabling_training_does_not_hide_it() 
     store
         .set_meta(
             "serving_capabilities",
-            "{\"lora\":true,\"lora_probe_version\":2}",
+            "{\"lora\":true,\"lora_probe_version\":3}",
         )
         .unwrap();
     let mut active = store.active().unwrap();
@@ -1516,7 +1516,7 @@ fn learning_status_reads_the_selected_model_store_not_the_project_store() {
     project_store
         .set_meta(
             "serving_capabilities",
-            "{\"lora\":true,\"lora_probe_version\":2}",
+            "{\"lora\":true,\"lora_probe_version\":3}",
         )
         .unwrap();
     config.state_dir = layout.state_dir.join("models/selected");
@@ -1530,7 +1530,7 @@ fn learning_status_reads_the_selected_model_store_not_the_project_store() {
     store
         .set_meta(
             "serving_capabilities",
-            "{\"lora\":false,\"lora_probe_version\":2,\"reason\":\"fused QKV unsupported\"}",
+            "{\"lora\":false,\"lora_probe_version\":3,\"reason\":\"fused QKV unsupported\"}",
         )
         .unwrap();
     store

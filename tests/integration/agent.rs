@@ -1103,6 +1103,9 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
     e.config.integrations = vec!["web_search".into()];
     e.config.sandbox.allow_network = false;
     e.config.assistance.compact_tools = true;
+    // The lean local profile (default On for a local endpoint) offers its own fixed set without `find`.
+    // This cloud-route fixture exercises the non-lean compact offer, so turn that profile off.
+    e.config.assistance.lean_local = dial::config::types::LeanLocal::Off;
     e.config.assistance.initial_tool_limit = 13;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("Inspect a file", &mut Recorder::default()).unwrap();
@@ -3815,6 +3818,9 @@ fn a_single_long_turn_can_be_compacted_instead_of_failing_with_nothing_to_compac
     e.config.compaction.keep_recent_tokens = 1000;
     // This fixture exercises the explicit manual boundary, independent of automatic trigger timing.
     e.config.compaction.enabled = false;
+    // The scripted endpoint is local, where compaction tries zero-inference Shake first. This fixture
+    // exercises the summary path that a single long turn needs when no earlier user message can be cut.
+    e.config.compaction.method_order = vec![dial::config::compaction::CompactionMethod::Soft];
     e.config.compaction.mid_turn_enabled = false;
     let body: String = (0..1200)
         .map(|n| format!("line {n:04} {}\n", "x".repeat(36)))

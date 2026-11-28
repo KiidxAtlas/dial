@@ -674,7 +674,14 @@ pub(in crate::agent) fn chat_with_wrap_up(
         return Err(GateHit::user_wrap_up(gate.prefix_digest()).into());
     }
     if let Some(reason) = &gate.hit {
-        return Err(GateHit::new(reason.clone(), gate.prefix_digest()).into());
+        // A repetition hit's prefix is the looping block itself; replaying it would re-inject the
+        // failed content, so only non-repetitive cutoffs keep a digest.
+        let digest = if GateHit::new(reason.clone(), None).is_repetition() {
+            None
+        } else {
+            gate.prefix_digest()
+        };
+        return Err(GateHit::new(reason.clone(), digest).into());
     }
     result
 }

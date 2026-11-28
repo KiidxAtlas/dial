@@ -832,7 +832,7 @@ fn shake_keeps_archive_reference_without_replaying_old_tool_output() {
                 "id":"read-1","type":"function","function":{"name":"read","arguments":"{}"}
             }]}),
             json!({"role":"tool","tool_call_id":"read-1","content":old_output,
-                   "dial_evidence":{"artifact":reference,"is_error":false}}),
+                   "dial_model_content":old_output,"dial_evidence":{"artifact":reference,"is_error":false}}),
             json!({"role":"user","content":"latest exact request"}),
         ],
         tools: vec![],
@@ -881,6 +881,13 @@ fn shake_keeps_archive_reference_without_replaying_old_tool_output() {
     let content = tool["content"].as_str().unwrap();
     assert!(content.contains(reference), "{content}");
     assert!(!content.contains("raw older tool output"), "{content}");
+    // Publish stores a model-facing view that the request projection restores over `content`.
+    let model_view = tool["dial_model_content"].as_str().unwrap();
+    assert!(model_view.contains(reference), "{model_view}");
+    assert!(
+        !model_view.contains("raw older tool output"),
+        "{model_view}"
+    );
     assert_eq!(tool["tool_call_id"], "read-1");
     assert_eq!(request.messages[3]["content"], old_output);
     assert_eq!(history.last(), request.messages.last());
