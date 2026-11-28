@@ -200,13 +200,16 @@ fn a_local_out_of_memory_overflow_lowers_the_planning_window() {
     with_agent("[retry]\nmax_attempts=1\n", |agent| {
         connect(agent, &server.url);
         let before = agent.context_window();
-        assert!(before > 8_192, "fixture window {before}");
+        assert!(
+            before > 8_192,
+            "the fixture must start above the minimum window"
+        );
         let report = agent.turn("Say done", &mut NullUi).unwrap();
         assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
         let after = agent.context_window();
         assert!(
             after < before && after >= 8_192,
-            "the window must drop below the served size after an out-of-memory prefill: {before} -> {after}"
+            "the window must drop below the served size after an out-of-memory prefill"
         );
     });
 }
