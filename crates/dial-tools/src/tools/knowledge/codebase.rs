@@ -2,6 +2,7 @@
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
 pub mod enrichment;
+pub mod guardrails;
 mod locator;
 mod packet;
 use crate::config::paths::Layout;
@@ -842,6 +843,7 @@ impl Codebase {
             CREATE TABLE IF NOT EXISTS codebase_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
         )?;
         migrate_outline_version(&conn)?;
+        guardrails::init_tables(&conn)?;
         Ok(Self {
             root: layout.project_root.clone(),
             conn: Mutex::new(conn),
@@ -1766,15 +1768,17 @@ impl Tool for CodebaseTool {
     fn schema(&self) -> Value {
         crate::runtime::schema::tool_schema(
             self.name(),
-            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. navigate returns an explicit task packet: owner files with freshness, symbols only for fresh owners, related lexical hints (identifier or import mentions, not verified consumers) and recorded check status (never check commands). Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
+            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, path-scoped 1-line invariant, or failure-triggered 1-line dead end, or forget one. Findings and guardrails are agent observations, never verification proof; only matching supporting sources make them eligible for reuse across sessions. navigate returns an explicit task packet: owner files with freshness, symbols only for fresh owners, related lexical hints (identifier or import mentions, not verified consumers) and recorded check status (never check commands). Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. remember_invariant saves a 1-line rule for one file in sources (attached lazily on first read/edit while the file matches); remember_dead_end saves a 1-line failed-approach warning for one file in sources with optional signature (attached only when a matching failure occurs). expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
             json!({
-                "action":{"type":"string","enum":["recall","architecture","impact","navigate","refresh","remember","forget","invalidate"]},
+                "action":{"type":"string","enum":["recall","architecture","impact","navigate","refresh","remember","forget","invalidate","remember_invariant","forget_invariant","remember_dead_end","forget_dead_end","list_guardrails"]},
                 "section_ids":{"type":"array","items":{"type":"string"},"maxItems":64},
                 "reason":{"type":"string","maxLength":1000},
                 "query":{"type":"string","maxLength":4096},
                 "topic":{"type":"string","maxLength":160},
-                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding; up to {MAX_SUMMARY_BYTES} UTF-8 bytes. For behavior navigation, use a descriptive topic and separate lines Owner: `identifier` and Check: `test_identifier`, citing their source files. These are locators, not check verdicts.")},
+                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding (up to {MAX_SUMMARY_BYTES} UTF-8 bytes) or 1-line invariant/dead-end summary (up to 240 chars). For behavior navigation, use a descriptive topic and separate lines Owner: `identifier` and Check: `test_identifier`, citing their source files. These are locators, not check verdicts.")},
                 "sources":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},
+                "signature":{"type":"string","maxLength":160,"description":"Optional failing test name or error signature for remember_dead_end."},
+                "guardrail_id":{"type":"string","maxLength":64,"description":"Identifier returned by remember_invariant, remember_dead_end or list_guardrails for forget_invariant/forget_dead_end."},
                 "expected_revision":{"type":"integer","minimum":0},
                 "max_bytes":{"type":"integer","minimum":1024,"maximum":24000}
             }),
@@ -1881,6 +1885,76 @@ impl Tool for CodebaseTool {
                         "topic missing or revision changed; recall before forgetting"
                     );
                     Ok(json!({"forgotten":text("topic")?}).to_string())
+                }
+                "remember_invariant" => {
+                    let paths = args["sources"]
+                        .as_array()
+                        .context("remember_invariant requires one source path in sources")?
+                        .iter()
+                        .map(|p| {
+                            p.as_str()
+                                .map(str::to_owned)
+                                .context("source paths must be strings")
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    ensure!(
+                        paths.len() == 1,
+                        "remember_invariant requires exactly 1 supporting source path"
+                    );
+                    Ok(self
+                        .cache
+                        .remember_invariant(&paths[0], text("summary")?, &self.session)?
+                        .to_string())
+                }
+                "forget_invariant" => Ok(self
+                    .cache
+                    .forget_invariant(text("guardrail_id")?)?
+                    .to_string()),
+                "remember_dead_end" => {
+                    let paths = args["sources"]
+                        .as_array()
+                        .context("remember_dead_end requires one source path in sources")?
+                        .iter()
+                        .map(|p| {
+                            p.as_str()
+                                .map(str::to_owned)
+                                .context("source paths must be strings")
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    ensure!(
+                        paths.len() == 1,
+                        "remember_dead_end requires exactly 1 supporting source path"
+                    );
+                    let signature = args.get("signature").and_then(Value::as_str).unwrap_or("");
+                    Ok(self
+                        .cache
+                        .remember_dead_end(&paths[0], signature, text("summary")?, &self.session)?
+                        .to_string())
+                }
+                "forget_dead_end" => Ok(self
+                    .cache
+                    .forget_dead_end(text("guardrail_id")?)?
+                    .to_string()),
+                "list_guardrails" => {
+                    let paths = args
+                        .get("sources")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|p| {
+                                    p.as_str()
+                                        .map(str::to_owned)
+                                        .context("source paths must be strings")
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?;
+                    let query = args.get("query").and_then(Value::as_str);
+                    Ok(self
+                        .cache
+                        .list_guardrails(paths.as_deref(), query)?
+                        .to_string())
                 }
                 _ => anyhow::bail!("unknown codebase_memory action"),
             }

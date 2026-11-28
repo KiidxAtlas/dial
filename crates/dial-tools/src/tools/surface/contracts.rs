@@ -224,6 +224,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "reason",
         ],
     ),
+    ("codebase_memory", &["guardrail_id", "signature"]),
 ];
 
 /// Enum values added after release. History recorded before them stays valid because the old
@@ -242,6 +243,17 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("monitor", "action", &["saved", "restore", "forget"]),
     ("bg", "action", &["saved", "restore", "forget"]),
     ("codebase_memory", "action", &["navigate"]),
+    (
+        "codebase_memory",
+        "action",
+        &[
+            "remember_invariant",
+            "forget_invariant",
+            "remember_dead_end",
+            "forget_dead_end",
+            "list_guardrails",
+        ],
+    ),
     ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
     (

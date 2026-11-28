@@ -545,8 +545,30 @@ fn consolidated_memory_codebase_store_routes_navigate_and_resumes_prior_identity
         "{}",
         out.text
     );
-    // The pre-navigate successor is the same schema without the new enum value; it must still resume.
-    let mut before = current.clone();
+    // Prior releases (before guardrails, and before navigate) must both still resume.
+    let mut pre_guardrails = current.clone();
+    for prop in ["guardrail_id", "signature"] {
+        pre_guardrails["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove(prop);
+    }
+    pre_guardrails["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|value| {
+            !matches!(
+                value.as_str(),
+                Some(
+                    "remember_invariant"
+                        | "forget_invariant"
+                        | "remember_dead_end"
+                        | "forget_dead_end"
+                        | "list_guardrails"
+                )
+            )
+        });
+    let mut before = pre_guardrails.clone();
     let enum_values = before["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array_mut()
         .unwrap();
@@ -555,11 +577,13 @@ fn consolidated_memory_codebase_store_routes_navigate_and_resumes_prior_identity
     assert_eq!(enum_values.len() + 1, count);
     let mut registry = Registry::new();
     registry.register(Arc::new(facade));
-    let identity = identities(&[before], &registry)["memory"].clone();
-    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
-    assert!(
-        project_history(&history, &[current], &registry)
-            .unwrap()
-            .is_none()
-    );
+    for historical in [pre_guardrails, before] {
+        let identity = identities(&[historical], &registry)["memory"].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+        assert!(
+            project_history(&history, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

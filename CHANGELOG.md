@@ -19,6 +19,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [0.4.2] - 2026-11-27
 
+- Codebase memory can surface saved file-specific invariants when you read or edit a file. Notes from previous failed approaches appear only when a new failure matches. Both are tied to the source content so stale notes stay out of context. [Memory and learning](docs/memory-and-learning.md#path-scoped-invariants-and-failure-triggered-dead-ends).
 - Hardened the npm installer against remote script substitution, removed raw tool-output previews from fast compaction, and marked quoted workspace filenames as untrusted in local-model context.
 - Updated Rust dependencies and the pinned CI and release-signing actions.
 - Local chat requests avoid redundant conversation copies before sending tool results back to the model. Continuation still carries structured tool results and any reasoning emitted by the model.

@@ -95,6 +95,11 @@ impl Agent<'_> {
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64,
         );
+        let guardrail_sources = if self.codebase.is_some() {
+            observed_sources.clone()
+        } else {
+            Default::default()
+        };
         self.observe_experience(call, &output, observed_sources, ui);
         if output.is_error {
             outcome.last_tool_failure = Some(format!(
@@ -390,6 +395,10 @@ impl Agent<'_> {
                 turn.reliability.passing_checks += 1;
             }
         }
+        let attached_verify_failed = attached_verify
+            .filter(|check| check["is_error"] == true)
+            .and_then(|check| check["text"].as_str())
+            .map(str::to_owned);
         // Phase follows observed check receipts only: a shell check that exited, an eval check
         // that ran, or a verify result with `ran` set (attached or the `verify` tool). A plan or a
         // reused result is not a run. Verification credit above is unchanged.
@@ -670,6 +679,16 @@ impl Agent<'_> {
                 .submit(cache, vec![path.to_owned()], review_stamp);
         }
         let is_duplicate = duplicate.is_some();
+        if !is_duplicate && !controller_blocked && !recovery_blocked {
+            self.attach_codebase_guardrails(
+                call,
+                &mut output,
+                check_failed,
+                attached_verify_failed.as_deref(),
+                &guardrail_sources,
+                ui,
+            );
+        }
         // A read pointer re-presents evidence the model already holds: it is neither a
         // withheld call nor a new observation.
         let is_pointer = duplicate

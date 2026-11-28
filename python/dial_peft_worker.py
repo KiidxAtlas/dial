@@ -593,6 +593,15 @@ def diagnostics_to_stderr():
         os.close(saved)
 
 
+def weights_map(request):
+    # Structural mapping reads checkpoint headers without loading a training backend.
+    from dial_weights import WeightsError, operation
+    try:
+        return operation(request)
+    except WeightsError as error:
+        return {"error": str(error)}
+
+
 def main():
     watch_parent()
     phase = "request validation"
@@ -610,6 +619,7 @@ def main():
             "export_gguf": export_gguf_op,
             "export_exl3": export_exl3,
             "prepare_gguf": prepare_gguf_op,
+            "weights_map": weights_map,
         }
         operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")

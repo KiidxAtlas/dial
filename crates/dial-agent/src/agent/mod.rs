@@ -423,6 +423,7 @@ pub struct Agent<'a> {
     memory: Option<Arc<ProvenanceMemory>>,
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
     codebase: Option<Arc<Codebase>>,
+    guardrails: memory::knowledge::GuardrailState,
     /// Per-turn code diffs searchable across sessions (`code_history`); `None` when disabled.
     history: Option<Arc<crate::tools::knowledge::history::ChangeHistory>>,
     experience: Option<Arc<crate::storage::experience::Experience>>,

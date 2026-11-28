@@ -116,7 +116,7 @@ pub(in crate::agent) fn is_observation(call: &ToolCall) -> bool {
         ),
         "codebase_memory" => matches!(
             call.arguments["action"].as_str(),
-            Some("recall" | "architecture" | "impact" | "refresh")
+            Some("recall" | "architecture" | "impact" | "refresh" | "list_guardrails")
         ),
         "peers" => matches!(call.arguments["action"].as_str(), None | Some("list")),
         _ => false,

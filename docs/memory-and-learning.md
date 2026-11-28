@@ -26,6 +26,28 @@ workspace up to the 2048-file cap. Unchanged indexed files are reused rather tha
 an outline format upgrade rebuilds each row once. While the last refresh is partial, navigation
 packets say that index coverage is partial, so an owner that is not found may be in an unread file.
 
+### Path-scoped invariants and failure-triggered dead ends
+
+`codebase_memory` (also reachable through `memory` with `store="codebase"`) stores two compact,
+source-verified guardrail records in `codebase.sqlite3` without adding text to the static system
+prompt:
+
+- **Path-scoped 1-line invariants** (`remember_invariant`, `forget_invariant`): tied to one
+  workspace-relative source file (`sources: [path]`) and its SHA-256 content digest, normalized to
+  a single screened line (`<= 240` chars). Fresh invariants attach lazily (up to 3 entries / 700
+  bytes) on the first `read` or edit of that file in the current history generation. When the file
+  changes on disk, stale invariants self-expire automatically and are omitted.
+- **Failure-triggered 1-line dead ends** (`remember_dead_end`, `forget_dead_end`): tied to one
+  workspace-relative source file (`sources: [path]`), its SHA-256 digest, an optional failing test
+  or error `signature` (`<= 160` chars), and a 1-line `summary` (`<= 240` chars). Dead ends add
+  zero tokens on passing runs; they attach lazily (up to 2 entries / 700 bytes) only when an
+  `edit`/`write`/`ast_edit`, `verify`, or `bash` run fails with a matching path/signature while the
+  recorded digest still matches the file's current or turn-baseline content.
+- **Inspection and session dedupe**: `list_guardrails` reports saved invariants and dead ends with
+  their live `fresh`/`stale` status and `guardrail_id`. Shown guardrail IDs are deduplicated per
+  `history_generation` and reset after compaction, reset, or rewind. Both record types are advisory
+  observations, never verification proof or instructions.
+
 ### Semantic facts backend
 
 `memory.backend = "semantic"` keeps facts in private SQLite stores outside the repository: one per project, plus a user-wide bank shared by every project. It offers the `memory` tool with the `retain`, `recall`, `update` and `forget` actions, with the same arguments as provenance memory; `retain` takes `scope: "project" | "global"` to choose the bank. It needs no configuration: recall is keyword search (FTS5 BM25). Assigning an embedding-capable model to the `embedding` model role (Alt+M, `/setup embeddings`, or `[model_roles.embedding]`) adds meaning-based search through that role's endpoint, model and key. The two rankings are fused with reciprocal-rank fusion, so recall degrades to keyword search when the service is unavailable or slower than the recall deadline, and `/memory` reports why. Alt+M lists embedding-capable models for this role, and also models whose kind the server does not declare, labelled "unclassified". Assigning the role or finishing `/setup embeddings` while another backend is selected offers to switch to semantic; it never switches silently.

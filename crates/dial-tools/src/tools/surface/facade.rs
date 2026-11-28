@@ -835,7 +835,7 @@ pub const GROUPS: &[Group] = &[
     Group {
         successor: "memory",
         intro: None,
-        selector_note: "codebase: saved project understanding (architecture, impact, navigate, refresh, remember, forget, invalidate, recall); omit for facts",
+        selector_note: "codebase: saved project understanding and guardrails (architecture, impact, navigate, refresh, remember, forget, invalidate, recall, remember_invariant, forget_invariant, remember_dead_end, forget_dead_end, list_guardrails); omit for facts",
         native_required: true,
         members: &[("codebase_memory", Spec::Select("store", "codebase"))],
     },
