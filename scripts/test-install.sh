@@ -298,8 +298,8 @@ case "$url" in
 esac
 SH
 chmod +x "$test_root/wget-only-bin/wget"
-# Build a PATH without curl by copying/symlinking needed utilities into wget-only-bin.
-for util in sh dash bash tar install mktemp grep sed awk tr base64 tail sha256sum shasum ssh-keygen openssl python3 chmod mkdir rm mv cp cat head basename dirname; do
+# GNU tar invokes gzip through PATH; keep it available without adding curl.
+for util in sh dash bash tar gzip install mktemp grep sed awk tr base64 tail sha256sum shasum ssh-keygen openssl python3 chmod mkdir rm mv cp cat head basename dirname; do
     found=$(command -v "$util" 2>/dev/null || true)
     if [ -n "$found" ] && [ ! -e "$test_root/wget-only-bin/$util" ]; then
         ln -s "$found" "$test_root/wget-only-bin/$util"

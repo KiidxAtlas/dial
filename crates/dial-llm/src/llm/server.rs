@@ -1398,9 +1398,11 @@ fn launch(
         &tail,
         deadline,
         interrupt,
-        fallback_model,
-        discover_model_id && explicit_request_model.is_none(),
-        embedding,
+        ReadyModel {
+            fallback: fallback_model,
+            discover_id: discover_model_id && explicit_request_model.is_none(),
+            embedding,
+        },
     );
     match outcome {
         Ok(discovered) => {
@@ -1439,15 +1441,19 @@ fn launch(
     }
 }
 
+struct ReadyModel<'a> {
+    fallback: &'a str,
+    discover_id: bool,
+    embedding: bool,
+}
+
 fn wait_ready(
     process: &mut Supervised,
     base_url: &str,
     tail: &Mutex<Tail>,
     deadline: Option<Instant>,
     interrupt: Option<Arc<AtomicBool>>,
-    model: &str,
-    discover_model_id: bool,
-    embedding: bool,
+    model: ReadyModel<'_>,
 ) -> Result<Option<String>> {
     let models_url = format!("{base_url}/v1/models");
     let mut last_probe = "no health response yet".to_string();
@@ -1473,7 +1479,7 @@ fn wait_ready(
             .call()
         {
             Ok(mut response) if response.status().as_u16() == 200 => {
-                if discover_model_id
+                if model.discover_id
                     && let Ok(text) = response.body_mut().read_to_string()
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
                 {
@@ -1488,7 +1494,7 @@ fn wait_ready(
             remaining.map_or(POLL_INTERVAL, |remaining| POLL_INTERVAL.min(remaining)),
         );
     }
-    let warmup_model = discovered_model.as_deref().unwrap_or(model);
+    let warmup_model = discovered_model.as_deref().unwrap_or(model.fallback);
     // The HTTP port opens before the model finishes loading, and a bad
     // model/adapter only fails on first use. One 1-token request blocks until
     // the weights are loaded and proves generation works.
@@ -1498,7 +1504,7 @@ fn wait_ready(
             .as_secs()
             .max(1)
     });
-    let warmed = if embedding {
+    let warmed = if model.embedding {
         warm_embedding(base_url, warmup_model, remaining, interrupt.clone())
     } else {
         let warmup = Chat {
