@@ -119,3 +119,69 @@ fn compaction_reattaches_the_current_text_of_files_edited_this_turn() {
         .unwrap();
     assert!(carry < retained);
 }
+
+/// Mid-turn compaction must never split a tool loop: if the model's newest tool call has no
+/// result yet, committing would separate the signed thinking + tool_use from its tool_result.
+#[test]
+fn compaction_refuses_to_commit_inside_an_open_tool_call_group() {
+    with_agent("", |agent| {
+        agent.auth_config.provider = Some("anthropic".into());
+        agent.auth_config.model = "claude-opus-5-5".into();
+        for message in [
+            json!({"role":"user","content":"survey the old code"}),
+            json!({"role":"assistant","content":"old findings ".repeat(4_000)}),
+            json!({"role":"user","content":"read a.rs"}),
+        ] {
+            agent.push(message).unwrap();
+        }
+        let snapshot = agent.compaction_snapshot(None).unwrap();
+        let first_kept = snapshot
+            .source
+            .messages
+            .iter()
+            .position(|m| m["content"] == "read a.rs")
+            .unwrap();
+        // The loop advanced after the snapshot: a signed thinking + tool call, result pending.
+        agent.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"r1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}],
+            "dial_provider_content":[{"type":"thinking","thinking":"","signature":"sig-r1"},{"type":"tool_use","id":"r1","name":"read","input":{"path":"a.rs"}}]})).unwrap();
+        let before = agent.session.messages();
+        let prepared = PreparedCompaction {
+            summary: "surveyed".into(),
+            prefix: vec![Session::compaction_message("surveyed")],
+            first_kept,
+            method: CompactionMethod::Soft,
+            outcome: CompactionOutcome {
+                kind: CompactionOutcomeKind::Compaction,
+                method: Some(CompactionMethod::Soft),
+                tokens_before: 0,
+                tokens_after: 0,
+                retained_messages: 1,
+                summarized_messages: 2,
+                continue_allowed: false,
+                native_usage: None,
+                handoff_path: None,
+                handoff_error: None,
+                reset_entry_id: None,
+                reset_digest: None,
+                journal_warning: None,
+            },
+        };
+        let mut backend = agent.backend.take().unwrap();
+        let error = agent
+            .commit_compaction(
+                &mut crate::agent::NullUi,
+                &snapshot,
+                prepared,
+                &CompactionOptions::default(),
+                None,
+                Some(&mut backend),
+            )
+            .unwrap_err();
+        agent.backend = Some(backend);
+        assert!(
+            error.to_string().contains("tool-call group is incomplete"),
+            "{error:#}"
+        );
+        assert_eq!(agent.session.messages(), before, "history must be unchanged");
+    });
+}

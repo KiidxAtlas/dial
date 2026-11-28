@@ -998,7 +998,6 @@ impl<'a> ChildTurn<'a> {
             config,
             false,
             &mut profile,
-            env.harness.temperature,
         );
         crate::agent::model::local_profile::host_default_output_limit(
             config,
@@ -1080,6 +1079,7 @@ impl<'a> ChildTurn<'a> {
                 stream: authorized.as_mut().map(|stream| {
                     stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
                 }),
+                wrap_up: None,
             },
         );
         self.streamed = streamed;
@@ -1264,7 +1264,13 @@ impl<'a> ChildTurn<'a> {
             {
                 self.recovering_output = true;
                 let _ = engine.setback(Setback::StreamStall);
-                match self.reasoning_recovery.intercept(&error.to_string()) {
+                let digest = error
+                    .downcast_ref::<reasoning::GateHit>()
+                    .and_then(|hit| hit.digest());
+                match self
+                    .reasoning_recovery
+                    .intercept_with_digest(&error.to_string(), digest)
+                {
                     Ok(message) => {
                         approver.notice(&message);
                         self.messages.push(json!({"role":"user","content":message}));

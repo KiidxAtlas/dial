@@ -68,6 +68,13 @@ Learning workers yield to coding at their existing safe handoff boundaries.
 
 Existing verified trajectories remain available to the explicit learning pipeline. Ordinary coding transcripts stay in the session journal for resume and review; exact request snapshots are saved only when explicitly enabled, and still require approval before teaching. To evaluate task/model performance, run the explicit benchmark and improvement tools.
 
+### Training from Dial Desktop
+
+Open a project and choose **Settings → Models → LoRA training**. Choose the local checkpoint to adapt; this does not switch the chat model. The page shows the detected format (`MLX / Safetensors`, `GGUF`, or `EXL3`), active backend (`mlx` on Apple Silicon or `peft` via PyTorch/CUDA/CPU elsewhere), inline hyperparameter controls (fine-tune type LoRA/DoRA, target modules, rank, iterations, gradient accumulation, learning rate, cosine/constant schedule, optimizer, gradient checkpointing, training window, and gate mode), live training progress, and export/deploy workflows. Review the data requirements, optionally approve the current session, then start training. Approval and starting a job are separate confirmations. The worker keeps running when Settings closes. Reopen the page and select the same base to inspect the outcome or request a stop. Stopping also pauses scheduling for that base until resumed.
+
+- **MLX / Safetensors**: Trains directly via MLX on Apple Silicon or PyTorch/PEFT (`training.backend = "auto" | "peft"`) on Linux/Windows/CUDA. Admitted MLX adapters serve natively; exported PEFT adapters also serve with ExLlamaV3/TabbyAPI or vLLM.
+- **GGUF**: GGUF weights cannot be trained in place. Choose **Prepare training weights** (available in Desktop and via `dial improve prepare-gguf`) to dequantize a `.gguf` file into a new FP16 safetensors checkpoint without modifying the original. Train on that checkpoint, then export either a **GGUF LoRA** (`llama-server --lora`, built-in GGUF v3 writer) or a **Fused GGUF** (fuse + `convert_hf_to_gguf.py` + optional `llama-quantize`).
+- **EXL3**: Dial detects EXL3 checkpoints (`quant_method: "exl3"` / `exl3_config`) and serves them via an external ExLlamaV3/TabbyAPI server (`DIAL_EXL3_SERVER` or PATH, Linux/Windows NVIDIA CUDA only; refused on macOS). Train on the matching unquantized HuggingFace safetensors base checkpoint, then export a **PEFT LoRA** (`--lora-dir`) or quantize a fused checkpoint to **EXL3** (`dial improve export-exl3 --bpw 4.0`, requires NVIDIA CUDA + `exllamav3`).
 ### Review-only lessons from recurring failures
 
 An explicit improvement cycle also records lesson proposals when the same closed failure category
@@ -111,7 +118,7 @@ time. Eligibility also depends on verified training data, so an elapsed cooldown
    Reasoning models retain `reasoning_content` on the final assistant target, not earlier turns. The worker uses the model's native reasoning template when available, otherwise its thinking markers; models without either omit that field. Training, preference scoring and likelihood screening share the same token boundary and target mask.
    Canonical inference/training messages omit harness-only metadata such as durable undo checkpoint links.
    Those links remain in the session journal for undo; strict message validation still rejects unsupported fields.
-4. **Train locally.** An isolated feedback-model invocation proposes harness changes. Bounded mutations explore prompts, notes, tool selection, temperature, step budgets and edit mode. For supported local MLX models, LoRA resumes from the active adapter on up to 32 new verified records plus 16 accepted replay records; validation is capped at 32. A small reference-free preference pass adds chosen SFT loss plus a 0.1-weighted pairwise logistic ranking loss on repair pairs. The base model stays frozen; rejected candidates do not advance the training watermark.
+4. **Train locally.** An isolated feedback-model invocation proposes harness changes. Bounded mutations explore prompts, notes, tool selection, temperature, step budgets and edit mode. For supported local checkpoints (MLX on Apple Silicon, PyTorch/PEFT elsewhere), LoRA or DoRA (`training.fine_tune_type = "lora" | "dora"`) targets all linear projections by default (`training.target_modules = "all-linear"`; also `"attention"`, `"q_proj"`, or an explicit module list) using AdamW, cosine LR warmup (`training.lr_schedule = "cosine"`, `warmup_ratio = 0.1`), gradient checkpointing (`grad_checkpoint = true`), gradient accumulation (`grad_accumulation_steps = 4`), rank 16, scale 20, and 100 iterations by default. Incremental runs resume from the active adapter on up to `training.max_train_examples` (256) new verified records plus `training.max_replay_examples` (64) replay records, with validation capped at `training.max_valid_examples` (128). A small reference-free preference pass adds chosen SFT loss plus a 0.1-weighted pairwise logistic ranking loss on repair pairs. The base model stays frozen; rejected candidates do not advance the training watermark.
 5. **Validate before activation.** Evaluate against fresh primary and general tasks, plus a frozen anchor suite. The primary (`tools`) suite is adaptive per model within a cycle: the baseline is scored at tier 0, and if it passes at least 90% of its cases (integer arithmetic, so 89.9% stays and 90.0% advances), the suite escalates to tier 1 and the baseline is scored again, then to tier 2 (the cap).
 
    The candidate runs on the final tier against the same baseline. Tier 1 adds five gate-only hard families (`refactor_behavior`, `search_then_edit`, `config_chain`, `bugfix_tests`, `multi_file_chain`) to the gate slots; tier 2 draws only from those hard families. Tier 0 excludes them, so its mixture is unchanged. The chosen tier is recorded on the `tools` score in the admission report.
@@ -124,7 +131,7 @@ time. Eligibility also depends on verified training data, so an elapsed cooldown
 
    Consequence, stated plainly: a guard with no discordant cases only bounds the drop by the discordance rate, so a clean guard needs about 300 to 440 paired cases to show a one-point tolerance at the default alpha (299 with one guard suite, 408 with three, 437 with four).
 
-   With the default generated guard sizes (about 20 cases) **automatic admission is blocked** until guard suites are much larger or the tolerance is raised. Nothing here proves zero regression: a zero tolerance can never be shown from finite samples. Manual `[gate]` suites keep the legacy point rule (`alpha` = 1, documented and unchanged). Retry-excluded pairs are removed from both sides and never counted as losses.
+   With the default generated guard sizes (about 20 cases) **strict** automatic guard bounds block admission until guard suites are much larger or the tolerance is raised. Configure `[improve] gate_mode`: `"auto"` (default) uses practical point-regression guards on explicit `dial improve train` / Desktop runs (still requiring primary statistical significance and rejecting any guard drop exceeding `max_regression`) while keeping strict Clopper-Pearson bounds for unattended automatic cycles; `"practical"` applies practical guard checks everywhere; `"strict"` enforces Clopper-Pearson guard bounds everywhere. Nothing here proves zero regression: a zero tolerance can never be shown from finite samples. Manual `[gate]` suites keep the legacy point rule (`alpha` = 1, documented and unchanged). Retry-excluded pairs are removed from both sides and never counted as losses.
 
    The anchor also limits cumulative drift from the original version, compared on the anchor cases the candidate was actually scored on. Private case contents and failed evaluator details never go to the feedback model.
 6. **Serve or reject.** At most one candidate is admitted per cycle, with an atomic SQLite baseline check. Rejected candidates never become active. New turns pick up admitted versions; adapter changes restart the local server. The live monitor is observational.
@@ -135,7 +142,7 @@ time. Eligibility also depends on verified training data, so an elapsed cooldown
 
    It **never rolls back automatically**: an identical prompt does not prove the same code, context or tests, and no anchored corroboration exists for live data yet. Use `dial improve rollback` after reviewing `last_monitor`.
 
-LoRA is enabled by default but requires a supported checkpoint, **24 examples** in the bounded delta/replay batch, a nonempty validation split and a **6-hour training interval**. Training defaults to **32 iterations**. A candidate must still pass the full sealed gate before activation. Data-poor cycles can still evaluate harness changes; no gain is guaranteed.
+LoRA is enabled by default and requires a supported checkpoint, **24 examples** in the bounded delta/replay batch, a nonempty validation split and a **6-hour training interval**. Training defaults to **100 iterations** (all-linear, rank 16, AdamW + cosine warmup, gradient checkpointing, grad accumulation 4). Both automatic cycles and explicit `dial improve train` runs apply likelihood pre-screening and adapter soup before the sealed gate. A candidate must still pass the full sealed gate before activation. Data-poor cycles can still evaluate harness changes; no gain is guaranteed.
 
 **Gate measurement under infrastructure failure.** Each gate case is measured as a baseline/candidate pair. A transient provider or transport failure (rate limit, 5xx, timeout, lost connection, model load failure) is retried twice, after 2 s and 8 s.
 
@@ -191,7 +198,12 @@ dial improve versions
 dial improve disable                # pause pending/future automatic cycles; a running cycle finishes
 dial improve enable
 dial improve cycle                  # optional: run a complete cycle now
-dial improve train                  # optional: request a gated LoRA candidate now
+dial improve train                  # optional: request a gated LoRA/DoRA candidate now
+dial improve fuse --out DIR         # fuse active adapter into a standalone checkpoint
+dial improve export-adapter --format peft|gguf --out PATH  # export PEFT or GGUF LoRA (--lora)
+dial improve export-gguf --quant q4_k_m --out FILE.gguf    # fuse, convert, and quantize to GGUF
+dial improve export-exl3 --bpw 4.0 --out DIR               # fuse and quantize to EXL3 (CUDA)
+dial improve prepare-gguf MODEL.gguf --out DIR             # dequantize GGUF to FP16 checkpoint
 dial improve diagnose
 dial improve harvest
 dial improve propose proposal.json

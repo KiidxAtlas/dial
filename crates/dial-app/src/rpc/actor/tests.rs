@@ -120,6 +120,7 @@ pub(super) fn with_runtime(
     let (_, approvals) = mpsc::channel();
     let (_, questions) = mpsc::channel();
     let (_, rx) = mpsc::channel();
+    let active = Arc::new(AtomicBool::new(false));
     let ui = RpcUi {
         out: out.clone(),
         approvals,
@@ -129,6 +130,7 @@ pub(super) fn with_runtime(
         interrupt: flag.clone(),
         input_disconnected: Arc::new(AtomicBool::new(false)),
         steering: Default::default(),
+        active: active.clone(),
         prompt_queued: Arc::new(AtomicBool::new(false)),
         next: 0,
         node_cursors: Default::default(),
@@ -152,7 +154,7 @@ pub(super) fn with_runtime(
         rx,
         worker_out: &out,
         flag,
-        active: Arc::new(AtomicBool::new(false)),
+        active,
         worker_closing: Arc::new(AtomicBool::new(false)),
         worker_prompt_queued: Arc::new(AtomicBool::new(false)),
         worker_host: Default::default(),
@@ -494,6 +496,7 @@ fn move_rebuild_publishes_destination_to_queries_and_controller_administration()
                 control_tx,
                 worker_out: runtime.worker_out.clone(),
                 flag: runtime.flag.clone(),
+                wrap_up: Default::default(),
                 active: runtime.active.clone(),
                 worker_closing: runtime.worker_closing.clone(),
                 worker_prompt_queued: runtime.worker_prompt_queued.clone(),
@@ -1355,6 +1358,7 @@ fn persistent_modes_rebuild_and_publish_effective_settings_without_resetting_ses
                 control_tx,
                 worker_out: runtime.worker_out.clone(),
                 flag: runtime.flag.clone(),
+                wrap_up: Default::default(),
                 active: runtime.active.clone(),
                 worker_closing: runtime.worker_closing.clone(),
                 worker_prompt_queued: runtime.worker_prompt_queued.clone(),
@@ -1780,6 +1784,57 @@ fn guest_retry_refuses_before_rewinding_local_history() {
             );
             assert_eq!(runtime.agent.session().id(), session);
             assert_eq!(runtime.agent.session().messages(), before);
+        },
+    );
+}
+
+#[test]
+fn maintenance_yields_when_any_actor_request_is_active() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            assert!(runtime.ui.maintenance_ready());
+            runtime.active.store(true, Ordering::SeqCst);
+            assert!(
+                !runtime.ui.maintenance_ready(),
+                "queued non-turn actor requests must make idle maintenance yield"
+            );
+            runtime.active.store(false, Ordering::SeqCst);
+            assert!(runtime.ui.maintenance_ready());
+        },
+    );
+}
+
+#[test]
+fn query_snapshot_matches_actor_modes_goal_and_evidence_queries() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let mut projection = QueryProjection::default();
+            query_snapshot(&runtime.agent, &mut projection);
+            assert_eq!(
+                super::modes_reply(&projection).unwrap(),
+                runtime
+                    .handle_request(&json!({"method": "get_modes", "params": {}}))
+                    .unwrap()
+            );
+            assert_eq!(
+                super::goal_get_reply(&projection).unwrap(),
+                runtime
+                    .handle_request(&json!({"method": "goal", "params": {"action": "get"}}))
+                    .unwrap()
+            );
+            for action in ["turns", "model_request", "checks"] {
+                let params = json!({"action": action});
+                assert_eq!(
+                    diagnostics::cached(&projection.evidence, &params).unwrap(),
+                    runtime
+                        .handle_request(&json!({"method": "evidence", "params": params}))
+                        .unwrap(),
+                    "evidence action {action}"
+                );
+            }
         },
     );
 }

@@ -143,6 +143,10 @@ MCP sign-in uses the same events: `mcp_login` (`server`) runs `/mcp login` for a
 Session administration, models and settings (native `dial rpc` only for the `session_admin` and `settings` groups). These controller methods answer while a turn runs:
 
 - `list_sessions` (`offset`, `limit` 1–500 default 50, `include_empty`): this project's sessions in picker order, pinned first then latest activity. Each entry has `session_id`, `title`, `started`, `updated`, `messages`, `user_messages`, `model`, `parent_id`, `first_message`, `last_message`, `last_answer`, `pinned`, `current` and `open_elsewhere`. The page has `offset`, `total` and `next_offset`. Sessions without a user request are omitted unless `include_empty` is true; the current session is always listed. Over ACP, `session/list` keeps its own ACP shape.
+- `session_messages` (`session_id`): the saved conversation of one session of this project, read
+  without resuming it or claiming its writer lock. Returns `{session_id, messages}` in the same
+  shape as `messages` (the active branch's full conversation). Clients can show a session at once
+  and resume it in the background. Unknown ids return `not_found`.
 - `search_sessions` (`query`, optional `limit` 1–1,000 default 50): read-only full-text history
   search through the same local index as `/search`. The nonblank query is capped at 4,096 UTF-8
   bytes after trimming. Returns `{query, limit, hits, has_more}`; hits contain `session_id`,

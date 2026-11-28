@@ -63,6 +63,10 @@ fn local_prefix_is_merged_without_moving_guidance_or_tool_history() {
     assert_eq!(wire[5], json!({"role":"user","content":"continue"}));
     assert_eq!(messages, original);
     assert_eq!(local(&wire).unwrap(), wire);
+    assert_eq!(
+        WireForm::SingleSystemPrefix.apply(&messages).unwrap().as_ref(),
+        &wire
+    );
 }
 
 #[test]
@@ -76,6 +80,10 @@ fn local_preserves_empty_and_already_compatible_conversations() {
         ],
     ] {
         assert_eq!(local(&messages).unwrap(), messages);
+        assert!(matches!(
+            WireForm::SingleSystemPrefix.apply(&messages).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
 
@@ -100,6 +108,11 @@ fn local_transient_guidance_ends_the_system_prefix() {
 fn local_rejects_invalid_system_content_instead_of_losing_it() {
     for content in [Value::Null, json!(42), json!({"text":"policy"})] {
         assert!(local(&[json!({"role":"system","content":content})]).is_err());
+        assert!(
+            WireForm::SingleSystemPrefix
+                .apply(&[json!({"role":"system","content":content})])
+                .is_err()
+        );
     }
 }
 

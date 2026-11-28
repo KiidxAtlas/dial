@@ -194,6 +194,9 @@ pub struct ModelServer {
     process: Supervised,
     base_url: String,
     model: String,
+    /// Model id to send in `/v1/chat/completions` when the runtime advertises its own id
+    /// (e.g. `mlx-serve`, `vllm-mlx`, `mistralrs-server`, `vllm`, `sglang`, `exllamav3-server`).
+    served_model: Option<String>,
     vlm: bool,
     /// Serves only `POST /v1/embeddings` (MLX-VLM embedding checkpoint), never chat.
     embedding: bool,
@@ -205,6 +208,8 @@ pub struct ModelServer {
     gguf_context: Option<Option<u64>>,
     tracking: Option<crate::platform::process_record::Record>,
     stderr: Arc<Mutex<Tail>>,
+    /// Monotonic timestamp of the most recent request or warmup, used for idle auto-unload.
+    last_used: Instant,
 }
 
 enum Failure {
@@ -312,7 +317,9 @@ impl ModelServer {
     }
 
     pub fn request_model(&self) -> &str {
-        if self.vlm || self.embedding {
+        if let Some(served) = &self.served_model {
+            served
+        } else if self.vlm || self.embedding {
             &self.model
         } else {
             SERVER_MODEL
@@ -357,9 +364,19 @@ impl ModelServer {
         self.process.stop();
         self.tracking.take();
     }
+    /// Record activity so the idle reaper keeps this server resident.
+    pub fn touch(&mut self) {
+        self.last_used = Instant::now();
+    }
+
+    /// How long this managed server has been idle since its last request or warmup.
+    pub fn idle_for(&self) -> Duration {
+        self.last_used.elapsed()
+    }
 
     /// Start a new diagnostic window so a failed request cannot quote a previous request's error.
     pub fn begin_request(&mut self) -> Result<()> {
+        self.touch();
         self.stderr
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -489,10 +506,11 @@ pub fn ensure_profile_tracked<'a>(
             startup_timeout_secs,
             interrupt,
         )?);
+    } else if let Some(server) = slot.as_mut() {
+        server.touch();
     }
     slot.as_mut().context("model server slot is empty")
 }
-
 /// Whether the server constrains tool calls with the grammar. Mirrors the
 /// `DIAL_TOOL_GRAMMAR` handoff in `launch`; Python defaults to enabled.
 pub fn tool_grammar_enabled(context: Option<&crate::config::types::Config>) -> bool {
@@ -589,20 +607,51 @@ const SHARED_SLOT_FLAGS: [&str; 3] = [
     "--kv-unified-per-slot",
     "--no-cache-idle-slots",
 ];
+/// Default soft-close reasoning token budget for Dial-managed `llama-server` binaries that support
+/// `--reasoning-budget`. Matches the 3/4 * 4096-token soft-close target used on Dial's MLX runtime,
+/// letting the server close the thought block cleanly and emit a tool call or answer in-place
+/// instead of aborting the stream.
+const LLAMA_DEFAULT_REASONING_BUDGET: u32 = 3072;
+const LLAMA_REASONING_BUDGET_MESSAGE: &str =
+    "I have reasoned enough; I will now execute the next step or answer directly.";
+/// Default KV-shift chunk threshold for Dial-managed `llama-server` binaries that support
+/// `--cache-reuse`, letting the server salvage matching prompt suffixes when earlier history shifts.
+const LLAMA_DEFAULT_CACHE_REUSE: u32 = 256;
 /// Bound on the offline `llama-server --help` probe; a slower or hung binary counts as old.
 const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const HELP_PROBE_MAX_BYTES: u64 = 1 << 20;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LlamaHelpCaps {
+    shared_slots: bool,
+    reasoning_budget: bool,
+    reasoning_budget_message: bool,
+    cache_reuse: bool,
+}
+
+fn help_options(help: &str) -> std::collections::HashSet<&str> {
+    help.split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|word| word.starts_with("--"))
+        .collect()
+}
+
 /// Whether `help` lists every shared-slot flag as a whole option name (`--kv-unified` is not
 /// matched by `--kv-unified-per-slot`).
+#[cfg(test)]
 fn help_lists_shared_slots(help: &str) -> bool {
-    let options: std::collections::HashSet<&str> = help
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|word| word.starts_with("--"))
-        .collect();
+    let options = help_options(help);
     SHARED_SLOT_FLAGS.iter().all(|flag| options.contains(flag))
 }
 
+fn help_caps_from(help: &str) -> LlamaHelpCaps {
+    let options = help_options(help);
+    LlamaHelpCaps {
+        shared_slots: SHARED_SLOT_FLAGS.iter().all(|flag| options.contains(flag)),
+        reasoning_budget: options.contains("--reasoning-budget"),
+        reasoning_budget_message: options.contains("--reasoning-budget-message"),
+        cache_reuse: options.contains("--cache-reuse"),
+    }
+}
 /// Runs `program --help` once with a deadline and returns its standard output (capped), or `None`
 /// when it cannot start or does not finish in time. Nothing is loaded and no network is used.
 fn probe_help(program: &Path, timeout: Duration) -> Option<String> {
@@ -634,15 +683,22 @@ fn probe_help(program: &Path, timeout: Duration) -> Option<String> {
     reader.join().ok()
 }
 
-/// Whether the `llama-server` at `program` supports the shared two-slot layout, probed once per
-/// path and process so routing and launches agree for the whole session.
-fn shared_slots_supported(program: &Path) -> bool {
-    static PROBED: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, bool>>> =
+/// Probes `program --help` once per path and process so routing and launches agree for the whole
+/// session without re-spawning the binary.
+fn llama_help_caps(program: &Path) -> LlamaHelpCaps {
+    static PROBED: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, LlamaHelpCaps>>> =
         std::sync::LazyLock::new(Default::default);
     let mut probed = PROBED.lock().unwrap_or_else(|p| p.into_inner());
     *probed.entry(program.to_path_buf()).or_insert_with(|| {
-        probe_help(program, HELP_PROBE_TIMEOUT).is_some_and(|help| help_lists_shared_slots(&help))
+        probe_help(program, HELP_PROBE_TIMEOUT)
+            .map(|help| help_caps_from(&help))
+            .unwrap_or_default()
     })
+}
+
+/// Whether the `llama-server` at `program` supports the shared two-slot layout.
+fn shared_slots_supported(program: &Path) -> bool {
+    llama_help_caps(program).shared_slots
 }
 
 /// Slots a Dial-launched `llama-server` is asked for: [`LLAMA_SHARED_SLOTS`] when the installed
@@ -654,7 +710,6 @@ pub fn dial_llama_slots() -> Option<u32> {
         .is_some_and(|program| shared_slots_supported(&program))
         .then_some(LLAMA_SHARED_SLOTS)
 }
-
 /// KV tokens reserved beyond the main window for the side slot: a quarter of the window within
 /// 4096..=16384, never more than the window, in 256-token steps.
 fn side_reserve(tokens: u64) -> u64 {
@@ -685,9 +740,14 @@ struct LlamaLaunch<'a> {
     context_tokens: Option<u64>,
     /// Unified KV pool for the two-slot layout (see [`shared_pool`]); `None` launches one slot.
     shared_pool: Option<u64>,
+    /// Soft-close thinking token budget when the `llama-server` binary supports `--reasoning-budget`.
+    reasoning_budget: Option<u32>,
+    /// Whether the binary also supports `--reasoning-budget-message`.
+    reasoning_budget_message: bool,
+    /// Minimum KV-shift chunk size when the binary supports `--cache-reuse`.
+    cache_reuse: Option<u32>,
     port: u16,
 }
-
 impl LlamaLaunch<'_> {
     /// Maps `[local_runtime]` onto llama.cpp. Settings without an exact llama.cpp equivalent are
     /// refused rather than approximated, so a launch never silently ignores configuration.
@@ -764,10 +824,153 @@ impl LlamaLaunch<'_> {
                 runtime.kv_group_size.is_none() && runtime.quantized_kv_start.is_none(),
                 "kv_group_size and quantized_kv_start are MLX-only; llama.cpp quantizes the whole KV cache with fixed blocks"
             );
-            args.extend(["--cache-type-k", kind, "--cache-type-v", kind].map(Into::into));
+            args.extend(
+                [
+                    "--flash-attn",
+                    "on",
+                    "--cache-type-k",
+                    kind,
+                    "--cache-type-v",
+                    kind,
+                ]
+                .map(Into::into),
+            );
+        }
+        if let Some(budget) = self.reasoning_budget.filter(|tokens| *tokens > 0) {
+            args.extend(["--reasoning-budget".into(), budget.to_string().into()]);
+            if self.reasoning_budget_message {
+                args.extend([
+                    "--reasoning-budget-message".into(),
+                    LLAMA_REASONING_BUDGET_MESSAGE.into(),
+                ]);
+            }
+        }
+        if let Some(chunk) = self.cache_reuse.filter(|tokens| *tokens > 0) {
+            args.extend(["--cache-reuse".into(), chunk.to_string().into()]);
         }
         Ok(args)
     }
+}
+
+/// Check that `adapter` is a PEFT directory (`adapter_config.json` + `adapter_model.safetensors`).
+fn require_peft_adapter(adapter: &Path, runtime_name: &str) -> anyhow::Result<()> {
+    ensure!(
+        adapter.join("adapter_config.json").is_file()
+            && adapter.join("adapter_model.safetensors").is_file(),
+        "{} is not a PEFT LoRA adapter (expected adapter_config.json + adapter_model.safetensors); export it with `dial improve export-adapter --format peft` for {runtime_name}",
+        adapter.display()
+    );
+    Ok(())
+}
+
+/// Arguments for `mlx-serve` serving a local MLX chat checkpoint on loopback `port`.
+fn mlx_serve_chat_args(model: &str, port: u16) -> Vec<std::ffi::OsString> {
+    vec![
+        "--model".into(),
+        model.into(),
+        "--serve".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+    ]
+}
+
+/// Arguments for `vllm-mlx serve` serving a local MLX checkpoint on loopback `port`.
+fn vllm_mlx_args(model: &str, port: u16) -> Vec<std::ffi::OsString> {
+    vec![
+        "serve".into(),
+        model.into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+    ]
+}
+
+/// Arguments for `mistralrs-server` serving either a GGUF file or a local Safetensors/MLX folder.
+fn mistralrs_args(
+    model: &str,
+    gguf: Option<&Path>,
+    port: u16,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = vec!["--port".into(), port.to_string().into()];
+    if let Some(file) = gguf {
+        let dir = file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = file
+            .file_name()
+            .ok_or_else(|| anyhow!("GGUF path {} has no filename", file.display()))?;
+        args.extend([
+            "gguf".into(),
+            "-m".into(),
+            dir.as_os_str().to_owned(),
+            "-f".into(),
+            name.to_owned(),
+        ]);
+    } else {
+        args.extend(["plain".into(), "-m".into(), model.into()]);
+    }
+    Ok(args)
+}
+
+/// Arguments for `vllm serve` serving a HuggingFace Safetensors checkpoint (+ optional PEFT LoRA).
+fn vllm_args(
+    model: &str,
+    adapter: Option<&Path>,
+    port: u16,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "serve".into(),
+        model.into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+    ];
+    if let Some(adapter) = adapter {
+        require_peft_adapter(adapter, "vLLM")?;
+        let mut spec = std::ffi::OsString::from("dial=");
+        spec.push(adapter);
+        args.extend(["--enable-lora".into(), "--lora-modules".into(), spec]);
+    }
+    Ok(args)
+}
+
+/// Arguments for `sglang serve` serving a HuggingFace Safetensors checkpoint (+ optional PEFT LoRA).
+fn sglang_args(
+    model: &str,
+    adapter: Option<&Path>,
+    port: u16,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "serve".into(),
+        "--model-path".into(),
+        model.into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string().into(),
+    ];
+    if let Some(adapter) = adapter {
+        require_peft_adapter(adapter, "SGLang")?;
+        let mut spec = std::ffi::OsString::from("dial=");
+        spec.push(adapter);
+        args.extend(["--lora-paths".into(), spec]);
+    }
+    Ok(args)
+}
+
+/// Extract the first usable model id from an OpenAI-compatible `GET /v1/models` body.
+fn first_served_model_id(body: &serde_json::Value) -> Option<String> {
+    body.get("data")?
+        .as_array()?
+        .iter()
+        .filter_map(|row| row.get("id").and_then(serde_json::Value::as_str))
+        .find(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 fn launch(
@@ -791,20 +994,26 @@ fn launch(
             "{model} is a Splash bundle, which only LM Studio can run: load it in LM Studio and select it under the LM Studio provider (Dial lists LM Studio's loaded models automatically)"
         )));
     }
+    let exl3 = format == Some(llm::local_format::LocalFormat::Exl3);
+    if exl3 && cfg!(target_os = "macos") {
+        return Err(Failure::Fatal(anyhow!(
+            "{model} is an EXL3 (ExLlamaV3) checkpoint, which requires an NVIDIA CUDA GPU on Linux or Windows. Connect to a remote ExLlamaV3/TabbyAPI server via /providers, or use an MLX/GGUF checkpoint on macOS."
+        )));
+    }
     let gguf = if format == Some(llm::local_format::LocalFormat::Gguf) {
         llm::local_format::gguf_file(Path::new(model))
     } else {
         None
     };
-    use llm::local_runtime::{GgufLoader, LocalEngine};
+    use llm::local_runtime::{GgufEngines, GgufLoader, LocalEngine};
     if gguf.is_none()
         && runtime.engine != LocalEngine::Auto
         && !format
-            .is_some_and(|f| LocalEngine::choices(f, Default::default()).contains(&runtime.engine))
+            .is_some_and(|f| LocalEngine::choices(f, GgufEngines::Unknown).contains(&runtime.engine))
     {
         return Err(Failure::Fatal(anyhow!(
-            "The selected {:?} engine is not a known loader for this model on this platform. Review the engine choice before loading it.",
-            runtime.engine
+            "The selected {} engine is not a known loader for this model on this platform. Review the engine choice before loading it.",
+            runtime.engine.label()
         )));
     }
     if embedding && gguf.is_some() {
@@ -812,45 +1021,102 @@ fn launch(
             "{model} is a GGUF file; local image embeddings need an MLX embedding checkpoint, or set an OpenAI-compatible embedding endpoint"
         )));
     }
-    let vlm = !embedding && gguf.is_none() && llm::catalog::uses_mlx_vlm(Path::new(model));
+    let resolved_non_gguf = if !exl3 && gguf.is_none() && !embedding {
+        match runtime.engine {
+            LocalEngine::Auto => format
+                .and_then(|f| LocalEngine::default_for(f, GgufEngines::Unknown))
+                .unwrap_or(LocalEngine::Mlx),
+            other => other,
+        }
+    } else {
+        LocalEngine::Mlx
+    };
+    let vlm = !embedding
+        && gguf.is_none()
+        && resolved_non_gguf == LocalEngine::Mlx
+        && llm::catalog::uses_mlx_vlm(Path::new(model));
     runtime.validate().map_err(Failure::Fatal)?;
     if vlm && !runtime.is_default() {
         return Err(Failure::Fatal(anyhow!(
             "draft-model and KV-cache settings apply to MLX-LM only; this model runs through MLX-VLM without them"
         )));
     }
-    let mut command = if let Some(file) = &gguf {
+    // External OpenAI-compatible runtimes advertise their own model id at `/v1/models` rather than
+    // accepting Dial's `default_model` alias.
+    let mut discover_model_id = false;
+    let mut explicit_request_model: Option<String> = None;
+    let mut command = if exl3 {
+        if steering.is_some() {
+            return Err(Failure::Fatal(anyhow!(
+                "activation steering needs an MLX checkpoint; EXL3 models run without it"
+            )));
+        }
+        let program = llm::local_format::exl3_server().ok_or_else(|| {
+            Failure::Fatal(anyhow!(
+                "EXL3 model {model} requires an ExLlamaV3 / TabbyAPI server executable (run `/setup exl3`, select ExLlamaV3 in Dial Desktop, or set DIAL_EXL3_SERVER), or configure a TabbyAPI endpoint in /providers"
+            ))
+        })?;
+        let mut command = Command::new(program);
+        command
+            .arg("--model-dir")
+            .arg(model)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string());
+        if let Some(adapter) = adapter {
+            require_peft_adapter(adapter, "ExLlamaV3").map_err(Failure::Fatal)?;
+            command.arg("--lora-dir").arg(adapter);
+        }
+        discover_model_id = true;
+        command
+    } else if let Some(file) = &gguf {
         if steering.is_some() {
             return Err(Failure::Fatal(anyhow!(
                 "activation steering needs an MLX checkpoint; GGUF models run without it"
             )));
         }
         let loader = GgufLoader::resolve(file, runtime.engine).map_err(Failure::Fatal)?;
-        let atomic = loader == GgufLoader::Atomic;
         let program = loader.program().map_err(Failure::Fatal)?;
-        let requested = requested_context(context);
-        let dspark = atomic
-            .then(|| llm::local_format::inkling_dspark(file))
-            .flatten()
-            .filter(|_| runtime.is_default() && adapter.is_none());
-        let context_tokens = if dspark.is_some() {
-            Some(requested.unwrap_or(4096).min(4096))
+        if loader == GgufLoader::MistralRs {
+            if adapter.is_some() {
+                return Err(Failure::Fatal(anyhow!(
+                    "mistral.rs GGUF launch does not accept a separate LoRA adapter; switch the engine to llama.cpp or export a fused GGUF"
+                )));
+            }
+            if !runtime.is_default() {
+                return Err(Failure::Fatal(anyhow!(
+                    "draft-model and KV-cache settings are not forwarded to mistral.rs; clear them or switch the engine to llama.cpp"
+                )));
+            }
+            let mut command = Command::new(program);
+            command.args(mistralrs_args(model, Some(file), port).map_err(Failure::Fatal)?);
+            discover_model_id = true;
+            command
         } else {
-            llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
-                .map_err(Failure::Fatal)?
-        };
+            let atomic = loader == GgufLoader::Atomic;
+            let requested = requested_context(context);
+        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
+            .map_err(Failure::Fatal)?;
+        let dspark = (atomic && runtime.is_default() && adapter.is_none())
+            .then(|| llm::local_format::inkling_dspark(file, context_tokens))
+            .flatten();
         let projector = llm::local_format::gguf_projector(file);
-        let shared_pool = shared_pool(
-            context_tokens,
-            !atomic && shared_slots_supported(&program),
-            |pool| llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits),
-        );
+        let caps = llama_help_caps(&program);
+        let shared_pool = shared_pool(context_tokens, !atomic && caps.shared_slots, |pool| {
+            llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits)
+        });
         let launch = LlamaLaunch {
             model: file,
             projector: projector.as_deref(),
             adapter,
             context_tokens,
             shared_pool,
+            reasoning_budget: caps
+                .reasoning_budget
+                .then_some(LLAMA_DEFAULT_REASONING_BUDGET),
+            reasoning_budget_message: caps.reasoning_budget_message,
+            cache_reuse: caps.cache_reuse.then_some(LLAMA_DEFAULT_CACHE_REUSE),
             port,
         };
         let mut command = Command::new(program);
@@ -906,8 +1172,6 @@ fn launch(
                     "8",
                     "-tb",
                     "8",
-                    "--temp",
-                    "0",
                     "--cache-ram",
                     "0",
                     "--ctx-checkpoints",
@@ -916,7 +1180,100 @@ fn launch(
                 ]);
             }
         }
-        command
+            command
+        }
+    } else if resolved_non_gguf != LocalEngine::Mlx {
+        if steering.is_some() {
+            return Err(Failure::Fatal(anyhow!(
+                "activation steering requires Dial's Python MLX runtime; {} runs without it",
+                resolved_non_gguf.label()
+            )));
+        }
+        if !runtime.is_default() {
+            return Err(Failure::Fatal(anyhow!(
+                "draft-model and KV-cache settings apply to Dial's Python MLX-LM runtime only; clear them or switch the engine to MLX"
+            )));
+        }
+        discover_model_id = true;
+        match resolved_non_gguf {
+            LocalEngine::MlxServe => {
+                if adapter.is_some() {
+                    return Err(Failure::Fatal(anyhow!(
+                        "MLX-Serve does not load Dial LoRA adapters; switch the engine to MLX or fuse the adapter first"
+                    )));
+                }
+                let program = llm::local_format::mlx_serve().ok_or_else(|| {
+                    Failure::Fatal(anyhow!(
+                        "MLX-Serve is not installed: run `/setup mlx-serve` or select MLX-Serve in Dial Desktop to download it, or set DIAL_MLX_SERVE"
+                    ))
+                })?;
+                let mut command = Command::new(program);
+                command.args(mlx_serve_chat_args(model, port));
+                command
+            }
+            LocalEngine::VllmMlx => {
+                if adapter.is_some() {
+                    return Err(Failure::Fatal(anyhow!(
+                        "vLLM-MLX launch does not accept a Dial LoRA adapter; switch the engine to MLX or fuse the adapter first"
+                    )));
+                }
+                let program = llm::local_format::vllm_mlx_server().ok_or_else(|| {
+                    Failure::Fatal(anyhow!(
+                        "vLLM-MLX is not installed: run `/setup vllm-mlx` or select vLLM-MLX in Dial Desktop to install it, or set DIAL_VLLM_MLX_SERVER"
+                    ))
+                })?;
+                let mut command = Command::new(program);
+                command.args(vllm_mlx_args(model, port));
+                command
+            }
+            LocalEngine::MistralRs => {
+                if adapter.is_some() {
+                    return Err(Failure::Fatal(anyhow!(
+                        "mistral.rs plain launch does not accept a separate LoRA adapter; fuse the adapter or switch engines"
+                    )));
+                }
+                let program = llm::local_format::mistralrs_server().ok_or_else(|| {
+                    Failure::Fatal(anyhow!(
+                        "mistral.rs (`mistralrs-server`) is not installed: run `/setup mistral-rs` or select mistral.rs in Dial Desktop, or set DIAL_MISTRALRS_SERVER"
+                    ))
+                })?;
+                let mut command = Command::new(program);
+                command.args(mistralrs_args(model, None, port).map_err(Failure::Fatal)?);
+                command
+            }
+            LocalEngine::Vllm => {
+                let program = llm::local_format::vllm_server().ok_or_else(|| {
+                    Failure::Fatal(anyhow!(
+                        "vLLM is not installed: run `/setup vllm` or select vLLM in Dial Desktop to install it, or set DIAL_VLLM_SERVER"
+                    ))
+                })?;
+                if adapter.is_some() {
+                    explicit_request_model = Some("dial".to_owned());
+                }
+                let mut command = Command::new(program);
+                command.args(vllm_args(model, adapter, port).map_err(Failure::Fatal)?);
+                command
+            }
+            LocalEngine::Sglang => {
+                let program = llm::local_format::sglang_server().ok_or_else(|| {
+                    Failure::Fatal(anyhow!(
+                        "SGLang is not installed: run `/setup sglang` or select SGLang in Dial Desktop to install it, or set DIAL_SGLANG_SERVER"
+                    ))
+                })?;
+                if adapter.is_some() {
+                    explicit_request_model = Some("dial".to_owned());
+                }
+                let mut command = Command::new(program);
+                command.args(sglang_args(model, adapter, port).map_err(Failure::Fatal)?);
+                command
+            }
+            other => {
+                return Err(Failure::Fatal(anyhow!(
+                    "Unsupported local runtime {} for model {model}",
+                    other.label()
+                )));
+            }
+        }
     } else {
         let mut command = Command::new(python);
         // `--opt=value` keeps a value that starts with `-` from being read as a flag.
@@ -1026,28 +1383,34 @@ fn launch(
         collect_stderr(stderr.ok_or_else(|| Failure::Fatal(anyhow!("missing server stderr")))?);
     let base_url = format!("http://127.0.0.1:{port}");
 
+    let fallback_model = if let Some(explicit) = explicit_request_model.as_deref() {
+        explicit
+    } else if vlm || embedding || discover_model_id {
+        model
+    } else {
+        SERVER_MODEL
+    };
     let outcome = wait_ready(
         &mut process,
         &base_url,
         &tail,
         deadline,
         interrupt,
-        if vlm || embedding {
-            model
-        } else {
-            SERVER_MODEL
-        },
+        fallback_model,
+        discover_model_id && explicit_request_model.is_none(),
         embedding,
     );
     match outcome {
-        Ok(()) => {
+        Ok(discovered) => {
             if let Some(record) = &mut tracking {
                 record.phase("loaded").map_err(Failure::Fatal)?;
             }
+            let served_model = explicit_request_model.or(discovered);
             Ok(ModelServer {
                 process,
                 base_url,
                 model: model.to_string(),
+                served_model,
                 vlm,
                 embedding,
                 adapter: adapter.map(Path::to_path_buf),
@@ -1057,6 +1420,7 @@ fn launch(
                 gguf_context: gguf.is_some().then(|| requested_context(context)),
                 tracking,
                 stderr: tail,
+                last_used: Instant::now(),
             })
         }
         Err(error) => {
@@ -1080,10 +1444,12 @@ fn wait_ready(
     deadline: Option<Instant>,
     interrupt: Option<Arc<AtomicBool>>,
     model: &str,
+    discover_model_id: bool,
     embedding: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let models_url = format!("{base_url}/v1/models");
     let mut last_probe = "no health response yet".to_string();
+    let mut discovered_model: Option<String> = None;
     loop {
         if interrupt
             .as_ref()
@@ -1104,7 +1470,15 @@ fn wait_ready(
             .get(&models_url)
             .call()
         {
-            Ok(response) if response.status().as_u16() == 200 => break,
+            Ok(mut response) if response.status().as_u16() == 200 => {
+                if discover_model_id
+                    && let Ok(text) = response.body_mut().read_to_string()
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    discovered_model = first_served_model_id(&value);
+                }
+                break;
+            }
             Ok(response) => last_probe = format!("HTTP {}", response.status().as_u16()),
             Err(error) => last_probe = error.to_string(),
         }
@@ -1112,6 +1486,7 @@ fn wait_ready(
             remaining.map_or(POLL_INTERVAL, |remaining| POLL_INTERVAL.min(remaining)),
         );
     }
+    let warmup_model = discovered_model.as_deref().unwrap_or(model);
     // The HTTP port opens before the model finishes loading, and a bad
     // model/adapter only fails on first use. One 1-token request blocks until
     // the weights are loaded and proves generation works.
@@ -1122,7 +1497,7 @@ fn wait_ready(
             .max(1)
     });
     let warmed = if embedding {
-        warm_embedding(base_url, model, remaining, interrupt.clone())
+        warm_embedding(base_url, warmup_model, remaining, interrupt.clone())
     } else {
         let warmup = Chat {
             messages: vec![json!({"role": "user", "content": "ping"})],
@@ -1136,7 +1511,7 @@ fn wait_ready(
                 headers: &[],
                 url: &llm::completions_url(base_url),
                 auth: None,
-                model,
+                model: warmup_model,
             },
             &warmup,
             remaining,
@@ -1170,7 +1545,7 @@ fn wait_ready(
         !process.exited().context("observing server exit")?,
         "model server exited right after becoming ready (is the port owned by another process?)"
     );
-    Ok(())
+    Ok(discovered_model)
 }
 
 /// One text embedding blocks until the embedding weights load and proves the route works.

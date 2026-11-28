@@ -84,6 +84,33 @@ fn provider_overflow_messages_are_context_overflow() {
     assert_eq!(http(500, omlx), ErrorClass::ContextOverflow);
 }
 
+/// LM Studio's MLX engine running out of Metal memory while prefilling a prompt: a smaller
+/// (compacted) prompt needs less prefill memory, so this recovers like an overflow.
+#[test]
+fn metal_prefill_out_of_memory_is_a_context_overflow() {
+    let lm_studio = "Error in iterating prediction stream: Exception: Encountered fatal exception in the backend generation thread: Traceback (most recent call last): File \"mlx_engine/model_kit/batched_vision/batch_generator.py\", line 806, in prompt_step mx.eval([c.state for c in self.prompt_cache]) RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)";
+    assert_eq!(
+        classify_stream_error(&[], lm_studio),
+        ErrorClass::ContextOverflow
+    );
+    assert!(is_context_overflow(&anyhow::anyhow!(
+        "model server reported a stream error: {lm_studio}"
+    )));
+    assert_eq!(http(500, lm_studio), ErrorClass::ContextOverflow);
+    assert!(is_memory_overflow(&anyhow::anyhow!(
+        "model server reported a stream error: {lm_studio}"
+    )));
+    // A token-limit overflow is not a memory ceiling.
+    assert!(!is_memory_overflow(&anyhow::anyhow!(
+        "model server reported a stream error: prompt filled the context window"
+    )));
+    // Loading a model that does not fit is not something compaction can fix.
+    assert_ne!(
+        http(400, "Failed to load model \"big-model\". Error: out of memory"),
+        ErrorClass::ContextOverflow
+    );
+}
+
 #[test]
 fn payload_rejection_is_distinguished_from_token_overflow() {
     assert_eq!(

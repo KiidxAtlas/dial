@@ -110,28 +110,43 @@ impl Agent<'_> {
                     "reasoning_gate",
                     json!({"reason":error.to_string(),"elapsed_ms":sent.started.elapsed().as_millis()}),
                 )?;
-                let plan_gate = self.config.reasoning_guard.require_plan
-                    && !self.todo.has_open()
-                    && !error
-                        .downcast_ref::<crate::agent::workflow::reasoning::GateHit>()
-                        .is_some_and(|hit| hit.is_repetition());
-                let recovered = if plan_gate {
-                    self.reasoning_recovery
-                        .intercept_planned(&error.to_string())
+                let hit = error.downcast_ref::<crate::agent::workflow::reasoning::GateHit>();
+                let digest = hit.and_then(|hit| hit.digest());
+                if hit.is_some_and(|hit| hit.is_user_wrap_up()) {
+                    let carry = digest
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\nEarlier reasoning summary (do not re-derive): {s}"))
+                        .unwrap_or_default();
+                    let nudge = format!(
+                        "The user asked you to wrap up thinking and act immediately. Emit the next tool call or direct answer now without further deliberation.{carry}"
+                    );
+                    ui.notice("Wrapping up thinking and acting now…");
+                    turn.wrap_up_next_step = true;
+                    self.push(json!({"role":"user","content":nudge}))?;
                 } else {
-                    self.reasoning_recovery.intercept(&error.to_string())
-                };
-                turn.plan_after_gate = plan_gate && recovered.is_ok();
-                match recovered {
-                    Ok(message) => {
-                        ui.notice(&message);
-                        self.push(json!({"role":"user","content":message}))?;
-                    }
-                    Err(message) => {
-                        return self
-                            .stop_turn(ui, message, sent.step + 1)
-                            .map(crate::agent::run::engine::Tick::Finished)
-                            .map(ControlFlow::Break);
+                    let plan_gate = self.config.reasoning_guard.require_plan
+                        && !self.todo.has_open()
+                        && !hit.is_some_and(|hit| hit.is_repetition());
+                    let recovered = if plan_gate {
+                        self.reasoning_recovery
+                            .intercept_planned_with_digest(&error.to_string(), digest)
+                    } else {
+                        self.reasoning_recovery
+                            .intercept_with_digest(&error.to_string(), digest)
+                    };
+                    turn.plan_after_gate = plan_gate && recovered.is_ok();
+                    match recovered {
+                        Ok(message) => {
+                            ui.notice(&message);
+                            self.push(json!({"role":"user","content":message}))?;
+                        }
+                        Err(message) => {
+                            return self
+                                .stop_turn(ui, message, sent.step + 1)
+                                .map(crate::agent::run::engine::Tick::Finished)
+                                .map(ControlFlow::Break);
+                        }
                     }
                 }
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
@@ -209,10 +224,22 @@ impl Agent<'_> {
                         sent.sent_messages,
                     );
                 }
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                    crate::agent::ui::ui_event::EventKind::Recovery,
-                    "context window exceeded; compacting and retrying",
-                ));
+                // Out of memory below the served window: plan against what this machine could
+                // actually prefill, so later turns compact before failing the same way.
+                if crate::llm::errors::is_memory_overflow(&error)
+                    && let Some(window) = self.learn_memory_ceiling(sent.request_context)
+                {
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                        crate::agent::ui::ui_event::EventKind::Recovery,
+                        format!("model server ran out of memory near {} tokens; planning against a {window}-token window", sent.request_context),
+                    ));
+                }
+                if crate::agent::compact::compaction::cut(&sent.context_before, 0).is_some() {
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                        crate::agent::ui::ui_event::EventKind::Recovery,
+                        "context window exceeded; compacting and retrying",
+                    ));
+                }
                 let overflow_request = Chat {
                     messages: sent.context_before.clone(),
                     tools: sent.offer.clone(),
@@ -252,12 +279,18 @@ impl Agent<'_> {
                                 )),
                             ));
                         }
+                        let message = if compaction_error
+                            .is::<crate::agent::compact::compaction::NothingToCompact>()
+                        {
+                            // Only the newest message group is left, so neither compacting nor
+                            // "continue" can shrink the request; say what the provider refused.
+                            let detail: String = format!("{error:#}").chars().take(400).collect();
+                            format!("Stopped: the model rejected the request as too large for its context ({detail}). There is no earlier conversation to compact: the request is only the latest message plus Dial's system prompt and tool definitions, so compacting or saying \"continue\" will not help. Select a model with a larger context window (for a local model, load it with a larger context or more memory), or send a shorter message.")
+                        } else {
+                            format!("Stopped: the request exceeded the model's context window and compaction could not make room ({compaction_error:#}). The session and completed work are kept; select a larger-window model, compact manually, or say \"continue\" to retry.")
+                        };
                         return self
-                            .stop_turn(
-                                ui,
-                                format!("Stopped: the request exceeded the model's context window and compaction could not make room ({compaction_error:#}). The session and completed work are kept; select a larger-window model, compact manually, or say \"continue\" to retry."),
-                                sent.step + 1,
-                            )
+                            .stop_turn(ui, message, sent.step + 1)
                             .map(crate::agent::run::engine::Tick::Finished).map(ControlFlow::Break);
                     }
                 };

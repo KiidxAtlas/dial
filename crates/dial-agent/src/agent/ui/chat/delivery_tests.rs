@@ -82,6 +82,7 @@ fn fast_provider_preserves_live_text_and_drops_all_deltas_after_cancel() {
             ChatMonitors {
                 rules: None,
                 stream: None,
+                wrap_up: None,
             },
         );
         if cancel {

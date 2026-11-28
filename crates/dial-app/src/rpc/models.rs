@@ -556,15 +556,51 @@ fn describe(config: &Config, row: Row, current: bool) -> Value {
         value["pricing"] = json!(bundled.pricing);
     }
     if let Some(metadata) = &row.local {
-        if provider == "mlx"
-            && row.sources.iter().any(|source| source == "local")
-            && let Some(format) = metadata.format
-        {
-            use crate::llm::local_runtime::LocalEngine;
-            let key = LocalEngine::model_key(model);
-            let choices = LocalEngine::choices(format, metadata.gguf_engines);
-            if !choices.is_empty() {
-                value["local_engine"] = json!({"choices": choices, "selected": config.local_model_engines.get(&key).copied().unwrap_or_default(), "setting": format!("local_model_engines.{key}")});
+        if provider == "mlx" && row.sources.iter().any(|source| source == "local") {
+            if let Some(format) = metadata.format {
+                use crate::llm::local_runtime::LocalEngine;
+                let key = LocalEngine::model_key(model);
+                let choices = LocalEngine::choices(format, metadata.gguf_engines);
+                if !choices.is_empty() {
+                    let default_engine = LocalEngine::default_for(format, metadata.gguf_engines);
+                    let mut installed = serde_json::Map::new();
+                    for &choice in choices {
+                        if choice != LocalEngine::Auto {
+                            installed.insert(
+                                choice.id().to_owned(),
+                                json!(choice.is_installed(&config.user_dir)),
+                            );
+                        }
+                    }
+                    value["local_engine"] = json!({
+                        "choices": choices,
+                        "selected": config.local_model_engines.get(&key).copied().unwrap_or_default(),
+                        "setting": format!("local_model_engines.{key}"),
+                        "default": default_engine,
+                        "installed": installed,
+                    });
+                }
+            }
+            let requested = config
+                .local_context_window
+                .tokens()
+                .map(u64::from)
+                .or_else(|| window.map(u64::from))
+                .unwrap_or(32_768);
+            if let Some((est, max_ctx, memory)) = crate::llm::local_fit::inspect_local_path(
+                Path::new(model),
+                requested,
+                config.local_runtime.kv_bits,
+            ) {
+                value["memory_fit"] = json!({
+                    "fit": est.fit,
+                    "weights_bytes": est.weights_bytes,
+                    "kv_bytes": est.kv_bytes,
+                    "resident_bytes": est.resident_bytes,
+                    "memory_bytes": memory,
+                    "context_tokens": est.context_tokens,
+                    "max_context_tokens": max_ctx,
+                });
             }
         }
         if let Some(limit) = metadata.max_output_tokens {
@@ -630,8 +666,41 @@ fn thinking_levels(
         })
         .or_else(|| catalog::bundled_model(provider, model).map(|bundled| bundled.thinking_efforts))
         .or_else(|| listed.and_then(listed_efforts))
+        .or_else(|| local_thinking_levels(config, provider, model))
         .unwrap_or_default();
     declared.into_iter().map(|effort| effort.as_str()).collect()
+}
+
+fn local_thinking_levels(
+    config: &Config,
+    provider: &str,
+    model: &str,
+) -> Option<Vec<crate::llm::profiles::ReasoningEffort>> {
+    let selection = config.selection();
+    let is_active_local =
+        config.local_main_model() && selection.provider == provider && selection.model == model;
+    if provider != "local" && !is_active_local {
+        return None;
+    }
+    let (base_url, token, headers) = if is_active_local {
+        let base_url = config.endpoint.as_ref().map(|e| e.base_url.as_str());
+        let token = config.endpoint.as_ref().and_then(|endpoint| {
+            crate::llm::catalog::resolve_credential(
+                &config.user_dir,
+                &endpoint.base_url,
+                endpoint.api_key_env.as_deref(),
+            )
+            .ok()
+            .flatten()
+        });
+        (base_url, token, config.request_headers())
+    } else {
+        (None, None, &[][..])
+    };
+    let facts =
+        crate::llm::local_server::facts(provider, model, base_url, token.as_deref(), headers);
+    let levels = facts.effort_caps?.to_reasoning_efforts();
+    (!levels.is_empty()).then_some(levels)
 }
 
 /// The reasoning profile `set_thinking` edits for the current model: the configured one, else the
@@ -694,6 +763,8 @@ pub(super) fn current(config: &Config) -> Value {
     json!({
         "provider": selection.provider,
         "model_id": selection.model,
+        "local": config.local_main_model(),
+        "managed_local": config.runs_dial_mlx(),
         "thinking": {
             "level": level.map(|effort| effort.as_str()),
             "default_level": default_level.map(|effort| effort.as_str()),

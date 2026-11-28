@@ -17,6 +17,14 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-27
+
+- Updated Rust dependencies and the pinned CI and release-signing actions.
+- Local chat requests avoid redundant conversation copies before sending tool results back to the model. Continuation still carries structured tool results and any reasoning emitted by the model.
+- Desktop clients can inspect a local LoRA base, approve a session for it, and queue or stop gated training without changing the chat model. [Training workflow](docs/improvement.md#training-from-dial-desktop).
+- Clarified the Homebrew install and upgrade commands for the CLI formula and the macOS Desktop cask. [Install guide](docs/release-and-install.md#other-distribution-channels).
+- Native RPC `session_messages {session_id}` returns one saved session's conversation without resuming it or taking its writer lock, so clients such as Dial Desktop can show a session at once while it opens. `/git` in a folder that isn't a repository uses its only nested repository or lists them; `/git repo <folder>` picks one. [RPC and ACP](docs/rpc-and-acp.md).
+
 ## [0.4.1] - 2026-11-27
 
 - Dial's built-in guidance now calls for checking omissions when a request asks for every qualifying result. [Verification](docs/requirement-verification.md).
@@ -3304,7 +3312,7 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.2...HEAD
 [0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
 [0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
 [0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
@@ -3362,3 +3370,4 @@ Historical source-version milestone: no matching local release tag is available.
 [0.3.19]: https://github.com/KiidxAtlas/dial/tree/v0.3.19
 [0.4.0]: https://github.com/KiidxAtlas/dial/tree/v0.4.0
 [0.4.1]: https://github.com/KiidxAtlas/dial/tree/v0.4.1
+[0.4.2]: https://github.com/KiidxAtlas/dial/tree/v0.4.2

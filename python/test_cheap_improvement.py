@@ -279,19 +279,28 @@ class AdapterAlgebra(unittest.TestCase):
             with self.assertRaises(RequestError):
                 resume_layout(self.model(), "other-model", root / "soup", root)
 
-    def test_layout_rejects_keys_outside_the_model_and_nonzero_dropout(self):
+    def test_layout_rejects_keys_outside_the_model_and_out_of_range_dropout(self):
         from dial_worker import adapter_layout
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = self.adapter(root, "first", 2, ["q_proj"], 2, 20.0)
             config = json.loads((path / "adapter_config.json").read_text())
-            for change in ({"keys": ["k_proj"]}, {"dropout": 0.1}, {"scale": float("inf")}, {"keys": ["q_proj", "o_proj"]}):
+            # Valid training dropout in [0, 0.5] is accepted.
+            (path / "adapter_config.json").write_text(json.dumps(
+                dict(config, lora_parameters=dict(config["lora_parameters"], dropout=0.1))))
+            adapter_layout(self.model(), "test", path)
+            for change in (
+                {"keys": ["k_proj"]},
+                {"dropout": -0.1},
+                {"dropout": 0.6},
+                {"scale": float("inf")},
+                {"keys": ["q_proj", "o_proj"]},
+            ):
                 with self.subTest(change=change):
                     (path / "adapter_config.json").write_text(json.dumps(
                         dict(config, lora_parameters=dict(config["lora_parameters"], **change))))
                     with self.assertRaises((RequestError, ValueError)):
                         adapter_layout(self.model(), "test", path)
-
     def test_batched_scores_match_single_sequence_scores(self):
         from dial_worker import target_logprobs
         from mlx_lm.models.llama import Model, ModelArgs

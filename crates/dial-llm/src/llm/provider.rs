@@ -750,6 +750,64 @@ impl Backend {
     pub fn next_request_profile(&mut self, profile: Option<llm::profiles::ModelProfile>) {
         self.next_profile = profile;
     }
+    /// Temporarily drop reasoning effort / thinking budget for the single next request (used by
+    /// `wrap_up_thinking` on cloud routes so the immediate retry acts instead of deliberating
+    /// again at `high`/`max`). Never mutates the persistent `self.profile`.
+    pub fn lower_next_request_effort(&mut self) -> bool {
+        use llm::profiles::{ReasoningApi, ReasoningEffort};
+        let Some(mut profile) = self.next_profile.clone().or_else(|| self.profile.clone()) else {
+            return false;
+        };
+        let mut changed = false;
+        match profile.capabilities.reasoning {
+            ReasoningApi::AnthropicBudget | ReasoningApi::GeminiBudget => {
+                let clamped = profile.thinking_budget.map_or(1_024, |b| b.min(1_024));
+                if profile.thinking_budget != Some(clamped) {
+                    profile.thinking_budget = Some(clamped);
+                    changed = true;
+                }
+            }
+            ReasoningApi::OllamaThink => {
+                if profile.thinking != Some(false) {
+                    profile.thinking = Some(false);
+                    changed = true;
+                }
+            }
+            _ => {
+                if let Some(budget) = profile.thinking_budget
+                    && budget > 1_024
+                {
+                    profile.thinking_budget = Some(1_024);
+                    changed = true;
+                }
+            }
+        }
+        if !profile.capabilities.reasoning_efforts.is_empty() {
+            let target = [
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::None,
+            ]
+            .into_iter()
+            .find(|candidate| profile.capabilities.reasoning_efforts.contains(candidate));
+            if let Some(target) = target
+                && profile.reasoning_effort != Some(target)
+            {
+                profile.reasoning_effort = Some(target);
+                changed = true;
+            }
+        } else if profile
+            .reasoning_effort
+            .is_some_and(|effort| effort > ReasoningEffort::Low)
+        {
+            profile.reasoning_effort = Some(ReasoningEffort::Low);
+            changed = true;
+        }
+        if changed {
+            self.next_profile = Some(profile);
+        }
+        changed
+    }
     /// The caller has a fallback model ready for failures of these classes: the next request
     /// retries them briefly and returns the error so the caller can fail over, instead of
     /// spending every `retry.max_attempts`. Consumed once at the request boundary.
@@ -1253,6 +1311,42 @@ impl Backend {
         Ok(steering.is_some())
     }
 
+    /// Whether this backend currently holds a running managed local model server.
+    pub fn has_resident_server(&self) -> bool {
+        self.server.as_ref().is_some_and(ModelServer::is_running)
+    }
+    /// Start the managed local server ahead of Turn 1 so weights are already warm when the user
+    /// sends their message. Returns `Ok(true)` if the server is now resident, `Ok(false)` when
+    /// this backend is not a Dial-managed local model or its weights are not installed.
+    pub fn warm_local_server(&mut self, interrupt: Arc<AtomicBool>) -> Result<bool> {
+        if !self.is_managed_local() || !self.local_prefix_available() {
+            return Ok(false);
+        }
+        if self.has_resident_server() {
+            if let Some(server) = &mut self.server {
+                server.touch();
+            }
+            return Ok(true);
+        }
+        self.prepare_local_model(interrupt)?;
+        Ok(self.has_resident_server())
+    }
+
+    /// Stop the managed local server if it has been idle for at least `max_idle`. Returns `true`
+    /// when a resident server was unloaded.
+    pub fn release_if_idle(&mut self, max_idle: Duration) -> bool {
+        let idle = self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.is_running() && server.idle_for() >= max_idle);
+        if idle {
+            self.release();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Stop the local server (if any) to free its memory. A later `chat`
     /// starts a new one.
     pub fn release(&mut self) {
@@ -1664,8 +1758,7 @@ impl Backend {
             }
             ProviderKind::Local { model_dir } => {
                 let wire_form = llm::messages::WireForm::SingleSystemPrefix;
-                let mut req = req.clone();
-                req.messages = wire_form.apply(&req.messages)?.into_owned();
+                let req = wire_form.chat(req)?;
                 if interrupted() {
                     return Err(llm::Interrupted.into());
                 }
@@ -2050,15 +2143,7 @@ impl Backend {
                     on_event,
                 ),
                 Wire::ChatCompletions => {
-                    let projected = wire_form.apply(&req.messages)?;
-                    let mut owned;
-                    let req = if let std::borrow::Cow::Owned(messages) = projected {
-                        owned = req.clone();
-                        owned.messages = messages;
-                        &owned
-                    } else {
-                        req
-                    };
+                    let req = wire_form.chat(req)?;
                     exchange(
                         llm::Endpoint {
                             headers: &headers,
@@ -2066,7 +2151,7 @@ impl Backend {
                             auth,
                             model: &model,
                         },
-                        req,
+                        &req,
                         timeout_secs,
                         &mut on_text,
                         llm::Control {

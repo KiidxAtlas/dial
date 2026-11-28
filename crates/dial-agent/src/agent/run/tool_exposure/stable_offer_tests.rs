@@ -49,6 +49,28 @@ fn notebook_recovery_is_callable_within_the_stable_budget_and_on_small_window_re
 }
 
 #[test]
+fn lean_local_offers_the_edit_loop_without_loading_specialists() {
+    with_agent("context_window=128000", |agent| {
+        let offered = agent.offered();
+        for name in ["read", "grep", "write", "edit", "verify", "tool_search"] {
+            assert!(
+                offered.iter().any(|tool| tool == name),
+                "{name}: {offered:?}"
+            );
+        }
+        assert!(!offered.iter().any(|tool| tool == "git"));
+        assert!(
+            agent
+                .discoverable_tools(&offered)
+                .iter()
+                .any(|(name, _)| name == "git")
+        );
+        let prompt = format!("{:?}", agent.system_messages());
+        assert!(prompt.contains("locate the target, change it, check it"));
+    });
+}
+
+#[test]
 fn snapcompact_requires_layer_recovery_not_notebook_tools() {
     with_agent("[compaction.snapcompact]\noverlay=true", |agent| {
         let schemas = agent.schemas(&agent.offered()).unwrap();

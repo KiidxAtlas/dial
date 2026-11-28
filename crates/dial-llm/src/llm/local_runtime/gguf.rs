@@ -48,10 +48,12 @@ impl GgufEngines {
 }
 
 /// The resolved loader for a local GGUF, before checking installation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgufLoader {
     LlamaCpp,
     Atomic,
+    IkLlama,
+    MistralRs,
 }
 
 impl GgufLoader {
@@ -79,18 +81,39 @@ impl GgufLoader {
             choices.contains(&engine),
             "The selected {engine:?} engine is not a known loader for this model on this platform. Review the engine choice before loading it."
         );
-        Ok(if engine == LocalEngine::Atomic {
-            Self::Atomic
-        } else {
-            Self::LlamaCpp
+        Ok(match engine {
+            LocalEngine::Atomic => Self::Atomic,
+            LocalEngine::IkLlama => Self::IkLlama,
+            LocalEngine::MistralRs => Self::MistralRs,
+            _ => Self::LlamaCpp,
         })
     }
 
     pub fn program(self) -> anyhow::Result<std::path::PathBuf> {
-        use crate::llm::local_format::{atomic_server, llama_server};
+        use crate::llm::local_format::{
+            atomic_server, ik_llama_server, llama_server, mistralrs_server,
+        };
         match self {
-            Self::Atomic => atomic_server().ok_or_else(|| anyhow::anyhow!("Atomic Engine is not installed. Choose Atomic in Dial Desktop's model picker to set it up.")),
-            Self::LlamaCpp => llama_server().ok_or_else(|| anyhow::anyhow!("GGUF models need llama.cpp's `llama-server`: run `/setup llama-cpp` to install it, or set DIAL_LLAMA_SERVER to an existing install")),
+            Self::Atomic => atomic_server().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Atomic Engine is not installed. Select Atomic Engine in Dial Desktop's model picker to download and build it."
+                )
+            }),
+            Self::LlamaCpp => llama_server().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GGUF models need llama.cpp's `llama-server`: run `/setup llama-cpp` or select llama.cpp in Dial Desktop to install it, or set DIAL_LLAMA_SERVER"
+                )
+            }),
+            Self::IkLlama => ik_llama_server().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ik_llama.cpp (`ik-llama-server`) is not installed: select ik_llama.cpp in Dial Desktop to build it, or set DIAL_IK_LLAMA_SERVER"
+                )
+            }),
+            Self::MistralRs => mistralrs_server().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mistral.rs (`mistralrs-server`) is not installed: run `/setup mistral-rs` or select mistral.rs in Dial Desktop, or set DIAL_MISTRALRS_SERVER"
+                )
+            }),
         }
     }
 }

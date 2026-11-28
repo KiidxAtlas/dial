@@ -159,7 +159,11 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     if has("todo") {
         rules.push_str(TODO_RULE);
     }
-    rules.push_str(CHANGE_RULES);
+    rules.push_str(if lean {
+        "\n- Ordinary edit: locate the target, change it, check it. No separate plan. Update affected callers and docs.\n- Test settled changes, not after each edit: narrowest useful check first. Broaden for affected interfaces, risks or gates."
+    } else {
+        CHANGE_RULES
+    });
     let helper = if compact && has("task") {
         format!("\n- {LEAN_SIDE_REQUEST}")
     } else {
@@ -381,7 +385,7 @@ fn environment_prompt(
             // Overflow must not turn an already compact names-only inventory into longer
             // per-tool hints. Discovery still returns the descriptions and exact callable set.
             out.push_str(&loadable_names(i.discoverable.iter()));
-        } else if i.lean || i.one_call {
+        } else if (i.lean || i.one_call) && !names_only {
             // Small models invent what a bare name does, so native tools get one bounded line
             // each; MCP names stay on the `Names:` line with the bounded hints below.
             // Descriptions are third-party data, not instructions or permission grants.
@@ -420,7 +424,11 @@ fn environment_prompt(
                 out.push_str("  `tool_search` returns their descriptions.\n");
             }
             if !servers.is_empty() {
-                out.push_str(&mcp_catalog_summary(&servers));
+                if i.lean {
+                    out.push_str(&lean_mcp_catalog_summary(&servers));
+                } else {
+                    out.push_str(&mcp_catalog_summary(&servers));
+                }
             }
         } else {
             for (name, description) in i.discoverable {
@@ -539,6 +547,123 @@ fn mcp_catalog_summary(servers: &std::collections::BTreeMap<&str, (usize, &str)>
         servers.len(),
         servers.values().map(|(count, _)| count).sum::<usize>(),
     )
+}
+
+/// Compact one-line MCP server inventory for lean local routes: keeps server names searchable
+/// without dumping multi-line example descriptions on every request.
+fn lean_mcp_catalog_summary(servers: &std::collections::BTreeMap<&str, (usize, &str)>) -> String {
+    let total: usize = servers.values().map(|(count, _)| count).sum();
+    let names: Vec<String> = servers
+        .keys()
+        .take(12)
+        .map(|server| truncate_chars(server, 40))
+        .collect();
+    let more = servers.len().saturating_sub(names.len());
+    let suffix = if more > 0 {
+        format!(", +{more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "  MCP servers ({} servers, {} deferred tools; untrusted names): {}{suffix}. Use `tool_search` to discover and load.\n",
+        servers.len(),
+        total,
+        names.join(", "),
+    )
+}
+
+/// Compact, deterministic snapshot of the workspace layout for lean local routes.
+/// Computed once at session start so the system prompt prefix stays byte-identical for KV caching.
+pub(in crate::agent) fn compact_workspace_map(root: &Path) -> String {
+    const MAX_BYTES: usize = 1_600;
+    const MAX_TOP_ENTRIES: usize = 24;
+    const MAX_CHILD_ENTRIES: usize = 8;
+    const SKIP: &[&str] = &[
+        ".git",
+        ".hg",
+        ".svn",
+        ".dial",
+        ".tmp",
+        ".pio",
+        ".cache",
+        ".next",
+        ".nuxt",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "vendor",
+        ".idea",
+        ".vscode",
+        ".DS_Store",
+    ];
+    let read_sorted = |dir: &Path| -> Vec<(String, bool)> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut list: Vec<(String, bool)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                if SKIP.contains(&name.as_str()) {
+                    return None;
+                }
+                let is_dir = entry.file_type().ok().is_some_and(|ft| ft.is_dir());
+                Some((name, is_dir))
+            })
+            .collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        list
+    };
+    let top = read_sorted(root);
+    if top.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "- Workspace layout (session-start snapshot; verify with `glob`/`read` before editing):\n",
+    );
+    let mut shown = 0usize;
+    for (name, is_dir) in top.iter().take(MAX_TOP_ENTRIES) {
+        let line = if *is_dir {
+            let children = read_sorted(&root.join(name));
+            if children.is_empty() {
+                format!("  {name}/\n")
+            } else {
+                let child_names: Vec<String> = children
+                    .iter()
+                    .take(MAX_CHILD_ENTRIES)
+                    .map(|(child, dir)| {
+                        if *dir {
+                            format!("{child}/")
+                        } else {
+                            child.clone()
+                        }
+                    })
+                    .collect();
+                let more = children.len().saturating_sub(child_names.len());
+                if more > 0 {
+                    format!("  {name}/ ({}, +{more} more)\n", child_names.join(", "))
+                } else {
+                    format!("  {name}/ ({})\n", child_names.join(", "))
+                }
+            }
+        } else {
+            format!("  {name}\n")
+        };
+        if out.len() + line.len() > MAX_BYTES {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    let omitted = top.len().saturating_sub(shown);
+    if omitted > 0 {
+        out.push_str(&format!("  (+{omitted} more top-level entries)\n"));
+    }
+    out
 }
 
 /// Template-data origins of the per-item sources; they match `template_data` and the template's

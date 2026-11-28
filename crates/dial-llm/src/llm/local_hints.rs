@@ -9,6 +9,9 @@ pub struct LocalHints {
     /// top-level `enable_thinking` on MLX-VLM, `think` on Ollama. Set only when the server exposes a
     /// switch for this model and no explicit profile setting decides it.
     pub thinking: Option<bool>,
+    /// Graded template effort (`reasoning_effort`) when the server/template exposes effort levels
+    /// and no explicit profile setting decides thinking/effort.
+    pub reasoning_effort: Option<String>,
     /// Keep the model loaded this long after the request: Ollama `keep_alive` (seconds), LM Studio
     /// `ttl`. An explicit profile `keep_alive` wins.
     pub keep_alive_secs: Option<u32>,
@@ -20,8 +23,13 @@ pub struct LocalHints {
     pub presence_penalty: Option<f64>,
     /// Loop recovery: repetition penalty for this request only (never overrides a profile value).
     pub repetition_penalty: Option<f64>,
+    /// llama.cpp: lookback window for repetition penalty (`repeat_last_n`).
+    pub repeat_last_n: Option<u32>,
+    /// llama.cpp: DRY (Don't Repeat Yourself) sequence-repetition sampler controls.
+    pub dry_multiplier: Option<f64>,
+    pub dry_allowed_length: Option<u32>,
+    pub dry_penalty_last_n: Option<u32>,
 }
-
 impl LocalHints {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
@@ -34,11 +42,18 @@ impl LocalHints {
     pub fn over(self, base: &LocalHints) -> LocalHints {
         LocalHints {
             thinking: self.thinking.or(base.thinking),
+            reasoning_effort: self
+                .reasoning_effort
+                .or_else(|| base.reasoning_effort.clone()),
             keep_alive_secs: self.keep_alive_secs.or(base.keep_alive_secs),
             cache_slot: self.cache_slot.or(base.cache_slot),
             prompt_progress: self.prompt_progress || base.prompt_progress,
             presence_penalty: self.presence_penalty.or(base.presence_penalty),
             repetition_penalty: self.repetition_penalty.or(base.repetition_penalty),
+            repeat_last_n: self.repeat_last_n.or(base.repeat_last_n),
+            dry_multiplier: self.dry_multiplier.or(base.dry_multiplier),
+            dry_allowed_length: self.dry_allowed_length.or(base.dry_allowed_length),
+            dry_penalty_last_n: self.dry_penalty_last_n.or(base.dry_penalty_last_n),
         }
     }
 
@@ -47,6 +62,7 @@ impl LocalHints {
     pub fn without_explicit(mut self, thinking_decided: bool, keep_alive_decided: bool) -> Self {
         if thinking_decided {
             self.thinking = None;
+            self.reasoning_effort = None;
         }
         if keep_alive_decided {
             self.keep_alive_secs = None;
@@ -74,11 +90,14 @@ impl LocalHints {
                     put_absent(object, "return_progress", true.into());
                 }
                 put_thinking(object, self.thinking);
+                put_reasoning_effort(object, self.reasoning_effort.as_deref());
                 put_penalties(object, self, "repeat_penalty");
+                put_llama_dry(object, self);
             }
             // Dial's mlx_lm.server takes the same names LocalSampling::apply sends.
             LocalServer::MlxRuntime => {
                 put_thinking(object, self.thinking);
+                put_reasoning_effort(object, self.reasoning_effort.as_deref());
                 put_penalties(object, self, "repetition_penalty");
             }
             // mlx_vlm.server normalizes thinking from the top-level flag, not template kwargs.
@@ -89,6 +108,7 @@ impl LocalHints {
                 {
                     put_absent(object, "enable_thinking", thinking.into());
                 }
+                put_reasoning_effort(object, self.reasoning_effort.as_deref());
                 put_penalties(object, self, "repetition_penalty");
             }
             // LM Studio's OpenAI-compatible API documents `ttl` (idle seconds before unload, applies to
@@ -105,6 +125,7 @@ impl LocalHints {
             // checked against a live server. Neither has a prompt-cache slot or a keep-alive.
             LocalServer::Vllm | LocalServer::Sglang => {
                 put_thinking(object, self.thinking);
+                put_reasoning_effort(object, self.reasoning_effort.as_deref());
                 put_penalties(object, self, "repetition_penalty");
             }
             // Ollama's native API is applied by `apply_ollama`; its OpenAI-compatible route is not used.
@@ -168,6 +189,36 @@ fn put_penalties(
     }
     if let Some(value) = hints.repetition_penalty.filter(|v| v.is_finite()) {
         put_absent(object, repetition_name, value.into());
+    }
+}
+
+/// Top-level `reasoning_effort`, written only when the body does not already specify reasoning.
+fn put_reasoning_effort(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    effort: Option<&str>,
+) {
+    let Some(effort) = effort else {
+        return;
+    };
+    if !object.contains_key("reasoning_effort") && !object.contains_key("reasoning") {
+        object.insert("reasoning_effort".into(), effort.into());
+    }
+}
+
+/// llama.cpp sequence-level repetition controls: widened `repeat_last_n` and DRY sampling.
+/// `dry_allowed_length` and `dry_penalty_last_n` are only sent when `dry_multiplier` is active.
+fn put_llama_dry(object: &mut serde_json::Map<String, serde_json::Value>, hints: &LocalHints) {
+    if let Some(last_n) = hints.repeat_last_n.filter(|n| *n > 0) {
+        put_absent(object, "repeat_last_n", last_n.into());
+    }
+    if let Some(mult) = hints.dry_multiplier.filter(|v| v.is_finite() && *v > 0.0) {
+        put_absent(object, "dry_multiplier", mult.into());
+        if let Some(len) = hints.dry_allowed_length.filter(|n| *n > 0) {
+            put_absent(object, "dry_allowed_length", len.into());
+        }
+        if let Some(last_n) = hints.dry_penalty_last_n.filter(|n| *n > 0) {
+            put_absent(object, "dry_penalty_last_n", last_n.into());
+        }
     }
 }
 

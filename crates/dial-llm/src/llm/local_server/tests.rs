@@ -93,6 +93,44 @@ fn llama_cpp_props_report_slots_and_the_template_switch() {
 }
 
 #[test]
+fn llama_cpp_and_gguf_templates_detect_reasoning_effort_capabilities() {
+    let inkling_props = json!({
+        "total_slots": 1,
+        "chat_template": "{%- set effort_map = {\"none\": 0.0, \"minimal\": 0.1, \"low\": 0.2, \"medium\": 0.7, \"high\": 0.9, \"max\": 0.99} -%}{%- set eff = reasoning_effort if reasoning_effort is defined else 0.9 -%}",
+        "chat_template_caps": {
+            "supports_reasoning_effort": true,
+            "reasoning_effort_levels": ["minimal", "low", "medium", "high", "max"]
+        },
+        "default_generation_settings": {"n_ctx": 128000}
+    })
+    .to_string();
+    let url = routed(vec![("/props", inkling_props)]);
+    let facts = facts("llama-cpp", "inkling", Some(&url), None, &[]);
+    assert_eq!(facts.thinking_switch, Some(false));
+    let caps = facts.effort_caps.expect("effort_caps detected from /props");
+    assert_eq!(caps.pick_planning(), Some("medium"));
+    assert_eq!(caps.pick_routine(), Some("low"));
+    assert_eq!(caps.pick_recovery(), Some("minimal"));
+
+    // Dial-managed GGUF (base_url = None) detects effort_caps directly from the GGUF header.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inkling.gguf");
+    let template = "{%- set effort_map = {\"none\": 0.0, \"minimal\": 0.1, \"low\": 0.2, \"medium\": 0.7, \"high\": 0.9} -%}{{ reasoning_effort }}";
+    let bytes = header(&[
+        ("general.architecture", string("llama")),
+        ("tokenizer.chat_template", string(template)),
+    ]);
+    std::fs::write(&path, bytes).unwrap();
+    let managed = super::facts("mlx", path.to_str().unwrap(), None, None, &[]);
+    let managed_caps = managed
+        .effort_caps
+        .expect("effort_caps detected from GGUF chat_template");
+    assert_eq!(managed_caps.pick_planning(), Some("medium"));
+    assert_eq!(managed_caps.pick_routine(), Some("low"));
+    assert_eq!(managed_caps.pick_recovery(), Some("minimal"));
+}
+
+#[test]
 fn ollama_capabilities_report_the_thinking_switch_and_lm_studio_reports_none() {
     let url = routed(vec![(
         "/api/show",

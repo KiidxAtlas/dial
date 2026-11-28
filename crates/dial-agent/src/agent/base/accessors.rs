@@ -94,6 +94,53 @@ impl<'a> Agent<'a> {
         }
         true
     }
+    /// Whether a Dial-managed local server is currently loaded in memory for this agent.
+    pub fn local_model_resident(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(Backend::has_resident_server)
+    }
+    /// Default idle timeout before a Dial-managed local server is automatically unloaded (15 min).
+    pub const LOCAL_MODEL_IDLE_UNLOAD_SECS: u64 = 15 * 60;
+
+    /// Share an external `wrap_up_thinking` signal so RPC clients can steer mid-thought streams.
+    pub fn set_wrap_up_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.wrap_up_thinking = flag;
+    }
+
+    /// Pre-warm a Dial-managed local server ahead of Turn 1. No-op (`Ok(false)`) for hosted routes.
+    pub fn warm_local_model(&mut self) -> Result<bool> {
+        let interrupt = self.interrupt.clone();
+        let Some(backend) = &mut self.backend else {
+            return Ok(false);
+        };
+        backend.warm_local_server(interrupt)
+    }
+
+    /// Unload any Dial-managed local server that has been idle for at least `max_idle` (skipping
+    /// while child jobs are running). Returns `true` when at least one server was released.
+    pub fn release_idle_local_models(&mut self, max_idle: std::time::Duration) -> bool {
+        let Ok(jobs) = self.live_tasks.status(None) else {
+            return false;
+        };
+        if jobs
+            .as_array()
+            .is_none_or(|jobs| jobs.iter().any(|job| job["status"] == "running"))
+        {
+            return false;
+        }
+        let mut released = false;
+        if let Some(backend) = &mut self.backend {
+            released |= backend.release_if_idle(max_idle);
+        }
+        if let Some((_, backend)) = &mut self.subagent_backend {
+            released |= backend.release_if_idle(max_idle);
+        }
+        for backend in self.role_backends.values_mut() {
+            released |= backend.release_if_idle(max_idle);
+        }
+        released
+    }
     /// Explicitly unload only this agent's managed server; next inference reloads the same model.
     pub fn restart_managed_model(&mut self) -> Result<()> {
         self.cancel_background_compaction();
@@ -306,6 +353,7 @@ impl<'a> Agent<'a> {
         };
         // The loaded-window cap was probed for the outgoing session's model.
         self.context_cap = None;
+        self.memory_ceiling = None;
         self.route.reset();
         self.cache_warm = None;
         self.context_meter = crate::agent::window::context_meter::ContextMeter::default();
@@ -342,13 +390,29 @@ impl<'a> Agent<'a> {
     }
     /// The window to plan against: what is configured, limited by what the server really loaded.
     pub fn context_window(&self) -> u32 {
-        match self.context_cap {
+        let window = match self.context_cap {
             Some(loaded) => self
                 .effective_config()
                 .requested_context_window()
                 .map_or(loaded, |limit| limit.min(loaded)),
             None => self.auth_config.context_window,
+        };
+        self.memory_ceiling
+            .map_or(window, |ceiling| window.min(ceiling))
+    }
+    /// Lower the planning window after the local server ran out of memory prefilling a request of
+    /// about `failed_tokens`: plan below it so compaction runs before the next out-of-memory
+    /// failure. Never raises an existing ceiling; returns the new window when it changed.
+    pub(in crate::agent) fn learn_memory_ceiling(&mut self, failed_tokens: u64) -> Option<u32> {
+        const MIN_CEILING: u64 = 8_192;
+        let before = self.context_window();
+        let ceiling = (failed_tokens * 85 / 100).max(MIN_CEILING);
+        let ceiling = u32::try_from(ceiling).unwrap_or(u32::MAX);
+        if ceiling >= before {
+            return None;
         }
+        self.memory_ceiling = Some(ceiling);
+        Some(ceiling)
     }
     /// A ceiling actually reported by the loaded server, not a configured/model-metadata guess.
     pub fn loaded_context_window(&self) -> Option<u32> {
@@ -860,6 +924,7 @@ impl<'a> Agent<'a> {
         self.cache_warm = None;
         self.model_override = config;
         self.context_cap = None;
+        self.memory_ceiling = None;
         self.route.reset();
         self.record_main_model_route("Session main model override installed or restored; originating command/mode provenance unavailable (not recorded)");
         Ok(())

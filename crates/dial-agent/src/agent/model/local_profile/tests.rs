@@ -36,7 +36,7 @@ fn local_evidence_counters_follow_the_suggestions_switch() {
     };
     let on = flushed("").expect("evidence recorded");
     assert_eq!((on.rounds.ok, on.rounds.failed), (0, 1));
-    assert_eq!(on.edits.get("hashline").map(|t| t.failed), Some(1));
+    assert_eq!(on.edits.get("replace").map(|t| t.failed), Some(1));
     assert_eq!(flushed("[assistance.local]\nsuggestions=false"), None);
     let staged = flushed("[assistance.local]\nsuggestions=false\nescalate_after=1")
         .expect("the escalation step is kept");
@@ -169,10 +169,10 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         assert!(text.contains(rule.trim_matches('"')));
         assert!(!text.contains(crate::agent::prompts::system::LEAN_BATCHING.trim()));
         assert!(text.contains("# Example"));
-        // The example is written in the active grammar (hashline by default).
-        assert_eq!(agent.edit_mode(), crate::config::types::EditMode::Hashline);
+        // The example is written in the active grammar (replace by default on local routes).
+        assert_eq!(agent.edit_mode(), crate::config::types::EditMode::Replace);
         assert!(
-            text.contains("PUT 44.=44:") && text.contains("total.div_ceil(size)"),
+            text.contains("old_string") && text.contains("total.div_ceil(size)"),
             "{text}"
         );
         assert!(!text.contains(crate::agent::prompts::system::SKILL_RULE));
@@ -765,7 +765,7 @@ fn external_host_defaults_inherit_temperature_and_output_limit() {
     with_agent(LOCAL_HOST, |agent| {
         let mut profile = None;
         assert_eq!(
-            agent.apply_local_sampling(&mut profile, 0.2),
+            agent.apply_local_sampling(&mut profile),
             Some("local server defaults")
         );
         assert!(!profile.as_ref().unwrap().capabilities.temperature);
@@ -801,13 +801,13 @@ fn explicit_temperature_sources_win_over_the_host_defaults() {
     let pinned = format!("{LOCAL_HOST}\n[harness]\ntemperature=0.7");
     with_agent(&pinned, |agent| {
         assert!(agent.config.harness_temperature_pinned);
-        assert_eq!(agent.apply_local_sampling(&mut None, 0.7), None);
+        assert_eq!(agent.apply_local_sampling(&mut None), None);
     });
     with_agent(LOCAL_HOST, |agent| {
         assert!(!agent.config.harness_temperature_pinned);
         let mut profile = None;
         assert_eq!(
-            agent.apply_local_sampling(&mut profile, 0.7),
+            agent.apply_local_sampling(&mut profile),
             Some("local server defaults"),
             "an unpinned learned harness value is not an operator pin"
         );
@@ -816,12 +816,12 @@ fn explicit_temperature_sources_win_over_the_host_defaults() {
     with_agent(LOCAL_HOST, |agent| {
         let mut profile = Some(ModelProfile::minimal("ollama", "test"));
         profile.as_mut().unwrap().temperature = Some(0.3);
-        assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+        assert_eq!(agent.apply_local_sampling(&mut profile), None);
     });
     with_agent(
         &format!("{LOCAL_HOST}\n[adaptive]\nenabled=true\nsampling=true"),
         |agent| {
-            assert_eq!(agent.apply_local_sampling(&mut None, 0.2), None);
+            assert_eq!(agent.apply_local_sampling(&mut None), None);
         },
     );
 }
@@ -834,7 +834,7 @@ fn profile_thinking_does_not_block_host_sampling_defaults() {
         let mut profile = Some(ModelProfile::minimal("ollama", "test"));
         profile.as_mut().unwrap().thinking = Some(true);
         assert_eq!(
-            agent.apply_local_sampling(&mut profile, 0.2),
+            agent.apply_local_sampling(&mut profile),
             Some("local server defaults")
         );
         let profile = profile.unwrap();
@@ -851,7 +851,7 @@ fn hosted_defaults_apply_independently_of_the_local_profile() {
         |agent| {
             let mut profile = None;
             assert_eq!(
-                agent.apply_local_sampling(&mut profile, 0.2),
+                agent.apply_local_sampling(&mut profile),
                 Some("hosted provider defaults")
             );
             agent.apply_local_output_limit(&mut profile, 0);
@@ -863,7 +863,7 @@ fn hosted_defaults_apply_independently_of_the_local_profile() {
     with_agent(LOCAL_HOST, |agent| {
         agent.hermetic = true;
         let mut profile = None;
-        assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+        assert_eq!(agent.apply_local_sampling(&mut profile), None);
         agent.apply_local_output_limit(&mut profile, 0);
         assert!(profile.is_none());
     });
@@ -872,7 +872,7 @@ fn hosted_defaults_apply_independently_of_the_local_profile() {
         |agent| {
             let mut profile = None;
             assert_eq!(
-                agent.apply_local_sampling(&mut profile, 0.2),
+                agent.apply_local_sampling(&mut profile),
                 Some("local server defaults")
             );
             agent.apply_local_output_limit(&mut profile, 0);
@@ -912,5 +912,143 @@ fn default_local_host_request_adds_no_hints_or_context_to_the_profile() {
             .prepare_local_request(&mut backend, &mut profile)
             .unwrap();
         assert_eq!(record["loop_penalty"], json!(true));
+    });
+}
+/// Local llama.cpp routes enable prompt-cache slot pinning by default (main on slot 0, side
+/// requests on another slot when available), while non-llama servers and explicit opt-out send
+/// no slot hint.
+#[test]
+fn llama_cpp_prompt_cache_is_enabled_by_default_and_respects_opt_out() {
+    with_agent(LOCAL_HOST, |agent| {
+        assert!(agent.config.assistance.local.prompt_cache);
+        agent.local_session.probed = true;
+        agent.local_session.server = Some(LocalServer::LlamaCpp);
+        agent.local_session.facts.slots = Some(2);
+        assert_eq!(agent.local_base_hints(None).cache_slot, Some(MAIN_SLOT));
+        assert_eq!(side_slot(agent.local_session.facts.slots), Some(1));
+    });
+    with_agent(
+        &format!("{LOCAL_HOST}\n[assistance.local]\nprompt_cache=false"),
+        |agent| {
+            agent.local_session.probed = true;
+            agent.local_session.server = Some(LocalServer::LlamaCpp);
+            assert_eq!(agent.local_base_hints(None).cache_slot, None);
+        },
+    );
+    with_agent(LOCAL_HOST, |agent| {
+        agent.local_session.probed = true;
+        agent.local_session.server = Some(LocalServer::Ollama);
+        assert_eq!(agent.local_base_hints(None).cache_slot, None);
+    });
+}
+
+/// Lean local routes keep Turn-1 system context compact: omit the verbose host PATH/sys inventory
+/// and omit deferred `eval` runtime guidance until `eval` is actually offered.
+#[test]
+fn lean_local_prompt_omits_verbose_host_inventory_and_unoffered_eval_guidance() {
+    with_agent("context_window=65536", |agent| {
+        assert_eq!(agent.local_tier(), Some(Tier::Lean));
+        let text = prompt_text(agent);
+        assert!(!text.contains("On PATH:"), "{text}");
+        assert!(!text.contains("Live host state:"), "{text}");
+        assert!(!text.contains("Counterexample search in eval:"), "{text}");
+    });
+}
+
+/// Lean local routes include a bounded, deterministic workspace layout snapshot computed once at
+/// session start so local models do not burn early turns discovering top-level repo structure.
+#[test]
+fn lean_local_prompt_includes_bounded_workspace_layout_snapshot() {
+    with_agent("context_window=65536", |agent| {
+        assert_eq!(agent.local_tier(), Some(Tier::Lean));
+        let root = agent.workspace.root();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        let map = crate::agent::window::prompt::compact_workspace_map(root);
+        assert!(map.contains("src/ (main.rs)"), "{map}");
+        assert!(map.contains("Cargo.toml"), "{map}");
+        assert!(!map.contains("target/"), "build dirs stay skipped: {map}");
+        agent.parts.workspace_map = map;
+        agent.rebuild_system();
+        let text = prompt_text(agent);
+        let layout_idx = text
+            .find("Workspace layout")
+            .unwrap_or_else(|| panic!("missing Workspace layout: {text}"));
+        let layout_slice = &text[layout_idx..];
+        assert!(layout_slice.contains("src/ (main.rs)"), "{layout_slice}");
+        assert!(layout_slice.contains("Cargo.toml"), "{layout_slice}");
+        assert!(
+            !layout_slice.contains("target/"),
+            "build dirs stay skipped: {layout_slice}"
+        );
+    });
+}
+
+#[test]
+fn effort_capable_local_model_drives_phase_effort_and_llama_dry_hints() {
+    with_agent(LOCAL_HOST, |agent| {
+        agent.local_session.probed = true;
+        agent.local_session.server = Some(LocalServer::LlamaCpp);
+        agent.local_session.facts.effort_caps = Some(crate::llm::local_server::EffortCaps {
+            none: true,
+            minimal: true,
+            low: true,
+            medium: true,
+            high: true,
+            max: true,
+        });
+        let mut backend = agent.backend.take().unwrap();
+        let mut profile = None;
+
+        // Baseline llama.cpp hints include gentle DRY sampling.
+        let base = agent.local_base_hints(None);
+        assert_eq!(base.dry_multiplier, Some(BASELINE_DRY_MULTIPLIER));
+        assert_eq!(base.dry_allowed_length, Some(BASELINE_DRY_ALLOWED_LENGTH));
+        assert_eq!(base.dry_penalty_last_n, Some(BASELINE_DRY_PENALTY_LAST_N));
+
+        // Turn start (planning) -> medium effort (not model default 0.9 high).
+        agent.begin_local_turn(&mut crate::agent::NullUi);
+        let r1 = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(r1["reasoning_effort"], json!("medium"));
+
+        // After successful tool round (routine) -> low effort.
+        agent.observe_local_round(false, &mut crate::agent::NullUi);
+        let r2 = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(r2["reasoning_effort"], json!("low"));
+
+        // After failed tool round -> medium effort again.
+        agent.observe_local_round(true, &mut crate::agent::NullUi);
+        let r3 = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(r3["reasoning_effort"], json!("medium"));
+
+        // After reasoning repetition gate hit -> minimal effort + DRY recovery penalty.
+        let hit: anyhow::Error = crate::agent::workflow::reasoning::GateHit::new(
+            "stream repeated reasoning".into(),
+            None,
+        )
+        .into();
+        agent.observe_local_failure(&hit, &mut backend);
+        let r4 = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(r4["reasoning_effort"], json!("minimal"));
+
+        // Explicit profile pin disables automatic phase effort hints.
+        let mut pinned = Some(crate::llm::profiles::ModelProfile {
+            reasoning_effort: Some(crate::llm::profiles::ReasoningEffort::High),
+            ..Default::default()
+        });
+        let r5 = agent
+            .prepare_local_request(&mut backend, &mut pinned)
+            .unwrap();
+        assert!(r5["reasoning_effort"].is_null());
     });
 }

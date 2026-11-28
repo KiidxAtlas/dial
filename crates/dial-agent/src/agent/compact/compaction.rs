@@ -903,13 +903,22 @@ pub(in crate::agent) fn compact_history_with_execution(
                         .count();
                     let unprotected = history.len().saturating_sub(protected_count);
                     let mut elided = 0usize;
+                    let mut stripped_reasoning = 0usize;
                     for message in &mut history[..unprotected] {
+                        if message["role"] == "assistant"
+                            && message["dial_provider_content"].is_null()
+                            && message
+                                .as_object_mut()
+                                .and_then(|obj| obj.remove("reasoning_content"))
+                                .is_some()
+                        {
+                            stripped_reasoning += 1;
+                            continue;
+                        }
                         if message["role"] != "tool" || estimate(message) < 256 {
                             continue;
                         }
-                        if message["dial_evidence"]["is_error"] == true
-                            || message["dial_evidence"]["observation"].as_str().is_none()
-                        {
+                        if message["dial_evidence"]["is_error"] == true {
                             continue;
                         }
                         let Some(reference) = message["dial_evidence"]["artifact"]
@@ -918,19 +927,44 @@ pub(in crate::agent) fn compact_history_with_execution(
                         else {
                             continue;
                         };
-                        message["content"] = json!(format!(
-                            "[Recoverable older tool evidence archived at {reference}; retrieve with read. Original result and mutation outcome remain in the immutable session archive.]"
-                        ));
+                        let preview = message["content"]
+                            .as_str()
+                            .map(|text| {
+                                text.lines()
+                                    .map(str::trim)
+                                    .filter(|line| !line.is_empty())
+                                    .take(2)
+                                    .map(|line| {
+                                        if line.len() > 120 {
+                                            let end = line.floor_char_boundary(120);
+                                            format!("{}…", &line[..end])
+                                        } else {
+                                            line.to_owned()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" | ")
+                            })
+                            .filter(|s| !s.is_empty());
+                        let summary_line = match preview {
+                            Some(p) => format!(
+                                "[Compacted older tool result ({p}). Full output archived at {reference}; retrieve with read.]"
+                            ),
+                            None => format!(
+                                "[Recoverable older tool evidence archived at {reference}; retrieve with read. Original result and mutation outcome remain in the immutable session archive.]"
+                            ),
+                        };
+                        message["content"] = json!(summary_line);
                         elided += 1;
                     }
-                    if elided == 0 {
+                    if elided == 0 && stripped_reasoning == 0 {
                         return Err(unprofitable(
                             "shake found no older recoverable archived evidence",
                         ));
                     }
                     (
                         format!(
-                            "Elided {elided} recoverable older tool results without deleting history."
+                            "Fast-compacted history without model inference: elided {elided} older tool results (archived as artifact://) and stripped {stripped_reasoning} stale reasoning blocks."
                         ),
                         history,
                         request.messages.len(),

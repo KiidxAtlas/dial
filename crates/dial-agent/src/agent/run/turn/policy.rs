@@ -39,16 +39,11 @@ impl Agent<'_> {
                 hermetic: self.hermetic,
             },
         );
-        if let Some(source) =
-            self.apply_local_sampling(&mut selection.profile, turn.harness.temperature)
-        {
+        if let Some(source) = self.apply_local_sampling(&mut selection.profile) {
             selection.sampling_source = source.to_owned();
-            if selection
-                .profile
-                .as_ref()
-                .is_some_and(|p| !p.capabilities.temperature)
-            {
-                selection.temperature = None;
+            if let Some(profile) = &selection.profile {
+                selection.temperature = profile.temperature;
+                selection.top_p = profile.top_p;
             }
         }
         // Recovery budgets remain explicit; ordinary unlimited requests inherit the host's limit.

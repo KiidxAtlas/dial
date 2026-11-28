@@ -25,14 +25,46 @@ pub struct TrainingConfig {
     pub enabled: bool,
     /// Retain completed coding requests for later explicit teaching; retention is not approval.
     pub retain_session_requests: bool,
+    /// Training backend: "auto" (MLX on Apple Silicon, PyTorch/PEFT on CUDA), "mlx", or "peft".
+    pub backend: String,
+    /// Adapter family: "lora" or "dora".
+    pub fine_tune_type: String,
+    /// Linear projections adapted: "all-linear", "attention", "q-proj", or comma-separated names.
+    pub target_modules: String,
     /// Defaults to `<state>/grounded/train.jsonl` when empty.
     pub train_data: PathBuf,
     pub valid_data: PathBuf,
     pub iters: u32,
     pub batch_size: u32,
+    /// Gradient accumulation micro-steps before each optimizer step.
+    pub grad_accumulation_steps: u32,
     pub num_layers: u32,
     pub rank: u32,
+    /// LoRA/DoRA scaling factor (alpha / rank multiplier in mlx-lm; default 20.0).
+    pub scale: f64,
+    /// LoRA dropout probability in [0.0, 0.5].
+    pub dropout: f64,
+    /// Peak learning rate for the optimizer.
+    pub learning_rate: f64,
+    /// Learning rate schedule: "cosine" (with linear warmup) or "constant".
+    pub lr_schedule: String,
+    /// Fraction of training steps used for linear LR warmup (0.0..=0.5).
+    pub warmup_ratio: f64,
+    /// Optimizer: "adamw" or "adam".
+    pub optimizer: String,
+    /// Decoupled weight decay for AdamW (0.0..=1.0).
+    pub weight_decay: f64,
+    /// Enable gradient checkpointing to reduce training memory footprint.
+    pub grad_checkpoint: bool,
+    /// Write resumable disk checkpoints every N iterations (and immediately on pause).
+    pub checkpoint_every: u32,
     pub max_seq_length: u32,
+    /// Maximum fresh training examples per run (0 = unlimited).
+    pub max_train_examples: u32,
+    /// Maximum replay examples mixed into incremental runs (0 = no replay).
+    pub max_replay_examples: u32,
+    /// Maximum validation examples scored during pre-screen/training.
+    pub max_valid_examples: u32,
     pub interval_secs: u64,
     /// Sibling model DBs (matched by model name, or `provider/model`) whose externally verified
     /// trajectories and tool repairs may be learned from for this model's training data.
@@ -51,13 +83,29 @@ impl Default for TrainingConfig {
         Self {
             enabled: true,
             retain_session_requests: false,
+            backend: "auto".into(),
+            fine_tune_type: "lora".into(),
+            target_modules: "all-linear".into(),
             train_data: PathBuf::new(),
             valid_data: PathBuf::new(),
-            iters: 32,
+            iters: 100,
             batch_size: 1,
-            num_layers: 4,
-            rank: 8,
+            grad_accumulation_steps: 4,
+            num_layers: 16,
+            rank: 16,
+            scale: 20.0,
+            dropout: 0.0,
+            learning_rate: 1e-4,
+            lr_schedule: "cosine".into(),
+            warmup_ratio: 0.1,
+            optimizer: "adamw".into(),
+            weight_decay: 0.01,
+            grad_checkpoint: true,
+            checkpoint_every: 8,
             max_seq_length: 8192,
+            max_train_examples: 256,
+            max_replay_examples: 64,
+            max_valid_examples: 128,
             interval_secs: 6 * 3600,
             learn_from: Vec::new(),
             learn_from_all_verified: false,
@@ -120,6 +168,9 @@ pub struct ImproveConfig {
     pub distill: bool,
     /// Teacher self-play tasks per cycle when `distill` is on (1..=64).
     pub distill_tasks: u32,
+    /// Gate strictness: "auto" (practical guard check on explicit train, strict Clopper-Pearson on
+    /// automatic cycles), "practical" (point-estimate guard tolerance), or "strict" (Clopper-Pearson everywhere).
+    pub gate_mode: String,
 }
 
 impl Default for ImproveConfig {
@@ -147,6 +198,7 @@ impl Default for ImproveConfig {
             max_daily_usd: 0.0,
             distill: false,
             distill_tasks: 4,
+            gate_mode: "auto".into(),
         }
     }
 }

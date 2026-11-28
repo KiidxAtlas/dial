@@ -521,6 +521,45 @@ pub(in crate::agent) fn preview_limit(
     }
 }
 
+/// Tighter inline tool-result cap for local models when complete output is retained as an artifact,
+/// keeping per-step prefill fast while preserving lossless `artifact://` retrieval via `read`.
+pub(in crate::agent) const LOCAL_TOOL_PREVIEW_BYTES: usize = 16 * 1024;
+
+/// Same as [`preview_limit`], additionally capping non-error, non-mutation retained outputs to
+/// [`LOCAL_TOOL_PREVIEW_BYTES`] on local routes so huge reads/logs do not slow every future step.
+pub(in crate::agent) fn local_preview_limit(
+    config: &EfficiencyConfig,
+    window: u32,
+    tool: &str,
+    failed: bool,
+    retained: bool,
+    local: bool,
+) -> usize {
+    let base = preview_limit(config, window, tool, failed, retained);
+    if !local
+        || failed
+        || !retained
+        || matches!(
+            tool,
+            "edit"
+                | "write"
+                | "ast_edit"
+                | "edit_preview"
+                | "revert_edit"
+                | "tool_load"
+                | "tool_search"
+                | "todo"
+                | "finish"
+                | "ask"
+                | "codebase_memory"
+        )
+    {
+        base
+    } else {
+        base.min(LOCAL_TOOL_PREVIEW_BYTES)
+    }
+}
+
 /// Visible body of one tool result, shared by the parent and child controllers so each clips against
 /// the window of the model that reads it. A replacement body (investigation advice or a read pointer)
 /// stands for the result and is never clipped itself. Returns the body and whether the complete

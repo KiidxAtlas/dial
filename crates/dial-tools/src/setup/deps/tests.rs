@@ -117,3 +117,26 @@ fn settings_map_to_config_keys() {
         vec![("eval.node".into(), "/x/bun".into())]
     );
 }
+
+#[test]
+fn every_local_engine_recipe_is_registered() {
+    use crate::llm::local_runtime::LocalEngine;
+    for engine in [
+        LocalEngine::Mlx,
+        LocalEngine::MlxServe,
+        LocalEngine::VllmMlx,
+        LocalEngine::LlamaCpp,
+        LocalEngine::Atomic,
+        LocalEngine::IkLlama,
+        LocalEngine::MistralRs,
+        LocalEngine::Vllm,
+        LocalEngine::Sglang,
+        LocalEngine::Exl3,
+    ] {
+        let id = engine.recipe_id().expect("concrete engine has a recipe id");
+        assert!(
+            recipe(id).is_some(),
+            "recipe `{id}` for {engine:?} must exist in RECIPES"
+        );
+    }
+}

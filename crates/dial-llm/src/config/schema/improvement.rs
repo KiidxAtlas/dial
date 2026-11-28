@@ -370,7 +370,7 @@ pub(super) static LEARNING: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local edit mode",
-        "Edit grammar for locally served models when no pin chooses one. Hashline is the default, and an explicit Edit mode under Editing still applies unless this is set. Inherit follows Edit mode under Editing. Explicit pins always win.",
+        "Edit grammar for locally served models when no pin chooses one. Replace is the default, and an explicit Edit mode under Editing still applies unless this is set. Inherit follows Edit mode under Editing. Explicit pins always win.",
         Kind::Enum(LOCAL_EDIT_MODE),
     ),
     field!(
@@ -391,7 +391,7 @@ pub(super) static LEARNING: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local reasoning share",
-        "Percent of the planned window that streamed reasoning may use per request on lean local tiers. 0 disables the cap. An explicit reasoning byte limit that is stricter still applies.",
+        "Percent of the planned window that streamed reasoning may use per request on lean local tiers (capped at 16 KiB at or below the default share so large context windows do not unlock unbounded single-step thinking). 0 disables the cap. An explicit reasoning byte limit that is stricter still applies.",
         Kind::Int {
             min: 0,
             max: 90,
@@ -439,7 +439,7 @@ pub(super) static LEARNING: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local prompt cache",
-        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers on other slots, so side work does not evict the main prompt. Off by default; when off Dial sends no cache setting and the server keeps its own behaviour.",
+        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers and side requests on other slots when available, so side work does not evict the main prompt. On by default; turn off to leave cache and slot selection to the server.",
         Kind::Bool,
     ),
     field!(
@@ -1004,6 +1004,207 @@ pub(super) static ASSISTANCE: &[SettingDef] = &[
         "Retain session requests",
         "Save bounded completed requests for later explicit teaching. Off by default; retention never approves training.",
         Kind::Bool,
+    ),
+    field!(
+        "improve.gate_mode",
+        improve.gate_mode,
+        IM,
+        "Automatic improvement",
+        "Gate mode",
+        "Auto uses a practical regression check for explicit user training runs and strict Clopper-Pearson bounds for automatic cycles. Practical uses point-estimate guard tolerance everywhere; Strict requires Clopper-Pearson bounds everywhere.",
+        Kind::Enum(&[
+            ("auto", "Auto (practical on explicit train)"),
+            ("practical", "Practical (point-estimate guards)"),
+            ("strict", "Strict (Clopper-Pearson guards)"),
+        ]),
+    ),
+    field!(
+        "training.backend",
+        training.backend,
+        IM,
+        "Training",
+        "Training backend",
+        "Auto chooses MLX on Apple Silicon and PyTorch/PEFT on NVIDIA CUDA hosts.",
+        Kind::Enum(&[
+            ("auto", "Auto"),
+            ("mlx", "MLX (Apple Silicon)"),
+            ("peft", "PyTorch PEFT (CUDA / EXL3)"),
+        ]),
+    ),
+    field!(
+        "training.fine_tune_type",
+        training.fine_tune_type,
+        IM,
+        "Training",
+        "Adapter method",
+        "LoRA adapts low-rank weight updates; DoRA decomposes magnitude and direction for higher quality on small datasets.",
+        Kind::Enum(&[("lora", "LoRA"), ("dora", "DoRA")]),
+    ),
+    field!(
+        "training.target_modules",
+        training.target_modules,
+        IM,
+        "Training",
+        "Target linear layers",
+        "Linear projections adapted per transformer block: all-linear (recommended), attention, q-proj (legacy), or a comma-separated list of projection names.",
+        Kind::Text,
+    ),
+    field!(
+        "training.grad_accumulation_steps",
+        training.grad_accumulation_steps,
+        IM,
+        "Training",
+        "Gradient accumulation",
+        "Micro-batches accumulated before each optimizer step (effective batch = batch_size * grad_accumulation_steps).",
+        Kind::Int {
+            min: 1,
+            max: 64,
+            step: 1
+        },
+    ),
+    field!(
+        "training.scale",
+        training.scale,
+        IM,
+        "Training",
+        "LoRA scale",
+        "Adapter update scaling factor (mlx-lm default 20.0).",
+        Kind::Float {
+            min: 0.1,
+            max: 128.0,
+            step: 1.0
+        },
+    ),
+    field!(
+        "training.dropout",
+        training.dropout,
+        IM,
+        "Training",
+        "LoRA dropout",
+        "Dropout probability applied to LoRA inputs (0.0 to 0.5).",
+        Kind::Float {
+            min: 0.0,
+            max: 0.5,
+            step: 0.05
+        },
+    ),
+    field!(
+        "training.learning_rate",
+        training.learning_rate,
+        IM,
+        "Training",
+        "Learning rate",
+        "Peak optimizer learning rate (1e-6 to 1e-2).",
+        Kind::Float {
+            min: 0.000001,
+            max: 0.01,
+            step: 0.00005
+        },
+    ),
+    field!(
+        "training.lr_schedule",
+        training.lr_schedule,
+        IM,
+        "Training",
+        "LR schedule",
+        "Cosine decay with linear warmup or constant learning rate.",
+        Kind::Enum(&[("cosine", "Cosine with warmup"), ("constant", "Constant")]),
+    ),
+    field!(
+        "training.warmup_ratio",
+        training.warmup_ratio,
+        IM,
+        "Training",
+        "Warmup ratio",
+        "Fraction of training iterations spent linearly warming up the learning rate.",
+        Kind::Float {
+            min: 0.0,
+            max: 0.5,
+            step: 0.05
+        },
+    ),
+    field!(
+        "training.optimizer",
+        training.optimizer,
+        IM,
+        "Training",
+        "Optimizer",
+        "AdamW applies decoupled weight decay; Adam disables weight decay.",
+        Kind::Enum(&[("adamw", "AdamW"), ("adam", "Adam")]),
+    ),
+    field!(
+        "training.weight_decay",
+        training.weight_decay,
+        IM,
+        "Training",
+        "Weight decay",
+        "Decoupled weight decay coefficient for AdamW.",
+        Kind::Float {
+            min: 0.0,
+            max: 1.0,
+            step: 0.01
+        },
+    ),
+    field!(
+        "training.grad_checkpoint",
+        training.grad_checkpoint,
+        IM,
+        "Training",
+        "Gradient checkpointing",
+        "Recompute activations during backprop to substantially lower peak training memory.",
+        Kind::Bool,
+    ),
+    field!(
+        "training.checkpoint_every",
+        training.checkpoint_every,
+        IM,
+        "Training",
+        "Checkpoint interval",
+        "Iterations between periodic resumable checkpoints (pause requests always checkpoint immediately).",
+        Kind::Int {
+            min: 1,
+            max: 1000,
+            step: 1
+        },
+    ),
+    field!(
+        "training.max_train_examples",
+        training.max_train_examples,
+        IM,
+        "Training",
+        "Max train examples",
+        "Maximum fresh training examples per run (0 = unlimited).",
+        Kind::Int {
+            min: 0,
+            max: 10000,
+            step: 32
+        },
+    ),
+    field!(
+        "training.max_replay_examples",
+        training.max_replay_examples,
+        IM,
+        "Training",
+        "Max replay examples",
+        "Maximum historical replay examples mixed into incremental runs.",
+        Kind::Int {
+            min: 0,
+            max: 2000,
+            step: 16
+        },
+    ),
+    field!(
+        "training.max_valid_examples",
+        training.max_valid_examples,
+        IM,
+        "Training",
+        "Max validation examples",
+        "Maximum validation examples scored during training and pre-screening.",
+        Kind::Int {
+            min: 1,
+            max: 2000,
+            step: 16
+        },
     ),
 ];
 

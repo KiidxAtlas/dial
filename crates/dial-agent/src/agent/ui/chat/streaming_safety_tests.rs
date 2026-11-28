@@ -93,6 +93,7 @@ fn run(rule: &str, arguments: &str, prefix: Option<&str>, external_cancel: bool)
         ChatMonitors {
             rules: Some(&mut monitor),
             stream: Some(&mut observed),
+            wrap_up: None,
         },
     );
     server.requests();

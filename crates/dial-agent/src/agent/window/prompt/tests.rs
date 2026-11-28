@@ -1802,3 +1802,54 @@ fn template_inputs_without_template<'a>(
         reasoning_strategy: Default::default(),
     }
 }
+
+/// Lean local routes with concise guidance keep MCP server discovery to one compact line instead
+/// of dumping multi-line `<mcp-server>` XML capability blocks on every Turn 1.
+#[test]
+fn lean_concise_mcp_inventory_uses_one_line_summary() {
+    let harness = Harness::default();
+    let tools = names(&["read", "edit", "tool_search"]);
+    let discoverable = vec![
+        ("browser".into(), "Render a real page".into()),
+        ("mcp__context7__query".into(), "Query library docs".into()),
+        ("mcp__desktop__open".into(), "Launch a desktop app".into()),
+    ];
+    let build = |lean| {
+        environment_prompt(
+            &Inputs {
+                context_overflow: false,
+                cwd: Path::new("/work"),
+                runtimes: String::new(),
+                harness: &harness,
+                soul: None,
+                overrides: (None, None),
+                context: &[],
+                skills: String::new(),
+                memory: String::new(),
+                tools: &tools,
+                discoverable: &discoverable,
+                edit_mode: EditMode::Replace,
+                template: None,
+                lean,
+                concise_guidance: true,
+                prefer_subagents: false,
+                reasoning_strategy: Default::default(),
+                one_call: false,
+                worked_example: false,
+            },
+            None,
+            TurnNotes::Inline,
+        )
+    };
+    let hosted = build(false);
+    let lean = build(true);
+    assert!(hosted.contains("<mcp-server name=\"context7\""), "{hosted}");
+    assert!(!lean.contains("<mcp-server"), "{lean}");
+    assert!(
+        lean.contains(
+            "MCP servers (2 servers, 2 deferred tools; untrusted names): context7, desktop."
+        ),
+        "{lean}"
+    );
+    assert!(lean.len() < hosted.len());
+}

@@ -161,3 +161,56 @@ fn auto_uses_the_only_capable_gguf_loader() {
             .is_ok_and(|loader| loader == GgufLoader::LlamaCpp)
     );
 }
+
+#[test]
+fn local_engine_ids_labels_recipes_and_gguf_loaders_cover_all_runtimes() {
+    use crate::llm::local_format::{LocalFormat, gguf_fixtures::{header, string}};
+    let all = [
+        LocalEngine::Auto,
+        LocalEngine::Mlx,
+        LocalEngine::MlxServe,
+        LocalEngine::VllmMlx,
+        LocalEngine::LlamaCpp,
+        LocalEngine::Atomic,
+        LocalEngine::IkLlama,
+        LocalEngine::MistralRs,
+        LocalEngine::Vllm,
+        LocalEngine::Sglang,
+        LocalEngine::Exl3,
+    ];
+    for engine in all {
+        let serialized = serde_json::to_string(&engine).unwrap();
+        assert_eq!(serialized, format!("\"{}\"", engine.id()));
+        let parsed: LocalEngine = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, engine);
+        assert!(!engine.label().is_empty());
+        if engine == LocalEngine::Auto {
+            assert!(engine.recipe_id().is_none());
+        } else {
+            assert!(engine.recipe_id().is_some(), "{engine:?} needs a recipe_id");
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let qwen = dir.path().join("qwen2.gguf");
+    std::fs::write(&qwen, header(&[("general.architecture", string("qwen2"))])).unwrap();
+    assert_eq!(
+        GgufLoader::resolve(&qwen, LocalEngine::IkLlama).unwrap(),
+        GgufLoader::IkLlama
+    );
+    assert_eq!(
+        GgufLoader::resolve(&qwen, LocalEngine::MistralRs).unwrap(),
+        GgufLoader::MistralRs
+    );
+    let mlx_choices = LocalEngine::choices(LocalFormat::Mlx, GgufEngines::Unknown);
+    assert!(mlx_choices.contains(&LocalEngine::Auto));
+    assert!(mlx_choices.contains(&LocalEngine::MistralRs));
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert!(mlx_choices.contains(&LocalEngine::Mlx));
+        assert!(mlx_choices.contains(&LocalEngine::MlxServe));
+        assert!(mlx_choices.contains(&LocalEngine::VllmMlx));
+        assert_eq!(
+            LocalEngine::default_for(LocalFormat::Mlx, GgufEngines::Unknown),
+            Some(LocalEngine::Mlx)
+        );
+    }
+}

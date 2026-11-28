@@ -257,6 +257,14 @@ pub(super) fn goal(agent: &mut Agent<'_>, params: &Value) -> Result<(Value, Opti
     Ok((json!({"goal":agent.modes().goal}), prompt))
 }
 
+/// Whether `params` is a valid read-only `goal { action: "get" }` query.
+pub(super) fn is_goal_get(params: &Value) -> bool {
+    matches!(
+        serde_json::from_value::<GoalRequest>(params.clone()),
+        Ok(GoalRequest::Get {})
+    )
+}
+
 /// Validate and preview goal admission without publishing a transition. Read-only and paused
 /// goal edits need no model lease; prompt-producing edits must acquire it before persistence.
 pub(super) fn goal_has_prompt(agent: &Agent<'_>, params: &Value) -> Result<bool> {

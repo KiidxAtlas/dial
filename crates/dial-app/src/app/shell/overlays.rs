@@ -166,16 +166,22 @@ impl Shell {
         }
     }
 
-    /// `/git [revision]`: the panel on the working tree, or read-only on a pinned revision.
+    /// `/git [repo <folder> | revision]`: the panel on the working tree, or read-only on a pinned revision.
+    /// `repo <folder>` picks a nested repository when the project is not one itself.
     pub(crate) fn open_git(
         &mut self,
         app: &App,
         agent: &mut Agent<'_>,
         revision: &str,
     ) -> Result<Step> {
+        let (folder, revision) = match revision.strip_prefix("repo ") {
+            Some(folder) => (Some(folder.trim().to_owned()), ""),
+            None => (None, revision),
+        };
         let which = Which::Git {
             root: agent.workspace().root().to_path_buf(),
             revision: revision.to_owned(),
+            folder,
         };
         self.open(app, agent, which)
     }
@@ -412,12 +418,16 @@ impl Shell {
                 }
                 ActiveOverlay::Jobs(Box::new(panel))
             }
-            Which::Git { root, revision } => {
+            Which::Git { root, revision, folder } => {
                 use crate::ui::overlay::git::{GitOverlay, GitTab};
                 let tab = GitTab::from_args(&revision);
                 let pinned = revision.as_str();
+                let mut repo = crate::git_panel::Repo::new(&root, &effective);
+                if let Some(folder) = &folder {
+                    repo = repo.select(folder);
+                }
                 let mut panel = GitOverlay::open(
-                    crate::git_panel::Repo::new(&root, &effective),
+                    repo,
                     (tab.is_none() && !pinned.is_empty()).then_some(pinned),
                 )
                 .map_err(anyhow::Error::msg)?;

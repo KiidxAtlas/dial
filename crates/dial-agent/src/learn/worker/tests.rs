@@ -83,6 +83,53 @@ fn gguf_and_splash_models_answer_capabilities_without_the_mlx_worker() {
     assert!(non_mlx_capabilities(mlx.to_str().unwrap(), LocalEngine::Auto).is_none());
 }
 
+#[test]
+fn exl3_capabilities_and_backend_script_routing() {
+    let root = tempfile::tempdir().unwrap();
+    let exl3 = root.path().join("exl3-model");
+    std::fs::create_dir(&exl3).unwrap();
+    std::fs::write(
+        exl3.join("config.json"),
+        r#"{"quantization_config":{"quant_method":"exl3","bits":4}}"#,
+    )
+    .unwrap();
+    std::fs::write(exl3.join("model.safetensors"), b"x").unwrap();
+    let caps = non_mlx_capabilities(exl3.to_str().unwrap(), LocalEngine::Auto).unwrap();
+    assert_eq!(caps["lora"], false);
+    assert_eq!(caps["lora_probe_version"], 3);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(caps["inference"], false);
+        assert!(caps["reason"].as_str().unwrap().contains("NVIDIA CUDA"));
+    }
+    validate_capabilities(caps).unwrap();
+
+    // Backend script selection routes peft to dial_peft_worker.py and mlx to dial_worker.py.
+    let mlx_script = root.path().join("dial_worker.py");
+    let peft_script = root.path().join("dial_peft_worker.py");
+    std::fs::write(&mlx_script, "# mlx").unwrap();
+    std::fs::write(&peft_script, "# peft").unwrap();
+    let mut cfg = Config::default();
+    cfg.python = root.path().join("python3");
+    cfg.worker = mlx_script.clone();
+    cfg.training.backend = "peft".into();
+    assert_eq!(
+        worker_script(&cfg)
+            .unwrap()
+            .file_name()
+            .and_then(|s| s.to_str()),
+        Some("dial_peft_worker.py")
+    );
+    cfg.training.backend = "mlx".into();
+    assert_eq!(
+        worker_script(&cfg)
+            .unwrap()
+            .file_name()
+            .and_then(|s| s.to_str()),
+        Some("dial_worker.py")
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_handoff_delivers_stdin_and_drains_output() {

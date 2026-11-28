@@ -156,21 +156,42 @@ pub fn request_stop(layout: &Layout, id: &str) -> Result<Value> {
     )
 }
 
+fn busy(path: &Path) -> Result<bool> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock().map_err(std::io::Error::from) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A read-only snapshot for one model. A persisted running flag is not a live job.
+pub fn model_job(state: &Path, store: &Store) -> Result<Value> {
+    let meta = |key: &str| -> Result<Value> {
+        Ok(store
+            .get_meta(key)?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or(Value::Null))
+    };
+    let scheduler = meta("auto_status")?;
+    let locked = busy(&state.join("control.lock"))?;
+    let launching = scheduler["state"] == "queued"
+        && serde_json::from_value::<ProcId>(scheduler["proc"].clone()).is_ok_and(|p| p.alive());
+    Ok(
+        json!({"active": locked || launching, "scheduler": scheduler,
+        "progress": if locked && scheduler["state"] == "running" { meta("cycle_progress")? } else { Value::Null },
+        "stop_requested": state.join("improvement.stop").try_exists()?}),
+    )
+}
+
 /// Project-wide observational status. A busy control lock proves work is still active;
 /// persisted scheduler state alone does not. The compute lock is shared across projects.
 pub fn jobs(layout: &Layout) -> Result<Value> {
-    fn busy(path: &Path) -> Result<bool> {
-        let file = match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        match file.try_lock().map_err(std::io::Error::from) {
-            Ok(()) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-            Err(error) => Err(error.into()),
-        }
-    }
     fn log_tail(path: &Path) -> Option<String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = File::open(path).ok()?;

@@ -240,6 +240,9 @@ impl Agent<'_> {
             self.auth_config.effective_service_tier(),
             self.auth_config.extended_context,
         )?);
+        if std::mem::take(&mut turn.wrap_up_next_step) && !self.local_profile_active() {
+            backend.lower_next_request_effort();
+        }
         let compaction_selection = self.auth_config.selection();
         let compaction_identity = crate::config::compaction::CompactionIdentity {
             provider: &compaction_selection.provider,

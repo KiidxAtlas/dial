@@ -1,0 +1,35 @@
+{
+  "name": "@kiidxatlas/dial",
+  "version": "0.4.0",
+  "description": "Installer and launcher wrapper for Dial Desktop and the dial CLI (for bunx / bun install -g / npx)",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KiidxAtlas/dial.git",
+    "directory": "packaging/npm"
+  },
+  "homepage": "https://dial.rootatlas.dev/",
+  "keywords": [
+    "dial",
+    "coding-agent",
+    "ai",
+    "cli",
+    "desktop",
+    "bun"
+  ],
+  "bin": {
+    "dial": "bin/dial.mjs",
+    "dial-install": "bin/install.mjs"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/wrapper.test.mjs"
+  }
+}

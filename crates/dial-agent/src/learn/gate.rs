@@ -546,6 +546,29 @@ fn sleep_unless(delay: Duration, stop: &dyn Fn() -> bool) -> bool {
     }
 }
 
+/// Guard-suite regression check strictness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardMode {
+    /// Enforce Clopper-Pearson upper bound when the guard suite is large enough to satisfy it
+    /// with zero regressions; otherwise use the point-estimate `max_regression` tolerance so
+    /// small guard suites (e.g. default 20 cases) are not mathematically deadlocked.
+    Auto,
+    /// Always use the point-estimate `max_regression` tolerance on guard suites.
+    Practical,
+    /// Always enforce the strict Clopper-Pearson upper bound on guard suites.
+    Strict,
+}
+
+impl GuardMode {
+    pub fn parse(mode: &str) -> Self {
+        match mode {
+            "practical" => Self::Practical,
+            "strict" => Self::Strict,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Runs baseline and candidate on every case, interleaved per case so that drift in the model server
 /// affects both equally. Private prompts, checks, outputs and runner errors never enter the report.
 pub fn evaluate(
@@ -568,11 +591,33 @@ pub fn evaluate_outcome(
     stop: &dyn Fn() -> bool,
     run: impl FnMut(&Version, &Case) -> Result<bool>,
 ) -> Result<(Admission, Outcome)> {
+    evaluate_outcome_with_guard(
+        rules,
+        suites,
+        baseline,
+        candidate,
+        GuardMode::Strict,
+        stop,
+        run,
+    )
+}
+
+/// [`evaluate_outcome`] with configurable guard-suite strictness (`improve.gate_mode`).
+pub fn evaluate_outcome_with_guard(
+    rules: &Rules,
+    suites: &[Suite],
+    baseline: &Version,
+    candidate: &Version,
+    guard_mode: GuardMode,
+    stop: &dyn Fn() -> bool,
+    run: impl FnMut(&Version, &Case) -> Result<bool>,
+) -> Result<(Admission, Outcome)> {
     judge_with(
         rules,
         suites,
         baseline,
         candidate,
+        guard_mode,
         run,
         &INFRA_BACKOFF,
         stop,
@@ -590,15 +635,26 @@ fn evaluate_with(
     backoff: &[Duration],
     stop: &dyn Fn() -> bool,
 ) -> Result<Admission> {
-    judge_with(rules, suites, baseline, candidate, run, backoff, stop)
-        .map(|(admission, _)| admission)
+    judge_with(
+        rules,
+        suites,
+        baseline,
+        candidate,
+        GuardMode::Strict,
+        run,
+        backoff,
+        stop,
+    )
+    .map(|(admission, _)| admission)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn judge_with(
     rules: &Rules,
     suites: &[Suite],
     baseline: &Version,
     candidate: &Version,
+    guard_mode: GuardMode,
     mut run: impl FnMut(&Version, &Case) -> Result<bool>,
     backoff: &[Duration],
     stop: &dyn Fn() -> bool,
@@ -692,7 +748,14 @@ fn judge_with(
         let total = evaluated;
         let (base_pts, cand_pts) = (percent(base_ok, total), percent(cand_ok, total));
         regression |= !futile_stop && cand_pts < base_pts - rules.max_regression;
-        if statistical && !suite.primary && !futile_stop && total > 0 {
+        let enforce_guard_bound = match guard_mode {
+            GuardMode::Strict => statistical,
+            GuardMode::Practical => false,
+            GuardMode::Auto => {
+                statistical && total > 0 && regression_bound(0, 0, total, guard_alpha) <= rules.max_regression
+            }
+        };
+        if enforce_guard_bound && !suite.primary && !futile_stop && total > 0 {
             let bound = regression_bound(base_only, cand_only, total, guard_alpha);
             if bound > rules.max_regression {
                 unproven.get_or_insert_with(|| {

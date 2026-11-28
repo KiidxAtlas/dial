@@ -222,7 +222,7 @@ jobs:
           docker run --rm "$image" --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${RELEASE_TAG#v}"
           docker run --rm "$image" --help >/dev/null
       - name: Install pinned Cosign
-        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.2; verifies pinned bootstrap checksum
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.2; verifies pinned bootstrap checksum
         with:
           cosign-release: v3.0.6
       - name: Sign immutable container digest with GitHub OIDC

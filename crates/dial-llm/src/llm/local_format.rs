@@ -1,12 +1,14 @@
 //! On-disk formats of local models, detected from file layout alone (no weights are loaded).
 //!
 //! - **MLX**: a directory with `config.json` and complete safetensors; served by Dial's supervised
-//!   MLX server, and the only format LoRA training supports.
+//!   MLX server, and trained directly on Apple Silicon (or PyTorch/PEFT on CUDA).
 //! - **GGUF**: a `.gguf` file, or a directory holding one; served by a supervised `llama-server`
-//!   (llama.cpp) for inference.
+//!   (llama.cpp) for inference. Training prepares a safetensors base and exports GGUF LoRA or
+//!   fused GGUF weights.
+//! - **EXL3**: an ExLlamaV3 quantized checkpoint (`config.json` with `quant_method: "exl3"` plus
+//!   safetensors); served by ExLlamaV3/TabbyAPI on NVIDIA CUDA hosts, with PEFT LoRA & EXL3 export.
 //! - **Splash**: LM Studio's bundle (`manifest.json` plus `target/` and `tokenizer/`); only LM Studio
 //!   can run it, so Dial recognises it to give an actionable error instead of a failed load.
-
 use crate::platform::fs as platform_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 pub enum LocalFormat {
     Mlx,
     Gguf,
+    Exl3,
     Splash,
 }
 
@@ -27,6 +30,7 @@ impl LocalFormat {
         match self {
             Self::Mlx => "MLX",
             Self::Gguf => "GGUF",
+            Self::Exl3 => "EXL3",
             Self::Splash => "Splash",
         }
     }
@@ -36,6 +40,7 @@ impl LocalFormat {
         match self {
             Self::Mlx => "MLX, served by Dial's MLX server",
             Self::Gguf => "GGUF, served by llama.cpp",
+            Self::Exl3 => "EXL3, served by ExLlamaV3 (CUDA)",
             Self::Splash => "Splash, LM Studio only",
         }
     }
@@ -103,8 +108,12 @@ fn complete_gguf_file(path: &Path) -> Option<PathBuf> {
 
 pub(crate) const INKLING_DRAFT: &str = "dspark-Inkling-2-Mini-Q8_0.gguf";
 
-/// Only opt into DSpark for explicitly qualified targets with the matching local companion.
-pub fn inkling_dspark(target: &Path) -> Option<PathBuf> {
+/// The qualified DSpark preset supports at most 4K. Select it *after* fitting the target's
+/// window, never by shrinking that window or assuming an unknown server default fits.
+pub fn inkling_dspark(target: &Path, serving_context: Option<u64>) -> Option<PathBuf> {
+    if !matches!(serving_context, Some(1..=4096)) {
+        return None;
+    }
     if !matches!(
         target.file_name()?.to_str()?,
         "Inkling-2-Mini-AD-IQ2_M.gguf"
@@ -191,8 +200,29 @@ fn is_splash(path: &Path) -> bool {
         && path.join("tokenizer").is_dir()
 }
 
-/// Detect the format of a local model path. MLX is checked by the caller's snapshot rules, so this
-/// only claims MLX for a directory that has `config.json` next to a safetensors file.
+/// Whether `path/config.json` declares an ExLlamaV3 (EXL3) quantized checkpoint.
+fn is_exl3_config(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path.join("config.json")) else {
+        return false;
+    };
+    let Some(bytes) = crate::llm::read_within(file, 1024 * 1024) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let quant = value.get("quantization_config");
+    let method_is_exl3 = quant
+        .and_then(|q| q.get("quant_method"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.eq_ignore_ascii_case("exl3") || m.eq_ignore_ascii_case("exllamav3"));
+    let has_exl3_section = value.get("exl3_config").is_some()
+        || quant.and_then(|q| q.get("exl3_config")).is_some();
+    method_is_exl3 || has_exl3_section
+}
+
+/// Detect the format of a local model path. EXL3 directories also contain `config.json` and
+/// `.safetensors`, so EXL3 metadata is checked before claiming MLX.
 pub fn detect(path: &Path) -> Option<LocalFormat> {
     if path.is_dir() {
         if is_splash(path) {
@@ -209,6 +239,9 @@ pub fn detect(path: &Path) -> Option<LocalFormat> {
                         .is_some_and(|ext| ext == "safetensors")
                 });
         if has_safetensors {
+            if is_exl3_config(path) {
+                return Some(LocalFormat::Exl3);
+            }
             return Some(LocalFormat::Mlx);
         }
     }
@@ -234,14 +267,104 @@ pub fn sd_server() -> Option<PathBuf> {
     find_server("DIAL_SD_SERVER", "sd-cpp", "sd-server")
 }
 
-/// MLX-Serve's `mlx-serve`, which serves downloaded MLX image packs on Apple Silicon:
-/// `DIAL_MLX_SERVE`, else Dial's own install (`/setup mlx-serve`, at `tools/mlx-serve`), else `PATH`
-/// or a common package-manager location.
+/// MLX-Serve's `mlx-serve`, which serves downloaded MLX chat models and image packs on Apple
+/// Silicon: `DIAL_MLX_SERVE`, else Dial's own install (`/setup mlx-serve`, at `tools/mlx-serve`),
+/// else `PATH` or a common package-manager location.
 pub fn mlx_serve() -> Option<PathBuf> {
     find_server("DIAL_MLX_SERVE", "mlx-serve", "mlx-serve")
 }
 
-/// A server program: the explicit `variable`, Dial's install under `tools/<install>`, then `PATH`.
+/// vLLM-MLX (`vllm-mlx`), a continuous-batching OpenAI-compatible MLX server for Apple Silicon:
+/// `DIAL_VLLM_MLX_SERVER`, else Dial's install under `tools/vllm-mlx`, else `PATH`.
+pub fn vllm_mlx_server() -> Option<PathBuf> {
+    find_server("DIAL_VLLM_MLX_SERVER", "vllm-mlx", "vllm-mlx")
+}
+
+/// ik_llama.cpp's `ik-llama-server` executable (IQK quantization & MoE GGUF fork):
+/// `DIAL_IK_LLAMA_SERVER`, else Dial's install under `tools/ik-llama`, else `PATH`.
+pub fn ik_llama_server() -> Option<PathBuf> {
+    find_server("DIAL_IK_LLAMA_SERVER", "ik-llama", "ik-llama-server")
+}
+
+/// mistral.rs's `mistralrs-server` executable (Rust Metal/CUDA/CPU server for GGUF & Safetensors):
+/// `DIAL_MISTRALRS_SERVER`, else Dial's install under `tools/mistral-rs`, else `PATH`.
+pub fn mistralrs_server() -> Option<PathBuf> {
+    find_server("DIAL_MISTRALRS_SERVER", "mistral-rs", "mistralrs-server")
+}
+
+/// vLLM's `vllm` CLI server (Linux CUDA/ROCm/CPU server for HuggingFace Safetensors + LoRA):
+/// `DIAL_VLLM_SERVER`, else Dial's install under `tools/vllm`, else `PATH`.
+pub fn vllm_server() -> Option<PathBuf> {
+    find_server("DIAL_VLLM_SERVER", "vllm", "vllm")
+}
+
+/// SGLang's `sglang` server CLI (Linux CUDA RadixAttention server for Safetensors + LoRA):
+/// `DIAL_SGLANG_SERVER`, else Dial's install under `tools/sglang`, else `PATH`.
+pub fn sglang_server() -> Option<PathBuf> {
+    find_server("DIAL_SGLANG_SERVER", "sglang", "sglang")
+}
+
+/// ExLlamaV3 / TabbyAPI local server executable (NVIDIA CUDA hosts):
+/// `DIAL_EXL3_SERVER`, else Dial's install under `tools/exl3`, else `PATH`.
+pub fn exl3_server() -> Option<PathBuf> {
+    find_server("DIAL_EXL3_SERVER", "exl3", "exllamav3-server")
+        .or_else(|| find_server("DIAL_EXL3_SERVER", "tabbyapi", "tabbyapi"))
+}
+
+/// Whether Dial's private Python MLX environment exists under `user_dir`.
+pub fn mlx_python_ready(user_dir: &Path) -> bool {
+    let venv = crate::config::paths::python_dir(user_dir).join(".venv");
+    let bin = if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    };
+    platform_fs::is_executable(&bin)
+}
+/// llama.cpp's `llama-quantize` executable for quantizing exported F16 GGUF checkpoints:
+/// `DIAL_LLAMA_QUANTIZE`, else Dial's install under `tools/llama-cpp`, else `PATH`.
+pub fn llama_quantize() -> Option<PathBuf> {
+    find_server("DIAL_LLAMA_QUANTIZE", "llama-cpp", "llama-quantize")
+}
+
+/// llama.cpp's `convert_hf_to_gguf.py` script if installed alongside llama.cpp or via env.
+pub fn convert_hf_to_gguf() -> Option<PathBuf> {
+    find_helper_script("DIAL_CONVERT_HF_TO_GGUF", "convert_hf_to_gguf.py")
+}
+
+/// llama.cpp's `convert_lora_to_gguf.py` script if installed alongside llama.cpp or via env.
+pub fn convert_lora_to_gguf() -> Option<PathBuf> {
+    find_helper_script("DIAL_CONVERT_LORA_TO_GGUF", "convert_lora_to_gguf.py")
+}
+
+fn find_helper_script(variable: &str, name: &str) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(explicit);
+        return path.is_file().then_some(path);
+    }
+    let user_dir = crate::config::types::default_user_dir();
+    if !user_dir.as_os_str().is_empty() {
+        let managed = crate::config::paths::tools_dir(&user_dir)
+            .join("llama-cpp")
+            .join(name);
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
+    if let Some(server) = llama_server()
+        && let Some(dir) = server.parent()
+    {
+        for candidate in [dir.join(name), dir.join("../share/llama.cpp").join(name)] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    find_server_on_path(name)
+}
+
+/// A server program: the explicit `variable`, Dial's install under `tools/<install>` (or its
+/// `bin`/`Scripts` venv directory), then `PATH`.
 fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(explicit));
@@ -249,16 +372,19 @@ fn find_server(variable: &str, install: &str, program: &str) -> Option<PathBuf> 
     let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let user_dir = crate::config::types::default_user_dir();
     if !user_dir.as_os_str().is_empty() {
-        let managed = crate::config::paths::tools_dir(&user_dir)
-            .join(install)
-            .join(&name);
-        if platform_fs::is_executable(&managed) {
-            return Some(managed);
+        let root = crate::config::paths::tools_dir(&user_dir).join(install);
+        for candidate in [
+            root.join(&name),
+            root.join("bin").join(&name),
+            root.join("Scripts").join(&name),
+        ] {
+            if platform_fs::is_executable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     find_server_on_path(&name)
 }
-
 /// Search PATH first; graphical launches may omit the package-manager directories.
 pub(super) fn find_server_on_path(name: &str) -> Option<PathBuf> {
     platform_fs::find_program(Path::new(name), std::env::var_os("PATH").as_deref()).or_else(|| {

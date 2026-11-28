@@ -44,6 +44,7 @@ mod sessions;
 mod settings;
 mod side_control;
 mod skills;
+mod training;
 mod tree;
 mod workflows;
 /// Wire vocabulary shared with clients: versions, the method table and error codes.
@@ -559,6 +560,7 @@ struct RpcUi {
     interrupt: Arc<AtomicBool>,
     input_disconnected: Arc<AtomicBool>,
     steering: Arc<Mutex<Steering>>,
+    active: Arc<AtomicBool>,
     prompt_queued: Arc<AtomicBool>,
     next: u64,
     node_cursors: std::collections::BTreeMap<String, usize>,
@@ -667,7 +669,9 @@ impl Ui for RpcUi {
         }
     }
     fn maintenance_ready(&mut self) -> bool {
-        !self.prompt_queued.load(Ordering::SeqCst) && !self.out.unavailable()
+        !self.active.load(Ordering::SeqCst)
+            && !self.prompt_queued.load(Ordering::SeqCst)
+            && !self.out.unavailable()
     }
     fn result_node(&mut self, body: &crate::runtime::Body) {
         body.read(|node| {
@@ -1034,6 +1038,7 @@ fn stop_owned_tasks(agent: &mut Agent<'_>, ui: &mut RpcUi) {
 struct QueryProjection {
     state: Value,
     messages: Value,
+    evidence: diagnostics::EvidenceProjection,
     cursor: crate::storage::session::MessageCursor,
 }
 
@@ -1042,9 +1047,27 @@ impl Default for QueryProjection {
         Self {
             state: Value::Null,
             messages: json!([]),
+            evidence: Default::default(),
             cursor: Default::default(),
         }
     }
+}
+
+/// Every discoverable slash command, with where its engine operation lives for an RPC client.
+fn available_commands(layout: &Layout) -> Value {
+    let mut commands: Vec<Value> = crate::app::discoverable_commands()
+        .map(|(name, usage, description)| {
+            let rpc = parity::parity(name).map(parity::Parity::json);
+            json!({"name":name,"usage":usage,"description":description,"kind":"builtin","rpc":rpc})
+        })
+        .collect();
+    // Custom and skill commands are prompt templates that `send` expands.
+    commands.extend(crate::app::prompt_commands(layout).into_iter().map(
+        |(name, usage, description, kind)| {
+            json!({"name":name,"usage":usage,"description":description,"kind":kind,"rpc":{"surface":"method","method":"send"}})
+        },
+    ));
+    json!({"commands":commands})
 }
 
 /// The single `state` projection, used by the worker's `state` arm and by the cached reader reply.
@@ -1053,6 +1076,16 @@ fn state_projection(agent: &Agent<'_>) -> Value {
     let workspace = agent.workspace();
     let mut current_model = models::current(agent.effective_config());
     current_model["context_window"] = json!(agent.context_window());
+    current_model["resident"] = json!(agent.local_model_resident());
+    if let Some(loaded) = agent.loaded_context_window() {
+        current_model["loaded_context_window"] = json!(loaded);
+    }
+    if let Some(requested) = agent.effective_config().requested_context_window() {
+        current_model["requested_context_window"] = json!(requested);
+    }
+    if let Some(bytes) = crate::llm::local_fit::cached_memory_bytes() {
+        current_model["system_memory_bytes"] = json!(bytes);
+    }
     json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
         "plan_mode":agent.plan_mode(),"approval":agent.approval(),"cost":agent.session_cost(),
         "working_modes":workflows::modes(agent),
@@ -1118,6 +1151,7 @@ impl Admin {
             method,
             "list_sessions"
                 | "search_sessions"
+                | "session_messages"
                 | "read_image_artifact"
                 | "list_models"
                 | "image_settings"
@@ -1137,6 +1171,8 @@ impl Admin {
                 | "commit_preview"
                 | "import_candidates"
                 | "computer_status"
+                | "get_available_commands"
+                | "training_status"
         )
     }
 
@@ -1152,6 +1188,7 @@ impl Admin {
         match method {
             "list_sessions" => sessions::list(&layout, session.as_deref(), params),
             "search_sessions" => sessions::search(&layout, params),
+            "session_messages" => sessions::messages(&layout, params),
             "read_image_artifact" => images::artifact(&layout.state_dir.join("artifacts"), params),
             "delete_session" => sessions::delete(&layout, session.as_deref(), params),
             "pin_session" => sessions::pin(&layout, params),
@@ -1272,6 +1309,8 @@ impl Admin {
             "import_candidates" => integrations::import_candidates(&layout, params),
             "import_session" => integrations::import_session(&layout, params),
             "computer_status" => Ok(integrations::computer_status(&self.saved_config()?)),
+            "get_available_commands" => Ok(available_commands(&layout)),
+            "training_status" => training::status(&layout, &config, params),
             _ => Err(unknown_method()),
         }
     }
@@ -1279,6 +1318,7 @@ impl Admin {
 
 fn query_snapshot(agent: &Agent<'_>, projection: &mut QueryProjection) {
     projection.state = state_projection(agent);
+    projection.evidence = diagnostics::snapshot(agent);
     refresh_messages(agent.session(), projection);
 }
 
@@ -1310,6 +1350,20 @@ fn state_reply(projection: &QueryProjection, busy: bool) -> Result<Value> {
     let mut state = projection.state.clone();
     state["busy"] = json!(busy);
     Ok(state)
+}
+
+/// Reply to `get_modes` from the cached state projection without taking the actor's busy slot.
+fn modes_reply(projection: &QueryProjection) -> Result<Value> {
+    let modes = &projection.state["working_modes"];
+    anyhow::ensure!(modes.is_object(), "RPC state snapshot is unavailable");
+    Ok(modes.clone())
+}
+
+/// Reply to `goal { action: "get" }` from the cached state projection without taking the busy slot.
+fn goal_get_reply(projection: &QueryProjection) -> Result<Value> {
+    let goal = &projection.state["working_modes"]["modes"]["goal"];
+    anyhow::ensure!(goal.is_object(), "RPC state snapshot is unavailable");
+    Ok(json!({ "goal": goal.clone() }))
 }
 
 /// Page the cached history without copying unrelated messages. Invalid cursors must not silently
@@ -1513,6 +1567,8 @@ fn run_control(
     let voice_env = crate::voice::VoiceEnv::from_config(&config);
     let worker_out = out.clone();
     let flag = interrupt.clone();
+    let wrap_up = Arc::new(AtomicBool::new(false));
+    let worker_wrap_up = wrap_up.clone();
     let active = busy.clone();
     let worker_closing = closing.clone();
     let worker_prompt_queued = prompt_queued.clone();
@@ -1540,6 +1596,7 @@ fn run_control(
         control_tx,
         worker_out,
         flag,
+        wrap_up: worker_wrap_up,
         active,
         worker_closing,
         worker_prompt_queued,
@@ -1784,6 +1841,27 @@ fn run_control(
                     })();
                     out.result(&id, result);
                 }
+                "get_modes" if !acp => {
+                    let result = (|| -> Result<Value> {
+                        let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
+                        modes_reply(&projection)
+                    })();
+                    out.result(&id, result);
+                }
+                "goal" if !acp && workflows::is_goal_get(&request["params"]) => {
+                    let result = (|| -> Result<Value> {
+                        let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
+                        goal_get_reply(&projection)
+                    })();
+                    out.result(&id, result);
+                }
+                "evidence" if !acp && diagnostics::is_cached_action(&request["params"]) => {
+                    let result = (|| -> Result<Value> {
+                        let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
+                        diagnostics::cached(&projection.evidence, &request["params"])
+                    })();
+                    out.result(&id, result);
+                }
                 "abort" => {
                     if !acp && let Some(result) = collaboration::abort() {
                         out.result(&id, result);
@@ -1814,6 +1892,13 @@ fn run_control(
                     }
                     cancelling = Some(Instant::now());
                     out.result(&id, Ok(json!({"requested":true})));
+                }
+                "wrap_up_thinking" => {
+                    let active = busy.load(Ordering::SeqCst);
+                    if active {
+                        wrap_up.store(true, Ordering::SeqCst);
+                    }
+                    out.result(&id, Ok(json!({"accepted": active})));
                 }
                 "steer" => {
                     if !acp && let Some(result) = collaboration::prompt("send", &request["params"])
@@ -2328,6 +2413,7 @@ fn run_control(
                 | "remove_check"
                 | "list_skills"
                 | "search_sessions"
+                | "session_messages"
                 | "code_history"
                 | "stats"
                 | "doctor"
@@ -2339,6 +2425,8 @@ fn run_control(
                 | "import_session"
                 | "computer_status"
                 | "read_image_artifact"
+                | "get_available_commands"
+                | "training_status"
                     if !acp =>
                 {
                     let method = request["method"].as_str().unwrap_or_default().to_owned();
@@ -2416,6 +2504,16 @@ fn run_control(
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_err()
                     {
+                        // Ensure idle maintenance yields even if an earlier non-turn actor request
+                        // took the busy slot while the actor was running `idle_tick`.
+                        if matches!(
+                            request["method"].as_str(),
+                            Some("send" | "retry" | "live_listen")
+                        ) {
+                            maintenance_control.note_input();
+                        } else {
+                            maintenance_control.cancel_idle();
+                        }
                         out.result(
                             &id,
                             Err(coded(
@@ -2425,7 +2523,11 @@ fn run_control(
                         );
                         continue;
                     }
-                    if matches!(request["method"].as_str(), Some("send" | "retry")) {
+                    if matches!(
+                        request["method"].as_str(),
+                        Some("send" | "retry" | "live_listen")
+                    ) {
+                        wrap_up.store(false, Ordering::SeqCst);
                         prompt_queued.store(true, Ordering::SeqCst);
                         maintenance_control.note_input();
                     } else if matches!(
@@ -2440,6 +2542,8 @@ fn run_control(
                         )
                     ) {
                         maintenance_control.cancel();
+                    } else {
+                        maintenance_control.cancel_idle();
                     }
                     interrupt.store(false, Ordering::SeqCst);
                     if out.unavailable() {

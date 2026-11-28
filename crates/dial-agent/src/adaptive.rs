@@ -15,6 +15,9 @@ pub(crate) enum OutputEffortSignal {
     Routine,
     CheckFailure,
     RewritePressure,
+    /// The request phase is `Recovery`: the last tool call failed or the previous reply was
+    /// malformed, an unexpected result to reason about instead of continuing the routine plan.
+    Recovery,
 }
 
 pub(crate) fn experimental_output_effort(
@@ -37,9 +40,9 @@ pub(crate) fn experimental_output_effort(
     }
     let requested = match signal {
         OutputEffortSignal::Routine => ReasoningEffort::Low,
-        OutputEffortSignal::CheckFailure | OutputEffortSignal::RewritePressure => {
-            ReasoningEffort::High
-        }
+        OutputEffortSignal::CheckFailure
+        | OutputEffortSignal::RewritePressure
+        | OutputEffortSignal::Recovery => ReasoningEffort::High,
     };
     profile
         .capabilities
@@ -246,9 +249,13 @@ pub fn select(config: &AppConfig, state: &State, request: Request<'_>) -> Select
             top_p = p.top_p;
         }
     }
+    // A local model keeps its thinking controls unless phase thinking was explicitly selected.
+    let phase_reasoning = settings.reasoning
+        && (!config.local_main_model()
+            || config.assistance.local.thinking == crate::config::types::LocalThinking::Phase);
     let mut reasoning_source = "provider default or explicit profile".to_owned();
     if enabled
-        && settings.reasoning
+        && phase_reasoning
         && let Some(p) = profile.as_mut()
         && p.reasoning_effort.is_none()
         && p.thinking.is_none()
@@ -309,7 +316,7 @@ pub fn select(config: &AppConfig, state: &State, request: Request<'_>) -> Select
         Phase::Exploration => 60,
         _ => 40,
     };
-    let pre_action_secs = if enabled && settings.reasoning {
+    let pre_action_secs = if enabled && phase_reasoning {
         pre_action_secs.min(secs)
     } else {
         pre_action_secs

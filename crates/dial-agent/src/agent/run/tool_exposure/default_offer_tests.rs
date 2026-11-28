@@ -993,16 +993,16 @@ fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
     }
 }
 
-/// Local routes default to the hashline grammar, the same as hosted routes; pins and
-/// `assistance.local.edit_mode` still apply.
+/// Local routes default to the replace grammar, while hosted routes keep hashline; explicit pins
+/// and `assistance.local.edit_mode` still apply.
 #[test]
-fn local_routes_default_to_hashline_unless_pinned() {
+fn local_routes_default_to_replace_unless_pinned() {
     use crate::config::types::EditMode;
     let mode = |overlay: &str| with_agent(overlay, |agent| agent.edit_mode());
-    assert_eq!(mode(""), EditMode::Hashline);
+    assert_eq!(mode(""), EditMode::Replace);
     assert_eq!(
         mode("[endpoint]\nbase_url='http://127.0.0.1:9/v1'"),
-        EditMode::Hashline
+        EditMode::Replace
     );
     assert_eq!(
         mode("[assistance.local]\nedit_mode='apply_patch'"),
@@ -1116,30 +1116,24 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
 #[test]
 fn local_sampling_defers_to_the_server_unless_pinned() {
     let local = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'";
-    let apply = |overlay: &str, temperature: f64| {
+    let apply = |overlay: &str| {
         with_agent(overlay, |agent| {
             let mut profile = None;
-            let source = agent.apply_local_sampling(&mut profile, temperature);
+            let source = agent.apply_local_sampling(&mut profile);
             (source, profile.map(|p| p.capabilities.temperature))
         })
     };
+    assert_eq!(apply(local), (Some("local server defaults"), Some(false)));
     assert_eq!(
-        apply(local, 0.2),
-        (Some("local server defaults"), Some(false))
-    );
-    assert_eq!(
-        apply(&format!("{local}\n[harness]\ntemperature=0.7"), 0.7),
+        apply(&format!("{local}\n[harness]\ntemperature=0.7")),
         (None, None)
     );
     assert_eq!(
-        apply(
-            &format!("{local}\n[assistance.local]\nsampling='harness'"),
-            0.2
-        ),
+        apply(&format!("{local}\n[assistance.local]\nsampling='harness'")),
         (None, None)
     );
     assert_eq!(
-        apply("[endpoint]\nbase_url='https://api.example.com/v1'", 0.2),
+        apply("[endpoint]\nbase_url='https://api.example.com/v1'"),
         (Some("hosted provider defaults"), Some(false))
     );
 }
@@ -1160,15 +1154,16 @@ fn local_sampling_sends_greedy_for_do_sample_false_unless_pinned() {
     with_agent(&overlay, |agent| {
         let mut profile = None;
         assert_eq!(
-            agent.apply_local_sampling(&mut profile, 0.2),
+            agent.apply_local_sampling(&mut profile),
             Some("generation_config.json")
         );
         let mut body = serde_json::json!({"temperature":0.2});
         profile.unwrap().apply_openai(&mut body);
         assert_eq!(body["temperature"], 0.0);
-
+    });
+    with_agent(&format!("{overlay}\n[harness]\ntemperature=0.7"), |agent| {
         let mut profile = None;
-        assert_eq!(agent.apply_local_sampling(&mut profile, 0.7), None);
+        assert_eq!(agent.apply_local_sampling(&mut profile), None);
         assert!(
             profile.is_none(),
             "An explicit harness temperature must win"
@@ -1176,11 +1171,41 @@ fn local_sampling_sends_greedy_for_do_sample_false_unless_pinned() {
     });
 }
 
-/// The reasoning cap applies on lean local tiers only and scales with the planned window.
+#[test]
+fn owned_local_missing_temperature_is_not_a_harness_override() {
+    use crate::llm::profiles::ModelProfile;
+
+    for config in ["{}", r#"{"top_p":0.8}"#] {
+        let model = tempfile::tempdir().unwrap();
+        std::fs::write(model.path().join("generation_config.json"), config).unwrap();
+        let overlay = format!(
+            "model={}",
+            toml::Value::String(model.path().display().to_string())
+        );
+        with_agent(&overlay, |agent| {
+            let mut profile = Some(ModelProfile::minimal("mlx", &agent.config.model));
+            profile.as_mut().unwrap().thinking = Some(true);
+            agent.apply_local_sampling(&mut profile);
+            let mut body = json!({"temperature":0.2});
+            profile.unwrap().apply_openai(&mut body);
+            assert!(body.get("temperature").is_none(), "{body}");
+            assert_eq!(body.get("top_p").is_some(), config != "{}");
+        });
+    }
+}
+
+/// The reasoning cap applies on lean local tiers only, scales with small windows, and caps at
+/// `LOCAL_REASONING_DEFAULT_MAX_BYTES` at or below the default share so large contexts do not
+/// unlock unbounded single-step thinking.
 #[test]
 fn local_reasoning_cap_follows_the_lean_tiers() {
     let cap = |overlay: &str| with_agent(overlay, |agent| agent.local_reasoning_cap());
-    for (window, bytes) in [(16384, 6553), (32768, 13107), (65536, 26214)] {
+    for (window, bytes) in [
+        (16384, 6553),
+        (32768, 13107),
+        (65536, 16384),
+        (128000, 16384),
+    ] {
         assert_eq!(cap(&format!("context_window={window}")), Some(bytes));
     }
     assert_eq!(

@@ -74,6 +74,46 @@ pub enum Cmd {
         #[arg(long)]
         dequantize: bool,
     },
+    /// Export a trained adapter to standard HuggingFace PEFT or GGUF LoRA (`--lora`) format.
+    ExportAdapter {
+        /// Adapter version (default: the active version).
+        version: Option<i64>,
+        /// Target adapter format: "peft" (for ExLlamaV3/TabbyAPI, vLLM) or "gguf" (for llama-server --lora).
+        #[arg(long, default_value = "peft")]
+        format: String,
+        #[arg(long)]
+        out: PathBuf,
+        /// Tensor dtype for GGUF LoRA export: f32, f16, or bf16.
+        #[arg(long, default_value = "f32")]
+        dtype: String,
+    },
+    /// Fuse a trained adapter into FP16 weights, convert to GGUF, and optionally quantize via llama-quantize.
+    ExportGguf {
+        /// Adapter version (default: the active version).
+        version: Option<i64>,
+        #[arg(long)]
+        out: PathBuf,
+        /// Target GGUF quantization (e.g. f16, bf16, q8_0, q6_k, q5_k_m, q4_k_m, iq4_xs).
+        #[arg(long, default_value = "f16")]
+        quant: String,
+    },
+    /// Fuse an optional adapter and quantize to EXL3 format (requires NVIDIA CUDA + exllamav3).
+    ExportExl3 {
+        /// Adapter version (default: the active version if it has an adapter).
+        version: Option<i64>,
+        #[arg(long)]
+        out: PathBuf,
+        /// Target bits per weight in [1.5, 8.0].
+        #[arg(long, default_value_t = 4.0)]
+        bpw: f64,
+    },
+    /// Dequantize a local GGUF file into a trainable FP16 safetensors checkpoint directory.
+    PrepareGguf {
+        /// Path to a local .gguf file (or directory containing one).
+        source: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run the local gate on a pending candidate, such as an imported pack.
     Evaluate {
         candidate: i64,
@@ -97,6 +137,14 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
     }
     if let Cmd::Stop { state_id } = &cmd {
         return print_json(&auto::request_stop(layout, state_id)?);
+    }
+    if let Cmd::PrepareGguf { source, out } = cmd {
+        let source_abs = std::path::absolute(&source)?;
+        let gguf = dial::llm::local_format::gguf_file(&source_abs)
+            .context("source must be an existing .gguf file or directory containing one")?;
+        let out_abs = std::path::absolute(&out)?;
+        let res = dial::learn::worker::prepare_gguf(&config, &gguf, &out_abs)?;
+        return print_json(&res);
     }
     auto::prepare_state(layout)?;
     config.require_model()?;
@@ -149,6 +197,43 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
             let fused = dial::learn::worker::fuse(&config, &config.model, adapter, &out, dequantize)?;
             print_json(&json!({"version":version.id,"fused":fused}))?;
         }
+        Cmd::ExportAdapter { version, format, out, dtype } => {
+            let version = match version { Some(id) => store.version(id)?, None => store.active()? };
+            ensure!(version.kind == "lora", "only LoRA adapter versions can be exported; version {} is {}", version.id, version.kind);
+            improve::verify_adapter(&store, &version)?;
+            let adapter = version.adapter.as_ref().context("version has no adapter")?;
+            let out = std::path::absolute(&out)?;
+            let res = match format.as_str() {
+                "peft" => dial::learn::worker::export_peft(&config, &config.model, adapter, &out)?,
+                "gguf" => dial::learn::worker::export_gguf_lora(&config, &config.model, adapter, &out, &dtype)?,
+                other => anyhow::bail!("unsupported adapter format `{other}` (use `peft` or `gguf`)"),
+            };
+            print_json(&json!({"version":version.id,"exported":res}))?;
+        }
+        Cmd::ExportGguf { version, out, quant } => {
+            let version = match version { Some(id) => store.version(id)?, None => store.active()? };
+            ensure!(version.kind == "lora", "only LoRA adapter versions can be exported to GGUF; version {} is {}", version.id, version.kind);
+            improve::verify_adapter(&store, &version)?;
+            let adapter = version.adapter.as_ref().context("version has no adapter")?;
+            let out = std::path::absolute(&out)?;
+            let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
+            let res = dial::learn::worker::export_gguf(&config, &config.model, adapter, &out, &quant)?;
+            print_json(&json!({"version":version.id,"exported":res}))?;
+        }
+        Cmd::ExportExl3 { version, out, bpw } => {
+            let version = match version { Some(id) => store.version(id)?, None => store.active()? };
+            let adapter = if version.adapter.is_some() {
+                improve::verify_adapter(&store, &version)?;
+                version.adapter.as_deref()
+            } else {
+                None
+            };
+            let out = std::path::absolute(&out)?;
+            let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
+            let res = dial::learn::worker::export_exl3(&config, &config.model, adapter, &out, bpw)?;
+            print_json(&json!({"version":version.id,"exported":res}))?;
+        }
+        Cmd::PrepareGguf { .. } => unreachable!(),
         Cmd::Import { pack } => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
             control.try_lock().map_err(std::io::Error::from).context("an improvement cycle is using the version store")?;

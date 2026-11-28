@@ -27,6 +27,9 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
         adapter: Some(&lora),
         context_tokens: Some(32768),
         shared_pool: None,
+        reasoning_budget: None,
+        reasoning_budget_message: false,
+        cache_reuse: None,
         port: 4100,
     };
     let runtime = llm::local_runtime::LocalRuntime {
@@ -56,6 +59,7 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
         ("--port", "4100"),
         ("--ctx-size", "32768"),
         ("--spec-draft-n-max", "5"),
+        ("--flash-attn", "on"),
         ("--cache-type-k", "q8_0"),
         ("--cache-type-v", "q8_0"),
         ("--parallel", "1"),
@@ -77,6 +81,7 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
     );
     assert!(!plain.iter().any(|arg| arg.starts_with("--ctx-size")
         || arg.starts_with("--cache-type")
+        || arg == "--flash-attn"
         || arg == "--lora"));
 }
 
@@ -104,6 +109,57 @@ fn shared_slots_need_every_flag_as_a_whole_option() {
     assert!(!help_lists_shared_slots(
         "--kv-unified-per-slot N\n--no-cache-idle-slots\n"
     ));
+}
+
+#[test]
+fn llama_help_caps_detects_reasoning_budget_and_launch_emits_soft_close_flags() {
+    let help = "\
+--reasoning-budget N                    token budget for thinking
+--reasoning-budget-message MESSAGE      message injected before end-of-thinking
+--cache-reuse N                         min chunk size to attempt reusing from the cache
+";
+    let caps = help_caps_from(help);
+    assert!(caps.reasoning_budget);
+    assert!(caps.reasoning_budget_message);
+    assert!(caps.cache_reuse);
+    assert!(!caps.shared_slots);
+    let old_caps = help_caps_from(OLD_HELP);
+    assert!(!old_caps.reasoning_budget);
+    assert!(!old_caps.cache_reuse);
+
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("m.gguf");
+    fs::write(&model, b"GGUF\x03\0\0\0").unwrap();
+    let launch = LlamaLaunch {
+        model: &model,
+        projector: None,
+        adapter: None,
+        context_tokens: None,
+        shared_pool: None,
+        reasoning_budget: Some(LLAMA_DEFAULT_REASONING_BUDGET),
+        reasoning_budget_message: true,
+        cache_reuse: Some(LLAMA_DEFAULT_CACHE_REUSE),
+        port: 4100,
+    };
+    let args = strings(launch.args(&Default::default()).unwrap());
+    assert!(
+        args.windows(2).any(|pair| pair
+            == [
+                "--reasoning-budget",
+                &LLAMA_DEFAULT_REASONING_BUDGET.to_string()
+            ]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--reasoning-budget-message", LLAMA_REASONING_BUDGET_MESSAGE]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--cache-reuse", &LLAMA_DEFAULT_CACHE_REUSE.to_string()]),
+        "{args:?}"
+    );
 }
 
 #[test]
@@ -139,6 +195,9 @@ fn shared_launch_keeps_the_whole_window_per_slot_over_one_pool() {
         adapter: None,
         context_tokens: Some(32768),
         shared_pool: shared_pool(Some(32768), help_lists_shared_slots(NEW_HELP), |_| true),
+        reasoning_budget: None,
+        reasoning_budget_message: false,
+        cache_reuse: None,
         port: 4100,
     };
     let args = strings(launch.args(&Default::default()).unwrap());
@@ -212,6 +271,9 @@ fn gguf_launch_refuses_settings_llama_cpp_cannot_honor() {
         adapter,
         context_tokens: None,
         shared_pool: None,
+        reasoning_budget: None,
+        reasoning_budget_message: false,
+        cache_reuse: None,
         port: 1,
     };
     let error = launch(Some(&mlx_adapter))
@@ -727,4 +789,49 @@ fn real_server_tool_calls() {
     ));
     let second = llm::chat(server.base_url(), SERVER_MODEL, &followup, 120).unwrap();
     println!("REAL FOLLOWUP: {second:?}");
+}
+
+#[test]
+fn external_runtime_command_builders_and_model_id_discovery() {
+    let to_strings = |args: Vec<std::ffi::OsString>| -> Vec<String> {
+        args.into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(
+        to_strings(mlx_serve_chat_args("/models/qwen", 8081)),
+        ["--model", "/models/qwen", "--serve", "--host", "127.0.0.1", "--port", "8081"]
+    );
+    assert_eq!(
+        to_strings(vllm_mlx_args("/models/qwen", 8082)),
+        ["serve", "/models/qwen", "--host", "127.0.0.1", "--port", "8082"]
+    );
+    assert_eq!(
+        to_strings(mistralrs_args("/models/qwen", None, 8083).unwrap()),
+        ["--port", "8083", "plain", "-m", "/models/qwen"]
+    );
+    assert_eq!(
+        to_strings(
+            mistralrs_args("/models/qwen", Some(Path::new("/models/qwen/q4.gguf")), 8084).unwrap()
+        ),
+        ["--port", "8084", "gguf", "-m", "/models/qwen", "-f", "q4.gguf"]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(vllm_args("/models/qwen", Some(dir.path()), 8085).is_err());
+    assert!(sglang_args("/models/qwen", Some(dir.path()), 8086).is_err());
+    fs::write(dir.path().join("adapter_config.json"), "{}").unwrap();
+    fs::write(dir.path().join("adapter_model.safetensors"), b"x").unwrap();
+    let vllm = to_strings(vllm_args("/models/qwen", Some(dir.path()), 8085).unwrap());
+    assert!(vllm.contains(&"--enable-lora".to_owned()));
+    assert!(vllm.iter().any(|a| a.starts_with("dial=")));
+    let sglang = to_strings(sglang_args("/models/qwen", Some(dir.path()), 8086).unwrap());
+    assert!(sglang.contains(&"--lora-paths".to_owned()));
+    assert!(sglang.iter().any(|a| a.starts_with("dial=")));
+
+    assert_eq!(
+        first_served_model_id(&json!({"data": [{"id": "Qwen/Qwen3-8B"}]})),
+        Some("Qwen/Qwen3-8B".to_owned())
+    );
+    assert_eq!(first_served_model_id(&json!({"data": []})), None);
 }

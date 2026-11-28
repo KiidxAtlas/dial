@@ -60,12 +60,17 @@ fn local_engine_pin_is_exact_and_only_offers_compatible_engines() {
         .insert(LocalEngine::model_key("one"), LocalEngine::LlamaCpp);
     let one = describe(&config, row("one", "qwen2"), false);
     let choices = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        json!(["auto", "llama-cpp", "atomic"])
+        json!(["auto", "llama-cpp", "atomic", "ik-llama", "mistral-rs"])
     } else {
-        json!(["auto", "llama-cpp"])
+        json!(["auto", "llama-cpp", "ik-llama", "mistral-rs"])
     };
     assert_eq!(one["local_engine"]["selected"], "llama-cpp");
     assert_eq!(one["local_engine"]["choices"], choices);
+    assert_eq!(one["local_engine"]["default"], "llama-cpp");
+    assert!(one["local_engine"]["installed"].is_object());
+    assert!(one["local_engine"]["installed"].get("llama-cpp").is_some());
+    assert!(one["local_engine"]["installed"].get("ik-llama").is_some());
+    assert!(one["local_engine"]["installed"].get("mistral-rs").is_some());
     let two = describe(&config, row("two", "qwen2"), false);
     assert_eq!(two["local_engine"]["selected"], "auto");
     assert_ne!(
@@ -90,6 +95,26 @@ fn local_engine_pin_is_exact_and_only_offers_compatible_engines() {
         !LocalEngine::choices(LocalFormat::Mlx, GgufEngines::Unknown)
             .contains(&LocalEngine::Atomic)
     );
+    let mlx_row = Row {
+        selection: selection("mlx", "mlx-model"),
+        label: "mlx-model".into(),
+        sources: vec!["local".into()],
+        local: Some(catalog::ModelMetadata {
+            format: Some(LocalFormat::Mlx),
+            ..Default::default()
+        }),
+        image_output: None,
+    };
+    let mlx_desc = describe(&config, mlx_row, false);
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert_eq!(
+            mlx_desc["local_engine"]["choices"],
+            json!(["auto", "mlx", "mlx-serve", "vllm-mlx", "mistral-rs"])
+        );
+        assert_eq!(mlx_desc["local_engine"]["default"], "mlx");
+        assert!(mlx_desc["local_engine"]["installed"].get("mlx-serve").is_some());
+        assert!(mlx_desc["local_engine"]["installed"].get("vllm-mlx").is_some());
+    }
 }
 
 #[test]

@@ -69,6 +69,8 @@ impl Agent<'_> {
                     crate::adaptive::OutputEffortSignal::CheckFailure
                 } else if turn.edit_churn.has_pressure() {
                     crate::adaptive::OutputEffortSignal::RewritePressure
+                } else if self.request_phase.phase == crate::config::adaptive::Phase::Recovery {
+                    crate::adaptive::OutputEffortSignal::Recovery
                 } else {
                     crate::adaptive::OutputEffortSignal::Routine
                 };
@@ -303,6 +305,7 @@ impl Agent<'_> {
                 )
             })
         } else {
+            let wrap_up_thinking = Arc::clone(&self.wrap_up_thinking);
             chat_with_ui_streaming(
                 backend,
                 turn.adapter.as_deref(),
@@ -355,6 +358,7 @@ impl Agent<'_> {
                     stream: streamed.as_mut().map(|stream| {
                         stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
                     }),
+                    wrap_up: Some(wrap_up_thinking),
                 },
             )
         };

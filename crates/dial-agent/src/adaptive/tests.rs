@@ -18,6 +18,10 @@ fn experimental_output_effort_raises_on_failure_but_never_overrides_an_explicit_
         experimental_output_effort(&config, &profile, OutputEffortSignal::CheckFailure),
         Some(ReasoningEffort::High)
     );
+    assert_eq!(
+        experimental_output_effort(&config, &profile, OutputEffortSignal::Recovery),
+        Some(ReasoningEffort::High)
+    );
     profile.reasoning_effort = Some(ReasoningEffort::Low);
     config
         .model_profiles
@@ -442,7 +446,7 @@ fn phase_sampling_is_opt_in_and_pins_and_unknown_capabilities_win() {
 }
 #[test]
 fn reasoning_only_uses_declared_values_and_never_clips_thinking_budget() {
-    let c = config();
+    let mut c = config();
     let mut s = State::begin(Kind::Editing, "Implement");
     s.observe("write", settled(true, true, false));
     let mut p = ModelProfile {
@@ -455,6 +459,14 @@ fn reasoning_only_uses_declared_values_and_never_clips_thinking_budget() {
         },
         ..Default::default()
     };
+    for phase in [Phase::Investigation, Phase::Editing, Phase::Verification] {
+        s.phase = phase;
+        assert_eq!(
+            choose(&c, &s, Some(&p), false, false).reasoning_effort,
+            None
+        );
+    }
+    c.assistance.local.thinking = crate::config::types::LocalThinking::Phase;
     let chosen = choose(&c, &s, Some(&p), false, false);
     assert_eq!(chosen.reasoning_effort, Some(ReasoningEffort::Low));
     assert_eq!(chosen.max_tokens, 8192);

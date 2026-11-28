@@ -467,3 +467,35 @@ fn intervention_counts_are_explicit_events_without_message_content() {
     assert_eq!(report["interventions"]["turn_interrupted"], 1);
     assert!(report["interventions"].get("corrections").is_none());
 }
+
+#[test]
+fn local_preview_limit_caps_retained_reads_and_shell_outputs_while_exempting_errors_and_edits() {
+    let config = EfficiencyConfig::default();
+    // Hosted route keeps the full read window.
+    assert_eq!(
+        local_preview_limit(&config, 128_000, "read", false, true, false),
+        preview_limit(&config, 128_000, "read", false, true)
+    );
+    // Local route caps retained read and bash outputs to 16 KiB.
+    assert_eq!(
+        local_preview_limit(&config, 128_000, "read", false, true, true),
+        LOCAL_TOOL_PREVIEW_BYTES
+    );
+    assert!(
+        local_preview_limit(&config, 128_000, "bash", false, true, true)
+            <= LOCAL_TOOL_PREVIEW_BYTES
+    );
+    // Errors, edits, and unretained outputs are never clipped by the local cap.
+    for (tool, failed, retained) in [
+        ("read", true, true),
+        ("bash", true, true),
+        ("edit", false, true),
+        ("write", false, true),
+        ("read", false, false),
+    ] {
+        assert_eq!(
+            local_preview_limit(&config, 128_000, tool, failed, retained, true),
+            preview_limit(&config, 128_000, tool, failed, retained)
+        );
+    }
+}

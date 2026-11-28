@@ -981,6 +981,7 @@ pub struct ExperimentalOverrides {
     pub outcome_gradient_rounds: Option<u8>,
     pub streaming_dispatch: Option<bool>,
     pub check_predictions: Option<bool>,
+    pub adaptive_output_effort: Option<bool>,
 }
 
 impl ExperimentalOverrides {
