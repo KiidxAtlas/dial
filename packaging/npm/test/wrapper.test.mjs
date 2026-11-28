@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +7,30 @@ import { pathToFileURL } from 'node:url'
 import test from 'node:test'
 import { parseInstallArgs, runInstaller } from '../bin/install.mjs'
 import { findNativeDial, isEphemeralRunner, shouldRunInstaller } from '../bin/dial.mjs'
+import { verifyDesktopAsset } from '../bin/verify-desktop.mjs'
+
+test('Desktop asset verification fails closed on changed bytes, comments, or signing key', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dial-desktop-signature-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'fixture')
+  const payload = Buffer.from('desktop fixture')
+  writeFileSync(path, payload)
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519')
+  const keyId = Buffer.alloc(8, 1)
+  const encode = (...lines) => Buffer.from(lines.join('\n')).toString('base64')
+  const key = encode('untrusted comment: fixture', Buffer.concat([
+    Buffer.from('Ed'), keyId, publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)
+  ]).toString('base64'))
+  const sig = sign(null, createHash('blake2b512').update(payload).digest(), privateKey)
+  const sigLine = Buffer.concat([Buffer.from('ED'), keyId, sig]).toString('base64')
+  const global = sign(null, Buffer.concat([sig, Buffer.from('fixture')]), privateKey).toString('base64')
+  const valid = encode('untrusted comment: fixture', sigLine, 'trusted comment: fixture', global)
+  assert.equal(await verifyDesktopAsset(path, valid, key), true)
+  assert.equal(await verifyDesktopAsset(path, valid), false)
+  assert.equal(await verifyDesktopAsset(path, encode('', sigLine, 'trusted comment: changed', global), key), false)
+  writeFileSync(path, 'changed bytes')
+  assert.equal(await verifyDesktopAsset(path, valid, key), false)
+})
 
 test('parseInstallArgs forwards CLI/Desktop flags cleanly', () => {
   assert.deepEqual(parseInstallArgs([]), {

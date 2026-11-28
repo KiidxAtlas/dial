@@ -55,9 +55,7 @@ $desktopVersion = if ($env:DIAL_DESKTOP_VERSION -and ($env:DIAL_DESKTOP_VERSION 
   $null
 }
 
-$desktopBase = if ($env:DIAL_DESKTOP_BASE_URL) {
-  $env:DIAL_DESKTOP_BASE_URL.TrimEnd('/')
-} elseif ($desktopVersion) {
+$desktopBase = if ($desktopVersion) {
   "https://github.com/KiidxAtlas/dial-desktop/releases/download/$desktopVersion"
 } else {
   'https://github.com/KiidxAtlas/dial-desktop/releases/latest/download'
@@ -104,18 +102,29 @@ if ($isArm64 -and ($matchedKey -like 'windows-x86_64*')) {
   Write-Host '    Native Windows ARM64 build not published in this release; using x64 installer (runs via Windows ARM64 emulation).'
 }
 
+$assetUrl = $null
+if (-not [Uri]::TryCreate([string]$entry.url, [UriKind]::Absolute, [ref]$assetUrl) -or
+    $assetUrl.Scheme -ne 'https' -or $assetUrl.Host -ne 'github.com' -or
+    -not $assetUrl.IsDefaultPort -or $assetUrl.UserInfo -or
+    $assetUrl.AbsolutePath -notmatch '^/KiidxAtlas/dial-desktop/releases/download/[^/]+/[^/]+\.(exe|msi)$') {
+  throw 'Dial Desktop installer URL must point to a GitHub release asset in KiidxAtlas/dial-desktop.'
+}
+if (-not $entry.signature) { throw 'Dial Desktop installer is missing its release signature.' }
+
 $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("dial-desktop-install-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 try {
-  $isMsi = $entry.url -match '\.msi(\?|$)'
+  $isMsi = $assetUrl.AbsolutePath -match '\.msi$'
   $setupPath = Join-Path $tmpDir $(if ($isMsi) { 'Dial-setup.msi' } else { 'Dial-setup.exe' })
-  Invoke-WebRequest -UseBasicParsing -Uri $entry.url -Headers @{ 'User-Agent' = 'dial-installer' } -OutFile $setupPath
+  $signaturePath = Join-Path $tmpDir 'asset.sig'
+  [IO.File]::WriteAllText($signaturePath, [string]$entry.signature)
+  Invoke-WebRequest -UseBasicParsing -Uri $assetUrl -Headers @{ 'User-Agent' = 'dial-installer' } -OutFile $setupPath
 
-  if ($env:DIAL_ALLOW_UNSIGNED_INSTALL -ne '1') {
-    $sig = Get-AuthenticodeSignature -FilePath $setupPath
-    if ($sig.Status -ne 'Valid') {
-      throw "Dial Desktop installer failed Authenticode signature check ($($sig.Status))."
-    }
+  & $env:DIAL_NPM_RUNTIME (Join-Path $PSScriptRoot 'verify-desktop.mjs') $setupPath $signaturePath
+  if ($LASTEXITCODE -ne 0) { throw 'Dial Desktop installer failed release signature verification.' }
+  $sig = Get-AuthenticodeSignature -FilePath $setupPath
+  if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) {
+    throw "Dial Desktop installer failed Authenticode signature check ($($sig.Status))."
   }
 
   if ($isMsi) {

@@ -23,7 +23,7 @@ bun install -g @kiidxatlas/dial
 dial
 ```
 
-On first run (or whenever invoked with `bunx @kiidxatlas/dial` / `dial-install`), the wrapper runs the installer shipped in the package. The bundled scripts fetch release assets, not executable installer scripts. `DIAL_INSTALL_SCRIPT_URL` and `DIAL_CLI_INSTALL_URL` overrides are no longer accepted. On macOS this installs `Dial.app` into `/Applications` (or `~/Applications`) and `dial` into `~/.local/bin` without browser-quarantined `.dmg` prompts.
+On first run (or whenever invoked with `bunx @kiidxatlas/dial` / `dial-install`), the wrapper runs the installer shipped in the package. The bundled scripts fetch release assets, not executable installer scripts. `DIAL_INSTALL_SCRIPT_URL` and `DIAL_CLI_INSTALL_URL` overrides are no longer accepted. Desktop assets must verify against the pinned Tauri release key before extraction or execution. On macOS, existing Gatekeeper quarantine attributes are not explicitly removed.
 
 ## Publishing
 

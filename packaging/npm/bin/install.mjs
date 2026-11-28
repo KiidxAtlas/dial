@@ -73,7 +73,7 @@ export async function runInstaller(argv = process.argv.slice(2), env = process.e
     throw new Error('Remote installer script overrides are no longer supported; this package runs bundled installers.')
   }
 
-  const childEnv = { ...env }
+  const childEnv = { ...env, DIAL_NPM_RUNTIME: process.execPath }
   if (cliOnly) childEnv.DIAL_CLI_ONLY = '1'
   if (desktopOnly) childEnv.DIAL_DESKTOP_ONLY = '1'
   if (desktopVersion) childEnv.DIAL_DESKTOP_VERSION = desktopVersion

@@ -6,12 +6,9 @@
 #   DIAL_INSTALL_DIR=<dir>          Override CLI install directory (default ~/.local/bin)
 #   DIAL_APP_DIR=<dir>              Override Desktop install directory (/Applications or ~/Applications on macOS; ~/.local/bin on Linux)
 #   DIAL_NO_MODIFY_PATH=1           Do not modify shell profile files
-#   DIAL_REQUIRE_DESKTOP_SIGNATURE=1  Fail if no minisign verifier is available for Dial Desktop
 set -eu
 
 DESKTOP_REPO="KiidxAtlas/dial-desktop"
-# Tauri updater minisign public key from dial-desktop/src-tauri/tauri.release.conf.json
-DEFAULT_DESKTOP_PUBKEY="dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlBRERBOEM2MkQ5MThDQUYKUldTdmpKRXR4cWpkbW9PUnBZQ3lrM2xjajJrQTZjWlJEcGJpM0pPTklyRmhlR1BXSUpiQlZGemMK"
 
 INSTALL_CLI=1
 INSTALL_DESKTOP=1
@@ -202,28 +199,6 @@ download_file() {
   esac
 }
 
-b64_decode() {
-  if printf 'YQ==' | base64 -d >/dev/null 2>&1; then
-    base64 -d
-  else
-    base64 -D
-  fi
-}
-
-find_openssl3() {
-  for cand in /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl "$(command -v openssl 2>/dev/null || true)"; do
-    [ -n "$cand" ] && [ -x "$cand" ] || continue
-    case "$("$cand" version 2>/dev/null || true)" in
-      "OpenSSL 3."*)
-        if "$cand" list -digest-algorithms 2>/dev/null | grep -qi blake2b512; then
-          printf '%s' "$cand"
-          return 0
-        fi
-        ;;
-    esac
-  done
-  return 1
-}
 
 # Locate a real python3 without triggering Apple's uninstalled Xcode CLT GUI dialog.
 find_real_python3() {
@@ -239,191 +214,10 @@ find_real_python3() {
   return 1
 }
 
-# Verify a Tauri minisign signature (.sig containing base64-encoded minisign text)
-# against the embedded minisign public key (also base64-encoded minisign text).
-# Returns 0 on verified signature, 2 if no verifier exists, or exits 1 on bad signature.
 verify_minisign() {
-  payload="$1"
-  sig_b64="$2"
-  pubkey_b64="${DIAL_DESKTOP_PUBKEY:-$DEFAULT_DESKTOP_PUBKEY}"
-
-  vdir="$TMP_DIR/verify"
-  rm -rf "$vdir"
-  mkdir -p "$vdir"
-
-  printf '%s' "$pubkey_b64" | tr -d ' \t\r\n' | b64_decode > "$vdir/pubkey.txt" || die "failed to decode desktop signing public key"
-  tr -d ' \t\r\n' < "$sig_b64" | b64_decode > "$vdir/sig.txt" || die "failed to decode desktop signature"
-
-  if command -v minisign >/dev/null 2>&1; then
-    if minisign -Vm "$payload" -p "$vdir/pubkey.txt" -x "$vdir/sig.txt" >/dev/null 2>&1; then
-      return 0
-    fi
-    die "Dial Desktop signature verification failed (minisign)"
-  fi
-
-  if openssl_bin=$(find_openssl3); then
-    sed -n '2p' "$vdir/pubkey.txt" | tr -d ' \t\r\n' | b64_decode > "$vdir/pubkey.bin" || die "malformed desktop public key"
-    sed -n '2p' "$vdir/sig.txt" | tr -d ' \t\r\n' | b64_decode > "$vdir/sig.bin" || die "malformed desktop signature"
-    sed -n '4p' "$vdir/sig.txt" | tr -d ' \t\r\n' | b64_decode > "$vdir/global_sig.bin" || die "malformed desktop global signature"
-
-    [ "$(wc -c < "$vdir/pubkey.bin" | tr -d ' \t\r\n')" = "42" ] || die "invalid desktop public key length"
-    [ "$(wc -c < "$vdir/sig.bin" | tr -d ' \t\r\n')" = "74" ] || die "invalid desktop signature length"
-    [ "$(wc -c < "$vdir/global_sig.bin" | tr -d ' \t\r\n')" = "64" ] || die "invalid desktop global signature length"
-
-    dd if="$vdir/pubkey.bin" bs=1 skip=2 count=8 2>/dev/null > "$vdir/pub_keyid"
-    dd if="$vdir/pubkey.bin" bs=1 skip=10 count=32 2>/dev/null > "$vdir/pub_raw"
-    dd if="$vdir/sig.bin" bs=1 skip=0 count=2 2>/dev/null > "$vdir/sig_alg"
-    dd if="$vdir/sig.bin" bs=1 skip=2 count=8 2>/dev/null > "$vdir/sig_keyid"
-    dd if="$vdir/sig.bin" bs=1 skip=10 count=64 2>/dev/null > "$vdir/sig_raw"
-
-    cmp -s "$vdir/pub_keyid" "$vdir/sig_keyid" || die "Dial Desktop signature key ID mismatch"
-
-    { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; cat "$vdir/pub_raw"; } > "$vdir/pub.der"
-    {
-      printf '%s\n' '-----BEGIN PUBLIC KEY-----'
-      base64 < "$vdir/pub.der" | tr -d ' \t\r\n'
-      printf '\n%s\n' '-----END PUBLIC KEY-----'
-    } > "$vdir/pub.pem"
-
-    alg=$(od -An -tx1 "$vdir/sig_alg" | tr -d ' \t\r\n')
-    if [ "$alg" = "4544" ]; then
-      "$openssl_bin" dgst -blake2b512 -binary "$payload" > "$vdir/msg.bin"
-    elif [ "$alg" = "4564" ]; then
-      cp "$payload" "$vdir/msg.bin"
-    else
-      die "unsupported minisign signature algorithm: $alg"
-    fi
-
-    "$openssl_bin" pkeyutl -verify -pubin -inkey "$vdir/pub.pem" -rawin -in "$vdir/msg.bin" -sigfile "$vdir/sig_raw" >/dev/null 2>&1 \
-      || die "Dial Desktop signature verification failed (OpenSSL)"
-
-    trusted_line=$(sed -n '3p' "$vdir/sig.txt")
-    case "$trusted_line" in
-      "trusted comment: "*) trusted_body="${trusted_line#trusted comment: }" ;;
-      *) die "malformed minisign trusted comment" ;;
-    esac
-    { cat "$vdir/sig_raw"; printf '%s' "$trusted_body"; } > "$vdir/global_msg.bin"
-    "$openssl_bin" pkeyutl -verify -pubin -inkey "$vdir/pub.pem" -rawin -in "$vdir/global_msg.bin" -sigfile "$vdir/global_sig.bin" >/dev/null 2>&1 \
-      || die "Dial Desktop trusted comment signature verification failed (OpenSSL)"
-    return 0
-  fi
-
-  if py_bin=$(find_real_python3); then
-    "$py_bin" - "$payload" "$vdir/pubkey.txt" "$vdir/sig.txt" <<'PY' || die "Dial Desktop signature verification failed (Python Ed25519)"
-import base64, hashlib, sys
-
-payload_path, pub_path, sig_path = sys.argv[1:4]
-pub_lines = open(pub_path, "r", encoding="utf-8").read().splitlines()
-sig_lines = open(sig_path, "r", encoding="utf-8").read().splitlines()
-if len(pub_lines) < 2 or len(sig_lines) < 4:
-    sys.exit(1)
-
-pub_raw = base64.b64decode(pub_lines[1].strip())
-sig_raw = base64.b64decode(sig_lines[1].strip())
-global_sig = base64.b64decode(sig_lines[3].strip())
-if len(pub_raw) != 42 or len(sig_raw) != 74 or len(global_sig) != 64:
-    sys.exit(1)
-if pub_raw[2:10] != sig_raw[2:10]:
-    sys.exit(1)
-if not sig_lines[2].startswith("trusted comment: "):
-    sys.exit(1)
-trusted_comment = sig_lines[2][len("trusted comment: "):].encode("utf-8")
-
-pk = pub_raw[10:42]
-alg = sig_raw[0:2]
-sig = sig_raw[10:74]
-
-# Pure stdlib RFC 8032 Ed25519 verification
-p = (1 << 255) - 19
-L = (1 << 252) + 27742317777372353535851937790883648493
-d = (-121665 * pow(121666, p - 2, p)) % p
-I = pow(2, (p - 1) // 4, p)
-
-def xrecover(y):
-    xx = (y * y - 1) * pow(d * y * y + 1, p - 2, p) % p
-    x = pow(xx, (p + 3) // 8, p)
-    if (x * x - xx) % p != 0:
-        x = (x * I) % p
-    if (x * x - xx) % p != 0:
-        raise ValueError("not on curve")
-    if x & 1:
-        x = p - x
-    return x
-
-By = (4 * pow(5, p - 2, p)) % p
-Bx = xrecover(By)
-B = (Bx % p, By % p, 1, (Bx * By) % p)
-
-def add(P, Q):
-    X1, Y1, Z1, T1 = P
-    X2, Y2, Z2, T2 = Q
-    A = ((Y1 - X1) * (Y2 - X2)) % p
-    B_ = ((Y1 + X1) * (Y2 + X2)) % p
-    C = (2 * d * T1 * T2) % p
-    D = (2 * Z1 * Z2) % p
-    E = (B_ - A) % p
-    F = (D - C) % p
-    G = (D + C) % p
-    H = (B_ + A) % p
-    return ((E * F) % p, (G * H) % p, (F * G) % p, (E * H) % p)
-
-def mul(P, e):
-    Q = (0, 1, 1, 0)
-    while e > 0:
-        if e & 1:
-            Q = add(Q, P)
-        P = add(P, P)
-        e >>= 1
-    return Q
-
-def decode_point(b):
-    y = int.from_bytes(b, "little")
-    sign = (y >> 255) & 1
-    y &= (1 << 255) - 1
-    if y >= p:
-        raise ValueError("y >= p")
-    x = xrecover(y)
-    if x == 0 and sign:
-        raise ValueError("invalid zero sign")
-    if (x & 1) != sign:
-        x = p - x
-    return (x, y, 1, (x * y) % p)
-
-def eq(P, Q):
-    return (P[0] * Q[2] - Q[0] * P[2]) % p == 0 and (P[1] * Q[2] - Q[1] * P[2]) % p == 0
-
-def verify_ed25519(public_key, message, signature):
-    R = decode_point(signature[:32])
-    A = decode_point(public_key)
-    S = int.from_bytes(signature[32:], "little")
-    if S >= L:
-        return False
-    h = int.from_bytes(hashlib.sha512(signature[:32] + public_key + message).digest(), "little") % L
-    return eq(mul(B, S), add(R, mul(A, h)))
-
-if alg == b"ED":
-    h = hashlib.blake2b(digest_size=64)
-    with open(payload_path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    msg = h.digest()
-elif alg == b"Ed":
-    msg = open(payload_path, "rb").read()
-else:
-    sys.exit(1)
-
-if not verify_ed25519(pk, msg, sig):
-    sys.exit(1)
-if not verify_ed25519(pk, sig + trusted_comment, global_sig):
-    sys.exit(1)
-PY
-    return 0
-  fi
-
-  return 2
+  verifier="$(dirname "$0")/verify-desktop.mjs"
+  "$DIAL_NPM_RUNTIME" "$verifier" "$1" "$2" || die "Dial Desktop release signature verification failed"
+  say "    Verified Dial Desktop release signature."
 }
 
 install_cli() {
@@ -471,18 +265,7 @@ install_desktop_macos() {
   download_file "${base}/${archive_name}" "$archive_path"
   download_file "${base}/${archive_name}.sig" "$sig_path"
 
-  verify_rc=0
-  verify_minisign "$archive_path" "$sig_path" || verify_rc=$?
-  if [ "$verify_rc" -eq 0 ]; then
-    say "    Verified Dial Desktop release signature."
-  elif [ "$verify_rc" -eq 2 ]; then
-    if [ "${DIAL_REQUIRE_DESKTOP_SIGNATURE:-0}" = "1" ]; then
-      die "no minisign verifier (minisign, OpenSSL 3, or python3) found"
-    fi
-    warn "no minisign verifier (minisign, OpenSSL 3, or python3) found; skipping archive signature check"
-  else
-    exit "$verify_rc"
-  fi
+  verify_minisign "$archive_path" "$sig_path"
 
   extract_dir="$TMP_DIR/extract"
   mkdir -p "$extract_dir"
@@ -496,9 +279,6 @@ install_desktop_macos() {
 
   if command -v codesign >/dev/null 2>&1; then
     codesign --verify --deep --strict "$src_app" >/dev/null 2>&1 || die "Dial.app failed macOS codesign integrity check"
-  fi
-  if command -v xattr >/dev/null 2>&1; then
-    xattr -dr com.apple.quarantine "$src_app" 2>/dev/null || true
   fi
 
   if [ -n "${DIAL_APP_DIR:-}" ]; then
@@ -520,9 +300,6 @@ install_desktop_macos() {
     ditto "$src_app" "$staged_app"
   else
     cp -R "$src_app" "$staged_app"
-  fi
-  if command -v xattr >/dev/null 2>&1; then
-    xattr -dr com.apple.quarantine "$staged_app" 2>/dev/null || true
   fi
 
   had_prev=0
@@ -644,18 +421,7 @@ install_desktop_linux() {
   printf '%s' "$asset_sig" > "$sig_tmp"
   download_file "$asset_url" "$appimage_tmp"
 
-  verify_rc=0
-  verify_minisign "$appimage_tmp" "$sig_tmp" || verify_rc=$?
-  if [ "$verify_rc" -eq 0 ]; then
-    say "    Verified Dial Desktop release signature."
-  elif [ "$verify_rc" -eq 2 ]; then
-    if [ "${DIAL_REQUIRE_DESKTOP_SIGNATURE:-0}" = "1" ]; then
-      die "no minisign verifier (minisign, OpenSSL 3, or python3) found"
-    fi
-    warn "no minisign verifier (minisign, OpenSSL 3, or python3) found; skipping AppImage signature check"
-  else
-    exit "$verify_rc"
-  fi
+  verify_minisign "$appimage_tmp" "$sig_tmp"
 
   app_dir="${DIAL_APP_DIR:-$HOME/.local/bin}"
   mkdir -p "$app_dir"
