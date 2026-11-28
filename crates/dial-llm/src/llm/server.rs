@@ -637,7 +637,7 @@ fn help_options(help: &str) -> std::collections::HashSet<&str> {
 
 /// Whether `help` lists every shared-slot flag as a whole option name (`--kv-unified` is not
 /// matched by `--kv-unified-per-slot`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn help_lists_shared_slots(help: &str) -> bool {
     let options = help_options(help);
     SHARED_SLOT_FLAGS.iter().all(|flag| options.contains(flag))

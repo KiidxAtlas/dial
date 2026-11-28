@@ -30,6 +30,7 @@
     "node": ">=18"
   },
   "scripts": {
+    "prepack": "node scripts/bundle-cli.mjs",
     "test": "node --test test/wrapper.test.mjs"
   }
 }

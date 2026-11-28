@@ -1,12 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-
-const DEFAULT_UNIX_URL = 'https://dial.rootatlas.dev/install.sh'
-const DEFAULT_WINDOWS_URL = 'https://dial.rootatlas.dev/install.ps1'
 
 export function parseInstallArgs(argv) {
   const installerArgs = []
@@ -74,47 +69,25 @@ export async function runInstaller(argv = process.argv.slice(2), env = process.e
     return 0
   }
 
+  if (env.DIAL_INSTALL_SCRIPT_URL || env.DIAL_CLI_INSTALL_URL) {
+    throw new Error('Remote installer script overrides are no longer supported; this package runs bundled installers.')
+  }
+
+  const childEnv = { ...env }
+  if (cliOnly) childEnv.DIAL_CLI_ONLY = '1'
+  if (desktopOnly) childEnv.DIAL_DESKTOP_ONLY = '1'
+  if (desktopVersion) childEnv.DIAL_DESKTOP_VERSION = desktopVersion
+  if (cliVersion) childEnv.DIAL_VERSION = cliVersion
+
   const isWindows = platform === 'win32'
-  const url = env.DIAL_INSTALL_SCRIPT_URL || (isWindows ? DEFAULT_WINDOWS_URL : DEFAULT_UNIX_URL)
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'dial-bun-installer' },
-    redirect: 'follow'
-  })
-  if (!response.ok) {
-    throw new Error(`Failed to fetch installer from ${url} (HTTP ${response.status})`)
-  }
-  const scriptText = await response.text()
-
-  const dir = mkdtempSync(join(tmpdir(), 'dial-npm-install-'))
-  try {
-    const childEnv = { ...env }
-    if (cliOnly) childEnv.DIAL_CLI_ONLY = '1'
-    if (desktopOnly) childEnv.DIAL_DESKTOP_ONLY = '1'
-    if (desktopVersion) childEnv.DIAL_DESKTOP_VERSION = desktopVersion
-    if (cliVersion) childEnv.DIAL_VERSION = cliVersion
-
-    if (isWindows) {
-      const scriptPath = join(dir, 'install.ps1')
-      writeFileSync(scriptPath, scriptText, 'utf8')
-      const res = spawnSync(
-        'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-        { stdio: 'inherit', env: childEnv }
-      )
-      if (res.error) throw res.error
-      return res.status ?? 1
-    }
-    const scriptPath = join(dir, 'install.sh')
-    writeFileSync(scriptPath, scriptText, { encoding: 'utf8', mode: 0o700 })
-    const res = spawnSync('/bin/sh', [scriptPath, ...installerArgs], {
-      stdio: 'inherit',
-      env: childEnv
+  const scriptPath = fileURLToPath(new URL(isWindows ? 'install-windows.ps1' : 'install-unix.sh', import.meta.url))
+  const res = isWindows
+    ? spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+      stdio: 'inherit', env: childEnv
     })
-    if (res.error) throw res.error
-    return res.status ?? 1
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+    : spawnSync('/bin/sh', [scriptPath, ...installerArgs], { stdio: 'inherit', env: childEnv })
+  if (res.error) throw res.error
+  return res.status ?? 1
 }
 
 const entry = process.argv[1]

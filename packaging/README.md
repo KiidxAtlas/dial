@@ -40,7 +40,9 @@ Homebrew reads versions from the published tap, not the latest GitHub tag. For a
 
 ## Bun / npm wrapper (`packaging/npm`, `@kiidxatlas/dial`)
 
-A zero-dependency launcher/installer wrapper for `bunx @kiidxatlas/dial` and `bun install -g @kiidxatlas/dial`. It runs the verified installer from `https://dial.rootatlas.dev/install.sh` (or `install.ps1` on Windows) without requiring Bun `postinstall` trust, and delegates subsequent `dial` calls to the native binary.
+A zero-dependency launcher/installer wrapper for `bunx @kiidxatlas/dial` and `bun install -g @kiidxatlas/dial`. It runs package-bundled installers without requiring Bun `postinstall` trust, and delegates subsequent `dial` calls to the native binary.
+
+Set the Engine release verification public key before publishing; see the [npm publishing instructions](npm/README.md#publishing).
 
 ```sh
 cd packaging/npm

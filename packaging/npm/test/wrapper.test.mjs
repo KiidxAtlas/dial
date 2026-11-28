@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import http from 'node:http'
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import test from 'node:test'
 import { parseInstallArgs, runInstaller } from '../bin/install.mjs'
 import { findNativeDial, isEphemeralRunner, shouldRunInstaller } from '../bin/dial.mjs'
@@ -95,32 +95,24 @@ test('shouldRunInstaller distinguishes bunx installs from normal CLI invocations
   assert.equal(shouldRunInstaller(['node', '/Users/u/.bun/bin/dial'], {}, null), true)
 })
 
-test('runInstaller downloads and executes the shell installer with forwarded args', async (t) => {
+test('runInstaller refuses both legacy remote installer overrides', async () => {
+  for (const key of ['DIAL_INSTALL_SCRIPT_URL', 'DIAL_CLI_INSTALL_URL']) {
+    await assert.rejects(
+      runInstaller(['--cli'], { [key]: 'https://example.invalid/install.sh' }),
+      /Remote installer script overrides are no longer supported/
+    )
+  }
+})
+
+test('runInstaller invokes only the sibling CLI script with the selected version', { skip: process.platform === 'win32' }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dial-npm-run-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
+  for (const name of ['install.mjs', 'install-unix.sh']) {
+    copyFileSync(new URL(`../bin/${name}`, import.meta.url), join(dir, name))
+  }
   const outFile = join(dir, 'recorded.txt')
-
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'content-type': 'text/plain' })
-    res.end(`#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' "$*" "\${DIAL_CLI_ONLY:-0}" "\${DIAL_DESKTOP_ONLY:-0}" "\${DIAL_DESKTOP_VERSION:-}" "\${DIAL_VERSION:-}" > "${outFile}"\n`)
-  })
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  t.after(() => server.close())
-
-  const { port } = server.address()
-  const code = await runInstaller(
-    ['--cli'],
-    { ...process.env, DIAL_INSTALL_SCRIPT_URL: `http://127.0.0.1:${port}/install.sh` },
-    'darwin'
-  )
-  assert.equal(code, 0)
-  assert.equal(readFileSync(outFile, 'utf8').trim(), '--cli|1|0||')
-
-  const desktopCode = await runInstaller(
-    ['--desktop', '--desktop-version', 'v0.4.0', 'v0.4.1'],
-    { ...process.env, DIAL_INSTALL_SCRIPT_URL: `http://127.0.0.1:${port}/install.sh` },
-    'darwin'
-  )
-  assert.equal(desktopCode, 0)
-  assert.equal(readFileSync(outFile, 'utf8').trim(), '--desktop --desktop-version v0.4.0 v0.4.1|0|1|v0.4.0|v0.4.1')
+  writeFileSync(join(dir, 'install-cli.sh'), '#!/bin/sh\nprintf "%s|%s|%s\\n" "$*" "$DIAL_CLI_ONLY" "$DIAL_VERSION" > "$RECORD"\n')
+  const { runInstaller: runBundled } = await import(pathToFileURL(join(dir, 'install.mjs')).href)
+  assert.equal(await runBundled(['--cli', 'v0.4.1'], { PATH: process.env.PATH, RECORD: outFile }), 0)
+  assert.equal(readFileSync(outFile, 'utf8').trim(), 'v0.4.1|1|v0.4.1')
 })
